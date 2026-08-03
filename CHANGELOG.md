@@ -5,6 +5,108 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### #591: silence is a decision, and nobody made it
+
+#574 shipped the commons' brake — one objection raises it, m-of-n dismisses it — and left one
+case undecided: **the duty-holders do not answer.** Then the outcome falls out of whichever
+default the window resolves to. The brake stands indefinitely on one member's word, or it
+lapses with nobody having judged it. Both are decisions and neither was made by anybody.
+
+Non-response is the *normal* failure mode, not an exotic one: moderator burnout is the
+fediverse's dominant cause of instance death. The adversarial case is a duty-holder
+unreachable precisely because the objection concerns them.
+
+A cohort may now declare a **steward tier**:
+
+```
+reverse_quorum:{m}/{n}:{window}+escalate:{steward_secs}:{floor}
+       e.g.  reverse_quorum:2/9:86400+escalate:172800:3
+```
+
+The appointed moderators get `steward_secs` after the objection window closes to reach an
+upholding ruling. If they do not, the objection escalates to a quorum of **respondents**.
+
+#### Silence is its own arm, on its own axis
+
+Two new enums, not new arms on old ones. `StewardTierStanding` answers *did the people
+carrying the duty answer?*; `ReverseQuorumStanding` still answers *does the action stand?*
+Fusing them would put "the action stands" and "nobody looked" in one value, which is the
+defect #591 exists to close. Three of the six arms are different **zeroes** and none share a
+token: `silent` (nobody answered) / `overruled` (somebody answered, but their answer was an
+undo, and undos are never unilateral) / `no_duty_holders` (there was nobody to answer). The
+second enum, `EscalationOutcome`, says what came back.
+
+Silence is deliberately NOT an arm of `ObjectionRefusalReason` or of `DismissalDecision`
+(which the issue suggested): a refusal is a verdict on ONE admission attempt, and silence is a
+property of an objection over time that refuses nothing and is nobody's act.
+
+#### The escalated threshold counts RESPONDENTS — and that is the opposite of #578's rule
+
+`escalated_dismissal_required` = `max(dismissal_threshold(RESPONDENTS), declared floor, 3)`.
+m-of-n over the full roster means the more members have gone quiet the more impossible any
+decision becomes — the threshold inverts exactly when it is needed.
+
+#578's `wa_quorum_over_body` uses the FULL seated roster and never the live subset, and both
+are right. There, shrinking the denominator LOWERS the bar to take somebody's node, so an
+adversary who can silence seats would shrink the body to the seats they hold: **silence is a
+lever there and the condition being escalated past here.** Written into the module doc as a
+blockquote, because the next reader will otherwise think one of them is a bug.
+
+#### The griefing mitigations, and the one deliberately rejected
+
+- **An absolute respondent floor of 3** that no policy string can lower — a cohort may raise
+  its own, and a string declaring less is refused at the parse door AND clamped at use. This
+  is not a tuning knob: `strict_majority(1) == 1`, so without it the escalated undo would be a
+  literal **1-of-N capability grant**, which the repo's standing accord-ops invariant forbids.
+- **The ratio is not re-priced** — the escalated path calls `dismissal_threshold` itself and
+  only swaps the denominator, so a cohort that declared `7/9` still needs seven.
+- **Upholders dilute the pool** — a respondent is anyone who answered in either direction.
+- **Recusal** — the action's author is struck from both the duty-holder bench and the
+  respondent pool; the objection's author is struck from the bench for their own objection.
+- **It is all in the record** — every ballot is an ordinary signed `scores` row and the fold
+  names every one it counted.
+- **REJECTED: a per-objector rate limit.** It does not fit the threat (escalation is not an
+  act — nobody performs it, and no objector can advance the clock, which is a function of the
+  ACTION's `asserted_at` and the declared windows alone), and it would make the PROTECTIVE
+  side conditional on the objector's unrelated history. In a burning-out community the last
+  member still paying attention is the one who has objected most recently. Load metering
+  belongs on the capacity plane.
+
+#### The op classification
+
+Escalation is **not an op**: no signature performs it, it grants nobody anything, and the only
+thing it changes is which denominator the *undo* is priced against. Every threshold of 1 on
+this plane buys protection (raise an objection; a duty-holder keeping protection in place) and
+every undo is m-of-n — including the escalated one, which is what the floor guarantees.
+
+#### Surface
+
+- `reverse_quorum`: `DIMENSION_UPHELD` / `DIMENSION_OVERRULED` (both under the EXISTING
+  `objection:{state}` family — a new dimension inside a registered family is not a new
+  family), `StewardTier`, `ReverseQuorumInputs`, `fold_reverse_quorum_over`,
+  `escalated_dismissal_required`, `ballot_envelope`, `record_objection_ballot`, and three
+  appended `ObjectionRefusalReason` variants (`steward_tier_not_adopted`, `actor_recused`,
+  `ballot_predates_action`). `ReverseQuorumFold` gains `steward_deadline`, `escalation`,
+  `escalated_dismissed_objection_ids`.
+- `admission::appointed_moderators_of` — the **appointed** duty-holder set (steward-bound
+  founders ∪ their `moderate`-scoped delegates). Distinct from `moderators_of` and
+  `duty_holders_for_community`, which resolve the appointment-ELIGIBILITY set: for any
+  non-`founder_only` protocol that is the whole roster, and a "steward tier" whose membership
+  equals the roster is not a tier. The three-way distinction is a table on the new function.
+- **BREAKING (source-compatible in-repo):** `resolve_reverse_quorum` takes
+  `&dyn FederationDirectory` instead of a generic. The duty-holder derivation is the
+  §11.10/§11.11 moderation walk, which is `&dyn` the whole way down, and `&F where F: ?Sized`
+  cannot be unsize-coerced. Concrete callers coerce automatically; `&dyn` callers are
+  unchanged.
+- **V120 (postgres only).** The sqlite V116 CHECK is `GLOB 'reverse_quorum:*/*:*'` and GLOB's
+  `*` spans `:` and `+`, so it admits the suffix unchanged — verified against the engine, not
+  argued from the shape. Postgres closes the column with an anchored regex and genuinely
+  needed widening. No sqlite twin, and that is a finding: the alternative was an irreversible
+  rebuild of `federation_communities` whose data path CI structurally cannot cover, taken on a
+  false premise.
+
 ## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open

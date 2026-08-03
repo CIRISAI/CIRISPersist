@@ -20445,6 +20445,32 @@ mod tests {
             .await;
     }
 
+    /// CIRISPersist#591 — the POSTGRES leg of the shared
+    /// escalation-on-silence witness (see the sqlite + memory legs); all three
+    /// call the SAME `exercise_escalation_on_silence` body.
+    ///
+    /// The V120 leg: postgres closes `consensus_protocol` with an ANCHORED
+    /// regex, so unlike sqlite's coarse `GLOB` it genuinely refuses the
+    /// `+escalate:` suffix until V120 widens it. A real `put_community` here is
+    /// the only thing that proves the migration and the Rust parse door admit
+    /// the same language — V116 shipped with exactly that disagreement in the
+    /// other direction.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn escalation_on_silence_parity_postgres_591() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the POSTGRES leg of the shared
     /// admin-op witness (see `sqlite::tests::admin_ops_parity_sqlite_570` and
     /// the memory leg); all three call the SAME

@@ -6523,6 +6523,76 @@ pub async fn moderators_of(
     Ok(out)
 }
 
+/// CIRISPersist#591 — the **APPOINTED** moderator set of community
+/// `community_id` for `duty`: the steward-bound **founders** and every key they
+/// reach under the same §11.10 `duty`-scoped `delegates_to` walk.
+///
+/// # Three functions, three questions — read the table before adding a fourth
+///
+/// | question | function | set |
+/// |---|---|---|
+/// | who may **appoint** a moderator? | [`duty_holders_for_community`] | the steward-bound authority set — founders, **plus every current member for any non-`founder_only` protocol** |
+/// | who **counts as** a named moderator (§11.11 existence)? | [`moderators_of`] | that same widened authority set ∪ its `duty`-scoped delegates |
+/// | who has **been appointed** to the duty? | **this function** | founders ∪ their `duty`-scoped delegates |
+///
+/// For a `founder_only` community all three coincide, which is why the widening
+/// was invisible for as long as §11.11's only consumer was the
+/// moderator-EXISTENCE gate ([`check_no_moderator_federate_admission`]). There
+/// the widened reading is correct and deliberate: a community with any
+/// steward-bound member *can* appoint, so it is not moderator-less.
+///
+/// It is NOT correct for a **duty** question. Every cohort that adopts
+/// `reverse_quorum:*` is by construction non-`founder_only`, so `moderators_of`
+/// on that plane returns the ENTIRE steward-bound roster — and a "steward tier"
+/// whose membership equals the roster is not a tier. Worse than useless:
+/// [`reverse_quorum`](super::reverse_quorum)'s escalation is blocked by a
+/// duty-holder ruling, so a roster-wide steward set would let any member rule
+/// on any objection and freeze the commons' escalated undo forever — the exact
+/// 1-of-N capability grant the accord-ops invariant forbids. Reading an
+/// appointment-ELIGIBILITY set as an appointed-duty set is axis fusion; this is
+/// the split.
+///
+/// Fail-closed, exactly like [`moderators_of`]: an unknown community, a
+/// community with no founder-tagged member, or a founder that is not
+/// [`is_steward_bound`] yields the empty set (no appointed moderators), never
+/// an error. An empty result is a legible fact, not an error — see
+/// [`StewardTierStanding::NoDutyHolders`](super::reverse_quorum::StewardTierStanding::NoDutyHolders).
+pub async fn appointed_moderators_of(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    duty: &str,
+) -> Result<Vec<String>, Error> {
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(Vec::new());
+    };
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for member in &community.members {
+        if member.role.as_deref() != Some(MEMBER_ROLE_FOUNDER) {
+            continue;
+        }
+        // The SAME steward-binding gate `moderators_of` applies to its roots
+        // (§11.11 → §5.6.8.10) — a non-steward-bound founder roots no duty.
+        if !is_steward_bound(directory, &member.key_id).await? {
+            continue;
+        }
+        // …and the SAME duty-scoped walk. One reachability predicate, two root
+        // sets — never two walks that could drift on what a delegated duty is.
+        let reach = enumerate_scoped_delegation_reach(
+            directory,
+            &member.key_id,
+            duty,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+        )
+        .await?;
+        out.insert(member.key_id.clone());
+        out.extend(reach);
+    }
+    let mut out: Vec<String> = out.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — the **authority set**
 /// of community `community_id`: the keys empowered to appoint moderators.
 /// Per §8.1.13.3 + §5.6.8.9 the community record carries a member roster
