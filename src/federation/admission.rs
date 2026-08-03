@@ -1613,6 +1613,157 @@ pub fn check_capacity_never_local(
     )))
 }
 
+/// CIRISPersist#592 (AV-84) — **WHICH party** made a targeted-cohort
+/// placement something other than a producer self-declaration.
+///
+/// Closed, snake_case serde tokens, [`Self::as_str`] returning the SAME token,
+/// no `Other` catch-all — the #565 `KeyRefusalReason` discipline. "The
+/// placement was refused" is not an answer an operator can act on;
+/// "`attested_party`" points at the field to fix.
+///
+/// **The token set is the downstream contract and this mapping is
+/// APPEND-ONLY.** Add variants; never re-spell one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CohortStandingRefusal {
+    /// `attested_key_id` is not the row's own producer: the row is a claim
+    /// ABOUT somebody else, and placing it into a cohort plane publishes that
+    /// claim to a cohort the producer cannot be shown to stand in.
+    AttestedParty,
+    /// `subject_key_ids` names a key other than the producer. Subject-naming is
+    /// the revocability-authority surface (CEG 0.6 §4.2), so a row that names
+    /// a foreign subject is a row a foreign party has standing over — not a
+    /// self-declaration about the producer's own content's visibility.
+    NamedSubject,
+}
+
+impl CohortStandingRefusal {
+    /// The **stable program token** — identical to the serde token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::AttestedParty => "attested_party",
+            Self::NamedSubject => "named_subject",
+        }
+    }
+
+    /// The row field the refusal is about.
+    #[must_use]
+    pub const fn field(&self) -> &'static str {
+        match self {
+            Self::AttestedParty => "attested_key_id",
+            Self::NamedSubject => "subject_key_ids",
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set.
+    pub const ALL: &'static [Self] = &[Self::AttestedParty, Self::NamedSubject];
+}
+
+impl std::fmt::Display for CohortStandingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// CIRISPersist#592 (AV-84) — **THE TARGETED-COHORT STANDING GATE**:
+/// a row reaches the `family` / `community` plane only as a self-declaration by
+/// its own producer.
+///
+/// # Why this is not AV-45, and must not be
+///
+/// AV-45 ([`DimensionAdmissionPolicy::check_write_cohort_scope`]) asks *"is the
+/// writer a member of the target cohort it names?"* On `federation_attestations`
+/// that question is **unaskable**: the row carries a `cohort_scope` and no
+/// `cohort_target_id`, so the predicate's `family` / `community` arms refuse on
+/// a `None` target — which, on this table, is every row. `put_attestation`
+/// therefore refuses those two placements outright, and that door is SHUT, not
+/// leaking.
+///
+/// The promote door cannot copy that answer. Promotion is the ONLY door those
+/// placements have ever had, so refusing them there deletes the #519/#510
+/// audience plane — a product amputation wearing a security fix's clothes, and
+/// the reason CIRISPersist#589 left AV-45 out of
+/// [`check_promotion_admission`]. **This is a different predicate for a
+/// different question, deliberately: one implementation forced onto two
+/// questions is the axis-fusion defect this repo gates against.**
+///
+/// # The question this one CAN ask
+///
+/// #589 wrote down why the promote door's exemption is defensible:
+///
+/// > A promotion re-publishes a row this node itself authored (local tier IS
+/// > producer authority) at an audience taken from this node's OWN signed
+/// > consent grant — a self-declaration about its own content's visibility, not
+/// > a claim about someone else's cohort.
+///
+/// **Nothing enforced that sentence.** `attestation_promote` is a raw primitive
+/// that places ANY local-tier row, including one authored by — and about — a
+/// peer; and `promote_consented_backlog` pages
+/// `list_local_tier_attestations` (`WHERE tier = 'local'`, no author
+/// predicate), so a peer's local row is promoted under THIS node's grant and
+/// re-signed with THIS node's key. The excuse for AV-45's absence was itself
+/// unchecked, which is the [SHIPPED-means-host-reachable](https://github.com/CIRISAI/CIRISPersist/issues/444)
+/// class read in the mirror: not a rule written behind a door nothing uses, but
+/// a *precondition asserted in prose that no door ever tests*.
+///
+/// So this gate makes it testable, and tests it: for `family` / `community`,
+/// the row must name **no party but its own producer** —
+/// `attested_key_id == attesting_key_id`, and every `subject_key_ids` entry is
+/// the producer. Anything else is a claim about a third party being published
+/// into a cohort plane, which is exactly the unverifiable cohort claim AV-45
+/// refuses at the put door, arriving through the one door AV-45 cannot stand at.
+///
+/// # Scope, stated as a limit rather than implied
+///
+/// The broad belonging-tiers (`affiliations` / `species` / `biosphere` /
+/// `federation`) are untouched: AV-45's own rule for them is *"no per-row
+/// target; any authenticated writer may emit"*, so there is no cohort to have
+/// standing in and this gate has nothing to ask. `self` is refused earlier by
+/// the placement-validity arm (#315/#519). Widening this to a general ban on
+/// promoting third-party rows would be a DIFFERENT gate shipped silently under
+/// this one's name.
+///
+/// What this does **not** close, stated plainly so it does not quietly become
+/// untrue: a producer that belongs to no community can still place its OWN
+/// content at `community`. That placement names no cohort — the row has no
+/// field to name one — so it is unprovable in the same way for everybody, and
+/// closing it means naming the target end-to-end (grant grammar, promotion
+/// signature, and a stored column if it is ever to be read back). See
+/// [`tests::promotion_does_not_prove_cohort_membership_589`], which still
+/// holds and still pins that residual.
+///
+/// Pure: no directory read, no configuration, no `self_key_id`. It cannot
+/// fail open on an unset node identity, and it is free — which is why it leads
+/// [`check_promotion_admission`]'s cheapest-refusal-first ordering.
+pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::types::cohort_scope as cs;
+
+    // Only the TARGETED cohorts. The broad belonging-tiers have no cohort to
+    // stand in; `self` is already refused by the placement-validity arm.
+    if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
+        return Ok(());
+    }
+
+    let producer = row.attesting_key_id.as_str();
+    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
+        Err(Error::CohortStandingRefused {
+            cohort_scope: row.cohort_scope.clone(),
+            producer_key_id: producer.to_owned(),
+            foreign_key_id: foreign.to_owned(),
+            reason,
+        })
+    };
+
+    if row.attested_key_id != producer {
+        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
+    }
+    if let Some(foreign) = row.subject_key_ids.iter().find(|s| s.as_str() != producer) {
+        return refuse(CohortStandingRefusal::NamedSubject, foreign);
+    }
+    Ok(())
+}
+
 /// v25.2.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
 /// tier-4 authority stack, re-run against the row a promotion is about to
 /// store.
@@ -1649,6 +1800,13 @@ pub fn check_capacity_never_local(
 ///
 /// # What it re-runs
 ///
+/// **Pure** — no directory read, so it leads (CIRISPersist#592):
+///
+/// 0. [`check_promotion_cohort_standing`] — AV-84. A `family` / `community`
+///    placement is a producer self-declaration or it is refused. Not AV-45
+///    finally wired in — a DIFFERENT predicate for a question AV-45 cannot ask
+///    on this table; see "AV-45 is deliberately NOT here" below.
+///
 /// **Tier-sensitive** — these no-op at `tier = "local"`, so the promotion is
 /// the first time they are ever asked:
 ///
@@ -1682,6 +1840,16 @@ pub fn check_capacity_never_local(
 /// There is no dedup arm here for exactly that reason.
 ///
 /// # AV-45 is deliberately NOT here, and this is the residual
+///
+/// **CIRISPersist#592 (AV-84) update:** everything below still holds
+/// verbatim — AV-45's predicate is still unaskable on this table and running it
+/// here would still delete the audience plane. What changed is the last
+/// paragraph's *"what remains true"*: the provenance argument that justifies
+/// the asymmetry (a promotion republishes a row THIS NODE ITSELF AUTHORED) was
+/// asserted and never enforced, and [`check_promotion_cohort_standing`] now
+/// enforces it. The SCHEMA question — persist cannot PROVE a family/community
+/// placement, because the row has nowhere to name the family or community it
+/// means — is unchanged and still tracked separately.
 ///
 /// A promotion stamps a `cohort_scope`, which looks like the fresh membership
 /// claim [`check_write_cohort_scope_for`](super::FederationDirectory::check_write_cohort_scope_for)
@@ -1717,6 +1885,12 @@ pub fn check_capacity_never_local(
 /// smuggled in here. [`tests::promotion_does_not_prove_cohort_membership_589`]
 /// is the executed witness that the residual is real, so it cannot quietly
 /// become untrue in either direction.
+///
+/// CIRISPersist#592 took the ANSWERABLE half of that residual and left the
+/// schema half exactly where it was: a producer that belongs to no community
+/// can still place its OWN content at `community`, because the row still cannot
+/// name a community for anybody. What it can no longer do is place someone
+/// ELSE's content there — see [`check_promotion_cohort_standing`].
 ///
 /// # Deliberately NOT re-run, and why
 ///
@@ -1767,6 +1941,12 @@ pub async fn check_promotion_admission(
             row.cohort_scope
         )));
     }
+
+    // AV-84 — a TARGETED cohort placement (`family` / `community`) is a
+    // producer self-declaration or it is refused. Pure and free, so it leads
+    // the walks; and #589's justification for AV-45's absence from this stack
+    // is precisely the sentence this arm turns into a check.
+    check_promotion_cohort_standing(row)?;
 
     // AV-77 — a de-admitted author's rows are refused before any walk runs, so
     // a sanctioned peer also sheds the amplification cost (same posture as
@@ -8369,6 +8549,93 @@ mod tests {
                     .is_ok(),
                 "#589 residual: {scope} passes with no membership read"
             );
+        }
+    }
+
+    /// CIRISPersist#592 (AV-84) — **AV-84 IS NOT AV-45, AND THE
+    /// SEPARATION IS THE POINT.**
+    ///
+    /// The witness above pins what AV-45 cannot ask on this table. This pins
+    /// what AV-84 does ask instead, and — more importantly — the two ways a
+    /// well-meaning later reader could collapse them into one gate:
+    ///
+    /// 1. **Widening it into a general third-party ban.** AV-45's own rule for
+    ///    the broad belonging-tiers is *"no per-row target; any authenticated
+    ///    writer may emit"*. A third-party row promoted to `federation` must
+    ///    still pass, or AV-84 has silently become a different gate under this
+    ///    one's name.
+    /// 2. **Reporting it as a membership failure.** The refusal names the FIELD
+    ///    that carried the foreign party (`attested_key_id` /
+    ///    `subject_key_ids`), never "no family membership" — that would send an
+    ///    operator hunting a membership record that was never the problem, on a
+    ///    table with nowhere to record one.
+    ///
+    /// Pure: same verdict on every backend because there is no backend in it.
+    #[test]
+    fn promotion_cohort_standing_is_not_av45_592() {
+        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope as cs};
+
+        let row = |attested: &str, subjects: &[&str], scope: &str| super::super::Attestation {
+            attestation_id: "att-592".to_owned(),
+            attesting_key_id: "producer-592".to_owned(),
+            attested_key_id: attested.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({"dimension": "trust:demo:v1"}),
+            original_content_hash: "ab".to_owned(),
+            scrub_signature_classical: "c2ln".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "producer-592".to_owned(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects.iter().map(|s| (*s).to_owned()).collect(),
+            withdraws_admission_rule: None,
+            cohort_scope: scope.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+
+        // (1) The gate is the TARGETED-cohort arm and nothing else. A row about
+        // a stranger still reaches every broad belonging-tier.
+        for scope in [cs::AFFILIATIONS, cs::SPECIES, cs::BIOSPHERE, cs::FEDERATION] {
+            check_promotion_cohort_standing(&row("stranger-592", &["stranger-592"], scope))
+                .expect("AV-84 is the targeted-cohort arm — broad tiers keep AV-45's own rule");
+        }
+
+        // (2) …and on the two targeted cohorts it refuses, naming its branch.
+        for scope in [cs::FAMILY, cs::COMMUNITY] {
+            let err = check_promotion_cohort_standing(&row("stranger-592", &[], scope))
+                .expect_err("a row ABOUT a stranger is not a producer self-declaration");
+            assert!(
+                matches!(&err, Error::CohortStandingRefused { reason, foreign_key_id, .. }
+                    if *reason == CohortStandingRefusal::AttestedParty
+                        && foreign_key_id == "stranger-592"),
+                "the refusal names the FIELD, not a membership: {err:?}"
+            );
+
+            // The subject surface is the other way a foreign party rides in —
+            // checking only `attested_key_id` would be a one-shape answer.
+            let err =
+                check_promotion_cohort_standing(&row("producer-592", &["stranger-592"], scope))
+                    .expect_err("a foreign SUBJECT is a foreign party too");
+            assert!(
+                matches!(&err, Error::CohortStandingRefused { reason, .. }
+                    if *reason == CohortStandingRefusal::NamedSubject),
+                "the subject arm names its own branch: {err:?}"
+            );
+
+            // The producer's own row — the #519/#510 audience plane — passes.
+            check_promotion_cohort_standing(&row("producer-592", &["producer-592"], scope))
+                .expect("a producer's own row still reaches its own audience");
+        }
+
+        // The refusal token set is closed and each variant names a real field.
+        for r in CohortStandingRefusal::ALL {
+            assert!(!r.as_str().is_empty() && !r.field().is_empty());
         }
     }
 

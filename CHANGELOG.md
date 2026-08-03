@@ -5,6 +5,70 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### #592 — the excuse for leaving AV-45 out of the promote gate was itself unchecked (**AV-84**)
+
+#589 re-ran the tier-4 stack at the promote door and deliberately left AV-45 out, because on
+`federation_attestations` AV-45 **cannot ask its question**: the row carries a `cohort_scope` and no
+`cohort_target_id`, so its `family`/`community` arms refuse on a `None` target — always. The put
+door answers that the only honest way it can (both placements refused outright), so promotion is the
+only door those placements have ever had; copying the put door's answer there would have deleted the
+#519/#510 audience plane rather than checked anything.
+
+What #589 wrote down as the justification for the asymmetry was this:
+
+> A promotion re-publishes a row this node itself authored (local tier IS producer authority) at an
+> audience taken from this node's OWN signed consent grant — a self-declaration about its own
+> content's visibility, not a claim about someone else's cohort.
+
+**Nothing enforced that sentence.** `attestation_promote` is a raw primitive that places ANY
+local-tier row, including one authored by and about a peer. `promote_consented_backlog` pages
+`list_local_tier_attestations` (`WHERE tier = 'local'`, no author predicate), so a peer's row is
+promoted under THIS node's grant and re-signed with THIS node's key. And
+`repair_stranded_scope_backlog` re-scopes an already-federation row through
+`set_attestation_cohort_scope`, whose broaden-only guard skips `self`/`family` and lets `community`
+straight through. Executed before the fix on memory and sqlite: a node in no community promoted a
+stranger's verdict about a third party into the `community` plane, and the tier-4 stack said `Ok`.
+
+**No migration.** The issue offered two shapes — store `cohort_target_id` on the row, or carry the
+target on the promotion — and the evidence chose neither. A stored column does not make the question
+askable on its own: the value has to enter through the publish ACT in either design, so shape 1 is
+shape 2 plus a column whose only consumer would be the read gate, with no honest backfill value for
+rows promoted before it existed. And the promote-side question is not the put-side question:
+AV-45 asks *"is the writer in the cohort it named?"*, AV-84 asks *"is this the promoter's own
+content?"*. Forcing one implementation onto both is the axis-fusion defect this repo gates against.
+
+- **`check_promotion_cohort_standing`** — pure (no directory read, no `self_key_id`, so it cannot
+  fail open on an unset node identity). For `family` / `community`, the row must name **no party but
+  its own producer**: `attested_key_id == attesting_key_id`, and every `subject_key_ids` entry is
+  the producer.
+- Wired at **both** placement doors on all three backends: `check_promotion_admission` (so
+  `promote_attestation`, `promote_attestation_transformed`, `Engine::attestation_promote`,
+  `promote_consented_backlog`, the pyo3 wrapper and the FFI capsule all inherit it) and
+  `set_attestation_cohort_scope` (the #530 repair motion). A gate at one door and a motion using the
+  other is this repo's own recurring class.
+- The broad belonging-tiers are untouched: AV-45's own rule for them is *"no per-row target; any
+  authenticated writer may emit"*. A third-party row still promotes at `federation` — widening this
+  into a general third-party ban would be a different gate shipped under this one's name.
+- New typed refusal `Error::CohortStandingRefused` (`federation_cohort_standing_refused`) carrying
+  `CohortStandingRefusal::{attested_party, named_subject}`, so the refusal names the FIELD that
+  carried the foreign party instead of a membership record that was never the problem.
+- **Still open, said plainly:** a producer that belongs to no community can still place its OWN
+  content at `community`. That placement names no cohort because the row has no field to name one,
+  so it is unprovable identically for everybody; closing it means naming the target end-to-end
+  (grant grammar + promotion signature + a stored column if it is ever to be read back), and every
+  route to it reddens `promotion_honors_audience_510` and
+  `attestation_promote_rejects_federation_self_519` — which ARE instances of an unproven placement.
+  Both stayed green here, unmodified, as did `promotion_does_not_prove_cohort_membership_589`.
+- Witnesses: **B9** `{gate} × {backend}` matrix on memory/sqlite/postgres, plus
+  `promotion_cohort_standing_is_not_av45_592` pinning the separation from AV-45 in both directions.
+
+**Adoption (edge / server):** no signature changed, so nothing recompiles differently — but the
+promote contract tightened again. A caller that promotes a row it did not author into `family` /
+`community` now gets `federation_cohort_standing_refused` where it previously got `Ok`. Broad-tier
+promotions (`federation` and friends) are unaffected.
+
 ## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
 
 Six issues. The through-line is one sentence: **a check that cannot fail is a report, and a report

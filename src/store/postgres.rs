@@ -4822,6 +4822,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
         row.cohort_scope = cohort_scope.to_owned();
+        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
+        // `repair_stranded_scope_backlog` re-scopes an already-federation row
+        // to a covering grant's audience through here, which can be
+        // `community` — so without this the standing gate on
+        // `promote_attestation` would have a door beside it, which is this
+        // repo's own recurring class (a rule shipped behind one door while the
+        // motion uses another). Verify-before-mutation (AV-9): `row` is a
+        // loaded copy and nothing has been written yet.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -20320,6 +20329,25 @@ mod tests {
         backend.set_self_key_id(Some(me.clone()));
         crate::federation::bootstrap_admission::test_support::exercise_promotion_admission_gate(
             &backend, &me, &tag,
+        )
+        .await;
+    }
+
+    /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
+    /// self-declaration, on postgres. Shared exercise body; the tag is unique
+    /// per run because this database persists across tests.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn promotion_cohort_standing_gate_postgres_592() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg592{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
+            &backend, &tag,
         )
         .await;
     }

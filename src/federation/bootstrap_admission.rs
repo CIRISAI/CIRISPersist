@@ -35,6 +35,7 @@
 //! | B5 | A federation-tier `capacity:*` score about S from P needs a live `analyze` consent from S covering P | An admitted stranger publishing a reputation verdict about someone who never authorized it (CIRISConstitution#46) |
 //! | B7 | B5's gate is `capacity:*` and NOTHING else: the verify-owned artifact-integrity and adversarial-detector families admit with the subject silent (CC 3.4.5) | An adversary opting out of `rollback_detected:*` by declining `analyze`, and integrity verification stopping at the forger's own consent (CIRISPersist#569, adjudicated) |
 //! | B8 | A row does not escape a put-gate by entering at the local tier and being PROMOTED, and `capacity:*` never reaches the local tier on any door | Minting the `capacity:composite` CC 3.4.5 says MUST NOT be emitted — and, for every other family, laundering a row past AV-45/AV-77/moderation through the promote path (CIRISPersist#589 / AV-83) |
+//! | B9 | A row reaches a TARGETED cohort plane (`family` / `community`) only when it names no party but its own producer | Publishing a stranger's row — or a verdict about a stranger — into a cohort plane, which is the placement AV-45 refuses at the put door and nothing checked at the promote door (CIRISPersist#592 / AV-84) |
 //!
 //! Each invariant is stated as ONE sentence on purpose. A gate whose property
 //! cannot be stated in one sentence is a gate nobody can review.
@@ -1093,5 +1094,263 @@ pub mod test_support {
         crate::federation::admission::check_promotion_admission(dir, &legacy, None)
             .await
             .expect("({tag}) B8: with a live analyze grant the same promotion is admitted");
+    }
+
+    /// **B9 (CIRISPersist#592 / AV-84) — a TARGETED-COHORT placement is a
+    /// producer self-declaration, or it is refused.**
+    ///
+    /// # The hole this closes
+    ///
+    /// AV-45 at `put_attestation` asks *"is the writer a member of the target
+    /// cohort it names?"* On `federation_attestations` that question is
+    /// **unaskable** — the row carries a `cohort_scope` and no
+    /// `cohort_target_id` — so the put door answers it the only honest way it
+    /// can: `family` / `community` are refused outright. That door is SHUT,
+    /// not leaking.
+    ///
+    /// The promote door cannot copy that answer, because promotion is the only
+    /// door those placements have ever had; copying it would delete the
+    /// #519/#510 audience plane. CIRISPersist#589 wrote down why the asymmetry
+    /// is defensible — a promotion *"re-publishes a row this node itself
+    /// authored … a self-declaration about its own content's visibility, not a
+    /// claim about someone else's cohort"* — and **nothing enforced that
+    /// sentence.** `attestation_promote` is a raw primitive that will place ANY
+    /// local row into the `community` plane, including one authored by, and
+    /// about, a peer; and `promote_consented_backlog` pages
+    /// `WHERE tier = 'local'` with no author predicate, so a peer's row is
+    /// promoted under THIS node's grant and THIS node's fresh signature.
+    ///
+    /// So the excuse for AV-45's absence was itself unchecked. B9 makes it a
+    /// gate: the one cohort placement the promote door CAN adjudicate without a
+    /// target is the producer's own content, and it now has to actually be
+    /// that.
+    ///
+    /// # What it pins, on every backend
+    ///
+    /// (a) a THIRD-PARTY row — a verdict by P about S — is refused at
+    /// `community`, and the refusal names the standing rule rather than a
+    /// membership the row could never have expressed; (b) the same at `family`;
+    /// (c) **NOT A LOCKDOWN**: that identical row still promotes at
+    /// `federation`, because a broad belonging-tier has no cohort to belong to
+    /// and AV-45 itself admits any authenticated writer there; (d) **THE
+    /// AUDIENCE PLANE SURVIVES** — a producer's own row promotes to `community`
+    /// exactly as #510's `audience: community` grant needs it to; (e) the
+    /// refused promotion leaves the row byte-identical (AV-9), the same
+    /// property B8 pins for the gates it added; and (f) **THE SECOND DOOR** —
+    /// the same verdict, the same error kind, at `set_attestation_cohort_scope`,
+    /// which is how the #530 repair motion places a row and whose broaden-only
+    /// guard lets `community` straight through. A gate on one door and a motion
+    /// using the other is this repo's own recurring class.
+    pub async fn exercise_promotion_cohort_standing_gate(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+
+        // Invocation-unique — the postgres arm shares a long-lived database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let producer = format!("{tag}-p592-{run}"); // P — the row's author
+        let stranger = format!("{tag}-s592-{run}"); // S — the party P names
+        for k in [&producer, &stranger] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+
+        // A LOCAL-tier row by P ABOUT S. Nothing about it is malformed: P is
+        // registered and in good standing, the dimension is ordinary, the
+        // signature is real. The only thing wrong with promoting it into a
+        // cohort plane is that it is not P's own content.
+        let third_party = |id: &str| {
+            let mut row = scores_row(id, &producer, &stranger, "trust:demo:v1");
+            row.tier = attestation_tier::LOCAL.to_owned();
+            row.cohort_scope = cohort_scope::SELF.to_owned();
+            row
+        };
+        // …and P's OWN row: it names nobody but P.
+        let own = |id: &str| {
+            let mut row = scores_row(id, &producer, &producer, "trust:demo:v1");
+            row.tier = attestation_tier::LOCAL.to_owned();
+            row.cohort_scope = cohort_scope::SELF.to_owned();
+            row
+        };
+
+        let store = |row: Attestation| async {
+            let (id, och, sc, sp) = (
+                row.attestation_id.clone(),
+                row.original_content_hash.clone(),
+                row.scrub_signature_classical.clone(),
+                row.scrub_signature_pqc.clone(),
+            );
+            dir.put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect("B9: the local write itself is admissible");
+            (id, och, sc, sp)
+        };
+
+        // ── (a) + (b) THE HOLE: a stranger's row into a cohort plane. ──
+        for scope in [cohort_scope::COMMUNITY, cohort_scope::FAMILY] {
+            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            let before = dir
+                .get_attestation(&id)
+                .await
+                .expect("read back")
+                .expect("row");
+            let err = dir
+                .promote_attestation(
+                    &id,
+                    scope,
+                    &sc,
+                    sp.as_deref(),
+                    &och,
+                    &producer,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect_err(
+                    "({tag}) B9: promoting a row that names a THIRD PARTY into a targeted \
+                     cohort plane must be refused — this is the #592 open door",
+                );
+            assert_eq!(
+                err.kind(),
+                "federation_cohort_standing_refused",
+                "({tag}) B9: every backend refuses at the SAME error kind: {err:?}"
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(scope) && msg.contains(&stranger),
+                "({tag}) B9: the refusal names the placement and the party the row is not \
+                 entitled to publish about — not a membership the row could never express: {msg}"
+            );
+
+            // ── (e) AV-9 — a refused promotion mutates nothing. ────────
+            let after = dir
+                .get_attestation(&id)
+                .await
+                .expect("read back")
+                .expect("row");
+            assert_eq!(
+                after.tier,
+                attestation_tier::LOCAL,
+                "({tag}) B9: a refused promotion leaves the row at its original tier"
+            );
+            assert_eq!(
+                after.cohort_scope, before.cohort_scope,
+                "({tag}) B9: and does NOT stamp the target placement"
+            );
+            assert_eq!(
+                after.persist_row_hash, before.persist_row_hash,
+                "({tag}) B9: byte-identical"
+            );
+        }
+
+        // ── (c) NOT A LOCKDOWN — the SAME row promotes at a broad tier. ──
+        // AV-45's own rule for `affiliations` / `species` / `biosphere` /
+        // `federation` is "no per-row target; any authenticated writer may
+        // emit". B9 is the targeted-cohort arm and must not become a general
+        // ban on promoting third-party rows — that would be a different gate,
+        // silently widened under this one's name.
+        {
+            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            assert!(
+                dir.promote_attestation(
+                    &id,
+                    cohort_scope::FEDERATION,
+                    &sc,
+                    sp.as_deref(),
+                    &och,
+                    &producer,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("({tag}) B9: a broad-tier promotion of the same row still succeeds"),
+                "({tag}) B9: and it flips the tier"
+            );
+        }
+
+        // ── (d) THE AUDIENCE PLANE SURVIVES. ──────────────────────────
+        // The #519/#510 motion this gate must not amputate: a producer's own
+        // row, promoted to the audience its own signed grant named.
+        {
+            let (id, och, sc, sp) = store(own(&uuid::Uuid::new_v4().to_string())).await;
+            assert!(
+                dir.promote_attestation(
+                    &id,
+                    cohort_scope::COMMUNITY,
+                    &sc,
+                    sp.as_deref(),
+                    &och,
+                    &producer,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect(
+                    "({tag}) B9: a producer's OWN row still reaches the community plane — \
+                     the #510 audience plane is intact"
+                ),
+                "({tag}) B9: and it flips the tier"
+            );
+            let after = dir
+                .get_attestation(&id)
+                .await
+                .expect("read back")
+                .expect("row");
+            assert_eq!(after.cohort_scope, cohort_scope::COMMUNITY);
+        }
+
+        // ── (f) THE SECOND DOOR. ──────────────────────────────────────
+        // `promote_attestation` is not the only way a row acquires a
+        // placement: `Engine::repair_stranded_scope_backlog` (CIRISPersist#530)
+        // re-scopes an ALREADY-federation row to a covering grant's audience
+        // via `set_attestation_cohort_scope`, and its broaden-only guard skips
+        // only `self`/`family` — `community` goes straight through. A gate on
+        // one door and a motion using the other is this repo's own recurring
+        // defect; the standing rule therefore lives at BOTH placement doors,
+        // and both leave a refused row byte-identical.
+        {
+            let stranded_id = uuid::Uuid::new_v4().to_string();
+            dir.put_attestation(SignedAttestation {
+                attestation: scores_row(&stranded_id, &producer, &stranger, "trust:demo:v1"),
+            })
+            .await
+            .expect("({tag}) B9: the federation-tier third-party row admits");
+            let before = dir
+                .get_attestation(&stranded_id)
+                .await
+                .expect("read back")
+                .expect("row");
+            let err = dir
+                .set_attestation_cohort_scope(&stranded_id, cohort_scope::COMMUNITY)
+                .await
+                .expect_err(
+                    "({tag}) B9: re-scoping a third-party row into a cohort plane must be \
+                     refused at the repair door too",
+                );
+            assert_eq!(
+                err.kind(),
+                "federation_cohort_standing_refused",
+                "({tag}) B9: the same verdict, the same kind, at both doors: {err:?}"
+            );
+            let after = dir
+                .get_attestation(&stranded_id)
+                .await
+                .expect("read back")
+                .expect("row");
+            assert_eq!(
+                after.cohort_scope, before.cohort_scope,
+                "({tag}) B9: a refused re-scope stamps nothing"
+            );
+            assert_eq!(
+                after.persist_row_hash, before.persist_row_hash,
+                "({tag}) B9: byte-identical — memory holds this as tightly as the SQL backends"
+            );
+
+            // And the producer's own row still re-scopes: the repair motion is
+            // narrowed, not disabled.
+            let own_id = uuid::Uuid::new_v4().to_string();
+            dir.put_attestation(SignedAttestation {
+                attestation: scores_row(&own_id, &producer, &producer, "trust:demo:v1"),
+            })
+            .await
+            .expect("({tag}) B9: the federation-tier own row admits");
+            dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY)
+                .await
+                .expect("({tag}) B9: the #530 repair motion still works on a producer's own row");
+        }
     }
 }
