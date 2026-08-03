@@ -5,7 +5,29 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased]
+## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
+
+Six issues. The through-line is one sentence: **a check that cannot fail is a report, and a report
+is not a check.** Every item below is either a gate that existed and reached nothing, or a list that
+stood in for an inventory it had drifted from.
+
+- **#589** — `attestation_promote` re-signed and flipped `tier` without re-running ANY tier-4
+  put-gate. Consent, AV-77, moderation, reserved-prefix and node-agency reach the promote door for
+  the first time. **AV-83.** BREAKING: the promote trait carries `cohort_scope`.
+- **#590** — CC 3.1.7 R2. Manifest re-vendored 95 → 109; `namespace_family_unregistered` at the same
+  chokepoint as the emitter rule; an R2(a) build gate so a family cannot be minted without its row.
+- **#591** — steward silence was a decision nobody made. Escalation counts **respondents**, floored
+  at 3. BREAKING: `resolve_reverse_quorum` takes `&dyn`.
+- **#567/#568** — CIRISVerify v12.1.0. `Gating`/`Classification` answers *may persist gate on this?*
+  in the type, and `ForeignAuthority` refuses a rule normative on someone else’s document.
+- **#585** — CI kept its own list of which features exist. It had drifted in **four** places, one of
+  them a pre-commit hook claiming parity with a matrix it matched in neither direction.
+- **#580/#581** — `verify_trace` wedged the interpreter; and the `.pyi` had **never been read by
+  anything**, for the package’s entire life, because no `py.typed` marker shipped.
+
+Also: seven verify pins to v12.1.0, and 19 evidence rows re-stamped `@26.0.0`.
+
+### #590 / #591 / #567: the registry gate, the commons’ escalation, and the classification that says whether you may gate on it
 
 ### #590 — CC 3.1.7 R2: the registry row becomes a build gate, and a rowless family stops being admittable
 
@@ -138,7 +160,7 @@ discrepancy that was nearly reconciled away. So: `families[].len() == _meta.n_fa
 own assertion, duplicates are refused, and `VENDORED_FAMILY_PREFIXES` pins all 109 so a
 re-vendor that DROPS one fails **by name** and is cleared only by moving the line to
 `RETIRED_FAMILIES`. Additions stay cheap; the removal direction is the dangerous one.
-## [Unreleased] — #589: a row does not escape a put-gate by entering at the local tier
+### #589: a row does not escape a put-gate by entering at the local tier
 
 `Engine::attestation_promote` re-signed a row and flipped `tier` local→federation while
 running **no** put-gate at all. It validated `cohort_scope`, refused `(federation, self)`,
@@ -153,7 +175,7 @@ and MUST NOT be emitted"*. The two-step below minted exactly that row, and becau
 
 **AV-83.** (Not AV-82 — #569's adjudication took that number in v25.1.0.)
 
-### Red first: the premise was executed before anything was fixed
+#### Red first: the premise was executed before anything was fixed
 
 The issue asserted this from code reading. Run on all three backends plus the public
 `Engine` surface, before any fix:
@@ -170,7 +192,7 @@ CONTROL  direct federation-tier capacity:composite:v1 about a silent subject
 Identical on memory, sqlite and postgres, and identical through
 `Engine::attestation_promote`.
 
-### The sharp part: the rule existed, behind a door the attack does not use
+#### The sharp part: the rule existed, behind a door the attack does not use
 
 `check_local_tier_eligibility` has declared `capacity:*` ineligible for the local tier
 since v4.4.0. It runs on `attestation_insert_local` / `attestation_upsert_local` and
@@ -179,7 +201,7 @@ The correct rule was written, tested and shipped, and the attack simply walked a
 Third occurrence of the SHIPPED-means-host-reachable class, after AV-77 and #444's route
 table.
 
-### Two chokepoints, because they close different things
+#### Two chokepoints, because they close different things
 
 **1. `check_capacity_never_local` — the symptom, at the door where the row is born.**
 The capacity arm is lifted out of `check_local_tier_eligibility` into one predicate both
@@ -218,7 +240,7 @@ as they were for every other family. The witness proves the difference: a row wr
 its author was in good standing, promoted **after** this node de-admits that author, is now
 refused — and nothing about `capacity:*` is involved.
 
-### The promotion primitive now carries its placement
+#### The promotion primitive now carries its placement
 
 `FederationDirectory::promote_attestation` and `promote_attestation_transformed` take
 `cohort_scope`, written in the same statement as the tier flip. The old shape was a
@@ -237,7 +259,7 @@ This also means `(federation, self)` — the #315 dead-plane state — is now re
 **primitive** rather than only by `Engine::attestation_promote`, so a caller reaching the
 directory directly can no longer mint it.
 
-### AV-45 is deliberately NOT in the promotion gate — and that is recorded as a residual
+#### AV-45 is deliberately NOT in the promotion gate — and that is recorded as a residual
 
 #589 names AV-45 as part of the bypassed class, and it is left out on purpose.
 
@@ -258,7 +280,7 @@ becomes answerable at both doors — not a gate change, and it is filed separate
 than smuggled in here. `promotion_does_not_prove_cohort_membership_589` is the executed
 witness, so the residual cannot quietly become untrue in either direction.
 
-### Witnesses
+#### Witnesses
 
 **B8**, added to the `{gate} × {backend}` bootstrap-admission matrix and run on all three
 backends: the local-tier `capacity:*` write is refused naming the local-tier rule; the
@@ -296,7 +318,7 @@ refusing one. A probabilistic witness for an ordering rule is not a witness.
 `attestation_promote_refusal_does_not_prestamp_placement_589` now drives it deterministically
 and is the only test that goes red under that mutation.
 
-### Breaking
+#### Breaking
 
 - `FederationDirectory::promote_attestation` and
   `FederationDirectory::promote_attestation_transformed` take a `cohort_scope` argument.
@@ -308,7 +330,7 @@ and is the only test that goes red under that mutation.
 
 Threat model: **AV-83**. Refs: CC 3.4.5 (reciprocity clause) · CC 3.1.8.1 · AV-45 / AV-62 /
 AV-76 / AV-77 / AV-79 · #444 · #519 / #510 / #315 · #543 · #569.
-### #591: silence is a decision, and nobody made it
+#### #591: silence is a decision, and nobody made it
 
 #574 shipped the commons' brake — one objection raises it, m-of-n dismisses it — and left one
 case undecided: **the duty-holders do not answer.** Then the outcome falls out of whichever
@@ -407,7 +429,7 @@ every undo is m-of-n — including the escalated one, which is what the floor gu
   needed widening. No sqlite twin, and that is a finding: the alternative was an irreversible
   rebuild of `federation_communities` whose data path CI structurally cannot cover, taken on a
   false premise.
-### Changed — #568/#567: the "may I gate on this?" question moves out of prose and into the type
+#### Changed — #568/#567: the "may I gate on this?" question moves out of prose and into the type
 
 CIRISVerify **v12.1.0** re-pin (seven `tag` sites; MINOR within major 12, so
 `version = "12"` and pyproject's `>=12.0.0,<13` are both unchanged — and
@@ -445,7 +467,7 @@ its first consumer.
   admission on where a chain says a key lives makes hardware a **requirement**,
   the inversion `hardware_attestation` refuses by design.
 
-### Documentation — #568: the v12.1.0 capability matrix, recorded where the deferral is
+#### Documentation — #568: the v12.1.0 capability matrix, recorded where the deferral is
 
 - `federation::hardware_attestation`'s module doc carries verify's v12.1.0
   matrix, so a reader deciding whether a gap is real does not need a round trip
@@ -493,14 +515,14 @@ undecided question:
 Verifying at admission without carrying is not a half-bundle, it is a gate with
 no input; carrying without the verify is the thing the brief rightly calls worse
 than none. So: the reasoning goes on the issue and the issue stays open.
-## [Unreleased] — #585: CI stops keeping its own list of which features exist
+### #585: CI stops keeping its own list of which features exist
 
 `secrets-server` did not compile. The `capability_roles` rename from #565 (v24.2.0) never
 reached `src/server/secrets.rs` — three sites still said `record.roles`. Three releases of a
 feature-gated module broken on `main`, with every CI run green. The compile break was fixed on
 main in `401bbb3`; this cut is about the gate that should have caught it.
 
-### The defect was a list, not a rename
+#### The defect was a list, not a rename
 
 `.github/workflows/ci.yml` spelled out the feature sets clippy and the test matrix ran against.
 `secrets-server` was not among them, so **no job compiled it** — not clippy, not the test job,
@@ -520,7 +542,7 @@ It was not two copies. It was **four**, and no two agreed:
 | `scripts/hooks/pre-commit` | `postgres,pyo3,server,sqlite,tls` under a comment claiming it "matched the CI matrix's strictest job" | it matched nothing; it carried `tls`, which no CI job compiled, and omitted every substrate axis every CI leg carried |
 | `ios-build` / `android-ndk` env | 27 features | `secrets-server`, `secrets-client`, `encrypted-kv`, `postgres`, `server`, `tls`, … |
 
-### The cure is derivation, not diligence
+#### The cure is derivation, not diligence
 
 `scripts/ci_feature_matrix.py` — one tool, `Cargo.toml [features]` as the only inventory.
 
@@ -553,7 +575,7 @@ than 35 because it also compiles a wider graph from a cache warmed for the `core
 reasoning as #543's 25→35 — this is the runner-stall backstop, not the hang detector, which
 `.config/nextest.toml` still owns per test and by name.
 
-### A configuration, not a flag: `test-anchor` gets a rider
+#### A configuration, not a flag: `test-anchor` gets a rider
 
 `test-anchor` cannot be covered by adding it to a leg's feature list. The feature compiles the
 genesis relaxation in; `ciris_verify_core::test_anchor::test_anchor_active()` — reading
@@ -589,7 +611,7 @@ Verified by mutation, not by assertion — each of these was made to fail on pur
 | hold a feature out with an empty reason | ✗ "must say why, in writing, here" |
 | leave a stale `NOT_TESTED` key after a rename | ✗ "stale entry; delete it" |
 
-### The 19 lints CI had never seen
+#### The 19 lints CI had never seen
 
 `--all-features` clippy surfaced exactly 19 warnings at v25.1.0, all of them in test code, and
 — read one at a time rather than auto-fixed, because a lint in code nobody has compiled can be
@@ -604,7 +626,7 @@ pointing at a defect — **all 19 are style**:
   `&String` where `impl AsRef<[u8]>` was wanted. Never seen because nothing compiled
   `secrets-server` at all.
 
-### It caught a bench nobody was compiling either
+#### It caught a bench nobody was compiling either
 
 `--all-targets` includes benches, and benches carry `required-features`. `benches/encrypted_kv.rs`
 declares `required-features = ["encrypted-kv"]`, `bench.yml` has no `run_bench` line for it, and
@@ -615,7 +637,7 @@ already records the same class landing once before ("this is exactly how `storag
 feature list. Every bench target is now compile-gated on the ordinary PR path, not only by the
 bench workflow's schedule.
 
-### Features that were compiled by no job at all
+#### Features that were compiled by no job at all
 
 Beyond `secrets-server`: `secrets-client`, `encrypted-kv`, `tls`, `cirisincident`,
 `test-genesis-seam`, `c-abi`, `peer-replicate`, `pyo3-sqlite`, `default-sovereign-light`,
@@ -624,7 +646,7 @@ Beyond `secrets-server`: `secrets-client`, `encrypted-kv`, `tls`, `cirisincident
 iOS/Android cross-builds but by nothing that ran their tests. All 46 are compiled now; 39 of the
 46 are also tested, and the other seven each carry a written reason.
 
-### Held out of the test invocations, on the record — seven, each with a reason
+#### Held out of the test invocations, on the record — seven, each with a reason
 
 `extension-module` (strips libpython from the test binary → `undefined symbol: _Py_DecRef`),
 `test-panic` (its whole surface is one `#[pyfunction]` reachable only from Python; it *is*
@@ -637,7 +659,7 @@ load from `CIRISLENS_NER_MODEL_DIR` or HF Hub), `_pyffi` (internal; every leg ge
 and `default` (the empty set — the `wire_format_fixtures` step *is* that invocation). Every one
 of them is still compiled and linted by the `--all-features` pass.
 
-### Test counts
+#### Test counts
 
 | configuration | before | after |
 | --- | --- | --- |
@@ -648,8 +670,7 @@ of them is still compiled and linted by the `--all-features` pass.
 
 Nothing existing moved. The only Rust changes are inside two test bodies that no CI job compiled.
 
-## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
-## [Unreleased] — #580/#581: the read path stops wedging the interpreter, and the Python surface says what the Rust does
+### #580/#581: the read path stops wedging the interpreter, and the Python surface says what the Rust does
 
 Two issues, one shape: **the Rust side is right and the Python side does not reflect it.**
 
@@ -675,7 +696,7 @@ the output format it emulates (CPython's `json.dumps` escaping), not a call into
 So the fix is the simple wrap the issue ruled out, and it is the same shape the sibling
 `verify_hybrid_via_directory` has used all along.
 
-### The sweep, and why a textual one would have returned zero
+#### The sweep, and why a textual one would have returned zero
 
 The issue asked which read paths call `block_on` while holding the GIL, and proposed the
 mechanical test "any `#[pymethods]` fn that reaches `block_on` without an enclosing `py.detach`".
@@ -700,7 +721,7 @@ clause 1's two exceptions so they cannot quietly become holes — clause 2 requi
 pre-#580 code), clause 3 the same for every `accord_dispatch!` call site. Each clause was mutation-
 tested to fire, naming the offending line.
 
-### #581 — the teardown API on the package surface
+#### #581 — the teardown API on the package surface
 
 `engine_teardown_wait` and `engine_teardowns_in_flight` are now re-exported from
 `python/ciris_persist/__init__.py` (import + `__all__`), so the fixture recipe #572 exists to
@@ -717,7 +738,7 @@ return value is the only way a caller learns teardown was **deferred** rather th
 learns nothing; a wrong stub is *believed*, and a caller obeying this one would never check the
 value that tells them teardown had not finished.
 
-### …and the stubs had never been read by anything
+#### …and the stubs had never been read by anything
 
 Checking that claim turned up a bigger one. The package shipped **no PEP 561 `py.typed` marker**,
 and without it every type checker skips a package's inline stubs outright — mypy says *"Skipping
@@ -754,7 +775,7 @@ shipped `.pyi` to assert it describes the functions that actually exist. Verifie
 `maturin develop` + `pytest tests/python/` locally, which is what CI does; both halves were shown
 red-first by reverting the re-exports and the stub.
 
-### Coverage the change needed and did not have
+#### Coverage the change needed and did not have
 
 The FFI `verify_trace` wrapper had **no behavioural test of any kind** — the inner
 `crate::verify::verify_trace` tests exercise the pure function, not the boundary — so the
@@ -774,7 +795,7 @@ the narrow house form (`ValueError` naming both `sqlite` and `feature`, everythi
 re-raised). **A test that skips itself on any failure is worse than no test: it looks like
 coverage.**
 
-### A gap in the local verification matrix
+#### A gap in the local verification matrix
 
 The `sqlite`, `sqlite test-anchor` and `sqlite postgres` suites do **not** compile `src/ffi/pyo3.rs`,
 so none of them execute the new Rust tests — their counts are unchanged at 1645 / 1650 / 1979,
@@ -809,6 +830,7 @@ hours, in the direction that protects the wire.
 Also: CIRISVerify `v11.1.0` → `v12.0.0` (seven pins), and a fix for a wheel whose
 `Requires-Dist` had excluded the verify major its own Rust linked since v25.0.0.
 
+## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 ### #582: a tightened vocabulary needs a way to retire the old word
 
 CIRISVerify v11.1.0 re-pin (all seven sites), plus the reusable maintenance primitive the
