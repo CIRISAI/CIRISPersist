@@ -268,6 +268,20 @@ re-invented:
 - `admission::DELEGATION_SCOPE_SLASH` (#570 ask 2) for the authority, walked
   under `MODERATION_DUTY`, which is what `quarantine:` already gates on.
 
+**Do not model it on `evict_actor`.** #573's table lists it as an existing
+erasure primitive, and it is — but not one to copy. It lives on `BlobStorage`
+rather than `FederationDirectory` (`src/federation/blobs.rs:1263`), **the
+memory backend does not implement it at all**, it runs **no transaction**
+(a per-holding loop of autocommit `DELETE`s plus a separate `put_attestation`
+each), and it is **not idempotent on the audit side**: the holdings query
+carries no `withdraws` filter and each withdraws mints a fresh
+`uuid::Uuid::new_v4()`, so a re-run evicts zero blobs and mints a fresh
+withdraws every time — which is why its own contract tells callers to
+"re-invoke until the report shows zero blobs evicted"
+(`blobs.rs:1255-1260`, `:1829`). `delete_traces_for_agent_id_hash` is the
+primitive with the discipline #573 asks for; `evict_actor` is the one that
+shows what happens without it.
+
 **The first thing that should use it is #573's own sharpest case.** #573
 observes that CIRISServer#346's admin ops require `{delegation_id, reason}` in
 `HardCaseEvent.detail`, so *"the tombstone recording an infohazard's removal is
@@ -280,22 +294,40 @@ backend's `record_hard_case` (verify-before-mutation) and refuses with
 is not a non-empty string. So persist *requires* a free-text field on every
 admin act and provides no way to remove what lands in it.
 
-`hard_case_events` carries no `persist_row_hash` and no signature, so `reason`
-could simply be `UPDATE`d to null — no cryptography required. **That is exactly
-why the commitment is needed there anyway**, and it is the cleanest
-demonstration that the mint-time distinction is not about signatures:
+**[TESTED — `migrations/postgres/lens/V075__hard_case_events.sql:19-26`]** —
+the table's full column list is `event_id, kind, target_key_id,
+subject_key_id, detail, emitted_at`. **No signature, and no
+`persist_row_hash`.** So `reason` can simply be `UPDATE`d to null, and no
+cryptography is involved anywhere on the plane.
+
+**A commitment alone does not fix this, and an earlier draft of this document
+said it did.** The claim was that holding the reason as a disclosure with a
+salted commitment in `detail` would make it *withholdable but not
+replaceable*. That is false for an unsigned, mutable row: **an actor who can
+null the reason can equally rewrite the commitment sitting beside it.** A
+commitment binds only to the extent that whatever carries it is itself
+integrity-protected, and here nothing is.
+
+The corrected finding is sharper than the one it replaces:
 
 > #570's stated reason for the attribution is that *"a compromised authority
 > becomes survivable, because every act taken under it can be enumerated and
-> re-adjudicated."* If the reason can be nulled with no trace, it can also be
-> **substituted** with no trace — an authority rewriting its own justifications
-> after the fact, which is the same failure the attribution exists to prevent.
-> A salted commitment in `detail` and the reason held as a disclosure gives
-> both: the reason can be withheld, and it cannot be replaced.
+> re-adjudicated."* But the attribution plane has **no integrity protection at
+> all** — not a signature, not a row hash. Its enumeration is therefore only as
+> trustworthy as the node's own database, which is exactly the thing a
+> compromised authority has. Erasability is the *second* problem on this table;
+> the first is that a reason can be silently substituted today.
 
-So the shape generalizes past the envelope plane. What an object is "sealed"
-*against* is not always a signature — sometimes it is only an audit claim — but
-the choice is the same one and it is still made at mint.
+So the ask here is a pair, not a single change: bind the `hard_case` row into
+something the node cannot silently rewrite, **and then** make its reason a
+disclosure. Doing only the second buys nothing. Sequenced the other way it is
+the strongest case for the shape, because it is the plane where erasure is
+*mandatory* (the reason is a required field) and retention is *unbounded*.
+
+What generalizes past the envelope plane is the sealed/erasable **choice**, not
+the guarantee: what an object is "sealed" *against* is whatever integrity its
+carrier actually has. Where the carrier has none, the choice has no teeth until
+one is added.
 
 **The blocking sub-question, and why the table is not in this cut:** *does a
 disclosure set replicate, and under which consent edge?* An erasable object's
@@ -305,6 +337,26 @@ direction — an unreplicated disclosure set is indistinguishable from a
 fully-erased one, so the failure is *content unavailable*, never *content
 leaked* and never *object rejected*. But committing a schema before answering
 it would bake the wrong shape. It should be answered first.
+
+**There is already a precedent with almost exactly the right shape, and it
+should be the starting point rather than a new plane.** `federation_blobs`
+carries opaque bytes that ride *beside* a signed attestation: `put_blob`
+auto-emits a `holds_bytes:sha256:*` attestation (`blobs.rs:474-478`), that
+attestation is what replicates, and the bytes themselves are pulled by peers
+over Edge's ContentFetch — with `put_blob_local` existing precisely to store
+bytes *without* the announcement (`blobs.rs:1697-1710`), and serve-side
+refusals already modelled (`DiskPressureProxyRefused { operation: "serve" }`,
+`QuarantineWithheld`). A disclosure set is the same topology: signed
+commitment replicates, opaque bytes are fetched on demand, and withholding is
+a first-class state. Whether disclosures should *be* blobs or merely copy the
+pattern is the design question; either way the consent-edge answer likely
+already exists there.
+
+**One trap in that area, since it reads like the opposite of what it is:**
+`V047__federation_blobs.sql:48-54`'s *"joins the default repset"* note is about
+Spock/PG **logical replication between co-located database replicas**, not peer
+federation. Read quickly it looks like a statement that the table replicates to
+peers. It is not one.
 
 ### 5.2 CIRISVerify — the news is that nothing is required (#241)
 
@@ -373,3 +425,15 @@ should hear:
 - **No timing or storage-size analysis.** A commitment adds 32 bytes per member
   to the envelope plus a salt per member beside it; whether that matters for
   any real dimension was not measured.
+- **Whether `federation_group_versions.snapshot` is reachable from any
+  delete-or-blank path was not checked.** A sweep of all 122 `DELETE FROM`
+  sites plus every `SET … = NULL` in `src/` found nothing naming that table,
+  but "no delete site names it" is not the same as "it is unreachable".
+- **Confirming the negative that §3 rests on:** that same sweep found **no
+  existing implementation that hard-deletes or blanks a payload column on a
+  hashed federation row** — Class 2 has zero prior art to model on. The two
+  near-misses are not counterexamples: the `detection_events` tombstone blanks
+  columns in place but its table carries no `persist_row_hash`
+  (`V008__lens_derived_schemas.sql:65-99`), and
+  `delete_traces_for_agent(include_federation_key)` deletes whole `federation_keys`
+  rows — row deletion, which removes the hash rather than invalidating it.
