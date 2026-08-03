@@ -194,16 +194,21 @@ pub const RECOGNITION_MIN_BYTES: usize = 64;
 /// lets a reader holding **only the envelope** see how many members existed
 /// and, against a disclosure set, exactly which are gone. #573's operator
 /// requirement is *which* members were erased, not merely that some were.
+/// **Closed shape.** `deny_unknown_fields` because [`SD_SCHEME`] is
+/// version-pinned: any additional member means a *different* scheme, and
+/// tolerating one here would let a future scheme's weaker commitment be read
+/// under this one's name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealedCommitment {
     /// [`SD_SCHEME`].
     pub scheme: String,
-    /// Hex `sha256(ROOT_DOMAIN ‖ u32_be(count) ‖ digests…)` — what the
-    /// producer's hybrid signature covers, transitively, by being inside the
-    /// canonical envelope bytes.
+    /// **Lowercase** hex `sha256(ROOT_DOMAIN ‖ u32_be(count) ‖ digests…)` —
+    /// what the producer's hybrid signature covers, transitively, by being
+    /// inside the canonical envelope bytes.
     pub root: String,
-    /// Hex per-member salted digests, in index order. Length is the committed
-    /// member count.
+    /// **Lowercase** hex per-member salted digests, in index order. Length is
+    /// the committed member count.
     pub digests: Vec<String>,
 }
 
@@ -546,8 +551,20 @@ pub fn erased_indices(
         .collect())
 }
 
+/// Decode a 32-byte digest, **lowercase hex only**.
+///
+/// Uppercase is refused rather than accepted-and-normalized, on the #288/#293
+/// lowercase-hex discipline and for a reason specific to this plane: a
+/// commitment with two admissible spellings is one commitment with two sets of
+/// canonical envelope bytes, hence two `original_content_hash` values for the
+/// same erasable object. That is the one-name-two-value-spaces class, and this
+/// is the plane where its failure mode is silent retention.
 fn decode_digest(hex_str: &str) -> Option<[u8; 32]> {
-    if hex_str.len() != 64 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hex_str.len() != 64
+        || !hex_str
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     let bytes = hex::decode(hex_str).ok()?;
@@ -819,6 +836,24 @@ mod tests {
         }
     }
 
+    /// A disclosure set is bound to its object by the salts, not by an id it
+    /// carries — so mixing two objects' sets up **fails loudly** rather than
+    /// silently reporting the wrong members as disclosed.
+    ///
+    /// Worth pinning because a storage layer keyed on `(object_id,
+    /// member_index)` will one day get that key wrong, and the question is
+    /// which direction it fails in.
+    #[test]
+    fn a_disclosure_set_from_another_object_does_not_verify() {
+        let (env_a, _) = seal(&header(), &members()).unwrap();
+        let (_, set_b) = seal(&header(), &members()).unwrap();
+        assert_eq!(
+            verify_members(&env_a, &set_b).unwrap_err(),
+            VerifyMembersError::Redaction(RedactionError::DigestMismatch { index: 0 }),
+            "another object's disclosures are TAMPERING, not a partial view"
+        );
+    }
+
     #[test]
     fn commitment_reader_refuses_rather_than_guesses() {
         let (env, _) = seal(&header(), &members()).unwrap();
@@ -860,6 +895,32 @@ mod tests {
             ))
             .unwrap_err(),
             CommitmentRefusal::NoErasableMembers
+        );
+
+        // Uppercase hex is REFUSED, not normalized: two admissible spellings
+        // would give one commitment two sets of canonical envelope bytes.
+        let good = read_commitment(&env).unwrap();
+        assert_eq!(
+            read_commitment(&with(serde_json::json!({
+                "scheme": SD_SCHEME,
+                "root": good.root.to_uppercase(),
+                "digests": good.digests,
+            })))
+            .unwrap_err(),
+            CommitmentRefusal::DigestMalformed
+        );
+
+        // An extra member inside the slot is malformed, not tolerated — the
+        // scheme token is version-pinned, so a new field means a new scheme.
+        assert_eq!(
+            read_commitment(&with(serde_json::json!({
+                "scheme": SD_SCHEME,
+                "root": good.root,
+                "digests": good.digests,
+                "extra": "from a scheme this reader does not know",
+            })))
+            .unwrap_err(),
+            CommitmentRefusal::CommitmentMalformed
         );
     }
 
