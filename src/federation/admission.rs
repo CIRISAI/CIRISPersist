@@ -4432,7 +4432,30 @@ pub enum ReachabilityVerdict {
 /// `bool` form returns `true`. Only the classification of the "no" is new.
 /// (CIRISPersist#593) That is now STRUCTURAL — both run
 /// [`scoped_delegation_reach`], the one shared body — rather than a claim about
-/// two hand-mirrored copies.
+/// two hard-mirrored copies.
+///
+/// # NOT a diagnostic for the consent-revocation plane (CIRISPersist#594)
+///
+/// This walks under [`MODERATION_DUTY`], **always** — the policy is hard-coded
+/// below, not a parameter. Passing
+/// [`DELEGATION_SCOPE_CONSENT_REVOCATION`] as `scope` therefore does NOT
+/// explain a rule-(3) proxy refusal: it answers under `⊆`-parent attenuation
+/// and the `sub_delegation` deputization gate, neither of which the consent
+/// plane applies. It can report `SignerUnreached` for a chain the consent walk
+/// would happily traverse.
+///
+/// This matters more since CIRISPersist#594 made that plane honour retractions:
+/// a proxy chain that used to work can now be refused, and the refusal arrives
+/// as a bare [`Error::WithdrawsNotAdmitted`](super::Error::WithdrawsNotAdmitted)
+/// carrying only `issuer` + `target_attestation_id`. So an operator cannot
+/// currently distinguish *"the delegation was retracted — appoint a new proxy"*
+/// from *"this issuer never had standing"*, and the obvious surface to reach
+/// for is this one, which will mislead them.
+///
+/// Deliberately NOT fixed in #594: a classified consent-plane verdict is a new
+/// public/FFI surface on the `deontic` tier, which is a separate cut with its
+/// own stub and taxonomy obligations. Closing the authority hole should not
+/// wait on it. Recorded here so the gap is a known one rather than a surprise.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn reachable_under_scope_with_reasons(
@@ -14622,6 +14645,79 @@ pub(crate) mod moderation_walk_liveness_test_support {
              become the sole proxy for a subject who cannot object — a privilege escalation the \
              directed walk is what prevents"
         );
+
+        // ── GATE (a) IS RECIPIENT-SCOPED, NOT EDGE-SCOPED (CIRISPersist#594)
+        //
+        // A precision property that existed before this cut but only BOUND the
+        // moderation plane; #594 makes it bind the consent plane too, so it is
+        // pinned here rather than left to be discovered by an adopter.
+        //
+        // Gate (a) buckets a granter's retractions by `attested_key_id` alone.
+        // It does NOT read `references_attestation_id`. So a granter who
+        // retracts ONE scoped delegation to a recipient retracts EVERY edge to
+        // that recipient, on every scope — even when the retraction names a
+        // different edge by id.
+        //
+        // That is the §11.10 edge-retraction model ("the granter has retracted
+        // this recipient"), and the over-broad direction is the SAFE one: it
+        // withdraws more authority than named, never less. Narrowing it to be
+        // edge-precise would LOOSEN the moderation plane as a side effect of a
+        // consent-plane fix, which is not a trade this cut may make silently.
+        // Recorded as behaviour + flagged as a follow-up, not changed here.
+        let broad_g = format!("mw-cr-broad-g-{suffix}");
+        let broad_p = format!("mw-cr-broad-p-{suffix}");
+        register(dir, &broad_g, &[identity_type::USER]).await;
+        register(dir, &broad_p, &[identity_type::PRIMITIVE]).await;
+        let keep_edge = moderation_edge(
+            &broad_g,
+            &broad_p,
+            &[DELEGATION_SCOPE_CONSENT_REVOCATION],
+            &[&broad_p],
+            true,
+        );
+        let other_edge = moderation_edge(
+            &broad_g,
+            &broad_p,
+            &[DELEGATION_SCOPE_REVIEW],
+            &[&broad_p],
+            true,
+        );
+        store(dir, &keep_edge).await.expect("cr edge admitted");
+        store(dir, &other_edge).await.expect("review edge admitted");
+        let broad_targets = cr_targets_of(&broad_p);
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &broad_g,
+                &broad_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "both edges live — the consent_revocation one confers proxy authority"
+        );
+        // Retract ONLY the `review` edge, BY ID.
+        store(
+            dir,
+            &withdraws_of(&broad_g, &broad_p, &other_edge.attestation_id),
+        )
+        .await
+        .expect("the granter's targeted retraction lands");
+        assert!(
+            !issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &broad_g,
+                &broad_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "CIRISPersist#594, recorded rather than desired: gate (a) is keyed on the RECIPIENT, \
+             so a granter's retraction naming ONE edge by id withdraws every edge to that \
+             recipient — here a `review` retraction also killed the `consent_revocation` proxy. \
+             Over-broad in the SAFE direction (less authority, never more). Narrowing it would \
+             loosen the §11.10 moderation plane too, which #594 may not do as a side effect"
+        );
     }
 
     /// **THE READ COST, MEASURED** (CIRISPersist#593) — and the short-circuit,
@@ -14774,6 +14870,61 @@ pub(crate) mod moderation_walk_liveness_test_support {
             (2, 1),
             "5 edges, ONE distinct recipient, ONE incoming read — memoized per recipient for the \
              whole walk. Key the memo on the granter instead and this becomes 5"
+        );
+
+        // (5) THE CIRISPersist#594 COST — the consent-revocation plane, which
+        //     paid NEITHER gate before this cut.
+        //
+        //     #593 measured the moderation plane, where the granter-scoped gate
+        //     already ran and only the incoming clause was new. On this plane
+        //     BOTH gates are new, so the honest before/after is 1× → 2×, not
+        //     the moderation plane's already-1.5×. Measured rather than
+        //     reasoned, because "the walk is shallow so it does not matter" is
+        //     exactly the kind of claim that is true until a deployment makes
+        //     it false.
+        //
+        //     The shape is a rule-(3) probe: a proxy chain from an issuer to a
+        //     keyless subject. Same numbers as (1) — which is the point. The
+        //     consent plane now costs precisely what the moderation plane
+        //     costs, because it now runs precisely the same gates.
+        let cr_iss = format!("mc-cr-issuer-{suffix}");
+        let cr_mid = format!("mc-cr-mid-{suffix}");
+        let cr_sub = format!("mc-cr-subject-{suffix}");
+        register(backend, &cr_iss, &[identity_type::USER]).await;
+        for k in [&cr_mid, &cr_sub] {
+            register(backend, k, &[identity_type::PRIMITIVE]).await;
+        }
+        for (g, r) in [(&cr_iss, &cr_mid), (&cr_mid, &cr_sub)] {
+            store(
+                backend,
+                &moderation_edge(g, r, &[DELEGATION_SCOPE_CONSENT_REVOCATION], &[r], true),
+            )
+            .await
+            .expect("proxy chain edge admitted");
+        }
+        backend.reset_attestation_read_counts();
+        let cr_targets: std::collections::HashSet<String> =
+            std::iter::once(cr_sub.clone()).collect();
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                backend,
+                &cr_iss,
+                &cr_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "the live proxy chain reaches the keyless subject"
+        );
+        assert_eq!(
+            backend.attestation_read_counts(),
+            (2, 2),
+            "CIRISPersist#594's measured cost on the consent-revocation plane: a two-hop rule-(3) \
+             probe reads 2 granters (unchanged — one per dequeued node) and 2 recipients (BOTH \
+             new; this plane previously read none). So 2 reads became 4 — the same 2× ceiling the \
+             walk's doc claims, and identical to the moderation plane's (1) because the two planes \
+             now run the same gates. A `for` count above `by` here means the memo is not shared \
+             across the walk"
         );
     }
 }
