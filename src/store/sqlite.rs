@@ -37438,6 +37438,16 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "sq").await;
     }
 
+    /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
+    /// the real envelope, on this backend, through the real host API.
+    #[tokio::test]
+    async fn quota_byte_dimension_is_wired_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::replication::admission::gate_order_test_support::
+            assert_byte_dimension_is_wired(&backend, "sq").await;
+    }
+
     fn signed_attestation_fixture(
         attesting_key_id: &str,
         attested_key_id: &str,

@@ -5,6 +5,118 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #583: the quota could not see storage, and the table could be squeezed
+
+> **Note.** This section is scoped to CIRISPersist#583 only. The version line in `Cargo.toml`
+> is owned by a sibling cut; this entry lands under `Unreleased` and moves under whatever
+> version number that cut assigns.
+
+Two gaps in the v24.3.0 quota (#575), reported by CIRISServer. **Neither was refused — both
+were missed**, and the fix for each ships with a gate designed to fail if the *class* of
+mistake returns rather than only if the current numbers change.
+
+### 1. The byte dimension — `600 × 100 B` cost the same as `600 × 10 MB`
+
+`PeerWriteQuota` metered **rows only**. `classify` keyed on the envelope dimension and
+`spend` decremented a count; nothing in the quota path read a payload size. A peer at its
+full row allowance could consume ~6 GB or ~60 KB and the substrate could not tell the
+difference — **inauthentic storage was invisible to the control that exists to bound it**.
+`MAX_ATTESTATION_ENVELOPE_BYTES` (CC#38 interim) bounds *one* row; nothing bounded the sum.
+
+Bytes are now a second dimension **on the same bucket**, burst and sustained, on all four
+budgets (peer / untracked tail / node / reserved), with their own refusal tokens so an
+operator can tell a **row flood** from a **storage flood**:
+`peer_bytes_burst`, `peer_bytes_sustained`, `untracked_tail_bytes_burst`,
+`untracked_tail_bytes_sustained`, `node_bytes_burst`, `node_bytes_sustained`,
+`reserved_bytes_burst`, `reserved_bytes_sustained`. The eight v24.3.0 tokens keep their
+exact spelling — the `PeerQuotaRefusal` contract from #565/#575 is **append-only** and
+downstream is already keying on `as_str`.
+
+The numbers derive from one new stated input, not from taste:
+
+| constant | value | derivation |
+|---|---|---|
+| `TYPICAL_ATTESTATION_ENVELOPE_BYTES` | 1 536 | the ~1.5 KiB typical federation row v24.3.0's own doc already argued from — now a program constant instead of a number in prose |
+| `QUOTA_BYTE_HEADROOM_MULTIPLE` | 10 | the mean row size at which bytes bind instead of rows; below ~8 the byte dimension becomes a second row control and an AV-75 outage |
+| `QUOTA_CALIBRATION_ROW_BYTES` | 15 360 | `TYPICAL × HEADROOM` |
+| `PER_PEER_ATTESTATION_BYTES_PER_WINDOW` | 9 216 000 (8.79 MiB/min) | `600 rows × calibration` |
+| `PER_PEER_SUSTAINED_BYTES_PER_WINDOW` | 221 184 000 (211 MiB/day) | `14 400 rows × calibration`, equivalently `24 ×` the burst — the same "one burst per hour, forever" shape the sustained *row* constant uses |
+
+Worst case per peer goes from the **14 GiB/day** v24.3.0 stated to **211 MiB/day** (68×);
+node-wide, 2.06 GiB/day. Honest traffic is untouched: at the typical row the *row* dimension
+still binds first, at 21 MiB/day, with ~90% of the byte budget unspent. Every write is
+charged `max(envelope_bytes, TYPICAL)` — the row count bounds the fixed per-row cost
+(signatures, hashes, indexes) that the envelope cannot see, the byte count bounds the payload
+that a count cannot see, and **each dimension bounds the part of the cost the other is blind
+to**. The size is measured with a counting sink, never by canonicalizing: this gate runs
+first, on unauthenticated input, and must not allocate a copy of an attacker's payload.
+
+### 2. The tail-squeeze residue — and why the fix is a *size*, not an eviction rule
+
+v24.3.0 already closed the self-reset version (the prune drops only buckets refilled to
+**full**, and a flooder's own bucket is never full). What remained: once the table saturates
+with live-spending peers, no bucket is created and an honest newcomer is demoted to the
+shared untracked tail the attacker is saturating.
+
+Shape considered and **rejected**: "evict by adversary cost". A fresh bucket is born *full*,
+so evicting a bucket that still carries a deficit hands its owner the spent budget back — a
+reset, the exact primitive #575 closed. Evicting the emptiest maximises that payout;
+evicting the fullest minimises but does not eliminate it; evicting the oldest is steerable by
+whoever writes most. **The only eviction rule with a payout of exactly zero is "evict the
+buckets whose eviction is a no-op" — the full ones — which is what v24.3.0 already does.**
+Seeding fresh buckets from the tail would unlock other rules but inverts the property: a
+rotation flood could then evict an honest full bucket and the honest peer would return to a
+*drained* one. Also rejected: reserving table slots for rooted peers, which requires a
+directory read and would destroy the property that lets this gate lead the whole chain
+(it consults no shared state).
+
+So the fix is the table's **size**, derived rather than chosen. Every non-full bucket cost
+the adversary at least one write, every write is charged to the node budget, and one write
+keeps a bucket non-full only for as long as its own deficit takes to refill — so the largest
+number of buckets any schedule can hold simultaneously non-full is **6 600**
+(node burst 6 000, plus the 600 that refill during one sustained row token's 6 s). The cap
+moves **4096 → 8192**, the next power of two above it, and the saturated branch becomes
+unreachable: the prune always frees a slot and a peer with no history always leaves first
+contact with an individual budget. `PeerWriteQuota::slot_denials()` counts the branch anyway
+— "unreachable by arithmetic over four constants" survives exactly as long as the four
+constants do, and a drifted deployment should be able to *see* it. Memory cost: ~1.5 MB.
+
+### The three gates — the deliverable that outlives the fixes
+
+1. **Dimensional completeness** (`every_metered_dimension_has_a_witness`). `QuotaDimension`
+   is a closed enum; budgets are sized by `[_; QuotaDimension::COUNT]` and priced by an
+   exhaustive match, so a new dimension does not *compile* until it is sized, priced and
+   named. The refusal taxonomy is asserted to be exactly `budget × dimension × horizon`
+   (4 × 2 × 2 = 16), and **every cell is driven to a real refusal by a real schedule** — a
+   metered cell nothing can witness fails the test naming the cell. The row dimension
+   shipped alone in v22.0.0 not because anyone decided bytes did not matter but because
+   there was no *set* to be incomplete, only a field.
+2. **Adversary monotonicity** (`no_adversary_schedule_resets_itself_or_degrades_an_incumbent`),
+   property-style with a deterministic RNG: rotation, deep drains, byte-heavy writes, clock
+   jumps and squeezes, driven past the table cap so the eviction path really runs, with an
+   honest incumbent writing alongside. Four invariants re-checked as it goes — no key ever
+   exceeds its own token-bucket ceiling (an eviction that reset anyone shows up here); the
+   incumbent's bucket differentials cell-by-cell against a shadow driven only by its own
+   writes; `slot_denials() == 0`; the table stays bounded.
+3. **Derivation** (`every_quota_constant_is_derived`, `the_tracked_table_is_larger_than_any_flood_can_hold`).
+   The first scans this file's own source between the `QUOTA CONSTANTS` markers and fails if
+   any `pub const` there lacks a `**Bounds:**` line, a `**Derived:**` line, or an entry in
+   the gate's table — then asserts the identities and inequalities the docs claim (including
+   ones v24.3.0 only stated in prose, like `sustained_rows == 24 × burst_rows`, and that a
+   maximum-size *legal* row stays affordable to every budget it can be charged against). The
+   second re-derives the tail-squeeze bound from the live constants by sweeping every write
+   shape an adversary can choose. Raising `NODE_INGEST_BUDGET_MULTIPLE` or shrinking
+   `PER_PEER_QUOTA_TRACKED_PEERS_CAP` now fails a test that names the inequality it broke.
+
+Both fixes were witnessed red first: `a_ten_megabyte_row_must_not_cost_the_same_as_a_hundred_byte_row`
+and `an_honest_newcomer_gets_its_own_budget_during_a_rotation_flood`. The byte dimension is
+additionally proven wired through the real `put_attestation` on **all three backends**
+(`assert_byte_dimension_is_wired`) — a dimension exercised only through a bypass certifies
+an unreachable feature (AV-77).
+
+Refs: #583; #575 (shipped v24.3.0), #565 (the refusal-token contract),
+CIRISConstitution#38 (single-envelope cap).
+
 ## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
 
 **MAJOR because the dependency graph moves under every consumer**, not because persist's own
