@@ -173,21 +173,24 @@ pub const OWNERSHIP_FRESHNESS_TARGET_KIND: &str = "ownership_binding";
 pub const RECLAIM_WITHDRAWS_ADMISSION_RULE: u8 = 5;
 
 /// The CC 3.1 namespace family the petition and the two finding dimensions
-/// live under.
+/// live under. **Registered** (CIRISPersist#590): CC 1.0-rc3
+/// catalogues it at CC 3.1.9.4, owning component `node`. It is on the CC 3.1.7
+/// R2(a) mint gate ([`super::admission::MINTED_NAMESPACE_FAMILIES`]).
 ///
-/// **Not yet in the vendored registry** ([`super::namespace::registry`]);
-/// like [`objection:{state}`](super::reverse_quorum::NAMESPACE_FAMILY) a
-/// dimension outside the manifest resolves
-/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
-/// so these rows admit today and the ratification ask is about making the
-/// authority EXPLICIT rather than about unblocking the plane.
+/// **The parameter is `{state}`, not `{finding}`.** #578 filed the ask as
+/// `wa_adjudication:{finding}`; CC ratified `wa_adjudication:{state}`, matching
+/// its `objection:{state}` / `quarantine:{state}` siblings in the same Part.
+/// The stem is identical either way, so nothing on the wire moved — but the
+/// declared family must be spelled the way the registry row spells it, or the
+/// R2(a) gate is comparing persist's intention against CC's record and calling
+/// a mismatch agreement.
 ///
 /// The finding deliberately does **not** live under `ownership:*`: CC 3.4
 /// reserves that family to the live owner and says the recovery path *"rides
 /// `withdraws` + `wa_adjudication_ref` and never a fresh `ownership:*`
 /// emission"*. A finding minted on `ownership:*` would be a seizure by
 /// attestation, which is the thing being adjudicated.
-pub const NAMESPACE_FAMILY: &str = "wa_adjudication:{finding}";
+pub const NAMESPACE_FAMILY: &str = "wa_adjudication:{state}";
 
 /// Ceremony **step 1** — the petition naming K and the evidence. A `scores`
 /// row; anyone may file one (that is what a petition IS), and persist never

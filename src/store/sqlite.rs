@@ -20158,6 +20158,19 @@ mod tests {
             .await;
     }
 
+    /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the sqlite leg of the shared
+    /// namespace-registration witness (see the postgres + memory legs); all
+    /// three call the SAME `admission::r2_test_support::exercise_r2b_refusal`
+    /// body through the REAL `put_attestation`, so no backend can silently
+    /// admit a family with no registry row.
+    #[tokio::test]
+    async fn namespace_family_unregistered_parity_sqlite_590() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, "sqlite-r2")
+            .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the sqlite leg of the shared
     /// revocation-history-bound witness. The bound is stored in a column
     /// (V118), so "it round-trips" is a per-backend claim, not a shared one.

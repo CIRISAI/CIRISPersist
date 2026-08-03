@@ -14,7 +14,7 @@
 //! change is therefore a deliberate, reviewable bump of all three consts — the
 //! copy can never silently drift from the Constitution it mirrors.
 //!
-//! **The removal direction is the dangerous one** (v25.2.0, CIRISPersist#590).
+//! **The removal direction is the dangerous one** (CIRISPersist#590).
 //! A count bump plus a source-hash bump is the signature of *any* re-vendor —
 //! including one that silently DROPS families. CC's own first CC-3.1.7-R2
 //! regeneration lost four (`judge_model:verdict`, `health:liveness`,
@@ -242,7 +242,7 @@ pub fn authority_for(dimension: &str) -> Authority {
         })
 }
 
-// ── v25.2.0 (CIRISPersist#590, CC 3.1.7 R2) — family-STEM registration ──
+// ── (CIRISPersist#590, CC 3.1.7 R2) — family-STEM registration ──
 
 /// The **family stem** of a dimension or `attestation_type` — everything up to
 /// and including its first `:` (`"objection:raised:v1"` → `"objection:"`), or
@@ -464,7 +464,7 @@ mod tests {
         }
     }
 
-    // ── v25.2.0 (CIRISPersist#590) — the vendor-drift witnesses ──────────
+    // ── (CIRISPersist#590) — the vendor-drift witnesses ──────────
 
     /// **The equality that caught CC's own incident.** `_meta.n_families` is a
     /// number the generator writes; `families[]` is what it actually emitted.

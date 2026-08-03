@@ -5,6 +5,88 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### #590 — CC 3.1.7 R2: the registry row becomes a build gate, and a rowless family stops being admittable
+
+Three consecutive cuts (#574 `objection:{state}`, #578 `wa_adjudication:`, #570
+`quarantine:{state}`) each minted a namespace family that shipped, worked, and admitted with
+**no registry row** — meaning each admitted under the `ProducerSteward` fallback, an authority
+nobody chose for it. CIRISConstitution ratified **CC 3.1.7 R2** in response, and this cut
+implements persist's half.
+
+#### Re-vendor: 95 → 109 families, and nothing lost
+
+`namespace_registry.json` re-vendored from CC `1.0-rc2` (95) to `1.0-rc3` (109). All three
+persist-minted families now carry rows, as do `capacity_assurance:` / `consent:` / `system:` /
+`config:` / `ownership:` / `trust:` / `trace:` / `trace_summary:` / `delivery_receipt:` /
+`age_assurance:` / `age_self_declared:` — the families CC's old `### 3.1.N`-only section walk
+was structurally blind to. **No family was removed.**
+
+`trust:{job}:{version}` carries a null `cc_ref`, which the `String`-typed raw shape could not
+deserialize at all — it would have panicked at the first `authority_for` call. Typed `Option`,
+and resolved to the family's own catalogue section rather than to an empty string that reads
+like a present-but-blank citation.
+
+#### R2(a) — minting a family without its row fails persist's build
+
+`admission::MINTED_NAMESPACE_FAMILIES` declares every family persist is the producer of,
+cross-checked against exactly the `NAMESPACE_FAMILY` consts of the three modules that mint on
+them, and gated against the vendored registry. A fourth rowless family is now impossible
+rather than noticed afterwards.
+
+`ownership_reclaim::NAMESPACE_FAMILY` changes value `"wa_adjudication:{finding}"` →
+`"wa_adjudication:{state}"`: #578 filed the ask as `{finding}` and CC ratified `{state}`,
+matching its `objection:{state}` / `quarantine:{state}` siblings. The stem is unchanged so
+nothing on the wire moves — but a declared family spelled differently from its registry row
+turns the R2(a) gate into a comparison that calls a mismatch agreement.
+
+#### R2(b) — `namespace_family_unregistered`, at the reserved-prefix chokepoint
+
+New typed refusal `Error::NamespaceFamilyUnregistered` +
+`admission::NamespaceConformanceReason::FamilyUnregistered`, whose `as_str()` is CC's own token
+`namespace_family_unregistered` (not a persist coinage; the serde spelling is pinned to match).
+It runs **inside `check_reserved_prefix_admission`**, off the same
+`default_reserved_prefix_rules()` call site the emitter rule uses, so the two questions — *who
+may emit on this family* and *did anyone ever say* — cannot drift apart. Every backend reaches
+it through `put_attestation`; memory / sqlite / postgres run one shared witness body.
+
+The refusal is **stem-granular and scoped to governed families** — the ones persist gates or
+mints. That scoping is the point of the whole issue: #590 warned that enforcing R2(b) naively
+would refuse conformant traffic, and CC 3.1.7 R2 itself preserves "the open-vocabulary space
+this Part deliberately leaves open". So `credits:rust:en:alice` admits (open vocabulary inside a
+registered family), `identity_binding:v1` admits (a family this Part never speaks to), and only
+a family persist itself governs with no row anywhere is refused.
+
+#### The differential witness, and what it found
+
+`authority_lists_agree_on_every_manifest_family` asserts, in both directions, that
+`namespace/registry.rs#authority_for` (manifest-derived) and
+`admission.rs#default_reserved_prefix_rules` (hand-maintained) agree about every family in the
+manifest — the #541/#532/#588 two-lists-that-disagree class, made a build failure.
+
+- **`capacity_assurance:` — the known split truth is CLOSED.** The rule table knew it was
+  witness-reserved while `authority_for` returned `ProducerSteward`/`reserved: None`. rc3
+  registers it with `witness-reserved, subject-not-self, attester != steward`. Same for
+  `consent:` and `age_assurance:`.
+- **Three families still disagree, in the other direction.** `content_rating:` /
+  `content_class:` / `cw_class:` are gated here and CC Part 3 has **no row for any of them** —
+  they are CEG 0.3 §5.6.8.3 families, never catalogued in CC. They are pinned in
+  `UNREGISTERED_GATED_FAMILIES` with that reason, and `declared_exceptions_are_still_unregistered`
+  deletes the excuse the moment CC registers one. They admit rather than refuse: refusing traffic
+  the Constitution never spoke about is the "reject conformant traffic and blame the producer"
+  failure #590 was opened to prevent. The ask on CC is a Part-3 row for each.
+
+#### The vendor-drift witness
+
+CC's own first R2 regeneration silently dropped four families (`judge_model:verdict`,
+`health:liveness`, `seed_holder_voting_alignment`, `watchlist`) because a prose paragraph was
+inserted mid-markdown-table; 106 + 3 − 4 = 105 and the only signal was an arithmetic
+discrepancy that was nearly reconciled away. So: `families[].len() == _meta.n_families` is its
+own assertion, duplicates are refused, and `VENDORED_FAMILY_PREFIXES` pins all 109 so a
+re-vendor that DROPS one fails **by name** and is cleared only by moving the line to
+`RETIRED_FAMILIES`. Additions stay cheap; the removal direction is the dangerous one.
+
 ## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open

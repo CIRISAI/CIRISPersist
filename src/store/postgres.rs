@@ -20462,6 +20462,23 @@ mod tests {
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
     }
 
+    /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the POSTGRES leg of the shared
+    /// namespace-registration witness (see the sqlite + memory legs); all three
+    /// call the SAME `admission::r2_test_support::exercise_r2b_refusal` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn namespace_family_unregistered_parity_postgres_590() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, &suffix)
+            .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the POSTGRES leg of the shared
     /// revocation-history-bound witness. The bound is a TIMESTAMPTZ column
     /// here and TEXT on sqlite, so the round-trip claim is per-backend.

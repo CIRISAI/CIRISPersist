@@ -122,17 +122,18 @@ pub const DIMENSION_OBJECTION: &str = "objection:raised:v1";
 /// asymmetry — see [`ReverseQuorumPolicy::dismissal_threshold`].
 pub const DIMENSION_DISMISSAL: &str = "objection:dismissed:v1";
 
-/// The CC 3.1 namespace family both dimensions live under. **Not yet in the
-/// vendored registry** ([`super::namespace::registry`] pins CC 1.0-rc2 at 95
-/// families); a dimension outside the manifest resolves
-/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
-/// so these rows admit today and the ratification ask is about making the
-/// authority EXPLICIT rather than about unblocking the plane.
+/// The CC 3.1 namespace family both dimensions live under. **Registered**
+/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning
+/// component `node`, alongside `moderation:{allegation_type}`,
+/// `slashing:{outcome}` and `reconsideration:{grounds}`. Between #574 and the
+/// re-vendor it was rowless, which is the state CC 3.1.7 R2 exists to make
+/// impossible; it is now on the R2(a) mint gate
+/// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]), so a future family minted
+/// without its row fails persist's own build.
 ///
-/// The ask: `objection:{state}`, owning component `node`, CC §3.1.9.2
-/// (alongside `moderation:{allegation_type}`, `slashing:{outcome}`,
-/// `reconsideration:{grounds}`), reserved rule **cohort-member-only** — which
-/// is precisely the gate [`record_objection`] already enforces here.
+/// The cohort-member-only emitter rule the ask named is the gate
+/// [`record_objection`] enforces here; CC's row carries the family, and the
+/// emitter/composition elaboration rides CIRISConstitution#67.
 pub const NAMESPACE_FAMILY: &str = "objection:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so

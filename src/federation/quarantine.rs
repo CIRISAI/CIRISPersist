@@ -112,20 +112,18 @@ pub const DIMENSION_WITHHELD: &str = "quarantine:withheld:v1";
 /// without reconstructing anything.
 pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 
-/// The CC 3.1 namespace family both dimensions live under. **Not yet in the
-/// vendored registry** ([`super::namespace::registry`]); a dimension outside
-/// the manifest resolves
-/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
-/// so these rows admit today and the ratification ask is about making the
-/// authority EXPLICIT rather than about unblocking the plane.
+/// The CC 3.1 namespace family both dimensions live under. **Registered**
+/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning
+/// component `node`, alongside `moderation:{allegation_type}`,
+/// `slashing:{outcome}`, `reconsideration:{grounds}` and #574's
+/// `objection:{state}` — carrying the **slash-duty-holder-only** emitter rule
+/// this repo already enforces at
+/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)'s
+/// [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX) arm.
 ///
-/// The ask (persist does NOT re-vendor the registry — this is a filing):
-/// `quarantine:{state}`, owning component `node`, CC §3.1.9.2 (alongside
-/// `moderation:{allegation_type}`, `slashing:{outcome}`,
-/// `reconsideration:{grounds}`, and #574's `objection:{state}`), reserved rule
-/// **slash-duty-holder-only** — which is precisely the gate
-/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
-/// already enforces on the [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX) arm.
+/// It is on the CC 3.1.7 R2(a) mint gate
+/// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]): a family persist mints
+/// without landing its registry row now fails persist's own build.
 pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so the
