@@ -5,9 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — #519/#520/#568: the list of what persist rules on, and the scan that finds the next one
+## [27.0.0] — 2026-08-03 — #519/#586/#579/#571/#592/#584: the rules persist enforces, enumerated — and four preconditions nothing was testing
 
-### Added — `federation::family_rules`: the family-rule inventory (#519 / #520)
+Six issues, and a pattern that only became visible with all six in one cut: **v26.0.0 shipped four
+claims that were true of the prose and false of the code.** Each was found by an agent instructed to
+contradict its own brief, and each had survived review — including mine.
+
+- **#592** — #589 justified excluding AV-45 from the promote gate on the grounds that a promotion
+  *"re-publishes a row this node itself authored."* `list_local_tier_attestations` is `WHERE tier =
+  'local'` with **no author predicate**: a peer's row promotes under this node's grant, re-signed
+  with this node's key. A second placement door (`repair_stranded_scope_backlog`) was uncounted.
+  **AV-84.**
+- **#519** — `registry::class_for` **hardcodes** `AccordCoScrub` for `provenance:build_manifest`
+  while the manifest states no rule: a hand-written authority inside the artifact whose job is to be
+  derived. The enforcement inventory — what persist rules *on*, not *from* — goes **3 of 17 → 17 of
+  17**, closed by a source scan so the 18th cannot arrive silently.
+- **#571** — CC 3.1.7's Private Use range MUST NOT admit at federation tier. v26.0.0 shipped R2
+  before that clause existed, so it was unenforced; an `x_private:*` row promoted cleanly on every
+  backend. `regime:*` itself needs no gate — it is the open vocabulary CC preserves, and governing it
+  today would refuse it.
+- **#584** — a subject-revoked `delegates_to` still conferred stewardship. Four written
+  biconditionals sit on that surface; a per-site repair falsifies two. One shared walk now serves all
+  four callers.
+- **#586** — an absence claim is the only claim that rots while nobody touches it. Nine derived from
+  the manifest, each with a declared falsifier resolved by the *same* predicate the presence gate
+  uses.
+- **#579** — the classification unit is `(field, op)`, and `references_attestation_id` no longer
+  reads as `data_subject`.
+
+Verify re-pinned v12.1.0 → **v12.5.0** (seven sites). No migration in this cut.
+
+### #519/#520/#568: the list of what persist rules on, and the scan that finds the next one
+
+#### Added — `federation::family_rules`: the family-rule inventory (#519 / #520)
 
 v26.0.0 closed six defects with one shape between them — a hand-maintained list
 that had drifted from the inventory it stood for — and every fix was a new gate
@@ -124,7 +154,7 @@ cited gate `fn` with all its callers (the site resolver, red); landing a
 `reserved_rule` on a pinned row (the stale-pin bite, red); deleting the
 `provenance:build_manifest` classifier arm (the classifier-asserted arm, red).
 
-### Changed — #568: the hardware-attestation deferral doc names the TPM shape, not just its absence
+#### Changed — #568: the hardware-attestation deferral doc names the TPM shape, not just its absence
 
 The verify v12.1.0 capability matrix landed with #567. Two residues closed:
 
@@ -144,7 +174,7 @@ The verify v12.1.0 capability matrix landed with #567. Two residues closed:
   admission, which is not a decision persist takes unilaterally. Same-name /
   different-substance, named in the table so the next reader does not spend the
   round trip finding it out.
-## [Unreleased] — #586: an absence claim is the only claim that rots while nobody touches it
+### #586: an absence claim is the only claim that rots while nobody touches it
 
 `namespace_supersets.json` is the vendored Registry-of-Record — what the conformance tests generate
 from and what downstream reads to decide what persist does and does not implement. Its
@@ -155,7 +185,7 @@ A **presence** claim breaks its own build when the symbol moves: `evidence_cc_im
 proves that on every run. An **absence** claim — *"X does not exist"* — is true when written, and
 **nothing ever re-asks**.
 
-### The witness
+#### The witness
 
 `manifest_absence_claims()` DERIVES the claim set by walking the whole manifest for a structural
 marker (`asymmetry_kind: "logical_defect"` **+** a `missing_dual` key), never by naming a section —
@@ -171,7 +201,7 @@ two predicates over one question.
 - **A `falsified` entry is a proof**: its symbol must really be there.
 - **A `holds` entry is a tripwire, not a proof**, and says so.
 
-### What it deliberately does NOT check
+#### What it deliberately does NOT check
 
 Only **structured** absence claims. The obvious wider gate — treat every `proposed:`-prefixed
 processor citation naming a `path#symbol` as "this symbol does not exist" — was tried and is
@@ -181,7 +211,7 @@ Separating the two requires reading the parenthetical, and inferring a rule from
 is the section-walk heuristic pointed at a different field. A narrow gate that fires beats a broad
 one that cannot.
 
-### Two claims the witness immediately falsifies
+#### Two claims the witness immediately falsifies
 
 - **`ownership:*` / WA-adjudicated reclaim** — *"CIRISPersist v21.4.0 contains zero
   seizure/reclaim/ownerless handling"*. False since v21.8.0 (`federation::ownership_reclaim`), doubly
@@ -191,7 +221,7 @@ one that cannot.
   signature"*. #557's `check_family_charter_admission` refuses a family charter below that family's
   own quorum, at the write chokepoint.
 
-### The state the manifest could not express
+#### The state the manifest could not express
 
 `PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES` gives *"gated here, uncatalogued there, deliberately
 admitting"* a home on the manifest surface: per family, which document DOES define it (CEG 0.3
@@ -202,7 +232,7 @@ letting it outlive its reason. **CIRISConstitution#77 has since landed on `rc3` 
 record, all three rows present); persist still vendors the 109-family cut, so that gate fires at the
 next registry re-vendor.**
 
-### Not re-vendored, and precisely why
+#### Not re-vendored, and precisely why
 
 There is no generator, anywhere. `namespace_registry.json` has one (CIRISConstitution's
 `tools/build_cc_namespace.py`, which #590 re-ran); `namespace_supersets.json` has no counterpart in
@@ -213,12 +243,12 @@ The correction therefore lands outside the file and gated, as every persist-auth
 it does. #590's declared lag (`SEED_LAGS_REGISTRY_TRACKED_BY`) is untouched.
 
 Also: the manifest's four independent 2 MB `serde_json::Value` parses collapse to one shared `root()`.
-## [Unreleased] — #579: the classification unit is `(field, op)`, and one reading of the pointer is gone
+### #579: the classification unit is `(field, op)`, and one reading of the pointer is gone
 
 CIRISConstitution rc3 ratified the axis-fusion gate at CC 4.5.1.1 (resolving CIRISConstitution#44)
 with two refinements, and this cut lands persist's half of both.
 
-### The unit moved from the field to `(field, op)`
+#### The unit moved from the field to `(field, op)`
 
 `PERSIST_AUTHORED_AXIS_CLASSIFICATIONS` was `(field, kind, rationale)`; it is now
 `(field, op, kind, rationale)`. rc3's sentence is the whole argument: *"a slot meaning one relation
@@ -243,7 +273,7 @@ Of the 15 proposals #532 filed pending ratification, rc3 settled all 15: 12 `n/a
 now recorded in their rationales, and rc3's *direction MUST NOT ride `consent`* recorded in that
 one), and the 15th is the op split below.
 
-### `references_attestation_id` no longer reads as a subject binding
+#### `references_attestation_id` no longer reads as a subject binding
 
 Three relations, three operations. Under `withdraws` the pointer is the revoke target
 (`axiomatic_intent`); under composition it is the temporal prior (`n/a`, not cross-axis at all); and
@@ -269,16 +299,16 @@ tombstone fold makes a `recipient_revoke` decision on its pointer exactly as it 
 `withdraws` one, so the composition/`n/a` arm would be a false claim. It is classified with the
 `withdraws` arm.
 
-### Also: `trace_manifest:v1.content_hash` is a digest again
+#### Also: `trace_manifest:v1.content_hash` is a digest again
 
 `check_trace_dimension_admission` validated `starts_with("sha256:")` and a non-empty remainder, so a
 truncated digest, an uppercase one, and `"sha256:"` + a sentence all admitted as conformant trace
 manifests. CC 3.1.5 requires the CC 2.6.3 encoding: `"sha256:"` + exactly 64 lowercase hex. Both live
 emitters (`ingest.rs`, the `engine.rs` backfill) already produce exactly that, so the gate now
 matches what it was always meant to check.
-## [Unreleased]
+### #571/#592: regime federates, Private Use never does, and a promotion may not place a row it did not author
 
-### #592 — the excuse for leaving AV-45 out of the promote gate was itself unchecked (**AV-84**)
+#### #592 — the excuse for leaving AV-45 out of the promote gate was itself unchecked (**AV-84**)
 
 #589 re-ran the tier-4 stack at the promote door and deliberately left AV-45 out, because on
 `federation_attestations` AV-45 **cannot ask its question**: the row carries a `cohort_scope` and no
@@ -339,7 +369,7 @@ content?"*. Forcing one implementation onto both is the axis-fusion defect this 
 promote contract tightened again. A caller that promotes a row it did not author into `family` /
 `community` now gets `federation_cohort_standing_refused` where it previously got `Ok`. Broad-tier
 promotions (`federation` and friends) are unaffected.
-## [Unreleased] — #584: a subject-revoked `delegates_to` stops conferring stewardship
+### #584: a subject-revoked `delegates_to` stops conferring stewardship
 
 `#578` repaired `live_owner_binding_granters`, which folded **only the granter's own** retraction
 when deciding whether an owner-binding was still live. `admission.rs` carried the same fold in three
@@ -349,7 +379,7 @@ by a consent-revocation proxy) kept conferring stewardship on the whole mesh, no
 reclaim ceremony. Same two-lists-that-disagree class as `#541`: the set we preserve was not the set
 we verify.
 
-### The fix is the extraction, not the fold
+#### The fix is the extraction, not the fold
 
 `admission.rs` states the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()` in
 prose, with a note recording that `#306`'s fix had to be hand-mirrored into the second copy. So
@@ -363,7 +393,7 @@ carry the CC 1.13.3.3 owner-binding dimension. `nodes_stewarded_by` inherits it 
 defined by re-asking `steward_bindings_of`. `owner_of ⊆ steward_bindings_of` now holds by
 construction rather than by two functions being edited in step.
 
-### BEHAVIOUR CHANGE — bindings accepted today start being refused
+#### BEHAVIOUR CHANGE — bindings accepted today start being refused
 
 This is deliberate, un-flagged and un-grandfathered: a subject-revoked delegation must not confer
 stewardship. The fold is **read-time**, so there is no migration and no stored-data change —
@@ -380,7 +410,7 @@ node, not about the commons, so the §11.11 apply gate does not refuse the very 
 Commons rostered by `user`-role members — every existing `#574`/`#591` fixture — self-anchor and are
 untouched.
 
-### Left in place, named
+#### Left in place, named
 
 The three forward `delegates_to` BFS walks (`issuer_reaches_target_via_scoped_delegation`,
 `reachable_under_scope_with_reasons`, `enumerate_scoped_delegation_reach`) bucket retractions by the
@@ -390,7 +420,7 @@ in here for the reason `#578` did not fold in this issue: it is a different mesh
 change (takedown / review authority), it needs a per-edge incoming-row read the current walk does not
 make, and it deserves its own red-first witnesses and its own adoption note.
 
-### Witnesses (memory · sqlite · postgres, one shared body through the real `put_attestation`)
+#### Witnesses (memory · sqlite · postgres, one shared body through the real `put_attestation`)
 
 - `steward_binding_liveness_parity_*_584` — the biconditional asserted at **every** state
   transition, plus subject-revocation liveness. The subject's `withdraws` is admitted under rule 2
