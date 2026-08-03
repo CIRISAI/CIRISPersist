@@ -6952,6 +6952,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))
     }
 
+    /// CIRISServer#356 — this backend DOES charge peer writes
+    /// (`peer_write_quota.check_write` on the `put_attestation` path), so it
+    /// answers rather than taking the `None` default.
+    fn peer_quota_observation(
+        &self,
+    ) -> Option<crate::federation::replication::admission::PeerQuotaObservation> {
+        Some(self.peer_write_quota.observe())
+    }
+
     async fn list_hard_case_events(
         &self,
         filter: crate::federation::HardCaseFilter,
@@ -37662,6 +37671,20 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::replication::admission::gate_order_test_support::
             assert_per_peer_write_quota_is_wired(&backend, "sq").await;
+    }
+
+    /// CIRISServer#356 — the operator read surface on the sqlite backend:
+    /// unknown-not-green, the distinguished zeroes, and the read-only overdue
+    /// query's zero-write proof. Shares its body with the memory and postgres
+    /// twins.
+    #[tokio::test]
+    async fn node_state_surface_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::node_state::parity_test_support::assert_node_state_surface(
+            &backend, "sq",
+        )
+        .await;
     }
 
     /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from

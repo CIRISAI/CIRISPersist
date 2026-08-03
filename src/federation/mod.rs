@@ -122,6 +122,10 @@ pub mod freshness;
 // object load-bearing on THIS node? Read-only, fail-secure, and gated for
 // exhaustiveness against the #519 manifest. Releases nothing.
 pub mod load_bearing;
+// CIRISServer#356 — the OPERATOR read surface: the node-scoped state signals
+// this substrate already computes, folded into one banded, three-valued
+// answer. A gauge, never a gate; see the module doc.
+pub mod node_state;
 
 /// v20.1.0 (CIRISPersist#478) — the trace-attestation backfill report:
 /// what minted (incl. idempotent already-present no-ops — the funnels'
@@ -464,11 +468,23 @@ fn assert_change_envelope_matches(
 /// lowercase alphabetic label — the operative canonical invariant is "no
 /// uppercase", matching the precedent validators.
 ///
-/// Gated to the backends that have an emit path: the sole caller
-/// (`Engine::emit_attestation_assemble`) is
-/// `#[cfg(any(feature = "postgres", feature = "sqlite"))]`, so without a
-/// backend feature this function would be dead code (the crate denies it).
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+/// # Why this is no longer backend-gated (a pre-existing red, fixed here)
+///
+/// It used to carry `#[cfg(any(feature = "postgres", feature = "sqlite"))]`,
+/// on the stated grounds that its *sole* caller
+/// (`Engine::emit_attestation_assemble`) carried the same gate and it would
+/// otherwise be dead code. v25.1.0 (CIRISPersist#582) added a SECOND caller —
+/// [`attestation_emit::assemble_and_put`] — and that one is **not** gated, so
+/// from that release the crate stopped compiling with no backend feature at
+/// all: `cargo check`, and CI's `cargo nextest run --test
+/// wire_format_fixtures` default leg, both fail with "cannot find function
+/// `validate_subject_key_ids` in module `super`".
+///
+/// The gate's premise is simply no longer true — an ungated caller makes this
+/// live in every configuration — so the gate is removed rather than the second
+/// caller being gated to match. Found while verifying CIRISServer#356 against
+/// the feature matrix; unrelated to that work, and fixed rather than deferred
+/// because a leg that cannot compile is a leg that proves nothing.
 pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
     for sid in subject_key_ids {
         if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -479,6 +495,46 @@ pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// CIRISServer#356 — **the one definition of "this revocation is overdue for
+/// promotion"** (CC 5.3.2.2 / §10.1.3's never-rest-local tripwire).
+///
+/// A subject-side `consent:state:revoked` fires iff it is still at a
+/// non-federation tier, has no `promoted_at`, and has rested longer than
+/// `window`. Extracted so
+/// [`FederationDirectory::list_consent_revocation_promotion_overdue`] and its
+/// non-emitting twin
+/// [`FederationDirectory::list_consent_revocation_promotion_overdue_readonly`]
+/// ask the identical question — a read-only variant that re-derived the
+/// predicate would be a second definition of overdue, and this repo has a
+/// recorded defect class for exactly that (one predicate, one impl).
+#[must_use]
+pub fn is_promotion_overdue(
+    rev: &Attestation,
+    now: chrono::DateTime<chrono::Utc>,
+    window: chrono::Duration,
+) -> bool {
+    let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
+    local && rev.promoted_at.is_none() && now - rev.asserted_at > window
+}
+
+/// The projection shared by both overdue readers, for the same reason
+/// [`is_promotion_overdue`] is shared: two readers of one condition must
+/// produce one row shape.
+#[must_use]
+fn overdue_row(
+    rev: &Attestation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> hard_case::ConsentPromotionOverdueRow {
+    hard_case::ConsentPromotionOverdueRow {
+        attestation_id: rev.attestation_id.clone(),
+        target_key_id: rev.attested_key_id.clone(),
+        subject_key_id: rev.attesting_key_id.clone(),
+        asserted_at: rev.asserted_at,
+        age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
+        tier: rev.tier.clone(),
+    }
 }
 
 /// Federation directory trait — the registry/lens/agent's read+write
@@ -3910,6 +3966,25 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// CIRISServer#356 — this backend's **live peer-write-quota gauge**, or
+    /// `None` when it holds no quota at all.
+    ///
+    /// The default is `None` and that is the honest answer for any
+    /// implementation that does not run the #583 admission path: a backend
+    /// which never charges a peer write has no tripwire to report, and
+    /// synthesising a zero here would be indistinguishable from a healthy
+    /// reading. Every consumer must render `None` as *unknown* — see
+    /// [`PeerQuotaObservation`](replication::admission::PeerQuotaObservation),
+    /// whose doc also explains why the numbers it carries are about a PROCESS
+    /// and not about a node.
+    ///
+    /// Not `async` in spirit — it takes a mutex, touches no I/O, and never
+    /// fails — but it lives on this trait because the quota is a private field
+    /// of each backend and this is the only seam a host can reach it through.
+    fn peer_quota_observation(&self) -> Option<replication::admission::PeerQuotaObservation> {
+        None
+    }
+
     /// List recorded `hard_case:*` events (LensCore consumes by kind +
     /// recency to compose `detection:consent:*`). Newest first.
     async fn list_hard_case_events(
@@ -4335,8 +4410,11 @@ pub trait FederationDirectory: Send + Sync {
             // gate (`check_local_tier_eligibility` rule 2) refuses to originate
             // one; a transit-staged row here arrives via the #171 promote
             // surface and this watcher drives it out (promote or flag).
-            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
-            if local && rev.promoted_at.is_none() && now - revoked_at > promotion {
+            // CIRISServer#356 — the SAME predicate the two readers use. It was
+            // a third open-coded copy of the identical three conjuncts; a
+            // watcher and a reader that disagreed about "overdue" would flag
+            // and report different sets.
+            if is_promotion_overdue(rev, now, promotion) {
                 self.record_hard_case(hard_case::HardCaseEvent {
                     event_id: hard_case::watch_event_id(
                         hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE,
@@ -4390,8 +4468,7 @@ pub trait FederationDirectory: Send + Sync {
             // §10.1.3 transit-not-rest: only a LOCAL-tier, unpromoted row
             // past the window is overdue (a promoted row's terminal state
             // is `federation`, which drops it out of the fire condition).
-            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
-            if !(local && rev.promoted_at.is_none() && now - rev.asserted_at > window) {
+            if !is_promotion_overdue(rev, now, window) {
                 continue;
             }
             // Flag it (idempotent — the watcher's own event_id derivation,
@@ -4412,16 +4489,56 @@ pub trait FederationDirectory: Send + Sync {
                 emitted_at: now,
             })
             .await?;
-            overdue.push(hard_case::ConsentPromotionOverdueRow {
-                attestation_id: rev.attestation_id.clone(),
-                target_key_id: rev.attested_key_id.clone(),
-                subject_key_id: rev.attesting_key_id.clone(),
-                asserted_at: rev.asserted_at,
-                age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
-                tier: rev.tier.clone(),
-            });
+            overdue.push(overdue_row(rev, now));
         }
         Ok(overdue)
+    }
+
+    /// CIRISServer#356 — **the same question, answered without writing
+    /// anything.**
+    ///
+    /// Byte-for-byte the same `Vec<ConsentPromotionOverdueRow>` that
+    /// [`list_consent_revocation_promotion_overdue`](Self::list_consent_revocation_promotion_overdue)
+    /// returns for the same `(now, sla)`, computed by the same
+    /// [`is_promotion_overdue`] predicate over the same rows — and with the
+    /// `record_hard_case` call removed. Nothing else differs, and the two share
+    /// their predicate rather than copying it so they cannot drift into
+    /// disagreeing about what "overdue" means.
+    ///
+    /// # Why "idempotent" was not good enough
+    ///
+    /// The emitting reader is idempotent, which means *no duplicate rows*. It
+    /// does not mean *no writes*: every call re-executes `record_hard_case` for
+    /// every currently-overdue row, so an operator dashboard polling the
+    /// condition every few seconds drives a write to the audit plane on every
+    /// refresh — forever, at whatever rate someone left the page open at. The
+    /// row count stays flat and the write volume does not, and a substrate that
+    /// makes *looking* a mutation has made observation expensive in exactly the
+    /// place #356 wants it cheap.
+    ///
+    /// So: **poll this one.** Use the emitting sibling (or
+    /// [`run_consent_sla_watch`](Self::run_consent_sla_watch)) when the point
+    /// is to put the breach on the record — a scheduled watcher tick, an
+    /// operator acknowledging the condition. Reading and attesting are two
+    /// different acts and they now have two different methods.
+    ///
+    /// Backend-agnostic default over
+    /// [`list_consent_revocations`](Self::list_consent_revocations); mutates
+    /// nothing on any backend.
+    async fn list_consent_revocation_promotion_overdue_readonly(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        let window =
+            chrono::Duration::from_std(sla).unwrap_or_else(|_| chrono::Duration::hours(24));
+        Ok(self
+            .list_consent_revocations(None)
+            .await?
+            .iter()
+            .filter(|rev| is_promotion_overdue(rev, now, window))
+            .map(|rev| overdue_row(rev, now))
+            .collect())
     }
 
     // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──

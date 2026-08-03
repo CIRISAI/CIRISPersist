@@ -4798,6 +4798,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    /// CIRISServer#356 — this backend DOES charge peer writes
+    /// (`peer_write_quota.check_write` on the `put_attestation` path), so it
+    /// answers rather than taking the `None` default.
+    fn peer_quota_observation(
+        &self,
+    ) -> Option<crate::federation::replication::admission::PeerQuotaObservation> {
+        Some(self.peer_write_quota.observe())
+    }
+
     async fn list_hard_case_events(
         &self,
         filter: crate::federation::hard_case::HardCaseFilter,
@@ -9456,6 +9465,19 @@ mod tests {
         let backend = MemoryBackend::new();
         crate::federation::replication::admission::gate_order_test_support::
             assert_per_peer_write_quota_is_wired(&backend, "mem").await;
+    }
+
+    /// CIRISServer#356 — the operator read surface on the memory backend:
+    /// unknown-not-green, the distinguished zeroes, and the read-only overdue
+    /// query's zero-write proof. Shares its body with the sqlite and postgres
+    /// twins.
+    #[tokio::test]
+    async fn node_state_surface_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::node_state::parity_test_support::assert_node_state_surface(
+            &backend, "mem",
+        )
+        .await;
     }
 
     /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from

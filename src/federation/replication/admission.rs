@@ -1462,6 +1462,57 @@ pub struct PeerWriteQuota {
     state: std::sync::Mutex<QuotaState>,
 }
 
+/// CIRISServer#356 — what [`PeerWriteQuota::observe`] can honestly say about
+/// the #583 tail-squeeze tripwire, **with its volatility in the type**.
+///
+/// # Read the name before the numbers
+///
+/// [`process_local`](Self::process_local) is `true` on every value this crate
+/// can produce, and it is a field rather than a doc note on purpose. The quota
+/// is held per backend instance (never a process global — see
+/// [`PeerWriteQuota`]), so both counters below:
+///
+/// - **reset when the process restarts**, and reset again when a host opens a
+///   second engine over the same database;
+/// - **differ between processes** serving the same node, so two replicas of one
+///   service report two different numbers for one node;
+/// - **are not stored anywhere.** No row backs them, no replication carries
+///   them, and no peer can be shown them as evidence.
+///
+/// So this is a **gauge of this process**, not a fact about the node. Summing
+/// it across replicas, diffing it across restarts, or putting it on a trust
+/// card would each be reading it as something it is not. Making it durable
+/// would be a schema change and is deliberately not one that was taken here.
+///
+/// # What it is genuinely good for
+///
+/// [`slot_denials`](Self::slot_denials) **must be 0** — the
+/// [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`] derivation makes the branch that
+/// increments it unreachable by arithmetic over four constants. A non-zero
+/// reading is therefore not "traffic is heavy", it is *"the inequality the
+/// derivation gate asserts no longer holds in this build"*, which is worth
+/// seeing from outside the crate's own test module — the only place it was
+/// observable before this cut.
+///
+/// It is emphatically **not** a throttling metric: ordinary quota refusals
+/// (`PeerQuotaRefusal`) are a different, far more common thing and are not
+/// counted here at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerQuotaObservation {
+    /// Always `true`. See the type doc — this is the field that says the two
+    /// numbers below are about a process, not about a node.
+    pub process_local: bool,
+    /// Peers holding an individual budget in THIS engine's table right now.
+    ///
+    /// The tripwire's denominator: `0` means no peer write has been charged
+    /// against this quota since the engine was opened, so
+    /// [`slot_denials`](Self::slot_denials) being `0` is *untested*, not
+    /// *clean*.
+    pub tracked_peers: usize,
+    /// The #583 tail-squeeze count. **Must be 0**; see the type doc.
+    pub slot_denials: u64,
+}
+
 /// The four budgets, behind one lock. They move together on every write, so
 /// splitting the lock would only buy a torn decision.
 struct QuotaState {
@@ -1794,6 +1845,29 @@ impl PeerWriteQuota {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .slot_denials
+    }
+
+    /// CIRISServer#356 — the tail-squeeze tripwire **and the denominator that
+    /// makes it readable**, taken under one lock so the two cannot disagree.
+    ///
+    /// [`slot_denials`](Self::slot_denials) alone is not reportable state.
+    /// Zero is both "the derivation still holds" and "this process has not
+    /// exercised the branch yet", and a surface that cannot tell those apart
+    /// renders a just-booted node green on evidence it does not have. Pairing
+    /// the counter with [`tracked_peers`](Self::tracked_peers) separates them:
+    /// an empty bucket table means no peer write has been charged here at all,
+    /// so the tripwire has not been tested and the honest band is *unknown*.
+    ///
+    /// **Process-local and non-durable**, which is why it is named on the type
+    /// rather than left in prose — see [`PeerQuotaObservation`].
+    #[must_use]
+    pub fn observe(&self) -> PeerQuotaObservation {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        PeerQuotaObservation {
+            process_local: true,
+            tracked_peers: st.buckets.len(),
+            slot_denials: st.slot_denials,
+        }
     }
 
     /// Remaining tokens in `key_id`'s own bucket for one dimension/horizon,

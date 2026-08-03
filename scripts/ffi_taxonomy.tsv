@@ -281,6 +281,7 @@ Engine	list_communities_for_member_json	empirical
 Engine	list_community_membership_revocations_for_json	empirical
 Engine	list_consent_peers	empirical
 Engine	list_consent_revocation_promotion_overdue_json	empirical
+Engine	list_consent_revocation_promotion_overdue_readonly_json	empirical
 Engine	list_consumers	structural
 Engine	list_delivery_receipts_for	testimonial
 Engine	list_families_for_member_active_json	empirical
@@ -355,6 +356,7 @@ Engine	match_ack_to_outbound	procedural
 Engine	may_release_copy_json	deontic
 Engine	moderators_of_json	empirical
 Engine	next_sequence	testimonial
+Engine	node_state_json	epistemic
 Engine	nodes_stewarded_by_json	empirical
 Engine	outbound_queue_capsule	structural
 Engine	outbound_queue_ops_capsule	structural
@@ -362,6 +364,7 @@ Engine	outbound_status	empirical
 Engine	owner_of_json	empirical
 Engine	peek_sequence	testimonial
 Engine	peer_metadata_for_json	empirical
+Engine	peer_quota_observation_json	epistemic
 Engine	promote_consented_backlog	procedural
 Engine	provenance_chain	testimonial
 Engine	public_key_b64	ontological
@@ -404,6 +407,9 @@ Engine	remove_moderator	deontic
 Engine	remove_peer_record	deontic
 Engine	repair_stranded_scope_backlog	procedural
 Engine	replay_abandoned	procedural
+Engine	resolve_key_statement_standing_json	deontic
+Engine	resolve_quarantine_json	deontic
+Engine	resolve_reverse_quorum_json	deontic
 Engine	resolve_scores	axiotic
 Engine	resolve_transit_eligibility_json	deontic
 Engine	respond_classical_kex_b64	ontological
@@ -500,6 +506,7 @@ Engine	ticket_upsert	empirical
 Engine	trace_summary_extraction	nomological
 Engine	trust_grant_consistency_proof	testimonial
 Engine	trust_grant_inclusion_proof	testimonial
+Engine	trust_root_verdict_json	deontic
 Engine	trust_scoring_capsule	structural
 Engine	tsdb_consolidate_audit	procedural
 Engine	tsdb_consolidate_conversations	procedural

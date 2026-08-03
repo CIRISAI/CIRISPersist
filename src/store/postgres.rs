@@ -7545,6 +7545,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    /// CIRISServer#356 — this backend DOES charge peer writes
+    /// (`peer_write_quota.check_write` on the `put_attestation` path), so it
+    /// answers rather than taking the `None` default.
+    fn peer_quota_observation(
+        &self,
+    ) -> Option<crate::federation::replication::admission::PeerQuotaObservation> {
+        Some(self.peer_write_quota.observe())
+    }
+
     async fn list_hard_case_events(
         &self,
         filter: crate::federation::HardCaseFilter,
@@ -19994,6 +20003,26 @@ mod tests {
         let tag = uuid_like();
         crate::federation::replication::admission::gate_order_test_support::
             assert_per_peer_write_quota_is_wired(&backend, &tag).await;
+    }
+
+    /// CIRISServer#356 — the operator read surface on POSTGRES:
+    /// unknown-not-green, the distinguished zeroes, and the read-only overdue
+    /// query's zero-write proof. Shares its body with the memory and sqlite
+    /// twins — a read surface proven on memory alone is proven nowhere (#541).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn node_state_surface_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = uuid_like();
+        crate::federation::node_state::parity_test_support::assert_node_state_surface(
+            &backend, &tag,
+        )
+        .await;
     }
 
     /// v24.4.0 (CIRISPersist#583) on POSTGRES: the quota's BYTE dimension is
