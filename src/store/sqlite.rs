@@ -20294,6 +20294,19 @@ mod tests {
         .await;
     }
 
+    /// (CIRISPersist#593) — the SQLITE leg of the shared moderation-duty walk
+    /// liveness witness (see the memory + postgres legs); all three call the
+    /// SAME `admission::moderation_walk_liveness_test_support` body.
+    #[tokio::test]
+    async fn moderation_walk_liveness_parity_sqlite_593() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
+            &backend, "sq",
+        )
+        .await;
+    }
+
     /// (CIRISPersist#584) — the SQLITE leg of the objection-plane blast-radius
     /// witness (see the memory + postgres legs).
     #[tokio::test]

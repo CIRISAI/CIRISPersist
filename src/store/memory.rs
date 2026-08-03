@@ -96,6 +96,17 @@ pub struct MemoryBackend {
     /// for) would be an immediate cross-test flake. Always on; the limit is
     /// a substrate constant, not an operator knob.
     peer_write_quota: crate::federation::replication::admission::PeerWriteQuota,
+    /// (CIRISPersist#593) — how many times has
+    /// [`FederationDirectory::list_attestations_by`] been called on this
+    /// instance? See [`MemoryBackend::attestation_read_counts`]; this exists so
+    /// a walk's read cost can be **measured** rather than estimated.
+    ///
+    /// [`FederationDirectory::list_attestations_by`]: crate::federation::FederationDirectory::list_attestations_by
+    attestation_reads_by: std::sync::atomic::AtomicU64,
+    /// (CIRISPersist#593) — the [`list_attestations_for`] twin.
+    ///
+    /// [`list_attestations_for`]: crate::federation::FederationDirectory::list_attestations_for
+    attestation_reads_for: std::sync::atomic::AtomicU64,
 }
 
 struct State {
@@ -453,6 +464,8 @@ impl Default for MemoryBackend {
             )),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
+            attestation_reads_by: std::sync::atomic::AtomicU64::new(0),
+            attestation_reads_for: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -461,6 +474,32 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// (CIRISPersist#593) — snapshot `(list_attestations_by,
+    /// list_attestations_for)` call counts for this instance.
+    ///
+    /// A directory-read counter, not a walk-internal one: it counts what the
+    /// substrate was actually asked for, so a claim like *"the moderation walk
+    /// costs at most 2× the reads it used to"* is a measurement rather than an
+    /// estimate. Two relaxed atomic increments inside methods that already take
+    /// the state mutex — no meaningful cost, and the memory backend is the one
+    /// every test reaches for.
+    #[must_use]
+    pub fn attestation_read_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.attestation_reads_by.load(Ordering::Relaxed),
+            self.attestation_reads_for.load(Ordering::Relaxed),
+        )
+    }
+
+    /// (CIRISPersist#593) — zero both counters, so a measurement can start at a
+    /// known point after the fixture has finished writing.
+    pub fn reset_attestation_read_counts(&self) {
+        use std::sync::atomic::Ordering;
+        self.attestation_reads_by.store(0, Ordering::Relaxed);
+        self.attestation_reads_for.store(0, Ordering::Relaxed);
     }
 
     /// v22.0.0 (CIRISPersist#543) — install a custom hardware-attestation
@@ -2918,6 +2957,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attested_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        self.attestation_reads_for
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_attestations
@@ -2937,6 +2978,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attesting_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        self.attestation_reads_by
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_attestations
@@ -15744,6 +15787,32 @@ mod tests {
     async fn steward_binding_liveness_parity_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// (CIRISPersist#593) — the MEMORY leg of the shared moderation-duty walk
+    /// liveness witness (the two biconditionals + subject-revocation liveness on
+    /// the `moderate`/`takedown`/`review` plane).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn moderation_walk_liveness_parity_memory_593() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// (CIRISPersist#593) — the read cost of the new incoming-retraction
+    /// clause, MEASURED against this backend's own directory-read counters, and
+    /// the proof that the predicate walk still stops at the first hit.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn moderation_walk_read_cost_memory_593() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_read_cost(
             &backend, "mem",
         )
         .await;
