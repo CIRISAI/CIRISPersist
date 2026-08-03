@@ -3858,40 +3858,50 @@ fn delegation_grants_sub_delegation(envelope: &serde_json::Value) -> bool {
 /// `delegates_to`-chain consumers that share
 /// [`issuer_reaches_target_via_scoped_delegation`]:
 ///
-/// - **`consent_revocation`** (CEG §3.2.3) — the pre-existing proxy
-///   revocation walk. `enforce_attenuation_and_sub_delegation = false`
-///   and `skip_withdrawn_edges = false`: BYTE-IDENTICAL to the v6.4.0
-///   behavior (no `⊆`-parent attenuation, no `sub_delegation`
-///   deputization gate, no per-edge `withdraws` skip). Its delegations
-///   simply do not set those constraints, so adding the machinery behind
-///   a `false` flag cannot regress it.
-/// - **§11.10 `moderate` / `takedown` / `review`** (CEG RC24) — the new
-///   moderation-enforcement walk. Both flags `true`: each edge's scope
-///   must be `⊆` its parent edge's scope (restate-or-attenuate), a
-///   non-root node may only be reached through a parent edge that granted
-///   `sub_delegation`, and a `withdraws`-revoked edge (issuer-against-
-///   recipient, UCAN-style) invalidates everything downstream.
+/// - **`consent_revocation`** (CEG §3.2.3) — the proxy revocation walk
+///   (rule 3, and the proxy half of rule 4).
+///   `enforce_attenuation_and_sub_delegation = false`: its delegations do
+///   not carry `⊆`-parent attenuation or a `sub_delegation` deputization
+///   gate, so those constraints do not apply to it.
+/// - **§11.10 `moderate` / `takedown` / `review`** (CEG RC24) — the
+///   moderation-enforcement walk. `enforce_attenuation_and_sub_delegation
+///   = true`: each edge's scope must be `⊆` its parent edge's scope
+///   (restate-or-attenuate) and a non-root node may only be reached
+///   through a parent edge that granted `sub_delegation`.
+///
+/// # Retraction is NOT a policy axis (CIRISPersist#594)
+///
+/// This struct used to carry a second flag, `skip_withdrawn_edges`, which
+/// the consent-revocation policy set to `false` — so that walk consulted
+/// **no retraction at all**, not even one the granter issued against its own
+/// edge. It was introduced in v8.7.1 to add per-edge revocation for the
+/// moderation walk *without* changing the consent walk, and documented as
+/// keeping that walk "BYTE-IDENTICAL to the v6.4.0 behaviour".
+///
+/// That was true, and it was the defect: byte-identical-to-v6.4.0 preserved a
+/// v6.4.0 **gap** rather than a v6.4.0 **decision**. Nothing anywhere recorded
+/// that a plane should ignore retractions; it read as compatibility, and
+/// compatibility with an unexamined default is not a policy.
+///
+/// So the flag is **gone** rather than flipped. Both retraction gates now run
+/// on every walk, unconditionally, and there is no way to spell a walk that
+/// skips them — which is the point: a flag that only ever had one correct
+/// value is a way for the wrong value to come back.
 #[derive(Debug, Clone, Copy)]
 struct DelegationWalkPolicy {
     /// Enforce `child.scope ⊆ parent.scope` along the chain AND require
     /// `sub_delegation` on the parent edge before traversing past depth 1.
     enforce_attenuation_and_sub_delegation: bool,
-    /// Skip any `delegates_to` edge the granter has `withdraws`/`recants`-
-    /// revoked against the recipient (topology's edge-retraction model).
-    skip_withdrawn_edges: bool,
 }
 
 impl DelegationWalkPolicy {
-    /// The pre-v8.7.1 behavior — consent_revocation proxy reachability.
+    /// Consent_revocation proxy reachability (CEG §3.2.3 rules 3 / 4).
     const CONSENT_REVOCATION: Self = Self {
         enforce_attenuation_and_sub_delegation: false,
-        skip_withdrawn_edges: false,
     };
-    /// The §11.10 moderation-duty walk — attenuation + sub_delegation +
-    /// per-edge revocation all enforced.
+    /// The §11.10 moderation-duty walk — attenuation + sub_delegation.
     const MODERATION_DUTY: Self = Self {
         enforce_attenuation_and_sub_delegation: true,
-        skip_withdrawn_edges: true,
     };
 }
 
@@ -3998,7 +4008,8 @@ struct ScopedReach {
 ///
 /// # The retraction gates — two of them, reading two different row sets
 ///
-/// Under `policy.skip_withdrawn_edges` an edge is skipped when EITHER:
+/// An edge is skipped — on EVERY walk, unconditionally since
+/// CIRISPersist#594 — when EITHER:
 ///
 ///   * its granter retracted it — a `withdraws`/`recants` among the granter's
 ///     OUTGOING rows naming the recipient (the §11.10 edge-retraction model,
@@ -4008,14 +4019,39 @@ struct ScopedReach {
 ///     `references_attestation_id` — CEG §3.2.3 rules 2/3/4, which the granter
 ///     by definition never issued.
 ///
-/// The second clause is the whole point of this cut: without it a
+/// The second clause is the whole point of the #593 cut: without it a
 /// subject-revoked `delegates_to` kept conferring `moderate` / `takedown` /
 /// `review`. The two clauses read DIFFERENT rows, so neither subsumes the
 /// other and neither may be deleted as redundant.
 ///
-/// The clause does not re-litigate AUTHORITY. A stored `withdraws` already
-/// passed [`check_withdraws_admission`], which is where CEG §3.2.3 rules 1-4
-/// decided whether its issuer had standing.
+/// Neither clause re-litigates AUTHORITY. A stored `withdraws` already passed
+/// [`check_withdraws_admission`], which is where CEG §3.2.3 rules 1-4 decided
+/// whether its issuer had standing.
+///
+/// # Why the consent-revocation plane needed this too (CIRISPersist#594)
+///
+/// On that plane the delegation confers **rule-(3) proxy revocation
+/// authority**: the right to file an admitted `withdraws` on behalf of a
+/// subject who cannot hold a federation key — a Discord user-id, a
+/// content-sha256-bound entity. Skipping the retraction gates there meant a
+/// proxy whose delegation had been withdrawn *by its own granter* kept
+/// speaking for exactly the party CC 1.13.2 names as least able to object.
+///
+/// Honouring retractions here raises a question the moderation plane does not
+/// have, because rule-3 authority is **itself a revocation mechanism**: can a
+/// proxy defend its own edge, or attack a rival's? It cannot, and the reason
+/// is structural rather than a rule bolted on:
+///
+///   * the walk is DIRECTED, and a `delegates_to` names its RECIPIENT in
+///     `subject_key_ids` — so retracting the edge that empowers you is
+///     resignation, which is exactly what rule 2 is for;
+///   * SIBLING proxies under one root never reach each other, so neither can
+///     obtain rule-3 standing against the other's edge and become the sole
+///     proxy for a subject who cannot object.
+///
+/// Both are pinned by the witness rather than left as reasoning, because the
+/// sibling case is the one that would be a privilege escalation and it is
+/// currently prevented by a topology property, not by a check.
 ///
 /// # Reach — the honest bound
 ///
@@ -4028,15 +4064,21 @@ struct ScopedReach {
 ///
 /// # Cost
 ///
-/// One `list_attestations_by` per dequeued node (unchanged), plus — under
-/// `skip_withdrawn_edges` only — one `list_attestations_for` per DISTINCT
-/// recipient of an edge that survived the type, scope, granter-retraction and
-/// `⊆`-attenuation gates. Memoized for the whole walk, so a root with twenty
-/// `moderate` edges to one deputy costs ONE extra read, and placed LAST so
-/// pruned edges pay nothing. CIRISPersist#584's trick — skip the read when the
-/// granter is not `user`-role — does NOT transfer: any recipient's incoming
-/// edge can be revoked, so there is no analogous precondition. The bound is
-/// therefore ≤ 2× the reads of the pre-#593 walk, never a per-edge fan-out.
+/// One `list_attestations_by` per dequeued node (unchanged), plus one
+/// `list_attestations_for` per DISTINCT recipient of an edge that survived the
+/// type, scope, granter-retraction and `⊆`-attenuation gates. Memoized for the
+/// whole walk, so a root with twenty `moderate` edges to one deputy costs ONE
+/// extra read, and placed LAST so pruned edges pay nothing.
+/// CIRISPersist#584's trick — skip the read when the granter is not
+/// `user`-role — does NOT transfer: any recipient's incoming edge can be
+/// revoked, so there is no analogous precondition. The bound is therefore
+/// ≤ 2× the reads of the pre-#593 walk, never a per-edge fan-out.
+///
+/// CIRISPersist#594 extends that same bound to the consent-revocation plane,
+/// which previously paid neither gate. Its walks are shallow (rule 3 probes a
+/// subject set; `MAX_WITHDRAWS_DELEGATION_DEPTH` caps the chain), so the
+/// absolute cost is small — but it is a real increase from 1× to ≤2×, and is
+/// measured by the witness rather than asserted here.
 async fn scoped_delegation_reach(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
@@ -4094,16 +4136,15 @@ async fn scoped_delegation_reach(
         let rows = directory.list_attestations_by(&node.key).await?;
         // §11.10: bucket this granter's `withdraws`/`recants` retractions by
         // recipient so a revoked edge invalidates the downstream chain
-        // (UCAN-style; topology's edge-retraction model). Inert for
-        // consent_revocation (`skip_withdrawn_edges == false`).
+        // (UCAN-style; topology's edge-retraction model). Unconditional since
+        // CIRISPersist#594 — a granter's retraction of its own edge means the
+        // same thing on every plane.
         let mut retracted: HashSet<String> = HashSet::new();
-        if policy.skip_withdrawn_edges {
-            for r in &rows {
-                if r.attestation_type == attestation_type::WITHDRAWS
-                    || r.attestation_type == attestation_type::RECANTS
-                {
-                    retracted.insert(r.attested_key_id.clone());
-                }
+        for r in &rows {
+            if r.attestation_type == attestation_type::WITHDRAWS
+                || r.attestation_type == attestation_type::RECANTS
+            {
+                retracted.insert(r.attested_key_id.clone());
             }
         }
         let is_issuer = node.depth == 0;
@@ -4125,7 +4166,7 @@ async fn scoped_delegation_reach(
                 continue;
             }
             // Retraction gate (a): the granter retracted its own edge.
-            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
+            if retracted.contains(&r.attested_key_id) {
                 if to_target {
                     out.target_edge_retracted = true;
                 }
@@ -4151,18 +4192,15 @@ async fn scoped_delegation_reach(
             // edges that survived every cheaper gate pay a read, and memoized
             // per recipient so the fan-out is bounded by distinct recipients
             // rather than by edges.
-            if policy.skip_withdrawn_edges {
-                if !incoming_retracted.contains_key(&r.attested_key_id) {
-                    let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
-                    incoming_retracted
-                        .insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
+            if !incoming_retracted.contains_key(&r.attested_key_id) {
+                let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
+            }
+            if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
+                if to_target {
+                    out.target_edge_retracted = true;
                 }
-                if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
-                    if to_target {
-                        out.target_edge_retracted = true;
-                    }
-                    continue;
-                }
+                continue;
             }
             // The edge is traversable. Record the recipient (the enumerating
             // projection) BEFORE the short-circuit, so the two never disagree
@@ -14424,19 +14462,29 @@ pub(crate) mod moderation_walk_liveness_test_support {
              property (CIRISRegistry#90 'and only then')"
         );
 
-        // ── THE SCOPE DECISION, pinned ───────────────────────────────────
-        // The new clause is gated on `policy.skip_withdrawn_edges`, so the
-        // CONSENT_REVOCATION walk (whose doc pins it BYTE-IDENTICAL to v6.4.0)
-        // is unchanged: a subject-revoked hop still confers proxy revocation
-        // authority. That plane carries the same defect and is filed
-        // separately as CIRISPersist#594, NOT widened here. Flip the gate and
-        // this goes red.
+        // ── THE CONSENT-REVOCATION PLANE — CIRISPersist#593's tripwire,
+        //    RETARGETED by CIRISPersist#594 ───────────────────────────────
         //
-        // **This block is CIRISPersist#594's tripwire, and #594 says so.** Do
-        // not delete it when that issue is fixed — RETARGET it. The two
-        // assertions below record the plane's behaviour exactly as it stands
-        // today, including the stronger fact #594 names: this walk consults NO
-        // retraction at all, not even the granter's own.
+        // #593 left this block asserting the DEFECT (the walk consulted no
+        // retraction at all) with instructions to flip it rather than delete
+        // it when #594 landed. This is that flip. It is still the tripwire:
+        // narrow the retraction gates on this plane again and it goes red.
+        //
+        // **Each clause gets its OWN edge.** #593's version reused one edge
+        // for both, which meant the granter-retraction assertion ran with the
+        // subject's retraction already in place — so once the first clause
+        // worked, the second would pass whether or not it was implemented.
+        // Two clauses that read DIFFERENT rows need two fixtures, or the
+        // weaker one is never actually under test.
+        let cr_targets_of = |k: &String| -> std::collections::HashSet<String> {
+            std::iter::once(k.clone()).collect()
+        };
+
+        // ── clause (a): the GRANTER retracts its own edge ────────────────
+        // The #594 core. `bare_edge_retraction` carries NO
+        // `references_attestation_id` — it is the §11.10 edge-retraction
+        // shape, granter-against-recipient — so ONLY the granter-scoped gate
+        // can see it. If that gate is dropped this goes red.
         let cr_from = format!("mw-cr-from-{suffix}");
         let cr_to = format!("mw-cr-to-{suffix}");
         register(dir, &cr_from, &[identity_type::USER]).await;
@@ -14449,8 +14497,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             true,
         );
         store(dir, &cr_edge).await.expect("cr edge admitted");
-        let cr_targets: std::collections::HashSet<String> =
-            std::iter::once(cr_to.clone()).collect();
+        let cr_targets = cr_targets_of(&cr_to);
         assert!(
             issuer_reaches_target_via_consent_revocation_delegation(
                 dir,
@@ -14462,33 +14509,11 @@ pub(crate) mod moderation_walk_liveness_test_support {
             .expect("consent-revocation walk"),
             "the live consent-revocation edge confers proxy authority"
         );
-        store(dir, &withdraws_of(&cr_to, &cr_to, &cr_edge.attestation_id))
-            .await
-            .expect("the subject's rule-2 withdraws lands");
-        assert!(
-            issuer_reaches_target_via_consent_revocation_delegation(
-                dir,
-                &cr_from,
-                &cr_targets,
-                MAX_WITHDRAWS_DELEGATION_DEPTH,
-            )
-            .await
-            .expect("consent-revocation walk"),
-            "CIRISPersist#593 deliberately does NOT widen the consent-revocation plane: its walk \
-             policy sets `skip_withdrawn_edges = false` and its doc pins it byte-identical to \
-             v6.4.0. Widening it silently is what this assertion exists to stop — the same defect \
-             is filed as CIRISPersist#594, with its own adopters and its own adoption note"
-        );
-        // …and the stronger fact, recorded here because it is the reason #594
-        // exists rather than being folded in: the GRANTER's own edge-retraction
-        // is equally invisible on this plane. `skip_withdrawn_edges = false`
-        // means no retraction is consulted at all — the narrow fold #578/#584/
-        // #593 each repaired is a SUBSET of this one. Verified, not inferred.
         store(dir, &bare_edge_retraction(&cr_from, &cr_to))
             .await
             .expect("the granter's own edge-retraction lands");
         assert!(
-            issuer_reaches_target_via_consent_revocation_delegation(
+            !issuer_reaches_target_via_consent_revocation_delegation(
                 dir,
                 &cr_from,
                 &cr_targets,
@@ -14496,9 +14521,106 @@ pub(crate) mod moderation_walk_liveness_test_support {
             )
             .await
             .expect("consent-revocation walk"),
-            "CIRISPersist#594: the consent-revocation proxy walk consults NO retraction — not even \
-             one the granter issued itself. This assertion documents the defect as it stands; when \
-             #594 lands it must be RETARGETED (flipped to `!`), never deleted"
+            "CIRISPersist#594: a `delegates_to` the GRANTER itself withdrew must stop conferring \
+             rule-(3) proxy authority. Before #594 this plane consulted no retraction at all, so a \
+             revoked proxy could still revoke consent on behalf of a subject who cannot hold a key \
+             to object (CC 1.13.2). This is the assertion #593 asked to have flipped, not deleted"
+        );
+
+        // ── clause (b): the SUBJECT names the edge (CEG §3.2.3 rules 2/3/4)
+        // A FRESH edge, so this is not satisfied by clause (a)'s retraction.
+        // `withdraws_of` carries `references_attestation_id`, which the
+        // granter-scoped gate structurally cannot see — the granter never
+        // issued it. Only the #593 incoming-rows clause catches this one.
+        let cr2_from = format!("mw-cr2-from-{suffix}");
+        let cr2_to = format!("mw-cr2-to-{suffix}");
+        register(dir, &cr2_from, &[identity_type::USER]).await;
+        register(dir, &cr2_to, &[identity_type::PRIMITIVE]).await;
+        let cr2_edge = moderation_edge(
+            &cr2_from,
+            &cr2_to,
+            &[DELEGATION_SCOPE_CONSENT_REVOCATION],
+            &[&cr2_to],
+            true,
+        );
+        store(dir, &cr2_edge).await.expect("cr2 edge admitted");
+        let cr2_targets = cr_targets_of(&cr2_to);
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &cr2_from,
+                &cr2_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "the live consent-revocation edge confers proxy authority"
+        );
+        store(
+            dir,
+            &withdraws_of(&cr2_to, &cr2_to, &cr2_edge.attestation_id),
+        )
+        .await
+        .expect("the subject's rule-2 withdraws lands");
+        assert!(
+            !issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &cr2_from,
+                &cr2_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "CIRISPersist#594: the subject's own rule-2 retraction of the delegation naming it \
+             must also stop conferring proxy authority. This is the #593 clause, now reaching this \
+             plane too — the two gates read DIFFERENT rows, so neither subsumes the other"
+        );
+
+        // ── the answer to \"can the proxy path revoke itself?\", asserted
+        //    rather than argued (CIRISPersist#594) ──────────────────────────
+        // Rule-3 proxy authority IS a revocation mechanism, so honouring
+        // retractions here raises a question the moderation plane never had:
+        // can a proxy defend its own edge, or attack a rival's? The walk is
+        // DIRECTED and an edge names its RECIPIENT as subject, so:
+        //   * self-retraction is resignation — already covered by clause (b);
+        //   * SIBLING proxies never reach each other, so one cannot revoke the
+        //     other's edge by this path at all.
+        // The sibling case is the one that would be a privilege escalation,
+        // and it is structurally unreachable. Pinned so a future widening of
+        // the walk (an up-walk, a fan-out read) cannot quietly create it.
+        let sib_root = format!("mw-cr-sib-root-{suffix}");
+        let sib_a = format!("mw-cr-sib-a-{suffix}");
+        let sib_b = format!("mw-cr-sib-b-{suffix}");
+        register(dir, &sib_root, &[identity_type::USER]).await;
+        register(dir, &sib_a, &[identity_type::PRIMITIVE]).await;
+        register(dir, &sib_b, &[identity_type::PRIMITIVE]).await;
+        for peer in [&sib_a, &sib_b] {
+            store(
+                dir,
+                &moderation_edge(
+                    &sib_root,
+                    peer,
+                    &[DELEGATION_SCOPE_CONSENT_REVOCATION],
+                    &[peer],
+                    true,
+                ),
+            )
+            .await
+            .expect("sibling proxy edge admitted");
+        }
+        assert!(
+            !issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &sib_a,
+                &cr_targets_of(&sib_b),
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "CIRISPersist#594: two proxies under one root must NOT reach each other. If they did, \
+             either could file an admitted rule-(3) `withdraws` against the other's delegation and \
+             become the sole proxy for a subject who cannot object — a privilege escalation the \
+             directed walk is what prevents"
         );
     }
 
