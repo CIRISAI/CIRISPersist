@@ -3588,8 +3588,9 @@ pub async fn resolve_withdraws_admission_rule(
         return Ok(1);
     }
 
-    // v21.11.0 (CIRISPersist#528, CC 3.4.5 — the anti-Goodhart DUAL) — for the
-    // scored families whose SELF-EMISSION is banned (`capacity:*` /
+    // v21.11.0 (CIRISPersist#528), RATIFIED at **CC 2.4.1.1** as the
+    // anti-Goodhart retraction dual — for the scored families whose
+    // SELF-EMISSION is banned (`capacity:*` /
     // `detection:*`: `attesting_key_id` MUST NOT equal `attested_key_id`), the
     // subject-derived revocation rules (2/3/4) are DENIED. The scored agent is
     // legitimately named in `subject_key_ids` (it is who the claim is about —
@@ -3603,6 +3604,28 @@ pub async fn resolve_withdraws_admission_rule(
     // only the subject-self path is cut. `subject_key_ids` carries
     // naming-but-not-revocation for these families (the manifest's rubric keeps
     // `data_subject` and `recipient_revoke` distinct precisely for this).
+    //
+    // **Ratification history — read this before touching the citation.**
+    // v21.11.0 shipped this behaviour citing "CC 3.4.5 — the anti-Goodhart
+    // DUAL". **No such rule existed at CC 3.4.5**, and CC 2.4.1.1 said the
+    // substrate MUST admit under ANY of rules 1-4 with no carve-out. So for
+    // four minor versions this gate refused writes the Constitution required
+    // us to accept, on the authority of a clause nobody had written
+    // (CIRISPersist#587). The behaviour was right and only the citation was
+    // invented — but a comment asserting a rule that does not exist is how a
+    // reader concludes a question is settled when it is open.
+    //
+    // CC has since ratified the dual **in the MUST sentence itself** at CC
+    // 2.4.1.1, stated inline rather than by forward reference, and it is
+    // admissible only because CC 4.5.5 simultaneously grants the subject
+    // standing on `reconsideration:{grounds}` — contestation at zero
+    // disclosure, where the subject files band-blind and a duty-holder who CAN
+    // see the composition performs the valence-sensitive step. CC 4.5.5 says
+    // so explicitly: "the withdraws path closes only because a real contest
+    // path exists." **The two are one ruling.** If a future cut weakens the
+    // `reconsideration:{grounds}` standing, this gate must be revisited in the
+    // same change — otherwise it goes back to closing a door with nothing
+    // behind it, which is what #587 actually objected to.
     let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
         .is_some_and(|d| d.starts_with("capacity:") || d.starts_with("detection:"));
     if target_denies_subject_revocation {

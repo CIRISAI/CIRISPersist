@@ -508,10 +508,46 @@ impl HardwareAttestationPolicy {
     ///
     /// This is the SAME depth the [`AttestationEvidence::Hardware`] arm has
     /// always had (see the module header: persist does not do active chain
-    /// validation; that is the registry-side / CIRISVerify#32 Ask 5 surface).
-    /// The full chain walk runs where the pinned root lives — CIRISServer's
-    /// admission gate — and persist's storage of the evidence preserves the
-    /// audit trail either way.
+    /// validation *at this call site*).
+    ///
+    /// # Where the chain IS walked — corrected v25.1.0
+    ///
+    /// This note previously said the full walk "runs where the pinned root
+    /// lives — CIRISServer's admission gate." **That was wrong, and wrong in
+    /// the dangerous direction: it pointed a reader at another repo.** Server
+    /// imports `verify_yubikey_piv_attestation`, but the walk against the
+    /// *production* root runs **here, in persist**, roughly 4,300 lines below
+    /// this comment:
+    ///
+    /// - [`super::admission::verify_member_fips_custody_against`] — ungated
+    ///   `pub fn`, calling verify's `verify_accord_custody_attestation`.
+    /// - Reached at runtime from `verify_accord_family_coscrub_with`, under
+    ///   the canonical-role gate, against the pinned
+    ///   [`super::admission::YUBICO_ATTESTATION_ROOT_1_DER`] — production
+    ///   code, not a fixture. A caller-supplied root never reaches the
+    ///   admission path.
+    /// - The **baked production holders have actually been walked**:
+    ///   `baked_accord_holders_fips_custody_verifies_513` runs the real A1 /
+    ///   B1 / C1 genesis records against the real pinned root — holder
+    ///   hybrid signature, `9c → f9 → root` link-by-link, attested key ==
+    ///   holder's federation Ed25519, FIPS + touch=always — plus the inverse,
+    ///   that mock members fail against the real root.
+    ///
+    /// Two further corrections: verify **does** ship the pinned root since
+    /// v10.10.0 (`trust_anchor_store::baked`), so "verify deliberately ships
+    /// neither" is stale — it ships the root and still requires
+    /// caller-supplied directory pubkeys, which is correct because the
+    /// directory is ours. And the runtime gate is **canonical-role only** by
+    /// design (#513): ordinary node/agent admission does not walk the chain.
+    ///
+    /// The lesson is worth more than the correction. A deferral note that
+    /// names another component as the place the check happens is a claim
+    /// about a repo you are not compiling, and nothing fails when it stops
+    /// being true. This one was stale in the direction that reads as "someone
+    /// else has it covered" — the exact shape of #545/#554, where two layers
+    /// each believed the other verified the artifact. **Persist's storage of
+    /// the evidence preserves the audit trail regardless; the walk is what
+    /// makes it mean something, and the walk is ours.**
     ///
     /// # No freshness check — deliberately
     ///
