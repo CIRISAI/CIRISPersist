@@ -20474,6 +20474,28 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — the postgres leg of the shared
+    /// "the pointer confers no subject authority" witness (see the sqlite +
+    /// memory legs). postgres reads the pointer in SQL
+    /// (`->>'references_attestation_id'` anti-joins) where the others fold in
+    /// Rust, so this leg is the one that would catch a backend that resolved a
+    /// subject through the pointer in a query.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pointer_confers_no_subject_authority_postgres_579() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::precedence::test_support::exercise_pointer_confers_no_subject_authority(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v24.2.0 (CIRISPersist#564 stage 1) — the postgres leg of the shared
     /// `is_load_bearing` witness (see `sqlite::tests::
     /// load_bearing_predicate_parity_sqlite_564` and the memory leg); all

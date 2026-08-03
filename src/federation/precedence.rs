@@ -174,6 +174,312 @@ fn wins(a: &Attestation, b: &Attestation) -> bool {
     a.attestation_id < b.attestation_id
 }
 
+/// CIRISPersist#579 (CC 4.5.1.1, rc3) — the shared, backend-agnostic witness
+/// that **the pointer confers no subject authority**.
+///
+/// rc3 removed one of this pointer's three readings: *"under subject-binding
+/// (pointer = data subject) → **not admitted**. Subject authority rides
+/// `subject_key_ids` and nothing else … a processor MUST NOT establish
+/// `data_subject` from `references_attestation_id`."*
+///
+/// Removing a *semantic claim about what a reference means* changes which rows
+/// count as being ABOUT a data subject — consent, erasure and reachability all
+/// key on that. So the claim that persist never took the reading is not
+/// asserted here, it is exercised: through the REAL write path, on every
+/// backend, with positive controls on both sides so a green run cannot mean
+/// "nothing happened".
+///
+/// - The **removal**: `S`, the subject of `P`, may NOT revoke `R` — a row whose
+///   only relation to `S` is that it points at `P`. Under the dropped reading
+///   `S` would be `R`'s data subject and rule 2 would admit.
+/// - **Control A** (subject authority is live): `S` MAY revoke `P` itself,
+///   admitted under rule 2 — so the refusal above is about the pointer, not a
+///   broken fixture.
+/// - **Control B** (the admitted reading is live): `P`'s producer revokes `R`,
+///   and the tombstone fold FOLLOWS THE POINTER to retire it — the removal did
+///   not make the pointer inert, it removed one of its three meanings.
+/// - The **read surface**: a subject-keyed query for `S` returns `P` and never
+///   `R`. This is the erasure/DSAR shape (`attestations.where(s ∈
+///   subject_key_ids)`, CC 4.5.2.2 GDPR Art. 20). All three backends implement
+///   it; a backend that answered `Unsupported` would skip this arm and run the
+///   rest, and any OTHER error fails loudly rather than skipping.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::federation::types::{attestation_tier, attestation_type, Attestation};
+    use crate::federation::{FederationDirectory, SignedAttestation};
+
+    /// The family whose vendored `ci_axes.data_subject.wire_fields` names
+    /// `references_attestation_id` ("the load-bearing pointer … resolving to
+    /// the certified attestation") — i.e. the exact place the dropped reading
+    /// would have applied. Registered at CC 3.1.2, unreserved.
+    ///
+    /// The `:v1` is persist's, not the catalogue's: the catalogued stem carries
+    /// no `:v<N>` segment and the CEG §13.1 four-test gate refuses a `scores`
+    /// dimension without one, so the catalogued spelling cannot reach the wire
+    /// here at all. (Same for the other three families whose `data_subject`
+    /// axis names the pointer — a second, independent reason the dropped
+    /// reading was unreachable in persist; recorded for the re-vendor.)
+    const DIMENSION: &str = "transparency_log:inclusion:v1";
+
+    fn row(
+        id: &str,
+        attester: &str,
+        subjects: &[&str],
+        ty: &str,
+        envelope: serde_json::Value,
+    ) -> Attestation {
+        let (och, ed_sig, pqc_sig) =
+            crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
+        let now = chrono::Utc::now();
+        Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: attester.to_owned(),
+            attested_key_id: attester.to_owned(),
+            attestation_type: ty.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: attester.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects.iter().map(|s| (*s).to_owned()).collect(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// Ids visible to a LIVE-lifecycle read under `filter`, or `None` only when
+    /// the backend genuinely has no such read surface.
+    ///
+    /// A blanket `Err(_) => None` would let any backend failure quietly skip
+    /// every read assertion below — the vacuous-pass shape this whole witness
+    /// exists to avoid. Only [`Error::Unsupported`](crate::federation::Error)
+    /// buys the skip; anything else is a real failure and panics.
+    async fn visible_ids(
+        dir: &dyn FederationDirectory,
+        filter: crate::read::AttestationFilter,
+    ) -> Option<Vec<String>> {
+        match dir.list_scores("", filter, None, 100).await {
+            Ok(page) => Some(page.items.into_iter().map(|a| a.attestation_id).collect()),
+            Err(crate::federation::Error::Unsupported { .. }) => None,
+            Err(e) => panic!("list_scores failed for a reason other than Unsupported: {e}"),
+        }
+    }
+
+    /// The erasure/DSAR shape: everything ABOUT `subject`.
+    async fn subject_visible_ids(
+        dir: &dyn FederationDirectory,
+        subject: &str,
+    ) -> Option<Vec<String>> {
+        visible_ids(
+            dir,
+            crate::read::AttestationFilter {
+                subject_key_id: Some(subject.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Run the witness against one backend. `suffix` scopes every key id so a
+    /// shared postgres test database does not collide across runs.
+    pub(crate) async fn exercise_pointer_confers_no_subject_authority(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let producer = format!("prod-579-{suffix}");
+        let subject = format!("subj-579-{suffix}");
+        for k in [&producer, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+
+        // P — the row that genuinely names `subject` as its data subject.
+        let p_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: row(
+                &p_id,
+                &producer,
+                &[&subject],
+                attestation_type::SCORES,
+                serde_json::json!({ "dimension": DIMENSION, "score": 1.0 }),
+            ),
+        })
+        .await
+        .expect("P admits");
+
+        // R — points AT P and names nobody. Under the dropped subject-binding
+        // reading this row would be "about" `subject`.
+        let r_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: row(
+                &r_id,
+                &producer,
+                &[],
+                attestation_type::SCORES,
+                serde_json::json!({
+                    "dimension": DIMENSION,
+                    "score": 1.0,
+                    "references_attestation_id": p_id,
+                }),
+            ),
+        })
+        .await
+        .expect("R admits");
+
+        // ── read surface: what is ABOUT the subject? P, never R. ──
+        if let Some(ids) = subject_visible_ids(dir, &subject).await {
+            assert!(
+                ids.contains(&p_id),
+                "the subject-keyed read must return P — its subject_key_ids names {subject}"
+            );
+            assert!(
+                !ids.contains(&r_id),
+                "R reached the subject-keyed read for {subject} THROUGH ITS POINTER. That is the \
+                 subject-binding reading CC 4.5.1.1 (rc3) forbids, and it is what makes erasure \
+                 and DSAR export over-collect: got {ids:?}"
+            );
+        }
+
+        // ── THE REMOVAL: the pointer confers no revocation authority. ──
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &[],
+                    attestation_type::WITHDRAWS,
+                    serde_json::json!({
+                        "references_attestation_id": r_id,
+                        "withdrawal_reason": "subject-binding reading (must not admit)",
+                    }),
+                ),
+            })
+            .await
+            .expect_err(
+                "a subject of P must NOT be able to revoke R merely because R points at P — \
+                 admitting this IS the pointer-decides-authority shape rc3 closed",
+            );
+        assert_eq!(
+            err.kind(),
+            "federation_withdraws_not_admitted",
+            "the refusal must be the AUTHORITY refusal, not an unrelated gate — a test that \
+             passes for the wrong reason witnesses nothing"
+        );
+
+        // ── control B: the ADMITTED reading is still live. The producer's
+        //    withdraws follows the same pointer to retire R. ──
+        let wr_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: row(
+                &wr_id,
+                &producer,
+                &[],
+                attestation_type::WITHDRAWS,
+                serde_json::json!({
+                    "references_attestation_id": r_id,
+                    "withdrawal_reason": "producer authority (rule 1)",
+                }),
+            ),
+        })
+        .await
+        .expect("the producer's own withdraws admits under rule 1");
+        let stored = dir
+            .get_attestation(&wr_id)
+            .await
+            .expect("get withdraws")
+            .expect("withdraws stored");
+        assert_eq!(
+            super::references_attestation_id_from_envelope(&stored.attestation_envelope),
+            Some(r_id.as_str()),
+            "the stored composer still NAMES its target through the pointer — the removed \
+             reading is one of three, not the field's only job"
+        );
+        // …and the read side FOLLOWED that pointer: R leaves the live view, P
+        // (untouched) stays. This is the admitted `recipient_revoke` reading
+        // doing exactly the work rc3 preserved.
+        if let Some(ids) = visible_ids(
+            dir,
+            crate::read::AttestationFilter {
+                attesting_key_id: Some(producer.clone()),
+                dimension_exact: Some(DIMENSION.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            assert!(
+                !ids.contains(&r_id),
+                "the producer's withdraws named R through the pointer — the live view must drop \
+                 it. If R is still here the pointer is no longer read as the revoke target, and \
+                 the removal took the admitted reading with it: {ids:?}"
+            );
+            assert!(
+                ids.contains(&p_id),
+                "P is untouched and must remain visible — the fold retires the row NAMED by the \
+                 pointer, not everything near it: {ids:?}"
+            );
+        }
+
+        // ── control A: subject authority itself is live, via subject_key_ids. ──
+        let wp_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: row(
+                &wp_id,
+                &subject,
+                &[],
+                attestation_type::WITHDRAWS,
+                serde_json::json!({
+                    "references_attestation_id": p_id,
+                    "withdrawal_reason": "subject authority (rule 2)",
+                }),
+            ),
+        })
+        .await
+        .expect("the SUBJECT of P may revoke P — rule 2, on subject_key_ids");
+        let admitted = dir
+            .get_attestation(&wp_id)
+            .await
+            .expect("get subject withdraws")
+            .expect("subject withdraws stored");
+        assert_eq!(
+            admitted.withdraws_admission_rule,
+            Some(2),
+            "admitted under rule 2 (direct subject authority) — this is the control that makes \
+             the refusal above meaningful"
+        );
+
+        // ── what the subject's revocation does NOT do, recorded because it
+        //    surprised this test into being right. The §6.1 lifecycle fold is
+        //    PER ATTESTER (rule 4: cross-attester composers are independent
+        //    chains), so `S`'s admitted revocation does not hide the
+        //    producer's row from the producer's own chain — it is an admitted,
+        //    stored consent act that the consumer composes. That is a
+        //    composition-policy fact about `subject_key_ids` authority; it is
+        //    NOT the pointer conferring anything, which is the whole point.
+        if let Some(ids) = subject_visible_ids(dir, &subject).await {
+            assert!(
+                ids.contains(&p_id),
+                "P must still be visible on the producer's chain: a cross-attester revocation is \
+                 admitted (rule 2, above) and composed by the consumer, not folded into the \
+                 producer's own lifecycle (CEG §6.1 rule 4): {ids:?}"
+            );
+            assert!(
+                !ids.contains(&r_id),
+                "R must never appear in a subject-keyed read for {subject} — not before the \
+                 withdraws, and not after: {ids:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

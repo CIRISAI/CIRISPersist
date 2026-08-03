@@ -20176,6 +20176,22 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — the sqlite leg of the shared
+    /// "the pointer confers no subject authority" witness (see the postgres +
+    /// memory legs). This leg also exercises the subject-keyed READ surface
+    /// (`list_scores` with `subject_key_id`), which memory does not implement:
+    /// the erasure/DSAR question of which rows are ABOUT a subject.
+    #[tokio::test]
+    async fn pointer_confers_no_subject_authority_sqlite_579() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::precedence::test_support::exercise_pointer_confers_no_subject_authority(
+            &backend,
+            "sqlite-579",
+        )
+        .await;
+    }
+
     /// v24.2.0 (CIRISPersist#564 stage 1) — the sqlite leg of the shared
     /// `is_load_bearing` witness (see the postgres + memory legs); all three
     /// call the SAME `load_bearing::test_support::exercise_load_bearing_predicate`

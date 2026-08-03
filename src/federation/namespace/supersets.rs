@@ -428,53 +428,138 @@ pub const CI_AXES: &[&str] = &[
 /// [`tests::asymmetry_kind_vocabulary_is_closed`].
 pub const ASYMMETRY_KINDS: &[&str] = &["logical_defect", "axiomatic_intent", "n/a"];
 
-/// v21.13.0 (CIRISPersist#532) — persist-authored fusion classifications for
-/// the multi-axis `field_processor_matrix` fields the vendored v0.3.0 walk left
-/// with an EMPTY `asymmetry_kind`. These are **PROPOSED, pending
-/// CIRISConstitution ratification** — the CI rubric is the authority and these
-/// fold into the next manifest walk (tracked #520 + CIRISConstitution#44).
+/// The ONE non-discriminator token admissible in an axis classification's `op`
+/// column (CIRISPersist#579, CC 4.5.1.1 rc3): **the classification holds under
+/// EVERY emitting operation that carries the field** — the reading does not
+/// vary with the discriminator.
+///
+/// It is deliberately NOT a fallback / "every other op" default. A token
+/// meaning "all" in one row and "the rest" in another would be two answers
+/// under one name — the #532 defect rebuilt one level down, inside the fix.
+/// [`tests::no_field_mixes_op_invariant_with_op_specific_rows`] is what keeps
+/// the two readings from ever both existing: a field carries EITHER exactly one
+/// `*` row OR only discriminator-named rows, never a mix.
+pub const AXIS_OP_EVERY: &str = "*";
+
+/// CIRISPersist#579 (CC 4.5.1.1, rc3) — persist-authored fusion
+/// classifications for the multi-axis `field_processor_matrix` fields the
+/// vendored v0.3.0 walk left with an EMPTY `asymmetry_kind`.
+///
+/// **The classification unit is the `(field, op)` pair, not the field** — rc3's
+/// first refinement, ratified at CC 4.5.1.1: *"a slot meaning one relation
+/// under one operation and another under a different one is not one
+/// classifiable object; classifying it as one is how a fusion hides."*
+///
+/// `(field, op, kind, rationale)`. **`op` names the emitting operation's SIGNED
+/// DISCRIMINATOR — the row's `attestation_type` — and nothing else**; it is
+/// never a processor, an enforcement point, a family, or a prose class name.
+/// That single meaning is enforced, not documented:
+/// [`tests::axis_classification_ops_are_live_discriminators`] binds every op
+/// token to a live [`crate::federation::types::attestation_type`] constant (or
+/// [`AXIS_OP_EVERY`]), so an op column cannot start answering a second
+/// question. This is why CC's prose arm *"under composition"* lands here as
+/// [`attestation_type::SUPERSEDES`](crate::federation::types::attestation_type::SUPERSEDES)
+/// rather than the word `composition`: a class name in a discriminator column
+/// is the same fusion at one remove.
+///
 /// Recorded here (not edited into the vendored Registry-of-Record) so the
 /// fusion gate is complete NOW without a unilateral edit of the constitution's
-/// artifact. `(field, kind, rationale)`; every entry is cross-checked to be a
-/// real multi-axis matrix field the manifest left unclassified
+/// artifact — the vendored matrix has no `op` column at all, which is the
+/// standing CC ask this table stands in for. Every entry is cross-checked to be
+/// a real multi-axis matrix field the manifest left unclassified
 /// ([`tests::persist_authored_classifications_cover_exactly_the_manifest_gaps`]).
-/// Ratification is tracked at CIRISConstitution#44 (fold into the #520 re-vendor).
-pub const PERSIST_AUTHORED_AXIS_CLASSIFICATIONS: &[(&str, &str, &str)] = &[
+///
+/// rc3 settled the 15 proposals #532 filed: 12 `n/a` + 2 `axiomatic_intent`
+/// stand as proposed, with live falsifiers attached to `scope` and `enabled`
+/// (recorded in their rationales); the 15th, `references_attestation_id`, is
+/// the op split below.
+pub const PERSIST_AUTHORED_AXIS_CLASSIFICATIONS: &[(&str, &str, &str, &str)] = &[
     // ── benign co-occurrence: value/timestamp/identifier fields that supply
     //    context to several axes, but no ONE processor decides an axis wrongly.
-    ("achieved_tier", "n/a",
+    //    Every one is op-INVARIANT: the reading is the same whichever
+    //    operation emits the row, which is exactly what `*` asserts.
+    ("achieved_tier", AXIS_OP_EVERY, "n/a",
      "a tier value IS information_type; its progression over time IS temporal_lifecycle — the two roles co-occur on one immutable datum, no processor conflates them into a decision"),
-    ("committed_tier", "n/a",
+    ("committed_tier", AXIS_OP_EVERY, "n/a",
      "as achieved_tier: the committed tier is information_type content whose advance is temporal_lifecycle; benign co-occurrence"),
-    ("asserted_at", "n/a",
+    ("asserted_at", AXIS_OP_EVERY, "n/a",
      "a timestamp anchors both the temporal_lifecycle (when asserted) and the transmission context; a clock is not an authority — no processor spends it as one"),
-    ("validity_window", "n/a",
+    ("validity_window", AXIS_OP_EVERY, "n/a",
      "a window is temporal_lifecycle data expressed as information_type; no processor reads it as anything but a time bound"),
-    ("community_key_id", "n/a",
+    ("community_key_id", AXIS_OP_EVERY, "n/a",
      "naming a community both identifies the content context (information_type) and selects that community's transmission norm — both are lookups of one identity, no wrong axis decision"),
-    ("confidence", "n/a",
+    ("confidence", AXIS_OP_EVERY, "n/a",
      "a confidence score is information_type the sender asserts; the sender/transmission co-occurrence is descriptive, never spent as authority"),
-    ("context", "n/a",
+    ("context", AXIS_OP_EVERY, "n/a",
      "free-form context supplies supporting information across data_subject/information_type/transmission; it is never the field a processor keys an axis decision on"),
-    ("enabled", "n/a",
-     "a boolean enable flag is temporal_lifecycle state read in a transmission decision; the flag is the state, not a second axis"),
-    ("evidence_refs", "n/a",
+    ("enabled", AXIS_OP_EVERY, "n/a",
+     "a boolean enable flag is temporal_lifecycle state read in a transmission decision; the flag is the state, not a second axis. rc3 FALSIFIER (CC 4.5.1.1): a capability toggle is a decision by construction — a processor found gating ACROSS axes on it makes n/a wrong and logical_defect + a tracking ref correct. persist's only processor is safety/watchlist.rs#enable_watchlist/#disable_watchlist, which flips one flag on one watchlist row"),
+    ("evidence_refs", AXIS_OP_EVERY, "n/a",
      "an evidence pointer bundle legitimately touches every axis it cites (subject, info, sender, time, transmission); it is a reference list, not a decision field — no processor treats a ref as authority"),
-    ("scope", "n/a",
-     "here `scope` is the claim's coverage (information_type) with a downstream visibility implication; distinct from cohort_scope (which IS the logical_defect) — no persist processor fuses claim-scope with see-scope"),
-    ("tenant_id", "n/a",
+    ("scope", AXIS_OP_EVERY, "n/a",
+     "here `scope` is the claim's coverage (information_type) with a downstream visibility implication; distinct from cohort_scope (which IS the logical_defect) — no persist processor fuses claim-scope with see-scope. rc3 FALSIFIER (CC 4.5.1.1 / CC 4.5.2.2): consent:scope:{retain|share|analyze|train|publish} is a permitted-USE gate, so a processor found gating across axes on it flips this to logical_defect + a tracking ref"),
+    ("tenant_id", AXIS_OP_EVERY, "n/a",
      "a tenant identifier names both the subject and the information context; one identity lookup serving two descriptive roles, not a fused decision"),
-    ("withdrawal_reason", "n/a",
+    ("withdrawal_reason", AXIS_OP_EVERY, "n/a",
      "descriptive reason prose on a revoke; recipient_revoke + temporal_lifecycle co-occur because a withdrawal IS a timed revocation event — the reason text decides nothing"),
     // ── axiomatic_intent: the multi-role is deliberate and load-bearing; the
     //    action itself spans axes by definition, and each op uses the right one.
-    ("withdraws", "axiomatic_intent",
+    ("withdraws", AXIS_OP_EVERY, "axiomatic_intent",
      "a withdraws IS definitionally both a recipient_revoke action and a temporal_lifecycle transition — one coherent action, not two answers; the withdraws-authority arc (#517/#528) is the fusion to guard, and it is guarded on the SEPARATE subject_key_ids/attester axis, not here"),
-    ("consent", "axiomatic_intent",
-     "consent is definitionally a transmission_principle that also gates recipient_receive and carries a temporal_lifecycle — the spanning is the concept; the send-vs-receive fusion to watch is CIRISEdge#414's #396 gate, a DIRECTION overload downstream, not this substrate field"),
-    ("references_attestation_id", "axiomatic_intent",
-     "a pointer whose role is op-separated: withdraws/supersedes/recants read it as the recipient_revoke TARGET, structural composers as a temporal_lifecycle prior, subject-binding as data_subject — each op uses the correct axis; HIGHEST-risk benign member, the same pointer-decides-authority shape as #517/#528 — flagged for the CC rubric to confirm or split"),
+    ("consent", AXIS_OP_EVERY, "axiomatic_intent",
+     "consent is definitionally a transmission_principle that also gates recipient_receive and carries a temporal_lifecycle — the spanning is the concept. rc3 (CC 4.5.1.1): DIRECTION MUST NOT ride this field — send-versus-receive is a distinct discriminator, and the fusion to watch is CIRISEdge#414's #396 gate, a direction overload downstream, not this substrate field"),
+    // ── the op split (rc3, CC 4.5.1.1): ONE slot, three relations, three
+    //    operations. Polysemy, not an action that spans axes by definition —
+    //    and CC 1.7's 1+4 envelope freeze does not permit splitting the wire
+    //    field, so the split falls on the classification. The third relation
+    //    (subject-binding) is NOT ADMITTED and therefore has no row at all:
+    //    see PERSIST_NOT_ADMITTED_AXIS_READINGS.
+    ("references_attestation_id", crate::federation::types::attestation_type::WITHDRAWS, "axiomatic_intent",
+     "under `withdraws` the pointer is the REVOKE TARGET: one act that is both a recipient_revoke and a temporal_lifecycle transition, inheriting the withdraws guard on the attester axis (admission.rs#check_withdraws_admission resolves the target from this pointer and then reads the TARGET's subject_key_ids/attesting_key_id for authority — the pointer names what is revoked, never who may revoke it)"),
+    ("references_attestation_id", crate::federation::types::attestation_type::RECANTS, "axiomatic_intent",
+     "under `recants` the pointer is likewise the retraction TARGET — persist's tombstone fold (trust_root.rs#tombstoned_ids, scores.rs#compose_verdict) makes a recipient_revoke decision on a recants pointer exactly as it does on a withdraws one, so the composition/`n/a` arm would be a false claim here. CC 4.5.1.1 names three arms and does not spell `recants`; persist classifies it with the withdraws arm because that is what its code does, and asks CC to confirm. NOTE: unlike `withdraws`, `recants` runs no 4-rule authority gate at admission today"),
+    ("references_attestation_id", crate::federation::types::attestation_type::SUPERSEDES, "n/a",
+     "under composition the pointer is the TEMPORAL PRIOR — the row this one replaces. It serves temporal_lifecycle alone, so in this operation it is not cross-axis at all (CC 4.5.1.1: `n/a` under composition)"),
 ];
+
+/// CIRISPersist#579 (CC 4.5.1.1, rc3) — **readings a processor MUST NOT
+/// take.** `(field, axis, rationale)`.
+///
+/// A row here says: *no admitted operation reads `field` as `axis`* — which is
+/// why it carries no `op` column. The forbidden reading is not "wrong under one
+/// discriminator"; there is no discriminator that licenses it, and per rc3
+/// *"removing that reading removes the third axis, and with it the
+/// pointer-decides-authority shape."*
+///
+/// The table exists because the vendored walk still MAKES the claim being
+/// refused: four families
+/// (`locality:decision:{scale}`, `need:{domain}:{kind}`,
+/// `ratchet:flag:expertise_attestation_anomaly`, `transparency_log:inclusion`)
+/// list `references_attestation_id` under `ci_axes.data_subject.wire_fields`,
+/// so [`ci_axes_for_field`] still derives `data_subject` for the pointer. Until
+/// the re-vendor drops those entries (the standing CC ask), THIS is where the
+/// removal is recorded, and
+/// [`tests::not_admitted_axis_readings_refuse_a_claim_the_record_still_makes`]
+/// is the tripwire in both directions: a row whose axis the record no longer
+/// derives is stale and must go.
+///
+/// Behaviour, not prose: the claim that persist takes no such reading is
+/// witnessed on all three backends by
+/// [`crate::federation::precedence::test_support::exercise_pointer_confers_no_subject_authority`],
+/// and the rc3 revision condition (*"a processor found reading the pointer
+/// without the discriminator flips the ruling to a field split"*) is checked
+/// mechanically by
+/// [`tests::every_pointer_read_is_discriminator_guarded`].
+pub const PERSIST_NOT_ADMITTED_AXIS_READINGS: &[(&str, &str, &str)] = &[(
+    "references_attestation_id",
+    "data_subject",
+    "CC 4.5.1.1 (rc3): a processor MUST NOT establish `data_subject` from the pointer — subject \
+     authority rides `subject_key_ids` and nothing else (CC 2.3.1 / CC 4.5.2.1). The pointer \
+     resolves a TARGET ROW; that row's subjects are its own, and they do not propagate to the \
+     row pointing at it. persist's withdraws gate reads the TARGET's subject_key_ids (never the \
+     pointer's holder's), the consent peer-set projection reads the GRANT's subject_key_ids, and \
+     no read surface resolves a subject through a reference",
+)];
 
 /// v23.0.0 (CIRISPersist#551 item 2) — the manifest rows for the `trust:*`
 /// dimension family: the three envelope dimensions that NAME which job a
@@ -885,12 +970,26 @@ pub fn ci_axes_for_field(field: &str) -> std::collections::BTreeSet<&'static str
     field_ci_axes_map().get(field).cloned().unwrap_or_default()
 }
 
-/// The fusion classification for a placement `field`: the vendored manifest's
-/// `asymmetry_kind`+note when the walk set one, else persist's proposed
-/// [`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS`] entry (pending CC ratification),
-/// else `None` (an UNCLASSIFIED cross-axis field — a build failure under the
-/// fusion gate). Returns `(kind, rationale)`.
-pub fn fusion_classification(field: &str) -> Option<(&'static str, &'static str)> {
+/// The fusion classification for the `(field, op)` pair — the classification
+/// unit CC 4.5.1.1 (rc3) ratifies. `op` is the emitting operation's signed
+/// discriminator (the row's `attestation_type`).
+///
+/// Resolution order:
+///
+/// 1. the vendored manifest's `asymmetry_kind`+note when the walk set one. The
+///    vendored matrix has **no `op` column**, so a manifest classification is
+///    necessarily op-invariant — it answers for every op, which is the shape of
+///    the standing CC ask this module records;
+/// 2. else persist's [`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS`] row for exactly
+///    this `(field, op)`;
+/// 3. else the field's op-invariant ([`AXIS_OP_EVERY`]) row, if it has one;
+/// 4. else `None` — either an UNCLASSIFIED cross-axis field (a build failure
+///    under the fusion gate) or a reading that is **not admitted** under this
+///    op at all (see [`PERSIST_NOT_ADMITTED_AXIS_READINGS`]; the pointer's
+///    subject-binding arm is the ratified case).
+///
+/// Returns `(kind, rationale)`.
+pub fn fusion_classification(field: &str, op: &str) -> Option<(&'static str, &'static str)> {
     // Manifest first (the authored Registry-of-Record wins over persist's proposal).
     if let Some(row) = field_processor_matrix().iter().find(|r| r.field == field) {
         if !row.asymmetry_kind.trim().is_empty() {
@@ -906,8 +1005,21 @@ pub fn fusion_classification(field: &str) -> Option<(&'static str, &'static str)
     }
     PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
         .iter()
-        .find(|(f, _, _)| *f == field)
-        .map(|(_, kind, note)| (*kind, *note))
+        .find(|(f, o, _, _)| *f == field && (*o == op || *o == AXIS_OP_EVERY))
+        .map(|(_, _, kind, note)| (*kind, *note))
+}
+
+/// Is a processor permitted to read `field` as CI axis `axis` at all?
+///
+/// `false` iff [`PERSIST_NOT_ADMITTED_AXIS_READINGS`] forbids the pair — the
+/// rc3 ruling that `references_attestation_id` never establishes
+/// `data_subject`. Returns the refusal rationale alongside, so a caller that
+/// hits the wall can quote the ruling rather than restate it.
+pub fn not_admitted_axis_reading(field: &str, axis: &str) -> Option<&'static str> {
+    PERSIST_NOT_ADMITTED_AXIS_READINGS
+        .iter()
+        .find(|(f, a, _)| *f == field && *a == axis)
+        .map(|(_, _, why)| *why)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2163,10 +2275,86 @@ mod tests {
                 r.field
             );
         }
-        for (f, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+        for (f, op, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
             assert!(
                 closed.contains(k),
-                "persist-authored classification for {f} uses kind {k:?} outside {ASYMMETRY_KINDS:?}"
+                "persist-authored classification for ({f}, {op}) uses kind {k:?} outside \
+                 {ASYMMETRY_KINDS:?}"
+            );
+        }
+    }
+
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — **the op column answers exactly one
+    /// question.**
+    ///
+    /// rc3 moved the classification unit from the field to the `(field, op)`
+    /// pair. That fixes one fusion and opens the door to another: if `op` names
+    /// a signed discriminator in one row and a prose class (`"composition"`), a
+    /// processor, or an enforcement point in the next, the new column is itself
+    /// one name serving two axes — #532's defect rebuilt inside #532's fix.
+    ///
+    /// So every op token is bound to a LIVE
+    /// [`crate::federation::types::attestation_type`] constant, or is the one
+    /// declared quantifier [`AXIS_OP_EVERY`]. The binding is to the constants
+    /// the code actually branches on, not to a copied list — the same rule #9
+    /// move `ci_axis` made (derive, never copy).
+    #[test]
+    fn axis_classification_ops_are_live_discriminators() {
+        use crate::federation::types::attestation_type;
+        let live: BTreeSet<&str> = [
+            attestation_type::SCORES,
+            attestation_type::DELEGATES_TO,
+            attestation_type::SUPERSEDES,
+            attestation_type::WITHDRAWS,
+            attestation_type::RECANTS,
+        ]
+        .into_iter()
+        .collect();
+        for (f, op, _, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+            assert!(
+                *op == AXIS_OP_EVERY || live.contains(op),
+                "classification ({f}, {op}) names an op that is not a live attestation_type \
+                 discriminator. `op` means the EMITTING OPERATION'S SIGNED DISCRIMINATOR and \
+                 nothing else — a class name (\"composition\"), a processor or an enforcement \
+                 point in this column is the axis fusion one level down. Live: {live:?}"
+            );
+        }
+    }
+
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — **THE ANTI-FUSION GATE for the new
+    /// structure**: a field is EITHER op-invariant OR op-split, never both, and
+    /// no `(field, op)` pair is classified twice.
+    ///
+    /// [`AXIS_OP_EVERY`] means *"holds under every op"*. If a field could carry
+    /// both a `*` row and a discriminator-named row, `*` would mean "all ops"
+    /// in one table position and "every OTHER op" in another — two answers
+    /// under one name, which is precisely the thing rc3's `(field, op)` unit
+    /// exists to prevent. A duplicate `(field, op)` is the same failure without
+    /// the quantifier: two classifications, and [`fusion_classification`]
+    /// silently takes the first.
+    #[test]
+    fn no_field_mixes_op_invariant_with_op_specific_rows() {
+        let mut pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (f, op, _, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+            assert!(
+                pairs.insert((*f, *op)),
+                "({f}, {op}) is classified twice — one (field, op) pair, one answer"
+            );
+        }
+        let fields: BTreeSet<&str> = pairs.iter().map(|(f, _)| *f).collect();
+        for f in fields {
+            let ops: Vec<&str> = pairs
+                .iter()
+                .filter(|(g, _)| *g == f)
+                .map(|(_, o)| *o)
+                .collect();
+            let invariant = ops.iter().filter(|o| **o == AXIS_OP_EVERY).count();
+            assert!(
+                invariant == 0 || ops.len() == 1,
+                "{f} carries both an op-invariant ({AXIS_OP_EVERY}) row and op-specific rows \
+                 {ops:?}. Then {AXIS_OP_EVERY} would mean \"every op\" in one row and \"every \
+                 other op\" in another — one name, two meanings, which is the defect class this \
+                 restructure closes. Split it fully or classify it once."
             );
         }
     }
@@ -2194,12 +2382,23 @@ mod tests {
     /// An UNCLASSIFIED cross-axis field is exactly the "one name, two axes"
     /// defect the arc kept finding by hand; here it is a build failure. This
     /// converts axis fusion from latent-in-code to visible-in-artifact.
+    ///
+    /// Post-rc3 the unit is `(field, op)`, so "classified" here means *under at
+    /// least one operation*: WHICH ops a field's classification covers is
+    /// [`no_field_mixes_op_invariant_with_op_specific_rows`]'s question, and
+    /// the one op-split field's exhaustiveness (three admitted ops + one
+    /// not-admitted reading) is pinned by
+    /// [`references_attestation_id_is_op_split_and_never_subject_binding`].
     #[test]
     fn every_multi_axis_field_is_classified() {
         let mut unclassified: Vec<String> = Vec::new();
         for r in field_processor_matrix() {
             let axes = ci_axes_for_field(&r.field);
-            if axes.len() > 1 && fusion_classification(&r.field).is_none() {
+            let classified = !r.asymmetry_kind.trim().is_empty()
+                || PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
+                    .iter()
+                    .any(|(f, _, _, _)| *f == r.field);
+            if axes.len() > 1 && !classified {
                 unclassified.push(format!("{} {:?}", r.field, axes));
             }
         }
@@ -2230,7 +2429,7 @@ mod tests {
         }
         let authored: BTreeSet<&str> = PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
             .iter()
-            .map(|(f, _, _)| *f)
+            .map(|(f, _, _, _)| *f)
             .collect();
         assert_eq!(
             authored, manifest_gaps,
@@ -2241,12 +2440,234 @@ mod tests {
         );
         // Every authored entry names a real, non-empty rationale (the gate
         // demands a reviewed exemption WITH a reason).
-        for (f, _, note) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+        for (f, op, _, note) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
             assert!(
                 note.len() > 20,
-                "persist-authored classification for {f} needs a substantive rationale"
+                "persist-authored classification for ({f}, {op}) needs a substantive rationale"
             );
         }
+    }
+
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — **the ratified op split, pinned.**
+    ///
+    /// One slot, three relations, three operations: the revoke target under
+    /// `withdraws` (and, on persist's own fold, under `recants`), the temporal
+    /// prior under composition, and — the half this cut REMOVES — the data
+    /// subject under subject-binding. The third reading is not reclassified,
+    /// it is **not admitted**: subject authority rides `subject_key_ids` and
+    /// nothing else (CC 2.3.1 / CC 4.5.2.1).
+    ///
+    /// This test is the structural half; the behavioural half runs on all three
+    /// backends via
+    /// [`crate::federation::precedence::test_support::exercise_pointer_confers_no_subject_authority`].
+    #[test]
+    fn references_attestation_id_is_op_split_and_never_subject_binding() {
+        use crate::federation::types::attestation_type;
+        const FIELD: &str = "references_attestation_id";
+        let ops: BTreeSet<&str> = PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
+            .iter()
+            .filter(|(f, _, _, _)| *f == FIELD)
+            .map(|(_, op, _, _)| *op)
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+                attestation_type::SUPERSEDES,
+            ]
+            .into_iter()
+            .collect::<BTreeSet<&str>>(),
+            "the pointer classifies per operation (CC 4.5.1.1) — exactly the three composer \
+             discriminators that READ it. A fourth op appearing here needs its own rc3 arm."
+        );
+        assert_eq!(
+            fusion_classification(FIELD, attestation_type::WITHDRAWS).map(|(k, _)| k),
+            Some("axiomatic_intent"),
+            "under withdraws the pointer is the revoke target — axiomatic_intent"
+        );
+        assert_eq!(
+            fusion_classification(FIELD, attestation_type::SUPERSEDES).map(|(k, _)| k),
+            Some("n/a"),
+            "under composition the pointer serves temporal_lifecycle alone — n/a, not cross-axis"
+        );
+        // THE REMOVAL. `scores` is the op the four subject-binding families
+        // emit under; the pointer carries no admitted reading there, and
+        // `data_subject` is forbidden under EVERY op.
+        assert_eq!(
+            fusion_classification(FIELD, attestation_type::SCORES),
+            None,
+            "subject-binding is NOT ADMITTED (CC 4.5.1.1) — it must resolve to no classification \
+             at all, not to a lenient one. A fallback that answered here would re-open the \
+             pointer-decides-authority shape rc3 closed."
+        );
+        assert!(
+            not_admitted_axis_reading(FIELD, "data_subject").is_some(),
+            "the data_subject reading must be recorded as NOT ADMITTED — silence would leave the \
+             axis derived from the vendored walk with no entry saying persist refuses it"
+        );
+    }
+
+    /// CIRISPersist#579 — a not-admitted reading REFUSES a claim the record
+    /// still makes, and is deleted when the record stops making it.
+    ///
+    /// The tripwire runs in both directions, like [`KNOWN_AXIS_FUSIONS`]. A
+    /// forbidden reading whose axis [`ci_axes_for_field`] no longer derives is
+    /// stale prose refusing nobody — that is what the #520 re-vendor will do to
+    /// this row, and when it does, this test names it. And a forbidden reading
+    /// on a field that is not op-split would be incoherent: "no operation reads
+    /// it this way" is only a statement about a field whose readings are
+    /// enumerated per operation.
+    #[test]
+    fn not_admitted_axis_readings_refuse_a_claim_the_record_still_makes() {
+        assert!(
+            !PERSIST_NOT_ADMITTED_AXIS_READINGS.is_empty(),
+            "the table is the record of what rc3 removed; emptying it silently is the removal \
+             going unwitnessed"
+        );
+        for (field, axis, why) in PERSIST_NOT_ADMITTED_AXIS_READINGS {
+            assert!(
+                CI_AXES.contains(axis),
+                "{field}/{axis}: a not-admitted reading names an axis in the closed rubric set"
+            );
+            assert!(
+                ci_axes_for_field(field).contains(axis),
+                "{field}/{axis} refuses a reading the vendored manifest no longer derives — the \
+                 re-vendor has dropped it, so this row is stale: DELETE it (and drop the axis \
+                 from the field's classification bookkeeping)."
+            );
+            let ops: Vec<&str> = PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
+                .iter()
+                .filter(|(f, _, _, _)| f == field)
+                .map(|(_, op, _, _)| *op)
+                .collect();
+            assert!(
+                !ops.is_empty() && !ops.contains(&AXIS_OP_EVERY),
+                "{field} carries a not-admitted reading but is not op-split (ops {ops:?}) — \
+                 \"no operation reads it this way\" only means something where the admitted \
+                 readings are enumerated per operation"
+            );
+            assert!(
+                why.contains("CC 4.5.1.1"),
+                "{field}/{axis}: a forbidden reading cites the ruling that forbids it"
+            );
+        }
+    }
+
+    /// CIRISPersist#579 — **the rc3 revision condition, made mechanical.**
+    ///
+    /// CC 4.5.1.1 admits op-separation for `references_attestation_id` on one
+    /// empirical condition: *"A processor MUST resolve `references_attestation_id`
+    /// under the emitting operation's signed discriminator, and MUST NOT derive
+    /// authority from the pointer alone. Revision condition: if any processor
+    /// is found reading the pointer without the discriminator, op-separation
+    /// has failed empirically and the remedy is the field split, envelope cost
+    /// accepted."*
+    ///
+    /// A ruling with a falsifier that nothing evaluates is a ruling nobody can
+    /// lose. So this scans persist's own sources: every non-test call of
+    /// [`crate::federation::precedence::references_attestation_id_from_envelope`]
+    /// must sit within a window that also names the discriminator — an
+    /// `attestation_type` comparison, `is_structural_composer`, or a SQL
+    /// `attestation_type = $n` bound to a composer constant. An unguarded read
+    /// does not just fail this test: it flips the constitutional ruling to a
+    /// wire-field split, and the operator needs to know that the day it lands,
+    /// not at the next audit.
+    #[test]
+    fn every_pointer_read_is_discriminator_guarded() {
+        // Every way persist reads the pointer: the shared Rust accessor, the
+        // postgres JSON operator, and the sqlite JSON path (no site uses the
+        // last today — it is here so a NEW one arrives guarded). A scan that
+        // knew only the Rust accessor would be blind to a SQL query that
+        // resolved a subject through the pointer, which is precisely where a
+        // backend divergence hides.
+        const READERS: &[&str] = &[
+            "references_attestation_id_from_envelope",
+            "->>'references_attestation_id'",
+            "$.references_attestation_id",
+        ];
+        // The reader's own module is exempt: it holds the definition, its unit
+        // tests, and the dedup/precedence helpers that ARE the discriminator.
+        const WINDOW: usize = 30;
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ is readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(
+            files.len() > 20,
+            "the source walk found only {} files — a broken walk would make this gate vacuous",
+            files.len()
+        );
+        // What "guarded" looks like across persist's three read idioms: the
+        // shared predicate, an explicit type comparison (Rust or SQL), or a
+        // membership test against a composer set. Each NAMES the emitting
+        // operation in the same breath as the read; nothing here accepts a
+        // bare mention of the word.
+        let guards = [
+            "is_structural_composer",
+            "revocation_fold_target",
+            "attestation_type ==",
+            "attestation_type !=",
+            "attestation_type::",
+            "attestation_type.as_str()",
+            "attestation_type = $",
+            "attestation_type LIKE $",
+        ];
+        let mut unguarded: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let rel = path
+                .strip_prefix(concat!(env!("CARGO_MANIFEST_DIR"), "/"))
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if rel.ends_with("federation/precedence.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("source readable");
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                // Calls only — a doc link or a comment naming the reader is
+                // not a read (the #577 spell-checker lesson).
+                if !READERS.iter().any(|r| line.contains(r))
+                    || t.starts_with("///")
+                    || t.starts_with("//!")
+                    || t.starts_with("//")
+                    || t.starts_with("use ")
+                {
+                    continue;
+                }
+                checked += 1;
+                let lo = i.saturating_sub(WINDOW);
+                let hi = (i + WINDOW).min(lines.len());
+                let window = lines[lo..hi].join("\n");
+                if !guards.iter().any(|g| window.contains(g)) {
+                    unguarded.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            checked >= 14,
+            "found only {checked} pointer reads to check — persist has ~19 (Rust accessor + the \
+             four postgres SQL anti-joins); a renamed reader would turn this gate into a no-op"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "references_attestation_id is READ WITHOUT ITS DISCRIMINATOR at {unguarded:?}. This \
+             is CC 4.5.1.1's revision condition: op-separation has failed empirically and the \
+             remedy is a WIRE FIELD SPLIT (envelope cost accepted), not a local fix. Escalate to \
+             CIRISConstitution before proceeding."
+        );
     }
 
     /// v23.0.0 (CIRISPersist#551 item 2) — the `trust:*` manifest rows are
@@ -2326,7 +2747,7 @@ mod tests {
             .filter(|r| r.asymmetry_kind.trim() == "logical_defect")
             .map(|r| r.field.as_str())
             .collect();
-        for (f, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+        for (f, _, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
             if *k == "logical_defect" {
                 actual.insert(f);
             }

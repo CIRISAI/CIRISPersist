@@ -15631,6 +15631,21 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#579 (CC 4.5.1.1, rc3) — the MEMORY leg of the shared
+    /// "the pointer confers no subject authority" witness. rc3 removed the
+    /// subject-binding reading of `references_attestation_id`; the removal is
+    /// exercised through the real write path rather than asserted, and memory
+    /// is the backend where an untested divergence hides.
+    #[tokio::test]
+    async fn pointer_confers_no_subject_authority_memory_579() {
+        let backend = MemoryBackend::new();
+        crate::federation::precedence::test_support::exercise_pointer_confers_no_subject_authority(
+            &backend,
+            "memory-579",
+        )
+        .await;
+    }
+
     /// v24.3.0 (CIRISPersist#574) — the MEMORY leg of the shared reverse-quorum
     /// witness. The whole plane composes trait methods over
     /// `&dyn FederationDirectory` (no new table, no migration), so memory is
