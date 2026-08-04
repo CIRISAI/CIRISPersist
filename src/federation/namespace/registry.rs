@@ -97,6 +97,31 @@ struct RawMeta {
     cc_version: String,
     source_sha256: String,
     n_families: usize,
+    /// **The `_meta` key the R2 Private Use ask asked for, and the rc3
+    /// re-vendor delivered.** `x_private:` on this cut.
+    ///
+    /// [`PRIVATE_USE_FAMILY_STEM`](crate::federation::admission::PRIVATE_USE_FAMILY_STEM)
+    /// says of itself that it is "a prose transcription", and names the remedy
+    /// in its own doc: *"a machine-readable range field in the generated
+    /// manifest (a `_meta` key, not a family row, since it is not a family)"*.
+    /// That field now exists, so
+    /// [`tests::the_private_use_range_is_machine_readable_now`] binds the
+    /// transcription to it — the const stops being a claim about CC prose that
+    /// nothing can contradict and becomes one the vendored artifact can.
+    ///
+    /// Worth noting what this is NOT: it does not make persist enforce the
+    /// range from the manifest. The refusal
+    /// ([`check_private_use_not_federatable`](crate::federation::admission::check_private_use_not_federatable))
+    /// still matches on the const, because a range read from a mutable data
+    /// file is a range an attacker who can influence the vendored bytes could
+    /// move. What the field buys is that the const can no longer be silently
+    /// WRONG.
+    ///
+    /// `Option` because a cut generated before CC shipped the field carries
+    /// none, and the gate should say WHICH cut is stale rather than fail to
+    /// parse.
+    #[serde(default)]
+    private_use_prefix: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -242,6 +267,23 @@ fn registry() -> &'static [NamespaceEntry] {
 /// dimension→policy table once at boot.
 pub fn entries() -> &'static [NamespaceEntry] {
     registry()
+}
+
+/// The **Private Use range**, read from the vendored manifest's `_meta` rather
+/// than transcribed from CC prose. `None` on a cut generated before CC shipped
+/// the field.
+///
+/// See [`RawMeta::private_use_prefix`] — including what this deliberately does
+/// not change about enforcement.
+#[must_use]
+pub fn vendored_private_use_prefix() -> Option<&'static str> {
+    static P: OnceLock<Option<String>> = OnceLock::new();
+    P.get_or_init(|| {
+        let raw: RawManifest =
+            serde_json::from_str(REGISTRY_JSON).expect("vendored namespace_registry.json is valid");
+        raw.meta.private_use_prefix
+    })
+    .as_deref()
 }
 
 /// The [`NamespaceEntry`] whose `match_prefix` is the **longest prefix** of
@@ -595,6 +637,36 @@ mod tests {
             unpinned.is_empty(),
             "the vendored manifest carries famil(ies) the pin does not list: {unpinned:?} — add \
              them to VENDORED_FAMILY_PREFIXES so the removal gate keeps covering them"
+        );
+    }
+
+    /// **A transcription that was uncheckable is now checked, and it checks.**
+    ///
+    /// [`PRIVATE_USE_FAMILY_STEM`](crate::federation::admission::PRIVATE_USE_FAMILY_STEM)
+    /// shipped as a hand-transcription of CC 3.1.7 R2's Private Use prose, with
+    /// its own doc naming the remedy: a `_meta` key in the generated manifest.
+    /// The rc3 cut carries that key. So the const and the artifact are bound
+    /// here, in the direction that matters — if CC moves the range, this fails
+    /// rather than persist quietly refusing federation traffic on a stem CC no
+    /// longer reserves, or quietly admitting on one it newly does.
+    ///
+    /// Same shape as `family_rules::RULES_NOT_ON_THE_ROW` and
+    /// `quarantine::NAMESPACE_FAMILY`'s measured count: a claim persist repeats
+    /// about CC should be one CC's own artifact can contradict.
+    #[test]
+    fn the_private_use_range_is_machine_readable_now() {
+        let from_manifest = vendored_private_use_prefix().expect(
+            "the rc3 cut carries `_meta.private_use_prefix`. `None` here means the manifest was \
+             re-vendored BACKWARDS to a cut generated before CC shipped the field — check the \
+             source hash before assuming CC removed it.",
+        );
+        assert_eq!(
+            from_manifest,
+            crate::federation::admission::PRIVATE_USE_FAMILY_STEM,
+            "the hand-transcribed Private Use stem and CC's own machine-readable range disagree. \
+             CC is the source of truth: update PRIVATE_USE_FAMILY_STEM, and re-read every \
+             `x_private:` site with it — the federation-tier ban, the promotion gate, and \
+             `regime.rs`'s reasoning about why the range was rejected as a home for `regime:*`."
         );
     }
 
