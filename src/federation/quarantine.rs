@@ -123,10 +123,22 @@ pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 /// **The row registers the family, NOT the emitter rule.** CC's row says
 /// *"slash-duty-holder-only emitter"* in its `description` — human prose that
 /// nothing parses — while its machine-readable `reserved_rule` is **absent**.
-/// On the vendored rc3 cut this row is the **only** one of 109 whose
-/// description asserts an emitter rule its `reserved_rule` omits, which makes
-/// it the sharpest available example for the CC ask: the rule is decided, and
-/// it is one field away from being enforceable by anyone but us.
+///
+/// **This was "the only one of 109"; on the 114-family rc3 cut it is one of
+/// FOUR, and the shape of the gap changed with the count.** The others are
+/// `regime:{artifact}:{version}` (CIRISPersist#571), `mesh_config:{key}` and
+/// `content_rating:{scheme}:{rating}`. All four sit in **CC 3.1.9.2** — as do
+/// all 12 of that section's families, **none** of which carries a
+/// `reserved_rule`. So this is not four unlucky rows: CC's generator sources
+/// reserved rules from CC 3.4 plus a `Reserved?` table column, and 3.1.9.2's
+/// table is `| Prefix | Description | Polarity |` — it has neither. **The
+/// governance-steering tier is structurally unable to carry an enforceable
+/// emitter rule**, which is a better-aimed CC ask than four row-by-row ones.
+///
+/// A count in a doc comment is exactly the claim that rots silently, so it is
+/// measured rather than asserted:
+/// [`registry::tests::the_prose_only_emitter_rules_are_still_confined_to_cc_3_1_9_2`](super::namespace::registry)
+/// recomputes both numbers from the vendored bytes and fails when either moves.
 /// `registry::RawFamily` deserializes `reserved_rule` and ignores everything
 /// else, so
 /// [`authority_for`](super::namespace::registry::authority_for)`("quarantine:…")`

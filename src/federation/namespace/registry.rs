@@ -679,6 +679,79 @@ mod tests {
         );
     }
 
+    /// **The prose-only emitter rules, MEASURED** (CIRISPersist#571).
+    ///
+    /// Several rc3 rows state an emitter restriction in `description` while
+    /// generating no `reserved_rule`, so `authority_for` reports the family
+    /// open and no substrate can enforce what CC wrote. `quarantine.rs` used to
+    /// call itself *"the only one of 109"*; the re-vendor made that four of 114
+    /// while the sentence still read as freshly checked — a claim rotting in the
+    /// direction that looks verified, which is the class
+    /// `manifest_absence_claims_still_hold` exists for.
+    ///
+    /// Both numbers are recomputed from the vendored bytes here, so the doc
+    /// comments that cite them cannot drift without failing the build.
+    ///
+    /// The finding is NOT "four unlucky rows": every one of them is in CC
+    /// 3.1.9.2, and **no** family in that section carries a rule. CC's generator
+    /// sources reserved rules from CC 3.4 plus a `Reserved?` table column, and
+    /// 3.1.9.2's table has neither — so the governance-steering tier is
+    /// structurally unable to carry an enforceable emitter rule. That is the CC
+    /// ask, and this test states it as a measurement rather than a belief.
+    ///
+    /// Deliberately a keyword scan over prose — which persist must NEVER do for
+    /// enforcement (CC 3.1.7 R2 forbids exactly that, and nothing on any
+    /// admission path reads `description`). Here it is pointed at persist's own
+    /// documentation, and the assertion is only ever "re-read the rows", never
+    /// "admit or refuse this traffic".
+    #[test]
+    fn the_prose_only_emitter_rules_are_still_confined_to_cc_3_1_9_2() {
+        let prose_only: Vec<&NamespaceEntry> = entries()
+            .iter()
+            .filter(|e| e.authority.reserved.is_none())
+            .filter(|e| {
+                let d = e.description.to_lowercase();
+                d.contains("-emitted") || d.contains("emitter") || d.contains("-only")
+            })
+            .collect();
+
+        let names: Vec<&str> = prose_only.iter().map(|e| e.prefix.as_str()).collect();
+        assert_eq!(
+            prose_only.len(),
+            4,
+            "the prose-only emitter-rule population moved (now {}): {names:?}. If CC has landed a \
+             rule, the count DROPS — delete the corresponding pin and write the gate. If a new row \
+             arrived stating a rule nothing can parse, it joins the CC ask. Either way the doc \
+             comments in quarantine.rs and regime.rs that cite this number must be re-read.",
+            prose_only.len()
+        );
+        for e in &prose_only {
+            assert_eq!(
+                e.cc_section, "3.1.9.2",
+                "{} states an unenforceable emitter rule from OUTSIDE CC 3.1.9.2 — the CC ask is \
+                 currently scoped to that section's table shape, and this widens it",
+                e.prefix
+            );
+        }
+
+        // The structural claim the ask rests on: it is the SECTION, not the rows.
+        let section: Vec<&NamespaceEntry> = entries()
+            .iter()
+            .filter(|e| e.cc_section == "3.1.9.2")
+            .collect();
+        assert_eq!(
+            section.len(),
+            12,
+            "CC 3.1.9.2's family count moved — re-check the generator ask"
+        );
+        assert!(
+            section.iter().all(|e| e.authority.reserved.is_none()),
+            "a CC 3.1.9.2 family now carries a machine-readable rule — the section's table has \
+             gained a `Reserved?` column or the generator a predicate. That is the fix this ask \
+             wanted: re-check every prose-only pin."
+        );
+    }
+
     /// A `reserved_rule` with a null `cc_ref` (rc3's `trust:{job}:{version}`)
     /// parses, and resolves to the family's own catalogue section rather than
     /// an empty string that reads like a present-but-blank citation.
