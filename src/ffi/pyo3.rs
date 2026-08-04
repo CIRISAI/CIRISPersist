@@ -2797,6 +2797,137 @@ impl PyEngine {
         })
     }
 
+    /// CIRISPersist#570 ask 1 — **what mesh configuration does this node
+    /// actually run?** Returns the
+    /// [`MeshConfigFold`](crate::federation::MeshConfigFold) as JSON:
+    /// `{node_key_id, roots, settings}`.
+    ///
+    /// `settings` carries **one entry per registered key, always** — nine on
+    /// this cut — so a consumer never has to distinguish "not set" from "not
+    /// returned". Each entry is `{key, polarity, unit, baseline, effective,
+    /// relieved, decided_by_root?, row_id?, decided_by?, delegation_id?,
+    /// form?, expires_at?, grounds?, per_root, clamped_roots}`.
+    ///
+    /// **Read `effective`. That is the number to run.** The other fields are
+    /// evidence: `per_root` is every trust root's own answer including the ones
+    /// that lost, and `clamped_roots` names every root whose value was refused
+    /// for asking the node to do MORE than its owner consented to.
+    ///
+    /// # The two guarantees, which hold whatever any root signed
+    ///
+    /// - **relieve-never-expand** (CC 4.2.1) — `effective` never means more
+    ///   flow than `baseline`. Which direction "more flow" is depends on the
+    ///   key and is carried in `polarity`: `"higher_means_more_flow"` for
+    ///   `redundancy.k_repair_target`, `"lower_means_more_flow"` for
+    ///   `antientropy.round_secs`. **Do not assume smaller is tighter.**
+    /// - **most-restrictive-across-roots** — where roots disagree, the tightest
+    ///   value binds, on every node, regardless of visit order.
+    ///
+    /// `baseline` is what this node's owner consented to. Supply it as a JSON
+    /// object `{"<key>": <int>}` covering only the keys you pin; anything
+    /// omitted uses that key's registered default. An unregistered key name is
+    /// an error, not a silent no-op — the registry is closed (CC 4.2.1).
+    ///
+    /// `now` is RFC 3339 and defaults to the current instant.
+    /// **Clock-dependent**: a TTL-expired row stops binding at read time, with
+    /// nothing revoked and nobody notified.
+    ///
+    /// # This returns a JSON STRING, so it is TRUTHY in Python
+    ///
+    /// `if engine.resolve_mesh_config_json(...)` is `True` for every possible
+    /// answer, including one where every key sits at its default. Worse for
+    /// this surface than most: a flag key's value is the JSON number `0` or
+    /// `1`, and `"...\"effective\":0..."` is a truthy string. Parse it with
+    /// `json.loads`, find the entry whose `["key"]` matches, and read
+    /// `["effective"]`.
+    ///
+    /// **Read-only.** This never records a row — admitting one is
+    /// `Engine::record_mesh_config_row` on the Rust surface, which has no FFI
+    /// binding as of this cut.
+    #[pyo3(signature = (node_key_id, baseline_json=None, now=None))]
+    fn resolve_mesh_config_json(
+        &self,
+        py: Python<'_>,
+        node_key_id: &str,
+        baseline_json: Option<&str>,
+        now: Option<&str>,
+    ) -> PyResult<String> {
+        use crate::federation::mesh_config::{MeshConfigBaseline, MeshConfigKey};
+        self.ensure_usable()?;
+        let node = node_key_id.to_owned();
+        let at = parse_rfc3339_arg("now", now)?;
+        // The closed registry, enforced at the FFI boundary: an unknown key in
+        // the caller's baseline is an ERROR, never a silently ignored entry.
+        // A baseline the substrate quietly half-applied would make
+        // relieve-never-expand measured against a ceiling the caller never set.
+        let mut baseline = MeshConfigBaseline::owner_defaults();
+        if let Some(raw) = baseline_json {
+            let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("baseline_json must be a JSON object: {e}"))
+                })?;
+            for (name, value) in parsed {
+                let key = MeshConfigKey::from_wire(&name).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "{name:?} is not a registered mesh_config key (CC 4.2.1: the registry is \
+                         closed — a key naming no consumer processor cannot be set). Registered: \
+                         {:?}",
+                        MeshConfigKey::ALL
+                            .iter()
+                            .map(|k| k.wire_name())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+                let v = value.as_i64().ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "baseline_json[{name:?}] must be a JSON integer (values are integers on \
+                         every key; a ratio is carried in centi-units)"
+                    ))
+                })?;
+                baseline = baseline.with(key, v);
+            }
+        }
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let fold = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        let base = baseline.clone();
+                        runtime.block_on(async move {
+                            crate::federation::mesh_config::resolve_mesh_config(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &node,
+                                &base,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        let base = baseline.clone();
+                        runtime.block_on(async move {
+                            crate::federation::mesh_config::resolve_mesh_config(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &node,
+                                &base,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&fold)
+                    .map_err(|e| PyValueError::new_err(format!("mesh_config serialize: {e}")))
+            })
+        })
+    }
+
     /// CIRISServer#356 — **is a brake active on this action, and did the
     /// duty-holders answer?** Returns the
     /// [`ReverseQuorumFold`](crate::federation::reverse_quorum::ReverseQuorumFold)

@@ -408,6 +408,7 @@ Engine	remove_peer_record	deontic
 Engine	repair_stranded_scope_backlog	procedural
 Engine	replay_abandoned	procedural
 Engine	resolve_key_statement_standing_json	deontic
+Engine	resolve_mesh_config_json	deontic
 Engine	resolve_quarantine_json	deontic
 Engine	resolve_reverse_quorum_json	deontic
 Engine	resolve_scores	axiotic

@@ -23,8 +23,8 @@
 //! CIRISPersist#590 built the first slice of it — [`RULES_NOT_ON_THE_ROW`]'s
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
-//! the whole exposure. Measured on the vendored rc3 cut, those three are **3 of
-//! 18**.
+//! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
+//! of 19** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
 //!
 //! # What is derived and what is pinned
 //!
@@ -252,6 +252,33 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         cc_ask:
             "CIRISConstitution#67 (CC catalogues the five mechanisms and states no shape rule; \
                  the deprecation window lives only in CEG 0.2 §13.1 and in persist)",
+    },
+    PersistFamilyRule {
+        prefix: "mesh_config:",
+        rule: "the author is the node's OWN trust root, or a key that root has conferred to by a \
+               live `trust:confers:v1` `delegates_to` — never the accord's ceremony plane. Plus \
+               the three bounds CC 4.2.1 states on the ACT rather than the emitter: a value may \
+               relieve or restrict and never expand what flows; a key naming no consumer \
+               processor is refused; emergency relief carries a mandatory TTL of at most 72 h and \
+               is not renewable back-to-back by the same holder",
+        enforced_at: &[
+            "federation::mesh_config::record_mesh_config_row",
+            "federation::mesh_config::fold_mesh_config",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: true,
+        cc_ask: "CIRISConstitution#67 — CC 4.2.1 states this rule NORMATIVELY and at length \
+                 (CIRISConstitution#57, ratified), and CC 3.1.9.2's row for the family carries \
+                 `reserved: false` with no `reserved_rule`, so `authority_for` reports it open. \
+                 The root cause is the generator, not the drafting: \
+                 `build_cc_namespace.py` derives `reserved_rule` from CC 3.4 cross-references \
+                 plus a `Reserved?` table column, and CC 3.1.9.2's table has NEITHER — which is \
+                 why `admission::tests::most_of_the_manifest_carries_no_machine_readable_rule` \
+                 can assert that EVERY 3.1.9.2 family resolves `reserved: None`. The ask is one \
+                 generator predicate covering the whole section, not a reworded row. NOTE the \
+                 emitter rule here is a per-node GRAPH question (which root does THIS node \
+                 subscribe to), so a `reserved_rule` naming an identity_type could not express \
+                 it either; what the row could carry is the trust-root-emitter CLASS",
     },
     PersistFamilyRule {
         prefix: "hard_case:",
@@ -871,8 +898,8 @@ mod tests {
                 .filter(|e| e.minted_by_persist)
                 .count(),
             admission::MINTED_NAMESPACE_FAMILIES.len(),
-            "all three minted families are rule-free on the row today; if CC lands one, delete its \
-             line AND re-measure the \"3 of N\" claim in this module's doc"
+            "every minted family is rule-free on its row today; if CC lands one, delete its line \
+             AND re-measure the \"N of M\" claim in this module's doc"
         );
         // The other half of that claim, measured rather than asserted. Growing
         // the inventory is the expected direction and must not be hard to do —
@@ -881,9 +908,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            18,
-            "the inventory now has {} entries; this module's doc says the minted three are \"3 of \
-             18\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+            19,
+            "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
+             19\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

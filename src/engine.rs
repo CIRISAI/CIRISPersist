@@ -5912,6 +5912,68 @@ impl Engine {
         crate::federation::quarantine::resolve_quarantine(directory.as_ref(), key_id, now).await
     }
 
+    /// v25.2.0 (CIRISPersist#570 ask 1) — admit and store one **mesh-config**
+    /// row (see [`mesh_config`](crate::federation::mesh_config)).
+    ///
+    /// The host-reachable half of the config plane. `node_key_id` is the node
+    /// whose subscription and consent are judged: its live `trust:accepts:v1`
+    /// edges decide whether the named root may speak to it at all, and
+    /// `baseline` is what its owner consented to — the ceiling CC 4.2.1's
+    /// **relieve-never-expand** is measured against.
+    ///
+    /// Verify-before-mutation — a refused row writes nothing, and the returned
+    /// [`MeshConfigOutcome`](crate::federation::MeshConfigOutcome) names WHICH
+    /// branch refused rather than making the caller parse a message.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn record_mesh_config_row(
+        &self,
+        node_key_id: &str,
+        baseline: &crate::federation::MeshConfigBaseline,
+        row: &crate::federation::Attestation,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::MeshConfigOutcome, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::mesh_config::record_mesh_config_row(
+            directory.as_ref(),
+            node_key_id,
+            baseline,
+            row,
+            now,
+        )
+        .await
+    }
+
+    /// v25.2.0 (CIRISPersist#570 ask 1) — **what this node's mesh config
+    /// resolves to right now**: one entry per registered key, folded across
+    /// every trust root the node subscribes to.
+    ///
+    /// Evidence, not verdict. Each setting carries every root's own answer
+    /// (`per_root`), which root's value bound (`decided_by_root`), and every
+    /// root whose value was refused for expanding past consent
+    /// (`clamped_roots`) — so a reader auditing a hostile root sees what it
+    /// asked for, not only what it got.
+    ///
+    /// The two CC 4.2.1 guarantees hold here regardless of what any root
+    /// signed: `effective` never means more flow than `baseline`
+    /// (**relieve-never-expand**), and where roots disagree the tightest binds
+    /// (**most-restrictive-across-roots**).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_mesh_config(
+        &self,
+        node_key_id: &str,
+        baseline: &crate::federation::MeshConfigBaseline,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::MeshConfigFold, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::mesh_config::resolve_mesh_config(
+            directory.as_ref(),
+            node_key_id,
+            baseline,
+            now,
+        )
+        .await
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — **does a statement `key_id` made at
     /// `statement_at` still stand**, given the revocations this node holds?
     ///

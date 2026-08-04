@@ -868,9 +868,75 @@ def propose() -> int:
     return 0
 
 
+def surface() -> int:
+    """Regenerate `evidence/ffi_classification.tsv` from `scripts/ffi_taxonomy.tsv`.
+
+    **This subcommand did not exist until v25.2.0**, and `check()` had been
+    telling people to run it since #595 shipped. The projection is gated
+    against its source and there was no supported way to regenerate it, so the
+    only route through a red gate was to hand-edit the artifact the gate calls
+    a projection — which is the two-lists class the gate was built to close,
+    reintroduced by the gate's own error message. Found while landing
+    CIRISPersist#570 ask 1.
+
+    The header comment block is preserved verbatim except for the `Counts at
+    this revision:` line, which is a derived fact and is rewritten. Data rows
+    are `class\\tbinding\\tclass_count\\towner\\tsymbol`, sorted by (class,
+    owner, symbol) — the order the existing artifact is already in, so a
+    regeneration on an unchanged tree is a no-op diff.
+    """
+    syms = exported()
+    pin = pinned()
+    unclassified = [s for s in syms if s.key not in pin]
+    if unclassified:
+        print(
+            "✗ refusing to regenerate the projection while "
+            f"{len(unclassified)} symbol(s) carry no class: "
+            f"{[f'{s.owner}.{s.name}' for s in unclassified[:5]]}. "
+            "Classify them in scripts/ffi_taxonomy.tsv first — a projection of "
+            "an incomplete pin is a projection that reads as complete.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Sorted by (class, owner, symbol) ALPHABETICALLY — matching the artifact
+    # that already exists, not `ORDER`. Regenerating an unchanged tree must
+    # produce a zero-line diff, or the first person to run this gets a 500-line
+    # reorder they cannot review and will be tempted to skip reading.
+    rows = sorted((pin[s.key], s.owner, s.name) for s in syms)
+    counts = collections.Counter(r[0] for r in rows)
+    proj = ROOT / "evidence" / "ffi_classification.tsv"
+    old = proj.read_text().splitlines()
+    header = [ln for ln in old if ln.startswith("#")]
+    tally = " ".join(
+        f"{c}={counts[c]}" for c, _ in counts.most_common() if counts[c]
+    )
+    header = [
+        f"# Counts at this revision: {tally}" if ln.startswith("# Counts at this revision:") else ln
+        for ln in header
+    ]
+    out = list(header)
+    out.append("class\tbinding\tclass_count\towner\tsymbol")
+    for cls, owner, name in rows:
+        binding = "binding" if CLASSES[cls][0] else "descriptive"
+        out.append(f"{cls}\t{binding}\t{counts[cls]}\t{owner}\t{name}")
+    proj.write_text("\n".join(out) + "\n")
+    print(f"OK wrote {len(rows)} rows to {proj.relative_to(ROOT)}")
+    print(f"   {tally}")
+    return 0
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "check"
-    fn = {"check": check, "emit": emit, "report": report, "propose": propose}.get(cmd)
+    fn = {
+        "check": check,
+        "emit": emit,
+        "report": report,
+        "propose": propose,
+        "surface": surface,
+    }.get(cmd)
     if fn is None:
-        raise SystemExit(f"unknown subcommand {cmd!r}; try check | emit | report | propose")
+        raise SystemExit(
+            f"unknown subcommand {cmd!r}; try check | emit | report | propose | surface"
+        )
     raise SystemExit(fn())
