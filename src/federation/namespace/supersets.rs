@@ -1411,36 +1411,29 @@ pub fn absence_falsifier(
 /// "CC has no row for this" was an absence claim, it decayed between the
 /// issue's filing and this cut, and nothing but this would have re-asked.
 ///
-/// One thing the re-vendor must look at rather than rubber-stamp: persist gates
-/// the stem `content_rating:` and CC catalogues `content_rating:{scheme}:{rating}`,
-/// a two-parameter shape where persist's own doc says `{scheme}`. Stem-granular
-/// registration makes them agree for admission purposes; whether they agree
-/// about the VOCABULARY is a question for whoever lands the re-vendor.
-pub const PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES: &[(&str, &str, &str, &str)] = &[
-    (
-        "content_rating:",
-        "CEG 0.3 §5.6.8.3 / §11.5.3",
-        "trusted_publisher-emitted content-rating scheme; persist has gated the prefix since \
-         v3.0.0 and CC Part 3 has never carried a row for it. Refusing it under CC 3.1.7 R2(b) \
-         would reject conformant media-plane traffic on the strength of the Constitution's \
-         SILENCE — the fail-closed-and-wrong trade CIRISPersist#590 was opened to prevent.",
-        "CIRISConstitution#77",
-    ),
-    (
-        "content_class:",
-        "CEG 0.3 §5.6.8.3",
-        "substrate_persist-emitted content classification, same plane and same silence as \
-         content_rating:.",
-        "CIRISConstitution#77",
-    ),
-    (
-        "cw_class:",
-        "CEG 0.3 §5.6.8.3",
-        "substrate_persist-emitted content-warning class, same plane and same silence as \
-         content_rating:.",
-        "CIRISConstitution#77",
-    ),
-];
+/// # EMPTY as of the rc3 re-vendor (CIRISPersist#571) — the ending this table predicted
+///
+/// It carried the three CEG-0.3 media families. CIRISConstitution#77 landed all
+/// three, the re-vendor brought them in, and
+/// [`tests::gated_uncatalogued_families_are_still_gated_and_still_uncatalogued`]
+/// failed by name on `content_rating:`. The lines were deleted, not the gate
+/// suppressed — "that is the whole of CIRISPersist#586 in one test", executed.
+///
+/// The re-vendor did NOT rubber-stamp the arrival, and the caution above about
+/// vocabulary turned out to understate it. Reading the rows CC actually landed:
+/// CC 3.1.9.2 defers all three to CC 3.3.12, and CC 3.3.12's table opens *"All
+/// four families are open vocabulary"*, reserving only `age_assurance:`. CC did
+/// not ratify the CEG-0.3 emitter rules — it declined them. So the three did not
+/// merely stop being *exceptions*, they stopped being *governed*: persist
+/// removed the gates (see
+/// [`MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`](crate::federation::admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN)),
+/// which is also what unblocked the CC 3.4.14 R1 marking an `agent`-typed key
+/// was being refused for.
+///
+/// Kept rather than deleted because the mechanism is the point: a fourth
+/// exception cannot be slipped into the R2 gate as a bare stem without stating
+/// its provenance and its ask here.
+pub const PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES: &[(&str, &str, &str, &str)] = &[];
 
 /// The family stems persist gates that CC has never catalogued, with their
 /// provenance and tracking ask — see

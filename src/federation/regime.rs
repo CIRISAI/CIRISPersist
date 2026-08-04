@@ -10,38 +10,88 @@
 //!
 //! Exactly one of those was persist's to give.
 //!
-//! # The registry half is the Constitution's, and it is not landed
+//! # The registry half LANDED — and it did not carry the rule
 //!
 //! Persist does not author namespace rows. [`registry`](super::namespace::registry)
 //! is GENERATED from CC Part 3 by the Constitution's own
 //! `tools/build_cc_namespace.py` and vendored here byte-for-byte, pinned by
 //! [`VENDORED_SOURCE_SHA256`](super::namespace::registry::VENDORED_SOURCE_SHA256).
-//! **CC carries no `regime:` family** — checked against `rc3` HEAD, not merely
-//! against the vendored copy, precisely so the finding cannot be an artifact of
-//! a stale vendor. It is absent from the cut this crate vendors (109 families)
-//! AND from the newer cut on `rc3` (112 families, which added the CEG-0.3
-//! catalogue rows). There is no version of "pull the newer manifest" that
-//! produces a `regime:` row, so re-vendoring — which this module deliberately
-//! does not do, it is #519/#586's surface — would not unblock the ask either.
+//! At v27.0.0 CC carried no `regime:` family and this module said so, with a
+//! self-deleting pin. **CIRISConstitution#81 landed the row**, the rc3
+//! re-vendor (109 → 114 families) brought it in, the pin failed by name as
+//! designed, and #571's registry half is closed.
 //!
-//! A row hand-added *here* would be exactly the generated-vs-hand-maintained
-//! split truth CC 3.1.7 R2 exists to end, so this module adds none. What it
-//! adds instead is a finding that cannot be forgotten:
-//! [`tests::regime_families_are_still_absent_from_the_vendored_manifest`] fails
-//! the day CC lands the rows — which is the day #571 can be finished — the same
-//! shape as
-//! [`UNREGISTERED_GATED_FAMILIES`](super::admission::UNREGISTERED_GATED_FAMILIES)'s
-//! "the excuse deletes itself" pin, without granting persist the governance
-//! carve-out that pin grants.
+//! **What arrived is narrower than the row's prose, and the difference is the
+//! whole remaining story.** The catalogue row reads:
+//!
+//! > `regime:{artifact}:{version}` — … **reserved — substrate-steward-emitted**,
+//! > the emitter rule pinned at mint per R2(a); registered to end the
+//! > ProducerSteward default.
+//!
+//! The GENERATED row that prose produces is `"reserved": false` with **no
+//! `reserved_rule` key at all**. So:
+//!
+//! - [`is_family_registered`](super::namespace::registry::is_family_registered)
+//!   flips to `true` — real, and it is what unblocks R2(b);
+//! - [`authority_for`](super::namespace::registry::authority_for) returns
+//!   `ProducerSteward` / `reserved: None` — **byte-identical to what it returned
+//!   before the row existed.** The "ProducerSteward default" the row says it
+//!   ends is not ended by the artifact the row generates.
+//!
+//! This is not a CC drafting slip so much as a generator reach limit, and it is
+//! structural rather than incidental: `build_cc_namespace.py` cross-references
+//! reserved rules from CC **3.4** onto families, plus a `Reserved?` table column
+//! where one exists. The `regime:` row sits in CC **3.1.9.2**, whose table has
+//! three columns and no `Reserved?`, and its rule is stated in prose that names
+//! no CC 3.4 clause. Persist already measured exactly this and pinned it:
+//! `admission::tests::most_of_the_manifest_carries_no_machine_readable_rule`
+//! asserts that **every** CC 3.1.9.2 family resolves `reserved.is_none()`. The
+//! `regime:` row landed in the one section of the Part that cannot currently
+//! carry a machine-readable emitter rule.
+//!
+//! **So persist does not gate the family, and the reason has changed.** It is no
+//! longer "R2(b) would refuse it" (there is a row now — that reason is dead and
+//! [`tests::governing_regime_would_now_admit_but_the_row_states_no_rule`] proves
+//! it dead rather than quietly dropping it). It is that there is **no rule on
+//! the row to enforce**, and enforcing the prose instead would be persist
+//! re-deriving an emitter rule from CC's sentences — the generated-vs-hand-
+//! maintained split truth CC 3.1.7 R2 exists to end, and the exact defect
+//! `admission::tests::authority_lists_agree_on_every_manifest_family` fails the
+//! build for. That gate would refuse a hand-written `regime:` rule immediately,
+//! by construction. `substrate-steward-emitted` also names no
+//! `identity_type` persist has: there is no `substrate_steward`.
+//!
+//! **The ask on CC**, which is the last thing standing between this module and
+//! deletion: land the rule where the generator can reach it — a `Reserved?`
+//! column on the CC 3.1.9.2 row, or a `regime:` predicate in
+//! `build_cc_namespace.py`'s `RESERVED_RULES` naming the CC 3.4 clause that
+//! rules it. [`tests::the_regime_row_still_states_no_machine_readable_rule`]
+//! fails the day that lands, which is the day persist writes the gate.
+//!
+//! The same defect shipped on four other rc3 rows and persist is not
+//! speculating about that either: `content_rating:` / `content_class:` /
+//! `cw_class:` arrived in the same re-vendor with their emitter rules deferred
+//! to CC 3.3.12 prose, and `mesh_config:{key}` says "trust-root-emitted" with
+//! `reserved: false`. For the media three the resolution went the other way —
+//! CC 3.3.12 turned out to *declare them open*, so the fix was to delete
+//! persist's CEG-era gates
+//! ([`MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`](super::admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN)).
+//! `regime:`'s prose says the opposite, which is why it waits for a rule rather
+//! than being declared open.
 //!
 //! **The exception pin does not fit this family and was deliberately not used.**
-//! `UNREGISTERED_GATED_FAMILIES` grandfathers three CEG-0.3 families persist has
-//! *already gated* since v3.0.0 and CC never catalogued — enforcement that
-//! predates R2, named in source rather than implied by silence. `regime:*` is a
-//! family being introduced today, which persist does not gate and has no rule
-//! for. Putting it on that list would convert a named residual into a
-//! general-purpose bypass: the mechanism for "we govern this and CC hasn't
-//! caught up" would become the mechanism for "CC hasn't ruled, so we ruled."
+//! [`UNREGISTERED_GATED_FAMILIES`](super::admission::UNREGISTERED_GATED_FAMILIES)
+//! grandfathers families persist *already gates* that CC has *not* catalogued —
+//! enforcement predating R2, named in source rather than implied by silence.
+//! `regime:` is the exact opposite on both axes: catalogued by CC, gated by
+//! nobody. Putting it there would convert a named residual into a
+//! general-purpose bypass — the mechanism for "we govern this and CC hasn't
+//! caught up" becoming the mechanism for "CC hasn't ruled, so we ruled."
+//!
+//! As of this cut the list is **empty**: it held exactly the three CEG-0.3
+//! families, CC catalogued all three, and the lines were deleted rather than the
+//! gate suppressed. So the pin has now been exercised end to end, which is worth
+//! more than the three lines were.
 //!
 //! # Why not the Private Use range?
 //!
@@ -111,25 +161,34 @@
 //!    `regime:*` row becomes federation-visible without a placement someone
 //!    signed for.
 //!
-//! 4. **Authority is `ProducerSteward` — self-attested and un-reserved.** This
-//!    is what [`authority_for`](super::namespace::registry::authority_for)
-//!    already returns for an uncatalogued family, and for this one it is also
-//!    the honest answer: a `regime:gate:v1` from peer X is evidence about X's
-//!    own run, signed by X. Persist confers no warrant on it and no reader
-//!    should read one. Whether CC eventually reserves the family (as it did
-//!    `trace:{form}:{version}` — CC 3.1.5 / 3.4.5, catalogued after persist
-//!    shipped the interim validator) is CC's call, not this module's.
+//! 4. **Authority is still `ProducerSteward` — self-attested and un-reserved,
+//!    now WITH a registry row rather than for lack of one.** Before the
+//!    re-vendor this was
+//!    [`authority_for`](super::namespace::registry::authority_for)'s fallback
+//!    for an uncatalogued family. After it, the family is catalogued and the
+//!    answer is unchanged — because the row states no rule. The reading is the
+//!    honest one either way: a `regime:gate:v1` from peer X is evidence about
+//!    X's own run, signed by X, and persist confers no warrant on it. What
+//!    changed is that "un-reserved" is now a fact *about a row someone wrote*
+//!    instead of an artifact of silence, and
+//!    [`tests::regime_authority_is_unreserved_producer_steward`] asserts both
+//!    halves together so the pair cannot drift apart unnoticed.
 //!
-//! 5. **Letting it federate IS the decision not to gate it — today those are
-//!    the same decision.** Adding `regime:` to any source
-//!    [`governed_family_stems`](super::admission::governed_family_stems) reads
-//!    would make CC 3.1.7 R2(b) refuse the family outright, because there is no
-//!    row to satisfy R2(b) with: every `regime:*` emission would fail with
-//!    `namespace_family_unregistered`, taking out the local-tier path
-//!    CIRISAgent depends on today. So "govern it" and "let it replicate" are
-//!    presently mutually exclusive, and this is a footgun #571's own existence
-//!    creates. [`tests::governing_regime_today_would_refuse_it`] states it as an
-//!    executed witness rather than a hope.
+//! 5. **Not gating it is still the decision — for a different reason than in
+//!    v27.0.0.** The old reason was mechanical and is now DEAD: adding `regime:`
+//!    to any source [`governed_family_stems`](super::admission::governed_family_stems)
+//!    reads used to make CC 3.1.7 R2(b) refuse the family outright, because
+//!    there was no row to satisfy R2(b) with, taking out the local-tier path
+//!    CIRISAgent depends on. There is a row now, so R2(b) is satisfied and
+//!    governing the family would no longer refuse it.
+//!
+//!    The reason persist still does not gate it is the one in the header: the
+//!    row carries no machine-readable rule, so there is nothing to enforce, and
+//!    a hand-written rule would be refused by persist's own split-truth gate.
+//!    [`tests::governing_regime_would_now_admit_but_the_row_states_no_rule`]
+//!    retires the old claim by EXECUTING its falsification — it asserts the
+//!    R2(b) refusal no longer reaches `regime:*`, on the same predicate that
+//!    still refuses the governed-and-unregistered probe.
 //!
 //! # What is NOT here, on purpose
 //!
@@ -180,30 +239,105 @@ mod tests {
     // The finding: CC has not catalogued the family
     // ══════════════════════════════════════════════════════════════════
 
-    /// **The self-deleting pin.** #571's registry half is blocked on a CC Part-3
-    /// row; this asserts the block is still real. It FAILS the moment CC lands
-    /// `regime:*` and persist re-vendors — which is the signal to finish #571
-    /// (resolve the emitter rule, decide whether persist gates it, and delete
-    /// this test), not a signal to relax the assertion.
+    /// **The self-deleting pin, DELETED — by its own failure.**
+    ///
+    /// v27.0.0 shipped `regime_families_are_still_absent_from_the_vendored_manifest`,
+    /// asserting CC carried no `regime:` row. CIRISConstitution#81 landed one,
+    /// the rc3 re-vendor brought it in, and that test failed by name with the
+    /// instruction it was written to deliver. This is its replacement: the same
+    /// question, asked of the new state.
     ///
     /// Deliberately keyed on the vendored MANIFEST, never on a section-walk or a
     /// local list: R2's normative enforcement surface is the manifest, and a
     /// second source of truth about what CC catalogues is the defect this whole
     /// area exists to prevent.
     #[test]
-    fn regime_families_are_still_absent_from_the_vendored_manifest() {
+    fn regime_families_are_registered_by_the_vendored_manifest() {
         for dim in REGIME_DIMENSIONS {
             assert!(
-                !is_family_registered(dim),
-                "CIRISPersist#571: CC has catalogued {dim} — the registry half is no longer \
-                 blocked. Finish #571: resolve the emitter rule from the new row, re-decide \
-                 whether persist governs the family (see \
-                 `governing_regime_today_would_refuse_it`), and delete this pin."
+                is_family_registered(dim),
+                "CIRISPersist#571: {dim} is no longer registered. CIRISConstitution#81 landed \
+                 `regime:{{artifact}}:{{version}}` and this crate vendors that cut — if the family \
+                 has vanished, the re-vendor dropped it (see \
+                 `registry::tests::no_vendored_family_silently_disappears`), it did not become \
+                 open vocabulary again."
             );
         }
         assert!(
-            !is_family_registered(REGIME_FAMILY_STEM),
-            "the stem itself must be unregistered too — a row on any leaf registers the family"
+            is_family_registered(REGIME_FAMILY_STEM),
+            "the stem itself must be registered — R2 speaks at family-stem granularity"
+        );
+        // The row is spelled the way CC spells it. #571 asked for four leaf
+        // rows; CC landed ONE parameterised family covering all four, which is
+        // the R2 granularity and the better answer — pin the spelling so a
+        // re-vendor that re-spells it is visible.
+        assert!(
+            crate::federation::namespace::registry::entries()
+                .iter()
+                .any(|e| e.prefix == "regime:{artifact}:{version}"),
+            "the CC row must be the parameterised family `regime:{{artifact}}:{{version}}`"
+        );
+    }
+
+    /// **The remaining half of #571, as a failing-when-fixed pin.**
+    ///
+    /// The row's PROSE says *"reserved — substrate-steward-emitted"*. The row's
+    /// generated STRUCTURE says `"reserved": false` with no `reserved_rule`, so
+    /// [`authority_for`] has no rule to report and persist has none to enforce.
+    ///
+    /// The cause is structural, not a typo: CC's generator cross-references
+    /// reserved rules from CC 3.4 (plus a `Reserved?` table column where one
+    /// exists), and the `regime:` row sits in CC 3.1.9.2 — a three-column table
+    /// with no such column, whose prose names no CC 3.4 clause.
+    ///
+    /// This FAILS the day CC lands the rule where the generator can reach it,
+    /// which is the day persist writes the `regime:` gate. Until then persist
+    /// gates nothing on this family, and that is a decision with a stated
+    /// reason rather than an oversight.
+    #[test]
+    fn the_regime_row_still_states_no_machine_readable_rule() {
+        for dim in REGIME_DIMENSIONS {
+            let authority = authority_for(dim);
+            assert!(
+                authority.reserved.is_none(),
+                "CIRISPersist#571 IS NOW FINISHABLE: the vendored `regime:` row carries a \
+                 machine-readable rule ({:?}). CC has landed what the row's prose always claimed \
+                 (\"reserved — substrate-steward-emitted\"). Write the persist gate to match THAT \
+                 rule — not the prose — add the stem to the governed set, delete this pin, and \
+                 delete the ask in this module's header.",
+                authority.reserved
+            );
+        }
+        // The prose half, quoted from the vendored bytes rather than from
+        // memory, so "the row says one thing and generates another" is a
+        // checked claim and not a comment. If CC rewords the description, this
+        // fails and a human re-reads the row — which is the correct outcome:
+        // the whole finding is about the gap between these two fields.
+        let row = crate::federation::namespace::registry::entries()
+            .iter()
+            .find(|e| e.prefix == "regime:{artifact}:{version}")
+            .expect("the regime row is registered");
+        assert_eq!(
+            row.cc_section, "3.1.9.2",
+            "the row moved sections — re-check whether the generator can now reach its rule"
+        );
+        assert_eq!(
+            row.authority.class,
+            AuthorityClass::ProducerSteward,
+            "an unreserved row must classify ProducerSteward"
+        );
+        assert!(
+            row.description.contains("substrate-steward-emitted"),
+            "the row's prose no longer claims an emitter rule (got {:?}) — if CC has WITHDRAWN the \
+             reservation rather than landed it, `regime:*` is settled open vocabulary: say so here \
+             and in the header, and stop waiting for a rule that is not coming",
+            row.description
+        );
+        // The gap, stated as one assertion so a reader sees both halves at
+        // once: the row claims a reservation in prose and generates none.
+        assert!(
+            row.description.contains("reserved") && row.authority.reserved.is_none(),
+            "prose and structure have converged — one of the two branches above should have fired"
         );
     }
 
@@ -225,40 +359,59 @@ mod tests {
     // The decision, clause by clause
     // ══════════════════════════════════════════════════════════════════
 
-    /// **Clause 5, and the footgun guard.** `regime:*` must NOT be a governed
-    /// family while CC carries no row for it: R2(b) refuses a governed family
-    /// with no row, so governing it would refuse every `regime:*` emission —
-    /// including the local-tier path CIRISAgent uses today.
+    /// **Clause 5 — the old reason RETIRED by executing its falsification.**
     ///
-    /// The refusal half is proven on the SAME predicate, not asserted: the
-    /// `cfg(test)` R2 probe stem is governed-and-unregistered by construction,
-    /// so the two calls below differ in exactly one input.
+    /// v27.0.0's `governing_regime_today_would_refuse_it` claimed: governing
+    /// `regime:` would make CC 3.1.7 R2(b) refuse every `regime:*` emission,
+    /// because there was no registry row to satisfy R2(b) with. That claim was
+    /// TRUE and is now FALSE — CIRISConstitution#81 landed the row.
+    ///
+    /// Retiring it by deletion would leave "persist does not gate `regime:`"
+    /// resting on a reason nobody could find again. So the claim is retired the
+    /// only honest way: by asserting its negation on the same predicate that
+    /// once produced it. R2(b) no longer reaches `regime:*` **even if the family
+    /// were governed** — proven by driving the gate at the registered stem — and
+    /// the probe stem, governed-and-unregistered by construction, still refuses.
+    /// One differing input, opposite verdicts.
+    ///
+    /// What still holds is the DECISION, on its new footing: persist does not
+    /// gate the family because the row states no rule to enforce (see
+    /// [`the_regime_row_still_states_no_machine_readable_rule`]).
     #[test]
-    fn governing_regime_today_would_refuse_it() {
+    fn governing_regime_would_now_admit_but_the_row_states_no_rule() {
         let governed = governed_family_stems();
         assert!(
             !governed.contains(&REGIME_FAMILY_STEM.to_owned()),
-            "CIRISPersist#571 clause 5: `regime:` was added to a source \
-             `governed_family_stems()` reads while CC still carries no row for it. That makes CC \
-             3.1.7 R2(b) refuse EVERY regime:* emission with `namespace_family_unregistered`, \
-             taking out the local-tier artifact path CIRISAgent depends on. Governing this \
-             family requires the CC row first — not the other way round."
+            "CIRISPersist#571 clause 5: `regime:` is now in a source `governed_family_stems()` \
+             reads. That is no longer FATAL — the CC row satisfies R2(b), so emissions would still \
+             admit — but persist has no rule to enforce on this family: the row carries no \
+             `reserved_rule` and `substrate-steward-emitted` names no identity_type persist has. A \
+             gate here would be persist enforcing CC's PROSE, which \
+             `admission::tests::authority_lists_agree_on_every_manifest_family` fails the build \
+             for. Land the rule on the CC row first."
         );
         assert!(
             !UNREGISTERED_GATED_FAMILIES.contains(&REGIME_FAMILY_STEM),
-            "the declared-exception pin grandfathers families persist ALREADY gates and CC never \
-             catalogued; `regime:` is neither, and using it here would turn a named residual into \
-             a general-purpose bypass"
+            "`regime:` must never ride the declared-exception list: that list grandfathers \
+             families persist ALREADY gates that CC has NOT catalogued, and `regime:` is now the \
+             exact opposite — catalogued by CC, gated by nobody"
         );
 
-        // Ungoverned ⇒ R2(b) admits (the open vocabulary CC preserves).
+        // R2(b) admits — as it did before, but for the opposite reason. Then it
+        // was ungoverned; now the family is REGISTERED, which is the condition
+        // that would hold even under governance.
         for dim in REGIME_DIMENSIONS {
             check_namespace_family_registered(dim)
-                .unwrap_or_else(|e| panic!("{dim} must admit under R2(b) while ungoverned: {e}"));
+                .unwrap_or_else(|e| panic!("{dim} must admit under R2(b): {e}"));
+            assert!(
+                is_family_registered(dim),
+                "{dim} must admit because it is REGISTERED — if it admits only because it is \
+                 ungoverned, the old reason is still the live one and this test is lying"
+            );
         }
 
-        // The SAME predicate refuses when the family IS governed and
-        // unregistered — so the admit above is a decision, not a dead gate.
+        // The SAME predicate still refuses a governed-and-unregistered family,
+        // so the admit above is a decision and not a dead gate.
         let probe = format!(
             "{}manifest:v1",
             crate::federation::admission::R2_PROBE_UNREGISTERED_STEM
@@ -268,11 +421,17 @@ mod tests {
         assert_eq!(err.kind(), "federation_namespace_family_unregistered");
     }
 
-    /// **Clause 4.** The uncatalogued family resolves to a self-attested
-    /// producer claim with no reserved rule — which is both what the classifier
-    /// already does and the honest reading of a research artifact: evidence
+    /// **Clause 4.** The family resolves to a self-attested producer claim with
+    /// no reserved rule — the honest reading of a research artifact: evidence
     /// about its own producer's run, signed by that producer, carrying no
     /// warrant persist conferred.
+    ///
+    /// Both halves are asserted TOGETHER on purpose. Before the re-vendor this
+    /// answer came from `authority_for`'s uncatalogued-family fallback; after
+    /// it, the family IS catalogued and the answer is unchanged — which is the
+    /// finding, not a coincidence. A future re-vendor that lands the rule flips
+    /// the second assertion while the first still passes, and the pair is what
+    /// makes that legible.
     #[test]
     fn regime_authority_is_unreserved_producer_steward() {
         for dim in REGIME_DIMENSIONS {
@@ -280,11 +439,18 @@ mod tests {
             assert_eq!(
                 authority.class,
                 AuthorityClass::ProducerSteward,
-                "{dim} must classify as a producer claim while CC is silent"
+                "{dim} must classify as a producer claim"
             );
             assert!(
                 authority.reserved.is_none(),
                 "{dim} must carry no reserved rule — persist has not been given one to enforce"
+            );
+            assert!(
+                is_family_registered(dim),
+                "{dim} must be REGISTERED while resolving ProducerSteward — that pairing is \
+                 CIRISPersist#571's remaining finding (a row that ends the ProducerSteward default \
+                 in prose and not in structure). If registration has gone away, the re-vendor \
+                 regressed."
             );
         }
     }
@@ -429,6 +595,102 @@ mod tests {
         //    door. Asserted right next to the admit so the two verdicts are
         //    read together.
         private_use_is_banned_from_federation_tier(dir, tag).await;
+
+        // ── The other family the same re-vendor unblocked. Rides this body so
+        //    it inherits the three-backend trio rather than growing a fourth.
+        cc_3414_r1_class_marking_admits_from_any_attester(dir, tag).await;
+    }
+
+    /// **CC 3.4.14 R1 — "Class marking is universal (every attester)"**, the
+    /// regression witness for the gate this cut REMOVED.
+    ///
+    /// Until the rc3 re-vendor, persist carried a CEG-0.3 `ReservedPrefixRule`
+    /// pinning `content_class:` to `identity_type = substrate_persist`. CC then
+    /// catalogued the family (CIRISConstitution#77) and its semantics section,
+    /// CC 3.3.12, opens *"All four families are open vocabulary"* — while
+    /// CC 3.4.14 R1 makes `content_class:generated` / `generated_modified`
+    /// MANDATORY on any Contribution carrying generated content, and R2 requires
+    /// an agent's marking to ride a key whose `identity_type` contains `agent`.
+    ///
+    /// So persist's gate refused, on every backend, precisely the row CC makes
+    /// mandatory — blocking the Art. 50(2) disclosure path (applicable
+    /// 2026-08-02; discharged in CIRISAgent 2.9.8 / CIRISServer 0.6) at the
+    /// substrate. Measured before it was fixed:
+    /// `ReservedPrefixEmitterMismatch { required: ["substrate_persist"],
+    /// got_identity_type: "agent" }`.
+    ///
+    /// The test keys on an `agent`-typed key deliberately — that is R2's
+    /// required shape and was the exact identity the old rule refused. A
+    /// negative control rides alongside: `age_assurance:` is the ONE family in
+    /// CC 3.3.12 that IS reserved (witness-only, and it carries a real
+    /// `reserved_rule` in the manifest), and it must still refuse an `agent`
+    /// key. Without it this test would pass just as happily if every
+    /// reserved-prefix rule had been deleted.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn cc_3414_r1_class_marking_admits_from_any_attester(
+        dir: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        // `register_hybrid_key` registers `identity_type = agent` — CC 3.4.14
+        // R2's required shape, and what the removed rule rejected.
+        //
+        // The `:v1` leaf is the pre-existing T3 version-pinning convention
+        // (CEG §13.1, `require_version_segment`) that every `scores` dimension
+        // in persist carries; it is orthogonal to this cut and applies to the
+        // `{class}` token as open vocabulary. Worth knowing rather than
+        // discovering: CC 3.4.14 R1 spells the marking `content_class:generated`
+        // unversioned, so a producer emitting CC's literal spelling is refused
+        // by T3, not by any emitter rule. That is a separate question from this
+        // one and is NOT what #571 changed.
+        for (i, dim) in [
+            "content_class:generated:v1",
+            "content_class:generated_modified:v1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            land_local(dir, &format!("{tag}-cc3414-{i}"), dim)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "CC 3.4.14 R1 — class marking is universal (EVERY attester): {dim} was \
+                         refused from an `agent`-typed key on {tag} ({e}). A gate on \
+                         `content_class:` refuses the marking CC makes mandatory and blocks the \
+                         Art. 50(2) disclosure path; CC 3.3.12 leaves the family open vocabulary. \
+                         See admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN."
+                    )
+                });
+        }
+        // The sibling families CC 3.3.12 also leaves open.
+        for (i, dim) in ["content_rating:mpaa:pg13:v1", "cw_class:horror:v1"]
+            .iter()
+            .enumerate()
+        {
+            land_local(dir, &format!("{tag}-open-{i}"), dim)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("CC 3.3.12 leaves {dim} open vocabulary; refused on {tag}: {e}")
+                });
+        }
+        // NEGATIVE CONTROL — the one row in that CC 3.3.12 table that IS
+        // reserved must still refuse the same key. Proves the three admits
+        // above are a scoped decision, not a deleted gate.
+        let err = land_local(
+            dir,
+            &format!("{tag}-agegate"),
+            "age_assurance:provider:adult:v1",
+        )
+        .await
+        .expect_err(
+            "CC 3.3.12 + CC 3.4.11: `age_assurance:` is witness-reserved and must still \
+                 refuse an `agent`-typed emitter — if this admits, the media-plane fix deleted \
+                 more than CC leaves open",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_reserved_prefix_emitter_mismatch",
+            "the reserved-prefix gate must be what refuses `age_assurance:` on {tag}"
+        );
     }
 
     /// **CC 3.1.7 R2, the Private Use range** (landed on rc3 after v26.0.0

@@ -42,10 +42,10 @@ pub const VENDORED_CC_VERSION: &str = "1.0-rc3";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "774062a90c0a31520648839e6bef110d3305d0f78d35cf3e821e3af6b4b02ba8";
+    "ec3cca6cdfea62a51905867d380a3f7b07d90cd2bcdb4fa2c5080e8b405516b6";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 109;
+pub const VENDORED_N_FAMILIES: usize = 114;
 
 /// One resolved namespace family — a CC 3.1 prefix, its owning component, and
 /// the [`Authority`] its reserved-prefix rule (CC 3.4) demands.
@@ -67,6 +67,18 @@ pub struct NamespaceEntry {
     pub owning_repo: Option<String>,
     /// The CC section the family is catalogued in (e.g. `"3.1.2"`).
     pub cc_section: String,
+    /// The row's catalogue PROSE, verbatim from the manifest (the generator's
+    /// first-sentence extract of the CC 3.1 table cell).
+    ///
+    /// Carried since CIRISPersist#571 for one reason: several rc3 rows state an
+    /// emitter rule in this field while generating `reserved: false` with no
+    /// [`Authority::reserved`] — `regime:{artifact}:{version}` says *"reserved —
+    /// substrate-steward-emitted"* and resolves `ProducerSteward`/`None`. Persist
+    /// deliberately does **not** enforce anything read from here (that would be
+    /// the section-walk heuristic CC 3.1.7 R2 forbids); it exists so a test can
+    /// quote the row's own words back and FAIL when structure and prose
+    /// disagree, instead of that disagreement living in a comment.
+    pub description: String,
     /// The resolved emit authority (class + any CC 3.4 reserved rule).
     pub authority: Authority,
 }
@@ -94,6 +106,8 @@ struct RawFamily {
     #[serde(default)]
     owning_repo: Option<String>,
     cc_section: String,
+    #[serde(default)]
+    description: String,
     // NOTE: the manifest's `reserved` bool is redundant with `reserved_rule`
     // presence (which carries the CC 3.4 specifics) — serde ignores it.
     #[serde(default)]
@@ -201,6 +215,7 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
                 owning_component: f.owning_component,
                 owning_repo: f.owning_repo,
                 cc_section: f.cc_section,
+                description: f.description,
                 authority: Authority { class, reserved },
             }
         })
@@ -357,9 +372,15 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
     "consent:{kind}",
+    // rc3 / CIRISConstitution#77 — the three CEG-0.3 media-plane families
+    // persist had gated since v3.0.0 with no CC row. Their arrival is what
+    // retires `UNREGISTERED_GATED_FAMILIES`.
+    "content_class:{class}",
+    "content_rating:{scheme}:{rating}",
     "corpus_health:n_eff_measurable",
     "credits:{domain}:{language}:substrate_building",
     "credits:{domain}:{language}:{subject}",
+    "cw_class:{class}",
     "delivery:{class}",
     "delivery_receipt:{stream_id}",
     "detection:conscience_override_rate",
@@ -390,6 +411,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "licensure:{authority_id}",
     "locality:decision:{scale}",
     "manifold_conformity:{cohort}",
+    "mesh_config:{key}",
     "method:{approach_id}:{substrate_rung}",
     "moderation:{allegation_type}",
     "moderation_track_record:{community_key_id}",
@@ -414,6 +436,8 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ratchet:flag:harassment_pattern",
     "ratchet:flag:out_of_distribution_voting",
     "reconsideration:{grounds}",
+    // rc3 / CIRISConstitution#81 — the family CIRISPersist#571 was blocked on.
+    "regime:{artifact}:{version}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
     "seed_holder_voting_alignment:{cell}",
@@ -652,6 +676,79 @@ mod tests {
             ruled_but_unasserted.is_empty(),
             "{ruled_but_unasserted:?} carry a `reserved_rule` but `reserved: false` — the \
              manifest contradicts itself about whether the family is reserved"
+        );
+    }
+
+    /// **The prose-only emitter rules, MEASURED** (CIRISPersist#571).
+    ///
+    /// Several rc3 rows state an emitter restriction in `description` while
+    /// generating no `reserved_rule`, so `authority_for` reports the family
+    /// open and no substrate can enforce what CC wrote. `quarantine.rs` used to
+    /// call itself *"the only one of 109"*; the re-vendor made that four of 114
+    /// while the sentence still read as freshly checked — a claim rotting in the
+    /// direction that looks verified, which is the class
+    /// `manifest_absence_claims_still_hold` exists for.
+    ///
+    /// Both numbers are recomputed from the vendored bytes here, so the doc
+    /// comments that cite them cannot drift without failing the build.
+    ///
+    /// The finding is NOT "four unlucky rows": every one of them is in CC
+    /// 3.1.9.2, and **no** family in that section carries a rule. CC's generator
+    /// sources reserved rules from CC 3.4 plus a `Reserved?` table column, and
+    /// 3.1.9.2's table has neither — so the governance-steering tier is
+    /// structurally unable to carry an enforceable emitter rule. That is the CC
+    /// ask, and this test states it as a measurement rather than a belief.
+    ///
+    /// Deliberately a keyword scan over prose — which persist must NEVER do for
+    /// enforcement (CC 3.1.7 R2 forbids exactly that, and nothing on any
+    /// admission path reads `description`). Here it is pointed at persist's own
+    /// documentation, and the assertion is only ever "re-read the rows", never
+    /// "admit or refuse this traffic".
+    #[test]
+    fn the_prose_only_emitter_rules_are_still_confined_to_cc_3_1_9_2() {
+        let prose_only: Vec<&NamespaceEntry> = entries()
+            .iter()
+            .filter(|e| e.authority.reserved.is_none())
+            .filter(|e| {
+                let d = e.description.to_lowercase();
+                d.contains("-emitted") || d.contains("emitter") || d.contains("-only")
+            })
+            .collect();
+
+        let names: Vec<&str> = prose_only.iter().map(|e| e.prefix.as_str()).collect();
+        assert_eq!(
+            prose_only.len(),
+            4,
+            "the prose-only emitter-rule population moved (now {}): {names:?}. If CC has landed a \
+             rule, the count DROPS — delete the corresponding pin and write the gate. If a new row \
+             arrived stating a rule nothing can parse, it joins the CC ask. Either way the doc \
+             comments in quarantine.rs and regime.rs that cite this number must be re-read.",
+            prose_only.len()
+        );
+        for e in &prose_only {
+            assert_eq!(
+                e.cc_section, "3.1.9.2",
+                "{} states an unenforceable emitter rule from OUTSIDE CC 3.1.9.2 — the CC ask is \
+                 currently scoped to that section's table shape, and this widens it",
+                e.prefix
+            );
+        }
+
+        // The structural claim the ask rests on: it is the SECTION, not the rows.
+        let section: Vec<&NamespaceEntry> = entries()
+            .iter()
+            .filter(|e| e.cc_section == "3.1.9.2")
+            .collect();
+        assert_eq!(
+            section.len(),
+            12,
+            "CC 3.1.9.2's family count moved — re-check the generator ask"
+        );
+        assert!(
+            section.iter().all(|e| e.authority.reserved.is_none()),
+            "a CC 3.1.9.2 family now carries a machine-readable rule — the section's table has \
+             gained a `Reserved?` column or the generator a predicate. That is the fix this ask \
+             wanted: re-check every prose-only pin."
         );
     }
 

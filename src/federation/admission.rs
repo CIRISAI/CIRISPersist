@@ -383,7 +383,10 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     use super::types::identity_type;
     let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
     let witness = identity_type::WITNESS.to_owned();
-    let trusted_publisher = identity_type::TRUSTED_PUBLISHER.to_owned();
+    // NB: no `trusted_publisher` binding — CC 3.3.12 leaves `content_rating:`
+    // open vocabulary, so the write door carries no publisher rule. The
+    // publisher discrimination lives on the READ door
+    // (`lookup_trusted_publisher_chain`), which is where CC puts it.
     let lenscore_detector = identity_type::LENSCORE_DETECTOR.to_owned();
     vec![
         ReservedPrefixRule {
@@ -410,28 +413,41 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
             pattern_prefix: "transparency_log:cosigned:".into(),
             required_identity_types: vec![witness.clone()],
         },
-        // CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix
-        // families added for media-sharing admission.
+        // CEG 0.3 §5.6.8.3 + §11.5.3 added FOUR reserved-prefix families for
+        // media-sharing admission. **Three of them are gone as of the rc3
+        // re-vendor (CIRISPersist#571), and their removal is a fix, not a
+        // relaxation** — see [`MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`].
         //
-        // - content_rating:{scheme}:{rating} → emitted by trusted_publisher
-        //   (publisher-curated content ratings per Policy J).
-        // - content_class:{class} → emitted by substrate_persist.
-        // - cw_class:{class} → emitted by substrate_persist
-        //   (content-warning class).
+        // CC 3.3.12 catalogues `content_rating:` / `content_class:` /
+        // `cw_class:` and opens its own table with *"All four families are open
+        // vocabulary"*, naming NO emitter role for any of the three; the one
+        // family in that table CC does reserve (`age_assurance:`) it marks
+        // "witness-reserved" in as many words, and that row carries a
+        // machine-readable `reserved_rule` while the other three carry none.
+        // Persist's CEG-sourced gates therefore demanded an emitter role the
+        // Constitution does not, which CC 3.1.7 R2 names as refusing traffic
+        // the Constitution leaves open.
+        //
+        // `content_class:` was the sharp end: CC 3.4.14 R1 — *"Class marking is
+        // universal (every attester)"* — makes `content_class:generated` /
+        // `content_class:generated_modified` MANDATORY on any Contribution
+        // carrying generated content, and R2 requires an agent's to be attested
+        // under a key whose `identity_type` contains `agent`. Gating the family
+        // to `substrate_persist` refused exactly that row, so the disclosure
+        // path CC 3.4.14 makes normative (EU AI Act Art. 50(2), applicable
+        // 2026-08-02, discharged in CIRISAgent 2.9.8 / CIRISServer 0.6) was
+        // blocked at the substrate. Witnessed on every backend by
+        // `tests::cc_3414_r1_class_marking_admits_from_any_attester`.
+        //
+        // What did NOT change: `lookup_trusted_publisher_chain` still reads
+        // `content_rating:` rows through `trusted_publisher` keys ONLY. CC puts
+        // the discrimination on the READ side for these families — *"polarity
+        // carries certifier confidence; not a slashing input"* — so an open
+        // write door and a publisher-filtered read door is the shape CC
+        // describes, not a hole.
+        //
         // - age_assurance:{level} → emitted by witness (a registered
-        //   age-assurance provider).
-        ReservedPrefixRule {
-            pattern_prefix: "content_rating:".into(),
-            required_identity_types: vec![trusted_publisher],
-        },
-        ReservedPrefixRule {
-            pattern_prefix: "content_class:".into(),
-            required_identity_types: vec![substrate_persist.clone()],
-        },
-        ReservedPrefixRule {
-            pattern_prefix: "cw_class:".into(),
-            required_identity_types: vec![substrate_persist],
-        },
+        //   age-assurance provider). CC 3.3.12 + CC 3.4.11; STAYS.
         ReservedPrefixRule {
             pattern_prefix: "age_assurance:".into(),
             required_identity_types: vec![witness.clone()],
@@ -679,26 +695,91 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
 /// about (the exact "refuse conformant traffic and blame the producer" failure
 /// CIRISPersist#590 was opened to prevent).
 ///
-/// All three are **CEG 0.3**-sourced, not CC-sourced: `content_rating:{scheme}`
-/// (§5.6.8.3 / §11.5.3, trusted_publisher-emitted), `content_class:{class}` and
-/// `cw_class:{class}` (substrate_persist-emitted). They are the media-sharing
-/// admission plane; persist has gated them since v3.0.0 and CC Part 3 has never
-/// carried a row for any of them.
+/// # EMPTY as of the rc3 re-vendor (CIRISPersist#571) — and that is the pin working
 ///
-/// The pin is what keeps this honest rather than a hole:
+/// It carried exactly three: `content_rating:`, `content_class:`, `cw_class:` —
+/// CEG-0.3 media-plane families persist had gated since v3.0.0 that CC Part 3
+/// had never catalogued. CIRISConstitution#77 landed all three (CC 3.1.9.2,
+/// deferring their semantics to CC 3.3.12), the re-vendor brought them in, and
+/// [`tests::declared_exceptions_are_still_unregistered`] failed by name — which
+/// is precisely what it was written to do. The lines were deleted rather than
+/// the gate suppressed.
 ///
-/// - it is CLOSED — a fourth gated-but-unregistered family fails
+/// Reading the rows CC actually landed then removed their *gates* too: CC 3.3.12
+/// opens with *"All four families are open vocabulary"* and reserves only
+/// `age_assurance:`. See [`MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`] — the three are
+/// no longer exceptions to R2 because they are no longer governed at all.
+///
+/// The const stays (rather than being deleted) because the mechanism is the
+/// point, and it is still CLOSED and still self-deleting:
+///
+/// - a NEW gated-but-unregistered family fails
 ///   [`tests::r2_governed_families_are_registered_or_declared`] until someone
 ///   states why, so the loudness R2(b) asks for lands in the build rather than
 ///   nowhere;
-/// - it must stay TRUE — [`tests::declared_exceptions_are_still_unregistered`]
-///   fails once CC registers one, forcing the line's removal instead of letting
-///   a stale excuse outlive its reason.
+/// - any line added here must stay TRUE —
+///   [`tests::declared_exceptions_are_still_unregistered`] fails once CC
+///   registers it, forcing removal instead of letting a stale excuse outlive
+///   its reason. It has now done that once, for real.
+pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[];
+
+/// **CIRISPersist#571 — the three media-plane families persist STOPPED gating,
+/// and why that is a fix rather than a relaxation.**
 ///
-/// The ask on CC is a Part-3 row for each; until then the deviation from the
-/// letter of R2(b) is named here, in source, rather than implied by silence.
-pub const UNREGISTERED_GATED_FAMILIES: &[&str] =
-    &["content_rating:", "content_class:", "cw_class:"];
+/// Named in source because "persist deleted three admission gates" is exactly
+/// the sentence a future reader must be able to audit without re-deriving the
+/// argument from two Constitution sections.
+///
+/// `(family_stem, the CC clause that leaves it open, what still discriminates)`.
+///
+/// The rules came from CEG 0.3 §5.6.8.3 / §11.5.3 and predate any CC row. When
+/// CIRISConstitution#77 finally catalogued the families, CC did not ratify the
+/// CEG emitter rules — it contradicted them: CC 3.3.12's table opens *"All four
+/// families are open vocabulary per CC 4.5.1.1 axis-vocabulary discipline"* and
+/// marks only its fourth row (`age_assurance:`) reserved. Keeping the gates
+/// would have been persist demanding an emitter role CC declines to demand,
+/// which CC 3.1.7 R2 names as the failure mode.
+///
+/// `content_class:` is the one that was actively breaking: CC 3.4.14 R1 makes
+/// the `generated` / `generated_modified` marking **universal — every attester**
+/// — and R2 requires an agent's to ride a key whose `identity_type` contains
+/// `agent`. The `substrate_persist` gate refused precisely that row, on every
+/// backend, blocking the Art. 50(2) disclosure path CC 3.4.14 makes normative
+/// (applicable 2026-08-02; discharged in CIRISAgent 2.9.8 / CIRISServer 0.6).
+///
+/// [`tests::media_plane_families_cc_leaves_open_are_ungated_and_uncatalogued_by_persist`]
+/// keeps this from rotting in either direction: it fails if a rule for one of
+/// these reappears, AND if CC ever lands a `reserved_rule` on the row (at which
+/// point the gate should come back, matching CC's rule rather than CEG's).
+pub const MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN: &[(&str, &str, &str)] = &[
+    (
+        "content_rating:",
+        "CC 3.3.12 — open vocabulary; `{scheme}` explicitly admits \
+         `operator:{operator_id}` operator-defined rubrics, and polarity carries \
+         certifier confidence rather than admission authority",
+        "the READ door: `lookup_trusted_publisher_chain` surfaces only rows \
+         attested by `trusted_publisher` keys",
+    ),
+    (
+        "content_class:",
+        "CC 3.3.12 — open vocabulary, producer-declared; and CC 3.4.14 R1 makes \
+         the `generated`/`generated_modified` marking mandatory for EVERY \
+         attester, which a `substrate_persist` gate refuses outright",
+        "CC 3.4.14 R2 (an agent's marking must ride an `agent`-typed key, which \
+         is a property of the signed envelope, not an admission rule) and R5 \
+         (a false or stripped marking is a false attestation adjudicated by WA \
+         quorum on the `hard_case:*` evidence floor — the substrate observes, \
+         it does not adjudicate)",
+    ),
+    (
+        "cw_class:",
+        "CC 3.3.12 — open vocabulary, community-applied and cohort-attestable \
+         per CC 4.4.1 Frickerian discipline (low-density cohort CWs are \
+         explicitly NOT downweighted)",
+        "cohort composition on the read side; a community warning that only a \
+         substrate could emit would not be a community warning",
+    ),
+];
 
 /// Every family stem persist **governs**: the ones it gates
 /// ([`default_reserved_prefix_rules`] + [`HARD_CODED_RESERVED_STEMS`] +
@@ -10062,8 +10143,7 @@ mod tests {
     #[test]
     fn default_reserved_prefix_rules_cover_ceg_persist_slice() {
         // Sanity: the default rules cover the CEG §5.3 substrate-
-        // self-report set + §7.6 witness rule + CEG 0.3 §5.6.8.3
-        // four-family media-sharing set. Regression-guards the table
+        // self-report set + §7.6 witness rule. Regression-guards the table
         // doc-comment.
         let rules = default_reserved_prefix_rules();
         let prefixes: Vec<&str> = rules.iter().map(|r| r.pattern_prefix.as_str()).collect();
@@ -10074,15 +10154,27 @@ mod tests {
             "identity_continuity:",
             "federation_directory:",
             "transparency_log:cosigned:",
-            // CEG 0.3 §5.6.8.3 — four new families.
-            "content_rating:",
-            "content_class:",
-            "cw_class:",
+            // CEG 0.3 §5.6.8.3 landed FOUR media-sharing families here; only
+            // this one survives. CC 3.3.12 leaves the other three open
+            // vocabulary — see MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN.
             "age_assurance:",
         ] {
             assert!(
                 prefixes.contains(expected),
                 "default rules missing {expected}; got {prefixes:?}"
+            );
+        }
+        // The removal direction, asserted rather than left to the absence of a
+        // line: a re-added gate on a family CC leaves open is the regression
+        // CIRISPersist#571 fixed.
+        for gone in MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN {
+            assert!(
+                !prefixes.contains(&gone.0),
+                "{:?} is gated again — CC 3.3.12 leaves it open vocabulary ({}). If CC has since \
+                 landed a reserved rule on the row, restore the gate to match CC's rule and delete \
+                 the MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN line; do not restore the CEG-0.3 one.",
+                gone.0,
+                gone.1
             );
         }
     }
@@ -10494,74 +10586,72 @@ mod tests {
         );
     }
 
-    // ── CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix tests ──
+    // ── CEG 0.3 §5.6.8.3 + §11.5.3 landed FOUR reserved-prefix families here.
+    //    CC 3.3.12 later catalogued them and left three OPEN; only
+    //    `age_assurance:` survives as a reserved prefix. See
+    //    MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN. ──
 
+    /// **CIRISPersist#571 — the policy-layer twin of the removal.**
+    ///
+    /// Replaces three v3.0.0 tests that asserted the CEG-0.3 emitter rules
+    /// (`content_rating:` → `trusted_publisher`, `content_class:` /
+    /// `cw_class:` → `substrate_persist`). CC 3.3.12 catalogued all three as
+    /// **open vocabulary** and CC 3.4.14 R1 makes the `content_class` marking
+    /// mandatory for *every* attester, so those assertions encoded a rule the
+    /// Constitution declines to make. They are inverted rather than deleted:
+    /// the families must now admit from identities that were previously
+    /// refused, which is the property the removal exists to deliver.
+    ///
+    /// Pure-policy layer only. The executed three-backend witness through the
+    /// real `put_attestation` door is
+    /// `crate::federation::regime::tests::cc_3414_r1_class_marking_admits_from_any_attester`.
     #[test]
-    fn reserved_prefix_content_rating_requires_trusted_publisher_emitter() {
-        // CEG 0.3 §11.5.3: only trusted_publisher may emit
-        // content_rating:* attestations.
+    fn media_plane_families_cc_leaves_open_admit_from_any_emitter() {
         let p = default_policy();
-        let err = p
-            .check(
-                attestation_type::SCORES,
-                Some("content_rating:mpa:pg13:v1"),
-                identity_type::AGENT,
-            )
-            .unwrap_err();
-        match err {
-            Error::ReservedPrefixEmitterMismatch {
-                prefix, required, ..
-            } => {
-                assert_eq!(prefix, "content_rating:");
-                assert_eq!(required, vec!["trusted_publisher".to_string()]);
-            }
-            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
-        }
-        // trusted_publisher passes.
-        p.check(
-            attestation_type::SCORES,
-            Some("content_rating:mpa:pg13:v1"),
+        // Every identity_type that used to be refused on at least one of these.
+        for identity in [
+            identity_type::AGENT,
+            identity_type::WITNESS,
+            identity_type::SUBSTRATE_PERSIST,
             identity_type::TRUSTED_PUBLISHER,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn reserved_prefix_content_class_requires_substrate_persist_emitter() {
-        let p = default_policy();
-        let err = p
-            .check(
-                attestation_type::SCORES,
-                Some("content_class:violence:v1"),
-                identity_type::AGENT,
-            )
-            .unwrap_err();
-        assert!(matches!(err, Error::ReservedPrefixEmitterMismatch { .. }));
-        p.check(
-            attestation_type::SCORES,
-            Some("content_class:violence:v1"),
-            identity_type::SUBSTRATE_PERSIST,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn reserved_prefix_cw_class_requires_substrate_persist_emitter() {
-        let p = default_policy();
-        let err = p
-            .check(
-                attestation_type::SCORES,
-                Some("cw_class:flashing_lights:v1"),
-                identity_type::WITNESS,
-            )
-            .unwrap_err();
-        assert!(matches!(err, Error::ReservedPrefixEmitterMismatch { .. }));
-        p.check(
-            attestation_type::SCORES,
-            Some("cw_class:flashing_lights:v1"),
-            identity_type::SUBSTRATE_PERSIST,
-        )
-        .unwrap();
+        ] {
+            for dim in [
+                // CC 3.4.14 R1's mandatory markings — the sharp case.
+                "content_class:generated:v1",
+                "content_class:generated_modified:v1",
+                "content_class:violence:v1",
+                "content_rating:mpa:pg13:v1",
+                // CC 3.3.12 names `operator:{operator_id}` rubrics explicitly.
+                "content_rating:operator:acme:strong:v1",
+                "cw_class:flashing_lights:v1",
+            ] {
+                p.check(attestation_type::SCORES, Some(dim), identity)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "CC 3.3.12 leaves {dim} open vocabulary, but the policy refused it \
+                             from identity_type={identity:?}: {e}"
+                        )
+                    });
+            }
+        }
+        // The reasoning const must describe exactly the families that were
+        // freed — not a stem that is still gated, and not a stale line.
+        let rules = default_reserved_prefix_rules();
+        for (stem, why, still_discriminates) in MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN {
+            assert!(
+                !rules.iter().any(|r| r.pattern_prefix == *stem),
+                "{stem:?} is recorded as CC-leaves-open but is gated again"
+            );
+            assert!(
+                why.contains("CC 3.3.12"),
+                "{stem:?} must cite the clause that leaves it open, got {why:?}"
+            );
+            assert!(
+                still_discriminates.len() > 30,
+                "{stem:?} must name what DOES discriminate now — an open write door with nothing \
+                 said about the read door reads as a hole rather than a decision"
+            );
+        }
     }
 
     #[test]

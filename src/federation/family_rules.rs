@@ -423,16 +423,43 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
         "regime:",
-        "NOT persist-ruled, and deliberately so (CIRISPersist#571). `regime:*` is \
-         the OPEN VOCABULARY CC 3.1.7 preserves — it is governed by nothing, so \
-         R2(b) admits it and ordinary consented egress federates it. Governing it \
-         today would REFUSE it: adding the stem to `HARD_CODED_RESERVED_STEMS` \
-         fails the R2(a) build gate AND refuses every emission on all three \
-         backends, killing the local-tier path CIRISAgent uses (proven by \
-         `governing_regime_today_would_refuse_it`). The literal appears in \
-         `regime.rs` only as the family the replication DECISION is about, never \
-         as a gate. It becomes persist-ruled the day CC lands a Part 3 row — and \
-         `regime_family_is_still_uncatalogued_upstream` fires then.",
+        "NOT persist-ruled, and still deliberately so (CIRISPersist#571) — but the \
+         REASON changed at the rc3 re-vendor and the old one is dead. It used to \
+         be that CC catalogued no `regime:` family, so governing the stem would \
+         make R2(b) refuse every emission and kill the local-tier path CIRISAgent \
+         uses. CIRISConstitution#81 landed `regime:{artifact}:{version}`, so R2(b) \
+         is satisfied and governing it would no longer refuse it \
+         (`governing_regime_would_now_admit_but_the_row_states_no_rule` executes \
+         that falsification rather than deleting the claim). What persist still \
+         has is NOTHING TO ENFORCE: the generated row carries `reserved: false` \
+         and no `reserved_rule`, because CC's generator cross-references rules \
+         from CC 3.4 plus a `Reserved?` table column and the row sits in CC \
+         3.1.9.2, which has neither — so the row's own prose (\"reserved — \
+         substrate-steward-emitted\") reaches no machine-readable field, and \
+         `substrate-steward` names no identity_type persist has. Gating on the \
+         prose would be refused by \
+         `admission::tests::authority_lists_agree_on_every_manifest_family` by \
+         construction. The literal appears in `regime.rs` only as the family the \
+         replication DECISION is about, never as a gate. It becomes persist-ruled \
+         the day CC lands the rule where the generator can reach it — and \
+         `regime::tests::the_regime_row_still_states_no_machine_readable_rule` \
+         fires then.",
+    ),
+    (
+        "content_rating:",
+        "a READ-side filter, not an admission rule (CIRISPersist#571). Persist \
+         gated this family to `trusted_publisher` from v3.0.0 under CEG 0.3 \
+         §11.5.3 until CC catalogued it: CC 3.3.12 declares it OPEN VOCABULARY \
+         (its `{scheme}` explicitly admits `operator:{operator_id}` \
+         operator-defined rubrics), so the write gate was persist demanding an \
+         emitter role the Constitution declines to demand and it was removed — see \
+         `admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`. The surviving literal \
+         is in `FederationDirectory::lookup_trusted_publisher_chain`, which \
+         SELECTS rows attested by `trusted_publisher` keys when serving a rating \
+         chain. That is CC's own placement of the discrimination — the row admits, \
+         and the reader weighs it (\"polarity carries certifier confidence; not a \
+         slashing input\") — so an open write door with a publisher-filtered read \
+         door is the shape CC describes, not a gap.",
     ),
     (
         "admin_action:",

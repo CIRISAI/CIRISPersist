@@ -2063,12 +2063,24 @@ class Engine:
         per-peer quota refusals are a different and far more common thing, and
         are not counted here at all.
 
-        Those arrive as a ``RuntimeError`` on the **write** path, and the
-        boundary is worth stating: persist's Rust error carries a typed reason
-        naming *which* budget refused and in *which* regime, and the FFI error
-        mapping currently drops it -- Python sees only the bare
-        ``"federation_rate_limited"``. That gap is real and this method does
-        not close it.
+        Those arrive as a ``RuntimeError`` on the **write** path, and since
+        v28.3.0 they name which budget refused. The message is::
+
+            federation_rate_limited: <token> (retry_after_seconds=<n>)
+
+        ``<token>`` is a stable program constant -- one of ``peer_burst``,
+        ``peer_sustained``, ``untracked_tail_burst``,
+        ``untracked_tail_sustained``, ``node_burst``, ``node_sustained``,
+        ``reserved_burst``, ``reserved_sustained`` and their ``_bytes_``
+        counterparts (``peer_bytes_burst``, ``node_bytes_sustained``, ...).
+        The row tokens and the byte tokens are what let you tell a **row**
+        flood from a **storage** flood, and ``_burst`` from ``_sustained``
+        tells "slow down for seconds" from "the day's budget is gone". Branch
+        on the token, never on the sentence around it; the token set is
+        append-only.
+
+        Those refusals are ordinary throttling and are **not** counted in
+        ``slot_denials`` -- this method is a different signal.
 
         **Zero is not health until the tripwire has been exercised.**
         ``slot_denials == 0`` on a freshly-booted process is *untested*, not
