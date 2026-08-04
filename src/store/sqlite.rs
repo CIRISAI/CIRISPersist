@@ -3417,7 +3417,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
-        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
         // The rule is v4.4.0's (CEG §7.5 anti-Goodhart / AV-62) and it was
         // already written and tested — but only inside
         // `check_local_tier_eligibility`, which runs on
@@ -8162,7 +8162,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let och = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
         // Before this, promotion re-signed a row and flipped `tier` without
         // running ANY tier-4 put-gate, so every gate that no-ops at the local
         // tier had never been asked about a promoted row. Gated on the
@@ -8311,7 +8311,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let och = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
         // over the TRANSFORMED envelope: a #510 restriction pipeline changes
         // the bytes this row will federate as, so the gate must read the
         // stripped envelope (its `dimension` is what every family-keyed gate

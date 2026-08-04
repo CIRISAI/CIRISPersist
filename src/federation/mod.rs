@@ -177,7 +177,7 @@ pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
 // Tier 2 of the graded response set; a marker, never a command.
 pub mod quarantine;
-// v25.2.0 (CIRISPersist#570 ask 1) — the mesh_config plane: a trust root turns
+// v28.3.0 (CIRISPersist#570 ask 1) — the mesh_config plane: a trust root turns
 // a knob on the nodes that subscribe to it, bounded by CC 4.2.1's
 // relieve-never-expand and most-restrictive-across-roots.
 pub mod mesh_config;
@@ -297,7 +297,7 @@ pub use quarantine::{
     fold_quarantine, is_withheld, resolve_quarantine, QuarantineFold, QuarantineOutcome,
     QuarantineRefusalReason, QuarantineState,
 };
-// v25.2.0 (CIRISPersist#570 ask 1) — the mesh-config plane. Same export
+// v28.3.0 (CIRISPersist#570 ask 1) — the mesh-config plane. Same export
 // discipline: downstream keys on the `as_str` tokens, which are append-only.
 pub use mesh_config::{
     fold_mesh_config, record_mesh_config_row, resolve_mesh_config, FlowPolarity,
@@ -3265,7 +3265,7 @@ pub trait FederationDirectory: Send + Sync {
     /// canonicalizer), so a promoted row is byte-identical on the wire to
     /// a natively-federation one (Registry must #1).
     ///
-    /// # v25.2.0 (CIRISPersist#589 / AV-83) — the primitive carries its placement
+    /// # v26.0.0 (CIRISPersist#589 / AV-83) — the primitive carries its placement
     ///
     /// `cohort_scope` is the placement the promoted row lands at, written in
     /// the SAME statement as the tier flip. Before this it was a separate
@@ -3317,7 +3317,7 @@ pub trait FederationDirectory: Send + Sync {
     /// new directory methods — this is an engine-internal primitive, not
     /// wired into the FFI directory capsule); sqlite/postgres/memory
     /// override.
-    /// v25.2.0 (CIRISPersist#589 / AV-83) — carries `cohort_scope` for the same
+    /// v26.0.0 (CIRISPersist#589 / AV-83) — carries `cohort_scope` for the same
     /// reason [`Self::promote_attestation`] does; see that method.
     #[allow(clippy::too_many_arguments)]
     async fn promote_attestation_transformed(

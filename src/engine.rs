@@ -3012,7 +3012,7 @@ impl Engine {
             return Ok(false); // idempotent
         }
 
-        // v25.2.0 (CIRISPersist#589 / AV-83) — PLACEMENT IS CARRIED, NOT
+        // v26.0.0 (CIRISPersist#589 / AV-83) — PLACEMENT IS CARRIED, NOT
         // PRE-STAMPED. This used to call `set_attestation_cohort_scope` here,
         // before `promote_attestation`, on the reasoning that "a mid-sequence
         // failure leaves a coherent `(local, <new scope>)` row that a retry
@@ -3522,7 +3522,7 @@ impl Engine {
         // touching promotion, so it carries `cohort_scope` and rejects the
         // incoherent `(federation, self)`.
         //
-        // v25.2.0 (CIRISPersist#589 / AV-83) — the separate
+        // v26.0.0 (CIRISPersist#589 / AV-83) — the separate
         // `set_attestation_cohort_scope` pre-stamp is GONE for the same reason
         // it is gone from `attestation_promote`: promotion can now be REFUSED
         // by `check_promotion_admission`, and a pre-stamp would leave a refused
@@ -5912,7 +5912,7 @@ impl Engine {
         crate::federation::quarantine::resolve_quarantine(directory.as_ref(), key_id, now).await
     }
 
-    /// v25.2.0 (CIRISPersist#570 ask 1) — admit and store one **mesh-config**
+    /// v28.3.0 (CIRISPersist#570 ask 1) — admit and store one **mesh-config**
     /// row (see [`mesh_config`](crate::federation::mesh_config)).
     ///
     /// The host-reachable half of the config plane. `node_key_id` is the node
@@ -5943,7 +5943,7 @@ impl Engine {
         .await
     }
 
-    /// v25.2.0 (CIRISPersist#570 ask 1) — **what this node's mesh config
+    /// v28.3.0 (CIRISPersist#570 ask 1) — **what this node's mesh config
     /// resolves to right now**: one entry per registered key, folded across
     /// every trust root the node subscribes to.
     ///
@@ -11306,7 +11306,7 @@ mod tests {
     /// placement**, so a promotion refused on authority grounds leaves the row
     /// byte-identical (AV-9).
     ///
-    /// Until v25.2.0 the engine called `set_attestation_cohort_scope` first and
+    /// Until v26.0.0 the engine called `set_attestation_cohort_scope` first and
     /// `promote_attestation` second, on the reasoning that a mid-sequence
     /// failure left a coherent `(local, <new scope>)` row for a retry to
     /// complete. That held only while promotion could not REFUSE. Once

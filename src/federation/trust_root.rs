@@ -476,7 +476,7 @@ fn counts_in_capability_walk(a: &Attestation) -> bool {
     a.tier == super::types::attestation_tier::FEDERATION
 }
 
-/// v25.2.0 (CIRISPersist#570 ask 1) — **every trust root `node_key_id` has a
+/// v28.3.0 (CIRISPersist#570 ask 1) — **every trust root `node_key_id` has a
 /// live edge to**, sorted and deduped. The node's own subscription set.
 ///
 /// A "root" here is the `attested_key_id` of a live (non-tombstoned,

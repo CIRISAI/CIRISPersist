@@ -1,0 +1,29 @@
+# Doc-comment version references that name a version with no tag and no CHANGELOG entry.
+# RATCHET BASELINE. A version listed here is grandfathered; anything NEW fails the gate.
+# Burn this down (CIRISPersist#599) -- do not add to it.
+# version	refs	note
+12.7.0	93	PERSIST PHANTOM - never shipped
+24.4.0	42	PERSIST PHANTOM - never shipped
+6.9.0	13	PERSIST PHANTOM - never shipped
+8.9.0	10	PERSIST PHANTOM - never shipped
+21.3.1	9	PERSIST PHANTOM - never shipped
+2.8.13	7	CIRISAgent
+13.2.1	6	PERSIST PHANTOM - never shipped
+5.11.0	4	PERSIST PHANTOM - never shipped
+2.7.9	4	CIRISAgent FSD
+10.6.2	3	CIRISVerify
+3.0.1	3	cited as historical
+0.13.0	3	CIRISEdge
+12.2.1	2	PERSIST PHANTOM - never shipped
+5.10.0	2	PERSIST PHANTOM - never shipped
+0.6.2	2	secrets pipeline
+0.15.0	1	CIRISEdge
+10.6.3	1	CIRISVerify
+10.8.0	1	CIRISVerify
+10.9.0	1	CIRISVerify
+10.11.0	1	CIRISVerify
+10.10.0	1	CIRISVerify
+1.8.5	1	PERSIST PHANTOM - never shipped
+0.10.0	1	CIRISConformance
+0.13.1	1	CIRISEdge
+1.4.3	1	FSD-002

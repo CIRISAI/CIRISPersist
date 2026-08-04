@@ -974,7 +974,7 @@ pub enum ReverseQuorumStanding {
 pub enum StewardTierStanding {
     /// The cohort's `consensus_protocol` declares no `+escalate:` tier. There is
     /// no deadline, no ruling and no escalation — #574 semantics exactly, which
-    /// is what every string written before v25.2.0 keeps meaning.
+    /// is what every string written before v26.0.0 keeps meaning.
     NotAdopted,
     /// A tier IS declared, and this node resolves ZERO appointed moderators for
     /// the cohort — including the case where the only one is

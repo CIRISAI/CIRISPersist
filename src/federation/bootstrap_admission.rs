@@ -1064,7 +1064,7 @@ pub mod test_support {
         let err = crate::federation::admission::check_promotion_admission(dir, &legacy, None)
             .await
             .expect_err(
-                "({tag}) B8: promoting a pre-v25.2.0 local capacity row must be refused — \
+                "({tag}) B8: promoting a pre-v26.0.0 local capacity row must be refused — \
                  CC 3.4.5: its capacity:composite MUST NOT be emitted",
             );
         assert!(

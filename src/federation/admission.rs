@@ -667,7 +667,7 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
     "mesh_config:{key}",
 ];
 
-/// v25.2.0 (CIRISPersist#570 ask 1) — the dimension stem of the mesh-config
+/// v28.3.0 (CIRISPersist#570 ask 1) — the dimension stem of the mesh-config
 /// plane, re-exported here so the admission surface names it at the same place
 /// it names [`QUARANTINE_DIMENSION_PREFIX`] and friends.
 ///
@@ -1689,7 +1689,7 @@ pub fn check_local_tier_eligibility(
     Ok(LocalTierDisposition::Durable)
 }
 
-/// v25.2.0 (CIRISPersist#589, AV-83) — **`capacity:*` IS NEVER LOCAL**, stated
+/// v26.0.0 (CIRISPersist#589, AV-83) — **`capacity:*` IS NEVER LOCAL**, stated
 /// once and asked at BOTH doors onto the local tier.
 ///
 /// # Why this is its own function
@@ -1894,7 +1894,7 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
     Ok(())
 }
 
-/// v25.2.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
+/// v26.0.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
 /// tier-4 authority stack, re-run against the row a promotion is about to
 /// store.
 ///
@@ -2704,7 +2704,7 @@ impl From<ConsentGateRefused> for Error {
 ///   is safe to keep **because a `capacity:*` row can no longer be local at
 ///   all**: [`check_capacity_never_local`] is now asked at BOTH doors onto the
 ///   local tier — [`check_local_tier_eligibility`] (as before) and, since
-///   v25.2.0, `put_attestation`, which accepts a `tier = "local"` row on every
+///   v26.0.0, `put_attestation`, which accepts a `tier = "local"` row on every
 ///   backend and used to skip the rule entirely.
 ///
 ///   That was **CIRISPersist#589 / AV-83**, and it was rated a MUST violation
@@ -8784,7 +8784,7 @@ mod tests {
         DimensionAdmissionPolicy::default()
     }
 
-    /// v25.2.0 (CIRISPersist#589 / AV-83) — **THE RESIDUAL, EXECUTED.**
+    /// v26.0.0 (CIRISPersist#589 / AV-83) — **THE RESIDUAL, EXECUTED.**
     ///
     /// [`check_promotion_admission`] deliberately does NOT run AV-45, and its
     /// doc says why: on this table AV-45 cannot ASK the question (an
@@ -8939,7 +8939,7 @@ mod tests {
         }
     }
 
-    /// v25.2.0 (CIRISPersist#589 / AV-83) — the "capacity is never local" rule
+    /// v26.0.0 (CIRISPersist#589 / AV-83) — the "capacity is never local" rule
     /// is ONE predicate, asked on BOTH wire shapes, and
     /// [`check_local_tier_eligibility`] routes through it rather than holding a
     /// second copy. Two validators for one artifact MUST share one predicate.

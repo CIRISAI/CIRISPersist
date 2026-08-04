@@ -1048,6 +1048,14 @@ jobs:
       # from the Rust and are semantically unverified.
       - name: FFI surface + taxonomy gate
         run: python3 scripts/pyi_surface.py check
+      # v28.3.0 (CIRISPersist#599) — every `vX.Y.Z` a src/ comment names must be
+      # a version that SHIPPED (git tag or CHANGELOG entry). v25.2.0 was cited
+      # 30 times and never existed: written during the cut that went out as
+      # 26.0.0, unnoticed for three majors, and copied forward by every agent
+      # who grepped the convention. 223 such references remain, grandfathered by
+      # version in evidence/doc_version_baseline.tsv; the ratchet only tightens.
+      - name: doc version references name shipped versions
+        run: python3 scripts/doc_version_refs.py
       # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
       # the --all-features pass below: `dead_code` / `unused_imports` fire only
       # when a feature is OFF, so the narrow pass catches lints the total pass

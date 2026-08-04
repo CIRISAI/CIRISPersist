@@ -5,7 +5,160 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — #594: a revoked proxy could still revoke consent for someone who cannot hold a key
+## [28.3.0] — 2026-08-04 — #571/#570: the row that could not carry its own rule, and a mandatory marking persist was refusing
+
+- **#571 — the `regime:` row landed, and reading it found persist refusing a marking CC makes
+  mandatory.** CC registered `regime:{artifact}:{version}` at rc3, so `is_family_registered` flips
+  true and the `namespace_family_unregistered` refusal is **retired by executing the falsification**,
+  not by deleting the reason.
+
+  But the row **cannot end the `ProducerSteward` default its own prose says it ends**. It generates
+  `"reserved": false` with no `reserved_rule`, so `authority_for("regime:…")` returns
+  `ProducerSteward`/`None` — byte-identical to its answer before the row existed. The row
+  contradicts itself: prose says *reserved*, the field says `false`.
+
+  This is structural, not a drafting slip. `build_cc_namespace.py` writes `reserved_rule` **only
+  `if reserved`**, and `reserved` comes only from a CC 3.4 rule match or a `Reserved?` table column.
+  CC 3.1.9.2's table is `| Prefix | Description | Polarity |`. **All 12 families in that section
+  generate `reserved: false`; zero carry a rule; four assert an emitter restriction in prose no
+  enforcer can reach** — `quarantine:`, `regime:`, `mesh_config:`, `content_rating:`. The
+  governance-steering tier is the one structurally unable to carry an enforceable emitter rule.
+  Filed as **CIRISConstitution#81**.
+
+  So **persist gates nothing on `regime:`** — not because R2(b) would refuse it, but because there
+  is no rule to enforce, and enforcing the *prose* is the split-truth R2's enforcement-surface
+  clause exists to prevent.
+
+- **#571 — three CEG-0.3 media-plane gates removed: persist was refusing a row CC makes mandatory.**
+  CEG 0.3 gave persist emitter gates on `content_rating:` → `trusted_publisher` and
+  `content_class:` / `cw_class:` → `substrate_persist`. **CC 3.3.12's first line is "All four
+  families are open vocabulary."** It reserves exactly one — `age_assurance:` — which is precisely
+  the one whose manifest row carries a real `reserved_rule`. CC did not fail to carry those emitter
+  rules; it **declined** them.
+
+  Measured on the real `put_attestation` door before anything was touched:
+
+  ```
+  content_class:generated => Err(ReservedPrefixEmitterMismatch {
+      required: ["substrate_persist"], got_identity_type: "agent" })
+  ```
+
+  That is the marking **CC 3.4.14 R1 makes universal** ("every attester"), from the `agent`-typed
+  identity R2 requires, discharging **EU AI Act Art. 50(2) — applicable 2026-08-02**. Persist was
+  the thing blocking it.
+
+  The three rules are deleted; `age_assurance:` stays and serves as the **negative control** in the
+  same call shape, so "deleted the whole slice" cannot pass. **The read side is untouched, and that
+  is the point**: the trusted-publisher chain discriminates on identity at *read* time
+  (`list_keys_by_identity_type`), which is where CC puts the discrimination. Anyone may rate; only a
+  trusted publisher's rating enters the chain.
+
+  An escape hatch that had been added to the over-refusal side of the differential witness is
+  **deleted rather than kept** — it made the gate green while leaving the refusal in place, silencing
+  a detector that was correctly pointing at a blocked compliance path.
+
+- **#571 — a doc-comment count that had gone false is corrected and GATED.** `quarantine.rs` called
+  its row "the **only** one of 109 whose description asserts an emitter rule its `reserved_rule`
+  omits". The re-vendor made that false. Refreshing the denominator to 114 while leaving "the only
+  one" standing is the worse failure — it reads as freshly checked while the substantive claim has
+  gone false. It is **four of 114**, and
+  `the_prose_only_emitter_rules_are_still_confined_to_cc_3_1_9_2` now recomputes both numbers from
+  the vendored bytes and fails in **either** direction: count drops (CC landed a rule → write the
+  enforcement), count rises (a new unenforceable row joined the ask), or a 3.1.9.2 family acquires a
+  rule at all (the generator was fixed → re-read every pin).
+
+- **CIRISServer#356 — the quota refusal reason stops dying at the FFI boundary.** The
+  `PeerQuotaRefusal` reason was dropped at `federation_err_to_py`.
+
+- **Infra — the fresh-DB discipline becomes executable, and an advisory-lock diagnosis is
+  disproven.** `scripts/pg_test_db.sh` provisions a virgin single-use database and **propagates the
+  command's exit code exactly** — it never turns a failing run into a passing one.
+
+  The concurrent-pg-failure diagnosis this work was briefed with was **wrong, and was refuted rather
+  than implemented**. `pg_try_advisory_lock`'s tag includes the database OID, so advisory locks are
+  **per-database**: with a holder on database A, a contender on A gets `f` and a contender on B gets
+  `t`. Namespacing `MIGRATION_LOCK_ID` would have been a no-op at best and **actively harmful** at
+  worst — a mixed-version rolling upgrade would put two persist versions on two different keys and
+  they would stop excluding each other.
+
+  The real mechanism, measured: a **shared database** — 6/6 iterations red sharing one, 0/6 on
+  separate fresh ones. Two sub-mechanisms, both already documented in-tree: tests asserting *global*
+  row counts, and `av26`'s `DROP SCHEMA cirislens CASCADE`. Which is also why those tests are **not
+  re-runnable** against a spent database.
+
+- **Infra — a shared pre-commit hook stops aborting valid commits.** `.git/hooks` is common to every
+  worktree and the hooks are **symlinks into the shared checkout**, so the hook body that runs is
+  always the shared checkout's branch while the tree being committed is the worktree's. A gate
+  introduced in commit N therefore fired on every branch predating N, where its script does not
+  exist, and died with a bare traceback. Gates whose script is absent now **skip loudly**, naming
+  themselves and saying the gate did not run and did not pass. An abort on a valid branch is worse
+  than no gate: it teaches `--no-verify`, which skips every *other* gate too. The clippy leg now
+  **refuses an empty feature set** rather than linting `--features ""` and printing a pass.
+
+- **#570 ask 1 — the `mesh_config` plane: a knob a hostile root can only ever tighten.** The one of
+  #570's five asks v25.1.0 did not build. It was held on CIRISConstitution#57 on the issue's own
+  argument — *"shipping the plane before the authority is named means the authority gets retrofitted
+  from whatever the code did."* #57 is ratified, so this is written against text.
+
+  **Where CC contradicts the issue, CC wins.** #570 asked for rows authored by "an accord holder or
+  quorum". CC 4.2.1 says the author is **the trust root, on the CC 3.2 delegation plane, NEVER the
+  accord's ceremony plane**. Widening HUMANITY_ACCORD signature scope past `EmergencyShutdown` is the
+  thing #57 existed to avoid, so there is no accord-holder arm and no refusal variant for one —
+  authority re-derives from this node's own trust edges.
+
+  **One axis carries both ratified rules.** *relieve-never-expand* and *most-restrictive-across-roots*
+  look like two rules and are one question asked twice: does this value mean MORE flow, or less?
+  Writing "take the min" would have been correct for five of the nine keys and **silently inverted for
+  four** — `antientropy.round_secs` larger is *less* traffic, `backpressure.summary_only` true is
+  *less* traffic.
+
+  **The fold clamps, and that is the load-bearing half** — the door only sees rows that come through
+  it, and a row arriving on the replication plane never does.
+
+  The property test earned its shape by mutation, not by reading: an earlier version swept values at
+  uniform timestamps and **passed with the clamp deleted**, because the cross-root fold seeds from
+  `baseline` and bounds the result on its own. A witness for a property the fold had two reasons to
+  satisfy is a witness for neither. Six mutations applied, run and reverted; every one red.
+
+- **`PRIVATE_USE_FAMILY_STEM` stops being a claim nothing could contradict.** It has described
+  itself as *"a prose transcription"* since #590 and named its own remedy — a machine-readable range
+  field in the generated manifest, a `_meta` key rather than a family row *"since it is not a
+  family"*. **CC shipped exactly that at rc3 (`_meta.private_use_prefix`), and nothing in the tree
+  noticed**, because the const was an assertion about CC prose that no artifact was able to falsify.
+  `vendored_private_use_prefix()` now reads the field and a gate asserts the two agree.
+
+  It deliberately does **not** move enforcement onto the manifest: the refusal still matches on the
+  const, because a range read from a mutable data file is a range an attacker who can influence the
+  vendored bytes could move. What the binding buys is that the const can no longer be silently
+  wrong — if CC moves the range, the build says so instead of persist quietly refusing federation
+  traffic on a stem CC no longer reserves.
+
+- **Doc comments can no longer name a version that never shipped.** `v25.2.0` was cited **30 times
+  across 12 files** and was never released — written during the cut that shipped as **26.0.0**, and
+  unnoticed for three majors. Each reference was classified against what actually shipped: 22 to
+  `v26.0.0`, 8 to `v28.3.0`. A blanket replace would have stamped brand-new work with a
+  two-major-old version.
+
+  Measuring the class found **223 references to 26 versions that never shipped** — `v12.7.0` alone
+  has 93, `v24.4.0` has 42 (the #583 work, which shipped in v25.1.0: same mechanism, one cut
+  earlier). `scripts/doc_version_refs.py` now requires every `vX.Y.Z` in a `src/` comment to name a
+  version with a git tag or a CHANGELOG entry. The existing 223 are grandfathered **by version** in
+  `evidence/doc_version_baseline.tsv` — a ratchet that only tightens, and one the gate refuses to
+  write itself, because a baseline that gets appended to is a suppression file. The gate also fails
+  when a grandfathered version *becomes* real, so the ratchet cannot hide the next phantom behind a
+  stale entry. Burndown tracked as **#599**.
+
+- **Three `[Unreleased]` sections described work that had already shipped** — #594/#356 (28.2.0) and
+  #564 (28.1.0), the last of which was also filed under the wrong release. Folded into their real
+  entries, losslessly. A changelog that calls a shipped feature unreleased is worse than one that
+  omits it.
+
+- **A non-vacuity floor that had stopped guarding.** The evidence-registry version gate asserted
+  `checked >= 40` under a comment reading "expected ~43", against a registry that had since grown to
+  **67 rows** — it would have survived a parse change silently dropping 27 of them. Now an exact
+  count, so registry growth is a visible one-line diff instead of slack.
+
+## [28.2.0] — 2026-08-03 — #594 + #356: the last fold closes, and a running node becomes legible
 
 **Occurrence four of the retraction-fold class, and the only one that consulted no retraction at
 all.** #578, #584 and #593 each consulted too *narrow* a set — granter-scoped, missing
@@ -81,7 +234,7 @@ delete them. This is that flip. It also **splits the fixture**: #593's version r
 both clauses, so the granter-retraction assertion ran with the subject's retraction already in place
 and would have passed whether or not that clause existed. Two clauses reading different rows need two
 fixtures, or the weaker one is never under test.
-## [Unreleased] — CIRISServer#356: the node's refusals were legible, its STATE was not
+### CIRISServer#356 — the node’s refusals were legible, its STATE was not
 
 - **Seven of the ten signals #356 names were computed and discarded.** Three reached Python;
   `DrillFreshness`, `trust_root_valid`, `KeyStatementStanding`, `QuarantineState`,
@@ -164,7 +317,6 @@ fixtures, or the weaker one is never under test.
   releases. Verified pre-existing by reverting this branch's Rust changes and reproducing the
   failure at the v28.1.0 tag.
 
-## [28.2.0] — 2026-08-03 — #594 + #356: the last fold closes, and a running node becomes legible
 
 - **#594** — the consent-revocation proxy walk consulted **no retraction at all**. Fourth and last
   occurrence of the granter-scoped fold class (#578 ownership, #584 stewardship, #593 moderation),
@@ -193,6 +345,85 @@ fixtures, or the weaker one is never under test.
   `test-anchor`-only configuration (1137).
 
 ## [28.1.0] — 2026-08-03 — #564: reachability stage 2, and the release primitive that always says no
+
+### #564 stage 2 — the release predicate persist cannot satisfy, made structural
+
+Stage 1 shipped `is_load_bearing` — *"is this CEG object load-bearing on THIS node?"* — answering
+two object classes through the manifest's per-family predicate axis. Stage 2 is the rest of the
+sweep, plus the conjunct that decides whether an answer of `No` means anything.
+
+### The exhaustive object-class sweep
+
+#564's dependency-kind list names six kinds; stage 1 could address three. The other three had no way
+to even be **named** — `ObjectRef` had no arm for a route, a fountain unit, or a hard-case row.
+
+`ObjectClass` (closed, with `ALL`) and `object_class_policy` (exhaustive `match`) apply the
+`replication_policy::policy_for` discipline to the reachability axis: **a class without a declared
+predicate is a compile failure**, and `ObjectRef::class()` is exhaustive too, so a new arm cannot
+skip declaring how it is reference-counted.
+
+- **`TransportDestination` resolves structurally, in both directions.** A live route *is* the
+  reachability it provides; a retired route is a tombstone the route plane deliberately keeps
+  gossiping (`list_signed_transport_destinations_for` includes retired rows on purpose). Both are
+  dependents this node reads directly, so both prove `Yes` and their joint emptiness proves `No`.
+- **`FountainContent` DEFERS** to the eviction plane that already owns fountain retention. #564 says
+  reuse rather than duplicate, and a second mechanism reasoning about one object's fate is the
+  two-lists-that-disagree shape the issue exists to avoid. Deferring resolves `Unknown`.
+- **`HardCaseEvent` has no reverse index** of open verdict processes — the WA quorum that turns
+  evidence into sentences runs elsewhere — so *uncited* is unprovable. `Unknown`, the same shape as
+  the declared-`undeclared` `accord:*` and `bond_posted:{currency}` families.
+
+### `may_release_copy`, and the half that blocks it
+
+    may_release_copy(X) ⇔ is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)
+
+Both halves, always evaluated, both reported — a `No` that named only the half checked first would
+send a caller to fix the wrong thing.
+
+**The finding that shapes the stage: persist cannot produce `AntiEntropy::Satisfied`.** It has no
+peer transport; its replication surface is inbound-apply plus outbound-**pull**, and a pull never
+learns who kept what; and no table, column or trait method records a peer acknowledging a holding.
+Residence is therefore structurally unverifiable here, so **release is unreachable** — which is the
+correct fail-secure posture rather than a stub. Closing it needs an acknowledgment plane written by
+the layer that actually talks to peers, and `Satisfied` is the shape that plane would have to
+produce.
+
+That claim is held by a **source scan over all of `src/`**, not a call-graph test, because the
+failure mode is somebody adding a `Satisfied` producer to make a later release path go green. Its
+needles are assembled at runtime so the scanner does not match its own source — a scan that trips on
+itself is a scan someone silences.
+
+The verdict type is deliberately **separate from the erasure plane's** (#573): reachability fails
+SECURE, erasure fails OPEN, and one shared "is this covered?" verdict would be wrong for one of them.
+
+### The gate the documentation created
+
+Writing `object_class_policy` down produced a *second* statement of how each class is
+reference-counted, with nothing making it agree with the code that decides. The cross-check probes
+every `ObjectClass::ALL` with ids that cannot exist and asserts the verdict shape the **declared**
+resolution predicts; it runs in the shared witness body, so all three backends enforce it.
+
+It went red on its first run, on a real disagreement: `KeyRecord` was labelled `StructuralReads`, but
+stage 1's key-record arm returns `Unknown` for an absent key — *"which rows name it as scrub or
+co-scrub"* has no index, so an empty read means "found none by the routes we can search", not "there
+is none". One label had erased exactly the distinction the fail-secure posture rests on. Split into
+`StructuralReads` (reads prove `Yes`, their emptiness proves `No`) and `StructuralYesOnly` (reads
+prove `Yes`; `No` is unprovable ⇒ `Unknown`).
+
+### Reachability
+
+`ObjectRef::from_parts` is the **one parse door** from a host `(kind, id, id2)` triple; both FFI
+entry points funnel through it, so they cannot drift into supporting different subsets — which is how
+stage 1's surface came to handle two classes and no more. `every_class_is_constructible_from_host_parts`
+iterates `ObjectClass::ALL`, so a class with no FFI door goes red rather than shipping unreachable
+(AV-77 / #444 / #589). Composite-keyed classes **refuse** a missing second key: a defaulted
+`transport_kind` answers confidently about a route the caller never asked about.
+
+`Engine::may_release_copy` and `may_release_copy_json` ship alongside; `is_load_bearing_json` gains
+`object_id2` (additive, defaulted).
+
+**Releases, evicts and mutates nothing.** Stages 3 (release) and 4 (compaction) remain open and are
+blocked on the acknowledgment plane above, not on effort.
 
 - **#564 stages 2-4** — `is_load_bearing` gains the composite-keyed classes
   (`transport_destination`, `fountain_content`, `hard_case_event`) and a second key that **raises
@@ -475,85 +706,6 @@ says *something* and returns a typed value; it does not guarantee the JSON schem
 is documented anywhere a checker can see.
 
 No migration. No Rust behaviour change beyond doc comments.
-## [Unreleased] — #564 stage 2: the release predicate persist cannot satisfy, made structural
-
-Stage 1 shipped `is_load_bearing` — *"is this CEG object load-bearing on THIS node?"* — answering
-two object classes through the manifest's per-family predicate axis. Stage 2 is the rest of the
-sweep, plus the conjunct that decides whether an answer of `No` means anything.
-
-### The exhaustive object-class sweep
-
-#564's dependency-kind list names six kinds; stage 1 could address three. The other three had no way
-to even be **named** — `ObjectRef` had no arm for a route, a fountain unit, or a hard-case row.
-
-`ObjectClass` (closed, with `ALL`) and `object_class_policy` (exhaustive `match`) apply the
-`replication_policy::policy_for` discipline to the reachability axis: **a class without a declared
-predicate is a compile failure**, and `ObjectRef::class()` is exhaustive too, so a new arm cannot
-skip declaring how it is reference-counted.
-
-- **`TransportDestination` resolves structurally, in both directions.** A live route *is* the
-  reachability it provides; a retired route is a tombstone the route plane deliberately keeps
-  gossiping (`list_signed_transport_destinations_for` includes retired rows on purpose). Both are
-  dependents this node reads directly, so both prove `Yes` and their joint emptiness proves `No`.
-- **`FountainContent` DEFERS** to the eviction plane that already owns fountain retention. #564 says
-  reuse rather than duplicate, and a second mechanism reasoning about one object's fate is the
-  two-lists-that-disagree shape the issue exists to avoid. Deferring resolves `Unknown`.
-- **`HardCaseEvent` has no reverse index** of open verdict processes — the WA quorum that turns
-  evidence into sentences runs elsewhere — so *uncited* is unprovable. `Unknown`, the same shape as
-  the declared-`undeclared` `accord:*` and `bond_posted:{currency}` families.
-
-### `may_release_copy`, and the half that blocks it
-
-    may_release_copy(X) ⇔ is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)
-
-Both halves, always evaluated, both reported — a `No` that named only the half checked first would
-send a caller to fix the wrong thing.
-
-**The finding that shapes the stage: persist cannot produce `AntiEntropy::Satisfied`.** It has no
-peer transport; its replication surface is inbound-apply plus outbound-**pull**, and a pull never
-learns who kept what; and no table, column or trait method records a peer acknowledging a holding.
-Residence is therefore structurally unverifiable here, so **release is unreachable** — which is the
-correct fail-secure posture rather than a stub. Closing it needs an acknowledgment plane written by
-the layer that actually talks to peers, and `Satisfied` is the shape that plane would have to
-produce.
-
-That claim is held by a **source scan over all of `src/`**, not a call-graph test, because the
-failure mode is somebody adding a `Satisfied` producer to make a later release path go green. Its
-needles are assembled at runtime so the scanner does not match its own source — a scan that trips on
-itself is a scan someone silences.
-
-The verdict type is deliberately **separate from the erasure plane's** (#573): reachability fails
-SECURE, erasure fails OPEN, and one shared "is this covered?" verdict would be wrong for one of them.
-
-### The gate the documentation created
-
-Writing `object_class_policy` down produced a *second* statement of how each class is
-reference-counted, with nothing making it agree with the code that decides. The cross-check probes
-every `ObjectClass::ALL` with ids that cannot exist and asserts the verdict shape the **declared**
-resolution predicts; it runs in the shared witness body, so all three backends enforce it.
-
-It went red on its first run, on a real disagreement: `KeyRecord` was labelled `StructuralReads`, but
-stage 1's key-record arm returns `Unknown` for an absent key — *"which rows name it as scrub or
-co-scrub"* has no index, so an empty read means "found none by the routes we can search", not "there
-is none". One label had erased exactly the distinction the fail-secure posture rests on. Split into
-`StructuralReads` (reads prove `Yes`, their emptiness proves `No`) and `StructuralYesOnly` (reads
-prove `Yes`; `No` is unprovable ⇒ `Unknown`).
-
-### Reachability
-
-`ObjectRef::from_parts` is the **one parse door** from a host `(kind, id, id2)` triple; both FFI
-entry points funnel through it, so they cannot drift into supporting different subsets — which is how
-stage 1's surface came to handle two classes and no more. `every_class_is_constructible_from_host_parts`
-iterates `ObjectClass::ALL`, so a class with no FFI door goes red rather than shipping unreachable
-(AV-77 / #444 / #589). Composite-keyed classes **refuse** a missing second key: a defaulted
-`transport_kind` answers confidently about a route the caller never asked about.
-
-`Engine::may_release_copy` and `may_release_copy_json` ship alongside; `is_load_bearing_json` gains
-`object_id2` (additive, defaulted).
-
-**Releases, evicts and mutates nothing.** Stages 3 (release) and 4 (compaction) remain open and are
-blocked on the acknowledgment plane above, not on effort.
-
 ## [27.0.0] — 2026-08-03 — #519/#586/#579/#571/#592/#584: the rules persist enforces, enumerated — and four preconditions nothing was testing
 
 Six issues, and a pattern that only became visible with all six in one cut: **v26.0.0 shipped four

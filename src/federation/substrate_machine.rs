@@ -1117,7 +1117,7 @@ pub mod test_support {
             // key id). Using the row's attester keeps `scrub_key_id`'s FK and
             // the ingest gate's pubkey resolution coherent without an Engine.
             //
-            // v25.2.0 (CIRISPersist#589 / AV-83) — the separate
+            // v26.0.0 (CIRISPersist#589 / AV-83) — the separate
             // `set_attestation_cohort_scope` call that used to precede this is
             // gone, because the primitive now CARRIES the placement. This
             // harness found the reason: once `promote_attestation` could refuse

@@ -93,6 +93,25 @@ if echo "$STAGED" | grep -qE '^src/ffi/|^python/ciris_persist/ciris_persist\.pyi
     fi
 fi
 
+# v28.3.0 (CIRISPersist#599) — a doc comment naming a version that never shipped.
+# `v25.2.0` was cited 30 times: written during the cut that shipped as 26.0.0.
+# The failure is silent and self-propagating — the next agent greps the
+# convention and copies the phantom string, which is how one wrong number became
+# 93 for `v12.7.0`. Cheap and compile-free, so it runs with the other fast gates.
+if echo "$STAGED" | grep -qE '\.rs$|^CHANGELOG\.md$|^Cargo\.toml$|^evidence/doc_version_baseline\.tsv$|^scripts/doc_version_refs\.py$'; then
+    if gate_script_present scripts/doc_version_refs.py "doc version reference gate"; then
+        echo "─── pre-commit: doc version references ───"
+        # Same predicate, same implementation, as CI's `lint` job.
+        if ! python3 scripts/doc_version_refs.py; then
+            echo
+            echo "✗ doc version gate failed — see above." >&2
+            echo '  Do NOT add the version to evidence/doc_version_baseline.tsv;' >&2
+            echo '  that ratchet is being burned down (CIRISPersist#599).' >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Only run the Rust gates if Rust files changed. Bench-only /
 # changelog-only / migration-only / docs-only commits skip them.
 if ! echo "$STAGED" | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then

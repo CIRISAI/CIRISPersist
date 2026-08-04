@@ -2200,7 +2200,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // was accepted unconditionally here.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
-        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
         // See `src/store/sqlite.rs` put_attestation for the full rationale:
         // the v4.4.0 rule lived only inside `check_local_tier_eligibility`,
         // which this door never calls, while this door accepts
@@ -5876,7 +5876,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
         // See `src/store/sqlite.rs` promote_attestation for the rationale.
         // It MUST run before `self.state.lock()`: every gate in the stack
         // reads the directory through that same lock, so gating inside the
@@ -5962,7 +5962,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
         // over the TRANSFORMED envelope. Runs before the state lock for the
         // same deadlock reason as `promote_attestation`.
         {

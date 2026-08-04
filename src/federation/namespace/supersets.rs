@@ -1627,10 +1627,18 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(
-            checked >= 40,
-            "expected ~43 version-pinned persist rows, checked {checked} — a parse \
-             change would silently empty this test"
+        // Non-vacuity, EXACT rather than a floor. This was `>= 40` under a
+        // comment reading "expected ~43" while the registry grew to 67 — the
+        // floor never tracked the thing it guarded, so a parse change silently
+        // dropping 27 rows would still have passed. A floor only fails when a
+        // regression is catastrophic; an exact count makes registry growth a
+        // visible one-line diff, which is the same discipline the FFI taxonomy
+        // and the CC 3.1.9.2 prose-rule count are held to.
+        assert_eq!(
+            checked, 67,
+            "checked {checked} version-pinned persist src/ rows, expected 67. \
+             If you ADDED evidence rows, update this number in the same commit. \
+             If you did not, a parse change just silently emptied this test."
         );
     }
 

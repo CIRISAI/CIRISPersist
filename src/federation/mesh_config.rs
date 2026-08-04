@@ -1,4 +1,4 @@
-//! v25.2.0 (CIRISPersist#570 **ask 1**) — **the `mesh_config:{key}` plane.**
+//! v28.3.0 (CIRISPersist#570 **ask 1**) — **the `mesh_config:{key}` plane.**
 //!
 //! A trust root turns a knob on the nodes that subscribe to it, and the
 //! Constitution bounds what a knob can do. From CIRISServer's
@@ -122,7 +122,7 @@ use super::{Error, FederationDirectory};
 
 /// The CC 3.1 namespace family this plane lives on. **Registered** — CC
 /// 1.0-rc3 catalogues `mesh_config:{key}` at CC 3.1.9.2 (owning component
-/// `node`), landed by CIRISConstitution#57 and carried in by the v25.2.0
+/// `node`), landed by CIRISConstitution#57 and carried in by the v28.3.0
 /// re-vendor. It is on the CC 3.1.7 R2(a) mint gate
 /// ([`MINTED_NAMESPACE_FAMILIES`](super::admission::MINTED_NAMESPACE_FAMILIES)).
 ///

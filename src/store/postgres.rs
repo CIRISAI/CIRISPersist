@@ -4033,7 +4033,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
-        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
         // See `src/store/sqlite.rs` put_attestation for the full rationale:
         // the v4.4.0 rule lived only inside `check_local_tier_eligibility`,
         // which this door never calls, while this door accepts
@@ -8856,7 +8856,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
         // See `src/store/sqlite.rs` promote_attestation for the rationale.
         // Gated on the POST-promotion shape; verify-before-mutation.
         {
@@ -8978,7 +8978,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
         // over the TRANSFORMED envelope (the bytes this row will federate as).
         {
             let mut as_promoted = row.clone();
