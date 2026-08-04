@@ -682,11 +682,70 @@ pub enum MeshConfigForm {
     /// changes expire **by construction**, so the government is a thing you
     /// have to keep being, not a thing you become by acting once.
     Emergency,
-    /// Permanent until superseded, and correspondingly harder to get: the row
-    /// must name the emergency it makes durable ([`field::RATIFIES`]), that
-    /// emergency must be one this node holds, on the same key and root, and it
-    /// must agree about the value. CC: *"durable settings require the root's
-    /// own quorum ratifying the emergency's `payload_sha256`."*
+    /// Permanent until superseded, and correspondingly harder to get. CC:
+    /// *"durable settings require **the root's own quorum** ratifying the
+    /// emergency's `payload_sha256`."*
+    ///
+    /// **Two doors, and which two is a reading of an ambiguous clause.** Both
+    /// are pinned by
+    /// [`tests::cc_421_rule_3_is_read_as_unilateral_not_unexercised`], which
+    /// quotes the sentence, so if CC disambiguates in either direction it fails
+    /// loudly rather than sitting here looking settled:
+    ///
+    /// 1. **Conversion.** The row names the emergency it makes durable
+    ///    ([`field::RATIFIES`]); that emergency must be one this node holds, on
+    ///    the same key and root, agreeing about the value.
+    /// 2. **Cold durable, under the root's own quorum.** No prior emergency —
+    ///    admitted iff the act is not UNILATERAL. For a
+    ///    [`RootKind::Family`](super::trust_root::RootKind::Family) root that
+    ///    means ≥m distinct seated holders scrubbed this row, counted by the
+    ///    same [`family_quorum_over`](super::trust_root::family_quorum_over)
+    ///    that charters roots. For a
+    ///    [`RootKind::Key`](super::trust_root::RootKind::Key) root it means the
+    ///    root ITSELF signed — *"1-of-1 is a legitimate quorum for a root you
+    ///    alone own"*, which is
+    ///    [`trust_root`](super::trust_root)'s own doctrine, not a hole opened
+    ///    here. A CONFERRED delegate is refused on both arms: a delegation is
+    ///    not a quorum, and that is where this door actually bites.
+    ///
+    /// # The reading, and the one it replaced
+    ///
+    /// This module first shipped the STRICT reading — cold durable refused
+    /// outright, so a setting became durable only by having been *exercised*.
+    /// It was overturned on **CC 4.2.1 rule (4)**, which states the reason the
+    /// TTL exists: *"relief expires because it is **unilateral**; the halt
+    /// carries no TTL because its exit is the named resumption."* The bound
+    /// attaches to `threshold-1`, not to emergency-ness — so what earns
+    /// durability is **quorum**, not history. Under the strict reading a full
+    /// quorum act was still barred from durability unless it happened to
+    /// ratify some prior *unilateral* one, which makes quorum weaker than rule
+    /// (4)'s own logic and makes a single holder the agenda-setter for every
+    /// durable setting the mesh can hold.
+    ///
+    /// Two consequences settled it. Strict made a durable restriction that was
+    /// never an emergency **unreachable forever** — a fresh mesh could hold no
+    /// durable `mesh_config` until someone fired a 72-hour emergency to
+    /// bootstrap one, which is the circular-at-genesis class. And it forced
+    /// *every* durable change through the emergency channel, which is the most
+    /// direct available route to "the emergency path becomes the government" —
+    /// the property it was meant to protect. Compare CC 3.4.14 R4 on another
+    /// plane: *"marking everything is the same failure as marking nothing."*
+    ///
+    /// The honest counter, kept because it is not nothing: *"**the**
+    /// emergency's `payload_sha256`"* is a definite article and does
+    /// presuppose an emergency. But rule 3 is titled *"Emergency relief is
+    /// TTL-bounded"* — its subject is the emergency path, so it specifies the
+    /// CONVERSION case rather than enumerating every door to durability, and
+    /// reading its silence as prohibition is the fail-closed-and-wrong trade
+    /// CIRISPersist#590 exists to prevent.
+    ///
+    /// What makes this safe either way is rule 1: a cold durable row can only
+    /// ever RESTRICT, because [`fold_mesh_config`] clamps it. The dangerous
+    /// direction was already closed by construction, so "must have been
+    /// exercised" bought little and cost reachability.
+    ///
+    /// Argued out with CIRISPersist#571's agent; the reasoning above is
+    /// substantially theirs.
     Durable,
 }
 
@@ -773,10 +832,30 @@ pub enum MeshConfigRefusalReason {
     /// window has not closed before the new one opens. Chaining 72-hour
     /// windows is how a unilateral lever becomes a permanent one.
     BackToBackRenewal,
-    /// A [`Durable`](MeshConfigForm::Durable) row does not name a
-    /// [`field::RATIFIES`] emergency this node holds on the same root and key
-    /// with the same value. Ratification of nothing is not ratification.
+    /// A [`Durable`](MeshConfigForm::Durable) row NAMES a
+    /// [`field::RATIFIES`] that does not resolve to an emergency this node
+    /// holds on the same root and key with the same value. Ratification of
+    /// nothing is not ratification.
+    ///
+    /// Note what this is NOT: a durable row naming no emergency at all is the
+    /// cold-durable door, judged by
+    /// [`DurableWithoutRootQuorum`](Self::DurableWithoutRootQuorum).
     DurableUnratified,
+    /// A **cold** [`Durable`](MeshConfigForm::Durable) row — one naming no
+    /// prior emergency — that did not reach **the root's own quorum**.
+    ///
+    /// CC 4.2.1 rule 3 gives durability to quorum, and rule 4 says why:
+    /// *"relief expires because it is unilateral."* So a durable setting with
+    /// no emergency behind it must not be a unilateral act. A conferred
+    /// delegate is refused here on both root arms — a delegation is not a
+    /// quorum — as is a family-root row that fewer than m distinct seated
+    /// holders scrubbed.
+    ///
+    /// The one act this does NOT refuse is a single-key root signing for
+    /// itself: 1-of-1 is that root's whole quorum, which is
+    /// [`trust_root`](super::trust_root)'s own doctrine and not a carve-out
+    /// invented here.
+    DurableWithoutRootQuorum,
     /// **CC 4.2.1 rule 1, at the door.** The value means MORE flow than this
     /// node's own baseline. *"No key may cause a node to share more than its
     /// owner consented to."*
@@ -805,6 +884,7 @@ impl MeshConfigRefusalReason {
             Self::TtlTooLong => "ttl_too_long",
             Self::BackToBackRenewal => "back_to_back_renewal",
             Self::DurableUnratified => "durable_unratified",
+            Self::DurableWithoutRootQuorum => "durable_without_root_quorum",
             Self::ExpandsBeyondConsent => "expands_beyond_consent",
         }
     }
@@ -824,6 +904,7 @@ impl MeshConfigRefusalReason {
         Self::TtlTooLong,
         Self::BackToBackRenewal,
         Self::DurableUnratified,
+        Self::DurableWithoutRootQuorum,
         Self::ExpandsBeyondConsent,
     ];
 }
@@ -1310,6 +1391,48 @@ where
     }))
 }
 
+/// **"The root's own quorum" (CC 4.2.1 rule 3), as a predicate over one row.**
+///
+/// What counts depends on what kind of thing the root is, resolved once through
+/// [`resolve_family_root`](super::trust_root::resolve_family_root) — the same
+/// function [`trust_root_valid`](super::trust_root::trust_root_valid) uses to
+/// pick its arm, so the two can never disagree about which arm a root is on:
+///
+/// - **Family root** — ≥m distinct SEATED holders must have scrubbed this row,
+///   counted by [`family_quorum_over`](super::trust_root::family_quorum_over):
+///   the row's full scrub set intersected with the family's own
+///   revocation-folded roster, each survivor hybrid-verified against pubkeys
+///   from THIS node's directory, against a threshold floored at a strict
+///   majority of that roster. Not a second m-of-n implementation — the one
+///   that charters roots.
+/// - **Key root** — the root itself must be the author. *"1-of-1 is a
+///   legitimate quorum for a root you alone own"* is
+///   [`trust_root`](super::trust_root)'s stated doctrine, and this is where it
+///   is being relied on rather than quietly assumed.
+///
+/// **A conferred delegate fails on both arms.** That is the whole bite of this
+/// gate: a `trust:confers:v1` grant lets a key act for the root at
+/// threshold-1 — which is exactly what CC 4.2.1 rule 4 says must expire — so
+/// it can raise a bounded emergency and it cannot make anything permanent
+/// alone.
+async fn root_quorum_reached<F>(
+    directory: &F,
+    root_ref: &str,
+    row: &Attestation,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match super::trust_root::resolve_family_root(directory, root_ref).await? {
+        Some(family) => Ok(
+            super::trust_root::family_quorum_over(directory, row, &family)
+                .await?
+                .met(),
+        ),
+        None => Ok(row.attesting_key_id == root_ref),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  The admission door
 // ─────────────────────────────────────────────────────────────────────────
@@ -1458,20 +1581,32 @@ where
                 return refused(R::BackToBackRenewal);
             }
         }
-        // CC 4.2.1 rule 3 — durable settings ratify an emergency.
-        MeshConfigForm::Durable => {
-            let Some(ratifies) = env_nonempty(row, field::RATIFIES) else {
-                return refused(R::DurableUnratified);
-            };
-            let ratifies_a_real_emergency = same_key.iter().any(|(prior, p)| {
-                prior.attestation_id == ratifies
-                    && p.form == MeshConfigForm::Emergency
-                    && p.value == value
-            });
-            if !ratifies_a_real_emergency {
-                return refused(R::DurableUnratified);
+        // CC 4.2.1 rule 3 — durability belongs to QUORUM, not to history.
+        // Two doors; see `MeshConfigForm::Durable` for the reading and the
+        // argument that overturned the stricter one.
+        MeshConfigForm::Durable => match env_nonempty(row, field::RATIFIES) {
+            // Door 1 — CONVERSION. The row names the emergency it makes
+            // permanent, and that emergency must be one this node holds, on
+            // this root and key, agreeing about the value.
+            Some(ratifies) => {
+                let ratifies_a_real_emergency = same_key.iter().any(|(prior, p)| {
+                    prior.attestation_id == ratifies
+                        && p.form == MeshConfigForm::Emergency
+                        && p.value == value
+                });
+                if !ratifies_a_real_emergency {
+                    return refused(R::DurableUnratified);
+                }
             }
-        }
+            // Door 2 — COLD DURABLE, under the root's OWN quorum. What is
+            // refused here is a UNILATERAL durable act (rule 4: "relief
+            // expires because it is unilateral"), not an unexercised one.
+            None => {
+                if !root_quorum_reached(directory, &root_ref, row).await? {
+                    return refused(R::DurableWithoutRootQuorum);
+                }
+            }
+        },
     }
 
     directory
@@ -1659,6 +1794,64 @@ mod tests {
             assert_eq!(fold.effective(k), k.owner_default());
             assert!(!s.relieved);
         }
+    }
+
+    /// **The reading of CC 4.2.1 rule 3, pinned in one place with the clause
+    /// quoted.**
+    ///
+    /// > **(3) Emergency relief is TTL-bounded** — threshold-1 on the announce
+    /// > carrier, TTL ≤ 72 h, not renewable back-to-back by the same holder;
+    /// > **durable** settings require the root's own quorum ratifying the
+    /// > emergency's `payload_sha256`.
+    /// >
+    /// > **(4)** The halt asymmetry is deliberate: relief expires **because it
+    /// > is unilateral**; the halt carries no TTL because its exit is the named
+    /// > resumption.
+    ///
+    /// The clause is genuinely ambiguous and this module takes a side: the TTL
+    /// attaches to **threshold-1**, per rule 4's own stated reason, so what
+    /// earns durability is QUORUM and not having-been-exercised. The full
+    /// argument — including the honest counter, that *"**the** emergency's
+    /// `payload_sha256`"* presupposes an emergency — is on
+    /// [`MeshConfigForm::Durable`].
+    ///
+    /// This test exists so that reading is a **named artifact** rather than a
+    /// property scattered across the door's branches. It asserts the shape in
+    /// both directions and cites the sentence, so if CC ever disambiguates —
+    /// either way — there is one place to come and one thing to change. A
+    /// reading of ambiguous text should never sit in a doc comment looking
+    /// settled.
+    ///
+    /// The three-backend executed witness is
+    /// `mesh_config_door_and_fold_*` step 2b; this is the statement of what
+    /// that step is testing and why.
+    #[test]
+    fn cc_421_rule_3_is_read_as_unilateral_not_unexercised() {
+        // The reading, as three claims about the refusal taxonomy that only
+        // hold under it.
+        //
+        // 1. There is a refusal for a UNILATERAL durable act…
+        assert_eq!(
+            MeshConfigRefusalReason::DurableWithoutRootQuorum.as_str(),
+            "durable_without_root_quorum",
+            "the cold-durable refusal is named for the ABSENCE OF QUORUM. Under the strict \
+             reading it would be named for the absence of a prior emergency, and there would be \
+             no cold-durable door at all."
+        );
+        // 2. …and it is DISTINCT from the conversion-path refusal, because the
+        //    two doors judge different things. One token for both would make a
+        //    consumer unable to tell "you acted alone" from "the emergency you
+        //    named does not exist".
+        assert_ne!(
+            MeshConfigRefusalReason::DurableWithoutRootQuorum.as_str(),
+            MeshConfigRefusalReason::DurableUnratified.as_str()
+        );
+        // 3. The emergency form still carries the TTL, and the durable form
+        //    still does not — which is the half of rule 3 that is NOT in
+        //    dispute, and the half the reading has to preserve.
+        assert_eq!(EMERGENCY_MAX_TTL_HOURS, 72, "CC 4.2.1 rule 3 states 72h");
+        assert_eq!(MeshConfigForm::Emergency.as_str(), "emergency");
+        assert_eq!(MeshConfigForm::Durable.as_str(), "durable");
     }
 
     /// The refusal tokens are the downstream contract: stable, unique, and
@@ -2613,13 +2806,15 @@ mod tests {
             "[{tag}] a live trust:confers:v1 grant is the CC 3.2 delegation plane CC 4.2.1 names"
         );
 
-        // ── 2b. THE COLD DURABLE. A durable row that ratifies nothing is
-        //        refused even when it is otherwise perfect — the reading of CC
-        //        4.2.1 rule 3 this module takes, and the one flagged for review
-        //        on `MeshConfigForm::Durable`. It is why the happy path above
-        //        is an emergency: on this reading a setting becomes durable by
-        //        having been exercised, never by being asserted.
-        let cold_durable = signed_config_row(
+        // ── 2b. **CC 4.2.1 RULE 3, THE READ THAT MATTERS.** A COLD durable
+        //        row — no prior emergency — turns on whether the act is
+        //        UNILATERAL, not on whether it was exercised. `root_a` is a
+        //        single-key root, so signing for itself IS its whole quorum
+        //        and this admits; the conferred delegate is refused, because a
+        //        delegation is threshold-1 and rule 4 says threshold-1
+        //        expires. See `MeshConfigForm::Durable` for the argument that
+        //        overturned the stricter reading.
+        let cold_durable_by_root = signed_config_row(
             &root_a,
             &root_a,
             K::FeatureAvStreams,
@@ -2631,11 +2826,32 @@ mod tests {
             "att-deleg",
         );
         assert_eq!(
-            door!(cold_durable),
+            door!(cold_durable_by_root),
+            MeshConfigOutcome::Admitted,
+            "[{tag}] a single-key root IS its own quorum (1-of-1), so a cold durable RESTRICTION \
+             it signs for itself must admit. Refusing here makes a durable setting unreachable on \
+             a fresh mesh until someone fires a 72h emergency to bootstrap one — the \
+             circular-at-genesis class."
+        );
+        let cold_durable_by_delegate = signed_config_row(
+            &delegate,
+            &root_a,
+            K::FeatureTraceReplication,
+            0,
+            MeshConfigForm::Durable,
+            now - Duration::hours(1),
+            None,
+            None,
+            "att-deleg",
+        );
+        assert_eq!(
+            door!(cold_durable_by_delegate),
             MeshConfigOutcome::Refused {
-                reason: MeshConfigRefusalReason::DurableUnratified
+                reason: MeshConfigRefusalReason::DurableWithoutRootQuorum
             },
-            "[{tag}] a durable setting with no emergency behind it is refused"
+            "[{tag}] a CONFERRED delegate acts at threshold-1, and CC 4.2.1 rule 4 says \
+             threshold-1 expires. It may raise a bounded emergency; it may not make anything \
+             permanent alone. That asymmetry is the whole bite of the cold-durable door."
         );
 
         // ── 3. Every refusal branch, on the real door. Each differs from an
@@ -2686,7 +2902,8 @@ mod tests {
                 MeshConfigRefusalReason::Unattributed,
             ),
             (
-                "a durable row ratifying nothing",
+                "a durable row NAMING a ratification that resolves to nothing (distinct from a \
+                 cold durable, which names none and is judged on quorum)",
                 signed_config_row(&root_a, &root_a, K::AntientropyPageLimit, 50,
                     MeshConfigForm::Durable, now - Duration::hours(1), None,
                     Some("00000000-0000-0000-0000-000000000000"), "att-deleg"),
