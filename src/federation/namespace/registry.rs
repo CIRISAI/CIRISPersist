@@ -67,6 +67,18 @@ pub struct NamespaceEntry {
     pub owning_repo: Option<String>,
     /// The CC section the family is catalogued in (e.g. `"3.1.2"`).
     pub cc_section: String,
+    /// The row's catalogue PROSE, verbatim from the manifest (the generator's
+    /// first-sentence extract of the CC 3.1 table cell).
+    ///
+    /// Carried since CIRISPersist#571 for one reason: several rc3 rows state an
+    /// emitter rule in this field while generating `reserved: false` with no
+    /// [`Authority::reserved`] — `regime:{artifact}:{version}` says *"reserved —
+    /// substrate-steward-emitted"* and resolves `ProducerSteward`/`None`. Persist
+    /// deliberately does **not** enforce anything read from here (that would be
+    /// the section-walk heuristic CC 3.1.7 R2 forbids); it exists so a test can
+    /// quote the row's own words back and FAIL when structure and prose
+    /// disagree, instead of that disagreement living in a comment.
+    pub description: String,
     /// The resolved emit authority (class + any CC 3.4 reserved rule).
     pub authority: Authority,
 }
@@ -94,6 +106,8 @@ struct RawFamily {
     #[serde(default)]
     owning_repo: Option<String>,
     cc_section: String,
+    #[serde(default)]
+    description: String,
     // NOTE: the manifest's `reserved` bool is redundant with `reserved_rule`
     // presence (which carries the CC 3.4 specifics) — serde ignores it.
     #[serde(default)]
@@ -201,6 +215,7 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
                 owning_component: f.owning_component,
                 owning_repo: f.owning_repo,
                 cc_section: f.cc_section,
+                description: f.description,
                 authority: Authority { class, reserved },
             }
         })
