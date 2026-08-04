@@ -177,6 +177,10 @@ pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
 // Tier 2 of the graded response set; a marker, never a command.
 pub mod quarantine;
+// v25.2.0 (CIRISPersist#570 ask 1) — the mesh_config plane: a trust root turns
+// a knob on the nodes that subscribe to it, bounded by CC 4.2.1's
+// relieve-never-expand and most-restrictive-across-roots.
+pub mod mesh_config;
 // v24.3.0 (CIRISPersist#574) — reverse quorum: the commons' brake.
 // 1-of-N to protect, m-of-n to undo.
 pub mod reverse_quorum;
@@ -292,6 +296,13 @@ pub use hard_case::{
 pub use quarantine::{
     fold_quarantine, is_withheld, resolve_quarantine, QuarantineFold, QuarantineOutcome,
     QuarantineRefusalReason, QuarantineState,
+};
+// v25.2.0 (CIRISPersist#570 ask 1) — the mesh-config plane. Same export
+// discipline: downstream keys on the `as_str` tokens, which are append-only.
+pub use mesh_config::{
+    fold_mesh_config, record_mesh_config_row, resolve_mesh_config, FlowPolarity,
+    MeshConfigBaseline, MeshConfigFold, MeshConfigForm, MeshConfigKey, MeshConfigKeySpec,
+    MeshConfigOutcome, MeshConfigRefusalReason, MeshConfigSetting, MeshConfigUnit, RootValue,
 };
 // v25.1.0 (CIRISPersist#570 ask 4) — the time-bounded de-admission fold.
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};

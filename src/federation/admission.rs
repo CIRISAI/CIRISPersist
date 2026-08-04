@@ -663,7 +663,24 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
     "quarantine:{state}",
     // src/federation/ownership_reclaim.rs (#578) — CC 3.1.9.4.
     "wa_adjudication:{state}",
+    // src/federation/mesh_config.rs (#570 ask 1) — CC 3.1.9.2 / CC 4.2.1.
+    "mesh_config:{key}",
 ];
+
+/// v25.2.0 (CIRISPersist#570 ask 1) — the dimension stem of the mesh-config
+/// plane, re-exported here so the admission surface names it at the same place
+/// it names [`QUARANTINE_DIMENSION_PREFIX`] and friends.
+///
+/// **There is no `ReservedPrefixRule` for it, deliberately.** The prefix table
+/// gates on `identity_type`, and CC 4.2.1's rule is not about identity type at
+/// all — the author must be *this node's own trust root, or a key that root has
+/// conferred to on the `trust:confers:v1` delegation plane*, which is a
+/// per-node graph question no static table can answer. The gate is
+/// [`mesh_config::record_mesh_config_row`](crate::federation::mesh_config::record_mesh_config_row),
+/// and the read-time clamp in
+/// [`fold_mesh_config`](crate::federation::mesh_config::fold_mesh_config) is
+/// what holds for rows that arrive on the replication plane instead.
+pub const MESH_CONFIG_DIMENSION_PREFIX: &str = crate::federation::mesh_config::DIMENSION_PREFIX;
 
 /// Family stems persist gates with **hand-written arms** rather than a
 /// [`ReservedPrefixRule`] row — the gates [`check_reserved_prefix_admission`]
@@ -10302,6 +10319,7 @@ mod tests {
             crate::federation::reverse_quorum::NAMESPACE_FAMILY,
             crate::federation::quarantine::NAMESPACE_FAMILY,
             crate::federation::ownership_reclaim::NAMESPACE_FAMILY,
+            crate::federation::mesh_config::NAMESPACE_FAMILY,
         ]
         .into_iter()
         .collect();

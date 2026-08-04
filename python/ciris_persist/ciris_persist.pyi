@@ -1048,6 +1048,59 @@ class Engine:
         does not count yet. Read-only -- this never records a marker.
         """
 
+    def resolve_mesh_config_json(self, node_key_id: str, baseline_json: str | None = None, now: str | None = None) -> str:
+        """CIRISPersist#570 ask 1 — **what mesh configuration does this node
+        actually run?**
+
+        Returns the fold as JSON: ``{node_key_id, roots, settings}``.
+        ``settings`` carries **one entry per registered key, always** (nine on
+        this cut), so a consumer never has to tell "not set" from "not
+        returned". Each entry is ``{key, polarity, unit, baseline, effective,
+        relieved, decided_by_root?, row_id?, decided_by?, delegation_id?,
+        form?, expires_at?, grounds?, per_root, clamped_roots}``.
+
+        **Read ``effective``. That is the number to run.** The rest is
+        evidence: ``per_root`` is every trust root's own answer including the
+        ones that lost, and ``clamped_roots`` names every root whose value was
+        refused for asking this node to do MORE than its owner consented to.
+
+        Two guarantees hold whatever any root signed, per CC 4.2.1:
+
+        * **relieve-never-expand** -- ``effective`` never means more flow than
+          ``baseline``.
+        * **most-restrictive-across-roots** -- where roots disagree the
+          tightest value binds, on every node, whatever order they are in.
+
+        **Do not assume smaller is tighter.** Which direction is "more flow"
+        is per key and is carried in ``polarity``:
+        ``"higher_means_more_flow"`` for ``redundancy.k_repair_target``,
+        ``"lower_means_more_flow"`` for ``antientropy.round_secs`` (longer
+        between rounds is *less* gossip) and ``backpressure.summary_only``.
+
+        ``baseline_json`` is what this node's owner consented to: a JSON
+        object ``{"<key>": <int>}`` covering only the keys you pin, with
+        anything omitted taking that key's registered default. Values are
+        integers on every key; a ratio is carried in centi-units (``100`` =
+        1.00x). An unregistered key name raises ``ValueError`` rather than
+        being ignored -- the registry is closed (CC 4.2.1), and a baseline
+        half-applied would measure relieve-never-expand against a ceiling you
+        never set.
+
+        ``now`` is RFC 3339, defaulting to the current instant.
+        **Clock-dependent**: a TTL-expired row stops binding at read time,
+        with nothing revoked and nobody notified.
+
+        **This returns a JSON string, so it is truthy in Python.**
+        ``if engine.resolve_mesh_config_json(n)`` is ``True`` for every
+        possible answer, including one where every key sits at its default.
+        Sharper here than elsewhere: a flag key's ``effective`` is the JSON
+        number ``0`` or ``1``, and ``'..."effective":0...'`` is a truthy
+        string. ``json.loads`` it, find the entry whose ``["key"]`` matches,
+        and read ``["effective"]``.
+
+        Read-only -- this never records a row.
+        """
+
     def resolve_reverse_quorum_json(self, cohort: str, cohort_key_id: str, action_attestation_id: str, now: str | None = None) -> str:
         """CIRISServer#356 — **is a brake active on this action, and did the
         duty-holders answer?**

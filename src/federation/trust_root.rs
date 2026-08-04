@@ -476,6 +476,69 @@ fn counts_in_capability_walk(a: &Attestation) -> bool {
     a.tier == super::types::attestation_tier::FEDERATION
 }
 
+/// v25.2.0 (CIRISPersist#570 ask 1) — **every trust root `node_key_id` has a
+/// live edge to**, sorted and deduped. The node's own subscription set.
+///
+/// A "root" here is the `attested_key_id` of a live (non-tombstoned,
+/// non-expired, federation-tier) `delegates_to(node → R)` that is not
+/// self-referential and does not claim some OTHER `trust:*` job. That is
+/// exactly leg 1 of [`trust_root_valid`], evaluated with the SAME four
+/// predicates — `tombstoned_ids`, `is_expired`, `counts_in_capability_walk`,
+/// `job_dimension_admits` — rather than a second filter free to disagree with
+/// the first. It lives here for that reason: those four are private to this
+/// module, and a caller reimplementing "live trust edge" over
+/// `list_attestations_by` is precisely the two-lists class.
+///
+/// # What this deliberately does NOT check
+///
+/// It does not run the full [`trust_root_valid`] predicate. A root whose
+/// charter has lapsed, whose pre-rotation commitment is missing, or whose halt
+/// latch is pulled is **still returned**, and
+/// [`crate::federation::mesh_config`] — the caller this exists for — still
+/// folds its rows.
+///
+/// That is the fail-secure direction for a plane where every value is a
+/// RESTRICTION. Dropping a lapsed root from the mesh-config fold would silently
+/// RELAX whatever that root had tightened, on a schedule nobody chose, and a
+/// restriction that evaporates when its author's paperwork ages is not a
+/// restriction. The un-trust lever is the node's own edge — one row, deletable,
+/// and the only thing that should end a subscription.
+///
+/// A caller making a CAPABILITY decision must keep calling
+/// [`trust_root_valid`]; this is a subscription enumeration, not a validity
+/// verdict, and the two are named differently on purpose.
+pub async fn trusted_roots_of<F>(
+    directory: &F,
+    node_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let by_node = match directory.list_attestations_by(node_key_id).await {
+        Ok(rows) => rows,
+        Err(Error::Unsupported { .. }) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let refs: Vec<&Attestation> = by_node.iter().collect();
+    let dead = tombstoned_ids(&refs);
+    let mut roots: Vec<String> = by_node
+        .iter()
+        .filter(|a| {
+            a.attestation_type == attestation_type::DELEGATES_TO
+                && a.attested_key_id != node_key_id
+                && !dead.contains(&a.attestation_id)
+                && !is_expired(a, now)
+                && counts_in_capability_walk(a)
+                && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
+        })
+        .map(|a| a.attested_key_id.clone())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 /// Is this envelope's [`CHARTER_PRE_ROTATION_FIELD`] present and
 /// well-formed (64 lowercase hex — a sha256)?
 fn charter_commitment_well_formed(envelope: &serde_json::Value) -> bool {
