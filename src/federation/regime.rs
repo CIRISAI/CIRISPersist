@@ -80,13 +80,18 @@
 //! than being declared open.
 //!
 //! **The exception pin does not fit this family and was deliberately not used.**
-//! `UNREGISTERED_GATED_FAMILIES` grandfathers three CEG-0.3 families persist has
-//! *already gated* since v3.0.0 and CC never catalogued — enforcement that
-//! predates R2, named in source rather than implied by silence. `regime:*` is a
-//! family being introduced today, which persist does not gate and has no rule
-//! for. Putting it on that list would convert a named residual into a
-//! general-purpose bypass: the mechanism for "we govern this and CC hasn't
-//! caught up" would become the mechanism for "CC hasn't ruled, so we ruled."
+//! [`UNREGISTERED_GATED_FAMILIES`](super::admission::UNREGISTERED_GATED_FAMILIES)
+//! grandfathers families persist *already gates* that CC has *not* catalogued —
+//! enforcement predating R2, named in source rather than implied by silence.
+//! `regime:` is the exact opposite on both axes: catalogued by CC, gated by
+//! nobody. Putting it there would convert a named residual into a
+//! general-purpose bypass — the mechanism for "we govern this and CC hasn't
+//! caught up" becoming the mechanism for "CC hasn't ruled, so we ruled."
+//!
+//! As of this cut the list is **empty**: it held exactly the three CEG-0.3
+//! families, CC catalogued all three, and the lines were deleted rather than the
+//! gate suppressed. So the pin has now been exercised end to end, which is worth
+//! more than the three lines were.
 //!
 //! # Why not the Private Use range?
 //!

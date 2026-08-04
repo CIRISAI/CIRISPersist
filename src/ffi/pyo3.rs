@@ -2925,15 +2925,20 @@ impl PyEngine {
     /// throttling metric — ordinary per-peer quota refusals are a different,
     /// far more common thing and are not counted here at all.
     ///
-    /// Those refusals arrive as a `RuntimeError` on the WRITE path, and note
-    /// the honest boundary: v24.3.0 (CIRISPersist#575) put the typed
-    /// [`PeerQuotaRefusal`](crate::federation::PeerQuotaRefusal) — *which*
-    /// budget, in *which* regime — on the Rust error, and
-    /// `federation_err_to_py` currently drops it, so a Python caller sees only
-    /// the bare `federation_rate_limited` kind. That is the other half of
-    /// #356's throttling row and it is NOT closed by this binding; carrying
-    /// the reason across the FFI is a write-path change with its own
-    /// compatibility surface and belongs in its own cut.
+    /// Those refusals arrive as a `RuntimeError` on the WRITE path, and as of
+    /// v28.3.0 (CIRISPersist#571) they say which one. v24.3.0 (#575) put the
+    /// typed [`PeerQuotaRefusal`](crate::federation::PeerQuotaRefusal) —
+    /// *which* budget, in *which* regime — on the Rust error and
+    /// `federation_err_to_py` dropped it, so a Python caller saw only the bare
+    /// `federation_rate_limited` kind. That was the other half of #356's
+    /// throttling row; it is now closed. The message reads
+    /// `federation_rate_limited: <token> (retry_after_seconds=<n>)` where
+    /// `<token>` is a `PeerQuotaRefusal` program constant (`peer_sustained`,
+    /// `node_bytes_burst`, …), so a consumer can tell a row-budget refusal from
+    /// a byte-budget one and burst from sustained.
+    ///
+    /// It remains a different signal from this method: those refusals are
+    /// ordinary throttling and are **not** counted in `slot_denials`.
     ///
     /// # Zero is not health until the tripwire has been exercised
     ///
@@ -28252,6 +28257,30 @@ async fn reverse_quorum_by_action_id(
     .map_err(federation_err_to_py)
 }
 
+/// The Python-visible message for a quota refusal (CIRISPersist#571, closing
+/// the half CIRISServer#356 named).
+///
+/// Pure and separate from [`federation_err_to_py`] so the wire contract can be
+/// asserted over every [`PeerQuotaRefusal`](crate::federation::PeerQuotaRefusal)
+/// variant without an embedded interpreter —
+/// [`tests::every_quota_refusal_reason_survives_the_ffi_boundary`]. A boundary
+/// that could only be checked by constructing a `PyErr` would be checked by
+/// nobody, which is how the reason came to be dropped here for two releases.
+///
+/// Shape: `"{kind}: {token} (retry_after_seconds={n})"`. `kind` and `token` are
+/// both program constants; the parentheses and the word order are not, and no
+/// consumer should parse them positionally.
+fn rate_limited_message(
+    kind: &str,
+    reason: crate::federation::PeerQuotaRefusal,
+    retry_after_seconds: u64,
+) -> String {
+    format!(
+        "{kind}: {} (retry_after_seconds={retry_after_seconds})",
+        reason.as_str()
+    )
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -28320,7 +28349,45 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             PyValueError::new_err(kind)
         }
         // Rate-limit → RuntimeError; lens maps to 429.
-        crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
+        //
+        // v28.3.0 (CIRISPersist#571, closing the half CIRISServer#356 named and
+        // deliberately left) — the typed reason RIDES THE MESSAGE. #575 put
+        // `PeerQuotaRefusal` on the Rust error (WHICH budget, in WHICH regime)
+        // and #583 made the set a product including the byte budgets; this
+        // boundary then dropped all of it, so Python saw the bare
+        // `federation_rate_limited` and could not tell a row-budget refusal from
+        // a byte-budget one, or burst from sustained. That is precisely the
+        // disjunction #575 exists to end, surviving one layer out — the same
+        // shape as #545/#554, and #356's agent was right to flag it rather than
+        // fix it as a drive-by.
+        //
+        // `retry_after_seconds` rides too: it is the one number a caller acts on
+        // immediately, and a 429-shaped refusal that hides its own backoff makes
+        // every consumer guess.
+        //
+        // Format is the established one at this boundary
+        // (`AdminActionUnattributed`, `RevocationBoundInvalid`,
+        // `CohortStandingRefused`): `"{kind}: {token}"`, token first so a
+        // consumer can split once on `": "`. Both tokens are program constants —
+        // `PeerQuotaRefusal::as_str` is APPEND-ONLY and identical to the serde
+        // spelling — so a consumer keys on those, never on this sentence.
+        //
+        // COMPATIBILITY: this is a write-path error-MESSAGE change. The
+        // exception TYPE (`RuntimeError`) and the `kind` token
+        // (`federation_rate_limited`) are unchanged, so `except RuntimeError`
+        // and any `str(e).startswith("federation_rate_limited")` /
+        // `"federation_rate_limited" in str(e)` check keeps working. What breaks
+        // is an EQUALITY match on the message — `str(e) == "federation_rate_limited"`
+        // is now false. No consumer in this repo does that; CIRISServer#356's
+        // throttling row is the known consumer and it wants the reason.
+        crate::federation::Error::RateLimited {
+            retry_after_seconds,
+            reason,
+        } => PyRuntimeError::new_err(rate_limited_message(
+            kind,
+            reason,
+            retry_after_seconds,
+        )),
         // v25.1.0 (CIRISPersist#569) — CONSENT BEFORE SCORING is an
         // admission-gate rejection like its siblings above: the caller emitted
         // a trust signal about a subject who authorized no such thing.
@@ -29712,6 +29779,75 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **CIRISPersist#571 — the quota reason survives the FFI boundary.**
+    ///
+    /// v24.3.0 (#575) typed the refusal and v24.4.0 (#583) made the set a
+    /// product with the byte budgets; this boundary then mapped the whole thing
+    /// to `PyRuntimeError::new_err(kind)` and dropped it, so Python saw only
+    /// `federation_rate_limited` and could not tell a row-budget refusal from a
+    /// byte-budget one, or burst from sustained.
+    ///
+    /// Asserted over `PeerQuotaRefusal::ALL` rather than a sample, because the
+    /// token set is the downstream contract and is APPEND-ONLY: a variant added
+    /// later must not be able to reach Python as an unnamed refusal. The
+    /// distinctness assertion is what makes that real — 16 messages that all
+    /// carry *a* token but not a *distinguishing* one would satisfy a
+    /// per-variant `contains` check and still leave the caller guessing.
+    #[test]
+    fn every_quota_refusal_reason_survives_the_ffi_boundary() {
+        use crate::federation::PeerQuotaRefusal;
+        use std::collections::BTreeSet;
+
+        let kind = "federation_rate_limited";
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+
+        for reason in PeerQuotaRefusal::ALL {
+            let msg = rate_limited_message(kind, *reason, 42);
+            assert!(
+                msg.starts_with(kind),
+                "the stable kind token must lead the message so \
+                 `str(e).startswith(\"{kind}\")` keeps working: {msg:?}"
+            );
+            assert!(
+                msg.contains(reason.as_str()),
+                "{:?} must name its own token in the Python-visible message, else the boundary \
+                 has dropped the reason again: {msg:?}",
+                reason
+            );
+            assert!(
+                msg.contains("retry_after_seconds=42"),
+                "the backoff a caller acts on must survive too: {msg:?}"
+            );
+            assert!(
+                seen.insert(msg.clone()),
+                "two refusal reasons produce the SAME Python message ({msg:?}) — the caller cannot \
+                 tell them apart, which is the whole defect this closes"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            PeerQuotaRefusal::ALL.len(),
+            "every variant must produce a distinct message"
+        );
+
+        // The two axes #575/#583 exist to separate, spelled out so a re-spelling
+        // of the tokens fails HERE with the reason rather than in a consumer.
+        let rows = rate_limited_message(kind, PeerQuotaRefusal::PeerBurst, 1);
+        let bytes = rate_limited_message(kind, PeerQuotaRefusal::PeerBytesBurst, 1);
+        let sustained = rate_limited_message(kind, PeerQuotaRefusal::PeerSustained, 1);
+        assert_ne!(
+            rows, bytes,
+            "a row flood must be distinguishable from a storage flood"
+        );
+        assert_ne!(
+            rows, sustained,
+            "burst must be distinguishable from sustained"
+        );
+        // The v24.3.0 spelling is load-bearing and unversioned on purpose.
+        assert!(rows.contains("peer_burst") && !rows.contains("peer_rows_burst"));
+        assert!(bytes.contains("peer_bytes_burst"));
+    }
 
     /// v1.6.8 (CIRISPersist#76) — the config fingerprint must change
     /// when ANY of DSN / signing-key-id / local key ids change, and
