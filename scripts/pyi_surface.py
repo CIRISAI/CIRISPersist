@@ -138,6 +138,24 @@ CLASSES = {
 }
 BINDING = {c for c, (b, _) in CLASSES.items() if b}
 
+# v29.0.0 (CIRISOntology#3/#1, ratified; CIRISPersist#600) — the frames a
+# `testimonial` assignment may declare. Each answers WHOSE record, REPAIRABLE
+# BY WHOM, FROM WHAT; the full definitions live in ffi_taxonomy.tsv's header,
+# where the reader making an assignment will actually be looking.
+#
+# This set is CLOSED on purpose. Free-text frames would let an assignment
+# declare a frame that says nothing, which is an undeclared frame wearing a
+# name — and `repairable_does_not_factor` is a proof that the frame is the
+# whole content of the claim, not decoration on it.
+FRAMES = {
+    "self_audit",
+    "log_commitment",
+    "delivery_event",
+    "equivocation_evidence",
+    "erasure_effect",
+    "upstream_attestation",
+}
+
 # ── Rust → Python type mapping ──────────────────────────────────────────────
 # PyO3 generates the extraction/conversion from exactly these Rust types, so the
 # mapping is derivation, not guesswork. Anything unmapped falls back to `Any`,
@@ -482,14 +500,63 @@ def pinned() -> dict[tuple[str, str], str]:
             continue
         parts = line.split("\t")
         if len(parts) < 3:
-            raise SystemExit(f"{TAXONOMY.name}:{i}: expected 'owner<TAB>symbol<TAB>class'")
+            raise SystemExit(
+                f"{TAXONOMY.name}:{i}: expected 'owner<TAB>symbol<TAB>class<TAB>frame'"
+            )
         owner, sym, cls = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        frame = parts[3].strip() if len(parts) > 3 else ""
         if cls not in CLASSES:
             raise SystemExit(
                 f"{TAXONOMY.name}:{i}: '{cls}' is not one of the CIRISConstitution#83 "
                 f"classes: {', '.join(sorted(CLASSES))}"
             )
+        # v29.0.0 (CIRISOntology#3/#1, ratified; #600) — `testimonial` is a
+        # RELATION. `repairable_does_not_factor` proves no artifact-only
+        # procedure can assign it, so an undeclared frame is UNWARRANTED AS
+        # STATED rather than merely undocumented. Verify's own
+        # `Arity::testimonial` refuses an undeclared frame instead of
+        # defaulting one; this is the same refusal at persist's pin, because a
+        # defaulted frame is exactly the unstated assumption that silently
+        # decides the verdict.
+        if cls == "testimonial" and not frame:
+            raise SystemExit(
+                f"{TAXONOMY.name}:{i}: {owner}.{sym} is `testimonial` with NO FRAME. "
+                f"State whose record it is, repairable by whom, from what — one of: "
+                f"{', '.join(sorted(FRAMES))}. If it cannot state one, it is misfiled "
+                f"by construction and belongs in another class."
+            )
+        if cls != "testimonial" and frame:
+            raise SystemExit(
+                f"{TAXONOMY.name}:{i}: {owner}.{sym} is `{cls}` and carries frame "
+                f"'{frame}'. A frame relativises REPAIRABILITY, which only "
+                f"`testimonial` turns on; carrying one elsewhere implies a "
+                f"discriminator that class does not use."
+            )
+        if frame and frame not in FRAMES:
+            raise SystemExit(
+                f"{TAXONOMY.name}:{i}: {owner}.{sym} declares frame '{frame}', which is "
+                f"not defined in this file's header. Define it there — WHOSE record, "
+                f"REPAIRABLE BY WHOM, FROM WHAT — or use one of: "
+                f"{', '.join(sorted(FRAMES))}. A frame nobody defined is an undeclared "
+                f"frame wearing a name."
+            )
         out[(owner, sym)] = cls
+    return out
+
+
+def pinned_frames() -> dict[tuple[str, str], str]:
+    """The frame per symbol, empty for every non-`testimonial` row."""
+    out: dict[tuple[str, str], str] = {}
+    for raw in TAXONOMY.read_text().split("\n"):
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        out[(parts[0].strip(), parts[1].strip())] = (
+            parts[3].strip() if len(parts) > 3 else ""
+        )
     return out
 
 
@@ -788,10 +855,17 @@ def check() -> int:
     tally = "  ".join(f"{c}={counts[c]}" for c in ORDER if counts[c])
     # ── The evidence-layer projection must not drift from its source. ──────
     # `evidence/ffi_classification.tsv` exists because CIRISConstitution asked
-    # for it: 53 testimonial rows living only in a gated TSV is itself a
+    # for it: testimonial rows living only in a gated TSV is itself a
     # testimonial-class state, and the class should not exemplify its own
     # wrong. But a projection nothing checks is just a second hand-maintained
     # list — the defect this whole module exists to close. So it is checked.
+    #
+    # This comment said "53 testimonial rows" from #595 until v29.0.0. There
+    # were never 53 — the file held 49, and 53 was carried verbatim into
+    # CIRISPersist#597 and #600 as though counted. Exactly the class the
+    # v28.3.0 doc-version gate was built for, in the module that gates counts
+    # for a living. It is 37 now, and it is not written here, because the count
+    # is derived two lines below and a second copy would rot the same way.
     proj = ROOT / "evidence" / "ffi_classification.tsv"
     if not proj.exists():
         print(
@@ -801,14 +875,23 @@ def check() -> int:
         )
         print("::error title=ffi classification::evidence projection absent")
         return 1
-    want = {(s_.owner, s_.name, pin[s_.key]) for s_ in syms if s_.key in pin}
+    # v29.0.0 (#600) — the FRAME is compared too. Without it the projection
+    # could carry a stale or absent frame while its class column matched, and
+    # the evidence layer CC actually reads would state an unwarranted
+    # testimonial assignment while this gate called it clean.
+    frames_pin = pinned_frames()
+    want = {
+        (s_.owner, s_.name, pin[s_.key], frames_pin.get(s_.key, ""))
+        for s_ in syms
+        if s_.key in pin
+    }
     have = set()
     for line in proj.read_text().splitlines():
         if line.startswith("#") or not line.strip() or line.startswith("class\t"):
             continue
         f = line.split("\t")
         if len(f) >= 5:
-            have.add((f[3], f[4], f[0]))
+            have.add((f[3], f[4], f[0], f[5].strip() if len(f) > 5 else ""))
     if want != have:
         missing, extra = sorted(want - have)[:5], sorted(have - want)[:5]
         print(
@@ -903,7 +986,8 @@ def surface() -> int:
     # that already exists, not `ORDER`. Regenerating an unchanged tree must
     # produce a zero-line diff, or the first person to run this gets a 500-line
     # reorder they cannot review and will be tempted to skip reading.
-    rows = sorted((pin[s.key], s.owner, s.name) for s in syms)
+    frames = pinned_frames()
+    rows = sorted((pin[s.key], s.owner, s.name, frames.get(s.key, "")) for s in syms)
     counts = collections.Counter(r[0] for r in rows)
     proj = ROOT / "evidence" / "ffi_classification.tsv"
     old = proj.read_text().splitlines()
@@ -916,10 +1000,13 @@ def surface() -> int:
         for ln in header
     ]
     out = list(header)
-    out.append("class\tbinding\tclass_count\towner\tsymbol")
-    for cls, owner, name in rows:
+    # `frame` is APPENDED, not inserted: the drift check reads owner/symbol at
+    # fixed indices 3/4, and shifting them would make a column-order change
+    # look like a clean pass on rows it was no longer comparing.
+    out.append("class\tbinding\tclass_count\towner\tsymbol\tframe")
+    for cls, owner, name, frame in rows:
         binding = "binding" if CLASSES[cls][0] else "descriptive"
-        out.append(f"{cls}\t{binding}\t{counts[cls]}\t{owner}\t{name}")
+        out.append(f"{cls}\t{binding}\t{counts[cls]}\t{owner}\t{name}\t{frame}")
     proj.write_text("\n".join(out) + "\n")
     print(f"OK wrote {len(rows)} rows to {proj.relative_to(ROOT)}")
     print(f"   {tally}")

@@ -603,7 +603,7 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
 /// answer (the FFI directory capsule reports [`Error::Unsupported`] for
 /// `lookup_family`) reads as "no family" — the pre-v24 key-only behaviour —
 /// rather than guessing, exactly as the halt leg already does.
-/// `pub(crate)` since v25.2.0 — [`crate::federation::mesh_config`] asks the
+/// `pub(crate)` since v28.3.0 — [`crate::federation::mesh_config`] asks the
 /// same question (KEY root or FAMILY root?) to decide what "the root's own
 /// quorum" means for a durable config row, and asking it a second way is how
 /// two call sites come to disagree about which arm a root is on.
@@ -666,7 +666,7 @@ pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_siz
 /// already uses (`verify_quorum_policy` counts valid founder signatures and
 /// ignores the rest), and it means a stray co-signature degrades the evidence
 /// rather than destroying the row.
-/// `pub(crate)` since v25.2.0 — [`crate::federation::mesh_config`] uses this
+/// `pub(crate)` since v28.3.0 — [`crate::federation::mesh_config`] uses this
 /// EXACT accounting for "the root's own quorum ratifying" (CC 4.2.1 rule 3) on
 /// a durable config row. One implementation of m-of-n-over-a-row, two callers;
 /// a second one written for the config plane would be free to count differently

@@ -5,6 +5,91 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [29.0.0] — 2026-08-04 — verify 13.0.0's arity ruling: a frame is not decoration, and durability belongs to quorum
+
+- **BREAKING — `ClassificationStanding` gains a fourth variant, `Structural { breaks }`.** CIRISVerify
+  13.0.0 splits `Gating::Normative { authority }` (held under a ruling) from `Gating::Structural
+  { breaks }` (cannot vary; the machine breaks), because *"binding" was two words wearing one*. The
+  match over verify's type is exhaustive, so the new disposition arrived here as a **compile error
+  rather than a silent reclassification** — which is why that match has no wildcard.
+
+  Persist mirrors the split rather than flattening it. Both available arms encode something false:
+  `Binding { authority }` would name an authority that does not exist, inviting someone to petition
+  CC to amend a wire format; `NoStanding` would discard a constraint *more* inescapable than a
+  ruling, not less. **`Structural` binds without appearing in `PERSIST_RATIFYING_AUTHORITIES`**, and
+  that is not a hole in that list — the list asks "is persist answerable to this document?", and a
+  structural constraint cites no document.
+
+  The concrete case: **`Purpose` moved from `ForeignAuthority` to `Structural`, and persist's old
+  reasoning was wrong in a way worth keeping visible.** Persist read "cites an IETF draft" as *a
+  ruling by a body persist is not answerable to*. It was never a ruling — `Purpose`'s values are
+  pinned CDDL wire indices, so deviating breaks CBOR dispatch against every other CoTS
+  implementation, and no body can waive that. Persist could not tell *this would break* from *this
+  is disallowed*, so it filed a mechanical constraint under a document — and had it ever wanted to
+  deviate, the old standing pointed at the wrong remedy.
+
+- **BREAKING — verify re-pinned 12.5.0 → 13.0.0** across all seven Cargo pins, and the wheel's
+  `Requires-Dist` moved to `ciris-verify>=13.0.0,<14` in the same commit. The gate that exists for
+  exactly this (`verify_pin_major_matches_the_wheel_requires_dist`) caught the half-move.
+
+- **#600 — `ffi_taxonomy.tsv` gains a `frame` column, and `testimonial` stops being a property.**
+  CIRISOntology proved in Lean that **repairability does not factor**: `repairability_not_intrinsic`
+  exhibits one fact, two frames, opposite verdicts, so `repairable_does_not_factor` concludes no
+  artifact-only procedure can assign the class **by any procedure whatsoever**. `testimonial`
+  survives as a **relation**, and an assignment with no declared frame is *unwarranted as stated* —
+  not merely undocumented. Verify's `Arity::testimonial` refuses an undeclared frame rather than
+  defaulting one, because a defaulted frame is the unstated assumption that silently decides the
+  verdict; persist's pin now refuses it at the same place.
+
+  Six frames, each stating **whose record, repairable by whom, from what** — `self_audit`,
+  `log_commitment`, `delivery_event`, `equivocation_evidence`, `erasure_effect`,
+  `upstream_attestation`. The vocabulary is **closed**: a free-text frame would let an assignment
+  declare a frame that says nothing, which is an undeclared frame wearing a name.
+
+  **The re-audit moved 12 of 49 rows out of `testimonial`.** Eleven `list_signed_*_since` readers
+  plus `verify_trace` → `epistemic`. Each serves signed rows that exist on other nodes, so a
+  consumer getting a wrong or short answer re-queries and the signatures make the re-fetch
+  byte-exact — a wrong that **misreports a world still available to re-read**. They had earned the
+  class on a *source-attribution* reading ("it carries who signed it"), the exact reading #597 named
+  as misfiling; claiming testimonial for them needs the frame *"this node is the sole surviving
+  holder"*, which persist does not operate in. `verify_trace` moved for a simpler reason: it stores
+  nothing, so it produces no record and cannot be the only one.
+
+  Gate mutation-tested four ways — frame stripped from a testimonial row, frame added to a
+  non-testimonial row, an undefined frame declared, and the **projection's frame drifted while its
+  class still matched**. All four red with the intended message.
+
+- **The "53 testimonial rows" everyone was working from never existed.** #597 and #600 both say 53;
+  `pyi_surface.py`'s own comment said 53 since #595. The file held **49**, and both artifacts' counts
+  agreed on 49 the whole time. The number was carried between issues as though counted. Same class
+  as the phantom versions v28.3.0 gated — this time inside the module that gates counts for a
+  living. It is 37 now, and the count is no longer written in that comment at all, because a second
+  copy rots the same way.
+
+- **#570 ask 1, corrected — durability belongs to QUORUM, not to having-been-exercised.** v28.3.0
+  shipped the strict reading of CC 4.2.1 rule 3: a durable `mesh_config` row had to ratify a held
+  emergency, so a setting became durable only by having been **exercised**, never by being asserted.
+  It was flagged in code rather than presented as settled, and it was wrong.
+
+  Rule (4) is the interpretive key: *"relief expires **because it is unilateral**"*. CC states why
+  the TTL exists and the reason is not urgency — it is unilateralism. The bound attaches to
+  `threshold-1`, not to emergency-ness, so **what earns durability is quorum**. Under the strict
+  reading a full quorum act was barred from durability unless it happened to ratify some prior
+  *unilateral* one, making quorum weaker than rule (4)'s own logic and handing one holder agenda
+  control over every durable setting the mesh can hold.
+
+  Two consequences settled it. A durable restriction that was never an emergency was **unreachable
+  forever** — a fresh mesh could hold no durable `mesh_config` until someone fired a 72 h emergency
+  to bootstrap one, the circular-at-genesis class this repo has been bitten by before. And it
+  **inverted the property it protected**: forcing every durable change through the emergency channel
+  is the most direct route to *the emergency path becomes the government*.
+
+  This commit existed when v28.3.0 was tagged and did not ship in it — the agent that wrote it was
+  stopped before running a single leg, so it arrived uncertified and is certified here.
+  **CIRISConstitution#86 was filed stating persist ships the strict reading; that is now false, and
+  the issue is corrected in this cut.** An open ask that misdescribes the asker's own behaviour is
+  worse than no ask.
+
 ## [28.3.0] — 2026-08-04 — #571/#570: the row that could not carry its own rule, and a mandatory marking persist was refusing
 
 - **#571 — the `regime:` row landed, and reading it found persist refusing a marking CC makes

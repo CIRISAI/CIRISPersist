@@ -72,7 +72,7 @@ classifiers = [
 # milestone that CIRISPersist#422's infra:attest adopt-gate pairs with). Floor
 # moves to v9.0.0 (`<10`) in lockstep with the six Rust pins.
 dependencies = [
-    "ciris-verify>=12.0.0,<13",
+    "ciris-verify>=13.0.0,<14",
 ]
 dynamic = ["version"]
 

@@ -2486,6 +2486,37 @@ pub enum ClassificationStanding {
         /// The document verify cites, which persist's floor does not.
         authority: &'static str,
     },
+    /// v29.0.0 (CIRISVerify 13.0.0, CIRISOntology#3) — verify declares it
+    /// [`Gating::Structural`]: it **cannot vary**, and no authority ratifies
+    /// it because none *can* waive it. Deviating breaks parsing or dispatch.
+    ///
+    /// **Binding on persist without appearing in
+    /// [`PERSIST_RATIFYING_AUTHORITIES`]**, and that is not an exception to
+    /// that list — it is outside its subject. The list answers "is persist
+    /// answerable to this document?", and a structural constraint cites no
+    /// document. Persist honours it for the same reason verify does: the
+    /// machine breaks otherwise, and no ruling can make it not break.
+    ///
+    /// **Why this is a fourth variant rather than a reuse.** Both available
+    /// arms encode something false. [`Binding`](Self::Binding) would have to
+    /// name an authority that does not exist, inviting someone to petition CC
+    /// to amend a wire format. [`NoStanding`](Self::NoStanding) would discard
+    /// a constraint that is *more* inescapable than a ruling, not less. The
+    /// verify split exists precisely because a consumer that cannot tell
+    /// *this would break* from *this is disallowed* petitions the wrong body —
+    /// so flattening it here would reproduce, one layer down, the confusion
+    /// the split was made to end.
+    ///
+    /// The doc above still says three answers were considered where two were
+    /// honest ([#569](https://github.com/CIRISAI/CIRISPersist/issues/569)).
+    /// This is the same lesson one turn further: the count was never the
+    /// point, the *type answering instead of the reader* was.
+    Structural {
+        /// What breaks if it varies — verify's own words, carried rather than
+        /// paraphrased, so a persist-side reader can act on it without
+        /// re-deriving it from a variant name.
+        breaks: &'static str,
+    },
     /// [`Gating::may_gate`] is false — a measurement or an unratified
     /// proposal. Verify's own type says a consumer MUST NOT gate on it.
     /// Persist may compose policy *over* it; persist may never take it AS
@@ -2513,9 +2544,18 @@ pub fn classification_standing(gating: Gating) -> ClassificationStanding {
             ClassificationStanding::Binding { authority }
         }
         Gating::Normative { authority } => ClassificationStanding::ForeignAuthority { authority },
-        // Unreachable while `may_gate()` is true only for `Normative`. Kept so
-        // that if verify ever widens `may_gate()`, the new status arrives here
-        // as NoStanding rather than as an unhandled ruling.
+        // v29.0.0 (CIRISVerify 13.0.0) — the second gate-able disposition. No
+        // authority check, because there is no authority: `amendable_by()`
+        // returns None and the constraint is mechanical. The comment below
+        // used to say `may_gate()` is true only for `Normative`; verify
+        // widened it exactly as that comment anticipated, and the arm arrived
+        // here as a COMPILE ERROR rather than as a silent reclassification —
+        // which is the whole reason this match is exhaustive over verify's
+        // type instead of ending in a wildcard.
+        Gating::Structural { breaks } => ClassificationStanding::Structural { breaks },
+        // Unreachable while `may_gate()` is true only for `Normative` and
+        // `Structural`. Kept so that if verify widens it again, the new status
+        // arrives here as NoStanding rather than as an unhandled ruling.
         Gating::Measurement | Gating::Proposal { .. } => ClassificationStanding::NoStanding,
     }
 }
@@ -9883,6 +9923,24 @@ mod tests {
             "normative elsewhere is not normative here: persist's floor must be answerable \
              to a document before a classification citing it can bind a persist gate"
         );
+        // v29.0.0 — the second gate-able disposition. It binds WITHOUT
+        // appearing in PERSIST_RATIFYING_AUTHORITIES, and that is not a hole
+        // in that list: the list asks "is persist answerable to this
+        // document?", and a structural constraint cites no document. The
+        // string below is deliberately not a real authority — if the
+        // implementation ever routed Structural through the authority check,
+        // this would come back ForeignAuthority and fail.
+        assert_eq!(
+            classification_standing(Gating::Structural {
+                breaks: "CBOR dispatch against every other implementation"
+            }),
+            ClassificationStanding::Structural {
+                breaks: "CBOR dispatch against every other implementation"
+            },
+            "a structural constraint binds because the MACHINE breaks, not because a body \
+             ruled — so it must not be filtered by the ratifying-authority list, and \
+             disagreement with it is a bug report rather than an amendment"
+        );
 
         // Against the classifications verify actually ships, so this cannot
         // drift into testing only hand-built `Gating` values.
@@ -9898,15 +9956,33 @@ mod tests {
             ClassificationStanding::NoStanding,
             "production-vs-development is reported, never enforced"
         );
+        // v29.0.0 (CIRISVerify 13.0.0, CIRISOntology#3) — this assertion used
+        // to read `ForeignAuthority { "draft-ietf-rats-concise-ta-stores-02" }`
+        // and the reasoning under it was subtly wrong in a way worth keeping
+        // visible. Persist read "cites an IETF draft" as "normative on an
+        // authority persist does not read", i.e. as a RULING held by a body
+        // persist is not answerable to. Verify's arity ruling says it was
+        // never a ruling: `Purpose`'s values are pinned CDDL wire indices, so
+        // deviating breaks CBOR dispatch against every other CoTS
+        // implementation — and no body, including the IETF, can waive that.
+        //
+        // The distinction is exactly the one CIRISOntology#3 forced: persist
+        // could not tell *this would break* from *this is disallowed*, so it
+        // filed a mechanical constraint under a document. Had persist ever
+        // wanted to deviate, the old standing pointed it at the wrong
+        // remedy — petition (or adopt) the draft — when the real answer is
+        // that deviating is a bug and interop breaks.
         assert_eq!(
             standing_of::<Purpose>(),
-            ClassificationStanding::ForeignAuthority {
-                authority: "draft-ietf-rats-concise-ta-stores-02"
+            ClassificationStanding::Structural {
+                breaks: "CBOR wire interop with other draft-ietf-rats-concise-ta-stores \
+                         implementations"
             },
-            "the CoTS purpose vocabulary is normative on an IETF draft — correct for a \
-             trust-anchor store, and NOT a rule about what this substrate admits. If persist \
-             ever adopts constrained anchor resolution it adds that draft to \
-             PERSIST_RATIFYING_AUTHORITIES deliberately, in the change that adopts it."
+            "the CoTS purpose vocabulary CANNOT VARY — its values are wire indices, not a \
+             rule some body ratified and could re-ratify. Structural standing is NOT persist \
+             adopting constrained anchor resolution: it describes what the classification IS, \
+             not whether persist consumes that vocabulary. Persist still does not, and the \
+             day it does is still a deliberate change."
         );
 
         // And the rule is exactly `may_gate()` plus the authority question —
