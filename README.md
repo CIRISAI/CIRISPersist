@@ -128,6 +128,39 @@ engine.register_consumer("my-adapter", ["cirisgraph"])
 summary = engine.receive_and_persist(request_body_bytes)
 ```
 
+## Running the tests
+
+The Postgres suite must have a database to itself. Several tests assert on
+**global** row counts, and `av26_concurrent_boot_advisory_lock` does
+`DROP SCHEMA cirislens CASCADE`, so a second suite sharing the database reds
+tests that have nothing to do with either change. Measured, two concurrent
+copies of the same suite over six iterations: one shared database → 6/6
+iterations red; separate fresh databases → 0/6.
+
+It is *not* the migration advisory lock, which is a common guess. PostgreSQL
+builds the advisory lock tag from `MyDatabaseId` plus the key, so advisory
+locks are per-database — two suites on two databases cannot contend on one no
+matter what key they use.
+
+```bash
+# fresh single-use database, dropped afterwards, exit code propagated exactly
+scripts/pg_test_db.sh -- cargo nextest run --features postgres,sqlite
+
+scripts/pg_test_db.sh --check     # who is on which database right now
+```
+
+Parallel worktrees each grow a ~20G `target/`. To reclaim the finished ones:
+
+```bash
+scripts/reap_worktree_targets.sh            # dry run — prints verdict + reason
+scripts/reap_worktree_targets.sh --apply
+```
+
+It removes `target/`, and only `target/`, and only from a linked worktree that
+is unlocked, merged into `origin/main`, clean (untracked counts as dirty), has
+no process living in it, and whose `target/` has been cold for an hour. Any one
+of those failing skips it.
+
 ## Docs
 
 | Doc | What |
