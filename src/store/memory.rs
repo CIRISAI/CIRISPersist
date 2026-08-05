@@ -15716,6 +15716,7 @@ mod tests {
     /// backend where an untested divergence hides (v21.11–17.1, seven times).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn load_bearing_predicate_parity_memory_564() {
         let backend = MemoryBackend::new();
         crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
@@ -15747,6 +15748,7 @@ mod tests {
     /// hides, seven times over v21.11–17.1.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn reverse_quorum_parity_memory_574() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
@@ -15763,6 +15765,7 @@ mod tests {
     /// which is exactly why it runs the SAME body as the other two.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn escalation_on_silence_parity_memory_591() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
@@ -15779,6 +15782,7 @@ mod tests {
     /// — it is the only one holding a lock across the read the filter re-enters.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn admin_ops_parity_memory_570() {
         let backend = MemoryBackend::new();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
@@ -15793,6 +15797,7 @@ mod tests {
     /// and be silently absent on this one.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn namespace_family_unregistered_parity_memory_590() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, "memory-r2")
@@ -15806,6 +15811,7 @@ mod tests {
     /// stewardship after the others stop.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn steward_binding_liveness_parity_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
@@ -15819,6 +15825,7 @@ mod tests {
     /// the `moderate`/`takedown`/`review` plane).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn moderation_walk_liveness_parity_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
@@ -15832,6 +15839,7 @@ mod tests {
     /// the proof that the predicate walk still stops at the first hit.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn moderation_walk_read_cost_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_read_cost(
@@ -15845,6 +15853,7 @@ mod tests {
     /// node-rostered commons whose members' bindings are subject-revoked.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn objection_plane_blast_radius_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
@@ -15860,6 +15869,7 @@ mod tests {
     /// lesson).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn revocation_bound_parity_memory_570() {
         let backend = MemoryBackend::new();
         crate::federation::register::bound_test_support::exercise_revocation_bound(

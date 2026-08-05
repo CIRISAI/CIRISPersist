@@ -5,6 +5,94 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.0.1] — 2026-08-05 — the contradiction between a mode table and its doors, made build-visible
+
+No public API change. One enforced invariant, and the tool that generates dye tests.
+
+- **#607 — a claim whose conferral mode defers enforcement to USE may no longer back a membership
+  test.** `ConferralMode` is a promise about *where* a claim is enforced.
+  `DerivedFromVerifiedState` says the authority is *"re-derived from persist's own verified state at
+  each use, so a self-asserted claim buys nothing"*; `DelegatedFromTrustRoot` says it is *"resolved
+  at USE by `capability_roots_to_trusted_root`"*. A `required_identity_types` check **re-derives
+  nothing** — it reads the `identity_type` string off the stored registration row. So a deferred-mode
+  claim backing such a rule is a flat contradiction: the mode says the claim buys nothing, and the
+  door hands it everything.
+
+  Both tables were **already in the tree**; nothing compared them, so the contradiction survived
+  #543, which introduced one of them. That is the class this cycle keeps finding — **a declaration
+  naming where it is enforced, with nothing checking the where exists** — the same shape as
+  CIRISConstitution#81 (a rule in prose no enforcer reaches) and #602 (`consumer: "repair_planner"`,
+  a component nothing resolves).
+
+  The gate enumerates **11 (claim, rule) pairs across 3 claims**: `substrate_persist` × 5,
+  `witness` × 3 (`age_assurance:`, `capacity_assurance:`, `transparency_log:cosigned:` — the rungs
+  CC 3.4.11 reserves *precisely because a subject must not reach them*), `lenscore_detector` × 3.
+
+  **Two corrections to the report it came from.** `trusted_publisher` is **not** exploitable — its
+  only door, `content_rating:`, was removed in v28.3.0 when CC 3.3.12 turned out to declare those
+  families open vocabulary. And `hard_case:` **is** real but is gated by a different route, so this
+  gate is blind to it — recorded as declared depth rather than discovered later.
+
+  **Ratcheted, and the ratchet is explicitly not the fix.** The 11 are listed by name with the issue
+  cited; a twelfth fails the build. Mutation-verified in *both* directions: a new deferred-mode rule
+  fails, **and** a grandfathered pair that gets fixed but left in the list also fails — a stale
+  grandfather is how a closed hole gets silently reopened. The fix itself is a policy call per claim
+  (gate at registration vs resolve at use) and was deliberately left to the issue, because `witness`
+  turns out to be **mis-declared** rather than merely unenforced: there is no verified state to
+  derive *"is a witness"* from, unlike `steward` / `partner` / `wise_authority`, which have real
+  graph edges.
+
+- **42 postgres tests were not taking the postgres serial lock, and it explains a session's worth of
+  "flakes."** 289 tests carry `#[serial_test::serial(postgres)]`; 42 did not. `serial_test`'s group
+  lock only excludes other **serial** members, so a single unmarked test mutating shared database
+  state can perturb any serialized peer — including
+  `repair_sweep_fixes_stranded_self_row_postgres_530`, whose own doc says *"so co-resident fixtures
+  cannot perturb it."*
+
+  Found by running the full suite **twice**. Two legs that were green in run 1 went red in run 2 with
+  no source change between them, both failing on **seeding** rather than on logic. That is the
+  signature, and it retroactively explains at least three failures accepted as flakes this cycle —
+  `add_then_remove_moderator_round_trip_postgres`, `v053_pg_access_columns_present`,
+  `av26_concurrent_boot_advisory_lock` — every one reported as *"passed in isolation"*, which is what
+  a lost race looks like from the inside.
+
+  All 42 serialized, with `every_postgres_test_takes_the_serial_lock` and its dye test so it cannot
+  regress. **The gate's first predicate produced a false positive** — it matched the substring
+  `"test"`, so a helper carrying `#[cfg(all(test, feature = "postgres"))]` was flagged as an
+  unserialized test. Caught by the dye test's *second* assertion, the one checking the gate does NOT
+  fire on clean code; a gate that fails on correct input is a gate that gets deleted.
+
+- **Certification was measuring a subset of CI while reading as complete.** The local script
+  hardcoded four legs. CI runs **seven matrix legs plus the empty-default rider** — so
+  `cirisaudit`, `secrets`, `cirisnode`, `cirisgraph`, `telemetry`, `rest` and `default` had never
+  been certified locally, and every "ALL LEGS GREEN" in v28.3.0 / v29.0.0 / v30.0.0 was true only of
+  the four it ran. The script now DERIVES its legs from `ci_feature_matrix.py`, the same source CI's
+  own `lint` job asks, and refuses an empty feature set rather than running a leg that tests
+  nothing. Same spell-don't-derive defect this repo has fixed in four other places, sitting in the
+  tooling that was supposed to catch it.
+
+- **Gates now carry a `GateSpec` block** (CIRISOntology/GATES.md, CIRISConstitution#84): family,
+  headwaters, references, **dye test**, **depth**, owner. The new gate ships with its own dye test —
+  it plants the contradiction and confirms the detector fires — because *"a gate that has never been
+  shown to catch anything is a hypothesis about a gate"*, and a refactor that silently emptied its
+  loop would look identical to a clean pass.
+
+- **`cargo-mutants` wired in** (`.cargo/mutants.toml`). Roughly fifteen dye tests this cycle were run
+  **by hand** — comment out the clamp, run, revert — each of which found or confirmed something.
+  This is that, exhaustively, without a human forgetting to revert.
+
+  **Scoped to `--in-diff`, not the whole tree, and the numbers are why**: 168 mutants for a *single*
+  file swept whole, versus **43 for the entire v30.0.0 cut** in-diff. A full sweep is how mutation
+  testing gets adopted and then quietly turned off. It complements hand-aimed dye tests rather than
+  replacing them — a hand dye test proves a *specific* gate catches a *specific* planted violation,
+  which is what GateSpec asks for; this proves the weaker, broader thing.
+
+- **CC#84's R2(b) row paid**, with a correction: the dye test already existed
+  (`exercise_r2b_refusal` plants a violation and asserts the **typed** error, explicitly *"not some
+  other gate's"*, plus verify-before-mutation, on all three backends). What was actually owed was
+  **depth**, now stated: *R2(b) proves a family is registered and is structurally blind to who may
+  emit on it* — all 12 CC 3.1.9.2 families pass it and fall through to `ProducerSteward`.
+
 ## [30.0.0] — 2026-08-05 — the knob that named a quantity it did not carry, and the attribution that read as verified
 
 - **BREAKING — #602: `redundancy.*` split into two typed axes.** persist shipped two keys naming

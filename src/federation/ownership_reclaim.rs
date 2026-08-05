@@ -1393,6 +1393,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn ownership_reclaim_ceremony_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!(

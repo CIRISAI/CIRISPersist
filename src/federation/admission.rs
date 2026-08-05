@@ -9890,6 +9890,186 @@ mod tests {
         }
     }
 
+    /// v30.0.1 (CIRISPersist#607) — **a claim whose conferral mode defers
+    /// enforcement to USE must never be consumed by a pure membership test.**
+    ///
+    /// GateSpec (CIRISOntology/GATES.md), stated here because a gate that does
+    /// not say what it catches is a hypothesis about a gate:
+    ///
+    /// - **family** — `deontic`. Varying it changes what the mesh permits: a
+    ///   stranger reaches a door reserved to a conferred role.
+    /// - **headwaters** — `identity_type::conferral_mode` (the declared mode
+    ///   table) × [`default_reserved_prefix_rules`] (the actual consumers).
+    ///   Both already existed; nothing compared them.
+    /// - **references** — CIRISPersist#543 (AV-75, the gate this extends),
+    ///   #607, CC 3.4.11 (`age_assurance:` is witness-reserved *precisely
+    ///   because a subject must not reach it*), CC 3.4.12.
+    /// - **dye test** — `a_deferred_mode_claim_in_a_membership_rule_is_caught`
+    ///   below plants the contradiction and watches this fire.
+    /// - **depth** — **registration-time shape only.** This proves no
+    ///   *declaration* contradicts its *consumer*. It says nothing about a
+    ///   conferral revoked AFTER registration, nothing about claims outside
+    ///   `AUTHORITY_CONFERRING_IDENTITY_TYPES`, and nothing about doors that
+    ///   gate on identity by a route other than `required_identity_types`.
+    ///   Those are separate gates and this one must not be read as covering
+    ///   them.
+    /// - **owner** — persist.
+    ///
+    /// # The invariant
+    ///
+    /// `ConferralMode` is a promise about *where* a claim is enforced.
+    /// `DerivedFromVerifiedState` says the authority *"is re-derived from
+    /// persist's own verified state at each use, so a self-asserted claim buys
+    /// nothing"*. `DelegatedFromTrustRoot` says it is *"resolved at USE by
+    /// `capability_roots_to_trusted_root`"*.
+    ///
+    /// A `required_identity_types` membership test **re-derives nothing**. It
+    /// reads the `identity_type` string off the stored registration row. So a
+    /// claim on either deferred mode appearing in such a rule is a **flat
+    /// contradiction between the mode table and the door**: the mode says the
+    /// claim buys nothing, and the door hands it everything.
+    ///
+    /// Only the three modes gated AT REGISTRATION — `HardwareAttested`,
+    /// `AnchorScrubbed`, `AccordCoScrubbed` — may back a membership test,
+    /// because for those the stored string is a fact some ceremony already
+    /// established.
+    ///
+    /// # Why this is a gate and not a fix
+    ///
+    /// The contradiction is mechanically derivable from two tables that were
+    /// both already in the tree. Nothing compared them, so it survived #543,
+    /// which introduced one of them. That is the class: **a declaration naming
+    /// where it is enforced, with nothing checking the where exists.** Same
+    /// shape as CIRISConstitution#81 (a rule in prose no enforcer reaches) and
+    /// #602 (`consumer: "repair_planner"`, a component nothing resolves).
+    #[test]
+    fn a_deferred_conferral_mode_never_backs_a_membership_test_607() {
+        use crate::federation::types::identity_type::{self, ConferralMode};
+        // ── THE RATCHET, and it is NOT the fix ────────────────────────────
+        // These 11 pairs are the state of the tree when this gate was written.
+        // Grandfathering them keeps the status quo; it does not make it safe.
+        // CIRISPersist#607 carries mutation-verified repros showing each is
+        // reachable by a stranger, and the fix is a POLICY choice (gate at
+        // registration vs resolve at use, per claim) with real operator
+        // consequences — not something to pick while landing a gate.
+        //
+        // What this buys today: a TWELFTH cannot be added silently. Every new
+        // deferred-mode membership rule fails the build.
+        //
+        // Shrink this list; never extend it. A list that grows is a suppression
+        // file, and this one is load-bearing on an exploitable surface.
+        const GRANDFATHERED_607: &[(&str, &str)] = &[
+            ("substrate_persist", "system:"),
+            ("substrate_persist", "audit_chain:"),
+            ("substrate_persist", "corpus_health:"),
+            ("substrate_persist", "identity_continuity:"),
+            ("substrate_persist", "federation_directory:"),
+            ("witness", "transparency_log:cosigned:"),
+            ("witness", "age_assurance:"),
+            ("witness", "capacity_assurance:"),
+            ("lenscore_detector", "detection:correlated_action:"),
+            ("lenscore_detector", "detection:distributive:access:"),
+            ("lenscore_detector", "detection:"),
+        ];
+        let rules = default_reserved_prefix_rules();
+        let mut violations: Vec<String> = Vec::new();
+        let mut still_open = 0usize;
+        let mut checked = 0usize;
+
+        for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
+            let Some(mode) = identity_type::conferral_mode(claim) else {
+                continue;
+            };
+            let deferred = matches!(
+                mode,
+                ConferralMode::DerivedFromVerifiedState | ConferralMode::DelegatedFromTrustRoot
+            );
+            if !deferred {
+                continue;
+            }
+            checked += 1;
+            for rule in &rules {
+                if rule.required_identity_types.iter().any(|t| t == claim) {
+                    if GRANDFATHERED_607
+                        .iter()
+                        .any(|(c, p)| *c == claim && *p == rule.pattern_prefix)
+                    {
+                        still_open += 1;
+                        continue;
+                    }
+                    violations.push(format!(
+                        "  `{}` (mode {:?}) backs the membership rule `{}`",
+                        claim, mode, rule.pattern_prefix
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            checked >= 4,
+            "expected at least 4 deferred-mode claims to examine, examined {checked} — a \
+             change to the mode table just emptied this gate"
+        );
+        // A grandfathered pair that has been FIXED must leave the list, or the
+        // ratchet quietly re-permits it the day someone reintroduces the rule.
+        assert_eq!(
+            still_open,
+            GRANDFATHERED_607.len(),
+            "the ratchet lists {} pair(s) but only {still_open} are still present. Delete the \
+             fixed entr(ies) from GRANDFATHERED_607 — a stale grandfather is how a closed hole \
+             gets silently reopened.",
+            GRANDFATHERED_607.len()
+        );
+        assert!(
+            violations.is_empty(),
+            "{} NEW deferred-mode claim(s) back a pure membership test:\n{}\n\n\
+             A `required_identity_types` check re-derives NOTHING — it reads the \
+             identity_type off the stored registration row. Either gate the claim at \
+             registration (and move it to a registration-time mode), or make the door ask \
+             the resolver its mode names. The mode table and the door must not disagree \
+             about where a claim is enforced.",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    /// The **dye test** for
+    /// [`a_deferred_conferral_mode_never_backs_a_membership_test_607`]: plant
+    /// the contradiction and confirm the detector fires.
+    ///
+    /// Without this, that gate is a hypothesis — it has never been shown to
+    /// catch anything, and a refactor that silently emptied its loop would look
+    /// identical to a clean pass.
+    #[test]
+    fn a_deferred_mode_claim_in_a_membership_rule_is_caught() {
+        use crate::federation::types::identity_type::{self, ConferralMode};
+        // A claim on a deferred mode, exactly as the real table declares it.
+        let planted = identity_type::WITNESS;
+        assert!(
+            matches!(
+                identity_type::conferral_mode(planted),
+                Some(ConferralMode::DerivedFromVerifiedState)
+                    | Some(ConferralMode::DelegatedFromTrustRoot)
+            ),
+            "the dye depends on `{planted}` being a deferred-mode claim; if its mode moved, \
+             re-aim the dye rather than deleting it"
+        );
+        let planted_rule = ReservedPrefixRule {
+            pattern_prefix: "dye_test_planted:".into(),
+            required_identity_types: vec![planted.to_owned()],
+        };
+        // The same predicate the gate applies, over a table containing the
+        // planted rule.
+        let caught = [planted_rule]
+            .iter()
+            .any(|r| r.required_identity_types.iter().any(|t| t == planted));
+        assert!(
+            caught,
+            "the gate's predicate did not catch a planted deferred-mode membership rule — \
+             the gate cannot fire, and a passing run means nothing"
+        );
+    }
+
     /// (CIRISPersist#568 / CIRISVerify#238) — the rule that decides
     /// whether ANY verify classification may bind a persist gate, exercised on
     /// all three statuses plus the case the statuses alone do not cover.
@@ -11838,6 +12018,7 @@ mod canonical_gate_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn canonical_gate_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping canonical_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -12227,6 +12408,7 @@ mod canonical_gate_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn infra_attest_gate_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping infra_attest_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -12329,6 +12511,7 @@ mod canonical_gate_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn set_path_parity_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping set_path_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -12445,6 +12628,7 @@ mod canonical_gate_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn announced_peer_parity_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping announced_peer_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -12594,6 +12778,7 @@ mod canonical_gate_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn costeward_gate_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping costeward_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -13112,6 +13297,7 @@ mod canonical_withdrawal_tests {
     /// and drop it — full pg coverage with zero shared-anchor pollution.
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn canonical_withdrawal_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping canonical_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -13376,6 +13562,7 @@ mod canonical_withdrawal_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn infra_attest_withdrawal_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping infra_attest_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");

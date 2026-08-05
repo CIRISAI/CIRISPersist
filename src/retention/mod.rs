@@ -456,6 +456,7 @@ mod tests {
 
     #[cfg(all(feature = "cirisaudit", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn archive_audit_range_preserves_chain_postgres() {
         use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
         use crate::audit::{AuditEntry, AuditService, GENESIS_PREV_HASH};

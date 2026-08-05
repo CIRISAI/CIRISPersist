@@ -1349,6 +1349,7 @@ mod sweep_tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn tightening_supersedes_and_is_idempotent_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");

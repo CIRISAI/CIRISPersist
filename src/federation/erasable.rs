@@ -1365,6 +1365,7 @@ mod ingest_gate_proof {
     /// receiver-side check, and it runs here in full.
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!(

@@ -1974,6 +1974,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn register_matrix_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping register_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -2373,6 +2374,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn baked_seed_reoffer_reads_as_duplicate_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping baked_seed_reoffer_reads_as_duplicate_postgres: DSN unset");
@@ -2395,6 +2397,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn apply_replicated_matrix_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping apply_replicated_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");

@@ -1,0 +1,43 @@
+# cargo-mutants — the dye-test generator (CIRISPersist#607 / CC#84 gatecraft).
+#
+# WHY. GateSpec's rule is that "a gate that has never been shown to catch
+# anything is a hypothesis about a gate". Every dye test in this repo has been
+# run BY HAND — comment out the clamp, run, revert; strip the frame, run,
+# revert. Roughly fifteen of them in the v30.0.0 cycle alone, each of which
+# found or confirmed something. That is exactly what this tool does
+# exhaustively, and without a human forgetting to revert.
+#
+# It is not a replacement for hand-aimed dye tests. A hand dye test proves a
+# SPECIFIC gate catches a SPECIFIC planted violation, which is what GateSpec
+# asks for. This proves the weaker, broader thing: that no surviving mutant sits
+# in code nothing asserts on. Both are wanted; they answer different questions.
+#
+# SCOPE. Run on CHANGED FILES, not the whole tree. A full sweep over ~1800 tests
+# is hours, which is how mutation testing gets adopted and then quietly turned
+# off. `--in-diff` against the merge base is the shape that survives.
+
+# The fastest leg that still exercises a real backend. `--all-features` would
+# pull pyo3 and roughly triple build time for no extra mutant coverage on the
+# federation logic, which is where the gates live.
+additional_cargo_args = ["--features", "sqlite"]
+
+# Test-support and fixture code: mutating a test helper produces mutants that
+# are "caught" by definition and tell us nothing about production gates.
+exclude_globs = [
+    "src/**/test_support*.rs",
+    "benches/**",
+]
+
+# Generated / vendored surfaces. A mutant here is a mutant in something we do
+# not hand-author, and the drift gates already cover them.
+exclude_re = [
+    "impl Debug",
+    "impl serde::",
+]
+
+# A mutant that hangs is a mutant that ran away with a loop bound. Cap it
+# generously relative to the slowest honest test (the substrate state machine
+# proptest, ~100s) rather than tightly, so a slow-but-caught mutant is not
+# reported as a timeout.
+timeout_multiplier = 5.0
+minimum_test_timeout = 300

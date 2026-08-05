@@ -7878,6 +7878,7 @@ mod tests {
     /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
     #[cfg(all(feature = "cirisaudit", feature = "postgres"))]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn audit_service_postgres_round_trip() {
         use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
         use crate::audit::{AuditEntry, AuditFilter, AuditService, GENESIS_PREV_HASH};
@@ -7950,6 +7951,7 @@ mod tests {
     /// Skips when `CIRIS_PERSIST_TEST_PG_URL` is unset.
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn receive_and_persist_pre_verified_postgres() {
         use crate::ingest::IngestError;
         use crate::schema::{
@@ -10327,6 +10329,7 @@ mod tests {
     /// runs self-isolating). Skips when `CIRIS_PERSIST_TEST_PG_URL` unset.
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn install_storage_budget_v1_happy_and_anti_rollback_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -10590,6 +10593,7 @@ mod tests {
     /// isolated database (whole-table sweep). Skips when the twin is unset.
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn sweeper_b5_evicts_unpinned_before_pinned_postgres() {
         let Some((dsn, db)) = pg_isolated_db("b5order").await else {
             return;
@@ -10610,6 +10614,7 @@ mod tests {
     /// #370 §Q B5 reserve floor on Postgres (isolated database).
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn sweeper_b5_holds_pin_reserve_floor_postgres() {
         let Some((dsn, db)) = pg_isolated_db("b5floor").await else {
             return;
@@ -14567,6 +14572,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn cohort_surface_roundtrip_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -14723,6 +14729,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn supersede_versioning_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -14929,6 +14936,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn quorum_supersede_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -15148,6 +15156,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[serial_test::serial(postgres)]
     async fn g4_rekey_events_postgres() {
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");

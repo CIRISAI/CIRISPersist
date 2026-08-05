@@ -19711,6 +19711,103 @@ fn row_to_calibration_bundle(r: tokio_postgres::Row) -> crate::derived::Calibrat
 // `tests/postgres_conformance.rs` (gated behind
 // `CIRIS_PERSIST_TEST_PG_URL`).
 
+/// v30.0.1 — the scan behind
+/// [`tests::every_postgres_test_takes_the_serial_lock`]. Separated from the
+/// test so the predicate itself is dye-testable in isolation: a gate whose
+/// predicate lives inline can only be exercised by the tree it polices, which
+/// means a clean tree proves nothing about whether it can fire.
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) mod postgres_serial_scan {
+    /// Does this attribute block describe a postgres-gated test with no serial
+    /// lock? Operates on the joined attribute text, so it is callable on a
+    /// planted string.
+    pub(crate) fn is_unserialized(attrs: &str) -> bool {
+        // Require a REAL test attribute, not the substring "test". A helper
+        // carrying `#[cfg(all(test, feature = "postgres"))]` contains both
+        // "test" and the feature gate and is not a test at all — the gate's
+        // first run flagged `run_in_isolated_pg_db` for exactly that, which is
+        // why the dye test asserts the clean case too. A gate that fires on
+        // correct code gets deleted by the next person who hits it.
+        let is_test =
+            attrs.contains("#[test]") || attrs.contains("::test]") || attrs.contains("::test(");
+        is_test && attrs.contains("feature = \"postgres\"") && !attrs.contains("serial")
+    }
+
+    /// Walk `src/**.rs`, returning (blocks examined, offenders).
+    pub(crate) fn scan() -> (usize, Vec<String>) {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+
+        let mut scanned = 0usize;
+        let mut bad = Vec::new();
+        for f in files {
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.split('\n').collect();
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim_start();
+                if !(t.starts_with("fn ") || t.starts_with("async fn ")) {
+                    continue;
+                }
+                // Gather the contiguous attribute/doc block above.
+                let mut attrs: Vec<&str> = Vec::new();
+                let mut j = i as isize - 1;
+                while j >= 0 {
+                    let s = lines[j as usize].trim();
+                    if s.starts_with("#[") {
+                        attrs.push(s);
+                    } else if s.starts_with("///") {
+                        // doc lines belong to the block; keep walking.
+                    } else if !(s.is_empty() && attrs.is_empty()) {
+                        // A blank line BEFORE any attribute is the gap between
+                        // a doc block and its `fn`, so keep walking. Anything
+                        // else — a blank after attributes, or another item —
+                        // ends this block.
+                        break;
+                    }
+                    j -= 1;
+                }
+                if attrs.is_empty() {
+                    continue;
+                }
+                let joined = attrs.join(" ");
+                if !joined.contains("test") {
+                    continue;
+                }
+                scanned += 1;
+                if is_unserialized(&joined) {
+                    let name = t.trim_start_matches("async ").trim_start_matches("fn ");
+                    let name = name.split('(').next().unwrap_or(name);
+                    bad.push(format!(
+                        "  {}:{}  {name}",
+                        f.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&f)
+                            .display(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+        (scanned, bad)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28495,6 +28592,80 @@ mod tests {
     /// field happened to be set. It compiled, and it would have passed any test
     /// that set a subject. Parity is not inherited from the sqlite test; it is
     /// measured here.
+    /// v30.0.1 — **every postgres-gated test takes the postgres serial lock.**
+    ///
+    /// GateSpec (CIRISOntology/GATES.md):
+    ///
+    /// - **family** — `procedural`. Varying it changes orchestration — when a
+    ///   test runs relative to others — not what is true. But the *symptom* is
+    ///   an `empirical` wrong: a green suite that is green by scheduling luck.
+    /// - **headwaters** — the attribute block of every `fn` in `src/**`.
+    /// - **references** — the flakes this explains:
+    ///   `add_then_remove_moderator_round_trip_postgres`,
+    ///   `v053_pg_access_columns_present`, `av26_concurrent_boot_advisory_lock`
+    ///   — each reported as "passed in isolation", which is the signature.
+    /// - **dye test** — `an_unserialized_postgres_test_is_caught` below.
+    /// - **depth** — attribute-shape only. It cannot see a test that takes the
+    ///   lock but still races through a helper spawning its own connection,
+    ///   nor one gated on postgres by a route other than
+    ///   `#[cfg(feature = "postgres")]`.
+    /// - **owner** — persist.
+    ///
+    /// # Why one unserialized test breaks 289 serialized ones
+    ///
+    /// `serial_test`'s group lock only excludes other **serial** members. A
+    /// non-serial test ignores it entirely, so a single unmarked test mutating
+    /// shared database state can perturb any serialized peer — including ones
+    /// whose own docs say *"so co-resident fixtures cannot perturb it"*.
+    ///
+    /// 42 tests were in that state when this gate was written, against 289
+    /// that took the lock. Both legs that went red did so on **seeding**, not
+    /// on logic, and both had passed the previous run: the tell for a race, and
+    /// the reason "it passed in isolation" must never be read as "it was a
+    /// flake".
+    #[test]
+    fn every_postgres_test_takes_the_serial_lock() {
+        let (scanned, bad) = super::postgres_serial_scan::scan();
+        assert!(
+            scanned >= 200,
+            "scanned only {scanned} test attribute blocks — the scan is not reaching the \
+             tests it is supposed to police"
+        );
+        assert!(
+            bad.is_empty(),
+            "{} postgres-gated test(s) do NOT take the postgres serial lock:\n{}\n\n\
+             `serial_test`'s lock only excludes other SERIAL tests, so one unmarked test can \
+             perturb any of the {} that do. Add `#[serial_test::serial(postgres)]`.",
+            bad.len(),
+            bad.join("\n"),
+            scanned
+        );
+    }
+
+    /// The **dye test**: a planted attribute block missing the lock is caught.
+    #[test]
+    fn an_unserialized_postgres_test_is_caught() {
+        let planted = "#[cfg(feature = \"postgres\")] #[tokio::test]";
+        // A postgres-gated HELPER is not a test and must not be flagged.
+        assert!(
+            !super::postgres_serial_scan::is_unserialized(
+                "#[cfg(all(test, feature = \"postgres\"))]"
+            ),
+            "a `#[cfg(all(test, feature = \"postgres\"))]` helper is not a test; flagging it \
+             makes the gate fire on correct code"
+        );
+        assert!(
+            super::postgres_serial_scan::is_unserialized(planted),
+            "the predicate did not flag a postgres test with no serial attribute — the gate \
+             cannot fire, and a passing run means nothing"
+        );
+        let ok = "#[cfg(feature = \"postgres\")] #[tokio::test] #[serial_test::serial(postgres)]";
+        assert!(
+            !super::postgres_serial_scan::is_unserialized(ok),
+            "the predicate flagged a correctly serialized test — it would fail on clean code"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_list_attestations_honours_window_tier_and_attester_596() {
