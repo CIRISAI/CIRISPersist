@@ -13902,11 +13902,79 @@ const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.atteste
 /// `attestation_type='scores'` clause are added by the callers. The returned
 /// `parts` is always non-empty (tier + scope always emit), so the caller can
 /// unconditionally `WHERE parts.join(" AND ")`.
+/// v30.0.0 (CIRISPersist#596 item 2) — **the three selection axes, emitted
+/// once.**
+///
+/// `window`, `tier` and `attester_filter` were honoured by `list_scores` /
+/// `resolve_scores` and **silently dropped** by `list_attestations`, whose
+/// predicate builder emitted nine axes and none of these. Setting `window` read
+/// as a bound and was none — the exact class `dimension_exact` was in until
+/// v17.5.2 (#461), a filter field that accepts a value and discards it.
+///
+/// That mattered beyond tidiness: a consumer used the filter to build an
+/// operator preview, then committed on a hash of it. A dropped `window` means
+/// the operator ratifies a selection hash over a **larger** row set than they
+/// were shown.
+///
+/// Emitted from one function rather than copied into the second builder,
+/// because two implementations of one filter axis is how the two handles came
+/// to disagree in the first place. `alias` is the table prefix (`"fa."` where
+/// the query joins, `""` where it does not).
+///
+/// **`tier`'s DEFAULT deliberately still differs between the two handles**, and
+/// the difference is now stated instead of asserted away: `list_scores` treats
+/// `None` as federation-only; `list_attestations` treats it as no predicate,
+/// which is what it has always done. Making them agree by narrowing
+/// `list_attestations` would silently stop returning callers' own local rows —
+/// a quiet behaviour change dressed as a consistency fix. An EXPLICIT `tier` is
+/// honoured identically on both, which is what #596 asked for.
+fn sqlite_selection_axes(
+    filter: &crate::read::AttestationFilter,
+    alias: &str,
+    tier_none_means_federation: bool,
+    parts: &mut Vec<String>,
+    binds: &mut Vec<SqlValue>,
+) {
+    use crate::read::{AttesterSet, Tier};
+    if let Some((start, end)) = filter.window {
+        binds.push(SqlValue::Text(start.to_rfc3339()));
+        let ps = binds.len();
+        binds.push(SqlValue::Text(end.to_rfc3339()));
+        let pe = binds.len();
+        parts.push(format!(
+            "({alias}asserted_at >= ?{ps} AND {alias}asserted_at < ?{pe})"
+        ));
+    }
+    match filter.tier {
+        Some(Tier::Federation) => parts.push(format!("{alias}tier = 'federation'")),
+        Some(Tier::Local) => parts.push(format!("{alias}tier = 'local'")),
+        Some(Tier::Any) => {}
+        None => {
+            if tier_none_means_federation {
+                parts.push(format!("{alias}tier = 'federation'"));
+            }
+        }
+    }
+    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
+        if keys.is_empty() {
+            // An explicit EMPTY set selects nothing. Emitting no predicate
+            // would select EVERYTHING — the opposite of what was asked.
+            parts.push("0 = 1".to_owned());
+        } else {
+            let mut ph: Vec<String> = Vec::new();
+            for k in keys {
+                binds.push(SqlValue::Text(k.clone()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("{alias}attesting_key_id IN ({})", ph.join(",")));
+        }
+    }
+}
+
 fn sqlite_scores_shared_predicates(
     filter: &crate::read::AttestationFilter,
     scope: &crate::scope::CallerScope,
 ) -> (Vec<String>, Vec<SqlValue>) {
-    use crate::read::{AttesterSet, Tier};
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<SqlValue> = Vec::new();
     if let Some(subj) = &filter.subject_key_id {
@@ -13962,34 +14030,11 @@ fn sqlite_scores_shared_predicates(
             "(fa.asserted_at <= ?{p} AND (fa.expires_at IS NULL OR fa.expires_at > ?{p}))"
         ));
     }
-    if let Some((start, end)) = filter.window {
-        binds.push(SqlValue::Text(start.to_rfc3339()));
-        let ps = binds.len();
-        binds.push(SqlValue::Text(end.to_rfc3339()));
-        let pe = binds.len();
-        parts.push(format!(
-            "(fa.asserted_at >= ?{ps} AND fa.asserted_at < ?{pe})"
-        ));
-    }
-    // tier: default (None) = federation-only (matches list_attestations).
-    match filter.tier {
-        None | Some(Tier::Federation) => parts.push("fa.tier = 'federation'".to_owned()),
-        Some(Tier::Local) => parts.push("fa.tier = 'local'".to_owned()),
-        Some(Tier::Any) => {}
-    }
-    // attester_filter: Explicit set membership (All / None = no restriction).
-    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
-        if keys.is_empty() {
-            parts.push("0 = 1".to_owned());
-        } else {
-            let mut ph: Vec<String> = Vec::new();
-            for k in keys {
-                binds.push(SqlValue::Text(k.clone()));
-                ph.push(format!("?{}", binds.len()));
-            }
-            parts.push(format!("fa.attesting_key_id IN ({})", ph.join(",")));
-        }
-    }
+    // v30.0.0 (#596) — window / tier / attester_filter come from the SHARED
+    // emitter, so `list_attestations` cannot drift from this handle again. The
+    // comment that used to sit here claimed the two matched on tier's default;
+    // it did not, because `list_attestations` had no tier predicate at all.
+    sqlite_selection_axes(filter, "fa.", true, &mut parts, &mut binds);
     // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
     {
         let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
@@ -16885,6 +16930,14 @@ impl crate::read::ReadEngine for SqliteBackend {
                 binds.len()
             ));
         }
+        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter.
+        // This builder emitted nine axes and DROPPED these three, so a caller
+        // setting `window` got a bound that was never applied. Same emitter as
+        // `list_scores`, unaliased here because this query does not join.
+        // `tier: None` keeps this handle's historical meaning (no predicate) —
+        // see `sqlite_selection_axes` for why narrowing it silently would be
+        // worse than the inconsistency.
+        sqlite_selection_axes(&filter, "", false, &mut parts, &mut binds);
         // §4.3 scope gate — federation_attestations carries cohort_scope
         // (V056) + attested_key_id (the row's target identity, V055). The
         // gate compares the row's cohort_scope/attested_key_id against the
@@ -28219,6 +28272,159 @@ mod tests {
                 crate::federation::Error::FederationTierUnverified { .. }
             ),
             "crypto-invalid revocation rejected at admission, got {bad:?}"
+        );
+    }
+
+    /// v30.0.0 (CIRISPersist#596 item 2) — **`window`, `tier` and
+    /// `attester_filter` actually bind on `list_attestations`.**
+    ///
+    /// All three were accepted and DROPPED: the predicate builder emitted nine
+    /// axes and none of these, on both SQL backends identically. Setting
+    /// `window` read as a bound and was none — the class `dimension_exact` was
+    /// in until v17.5.2 (#461).
+    ///
+    /// Each assertion pairs a filtered result with the UNFILTERED one, so
+    /// "the filter returns nothing" cannot pass for "the filter works".
+    #[tokio::test]
+    async fn list_attestations_honours_window_tier_and_attester_596() {
+        use crate::ceg::ReadEngine;
+        use crate::read::{AttestationFilter, AttesterSet, Tier};
+        let backend = fresh_backend_with_occurrence("occ").await;
+        // The attester keys must exist — federation_attestations carries an FK
+        // on attesting_key_id, and a raw insert hits it like any other writer.
+        for k in ["k1", "k2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(
+                        k,
+                        "registry",
+                        k,
+                        crate::federation::types::identity_type::STEWARD,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let seed = |id: &str, attester: &str, at: &str, tier: &str| {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let env = serde_json::json!({"id": id, "dimension": "d:v1", "score": 1.0}).to_string();
+            conn.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
+                    pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
+                    cohort_scope, tier, promoted_at, additional_scrubs\
+                 ) VALUES (?1, ?2, 'occ', 'scores', 1.0, ?3, NULL, ?4, x'', \
+                          'sig', NULL, ?2, ?3, NULL, '0', '[]', NULL, \
+                          'federation', ?5, NULL, '[]')",
+                rusqlite::params![id, attester, at, env, tier],
+            )
+            .unwrap();
+        };
+        seed("old-fed", "k1", "2026-01-01T00:00:00Z", "federation");
+        seed("mid-fed", "k2", "2026-06-01T00:00:00Z", "federation");
+        seed("new-fed", "k1", "2026-12-01T00:00:00Z", "federation");
+        seed("mid-loc", "k2", "2026-06-02T00:00:00Z", "local");
+
+        let q = |f: AttestationFilter| {
+            let backend = &backend;
+            async move {
+                let mut ids: Vec<String> = backend
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        // The unfiltered baseline every assertion below is measured against.
+        let all = q(AttestationFilter::default()).await;
+        assert_eq!(
+            all,
+            vec!["mid-fed", "mid-loc", "new-fed", "old-fed"],
+            "baseline: no filter returns every seeded row (and `tier: None` on THIS handle \
+             still means no predicate, so the local row is present)"
+        );
+
+        // window — half-open [start, end)
+        let windowed = q(AttestationFilter {
+            window: Some((
+                "2026-05-01T00:00:00Z".parse().unwrap(),
+                "2026-07-01T00:00:00Z".parse().unwrap(),
+            )),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(
+            windowed,
+            vec!["mid-fed", "mid-loc"],
+            "`window` must BIND. Before #596 this returned all {} rows — an operator \
+             ratifying a selection hash over a window got a hash over everything.",
+            all.len()
+        );
+
+        // tier — explicit, honoured identically to list_scores
+        assert_eq!(
+            q(AttestationFilter {
+                tier: Some(Tier::Local),
+                ..Default::default()
+            })
+            .await,
+            vec!["mid-loc"],
+            "`tier: Local` must select only local rows"
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                tier: Some(Tier::Federation),
+                ..Default::default()
+            })
+            .await,
+            vec!["mid-fed", "new-fed", "old-fed"],
+            "`tier: Federation` must exclude the local row"
+        );
+
+        // attester_filter
+        assert_eq!(
+            q(AttestationFilter {
+                attester_filter: Some(AttesterSet::Explicit(vec!["k1".into()])),
+                ..Default::default()
+            })
+            .await,
+            vec!["new-fed", "old-fed"],
+            "`attester_filter` must restrict to the named attesters"
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                attester_filter: Some(AttesterSet::Explicit(vec![])),
+                ..Default::default()
+            })
+            .await,
+            Vec::<String>::new(),
+            "an EXPLICIT EMPTY attester set selects NOTHING. Emitting no predicate would \
+             select everything — the opposite of what was asked, and the direction that \
+             silently widens a preview."
+        );
+
+        // composed, to prove the axes AND rather than overwrite each other
+        assert_eq!(
+            q(AttestationFilter {
+                window: Some((
+                    "2026-05-01T00:00:00Z".parse().unwrap(),
+                    "2026-07-01T00:00:00Z".parse().unwrap(),
+                )),
+                tier: Some(Tier::Federation),
+                ..Default::default()
+            })
+            .await,
+            vec!["mid-fed"],
+            "the three axes compose AND-style with each other and with the existing nine"
         );
     }
 

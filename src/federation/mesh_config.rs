@@ -51,7 +51,7 @@
 //! [`MeshConfigKey::more_restrictive_of`] and
 //! [`MeshConfigKey::expands_beyond`], which are the same predicate read in two
 //! directions. Writing "take the min" would have been correct for five of the
-//! nine keys and silently inverted for four — `antientropy.round_secs` LARGER
+//! eleven keys and silently inverted for four — `antientropy.round_secs` LARGER
 //! is less traffic, `backpressure.summary_only` TRUE is less traffic. A fold
 //! that minimises is not most-restrictive; it is most-restrictive on the keys
 //! where the two coincide, which is the kind of bug that ships.
@@ -231,7 +231,7 @@ pub enum FlowPolarity {
     /// often), `backpressure.summary_only` (0 = full rows, not summaries),
     /// `descent.pressure_multiplier` (less descent pressure).
     ///
-    /// **Four of the nine keys are on this arm**, which is why the fold cannot
+    /// **Four of the eleven keys are on this arm**, which is why the fold cannot
     /// be a `min()`.
     LowerMeansMoreFlow,
 }
@@ -254,8 +254,22 @@ impl FlowPolarity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshConfigUnit {
-    /// A plain count (copies, rows, symbols).
+    /// A plain count of things with no redundancy axis — rows, pages,
+    /// admissions. **No longer "copies, rows, symbols"**: that gloss is what
+    /// let [`MeshConfigKey`] carry a symbol quantity and a holder quantity
+    /// under one unit, so the manifest could not express the difference
+    /// (CIRISPersist#602, the same gap #532 closed with `ci_axis`).
     Count,
+    /// v30.0.0 (CIRISPersist#602) — a count of **fountain symbols**: source or
+    /// repair blocks of one content. Distinct from [`Holders`](Self::Holders)
+    /// because a holder does not hold exactly one symbol, so the two are not
+    /// interconvertible and a knob typed for one silently misconfigures the
+    /// other.
+    Symbols,
+    /// v30.0.0 (CIRISPersist#602) — a count of **distinct peers** holding
+    /// symbols for one content. Edge's `target_holders` (`H`) is this axis; its
+    /// repair planner counts peers, not blocks.
+    Holders,
     /// Whole seconds.
     Seconds,
     /// A boolean, carried as `0` / `1`. **Not a JSON bool**: one integer domain
@@ -273,6 +287,8 @@ impl MeshConfigUnit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Count => "count",
+            Self::Symbols => "symbols",
+            Self::Holders => "holders",
             Self::Seconds => "seconds",
             Self::Flag => "flag",
             Self::CentiRatio => "centi_ratio",
@@ -314,10 +330,20 @@ impl MeshConfigUnit {
 pub enum MeshConfigKey {
     /// Target repair-symbol count the repair planner aims for. #570's headline:
     /// *"20 copies → 10"*. Higher = more copies pushed = more flow.
-    RedundancyKRepairTarget,
+    RedundancyKRepairSymbols,
+    /// v30.0.0 (CIRISPersist#602) — the symbol floor below which content is
+    /// unreconstructable. Edge's `min_viable_symbols` (`N/4`).
+    RedundancyMinViableSymbols,
+    /// v30.0.0 (CIRISPersist#602) — the target number of distinct PEERS holding
+    /// symbols. Edge's `target_holders` (`H`) — a different axis from
+    /// [`RedundancyKRepairSymbols`](Self::RedundancyKRepairSymbols).
+    RedundancyTargetHolders,
+    /// v30.0.0 (CIRISPersist#602) — the holder floor below which the converger
+    /// emits `RepairNeeded`. Edge's `min_viable`.
+    RedundancyMinViableHolders,
     /// Floor below which a corpus is not considered viable. Higher = more
     /// copies must be held and served = more flow.
-    RedundancyMinViableFloor,
+
     /// Seconds between anti-entropy rounds. **Higher = rounds less often = LESS
     /// flow.**
     AntientropyRoundSecs,
@@ -362,11 +388,65 @@ pub struct MeshConfigKeySpec {
     pub knob: &'static str,
 }
 
+/// v30.0.0 (CIRISPersist#602) — **the consumer's own pinned values, recorded
+/// once so a ceiling below them fails the build.**
+///
+/// `MeshConfigKeySpec::owner_default` is a **consent CEILING**: roots may only
+/// tighten beneath it ([`FlowPolarity`], CC 4.2.1 rule 1). So a ceiling ABOVE
+/// the consumer's operating value merely permits, while a ceiling BELOW it makes
+/// the knob **unsatisfiable** — no root can ever configure the consumer to a
+/// value the consumer itself considers viable. `redundancy.min_viable_floor`
+/// shipped that way: ceiling 3 against a consumer floor of 5.
+///
+/// **This table is a placeholder for a vendored manifest, and is the weakest
+/// thing in this module.** These numbers are hand-recorded from CIRISEdge's
+/// `pub const`s, which is the same transcription that produced the defect —
+/// `redundancy.k_repair_target` carried `n_source`'s 20 under `k_repair`'s
+/// name, and nothing could notice. Recording them *as a gate input* is
+/// different from using them *as values*: the gate's only job is to fail when
+/// our ceiling sinks below them. It cannot detect edge moving a floor UP, which
+/// is exactly what the manifest is for.
+///
+/// The right shape is `namespace_registry.json`'s: generated upstream, vendored,
+/// gated, failing in EITHER direction. Filed on edge; until it lands this is a
+/// ratchet, not a reconciliation.
+///
+/// `(wire_name, consumer's pinned value, where it lives)`
+/// Test-only: this table's whole job is to fail a gate, so it is not compiled
+/// into the shipped library. It is deliberately NOT `pub` — a consumer reading
+/// these numbers from persist would be taking the transcription as authority,
+/// which is the defect, not the fix.
+#[cfg(test)]
+const CONSUMER_FLOORS: &[(&str, i64, &str)] = &[
+    (
+        "redundancy.k_repair_symbols",
+        6,
+        "CIRISEdge DEFAULT_K_REPAIR (knee pinned by repair_headroom_knee_at_k_6)",
+    ),
+    (
+        "redundancy.min_viable_symbols",
+        5,
+        "CIRISEdge DEFAULT_MIN_VIABLE_SYMBOLS (N/4)",
+    ),
+    (
+        "redundancy.target_holders",
+        30,
+        "CIRISEdge DEFAULT_TARGET_HOLDERS (H = max(26,7,10) x 1.15)",
+    ),
+    (
+        "redundancy.min_viable_holders",
+        5,
+        "CIRISEdge DEFAULT_MIN_VIABLE",
+    ),
+];
+
 impl MeshConfigKey {
     /// Every registered key, in declaration order. **The closed set.**
     pub const ALL: &'static [Self] = &[
-        Self::RedundancyKRepairTarget,
-        Self::RedundancyMinViableFloor,
+        Self::RedundancyKRepairSymbols,
+        Self::RedundancyMinViableSymbols,
+        Self::RedundancyTargetHolders,
+        Self::RedundancyMinViableHolders,
         Self::AntientropyRoundSecs,
         Self::AntientropyPageLimit,
         Self::BackpressureSummaryOnly,
@@ -380,27 +460,55 @@ impl MeshConfigKey {
     #[must_use]
     pub const fn spec(self) -> MeshConfigKeySpec {
         use FlowPolarity::{HigherMeansMoreFlow, LowerMeansMoreFlow};
-        use MeshConfigUnit::{CentiRatio, Count, Flag, Seconds};
+        use MeshConfigUnit::{CentiRatio, Count, Flag, Holders, Seconds, Symbols};
         match self {
-            Self::RedundancyKRepairTarget => MeshConfigKeySpec {
-                wire_name: "redundancy.k_repair_target",
+            Self::RedundancyKRepairSymbols => MeshConfigKeySpec {
+                wire_name: "redundancy.k_repair_symbols",
                 polarity: HigherMeansMoreFlow,
-                unit: Count,
+                unit: Symbols,
                 min: 0,
                 max: 4096,
+                // A CEILING, not a recommendation. Roots may only tighten
+                // beneath it, so a generous ceiling merely permits; a tight one
+                // makes the consumer's own operating value unreachable. See
+                // CONSUMER_FLOORS.
                 owner_default: 20,
                 consumer: "repair_planner",
-                knob: "target_repair_symbols",
+                knob: "k_repair",
             },
-            Self::RedundancyMinViableFloor => MeshConfigKeySpec {
-                wire_name: "redundancy.min_viable_floor",
+            Self::RedundancyMinViableSymbols => MeshConfigKeySpec {
+                wire_name: "redundancy.min_viable_symbols",
                 polarity: HigherMeansMoreFlow,
-                unit: Count,
+                unit: Symbols,
                 min: 1,
                 max: 4096,
-                owner_default: 3,
+                // RAISED from 3 (CIRISPersist#602). The old ceiling sat BELOW
+                // the consumer's own viability floor, so no root could ever
+                // configure the planner to a value it considers viable — an
+                // unsatisfiable knob, not merely a mismatched one.
+                owner_default: 20,
                 consumer: "repair_planner",
-                knob: "min_viable_floor",
+                knob: "min_viable_symbols",
+            },
+            Self::RedundancyTargetHolders => MeshConfigKeySpec {
+                wire_name: "redundancy.target_holders",
+                polarity: HigherMeansMoreFlow,
+                unit: Holders,
+                min: 1,
+                max: 4096,
+                owner_default: 64,
+                consumer: "repair_planner",
+                knob: "target_holders",
+            },
+            Self::RedundancyMinViableHolders => MeshConfigKeySpec {
+                wire_name: "redundancy.min_viable_holders",
+                polarity: HigherMeansMoreFlow,
+                unit: Holders,
+                min: 1,
+                max: 4096,
+                owner_default: 64,
+                consumer: "repair_planner",
+                knob: "min_viable",
             },
             Self::AntientropyRoundSecs => MeshConfigKeySpec {
                 wire_name: "antientropy.round_secs",
@@ -804,6 +912,16 @@ pub enum MeshConfigRefusalReason {
     /// carry its own authority is indistinguishable from an unauthorized one
     /// once the actor is gone.
     Unattributed,
+    /// v30.0.0 (CIRISPersist#601) — [`field::DELEGATION_ID`] is present, but it
+    /// does **not** name any of the live `trust:confers:v1` edges by which the
+    /// root authorises this author.
+    ///
+    /// [`Unattributed`](Self::Unattributed) catches an act that names NO
+    /// authority. This catches one that names a **different** authority than
+    /// the one it actually has — which is worse, because it reads as attributed
+    /// and gets stored in a signed row that anything downstream will report as
+    /// verified provenance.
+    DelegationIdNotConferring,
     /// The row is not filed against the root it names, so the fold's
     /// `list_attestations_for(root)` read would never see it. A row stored and
     /// permanently uncounted is the preserve-set ≠ verified-set class (#541).
@@ -876,6 +994,7 @@ impl MeshConfigRefusalReason {
             Self::MalformedEnvelope => "malformed_envelope",
             Self::ValueOutOfDomain => "value_out_of_domain",
             Self::Unattributed => "unattributed",
+            Self::DelegationIdNotConferring => "delegation_id_not_conferring",
             Self::NotFiledAgainstRoot => "not_filed_against_root",
             Self::RootNotTrusted => "root_not_trusted",
             Self::AuthorNotRootAuthorized => "author_not_root_authorized",
@@ -896,6 +1015,7 @@ impl MeshConfigRefusalReason {
         Self::MalformedEnvelope,
         Self::ValueOutOfDomain,
         Self::Unattributed,
+        Self::DelegationIdNotConferring,
         Self::NotFiledAgainstRoot,
         Self::RootNotTrusted,
         Self::AuthorNotRootAuthorized,
@@ -1158,6 +1278,40 @@ pub struct MeshConfigFold {
     /// to distinguish "not set" from "not returned"; an absent key is exactly
     /// how a knob silently keeps a stale value.
     pub settings: Vec<MeshConfigSetting>,
+    /// v30.0.0 (CIRISPersist#601) — roots this node is subscribed to whose rows
+    /// **could not be read**, sorted. Empty on every backend that can answer.
+    ///
+    /// **The field above states the rule this one was breaking.** `settings`
+    /// returns all eleven keys always, because *"a consumer should never have to
+    /// distinguish 'not set' from 'not returned'"*. [`resolve_mesh_config`] then
+    /// swallowed `Error::Unsupported` per root, so **"this backend cannot answer
+    /// for root R" and "root R said nothing" were the same answer** — the
+    /// identical defect one level up, for roots instead of keys.
+    ///
+    /// The direction matters on this plane specifically. `mesh_config` only ever
+    /// *restricts*, so a root that silently contributes nothing renders as a
+    /// node under **fewer** restrictions than it consented to. A broken backend
+    /// read as an unconstrained node is the wrong way to fail here.
+    ///
+    /// Reported by CIRISServer, who worked around it by gathering per-root and
+    /// reporting `unreadable_roots` separately — the same shape, one layer out,
+    /// which is where it belongs but not where it should have been necessary.
+    /// They record it as the fifth independent instance of this class in the
+    /// project (`ScoreOutcome`, `RetentionOutcome`, edge's withhold ledger,
+    /// their operator surface, and this).
+    ///
+    /// **NOT COVERED BY AN AUTOMATED WITNESS, stated rather than implied.** All
+    /// three shipped backends implement `list_attestations_for`, so none of
+    /// them can produce `Unsupported` and no test in this repo reaches the arm
+    /// that fills this field. Exercising it needs a `FederationDirectory`
+    /// double, and that trait has **78 required methods** — disproportionate to
+    /// build for one arm, and the second time this cycle a testing gap has come
+    /// from the trait's size. A composable test-support directory is filed
+    /// separately. Until it exists, treat this field as reasoned-correct and
+    /// unwitnessed; the consumer that reported the defect is the one exercising
+    /// it, through their own directory implementation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_roots: Vec<String>,
 }
 
 impl MeshConfigFold {
@@ -1334,6 +1488,10 @@ pub fn fold_mesh_config(
         node_key_id: node_key_id.to_owned(),
         roots: sorted_roots,
         settings,
+        // The pure fold reads rows; it cannot know a root was unreadable,
+        // because an unreadable root contributes no row to observe.
+        // [`resolve_mesh_config`] fills this after the read.
+        unreadable_roots: Vec::new(),
     }
 }
 
@@ -1367,12 +1525,12 @@ async fn root_authorizes_author<F>(
     root_ref: &str,
     author: &str,
     now: DateTime<Utc>,
-) -> Result<bool, Error>
+) -> Result<AuthorAuthority, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     if root_ref == author {
-        return Ok(true);
+        return Ok(AuthorAuthority::Inherent);
     }
     let by_root = match directory.list_attestations_by(root_ref).await {
         Ok(rows) => rows,
@@ -1381,14 +1539,55 @@ where
     };
     let refs: Vec<&Attestation> = by_root.iter().collect();
     let dead = super::trust_root::tombstoned_ids(&refs);
-    Ok(by_root.iter().any(|a| {
-        a.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && a.attested_key_id == author
-            && a.tier == super::types::attestation_tier::FEDERATION
-            && !dead.contains(&a.attestation_id)
-            && !a.expires_at.is_some_and(|e| e <= now)
-            && env_str(a, "dimension") == Some(super::trust_root::TRUST_CONFERS_DIMENSION)
-    }))
+    let mut conferring: Vec<String> = by_root
+        .iter()
+        .filter(|a| {
+            a.attestation_type == super::types::attestation_type::DELEGATES_TO
+                && a.attested_key_id == author
+                && a.tier == super::types::attestation_tier::FEDERATION
+                && !dead.contains(&a.attestation_id)
+                && !a.expires_at.is_some_and(|e| e <= now)
+                && env_str(a, "dimension") == Some(super::trust_root::TRUST_CONFERS_DIMENSION)
+        })
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    if conferring.is_empty() {
+        return Ok(AuthorAuthority::None);
+    }
+    conferring.sort();
+    Ok(AuthorAuthority::Conferred(conferring))
+}
+
+/// v30.0.0 (CIRISPersist#601) — **what authorises this author, and by which
+/// edge.**
+///
+/// [`root_authorizes_author`] used to return `bool`, which threw away the one
+/// thing the envelope's [`field::DELEGATION_ID`] needed in order to mean
+/// anything. The door required that field to be non-empty
+/// ([`Unattributed`](MeshConfigRefusalReason::Unattributed)) and never checked
+/// that the id named **the conferral it had just verified** — so a
+/// syntactically valid but entirely unrelated id landed in a stored, signed
+/// row and was then reported as provenance by anything reading it. **The
+/// attribution read as verified and was not.**
+///
+/// Found by CIRISServer, who noted that `check_admin_action_attribution` is
+/// **stricter on a lower-stakes plane** — and who declined to re-implement this
+/// predicate on their side, correctly, because a second copy of an authority
+/// rule is the drift shape this module exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthorAuthority {
+    /// The author IS the root. There is no delegation, because none is needed:
+    /// *"1-of-1 is a legitimate quorum for a root you alone own"*. Nothing to
+    /// bind [`field::DELEGATION_ID`] to, so the door keeps requiring it
+    /// non-empty and treats it as a self-attribution label rather than
+    /// inventing a wire contract for a delegation that does not exist.
+    Inherent,
+    /// One or more live `trust:confers:v1` edges confer on this author. The
+    /// declared `delegation_id` MUST be one of these — sorted, so the refusal
+    /// message is stable.
+    Conferred(Vec<String>),
+    /// Nothing authorises this author.
+    None,
 }
 
 /// **"The root's own quorum" (CC 4.2.1 rule 3), as a predicate over one row.**
@@ -1536,8 +1735,22 @@ where
     }
 
     // ── The authority, re-derived from this node's own state.
-    if !root_authorizes_author(directory, &root_ref, &row.attesting_key_id, now).await? {
-        return refused(R::AuthorNotRootAuthorized);
+    match root_authorizes_author(directory, &root_ref, &row.attesting_key_id, now).await? {
+        AuthorAuthority::None => return refused(R::AuthorNotRootAuthorized),
+        // v30.0.0 (#601) — BIND the declared id to the edge just verified. The
+        // door has always required `delegation_id` to be non-empty; until now
+        // it never required it to be the conferral that authorised the author,
+        // so an unrelated id was stored in a signed row and read back as
+        // verified provenance.
+        AuthorAuthority::Conferred(edges) => {
+            let declared = env_str(row, field::DELEGATION_ID).unwrap_or_default();
+            if !edges.iter().any(|e| e == declared) {
+                return refused(R::DelegationIdNotConferring);
+            }
+        }
+        // The author is the root: no delegation exists to name, so there is
+        // nothing to bind. The non-empty requirement above still stands.
+        AuthorAuthority::Inherent => {}
     }
 
     // ── The author's own signature, against pubkeys from THIS node's
@@ -1641,6 +1854,7 @@ where
 {
     let roots = super::trust_root::trusted_roots_of(directory, node_key_id, now).await?;
     let mut rows: Vec<Attestation> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     for root in &roots {
         match directory.list_attestations_for(root).await {
             Ok(found) => rows.extend(
@@ -1648,11 +1862,27 @@ where
                     .into_iter()
                     .filter(|r| env_str(r, "dimension").is_some_and(is_mesh_config_dimension)),
             ),
-            Err(Error::Unsupported { .. }) => {}
+            // v30.0.0 (#601) — RECORDED, not swallowed. This arm used to be
+            // `{}`, which made an unanswerable backend indistinguishable from a
+            // silent root. It is still not an error: `Unsupported` is a
+            // legitimate answer from a backend that does not carry this plane,
+            // and failing the whole fold would take mesh-config resolution down
+            // on it entirely. But the caller has to be able to SEE it, because
+            // on a restrict-only plane a swallowed root reads as fewer
+            // restrictions than the node consented to.
+            Err(Error::Unsupported { .. }) => unreadable.push(root.clone()),
             Err(e) => return Err(e),
         }
     }
-    Ok(fold_mesh_config(node_key_id, baseline, &roots, &rows, now))
+    let mut fold = fold_mesh_config(node_key_id, baseline, &roots, &rows, now);
+    // Set here rather than inside `fold_mesh_config`, which stays a PURE
+    // function of held rows. Unreadability is a fact about this read, not about
+    // the rows — folding it in would make the pure fold's output depend on
+    // something no row carries.
+    unreadable.sort();
+    unreadable.dedup();
+    fold.unreadable_roots = unreadable;
+    Ok(fold)
 }
 
 #[cfg(test)]
@@ -1662,6 +1892,155 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().expect("rfc3339")
+    }
+
+    /// v30.0.0 (CIRISPersist#602) — **this module's prose count is checked
+    /// against the registry.**
+    ///
+    /// Three doc comments state how many keys exist. #602's split moved the
+    /// number and every one of them would have gone quietly stale — the class
+    /// this repo spent v28.3.0 and v29.0.0 fixing twice (30 references to a
+    /// version that never shipped; "53 testimonial rows" that were always 49).
+    /// A count a reader ACTS on is not allowed to be hand-maintained here.
+    #[test]
+    fn the_doc_counts_match_the_registry() {
+        const SRC: &str = include_str!("mesh_config.rs");
+        let n = MeshConfigKey::ALL.len();
+        let words = [
+            (0, "zero"),
+            (1, "one"),
+            (2, "two"),
+            (3, "three"),
+            (4, "four"),
+            (5, "five"),
+            (6, "six"),
+            (7, "seven"),
+            (8, "eight"),
+            (9, "nine"),
+            (10, "ten"),
+            (11, "eleven"),
+            (12, "twelve"),
+        ];
+        let word = words
+            .iter()
+            .find(|(v, _)| *v == n)
+            .map(|(_, w)| *w)
+            .expect("registry outgrew the spelled-number table; extend it");
+        let mut checked = 0usize;
+        // Only phrases that denote the WHOLE registry — "all N keys", "the N
+        // keys". Bare "<word> keys" would also match legitimate prose about a
+        // subset ("no TWO keys drive the same knob"), and a gate that fires on
+        // correct text gets deleted by the next person who hits it.
+        for (v, w) in words {
+            let whole = [format!("all {w} keys"), format!("the {w} keys")];
+            if whole.iter().any(|ph| SRC.contains(ph.as_str())) {
+                let phrase = whole
+                    .iter()
+                    .find(|ph| SRC.contains(ph.as_str()))
+                    .unwrap()
+                    .clone();
+                checked += 1;
+                assert_eq!(
+                    v, n,
+                    "a doc comment says \"{phrase}\" but the registry holds {n}. Say \
+                     \"{word} keys\", or this module joins the phantom-count class it \
+                     already carries two gates for."
+                );
+            }
+        }
+        // Non-vacuity. If every doc were reworded to avoid the phrases, this
+        // test would pass by checking nothing — the exact shape it exists to
+        // prevent, one level up.
+        assert!(
+            checked > 0,
+            "no doc comment states the registry size in a form this gate reads. Say \
+             \"all {word} keys\" or \"the {word} keys\" somewhere, or delete this test \
+             rather than leaving a check that cannot fail."
+        );
+    }
+
+    /// v30.0.0 (CIRISPersist#602) — **no consent ceiling may sit below the
+    /// consumer's own operating value.**
+    ///
+    /// `owner_default` is a ceiling and roots only tighten, so a ceiling under
+    /// the consumer's floor is not a mismatch — it is a knob that **cannot be
+    /// satisfied by any root**, which is strictly worse than a wrong default
+    /// because no operator action can reach the intended state.
+    ///
+    /// `redundancy.min_viable_floor` shipped at 3 against a consumer floor of 5
+    /// and nothing said so. This is the check that would have.
+    #[test]
+    fn no_consent_ceiling_sits_below_its_consumers_floor() {
+        for (wire, floor, source) in CONSUMER_FLOORS {
+            let key = MeshConfigKey::ALL
+                .iter()
+                .find(|k| k.spec().wire_name == *wire)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "CONSUMER_FLOORS names `{wire}`, which is not a registered key. Either \
+                         the key was renamed and this table was not, or the table is stale — \
+                         both are the drift this table exists to catch."
+                    )
+                });
+            let spec = key.spec();
+            assert!(
+                spec.owner_default >= *floor,
+                "`{wire}` ceiling is {} but its consumer's own value is {floor} ({source}). \
+                 owner_default is a CEILING and roots may only tighten beneath it, so no root \
+                 can ever configure the consumer to a value it considers viable. Raise the \
+                 ceiling — a generous ceiling only permits; a tight one forbids.",
+                spec.owner_default
+            );
+            assert!(
+                spec.max >= *floor,
+                "`{wire}` domain max is {} but its consumer's value is {floor} ({source}) — \
+                 the value is not even expressible on the wire.",
+                spec.max
+            );
+        }
+    }
+
+    /// v30.0.0 (CIRISPersist#602) — **the two redundancy axes stay two.**
+    ///
+    /// A holder does not hold exactly one symbol, so a knob typed for one
+    /// silently misconfigures the other. Both were `Count` until this cut,
+    /// which is precisely why the manifest could not express the difference —
+    /// the same gap #532 closed with `ci_axis`.
+    #[test]
+    fn redundancy_keys_declare_which_quantity_they_count() {
+        use MeshConfigUnit::{Holders, Symbols};
+        for key in MeshConfigKey::ALL {
+            let spec = key.spec();
+            if !spec.wire_name.starts_with("redundancy.") {
+                continue;
+            }
+            assert!(
+                matches!(spec.unit, Symbols | Holders),
+                "`{}` is a redundancy knob typed `{}`. Every redundancy key counts EITHER \
+                 fountain symbols OR distinct holders, and `count` is the fusion that let \
+                 `target_repair_symbols` be read by a planner counting holders.",
+                spec.wire_name,
+                spec.unit.as_str()
+            );
+            // The name must agree with the type, so a reader cannot be misled
+            // by either one alone.
+            let says_symbols = spec.wire_name.contains("symbols");
+            let says_holders = spec.wire_name.contains("holders");
+            assert!(
+                says_symbols ^ says_holders,
+                "`{}` names neither or both axes; a redundancy wire name must say which.",
+                spec.wire_name
+            );
+            assert_eq!(
+                says_symbols,
+                spec.unit == Symbols,
+                "`{}` is typed `{}` but its NAME says otherwise. The name and the unit are two \
+                 statements of one fact and must not be able to disagree — that disagreement \
+                 is how `k_repair_target` came to carry `n_source`'s value.",
+                spec.wire_name,
+                spec.unit.as_str()
+            );
+        }
     }
 
     /// A mesh-config row. No signature, no directory — the fold is pure and
@@ -1724,7 +2103,15 @@ mod tests {
     /// wire surfaces.
     #[test]
     fn the_key_registry_is_closed_and_round_trips() {
-        assert_eq!(MeshConfigKey::ALL.len(), 9, "#570's initial registry");
+        // 9 at #570; 11 after CIRISPersist#602 split the two redundancy knobs
+        // into their symbol and holder axes. Update BOTH this number and the
+        // prose above when the registry moves — the doc counts are checked by
+        // `the_doc_counts_match_the_registry` for exactly that reason.
+        assert_eq!(
+            MeshConfigKey::ALL.len(),
+            11,
+            "#570's registry + #602's axis split"
+        );
         for &k in MeshConfigKey::ALL {
             assert_eq!(MeshConfigKey::from_wire(k.wire_name()), Some(k));
             assert_eq!(MeshConfigKey::from_dimension(&k.dimension()), Some(k));
@@ -1885,8 +2272,8 @@ mod tests {
         use MeshConfigKey as K;
         // Higher = more flow.
         for (k, more, less) in [
-            (K::RedundancyKRepairTarget, 20, 10),
-            (K::RedundancyMinViableFloor, 6, 3),
+            (K::RedundancyKRepairSymbols, 20, 10),
+            (K::RedundancyMinViableSymbols, 6, 3),
             (K::AntientropyPageLimit, 500, 100),
             (K::FeatureAvStreams, 1, 0),
             (K::FeatureTraceReplication, 1, 0),
@@ -1963,7 +2350,7 @@ mod tests {
     fn a_root_cannot_expand_past_what_the_node_consented_to() {
         use MeshConfigKey as K;
         let base = MeshConfigBaseline::owner_defaults()
-            .with(K::RedundancyKRepairTarget, 10)
+            .with(K::RedundancyKRepairSymbols, 10)
             .with(K::AntientropyRoundSecs, 300);
         let roots = vec!["root-a".to_owned()];
         let rows = vec![
@@ -1972,7 +2359,7 @@ mod tests {
                 "m-expand-hi",
                 "root-a",
                 "root-a",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 40,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -1990,7 +2377,7 @@ mod tests {
         ];
         let fold = fold_mesh_config("node-1", &base, &roots, &rows, ts(NOW));
 
-        let hi = fold.setting(K::RedundancyKRepairTarget).unwrap();
+        let hi = fold.setting(K::RedundancyKRepairSymbols).unwrap();
         assert_eq!(hi.effective, 10, "clamped to consent, not raised to 40");
         assert!(!hi.relieved);
         assert_eq!(hi.clamped_roots, vec!["root-a".to_owned()]);
@@ -2015,13 +2402,13 @@ mod tests {
             "m-relief",
             "root-a",
             "root-a",
-            K::RedundancyKRepairTarget,
+            K::RedundancyKRepairSymbols,
             10,
             "2026-08-03T10:00:00Z",
             None,
         )];
         let fold = fold_mesh_config("node-1", &base, &roots, &rows, ts(NOW));
-        let s = fold.setting(K::RedundancyKRepairTarget).unwrap();
+        let s = fold.setting(K::RedundancyKRepairSymbols).unwrap();
         assert_eq!(s.baseline, 20);
         assert_eq!(s.effective, 10, "#570's headline: 20 copies to 10");
         assert!(s.relieved);
@@ -2190,7 +2577,7 @@ mod tests {
                 "m1",
                 "root-a",
                 "root-a",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 8,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -2199,7 +2586,7 @@ mod tests {
                 "m2",
                 "root-b",
                 "root-b",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 15,
                 "2026-08-03T11:00:00Z",
                 None,
@@ -2225,7 +2612,7 @@ mod tests {
         ];
         let fold = fold_mesh_config("node-1", &base, &roots, &rows, ts(NOW));
 
-        let hi = fold.setting(K::RedundancyKRepairTarget).unwrap();
+        let hi = fold.setting(K::RedundancyKRepairSymbols).unwrap();
         assert_eq!(
             hi.effective, 8,
             "most-restrictive: 8 copies is tighter than 15. Answering 15 means the fold took the \
@@ -2255,14 +2642,14 @@ mod tests {
     fn a_node_cannot_choose_the_permissive_root_even_deliberately() {
         use MeshConfigKey as K;
         // The node pins its OWN baseline at the loose root's value.
-        let base = MeshConfigBaseline::owner_defaults().with(K::RedundancyKRepairTarget, 15);
+        let base = MeshConfigBaseline::owner_defaults().with(K::RedundancyKRepairSymbols, 15);
         let roots = vec!["root-loose".to_owned(), "root-tight".to_owned()];
         let rows = vec![
             row(
                 "m1",
                 "root-loose",
                 "root-loose",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 15,
                 "2026-08-03T11:00:00Z",
                 None,
@@ -2271,14 +2658,14 @@ mod tests {
                 "m2",
                 "root-tight",
                 "root-tight",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 4,
                 "2026-08-03T10:00:00Z",
                 None,
             ),
         ];
         let fold = fold_mesh_config("node-1", &base, &roots, &rows, ts(NOW));
-        let s = fold.setting(K::RedundancyKRepairTarget).unwrap();
+        let s = fold.setting(K::RedundancyKRepairSymbols).unwrap();
         assert_eq!(
             s.effective, 4,
             "the tight root binds regardless of the node's own preference — CC 4.2.1: \
@@ -2301,7 +2688,7 @@ mod tests {
                 "a",
                 "r1",
                 "r1",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 12,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -2310,7 +2697,7 @@ mod tests {
                 "b",
                 "r2",
                 "r2",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 6,
                 "2026-08-03T11:00:00Z",
                 None,
@@ -2319,7 +2706,7 @@ mod tests {
                 "c",
                 "r3",
                 "r3",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 18,
                 "2026-08-03T09:00:00Z",
                 None,
@@ -2353,7 +2740,7 @@ mod tests {
             ),
         ];
         let expected = fold_mesh_config("n", &base, &roots, &rows, ts(NOW));
-        assert_eq!(expected.effective(K::RedundancyKRepairTarget), 6);
+        assert_eq!(expected.effective(K::RedundancyKRepairSymbols), 6);
         assert_eq!(expected.effective(K::AntientropyRoundSecs), 900);
         assert!(expected.flag(K::BackpressureSummaryOnly));
 
@@ -2397,7 +2784,7 @@ mod tests {
                 "zzz-loose",
                 "r",
                 "r",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 20,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -2406,7 +2793,7 @@ mod tests {
                 "aaa-tight",
                 "r",
                 "r",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 5,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -2414,7 +2801,7 @@ mod tests {
         ];
         let fold = fold_mesh_config("n", &base, &roots, &rows, ts(NOW));
         assert_eq!(
-            fold.effective(K::RedundancyKRepairTarget),
+            fold.effective(K::RedundancyKRepairSymbols),
             5,
             "restriction must win a same-instant tie; picking by attestation_id would answer 20 \
              for `aaa-tight` < `zzz-loose`"
@@ -2424,7 +2811,7 @@ mod tests {
         rev.reverse();
         assert_eq!(
             fold_mesh_config("n", &base, &roots, &rev, ts(NOW))
-                .effective(K::RedundancyKRepairTarget),
+                .effective(K::RedundancyKRepairSymbols),
             5
         );
     }
@@ -2446,7 +2833,7 @@ mod tests {
                 "m-expired",
                 "r",
                 "r",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 4,
                 "2026-08-03T09:00:00Z",
                 Some("2026-08-03T11:00:00Z"),
@@ -2464,8 +2851,8 @@ mod tests {
         ];
         let fold = fold_mesh_config("n", &base, &roots, &rows, ts(NOW));
         assert_eq!(
-            fold.effective(K::RedundancyKRepairTarget),
-            K::RedundancyKRepairTarget.owner_default(),
+            fold.effective(K::RedundancyKRepairSymbols),
+            K::RedundancyKRepairSymbols.owner_default(),
             "an expired emergency must stop binding without anyone revoking it"
         );
         assert_eq!(
@@ -2474,7 +2861,7 @@ mod tests {
             "a future-dated row has not taken effect"
         );
         assert!(fold
-            .setting(K::RedundancyKRepairTarget)
+            .setting(K::RedundancyKRepairSymbols)
             .unwrap()
             .per_root
             .is_empty());
@@ -2482,10 +2869,10 @@ mod tests {
         // Wound back one hour, the SAME row set binds — proving the drop is
         // the TTL and not a parse failure.
         let earlier = fold_mesh_config("n", &base, &roots, &rows, ts("2026-08-03T10:00:00Z"));
-        assert_eq!(earlier.effective(K::RedundancyKRepairTarget), 4);
+        assert_eq!(earlier.effective(K::RedundancyKRepairSymbols), 4);
         assert_eq!(
             earlier
-                .setting(K::RedundancyKRepairTarget)
+                .setting(K::RedundancyKRepairSymbols)
                 .unwrap()
                 .form
                 .unwrap(),
@@ -2507,7 +2894,7 @@ mod tests {
             "m",
             "r",
             "r",
-            K::RedundancyKRepairTarget,
+            K::RedundancyKRepairSymbols,
             5,
             "2026-08-03T10:00:00Z",
             None,
@@ -2522,8 +2909,8 @@ mod tests {
             ts(NOW),
         );
         assert_eq!(
-            fold.effective(K::RedundancyKRepairTarget),
-            K::RedundancyKRepairTarget.owner_default()
+            fold.effective(K::RedundancyKRepairSymbols),
+            K::RedundancyKRepairSymbols.owner_default()
         );
         assert_eq!(
             fold.effective(K::AdmissionRatePerKey),
@@ -2551,7 +2938,7 @@ mod tests {
                 "m-stranger",
                 "x",
                 "x",
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 1,
                 "2026-08-03T10:00:00Z",
                 None,
@@ -2565,8 +2952,8 @@ mod tests {
             K::AntientropyRoundSecs.owner_default()
         );
         assert_eq!(
-            fold.effective(K::RedundancyKRepairTarget),
-            K::RedundancyKRepairTarget.owner_default(),
+            fold.effective(K::RedundancyKRepairSymbols),
+            K::RedundancyKRepairSymbols.owner_default(),
             "root `x` is not in the node's subscription set, so it says nothing to this node"
         );
         assert_eq!(fold.roots, vec!["r".to_owned()]);
@@ -2581,7 +2968,7 @@ mod tests {
             "m",
             "r",
             "r",
-            K::RedundancyKRepairTarget,
+            K::RedundancyKRepairSymbols,
             5,
             "2026-08-03T10:00:00Z",
             Some("2026-08-03T20:00:00Z"),
@@ -2596,8 +2983,8 @@ mod tests {
             ts(NOW),
         );
         assert_eq!(
-            fold.effective(K::RedundancyKRepairTarget),
-            K::RedundancyKRepairTarget.owner_default(),
+            fold.effective(K::RedundancyKRepairSymbols),
+            K::RedundancyKRepairSymbols.owner_default(),
             "a garbled TTL must drop the row, not grant it eternal life"
         );
     }
@@ -2734,9 +3121,17 @@ mod tests {
         }
         // root_a confers config authority on `delegate` — the CC 3.2
         // delegation plane CC 4.2.1 names verbatim.
+        //
+        // v30.0.0 (#601) — the id is BOUND to a variable and threaded into the
+        // rows below. It used to be a discarded `Uuid::new_v4()` while every
+        // row declared the literal "att-deleg", and the door admitted them:
+        // the fixture was exercising the exact defect #601 reported, and
+        // passing. A conferral whose id nothing references cannot witness that
+        // `delegation_id` means anything.
+        let conferral_id = uuid::Uuid::new_v4().to_string();
         dir.put_attestation(super::super::SignedAttestation {
             attestation: trust_edge(
-                &uuid::Uuid::new_v4().to_string(),
+                &conferral_id,
                 &root_a,
                 &delegate,
                 crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
@@ -2774,7 +3169,7 @@ mod tests {
         let relief = signed_config_row(
             &root_a,
             &root_a,
-            K::RedundancyKRepairTarget,
+            K::RedundancyKRepairSymbols,
             10,
             MeshConfigForm::Emergency,
             now - Duration::hours(1),
@@ -2788,7 +3183,8 @@ mod tests {
             "[{tag}] 20 copies -> 10 is relief and must admit"
         );
 
-        // ── 2. THE CONFERRED AUTHOR: a key the root delegated to.
+        // ── 2. THE CONFERRED AUTHOR: a key the root delegated to, naming the
+        //       conferral it actually acted under.
         let by_delegate = signed_config_row(
             &delegate,
             &root_a,
@@ -2798,7 +3194,35 @@ mod tests {
             now - Duration::hours(1),
             Some(now + Duration::hours(24)),
             None,
-            "att-deleg",
+            &conferral_id,
+        );
+        // v30.0.0 (#601) — THE WITNESS for the defect. Same author, same root,
+        // same everything the door verified — differing ONLY in the id it
+        // claims to have acted under. Before this, a well-formed id naming
+        // nothing landed in a stored, signed row and was reported downstream as
+        // verified provenance. The NEGATIVE control is `by_delegate` directly
+        // below: identical call shape, real conferral, admitted — so "the
+        // delegate arm broke entirely" cannot pass this pair.
+        let wrong_delegation = signed_config_row(
+            &delegate,
+            &root_a,
+            K::AntientropyRoundSecs,
+            600,
+            MeshConfigForm::Emergency,
+            now - Duration::hours(1),
+            Some(now + Duration::hours(24)),
+            None,
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        assert_eq!(
+            door!(wrong_delegation),
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::DelegationIdNotConferring
+            },
+            "[{tag}] an act must name the conferral it ACTUALLY acted under. A syntactically \
+             valid id that names no live trust:confers:v1 edge is worse than naming none: it \
+             reads as attributed, and gets stored in a signed row anything downstream will \
+             report as verified provenance."
         );
         assert_eq!(
             door!(by_delegate),
@@ -2833,6 +3257,10 @@ mod tests {
              a fresh mesh until someone fires a 72h emergency to bootstrap one — the \
              circular-at-genesis class."
         );
+        // Names the REAL conferral, so this row reaches the durability check
+        // rather than stopping at #601's attribution gate — the refusal under
+        // test is DurableWithoutRootQuorum, and a fixture that never gets there
+        // would assert it while proving something else.
         let cold_durable_by_delegate = signed_config_row(
             &delegate,
             &root_a,
@@ -2842,7 +3270,7 @@ mod tests {
             now - Duration::hours(1),
             None,
             None,
-            "att-deleg",
+            &conferral_id,
         );
         assert_eq!(
             door!(cold_durable_by_delegate),
@@ -2872,7 +3300,7 @@ mod tests {
             ),
             (
                 "relieve-never-expand at the door: 40 copies is MORE than the 20 consented",
-                signed_config_row(&root_a, &root_a, K::RedundancyKRepairTarget, 40,
+                signed_config_row(&root_a, &root_a, K::RedundancyKRepairSymbols, 40,
                     MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
                 MeshConfigRefusalReason::ExpandsBeyondConsent,
             ),
@@ -3056,7 +3484,7 @@ mod tests {
             attestation: signed_config_row(
                 &root_b,
                 &root_b,
-                K::RedundancyKRepairTarget,
+                K::RedundancyKRepairSymbols,
                 4,
                 MeshConfigForm::Durable,
                 now - Duration::hours(1),
@@ -3077,7 +3505,7 @@ mod tests {
             "[{tag}] both subscriptions are folded, and only those"
         );
         let s = fold
-            .setting(K::RedundancyKRepairTarget)
+            .setting(K::RedundancyKRepairSymbols)
             .unwrap_or_else(|| panic!("[{tag}] key present"));
         assert_eq!(
             s.effective, 4,

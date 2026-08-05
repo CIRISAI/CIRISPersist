@@ -5,6 +5,109 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.0.0] — 2026-08-05 — the knob that named a quantity it did not carry, and the attribution that read as verified
+
+- **BREAKING — #602: `redundancy.*` split into two typed axes.** persist shipped two keys naming
+  `repair_planner` — edge's — as their consumer. Edge's own defaults module decomposes the problem
+  into a **four-tuple** `(n_source, k_repair, min_viable_symbols, target_holders)`, with `k_repair`
+  and `target_holders` as *separate members*. That is not an argument, it is the consumer's own
+  decomposition, and it settles the one-axis-or-two question the issue asked.
+
+  Two defects fell out, and the second is worse than the report:
+
+  - **`redundancy.k_repair_target` carried `n_source`'s 20 under `k_repair`'s name.** Edge pins
+    `k_repair = 6` at a knee its own property test guards. **A unit split would not have caught
+    this** — both quantities are symbols.
+  - **`redundancy.min_viable_floor`'s ceiling was 3 against a consumer floor of 5.**
+    `owner_default` is a **consent ceiling** and roots may only tighten beneath it, so that knob was
+    **unsatisfiable**: no root could ever configure the consumer to a value the consumer itself
+    considers viable. Strictly worse than a wrong default, because no operator action reaches the
+    intended state.
+
+  Now four keys — `redundancy.{k_repair,min_viable}_symbols` (`Symbols`) and
+  `redundancy.{target,min_viable}_holders` (`Holders`). `MeshConfigUnit::Count` stops claiming
+  "copies, rows, symbols": that gloss was the fusion living inside the type, which is why the
+  manifest could not express the difference — the same gap #532 closed with `ci_axis`. Registry 9 →
+  11 keys.
+
+  Three gates, each mutation-tested: a ceiling below a consumer floor fails; a `redundancy.*` key
+  typed `Count`, or whose **name disagrees with its unit**, fails; and the module's own prose count
+  is checked against the registry, with a non-vacuity guard so rewording the docs cannot make it
+  pass by checking nothing.
+
+  **The prevention is only two-thirds shipped, and the missing third is the real one.**
+  `CONSUMER_FLOORS` hand-records edge's constants — the same transcription that produced the bug. It
+  is a **ratchet, not a reconciliation**: it fails when *our* ceiling sinks, and is blind to *edge*
+  raising a floor past our ceiling. Filed as CIRISEdge#453 — publish the constants as a vendorable
+  manifest and gate against it, the `namespace_registry.json` pattern. Worth stating plainly:
+  `consumer: "repair_planner"` is a rule in prose no enforcer can reach, which is exactly what
+  persist filed CIRISConstitution#81 about, **with persist as the author**.
+
+- **BREAKING — #601 item 2: `delegation_id` is bound to the conferral it names.** The door required
+  the field to be non-empty and never checked that the id was the `trust:confers:v1` edge
+  `root_authorizes_author` had just verified — so a well-formed but unrelated id landed in a stored,
+  signed row and was reported downstream as **verified provenance. The attribution read as verified
+  and was not.**
+
+  `root_authorizes_author` now returns `AuthorAuthority::{Inherent, Conferred(ids), None}` instead of
+  `bool`, which is what threw the binding away. New refusal `delegation_id_not_conferring` —
+  distinct from `unattributed`, because naming a *different* authority is worse than naming none.
+  Where the author **is** the root there is no delegation to bind, so the non-empty requirement
+  stands and nothing is invented.
+
+  **The repo's own fixture was exercising the defect and passing** — it declared `"att-deleg"` while
+  the conferral it was supposed to name had a random UUID. Both are now bound, and the witness pairs
+  a wrong id against `by_delegate` as negative control so "the delegate arm broke entirely" cannot
+  pass.
+
+- **#601 item 1: `resolve_mesh_config` stops collapsing a zero.** `Error::Unsupported` per root was
+  swallowed, making *"this backend cannot answer for root R"* and *"root R said nothing"* the same
+  answer. `MeshConfigFold` gains `unreadable_roots`. The field it sits beside already stated the rule
+  it was breaking — `settings` returns all keys always because *"a consumer should never have to
+  distinguish 'not set' from 'not returned'"* — the identical defect one level up, for roots instead
+  of keys. It matters in one direction here: on a restrict-only plane a swallowed root renders as a
+  node under **fewer** restrictions than it consented to.
+
+  **Shipped with no automated witness, and says so in its own doc.** No shipped backend can return
+  `Unsupported`, so reaching the arm needs a `FederationDirectory` double — 78 required methods.
+  Filed as **#603**: the trait's size has now blocked two witnesses this cycle, and every failure
+  mode it makes expensive to reproduce arrives instead as a downstream bug report.
+
+- **#601 item 3 + #596 item 3 — one extraction closed both.** `attestation_emit::assemble` splits
+  the pure recipe from the put, and `Engine::assemble_attestation_self` exposes it. Two ops asked
+  independently from two planes: a co-signed cold durable `mesh_config` row needs canonical bytes
+  that do not yet exist anywhere, and `record_quarantine_marker` takes an already-signed row. Both
+  were hand-rolling a 20-field `Attestation` **around** the chokepoint built to stop exactly that —
+  a gate with no sanctioned path around it does not stop the traffic, it just stops seeing it.
+  Carries the same #293 and #527 admission gates, because they are properties of the **row**: a row
+  the put path refuses must not become emittable by declining to store it.
+
+- **#596 item 2: `window`, `tier` and `attester_filter` bind.** `list_attestations` emitted nine axes
+  and dropped these three, identically on both SQL backends — parity held in the sense that both were
+  wrong the same way. Setting `window` read as a bound and was none, the class `dimension_exact` was
+  in until v17.5.2 (#461). It fed an operator preview committed on a selection hash, so a dropped
+  window meant ratifying a hash over a **larger** row set than was shown.
+
+  Emitted from **one** function per backend rather than copied into the second builder, since two
+  implementations of one filter axis is how the handles diverged. The comment claiming
+  `list_attestations` was federation-only was **false** — it had no tier predicate at all; an
+  explicit `tier` is now honoured identically on both handles, while `tier: None` keeps each handle's
+  historical meaning, stated rather than asserted away, because narrowing it silently would stop
+  returning callers' own local rows.
+
+  **My first wiring landed inside the `subject_key_id` block on both backends.** It compiled, and
+  would have passed any test that happened to set a subject. The sqlite witness caught it; the pg
+  twin had the same bug and was found by checking rather than inheriting confidence.
+
+- **#596 item 3b: `delegation_scope_set` is `pub`.** The only public authority predicate was
+  `reachable_under_scope`, true the moment the issuer granted the scope by **any** edge —
+  CIRISServer's mutation testing caught that permitting a `review` delegation to authorise a `slash`
+  de-admission. They mirrored persist's parse to close it; that copy is a second implementation of
+  an authority rule, and it can now be deleted.
+
+- **BREAKING — verify 13.0.0 pin, `ClassificationStanding::Structural`, and the #600 frame column**
+  all landed in v29.0.0; this cut carries them forward unchanged.
+
 ## [29.0.0] — 2026-08-04 — verify 13.0.0's arity ruling: a frame is not decoration, and durability belongs to quorum
 
 - **BREAKING — `ClassificationStanding` gains a fourth variant, `Structural { breaks }`.** CIRISVerify

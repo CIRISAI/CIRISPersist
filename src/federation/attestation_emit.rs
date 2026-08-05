@@ -70,6 +70,45 @@ pub async fn assemble_and_put<D>(
 where
     D: FederationDirectory + Sync + ?Sized,
 {
+    let (row, emitted) = assemble(key_id, canonical, sig, input)?;
+    dir.put_attestation(SignedAttestation { attestation: row })
+        .await?;
+    Ok(emitted)
+}
+
+/// v30.0.0 (CIRISPersist#601 item 3 / CIRISPersist#596 item 3) — **the recipe
+/// WITHOUT the put.**
+///
+/// Every sanctioned emit helper canonicalizes, signs, assembles **and puts**.
+/// That is right for the ordinary path and wrong for two real ops, which asked
+/// for it independently from two different planes:
+///
+/// - **A co-signed row.** A cold durable `mesh_config` under a family root needs
+///   ≥m distinct seated holders' scrubs. A node cannot produce the canonical
+///   bytes for co-signers without a row, and cannot make a row without storing
+///   one.
+/// - **A marker assembled elsewhere.** `record_quarantine_marker` takes an
+///   already-signed [`Attestation`], so the one door built for tier 2 was
+///   unreachable through the chokepoint built to stop hand-rolled rows.
+///
+/// Both consumers hand-rolled a 20-field row instead — *through* the chokepoint,
+/// which is the outcome the chokepoint exists to prevent. **A gate with no
+/// sanctioned path around it does not stop the traffic; it just stops seeing
+/// it.**
+///
+/// This carries **the same two admission gates** as the put path — #293 subject
+/// canonicality and #527 cohort_scope validate-never-default — because they are
+/// properties of the ROW, not of storing it. A row that would be refused on the
+/// way in must not become emittable by declining to store it here.
+///
+/// Returns the row and the [`EmittedAttestation`] summary the put path returns,
+/// so a caller can assemble now and put later through the ordinary door.
+pub fn assemble(
+    key_id: String,
+    canonical: &[u8],
+    sig: ciris_crypto::HybridSignature,
+    input: EmitAttestationInput,
+) -> Result<(Attestation, EmittedAttestation), Error> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use sha2::{Digest, Sha256};
 
@@ -111,10 +150,7 @@ where
         is_grant_dimension: super::admission::envelope_dimension(&row.attestation_envelope)
             == Some(super::consent_grammar::GRANT_DIMENSION),
     };
-
-    dir.put_attestation(SignedAttestation { attestation: row })
-        .await?;
-    Ok(emitted)
+    Ok((row, emitted))
 }
 
 /// The whole recipe over an explicit

@@ -3711,6 +3711,52 @@ impl Engine {
             .await
     }
 
+    /// v30.0.0 (CIRISPersist#601 item 3 / #596 item 3) — **canonicalize, sign
+    /// and assemble a federation-tier row, and do NOT store it.**
+    ///
+    /// [`emit_attestation_self`](Self::emit_attestation_self) is exactly this
+    /// plus the `put`. Two ops need the bytes without the row landing:
+    ///
+    /// - a **co-signed** row — a cold durable `mesh_config` under a family root
+    ///   needs ≥m seated holders' scrubs, and co-signers need canonical bytes
+    ///   that do not yet exist anywhere;
+    /// - a **marker assembled here and stored by a different door** —
+    ///   `record_quarantine_marker` takes an already-signed row.
+    ///
+    /// Both were hand-rolling a 20-field `Attestation` to get it, *around* the
+    /// chokepoint built to stop exactly that. Reported independently from two
+    /// planes, which is the signal that the missing piece was the seam and not
+    /// either caller.
+    ///
+    /// **Carries the same admission gates as the put path** (#293 subject
+    /// canonicality, #527 cohort_scope validate-never-default): they are
+    /// properties of the row, so declining to store it must not make a
+    /// refusable row emittable.
+    ///
+    /// The returned row has an empty `persist_row_hash` — it is stamped at
+    /// store time, by whichever door finally admits it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn assemble_attestation_self(
+        &self,
+        input: crate::federation::EmitAttestationInput,
+    ) -> Result<crate::federation::SignedAttestation, crate::federation::Error> {
+        let key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "assemble_attestation_self derive key_id: {e}"
+            ))
+        })?;
+        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "assemble_attestation_self sign_hybrid: {e} — a conformant federation-tier row \
+                 requires a composed hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+            ))
+        })?;
+        let (row, _emitted) =
+            crate::federation::attestation_emit::assemble(key_id, &canonical, sig, input)?;
+        Ok(crate::federation::SignedAttestation { attestation: row })
+    }
+
     /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
     /// canonicalize the envelope (produce gate → JCS post-cut, §0.9). The
     /// canonical bytes are both SHA-256'd (`original_content_hash`) and
@@ -12546,6 +12592,96 @@ mod tests {
     /// engine's composed signer and derives attester/scrub from
     /// `local_derived_key_id()`, producing the SAME row shape as
     /// `emit_attestation(&signer, …)`: federation tier, attester == scrub ==
+    /// v30.0.0 (CIRISPersist#601 item 3 / #596 item 3) — **assemble without
+    /// storing, and the row is not second-class.**
+    ///
+    /// Three things, because any one alone would pass for a broken
+    /// implementation:
+    ///
+    /// 1. **Nothing is stored.** Asserted as a count that stays at zero across
+    ///    repeated calls, not merely "unchanged" — an implementation that
+    ///    stored one row per call would keep a count "unchanged" between two
+    ///    reads taken after the fact.
+    /// 2. **The row the ordinary door admits.** The whole point is to stop
+    ///    callers hand-rolling 20-field rows, so a row this produces must pass
+    ///    `put_attestation` unmodified. If it did not, the helper would just be
+    ///    a nicer way to hand-roll.
+    /// 3. **The admission gates still fire.** They are properties of the row,
+    ///    so declining to store it must not turn a refusable row into an
+    ///    emittable one.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn assemble_attestation_self_does_not_store_and_the_door_admits_it() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-asm");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-asm"))
+            .await
+            .expect("seed key");
+
+        let mk = || {
+            crate::federation::EmitAttestationInput::with_envelope(
+                SCORES,
+                crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                    "id": "asm-1", "dimension": "identity_binding:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }))
+                .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
+            )
+        };
+
+        // (1) five assembles store NOTHING.
+        for _ in 0..5 {
+            engine
+                .assemble_attestation_self(mk())
+                .await
+                .expect("assemble");
+        }
+        let held = sq.list_attestations_by(&derived).await.expect("list");
+        assert_eq!(
+            held.len(),
+            0,
+            "assemble_attestation_self must not write. Five calls left {} row(s) — a helper \
+             that stores is the door it was built to avoid.",
+            held.len()
+        );
+
+        // (2) the row the REAL door admits, unmodified.
+        let assembled = engine
+            .assemble_attestation_self(mk())
+            .await
+            .expect("assemble");
+        let id = assembled.attestation.attestation_id.clone();
+        sq.put_attestation(assembled)
+            .await
+            .expect("the ordinary door must admit an assembled row unmodified");
+        let held = sq.list_attestations_by(&derived).await.expect("list");
+        assert_eq!(held.len(), 1, "exactly the row we put");
+        assert_eq!(held[0].attestation_id, id);
+        assert!(
+            !held[0].scrub_signature_classical.is_empty() && held[0].scrub_signature_pqc.is_some(),
+            "assembled rows carry a real composed hybrid scrub, not placeholder bytes"
+        );
+
+        // (3) the gates travelled with the body: #527 cohort_scope is
+        // validated, never defaulted.
+        let mut bad = mk();
+        bad.cohort_scope = "not-a-cohort".to_owned();
+        let err = engine.assemble_attestation_self(bad).await;
+        assert!(
+            err.is_err(),
+            "a cohort_scope the put path refuses must not become emittable by declining to \
+             store the row — the gates are properties of the ROW"
+        );
+    }
+
     /// derived key_id, self-attested, populated hybrid scrub.
     #[cfg(feature = "sqlite")]
     #[tokio::test]

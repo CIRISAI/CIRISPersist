@@ -3930,9 +3930,29 @@ fn delegation_valid_until_lapsed(
         .unwrap_or(false)
 }
 
-pub(crate) fn delegation_scope_set(
-    envelope: &serde_json::Value,
-) -> std::collections::HashSet<String> {
+/// v30.0.0 (CIRISPersist#596 item 3) — **the scopes a `delegates_to` envelope
+/// actually confers**, exported so consumers stop re-implementing it.
+///
+/// `pub(crate)` until now, which left the only public authority predicate as
+/// [`reachable_under_scope`] — true the moment the issuer granted `S` by **any**
+/// edge. CIRISServer's mutation testing caught what that permits: without a
+/// per-row scope check their route **recorded a `review` delegation as the
+/// authority for a `slash` de-admission**. They mirrored this parse on their
+/// side to close it, and marked the copy for deletion the day this is exported.
+///
+/// That copy is the thing worth avoiding. A second implementation of an
+/// authority rule is the split-truth shape this repo has spent the cycle
+/// closing — the same defect persist filed CIRISConstitution#81 about, where a
+/// rule stated in one place is re-derived in another and nothing detects the
+/// two disagreeing.
+///
+/// Tolerant of both wire shapes a `scope` field takes (a bare string, or an
+/// array), because refusing a legitimate single-scope envelope on a parse
+/// quirk would fail CLOSED on the authority plane — and an authority predicate
+/// that silently returns an empty set is indistinguishable from "confers
+/// nothing".
+#[must_use]
+pub fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashSet<String> {
     match envelope.get("scope") {
         Some(serde_json::Value::String(s)) => std::iter::once(s.clone()).collect(),
         Some(serde_json::Value::Array(arr)) => arr

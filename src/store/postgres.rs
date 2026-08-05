@@ -14228,6 +14228,53 @@ const PG_SCORES_FA_COLS: &str = "fa.attestation_id::text AS attestation_id, fa.a
 /// §4.3 scope gate, over aliases `s` (`attestation_subjects`) and `fa`
 /// (`federation_attestations`). The returned `where_parts` is always non-empty
 /// (tier + scope always emit).
+/// v30.0.0 (CIRISPersist#596 item 2) — the postgres twin of
+/// [`sqlite_selection_axes`](crate::store::sqlite::sqlite_selection_axes)'s job:
+/// `window` / `tier` / `attester_filter` emitted ONCE, so `list_attestations`
+/// and `list_scores` cannot disagree about what a filter means.
+///
+/// Both backends dropped all three from `list_attestations` identically —
+/// parity held, in the sense that both were wrong the same way. `alias` is the
+/// table prefix (`"fa."` where the query joins, `""` where it does not).
+fn pg_selection_axes(
+    filter: &crate::read::AttestationFilter,
+    alias: &str,
+    tier_none_means_federation: bool,
+    where_parts: &mut Vec<String>,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    use crate::read::{AttesterSet, Tier};
+    if let Some((start, end)) = filter.window {
+        params.push(Box::new(start));
+        let ps = params.len();
+        params.push(Box::new(end));
+        let pe = params.len();
+        where_parts.push(format!(
+            "({alias}asserted_at >= ${ps} AND {alias}asserted_at < ${pe})"
+        ));
+    }
+    match filter.tier {
+        Some(Tier::Federation) => where_parts.push(format!("{alias}tier = 'federation'")),
+        Some(Tier::Local) => where_parts.push(format!("{alias}tier = 'local'")),
+        Some(Tier::Any) => {}
+        None => {
+            if tier_none_means_federation {
+                where_parts.push(format!("{alias}tier = 'federation'"));
+            }
+        }
+    }
+    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
+        if keys.is_empty() {
+            // An explicit EMPTY set selects nothing; emitting no predicate
+            // would select everything.
+            where_parts.push("FALSE".to_owned());
+        } else {
+            params.push(Box::new(keys.clone()));
+            where_parts.push(format!("{alias}attesting_key_id = ANY(${})", params.len()));
+        }
+    }
+}
+
 fn pg_scores_shared_predicates(
     filter: &crate::read::AttestationFilter,
     scope: &crate::scope::CallerScope,
@@ -14235,7 +14282,6 @@ fn pg_scores_shared_predicates(
     Vec<String>,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) {
-    use crate::read::{AttesterSet, Tier};
     let mut where_parts: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
     if let Some(subj) = &filter.subject_key_id {
@@ -14291,30 +14337,8 @@ fn pg_scores_shared_predicates(
             "(fa.asserted_at <= ${p} AND (fa.expires_at IS NULL OR fa.expires_at > ${p}))"
         ));
     }
-    if let Some((start, end)) = filter.window {
-        params.push(Box::new(start));
-        let ps = params.len();
-        params.push(Box::new(end));
-        let pe = params.len();
-        where_parts.push(format!(
-            "(fa.asserted_at >= ${ps} AND fa.asserted_at < ${pe})"
-        ));
-    }
-    // tier: default (None) = federation-only.
-    match filter.tier {
-        None | Some(Tier::Federation) => where_parts.push("fa.tier = 'federation'".to_owned()),
-        Some(Tier::Local) => where_parts.push("fa.tier = 'local'".to_owned()),
-        Some(Tier::Any) => {}
-    }
-    // attester_filter: Explicit set membership (All / None = no restriction).
-    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
-        if keys.is_empty() {
-            where_parts.push("FALSE".to_owned());
-        } else {
-            params.push(Box::new(keys.clone()));
-            where_parts.push(format!("fa.attesting_key_id = ANY(${})", params.len()));
-        }
-    }
+    // v30.0.0 (#596) — the three axes from the SHARED emitter.
+    pg_selection_axes(filter, "fa.", true, &mut where_parts, &mut params);
     // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
     {
         let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
@@ -17161,6 +17185,11 @@ impl crate::read::ReadEngine for PostgresBackend {
             params.push(Box::new(subj.clone()));
             where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
         }
+        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter,
+        // dropped by this builder on BOTH backends until now. Same emitter as
+        // `list_scores`; unaliased because this query does not join. `tier:
+        // None` keeps this handle's historical meaning (no predicate).
+        pg_selection_axes(&filter, "", false, &mut where_parts, &mut params);
         // §4.3 scope gate — federation_attestations carries cohort_scope
         // (V056) + attested_key_id (target identity, V055).
         {
@@ -28455,6 +28484,137 @@ mod tests {
             "attester_filter set membership"
         );
         let _ = s2;
+    }
+
+    /// v30.0.0 (CIRISPersist#596 item 2) — the POSTGRES twin of
+    /// `list_attestations_honours_window_tier_and_attester_596`.
+    ///
+    /// Written because the pg wiring had the **same misplacement bug** the
+    /// sqlite one did — the shared emitter was called inside the
+    /// `subject_key_id` block, so the axes only bound when an unrelated filter
+    /// field happened to be set. It compiled, and it would have passed any test
+    /// that set a subject. Parity is not inherited from the sqlite test; it is
+    /// measured here.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_list_attestations_honours_window_tier_and_attester_596() {
+        use crate::ceg::ReadEngine;
+        use crate::read::{AttestationFilter, AttesterSet, Tier};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+
+        let base = chrono::Utc::now() - chrono::Duration::hours(5);
+        let subj = format!("subj-{}", uuid_like());
+        let dim = "trust:filteraxes:v1";
+        let ka = format!("ka-{}", uuid_like());
+        let kb = format!("kb-{}", uuid_like());
+        // Invocation-unique attesters + dimension, so this is safe against a
+        // shared database and does not assert a GLOBAL row count.
+        let a_old = pg_put_score(&be, &ka, &subj, dim, 0.9, base, 0).await;
+        let b_mid = pg_put_score(&be, &kb, &subj, dim, 0.5, base, 120).await;
+        let a_new = pg_put_score(&be, &ka, &subj, dim, 0.7, base, 240).await;
+
+        let q = |f: AttestationFilter| {
+            let be = &be;
+            async move {
+                let mut ids: Vec<String> = be
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let only_ours = |mut v: Vec<String>| {
+            v.retain(|id| id == &a_old || id == &b_mid || id == &a_new);
+            v
+        };
+
+        let all = only_ours(
+            q(AttestationFilter {
+                dimension_exact: Some(dim.to_owned()),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(all.len(), 3, "baseline: all three seeded rows are visible");
+
+        // window — half-open, excludes the row at +240m
+        let windowed = only_ours(
+            q(AttestationFilter {
+                dimension_exact: Some(dim.to_owned()),
+                window: Some((base, base + chrono::Duration::minutes(180))),
+                ..Default::default()
+            })
+            .await,
+        );
+        let mut want = vec![a_old.clone(), b_mid.clone()];
+        want.sort();
+        assert_eq!(windowed, want, "`window` must BIND on postgres too");
+
+        // attester_filter
+        let by_ka = only_ours(
+            q(AttestationFilter {
+                dimension_exact: Some(dim.to_owned()),
+                attester_filter: Some(AttesterSet::Explicit(vec![ka.clone()])),
+                ..Default::default()
+            })
+            .await,
+        );
+        let mut want_ka = vec![a_old.clone(), a_new.clone()];
+        want_ka.sort();
+        assert_eq!(
+            by_ka, want_ka,
+            "`attester_filter` must restrict on postgres"
+        );
+
+        assert_eq!(
+            only_ours(
+                q(AttestationFilter {
+                    dimension_exact: Some(dim.to_owned()),
+                    attester_filter: Some(AttesterSet::Explicit(vec![])),
+                    ..Default::default()
+                })
+                .await
+            ),
+            Vec::<String>::new(),
+            "an explicit EMPTY attester set selects nothing on postgres"
+        );
+
+        // tier — all three are federation rows
+        assert_eq!(
+            only_ours(
+                q(AttestationFilter {
+                    dimension_exact: Some(dim.to_owned()),
+                    tier: Some(Tier::Local),
+                    ..Default::default()
+                })
+                .await
+            ),
+            Vec::<String>::new(),
+            "`tier: Local` must exclude federation rows"
+        );
+        assert_eq!(
+            only_ours(
+                q(AttestationFilter {
+                    dimension_exact: Some(dim.to_owned()),
+                    tier: Some(Tier::Federation),
+                    ..Default::default()
+                })
+                .await
+            )
+            .len(),
+            3,
+            "`tier: Federation` keeps them"
+        );
     }
 
     #[tokio::test]
