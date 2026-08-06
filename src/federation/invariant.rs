@@ -568,6 +568,7 @@ mod tests {
                 for scope in [
                     crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
                     crate::federation::types::delegation_scope::INFRA_DETECT,
+                    crate::federation::types::delegation_scope::INFRA_RECORD_HARD_CASE,
                 ] {
                     crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
                         &backend,
@@ -628,14 +629,22 @@ mod tests {
             // The REFUSAL direction above still runs on every build, so this
             // leg keeps proving the half it can: the wrong identity is rejected.
             #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
-            if crate::federation::admission::default_reserved_prefix_rules()
-                .iter()
-                .any(|r| {
-                    fact.sample_attestation_type
-                        .starts_with(r.pattern_prefix.as_str())
-                        && r.required_delegation_scope.is_some()
-                })
+            if fact.sample_attestation_type.starts_with("hard_case:")
+                || crate::federation::admission::default_reserved_prefix_rules()
+                    .iter()
+                    .any(|r| {
+                        fact.sample_attestation_type
+                            .starts_with(r.pattern_prefix.as_str())
+                            && r.required_delegation_scope.is_some()
+                    })
             {
+                // `hard_case:` is spelled out here rather than found in the rules
+                // table because its conferral requirement is CONDITIONAL —
+                // required only when the row is about a third party — and a
+                // `ReservedPrefixRule` cannot express a condition on the row. The
+                // positive control below builds exactly that third-party shape
+                // (attesting `wia-right-*`, attested `wia-target`), so it needs
+                // the conferral this build cannot sign.
                 continue;
             }
             let right_key = format!("wia-right-{}", fact.required_identity_type);

@@ -28659,6 +28659,20 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::CohortStandingRefused { reason, .. } => {
             PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
         }
+        // v30.3.0 (CIRISPersist#611) — the HOST did not tell this directory who
+        // it is, so a door that must re-derive authority against this node's own
+        // trust root cannot answer. Not caller-fault: no argument the Python
+        // caller could pass would fix it, and the remedy is a `set_node_key_id()`
+        // call in the host's wiring → RuntimeError (5xx), same as `Unsupported`.
+        //
+        // The message carries `method` and `needed_for` rather than the bare
+        // `kind`, for the reason `AdminActionUnattributed` and
+        // `CohortStandingRefused` do: a Python consumer must be able to see WHICH
+        // door went dark and why without holding a second copy of the taxonomy.
+        crate::federation::Error::NodeIdentityUnset {
+            method,
+            needed_for,
+        } => PyRuntimeError::new_err(format!("{kind}: {method} needs {needed_for}")),
     }
 }
 

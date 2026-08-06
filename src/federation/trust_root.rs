@@ -1094,12 +1094,15 @@ pub enum ConferralPlane {
 /// no root the user trusts — or from no root at all). Self-granted scope
 /// (`root == subject`) is skipped: a subject cannot confer capability on
 /// itself here, mirroring the self-root-is-not-an-external-root rule.
-pub async fn capability_roots_to_trusted_root(
-    directory: &dyn FederationDirectory,
+pub async fn capability_roots_to_trusted_root<F>(
+    directory: &F,
     user_key_id: &str,
     subject_key_id: &str,
     scope: &str,
-) -> Result<Option<TrustedGrant>, Error> {
+) -> Result<Option<TrustedGrant>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     capability_roots_to_trusted_root_over_roster(
         directory,
         user_key_id,
@@ -1119,13 +1122,24 @@ pub async fn capability_roots_to_trusted_root(
 /// hardware ceremony), so an explicit-roster variant is the only way a test
 /// or a downstream conformance run can drive the ceremony arm with keys it
 /// actually holds.
-pub async fn capability_roots_to_trusted_root_over_roster(
-    directory: &dyn FederationDirectory,
+// v30.3.0 (CIRISPersist#611) — generic over `?Sized` rather than taking
+// `&dyn FederationDirectory`, matching `trust_root_valid` and
+// `family_quorum_over`, which were already written this way. The change is
+// source-compatible (every `&dyn` and `&Concrete` call site still compiles) and
+// it is what lets a DEFAULT TRAIT METHOD reach this resolver: inside a default
+// body `Self` is not known to be `Sized`, so `&self` does not coerce to `&dyn`.
+// `lookup_trusted_publisher_chain` is such a method, and that coercion was the
+// only thing standing between it and the conferral check #611 needed.
+pub async fn capability_roots_to_trusted_root_over_roster<F>(
+    directory: &F,
     user_key_id: &str,
     subject_key_id: &str,
     scope: &str,
     accord_roster_key_ids: &[String],
-) -> Result<Option<TrustedGrant>, Error> {
+) -> Result<Option<TrustedGrant>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // Every grant ABOUT the subject (delegates_to(* → subject)) plus its
     // tombstones — a withdraws/recants on a grant is attested about the
     // same subject, so the one about-read carries both.

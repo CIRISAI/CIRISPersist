@@ -1081,8 +1081,43 @@ pub trait FederationDirectory: Send + Sync {
         let publishers = self
             .list_keys_by_identity_type(types::identity_type::TRUSTED_PUBLISHER)
             .await?;
+
+        // v30.3.0 (CIRISPersist#611) — **`trusted_publisher` is a claim a key
+        // makes about itself, so holding it is not enough to be in this chain.**
+        //
+        // `conferral_mode(TRUSTED_PUBLISHER)` is `DelegatedFromTrustRoot`, whose
+        // contract is that the authority is "resolved at USE by
+        // `capability_roots_to_trusted_root`". Nothing resolved it. This filter
+        // is what makes the declaration true: a publisher is in the chain only
+        // if a root THIS NODE trusts has conferred `infra:publish_rating` on it.
+        //
+        // Why the check lives here and not on the write door: CC 3.3.12 leaves
+        // `content_rating:` open vocabulary, and #571 removed persist's
+        // CEG-sourced write gate as stricter than the Constitution. CC puts the
+        // discrimination on the read side — *"polarity carries certifier
+        // confidence; not a slashing input"* — so an open write door and a
+        // conferral-filtered read door is the shape CC describes.
+        let node = self.node_key_id().ok_or(Error::NodeIdentityUnset {
+            method: "lookup_trusted_publisher_chain",
+            needed_for: "resolving each publisher's infra:publish_rating conferral against this node's own trust root",
+        })?;
+
         let mut chain: Vec<Attestation> = Vec::new();
         for publisher in publishers {
+            // Resolved per publisher, not cached: a conferral withdrawn between
+            // two reads must stop vouching on the second one. The walk is the
+            // same one the write doors use, so there is one predicate for
+            // "conferred", not two that can drift.
+            let conferred = trust_root::capability_roots_to_trusted_root(
+                self,
+                &node,
+                &publisher.key_id,
+                types::delegation_scope::INFRA_PUBLISH_RATING,
+            )
+            .await?;
+            if conferred.is_none() {
+                continue;
+            }
             let attestations = self.list_attestations_by(&publisher.key_id).await?;
             for att in attestations {
                 if att.attestation_type != types::attestation_type::SCORES {
@@ -5953,12 +5988,43 @@ pub enum Error {
         /// The `FederationDirectory` method name the proxy could not route.
         method: &'static str,
     },
+
+    /// v30.3.0 (CIRISPersist#611). A door that must re-derive authority
+    /// against **this node's own trust root** was asked of a directory that
+    /// does not know which key it is. The answer is neither "admit" nor a
+    /// silent empty result — it is this.
+    ///
+    /// # Why an error and not an empty result
+    ///
+    /// The gate this backs is a filter on a READ
+    /// ([`FederationDirectory::lookup_trusted_publisher_chain`]), where the
+    /// fail-secure reflex is to return nothing. That reflex is wrong here, and
+    /// the reason is the whole decision in #611: a host that forgot
+    /// `set_node_key_id()` would watch legitimate publisher vouches silently
+    /// vanish, with no diagnostic and nothing in the result distinguishing
+    /// "this content has no vouches" from "this node cannot check vouches".
+    /// Those are different facts and a caller acts differently on each.
+    ///
+    /// `Engine` injects the identity at construction, so no ordinary host
+    /// reaches this. It exists for the bare-backend case, and it names what to
+    /// call.
+    #[error(
+        "{method} must re-derive authority against this node's own trust root, but this \
+         directory has no node identity — call set_node_key_id() (needed for: {needed_for})"
+    )]
+    NodeIdentityUnset {
+        /// The method that could not answer.
+        method: &'static str,
+        /// What the identity was needed for, so the message is actionable.
+        needed_for: &'static str,
+    },
 }
 
 impl Error {
     /// Stable string-token for telemetry / structured logging.
     pub fn kind(&self) -> &'static str {
         match self {
+            Error::NodeIdentityUnset { .. } => "federation_node_identity_unset",
             Error::InvalidArgument(_) => "federation_invalid_argument",
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",

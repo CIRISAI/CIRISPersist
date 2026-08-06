@@ -5980,11 +5980,16 @@ fn is_baked_genesis_canonical(row: &super::KeyRecord) -> bool {
 /// roster, so it is silently not counted — self can never confer); (7)
 /// `verify_quorum_policy`. Returns `Ok(())` iff quorum met, else the failure
 /// reason (each caller maps it to its role-specific error variant).
-async fn verify_accord_family_coscrub(
-    directory: &dyn super::FederationDirectory,
+// v30.3.0 (CIRISPersist#611) — `?Sized`-generic; see
+// `has_accord_conferred_role_over_roster`. Source-compatible for `&dyn` callers.
+async fn verify_accord_family_coscrub<F>(
+    directory: &F,
     row: &super::KeyRecord,
     roster_key_ids: &[String],
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    F: super::FederationDirectory + ?Sized,
+{
     verify_accord_family_coscrub_with(
         directory,
         row,
@@ -6118,14 +6123,19 @@ pub fn verify_member_fips_custody_against(
 ///   silently doesn't count (recorded in the error on quorum failure).
 /// - `min_quorum` — `m = max(n/2 + 1, min_quorum)`; when `m > n` the quorum
 ///   is honestly unreachable and the verify fails with the full accounting.
-async fn verify_accord_family_coscrub_with(
-    directory: &dyn super::FederationDirectory,
+// v30.3.0 (CIRISPersist#611) — `?Sized`-generic; see
+// `has_accord_conferred_role_over_roster`. Source-compatible for `&dyn` callers.
+async fn verify_accord_family_coscrub_with<F>(
+    directory: &F,
     row: &super::KeyRecord,
     roster_key_ids: &[String],
     min_quorum: usize,
     require_fips_custody: bool,
     custody_root: &[u8],
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    F: super::FederationDirectory + ?Sized,
+{
     use ciris_verify_core::threshold::{
         verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
     };
@@ -6625,12 +6635,19 @@ pub async fn has_root_delegated_role(
 
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
 /// their own signable holders).
-pub async fn has_accord_conferred_role_over_roster(
-    directory: &dyn super::FederationDirectory,
+// v30.3.0 (CIRISPersist#611) — `?Sized`-generic for the same reason
+// `capability_roots_to_trusted_root_over_roster` is: it sits on that resolver's
+// ceremony arm, so the whole walk has to be reachable from a default trait
+// method. Source-compatible for every existing `&dyn` caller.
+pub async fn has_accord_conferred_role_over_roster<F>(
+    directory: &F,
     key_id: &str,
     role: &str,
     roster_key_ids: &[String],
-) -> Result<bool, Error> {
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
     let Some(row) = directory.lookup_public_key(key_id).await? else {
         return Ok(false);
     };
@@ -8852,13 +8869,74 @@ pub async fn check_reserved_prefix_admission(
             identity_type: got,
         });
     }
-    if is_hard_case && got != identity_type::SUBSTRATE_PERSIST {
-        return Err(Error::ReservedPrefixEmitterMismatch {
-            dimension: at.to_owned(),
-            prefix: "hard_case:".to_owned(),
-            required: vec![identity_type::SUBSTRATE_PERSIST.to_owned()],
-            got_identity_type: got,
-        });
+    if is_hard_case {
+        if got != identity_type::SUBSTRATE_PERSIST {
+            return Err(Error::ReservedPrefixEmitterMismatch {
+                dimension: at.to_owned(),
+                prefix: "hard_case:".to_owned(),
+                required: vec![identity_type::SUBSTRATE_PERSIST.to_owned()],
+                got_identity_type: got,
+            });
+        }
+        // v30.3.0 (CIRISPersist#607) — **a hard_case row ABOUT ANOTHER PARTY
+        // needs a conferral; one about YOURSELF does not.**
+        //
+        // `substrate_persist` is self-assertable, and until now this was a bare
+        // membership test — so a stranger claiming it could author tombstones
+        // about anyone. `hard_case:` is where CIRISServer's graded admin ladder
+        // records every action taken about someone else, carrying the
+        // authorizing delegation id and a mandatory reason: an accountability
+        // plane resting on a claim anybody could make.
+        //
+        // The split is attester==attested, and it is taken STRAIGHT from the
+        // retirement condition `substrate_persist`'s own mode note states:
+        // *"if a `system:*` row ever becomes an input to a decision ABOUT
+        // ANOTHER PARTY, this must move"*. A third-party `hard_case:` row meets
+        // that condition by construction; a self-attested one does not, and
+        // tightening past what the condition names would be scope creep with a
+        // fail-closed edge — a node unable to enter its own incident on the
+        // attestation plane.
+        //
+        // Note what this door does NOT govern: persist's own `hard_case:*`
+        // telemetry (the at-rest cascade, the community-DEK recipient
+        // exclusions, the consent-SLA watcher) is written through
+        // `FederationDirectory::record_hard_case` into `hard_case_events`, a
+        // different table on a different surface. Persist emits no `hard_case:`
+        // ATTESTATION at all. The traffic here is a host's — CIRISServer's
+        // graded admin ladder — which is exactly the third-party case.
+        if row.attested_key_id != row.attesting_key_id {
+            let Some(node) = directory.node_key_id() else {
+                return Err(Error::ReservedPrefixEmitterMismatch {
+                    dimension: at.to_owned(),
+                    prefix: "hard_case:".to_owned(),
+                    required: vec![format!(
+                        "delegated scope {} — but this directory has no node identity, so \
+                         conferral cannot be verified. Call set_node_key_id().",
+                        super::types::delegation_scope::INFRA_RECORD_HARD_CASE
+                    )],
+                    got_identity_type: got,
+                });
+            };
+            let conferred = super::trust_root::capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &row.attesting_key_id,
+                super::types::delegation_scope::INFRA_RECORD_HARD_CASE,
+            )
+            .await?;
+            if conferred.is_none() {
+                return Err(Error::ReservedPrefixEmitterMismatch {
+                    dimension: at.to_owned(),
+                    prefix: "hard_case:".to_owned(),
+                    required: vec![format!(
+                        "delegated scope {} from a root this node trusts (this row is ABOUT \
+                         another party)",
+                        super::types::delegation_scope::INFRA_RECORD_HARD_CASE
+                    )],
+                    got_identity_type: got,
+                });
+            }
+        }
     }
     if let Some(rule) = matched_rule {
         // CC 3.4.7.1 — set membership, not scalar equality: `got` is the
@@ -10008,6 +10086,30 @@ mod tests {
     ///   gate on identity by a route other than `required_identity_types`.
     ///   Those are separate gates and this one must not be read as covering
     ///   them.
+    ///
+    ///   In particular it reads the RULES TABLE only. The two prefixes handled
+    ///   by inline branches in [`check_reserved_prefix_admission`] — `accord:`
+    ///   and `hard_case:` — are invisible to it, because a `ReservedPrefixRule`
+    ///   cannot express their conditions (`accord:` keys off a co-scrub quorum,
+    ///   `hard_case:` off whether the row is about a third party). `accord:` is
+    ///   fine on its own terms — `accord_holder` is `HardwareAttested`, a
+    ///   registration-time mode, so its membership test reads a fact a ceremony
+    ///   established. But this gate is not what establishes that. That is not
+    ///   hypothetical scoping: #607's THIRD claim was exactly such a branch, so
+    ///   this gate stayed green while `substrate_persist` — self-assertable —
+    ///   membership-tested its way into every `hard_case:` row about anyone.
+    ///   v30.3.0 fixed the branch; nothing yet gates the shape of new ones.
+    ///
+    ///   It also reads WRITE doors only. #607's fourth claim,
+    ///   `trusted_publisher`, had no write door at all — CC 3.3.12 leaves
+    ///   `content_rating:` open vocabulary — and put its whole discrimination on
+    ///   a READ door, `lookup_trusted_publisher_chain`, which membership-tested
+    ///   the same self-written string. Closed in v30.3.0 (CIRISPersist#611) by
+    ///   resolving `infra:publish_rating` there. So this gate has now been shown
+    ///   blind to the same contradiction twice, in two different places, and
+    ///   both were found by reading the issue rather than by the build. A gate
+    ///   over read-side membership tests on
+    ///   `AUTHORITY_CONFERRING_IDENTITY_TYPES` is the missing third one.
     /// - **owner** — persist.
     ///
     /// # The invariant
@@ -10041,14 +10143,20 @@ mod tests {
     fn a_deferred_conferral_mode_never_backs_a_membership_test_607() {
         use crate::federation::types::identity_type::{self, ConferralMode};
         // ── THE RATCHET, and it is NOT the fix ────────────────────────────
-        // These 11 pairs are the state of the tree when this gate was written.
-        // Grandfathering them keeps the status quo; it does not make it safe.
-        // CIRISPersist#607 carries mutation-verified repros showing each is
-        // reachable by a stranger, and the fix is a POLICY choice (gate at
-        // registration vs resolve at use, per claim) with real operator
-        // consequences — not something to pick while landing a gate.
+        // Eleven pairs when this gate was written; five now. The six that left
+        // are #607's first two claims — `witness` × `age_assurance:` and
+        // `lenscore_detector` × `detection:` — repaired in v30.2.0 by giving
+        // their rules a `required_delegation_scope`, which the loop below
+        // recognises as no longer a membership test. The ratchet SHRANK, which
+        // is the only direction it is allowed to move.
         //
-        // What this buys today: a TWELFTH cannot be added silently. Every new
+        // What remains is persist's own self-telemetry: five prefixes a node
+        // writes ABOUT ITSELF. They are the weakest case for a stranger's
+        // benefit and the strongest case for fail-closed harm if gated wrong,
+        // and the fix is a POLICY choice (gate at registration vs resolve at
+        // use, per claim) with real operator consequences.
+        //
+        // What this buys today: a SIXTH cannot be added silently. Every new
         // deferred-mode membership rule fails the build.
         //
         // Shrink this list; never extend it. A list that grows is a suppression
@@ -14238,6 +14346,284 @@ pub(crate) mod r2_test_support {
     }
 
     /// R2(b) on the write path, both directions, on whichever backend `dir` is.
+    /// v30.3.0 (CIRISPersist#611) — **a self-asserted `trusted_publisher`
+    /// does not get into the publisher-vouch chain.**
+    ///
+    /// GateSpec:
+    ///
+    /// - **family** — `deontic`. Varying it changes what the mesh treats as a
+    ///   vouched rating: a stranger's self-issued `content_rating:` row is
+    ///   returned to callers as a trusted publisher's vouch.
+    /// - **headwaters** — `lookup_trusted_publisher_chain` (the READ door) ×
+    ///   `capability_roots_to_trusted_root` (the resolver its declared mode
+    ///   names). Both already existed; nothing connected them.
+    /// - **references** — #611, #607 (the same contradiction on three write
+    ///   doors), #571 (why the WRITE door is deliberately open here), CC 3.3.12.
+    /// - **dye test** — this IS the dye test. On the pre-#611 code the
+    ///   unconferred publisher's row comes back in the chain.
+    /// - **depth** — proves the filter resolves a conferral, both directions.
+    ///   Says nothing about the CONTENT of a rating, nor about whether the root
+    ///   should have conferred. It is also the only `?Sized` consumer of that
+    ///   resolver, so it doubles as the witness that the generic conversion did
+    ///   not change the walk's answer.
+    /// - **owner** — persist.
+    ///
+    /// Both legs are load-bearing: without the CONFERRED leg, a door that
+    /// returns an empty chain for everyone passes, and the whole
+    /// `content_rating:` plane goes dark; without the UNCONFERRED leg, the
+    /// pre-#611 code passes.
+    pub(crate) async fn exercise_publisher_vouch_conferral(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{delegation_scope, identity_type};
+
+        let node = dir
+            .node_key_id()
+            .expect("this leg must give the backend a node identity before calling");
+        let publisher = format!("tp-pub-{suffix}");
+        let root = format!("tp-root-{suffix}");
+        super::steward_liveness_test_support::register(
+            dir,
+            &publisher,
+            &[identity_type::TRUSTED_PUBLISHER],
+        )
+        .await;
+
+        // A content hash this rating vouches for. Real hex-64: the door
+        // validates the shape early and returns an empty vector for anything
+        // else, which would make both legs pass for the wrong reason.
+        let sha: String = suffix
+            .bytes()
+            .cycle()
+            .take(64)
+            .map(|b| char::from_digit((b % 16) as u32, 16).unwrap())
+            .collect();
+
+        let rating_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "dimension": "content_rating:mpa:pg13:v1",
+            "score": 0.5,
+            "evidence_refs": [sha],
+        });
+        let (och, ed_sig, pqc_sig) = sign_envelope(&publisher, &envelope);
+        dir.put_attestation(SignedAttestation {
+            attestation: Attestation {
+                attestation_id: rating_id.clone(),
+                attesting_key_id: publisher.clone(),
+                attested_key_id: publisher.clone(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: ed_sig,
+                scrub_signature_pqc: pqc_sig,
+                scrub_key_id: publisher.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect(
+            "the WRITE door for content_rating: is deliberately open (CC 3.3.12 leaves the \
+             family open vocabulary; CIRISPersist#571 removed persist's stricter gate) — if this \
+             refuses, the discrimination moved and this witness is testing the wrong door",
+        );
+
+        // ── (1) SELF-ASSERTED publisher — NOT in the chain ────────────────
+        let chain = dir
+            .lookup_trusted_publisher_chain(&sha)
+            .await
+            .expect("the read itself must succeed; the filter is on membership, not on the call");
+        assert!(
+            chain.is_empty(),
+            "a self-asserted trusted_publisher must not vouch — that is CIRISPersist#611. Got \
+             {} row(s)",
+            chain.len()
+        );
+
+        // ── (2) CONFERRED publisher — IS in the chain ─────────────────────
+        confer_scope_from_trusted_root(
+            dir,
+            &node,
+            &root,
+            &publisher,
+            delegation_scope::INFRA_PUBLISH_RATING,
+        )
+        .await;
+        let chain = dir
+            .lookup_trusted_publisher_chain(&sha)
+            .await
+            .expect("read after conferral");
+        assert_eq!(
+            chain.len(),
+            1,
+            "a publisher CONFERRED infra:publish_rating by this node's own trust root must vouch \
+             — otherwise the content_rating: plane is dark and leg (1) passes vacuously"
+        );
+        assert_eq!(
+            chain[0].attestation_id, rating_id,
+            "the chain must carry the rating row itself, not some other row"
+        );
+    }
+
+    /// v30.3.0 (CIRISPersist#607) — **a self-asserted `substrate_persist`
+    /// cannot file a `hard_case:` record ABOUT ANOTHER PARTY.**
+    ///
+    /// GateSpec:
+    ///
+    /// - **family** — `testimonial`, frame `repairable_does_not_factor`: a
+    ///   `hard_case:` row is the artifact CIRISServer's graded admin ladder
+    ///   leaves behind when it acts on someone. Forged, it is an accusation on
+    ///   the record that the accused cannot unmake by behaving differently.
+    /// - **headwaters** — `put_attestation` (every backend) ×
+    ///   `check_reserved_prefix_admission` (the shared chokepoint).
+    /// - **references** — CIRISPersist#607; CIRISServer's `abuse_surface`
+    ///   reproduction; #565 (typed refusals name the missing thing).
+    /// - **dye test** — this IS the dye test. On the pre-#607 code the third-party
+    ///   leg ADMITS, because the gate was a membership test on
+    ///   `substrate_persist`, and `substrate_persist` is a claim any key can make
+    ///   about itself at registration.
+    /// - **depth** — proves the gate is a CONFERRAL resolved against this node's
+    ///   own trust root, in both directions: refused without one, admitted with
+    ///   one. Says nothing about whether the root SHOULD have conferred it; that
+    ///   is the conferral plane's business, not this door's.
+    /// - **owner** — persist.
+    ///
+    /// Three legs, and all three are load-bearing. Without the SELF leg, a gate
+    /// that refuses every `hard_case:` row would pass — and that gate tightens
+    /// past what `substrate_persist`'s retirement condition names, leaving a node
+    /// unable to enter its own incident on this plane. Without the CONFERRED leg,
+    /// a gate that refuses every third-party row would pass, and the whole admin
+    /// ladder would be unreachable. Without the REFUSAL leg, the pre-#607 code
+    /// passes.
+    pub(crate) async fn exercise_hard_case_third_party_conferral(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{delegation_scope, identity_type};
+
+        // The gate resolves the conferral against THIS NODE's trust root, so a
+        // directory with no identity of its own refuses for a different reason.
+        // Asserting it here means a leg that forgets `set_node_key_id` fails
+        // loudly instead of passing for the wrong reason.
+        let node = dir
+            .node_key_id()
+            .expect("this leg must give the backend a node identity before calling");
+
+        let author = format!("hc-persist-{suffix}");
+        let victim = format!("hc-victim-{suffix}");
+        let root = format!("hc-root-{suffix}");
+        super::steward_liveness_test_support::register(
+            dir,
+            &author,
+            &[identity_type::SUBSTRATE_PERSIST],
+        )
+        .await;
+        super::steward_liveness_test_support::register(dir, &victim, &[identity_type::USER]).await;
+
+        let row = |id: &str, about: &str| {
+            let now = Utc::now();
+            let dimension = "hard_case:consent_sla_breach:v1";
+            let envelope = serde_json::json!({ "dimension": dimension });
+            let (och, ed_sig, pqc_sig) = sign_envelope(&author, &envelope);
+            SignedAttestation {
+                attestation: Attestation {
+                    attestation_id: id.to_owned(),
+                    attesting_key_id: author.clone(),
+                    attested_key_id: about.to_owned(),
+                    attestation_type: dimension.to_owned(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: ed_sig,
+                    scrub_signature_pqc: pqc_sig,
+                    scrub_key_id: author.clone(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                    tier: attestation_tier::FEDERATION.to_owned(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            }
+        };
+
+        // ── (1) ABOUT ANOTHER PARTY, no conferral — REFUSED ───────────────
+        let forged = uuid::Uuid::new_v4().to_string();
+        let err = dir.put_attestation(row(&forged, &victim)).await.expect_err(
+            "a self-asserted substrate_persist must NOT file a hard_case record about a \
+                 third party — that is CIRISPersist#607",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_reserved_prefix_emitter_mismatch",
+            "must refuse at the reserved-prefix door, not incidentally elsewhere: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(delegation_scope::INFRA_RECORD_HARD_CASE),
+            "the refusal must NAME the missing conferral (#565) — an is_err() check alone would \
+             pass on an unregistered key or a bad signature. Got: {err}"
+        );
+        assert!(
+            dir.get_attestation(&forged).await.expect("get").is_none(),
+            "a row refused by the #607 gate must not be persisted"
+        );
+
+        // ── (2) ABOUT ITSELF, no conferral — ADMITTED ─────────────────────
+        // The retirement condition in `substrate_persist`'s mode note is scoped
+        // to rows that are an input to a decision ABOUT ANOTHER PARTY; a
+        // self-attested row is not one, and refusing it would tighten past what
+        // #607 asks.
+        let own = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(&own, &author))
+            .await
+            .expect("a SELF-attested hard_case row must still admit — see the doc comment");
+        assert!(
+            dir.get_attestation(&own).await.expect("get").is_some(),
+            "the self-attested row must be stored"
+        );
+
+        // ── (3) ABOUT ANOTHER PARTY, WITH a conferral — ADMITTED ──────────
+        confer_scope_from_trusted_root(
+            dir,
+            &node,
+            &root,
+            &author,
+            delegation_scope::INFRA_RECORD_HARD_CASE,
+        )
+        .await;
+        let conferred = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(&conferred, &victim)).await.expect(
+            "a substrate_persist CONFERRED infra:record_hard_case by this node's own trust \
+                 root must be able to file the record — otherwise the admin ladder is \
+                 unreachable and leg (1) passes vacuously",
+        );
+        assert!(
+            dir.get_attestation(&conferred)
+                .await
+                .expect("get")
+                .is_some(),
+            "the conferred third-party row must be stored"
+        );
+    }
+
     pub(crate) async fn exercise_r2b_refusal(dir: &dyn FederationDirectory, suffix: &str) {
         let author = format!("r2-author-{suffix}");
         register_agent_key(dir, &author).await;
