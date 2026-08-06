@@ -4179,16 +4179,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
 
+        // v30.1.0 (CIRISPersist#610) — the wire index must move WITH the row.
+        // This mutator recomputes `persist_row_hash` (the scope is covered by
+        // it) and used to write ONLY the table. The row then advertised a hash
+        // the `signed_wire_index` did not hold: the offer path reads the table
+        // and offers it, the peer WANTS it, and the pack path reads the index
+        // and cannot serve it. Observed downstream as
+        // `wanted=6 packed=5 dropped=1` — the dropped ref being the trace.
+        //
+        // CIRISPersist#547's class, one plane over: #547 closed this for five
+        // Key-plane mutators and the Attestation re-scope path was not in that
+        // set. Same shape as #541 — a preserve set and a verified set that can
+        // disagree.
+        row.persist_row_hash = new_hash.clone();
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+
         let conn = self.conn.clone();
         let id = attestation_id.to_owned();
         let scope = cohort_scope.to_owned();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE federation_attestations SET cohort_scope = ?1, persist_row_hash = ?2 \
                  WHERE attestation_id = ?3",
                 rusqlite::params![scope, new_hash, id],
-            )
+            )?;
+            if n > 0 {
+                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)?;
+            }
+            Ok(n)
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("set_attestation_cohort_scope: {e}"))
@@ -19410,6 +19431,18 @@ mod tests {
             prompt: None,
             response_text: None,
         }
+    }
+
+    /// v30.1.0 (CIRISPersist#610) — the SQLITE leg of the shared re-scope
+    /// servability witness. All three backends call the SAME body.
+    #[tokio::test]
+    async fn rescope_keeps_row_servable_sqlite_610() {
+        let backend = fresh_backend_with_occurrence("occ-610").await;
+        crate::federation::admission::r2_test_support::exercise_rescope_keeps_row_servable(
+            &backend,
+            "sqlite-610",
+        )
+        .await;
     }
 
     /// Smoke: open in-memory, run migrations, both lens tables exist.

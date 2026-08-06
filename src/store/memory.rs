@@ -3144,6 +3144,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v30.1.0 (CIRISPersist#610) — the wire index moves WITH the row.
+        // Same defect as the two SQL backends: this mutator recomputes
+        // `persist_row_hash`, so without re-indexing the row advertises a hash
+        // the index does not hold and the pack path cannot serve what the offer
+        // path offered. Federation-tier only, per the E5 invariant that governs
+        // the put path's own indexing.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
+            state
+                .signed_wire_index
+                .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
+        }
         Ok(())
     }
 
@@ -15787,6 +15803,32 @@ mod tests {
         let backend = MemoryBackend::new();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
             .await;
+    }
+
+    /// v30.1.0 (CIRISPersist#610) — the MEMORY leg of the shared re-scope
+    /// servability witness. All three backends call the SAME body.
+    ///
+    /// Gated like the #590 memory leg beside it: the shared body lives in
+    /// `admission::r2_test_support`, which is `cfg(any(sqlite, postgres))`
+    /// because its fixtures need a real signing path. The memory BACKEND needs
+    /// no feature, but the shared witness does — and without this the
+    /// no-feature `default` leg fails to compile.
+    /// Takes the postgres serial lock even though it drives the MEMORY
+    /// backend, matching the #590 memory leg beside it. The cfg mentions
+    /// `feature = "postgres"` (it tracks the shared witness's own gate), and
+    /// `every_postgres_test_takes_the_serial_lock` reads that as touching
+    /// postgres. Opting in is a few microseconds; loosening the gate to parse
+    /// `any(...)` forms would blunt it against the real case it was built for.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn rescope_keeps_row_servable_memory_610() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_rescope_keeps_row_servable(
+            &backend,
+            "memory-610",
+        )
+        .await;
     }
 
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the MEMORY leg of the shared

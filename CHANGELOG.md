@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.1.0] — 2026-08-05 — a re-scoped row stopped being servable, and the peer asking for it got silence
+
+- **#610 — `set_attestation_cohort_scope` recomputed the row hash and never touched the wire index.**
+  All three backends: **zero** `wire_index` references in the whole function. The mutator changes
+  `cohort_scope` and recomputes `persist_row_hash`, so the row re-serializes to a new hash — and the
+  `signed_wire_index` kept pointing at the old one.
+
+  The two planes then disagree in the worst possible direction: the **offer** path reads the table
+  and advertises the row, the peer **wants** it, and the **pack** path reads the index and cannot
+  serve it. Downstream that is `wanted=6 packed=5 dropped=1` — a peer asking for exactly the ref
+  this node just advertised, and getting nothing. The dropped ref was the trace, which is why traces
+  crossed on HTTP ingest and never over anti-entropy.
+
+  **CIRISPersist#547's class, one plane over.** #547 closed this for five Key-plane mutators —
+  `adopt_scrub_upgrade`, `supersede_canonical_record`, `adopt_genesis_reanchor` among them — and the
+  Attestation re-scope path was not in that set. Same shape as #541: two lists, maintained
+  separately, free to disagree. `rebuild_signed_wire_index()` cured it, which is the signature of
+  index **key coverage** rather than serialization drift.
+
+  Fixed on sqlite, postgres and memory in one commit, with a shared witness all three call. The
+  witness is mutation-verified on both SQL backends: remove the upsert and it names the unservable
+  hash with the `wanted=N packed=N-1` framing.
+
+  **Two things the witness got wrong first, recorded because both would have shipped a test that
+  proved nothing.** It initially asserted servability by `persist_row_hash` and failed its own
+  *precondition* — the index is keyed by `content_hash_of(row)`, the **re-serialized** row, which is
+  what the offer path advertises. Had it only checked the post-re-scope case it would have "passed"
+  against broken code for the wrong reason. Then postgres failed where sqlite and memory passed,
+  which looked like a backend divergence and was **the fixture**: `TIMESTAMPTZ` is microsecond
+  precision, `Utc::now()` carries nanoseconds, so the row did not survive the round-trip. Wire-
+  arriving RFC-3339 instants already round-trip losslessly; the fixture now truncates, so the test
+  measures index coverage rather than clock precision.
+
+- **The v30.0.1 serial-lock gate caught its author.** All three new test legs had spliced into the
+  preceding test's attribute block; the memory one also absorbed a
+  `#[cfg(any(feature = "sqlite", feature = "postgres"))]`, leaving the displaced test ungated — and
+  that is what the gate flagged. The other two stole only prose, which nothing checks. Third
+  text-anchored insertion to land inside a construct in a single day, every one of which compiled.
+
 ## [30.0.1] — 2026-08-05 — the contradiction between a mode table and its doors, made build-visible
 
 No public API change. One enforced invariant, and the tool that generates dye tests.

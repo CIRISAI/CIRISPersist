@@ -4858,6 +4858,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "federation_attestations row {attestation_id} does not exist"
             )));
         }
+        // v30.1.0 (CIRISPersist#610) — the wire index moves WITH the row, on
+        // this backend too. See the sqlite twin for the full account: the row
+        // advertised a `persist_row_hash` the `signed_wire_index` did not hold,
+        // so the offer path offered it and the pack path could not serve it.
+        // Missing the postgres twin of a fix is this repo's own recurring
+        // class, so it is done in the same commit rather than followed up.
+        row.persist_row_hash = new_hash.clone();
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+        pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key).await?;
         Ok(())
     }
 
@@ -19730,7 +19741,30 @@ pub(crate) mod postgres_serial_scan {
         // correct code gets deleted by the next person who hits it.
         let is_test =
             attrs.contains("#[test]") || attrs.contains("::test]") || attrs.contains("::test(");
-        is_test && attrs.contains("feature = \"postgres\"") && !attrs.contains("serial")
+        if !(is_test && attrs.contains("feature = \"postgres\"")) {
+            return false;
+        }
+        // v30.1.0 — the group must be `postgres` SPECIFICALLY, not merely
+        // "serialized". serial_test's lock is per GROUP, so
+        // `#[serial_test::serial(engine_singleton)]` does not exclude a single
+        // member of the `postgres` group. The first version of this predicate
+        // only looked for the substring "serial", and passed
+        // `current_rust_engine_shares_singleton_backend_postgres` while it ran
+        // concurrently against the same database as 562 postgres-group tests.
+        //
+        // A test touching two shared resources names both:
+        // `#[serial_test::serial(engine_singleton, postgres)]`.
+        !postgres_group(attrs)
+    }
+
+    /// Is this attribute block in the `postgres` serial group, under either the
+    /// single-key or the multi-key form?
+    fn postgres_group(attrs: &str) -> bool {
+        attrs.split("serial(").skip(1).any(|rest| {
+            rest.split(')')
+                .next()
+                .is_some_and(|keys| keys.split(',').any(|k| k.trim() == "postgres"))
+        })
     }
 
     /// Walk `src/**.rs`, returning (blocks examined, offenders).
@@ -19772,8 +19806,17 @@ pub(crate) mod postgres_serial_scan {
                     let s = lines[j as usize].trim();
                     if s.starts_with("#[") {
                         attrs.push(s);
-                    } else if s.starts_with("///") {
-                        // doc lines belong to the block; keep walking.
+                    } else if s.starts_with("//") {
+                        // Doc lines AND plain `//` comments belong to the
+                        // block. `///` alone was not enough: a plain comment
+                        // interleaved between attributes ended the walk, so
+                        // everything ABOVE it — including `#[cfg(feature =
+                        // "postgres")]` and `#[test]` — became invisible and
+                        // the test silently stopped being policed. Found by
+                        // mutation: this gate's own explanatory comment, added
+                        // above a `#[serial_test::serial(...)]` line, hid that
+                        // test from it. A gate a COMMENT can disable is worse
+                        // than no gate, because it still reports green.
                     } else if !(s.is_empty() && attrs.is_empty()) {
                         // A blank line BEFORE any attribute is the gap between
                         // a doc block and its `fn`, so keep walking. Anything
@@ -20759,6 +20802,24 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
+    }
+
+    /// v30.1.0 (CIRISPersist#610) — the POSTGRES leg of the shared re-scope
+    /// servability witness. All three backends call the SAME body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn rescope_keeps_row_servable_postgres_610() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        crate::federation::admission::r2_test_support::exercise_rescope_keeps_row_servable(
+            &be,
+            &format!("pg-610-{}", uuid_like()),
+        )
+        .await;
     }
 
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the POSTGRES leg of the shared
@@ -28663,6 +28724,22 @@ mod tests {
         assert!(
             !super::postgres_serial_scan::is_unserialized(ok),
             "the predicate flagged a correctly serialized test — it would fail on clean code"
+        );
+        // Serialized, but in the WRONG GROUP — the case that shipped past this
+        // gate's first version and raced 562 postgres-group tests.
+        let wrong_group =
+            "#[cfg(feature = \"postgres\")] #[test] #[serial_test::serial(engine_singleton)]";
+        assert!(
+            super::postgres_serial_scan::is_unserialized(wrong_group),
+            "a test serialized under a DIFFERENT group is not excluded from the postgres group; \
+             the predicate must require the postgres KEY, not merely the word `serial`"
+        );
+        // The multi-key form names both resources and must NOT be flagged.
+        let both = "#[cfg(feature = \"postgres\")] #[test] \
+                    #[serial_test::serial(engine_singleton, postgres)]";
+        assert!(
+            !super::postgres_serial_scan::is_unserialized(both),
+            "the multi-key form names the postgres group and must pass"
         );
     }
 

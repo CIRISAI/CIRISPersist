@@ -30352,7 +30352,13 @@ mod tests {
     /// is unset.
     #[cfg(feature = "postgres")]
     #[test]
-    #[serial_test::serial(engine_singleton)]
+    // v30.1.0 (CIRISPersist#610 follow-on) — BOTH groups. `engine_singleton`
+    // alone does not exclude the `postgres` group, so this test ran
+    // concurrently with 562 postgres-group tests against the same database and
+    // could perturb any of them. serial_test's group lock only excludes members
+    // of the SAME group; a test that touches two shared resources must name
+    // both.
+    #[serial_test::serial(engine_singleton, postgres)]
     fn current_rust_engine_shares_singleton_backend_postgres() {
         use crate::store::Backend;
 

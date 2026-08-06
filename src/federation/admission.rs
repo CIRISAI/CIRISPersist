@@ -13890,6 +13890,136 @@ pub(crate) mod r2_test_support {
         }
     }
 
+    /// v30.1.0 (CIRISPersist#610) — **a re-scoped attestation stays SERVABLE.**
+    ///
+    /// GateSpec:
+    ///
+    /// - **family** — `testimonial`, frame `upstream_attestation`: the wire index
+    ///   is this node's record of what it can serve, and a row missing from it is
+    ///   unservable in a way no re-read of the row itself reveals.
+    /// - **headwaters** — `set_attestation_cohort_scope` (writes the table) ×
+    ///   `lookup_signed_record_by_content_hash` (reads the index).
+    /// - **references** — #610, #547 (the same class on five Key-plane mutators),
+    ///   #541 (preserve set ≠ verified set).
+    /// - **dye test** — this IS the dye test: it fails on the unfixed code.
+    /// - **depth** — proves the index resolves the NEW hash. Says nothing about
+    ///   the stale entry under the OLD hash, which is left to self-heal via the
+    ///   defensive re-hash on read.
+    /// - **owner** — persist.
+    ///
+    /// The defect: this mutator recomputes `persist_row_hash` and used to write
+    /// only the table. The offer path reads the table and offers the new hash; the
+    /// pack path reads the index and cannot serve it. Downstream that appears as
+    /// `wanted=6 packed=5 dropped=1` — a peer asking for a row this node just
+    /// advertised, and getting silence.
+    pub(crate) async fn exercise_rescope_keeps_row_servable(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use chrono::Timelike as _;
+
+        let author = format!("rescope-author-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &author).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id, "dimension": "trust:rescope:v1", "score": 1.0, "confidence": 0.9,
+        });
+        let (och, sc, sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&author, &envelope);
+        // TRUNCATED TO MICROSECONDS. Postgres `TIMESTAMPTZ` is microsecond
+        // precision while `Utc::now()` carries nanoseconds, so a nanosecond-bearing
+        // fixture does not survive the round-trip and the reloaded row re-serializes
+        // to a different hash than the one indexed at write. That is a property of
+        // the FIXTURE, not of the backend: rows arriving over the wire carry
+        // RFC-3339 instants that already round-trip losslessly. Truncating here
+        // keeps this test measuring index coverage rather than clock precision.
+        let now = chrono::Utc::now()
+            .with_nanosecond(chrono::Utc::now().nanosecond() / 1_000 * 1_000)
+            .expect("microsecond truncation");
+        let att = crate::federation::SignedAttestation {
+            attestation: crate::federation::Attestation {
+                attestation_id: id.clone(),
+                attesting_key_id: author.clone(),
+                attested_key_id: author.clone(),
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: author.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: cohort_scope::FEDERATION.to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        };
+        dir.put_attestation(att)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] seed row must admit: {e}"));
+
+        // Servable BEFORE the re-scope — the control. Without this, a fix that
+        // never indexed anything would look identical to a fix that works.
+        let before = dir
+            .get_attestation(&id)
+            .await
+            .expect("get")
+            .expect("row exists");
+        // The index is keyed by `content_hash_of(row)` — the RE-SERIALIZED row,
+        // which is exactly what the offer path advertises. NOT `persist_row_hash`;
+        // asking for that returns None even on a healthy row, which is how the
+        // first version of this test failed its own precondition.
+        let before_wire = crate::federation::wire_index::content_hash_of(&before).expect("hash");
+        let served = dir
+            .lookup_signed_record_by_content_hash("Attestation", &before_wire)
+            .await
+            .expect("lookup");
+        assert!(
+            served.is_some(),
+            "[{tag}] precondition: a freshly put federation row must be servable by its own hash"
+        );
+
+        dir.set_attestation_cohort_scope(&id, cohort_scope::COMMUNITY)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] re-scope must succeed: {e}"));
+
+        let after = dir
+            .get_attestation(&id)
+            .await
+            .expect("get")
+            .expect("row exists");
+        assert_ne!(
+            after.persist_row_hash, before.persist_row_hash,
+            "[{tag}] the re-scope must change persist_row_hash, or this test proves nothing"
+        );
+        let after_wire = crate::federation::wire_index::content_hash_of(&after).expect("hash");
+        assert_ne!(
+            after_wire, before_wire,
+            "[{tag}] the re-scope must change the SERIALIZED row hash, or the index could not go \
+         stale and this test proves nothing"
+        );
+        let served_after = dir
+            .lookup_signed_record_by_content_hash("Attestation", &after_wire)
+            .await
+            .expect("lookup");
+        assert!(
+            served_after.is_some(),
+            "[{tag}] CIRISPersist#610: the row re-serializes to {after_wire} — the hash the offer \
+         path advertises — but the signed_wire_index cannot serve it. The peer asks for exactly \
+         the ref this node just advertised and gets nothing: `wanted=N packed=N-1`. The wire \
+         index must move WITH the row."
+        );
+    }
+
     /// R2(b) on the write path, both directions, on whichever backend `dir` is.
     pub(crate) async fn exercise_r2b_refusal(dir: &dyn FederationDirectory, suffix: &str) {
         let author = format!("r2-author-{suffix}");
