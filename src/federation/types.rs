@@ -731,6 +731,50 @@ pub mod delegation_scope {
     /// closing.
     pub const INFRA_ATTEST_ASSURANCE: &str = "infra:attest_assurance";
 
+    /// v30.3.0 (CIRISPersist#607) — `infra:record_hard_case` — record a
+    /// `hard_case:*` observation **about another party**.
+    ///
+    /// `hard_case:` is where CIRISServer's graded admin ladder writes every
+    /// tombstone: the artifact whose entire job is to carry the authorizing
+    /// `delegates_to` id and a mandatory reason for an action taken about
+    /// someone else. A row on that family is about another party by
+    /// construction, which is exactly the retirement condition
+    /// `substrate_persist`'s own mode note states — *"if a `system:*` row ever
+    /// becomes an input to a decision ABOUT ANOTHER PARTY, this must move"*.
+    ///
+    /// NOT required for a self-attested `hard_case:` row — the retirement
+    /// condition is scoped to rows that are an input to a decision about ANOTHER
+    /// PARTY, and tightening past it would leave a node unable to enter its own
+    /// incident on this plane.
+    ///
+    /// Persist's own `hard_case:*` telemetry does not come through this door at
+    /// all: the at-rest cascade, the community-DEK recipient exclusions and the
+    /// consent-SLA watcher all write through
+    /// `FederationDirectory::record_hard_case` into `hard_case_events`. Persist
+    /// emits no `hard_case:` attestation. The traffic this scope governs is a
+    /// host's — CIRISServer's graded admin ladder.
+    pub const INFRA_RECORD_HARD_CASE: &str = "infra:record_hard_case";
+
+    /// v30.3.0 (CIRISPersist#611) — `infra:publish_rating` — vouch on the
+    /// `content_rating:*` plane as a `trusted_publisher`.
+    ///
+    /// The odd one out among these scopes: it governs a **READ** door, not a
+    /// write door. CC 3.3.12 leaves `content_rating:` open vocabulary — the
+    /// `{scheme}` field explicitly admits `operator:{operator_id}` rubrics — so
+    /// persist deliberately carries no emitter rule on the write side
+    /// (CIRISPersist#571 removed the CEG-sourced one as stricter than the
+    /// Constitution). The whole discrimination therefore lives in
+    /// `FederationDirectory::lookup_trusted_publisher_chain`, which surfaces
+    /// only rows attested by `trusted_publisher` keys, and that filter was a
+    /// membership test on a registration row the key wrote itself.
+    ///
+    /// A fourth name rather than reuse of `infra:attest`, `infra:attest_assurance`
+    /// or `infra:record_hard_case`, for the reason every one of them gives: one
+    /// name carrying two authorities is the fusion class this repo keeps closing.
+    /// A key blessed to publish content ratings has not thereby been blessed to
+    /// declare a third party's age band.
+    pub const INFRA_PUBLISH_RATING: &str = "infra:publish_rating";
+
     /// v30.2.0 (CIRISPersist#607) — `infra:detect` — emit on the adversarial
     /// detection plane (`detection:*`) about other parties.
     ///

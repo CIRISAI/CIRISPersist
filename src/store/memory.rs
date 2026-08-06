@@ -16334,6 +16334,76 @@ mod tests {
     // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────
     //    I1 age band + user-target steward-binding gate + minor liveness.
 
+    /// v30.3.0 (CIRISPersist#611) — the MEMORY leg of the shared
+    /// publisher-vouch-conferral witness. All three backends call the SAME
+    /// `admission::r2_test_support::exercise_publisher_vouch_conferral` body.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn publisher_vouch_conferral_parity_memory_611() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("tp-node-memory");
+        crate::federation::admission::r2_test_support::exercise_publisher_vouch_conferral(
+            &backend,
+            "memory-611",
+        )
+        .await;
+    }
+
+    /// v30.3.0 (CIRISPersist#611) — **no node identity is an ERROR, not an
+    /// empty chain.**
+    ///
+    /// The actual decision in #611. The fail-secure reflex on a read door is to
+    /// return nothing, and it is wrong here: a host that forgot
+    /// `set_node_key_id()` would watch legitimate vouches vanish with nothing
+    /// in the result distinguishing "this content has no vouches" from "this
+    /// node cannot check vouches". Those are different facts and a caller acts
+    /// differently on each.
+    ///
+    /// One leg, not three: the code path is the shared `FederationDirectory`
+    /// DEFAULT method, identical for every backend, and the conferral property
+    /// itself is what carries the three-backend witness above.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn publisher_vouch_without_node_identity_is_loud_611() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        // Deliberately NOT calling set_node_key_id.
+        let err = backend
+            .lookup_trusted_publisher_chain(&"a".repeat(64))
+            .await
+            .expect_err("a directory that cannot check vouches must say so, not return none");
+        assert_eq!(
+            err.kind(),
+            "federation_node_identity_unset",
+            "must be the typed refusal (#565: the refusal names its branch), got: {err}"
+        );
+        assert!(
+            err.to_string().contains("set_node_key_id"),
+            "the message must name what to call, or it is not actionable: {err}"
+        );
+    }
+
+    /// v30.3.0 (CIRISPersist#607) — the MEMORY leg of the shared
+    /// `hard_case:` third-party-conferral witness. All three backends call the
+    /// SAME `admission::r2_test_support::exercise_hard_case_third_party_conferral`
+    /// body through the REAL `put_attestation`; memory gets its own leg because
+    /// it tolerates what sqlite and postgres reject, so a guard that drifted
+    /// into a backend-local branch would pass on two backends and be silently
+    /// absent here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn hard_case_third_party_conferral_parity_memory_607() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("hc-node-memory");
+        crate::federation::admission::r2_test_support::exercise_hard_case_third_party_conferral(
+            &backend,
+            "memory-607",
+        )
+        .await;
+    }
+
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
     /// `agent` / `node`).
     /// v30.2.0 (CIRISPersist#607) — seed a key AND the trust-root conferral its

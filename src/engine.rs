@@ -315,6 +315,136 @@ pub mod teardown {
 
     #[cfg(test)]
     mod tests {
+
+        /// v30.3.0 (CIRISPersist#607) — **the abuse-surface path, through a real
+        /// Engine, with no test doubles.**
+        ///
+        /// Mirrors CIRISServer's `abuse_surface` reproduction: a stranger
+        /// self-registers carrying `identity_type: "witness"` — which still
+        /// SUCCEEDS, because the claim is self-assertable at registration and #607
+        /// never argued otherwise — and then attempts an `age_assurance:` row about
+        /// a third party. That second step is what must now fail.
+        ///
+        /// Kept as an Engine-level regression rather than trusting the
+        /// backend-level `a_self_asserted_witness_is_refused_607`: the consumer's
+        /// path builds an Engine, and a gate that works on a bare backend while the
+        /// Engine wires it differently is exactly the class this repo keeps hitting
+        /// (a control reachable in tests and absent from every real caller).
+        ///
+        /// The assertion is on the REFUSAL REASON, not merely on `is_err()`. A row
+        /// rejected for the wrong reason — an unregistered key, a bad signature —
+        /// would pass an `is_err()` check while proving nothing about #607.
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn a_self_asserted_witness_is_refused_through_the_engine_607() {
+            let signer = crate::federation::tier_ingest::test_support::local_signer("probe-node");
+            let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
+                .await
+                .expect("engine");
+            let sq = engine.sqlite_backend().expect("sqlite").clone();
+            // The Engine sets this at construction; without it the door refuses for
+            // a DIFFERENT reason (cannot verify), which would make this test pass
+            // while proving nothing.
+            assert!(
+                crate::federation::FederationDirectory::node_key_id(sq.as_ref()).is_some(),
+                "the Engine must give its backend a node identity at construction"
+            );
+
+            // A stranger self-registers AS a witness — the claim is on the record
+            // from the start, exactly as CIRISServer's abuse_surface does it.
+            let (ed, pqc) =
+                crate::federation::tier_ingest::test_support::hybrid_pubkeys("probe-stranger");
+            let rec = crate::federation::KeyRecord {
+                key_id: "probe-stranger".into(),
+                identity_ref: "probe-stranger".into(),
+                identity_type: "witness".into(),
+                pubkey_ed25519_base64: ed,
+                pubkey_ml_dsa_65_base64: pqc,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                valid_from: chrono::Utc::now(),
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": "probe-stranger" }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "probe-stranger".into(),
+                scrub_timestamp: chrono::Utc::now(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            };
+            crate::federation::FederationDirectory::put_public_key(
+                sq.as_ref(),
+                crate::federation::SignedKeyRecord { record: rec },
+            )
+            .await
+            .expect("stranger self-registers as witness");
+            // The claim itself IS still self-assertable — that is not the hole.
+            assert_eq!(
+            crate::federation::FederationDirectory::lookup_public_key(sq.as_ref(), "probe-stranger")
+                .await
+                .unwrap()
+                .map(|k| k.identity_type),
+            Some("witness".to_owned()),
+            "the stranger must actually hold the claim, or this test refuses for the wrong reason"
+        );
+
+            crate::federation::tier_ingest::test_support::register_hybrid_key(
+                sq.as_ref(),
+                "probe-victim",
+            )
+            .await;
+
+            let envelope =
+                serde_json::json!({"id":"probe-1","dimension":"age_assurance:government:adult:v1"});
+            let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
+                "probe-stranger",
+                &envelope,
+            );
+            let now = chrono::Utc::now();
+            let att = crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "probe-stranger".into(),
+                attested_key_id: "probe-victim".into(),
+                attestation_type: "age_assurance:government:adult:v1".into(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: "probe-stranger".into(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".into(),
+                tier: "federation".into(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            let err = crate::federation::FederationDirectory::put_attestation(
+                sq.as_ref(),
+                crate::federation::SignedAttestation { attestation: att },
+            )
+            .await
+            .expect_err(
+                "a self-asserted witness must NOT be able to assert an age rung about a third \
+             party through the Engine path — that is CIRISPersist#607",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("infra:attest_assurance"),
+                "refused, but not for the #607 reason — an is_err() check alone would have passed \
+             on an unregistered key or a bad signature. Got: {msg}"
+            );
+        }
+
         use super::*;
         use std::sync::atomic::{AtomicBool, Ordering};
 

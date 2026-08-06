@@ -5,6 +5,116 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.3.0] — 2026-08-06 — the last two claims in #607: who may write your record, and who may vouch
+
+- **#607 (final claim) — a self-asserted `substrate_persist` could file a `hard_case:` record about
+  anyone. Closed.** v30.2.0 repaired the two claims that ran through `ReservedPrefixRule`
+  (`witness` × `age_assurance:`, `lenscore_detector` × `detection:*`). The third did not: `hard_case:`
+  is handled by an **inline branch** in `check_reserved_prefix_admission`, invisible to the rules
+  table and therefore invisible to the #607 gate that scans it. So the gate stayed green over an
+  open door.
+
+  `hard_case:` is where CIRISServer's graded admin ladder writes every record of an action taken
+  about someone else — the artifact carrying the authorizing `delegates_to` id and a mandatory
+  reason. Its emitter check was a bare membership test on `substrate_persist`, and
+  `substrate_persist` is a claim any key makes about itself at registration. The accountability
+  plane rested on an unverified string.
+
+  **The split is attester == attested, and both directions are load-bearing.** A row ABOUT ANOTHER
+  PARTY now resolves a live `trust:confers:v1` grant of the new `infra:record_hard_case` scope from
+  a root **this node** trusts — same shape as v30.2.0, node identity from the host, refusing when
+  no identity is present. A row about YOURSELF still admits with no conferral, because the
+  retirement condition `substrate_persist`'s own mode note states — *"if a `system:*` row ever
+  becomes an input to a decision ABOUT ANOTHER PARTY, this must move"* — is scoped to third-party
+  rows, and tightening past it would leave a node unable to enter its own incident on this plane.
+
+  Worth stating precisely, because the obvious justification for that carve-out is wrong: persist's
+  own `hard_case:*` telemetry (the at-rest cascade, the community-DEK recipient exclusions, the
+  consent-SLA watcher) does **not** come through this door. It is written through
+  `record_hard_case` into `hard_case_events`, a different surface. Persist emits no `hard_case:`
+  attestation at all — every row this gate sees is a host's.
+
+  A fourth scope rather than reuse: `infra:record_hard_case` is minted separately from
+  `infra:attest`, `infra:attest_assurance` and `infra:detect` for the reason v30.2.0 gave — one name
+  carrying two authorities is the fusion class this repo keeps closing.
+
+- **The witness is one body on three backends, and it has three legs because each kills a different
+  wrong gate.** `exercise_hard_case_third_party_conferral` runs through the REAL `put_attestation`
+  on memory / sqlite / postgres. Third-party without conferral is REFUSED (drop this and the
+  pre-#607 code passes); self-attested is ADMITTED (drop this and "refuse every `hard_case:` row"
+  passes, tightening past what the retirement condition names); third-party WITH conferral is ADMITTED (drop this and
+  "refuse every third-party row" passes, leaving the admin ladder unreachable).
+
+  Mutation-verified, with an md5 check that each edit actually landed: neutering the conferral
+  requirement, inverting the self/third-party discriminator, accepting a `None` conferral, and
+  swapping the required scope for `infra:detect` each turn the witness red on **both** backends.
+  Four mutations, no survivors.
+
+- **#611 — the fourth claim in #607, on a READ door. Closed in the same cut.** `trusted_publisher`
+  has no write door at all: CC 3.3.12 leaves `content_rating:` open vocabulary, and #571 removed
+  persist's stricter CEG-sourced gate as refusing traffic the Constitution permits. So the entire
+  discrimination sat on `lookup_trusted_publisher_chain`, which returned rows attested by keys
+  whose `identity_type` said `trusted_publisher` — a string those keys wrote themselves. Same
+  contradiction as #607's three, one plane over, and the compensating control persist's own
+  `MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN` table names for the family.
+
+  The door now resolves the new `infra:publish_rating` scope per publisher, per read — not cached,
+  so a conferral withdrawn between two reads stops vouching on the second. Same walk the write
+  doors use, so there is one predicate for "conferred" rather than two that can drift.
+
+  **The obstacle was real and smaller than it looked.** A default trait method cannot coerce
+  `&self` to `&dyn FederationDirectory`, because `Self` is not known to be `Sized` there — which is
+  why this claim was not closed alongside the other three. But `trust_root_valid` and
+  `family_quorum_over` were *already* written as `?Sized`-generic, so converting the rest of the
+  walk took five signatures, every one source-compatible with its existing `&dyn` callers.
+
+  **The decision in #611 was what "cannot verify" means on a read.** On the write doors it means
+  refuse. The reflex on a read is to return an empty chain — and that is wrong here: a host that
+  forgot `set_node_key_id()` would watch legitimate vouches vanish with nothing in the result
+  separating *"this content has no vouches"* from *"this node cannot check vouches."* Those are
+  different facts. New typed refusal `NodeIdentityUnset`, naming the method, what the identity was
+  needed for, and the call to make.
+
+  Three-backend witness both directions (unconferred publisher absent, conferred publisher present)
+  plus the loud-failure leg. Four mutations, no survivors — and each killed the right leg: skipping
+  the filter, inverting it, and swapping the scope each turned the three conferral legs red while
+  leaving the loud-failure leg green; replacing the typed refusal with a silent empty did the exact
+  opposite.
+
+- **README rewritten; it had claimed `v8.5.0` for twenty-two majors.** Every version string in
+  it was wrong (`v2.8.0`, `v5.10.0`, `v6.0.0`, `v8.5.0`, `v9.0.0`), it quoted a throughput figure
+  against a seven-major-old dependency, and it opened by defining the crate in terms of CIRIS, so a
+  reader outside the ecosystem could not tell what it was. The structural fix is not a corrected
+  number: the file now hard-codes **no** versions and points at `CHANGELOG.md` / `Cargo.toml`,
+  because a fact nothing checks is a fact that rots.
+
+  It now leads with what the crate decides rather than what it stores, names who should use
+  something else, discloses which parts are a competent implementation of other people's standards
+  (RFC 8785, RFC 6962, FIPS 204, RFC 6330, and the ideas behind UCAN and Zanzibar), holds the
+  novelty claims to five, and states review status precisely: CIRISConformance drives the real
+  wheel and has filed findings that became fixes here, and **two external reviews of the CIRIS
+  stack exist of which NEITHER examines this crate** — so the substrate enforcing the stack's
+  admission rules is the part no outside reviewer has yet read. Stated as the headline of that
+  section rather than a footnote to it.
+
+  The Rust snippet lives in `examples/readme.rs` and is compiled by the `--all-targets` legs, so it
+  cannot silently drift out of sync with the signatures it demonstrates.
+
+- **The #607 gate has now been shown blind twice.** `a_deferred_conferral_mode_never_backs_a_membership_test_607`
+  scans the write-side rules table, so neither the `hard_case:` inline branch nor this read door was
+  ever in its view, and both were found by reading the issue rather than by the build. Its **depth**
+  clause says so, in those words. A gate over read-side membership tests on
+  `AUTHORITY_CONFERRING_IDENTITY_TYPES` is the missing third one and is not in this cut.
+
+- **The #607 gate now states what it cannot see.** `a_deferred_conferral_mode_never_backs_a_membership_test_607`
+  reads the rules table only, so the two prefixes handled by inline branches — `accord:` (keys off a
+  co-scrub quorum) and `hard_case:` (keys off whether the row is about a third party) — are outside
+  it. That is written into its **depth** clause now, citing this release as the proof it is not a
+  hypothetical gap. Its ratchet also SHRANK, eleven pairs to five: the six that left are v30.2.0's
+  repairs, recognised automatically because a rule carrying a `required_delegation_scope` is no
+  longer a membership test. What remains is persist's own self-telemetry — five prefixes a node
+  writes about itself.
+
 ## [30.2.0] — 2026-08-06 — the claim a stranger could write, and the suite that needed one thread
 
 - **#607 — a self-asserted `witness` could assert an age-assurance rung about any third party.

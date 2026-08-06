@@ -20795,6 +20795,45 @@ mod tests {
         .await;
     }
 
+    /// v30.3.0 (CIRISPersist#611) — the POSTGRES leg of the shared
+    /// publisher-vouch-conferral witness (see the memory + sqlite legs).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn publisher_vouch_conferral_parity_postgres_611() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        backend.set_node_key_id("tp-node-postgres");
+        crate::federation::admission::r2_test_support::exercise_publisher_vouch_conferral(
+            &backend,
+            &format!("pg611{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// v30.3.0 (CIRISPersist#607) — the POSTGRES leg of the shared `hard_case:`
+    /// third-party-conferral witness (see the memory + sqlite legs); all three
+    /// call the SAME body through the REAL `put_attestation`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn hard_case_third_party_conferral_parity_postgres_607() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        backend.set_node_key_id("hc-node-postgres");
+        crate::federation::admission::r2_test_support::exercise_hard_case_third_party_conferral(
+            &backend,
+            &format!("pg-607-{}", uuid_like()),
+        )
+        .await;
+    }
+
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the POSTGRES leg of the shared
     /// namespace-registration witness (see the sqlite + memory legs); all three
     /// call the SAME `admission::r2_test_support::exercise_r2b_refusal` body.
@@ -34135,6 +34174,11 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v30.3.0 (CIRISPersist#611) — the read door re-derives each publisher's
+        // conferral against THIS NODE's trust root, so the backend must know who
+        // it is. Without this the call returns the typed `NodeIdentityUnset`
+        // refusal and the fixture fails on its wiring, not on its property.
+        backend.set_node_key_id("tp-fixture-node-pg");
         // SHA that no trusted_publisher has rated — must yield empty.
         let sha_hex = format!(
             "e{}",
@@ -34161,6 +34205,11 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v30.3.0 (CIRISPersist#611) — the read door re-derives each publisher's
+        // conferral against THIS NODE's trust root, so the backend must know who
+        // it is. Without this the call returns the typed `NodeIdentityUnset`
+        // refusal and the fixture fails on its wiring, not on its property.
+        backend.set_node_key_id("tp-fixture-node-pg");
         // Unique-per-run publisher + att IDs so reruns against the
         // shared PG DB don't pollute (mirrors the existing
         // feedback_hundred_percent_green discipline).
@@ -34192,6 +34241,20 @@ mod tests {
             })
             .await
             .unwrap();
+        // v30.3.0 (CIRISPersist#611) — holding the `trusted_publisher` identity
+        // is no longer sufficient; the chain resolves a `trust:confers:v1` grant
+        // of `infra:publish_rating` from a root this node trusts. Conferring it
+        // keeps this fixture on its own property (the seeded row is found) rather
+        // than turning it into a second copy of the #611 witness.
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            &backend,
+            "tp-fixture-node-pg",
+            &format!("tp-fixture-root-{}", &nonce[..8]),
+            &publisher_key,
+            crate::federation::types::delegation_scope::INFRA_PUBLISH_RATING,
+        )
+        .await;
+
         let chain = backend
             .lookup_trusted_publisher_chain(&sha_hex)
             .await

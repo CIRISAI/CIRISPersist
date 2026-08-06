@@ -20387,6 +20387,35 @@ mod tests {
             .await;
     }
 
+    /// v30.3.0 (CIRISPersist#611) — the SQLITE leg of the shared
+    /// publisher-vouch-conferral witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn publisher_vouch_conferral_parity_sqlite_611() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_node_key_id("tp-node-sqlite");
+        crate::federation::admission::r2_test_support::exercise_publisher_vouch_conferral(
+            &backend,
+            "sqlite-611",
+        )
+        .await;
+    }
+
+    /// v30.3.0 (CIRISPersist#607) — the SQLITE leg of the shared `hard_case:`
+    /// third-party-conferral witness (see the memory + postgres legs); all
+    /// three call the SAME body through the REAL `put_attestation`.
+    #[tokio::test]
+    async fn hard_case_third_party_conferral_parity_sqlite_607() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_node_key_id("hc-node-sqlite");
+        crate::federation::admission::r2_test_support::exercise_hard_case_third_party_conferral(
+            &backend,
+            "sqlite-607",
+        )
+        .await;
+    }
+
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the sqlite leg of the shared
     /// namespace-registration witness (see the postgres + memory legs); all
     /// three call the SAME `admission::r2_test_support::exercise_r2b_refusal`
@@ -38025,6 +38054,12 @@ mod tests {
     async fn lookup_trusted_publisher_chain_returns_empty_for_unblessed_content() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v30.3.0 (CIRISPersist#611) — the read door now re-derives each
+        // publisher's conferral against THIS NODE's trust root, so the backend
+        // must know who it is. Without this the call returns the typed
+        // `NodeIdentityUnset` refusal and this fixture would fail on its
+        // wiring rather than on the property it was written for.
+        backend.set_node_key_id("tp-fixture-node");
         let sha_hex = "a".repeat(64);
         let chain = backend
             .lookup_trusted_publisher_chain(&sha_hex)
@@ -38040,6 +38075,12 @@ mod tests {
     async fn lookup_trusted_publisher_chain_returns_chain_when_trusted_publisher_attests() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v30.3.0 (CIRISPersist#611) — the read door now re-derives each
+        // publisher's conferral against THIS NODE's trust root, so the backend
+        // must know who it is. Without this the call returns the typed
+        // `NodeIdentityUnset` refusal and this fixture would fail on its
+        // wiring rather than on the property it was written for.
+        backend.set_node_key_id("tp-fixture-node");
         let publisher_key = "pub-1";
         let sha_hex = "b".repeat(64);
         let other_sha = "c".repeat(64);
@@ -38086,6 +38127,21 @@ mod tests {
             .await
             .unwrap();
 
+        // v30.3.0 (CIRISPersist#611) — the accord-conferred `trusted_publisher`
+        // IDENTITY above is no longer sufficient on its own: the chain resolves
+        // a `trust:confers:v1` grant of `infra:publish_rating` from a root this
+        // node trusts. Conferring it here keeps this fixture testing what it was
+        // written to test — SHA matching and dimension filtering — rather than
+        // silently becoming a second copy of the #611 witness.
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            &backend,
+            "tp-fixture-node",
+            "tp-fixture-root",
+            publisher_key,
+            crate::federation::types::delegation_scope::INFRA_PUBLISH_RATING,
+        )
+        .await;
+
         let chain = backend
             .lookup_trusted_publisher_chain(&sha_hex)
             .await
@@ -38110,6 +38166,12 @@ mod tests {
     async fn lookup_trusted_publisher_chain_ignores_non_publisher_emitters() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v30.3.0 (CIRISPersist#611) — the read door now re-derives each
+        // publisher's conferral against THIS NODE's trust root, so the backend
+        // must know who it is. Without this the call returns the typed
+        // `NodeIdentityUnset` refusal and this fixture would fail on its
+        // wiring rather than on the property it was written for.
+        backend.set_node_key_id("tp-fixture-node");
         // Seed a steward (not trusted_publisher).
         let steward_key = "steward-1";
         backend
