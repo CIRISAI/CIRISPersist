@@ -1145,7 +1145,7 @@ mod tests {
         use std::sync::Arc;
 
         fn pg_dsn() -> Option<String> {
-            std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+            crate::test_pg::dsn()
         }
 
         async fn clean_tenant(backend: &PostgresBackend, tenant: &str) {

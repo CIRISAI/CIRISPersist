@@ -893,7 +893,7 @@ pub(crate) mod watch_witness {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn deletion_window_breach_witness_postgres() {
-        let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

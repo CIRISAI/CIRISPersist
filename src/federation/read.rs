@@ -725,7 +725,7 @@ mod postgres_tests {
     use uuid::Uuid;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     fn build_signer(seed_byte: u8) -> Arc<LocalSigner> {

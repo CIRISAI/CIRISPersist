@@ -2959,7 +2959,7 @@ mod proptests {
     /// database SKIPS rather than fails.
     #[cfg(feature = "postgres")]
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     #[cfg(feature = "postgres")]

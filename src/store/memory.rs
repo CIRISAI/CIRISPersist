@@ -55,6 +55,10 @@ pub struct MemoryBackend {
     /// via [`MemoryBackend::set_hardware_attestation_policy`].
     hardware_attestation_policy:
         std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v30.2.0 (CIRISPersist#607) — this node's own federation key id, set by
+    /// the host via `set_node_key_id`. `None` until told, and gates that need
+    /// it MUST fail secure rather than invent one.
+    node_key_id: std::sync::RwLock<Option<String>>,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate. `None` =
     /// no gate (bootstrap-permissive). See
     /// [`MemoryBackend::set_admission_gate`].
@@ -458,6 +462,7 @@ impl Default for MemoryBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            node_key_id: std::sync::RwLock::new(None),
             admission_gate: std::sync::RwLock::new(None),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::NoOpSchemaResolver,
@@ -512,6 +517,21 @@ impl MemoryBackend {
             .hardware_attestation_policy
             .write()
             .unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
+    /// v30.2.0 (CIRISPersist#607) — tell this backend which federation key IS
+    /// this node.
+    ///
+    /// Required before any reserved-prefix rule carrying a
+    /// `required_delegation_scope` can admit: resolving "does THIS NODE trust
+    /// the root that conferred the emitter's role" needs an identity to ask on
+    /// behalf of, and asking on behalf of the ATTESTER is answered by rows the
+    /// attester signs itself.
+    ///
+    /// Set by the host (`Engine`), never inferred here. A backend that guesses
+    /// its own identity is a backend that can be told the wrong one.
+    pub fn set_node_key_id(&self, key_id: impl Into<String>) {
+        *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
     }
 
     /// Snapshot the currently-installed hardware-attestation policy.
@@ -1790,6 +1810,9 @@ fn mem_scores_row_matches(
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
+    fn node_key_id(&self) -> Option<String> {
+        self.node_key_id.read().expect("node_key_id lock").clone()
+    }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
     // the same predicate `put_public_key` uses. Delegates to the inherent
@@ -16313,6 +16336,139 @@ mod tests {
 
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
     /// `agent` / `node`).
+    /// v30.2.0 (CIRISPersist#607) — seed a key AND the trust-root conferral its
+    /// reserved-prefix rule now resolves.
+    ///
+    /// A `witness` / `lenscore_detector` claim is no longer self-sufficient: the
+    /// door asks whether a root THIS NODE trusts conferred the matching scope.
+    /// This helper builds the honest path — a root, this node's `trust:accepts`
+    /// edge to it, and the root's `trust:confers` edge carrying `scope` — so a
+    /// fixture proves the gate ADMITS a properly conferred emitter, not merely
+    /// that it refuses everything.
+    ///
+    /// The negative case (claim present, conferral absent) is
+    /// `a_self_asserted_witness_is_refused_607`.
+    /// v30.2.0 (CIRISPersist#607) — **a self-asserted witness is REFUSED.**
+    ///
+    /// The whole of #607 in one assertion. Before this, any stranger could
+    /// register with `identity_type: "witness"` and then assert an
+    /// age-assurance LEVEL about a third party — the rung CC 3.4.11 reserves to
+    /// a witness *precisely because a subject must not reach it*. The door
+    /// membership-tested a string the stranger wrote themselves.
+    ///
+    /// The POSITIVE control is `put_conferred_key`, used by every other witness
+    /// fixture here: same claim, same door, plus a conferral — admitted. Both
+    /// halves are needed. Without the positive, "refuse everything" passes;
+    /// without this, "admit everything" passes.
+    #[tokio::test]
+    async fn a_self_asserted_witness_is_refused_607() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("sa-node");
+        // The claim, with NO conferral behind it — the #607 attack exactly.
+        put_typed_key(&backend, "sa-witness", "witness").await;
+        put_typed_key(&backend, "sa-subject", "user").await;
+
+        let att = fix_age_attestation(
+            "sa-1",
+            "sa-witness",
+            "sa-subject",
+            "age_assurance:government:adult:v1",
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .expect_err(
+                "a self-asserted witness must NOT be able to assert an age rung about a \
+                 third party — that is CIRISPersist#607",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infra:attest_assurance"),
+            "the refusal must name the missing conferral so an operator knows what to obtain; \
+             got: {msg}"
+        );
+    }
+
+    async fn put_conferred_key(backend: &MemoryBackend, key_id: &str, it: &str, scope: &str) {
+        use crate::federation::trust_root::{
+            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
+        };
+        let node = "n607-node";
+        let root = "n607-root";
+        backend.set_node_key_id(node);
+        for k in [node, root] {
+            put_typed_key(backend, k, "node").await;
+        }
+        put_typed_key(backend, key_id, it).await;
+        // The root charters itself (key root), this node accepts it, and it
+        // confers `scope` on the emitter.
+        for (id, from, to, dim, sc) in [
+            // The root charters ITSELF (key root). It must carry a
+            // pre_rotation_commitment: without a pre-committed successor set,
+            // root-key compromise is unrecoverable by construction.
+            // The charter's job dimension is trust:CHARTER:v1 — not
+            // trust:confers. A charter is a root declaring itself, which is a
+            // different job from conferring on someone else.
+            (
+                "n607-charter",
+                root,
+                root,
+                TRUST_CHARTER_DIMENSION,
+                "infra:serve",
+            ),
+            (
+                "n607-accept",
+                node,
+                root,
+                TRUST_ACCEPTS_DIMENSION,
+                "infra:serve",
+            ),
+            ("n607-confer", root, key_id, TRUST_CONFERS_DIMENSION, scope),
+        ] {
+            // Sign the envelope we actually ship. Building the row first and
+            // overwriting the envelope afterwards invalidates the signature —
+            // the row then fails hybrid verify at the door, which is the door
+            // working correctly on a fixture that lied.
+            // A KEY-ROOT charter must carry BOTH infra:serve AND infra:attest
+            // (the RC3 AND-minimum, #488) — one alone is not a charter.
+            let mut envelope = if id == "n607-charter" {
+                serde_json::json!({"dimension": dim, "scope": ["infra:serve", "infra:attest"]})
+            } else {
+                serde_json::json!({"dimension": dim, "scope": [sc]})
+            };
+            if id == "n607-charter" {
+                envelope["pre_rotation_commitment"] =
+                    serde_json::json!(crate::federation::trust_root::pre_rotation_commitment(&[
+                        "n607-root-successor".to_owned()
+                    ])
+                    .expect("commitment"));
+            }
+            let envelope = envelope;
+            let (och, sc_sig, sp_sig) =
+                crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
+            let mut a = fix_attestation(id, from, to, from);
+            a.attestation_type =
+                crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
+            a.attestation_envelope = envelope;
+            a.original_content_hash = och;
+            a.scrub_signature_classical = sc_sig;
+            a.scrub_signature_pqc = sp_sig;
+            a.scrub_key_id = from.to_owned();
+            match backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: a })
+                .await
+            {
+                Ok(()) => {}
+                // Re-asserting the shared charter / accept row is expected when
+                // a test confers on more than one key. A UNIQUE violation on
+                // the SAME id is idempotence, not a failure — anything else
+                // still fails loudly.
+                Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
+                Err(e) => panic!("conferral edge must admit: {e}"),
+            }
+        }
+    }
+
     async fn put_typed_key(backend: &MemoryBackend, key_id: &str, it: &str) {
         let mut rec = fix_key(key_id, "ref", key_id);
         rec.identity_type = it.to_owned();
@@ -16342,7 +16498,13 @@ mod tests {
     async fn age_band_resolution_witness_outranks_self_and_ratchets() {
         use crate::federation::age::{age_band, AgeBand};
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "ab-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "ab-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "ab-subj", "user").await;
 
         // No attestation → Unknown (presumption of sovereignty).
@@ -16409,7 +16571,13 @@ mod tests {
     async fn age_band_witness_minor_and_expired_witness_ignored() {
         use crate::federation::age::{age_band, AgeBand};
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "abe-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "abe-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "abe-subj", "user").await;
 
         // Witness minor → Minor.
@@ -16458,7 +16626,13 @@ mod tests {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         // S = adult-user steward; the witness that attests adulthood.
-        put_typed_key(&backend, "ut-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "ut-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "ut-S", "user").await;
         // Adult target A (witness-attested adult), unknown-age user U,
         // minor target M (witness-attested minor), node N.
@@ -16531,7 +16705,13 @@ mod tests {
     async fn user_target_gate_granter_must_be_adult_and_nodes_unaffected() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "ug-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "ug-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "ug-U", "user").await; // unknown-age user (granter)
         put_typed_key(&backend, "ug-M", "user").await; // witness-minor ward
         put_typed_key(&backend, "ug-N", "node").await; // node target
@@ -16602,7 +16782,13 @@ mod tests {
     async fn age_assurance_witness_targets_subject_decision_table() {
         use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "wts-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "wts-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "wts-T", "user").await; // the subject
         put_typed_key(&backend, "wts-P", "user").await; // plain (non-witness) user
 
@@ -16691,7 +16877,13 @@ mod tests {
     async fn age_band_ignores_pre_gate_self_emitted_witness_row() {
         use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "pg-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "pg-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "pg-T", "user").await;
 
         // Bypass the gate: push a self-emitted witness-adult row directly.
@@ -16787,7 +16979,15 @@ mod tests {
     /// Register `assessor`(witness), `S`(adult user), `A`(adult user); attest
     /// S and A adults. Returns nothing; keys are `<p>-assessor/-S/-A`.
     async fn bootstrap_incapacity(backend: &MemoryBackend, p: &str) {
-        put_typed_key(backend, &format!("{p}-assessor"), "witness").await;
+        // v30.2.0 (CIRISPersist#607) — the assessor is a witness, and a witness
+        // now needs a trust-root conferral before `age_assurance:` admits.
+        put_conferred_key(
+            backend,
+            &format!("{p}-assessor"),
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(backend, &format!("{p}-S"), "user").await;
         put_typed_key(backend, &format!("{p}-A"), "user").await;
         for who in ["S", "A"] {
@@ -16827,7 +17027,13 @@ mod tests {
     #[tokio::test]
     async fn capacity_assurance_witness_reserved_and_no_self_emit() {
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "cap-assessor", "witness").await;
+        put_conferred_key(
+            &backend,
+            "cap-assessor",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "cap-user", "user").await;
         put_typed_key(&backend, "cap-subj", "user").await;
 
@@ -16860,7 +17066,13 @@ mod tests {
 
         // The SUBJECT must not self-mint their own (in)capacity, even as a
         // witness (attester == attested).
-        put_typed_key(&backend, "cap-selfwit", "witness").await;
+        put_conferred_key(
+            &backend,
+            "cap-selfwit",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         let e = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_age_attestation(
@@ -17267,7 +17479,13 @@ mod tests {
         use crate::federation::admission::{is_steward_bound, steward_bindings_of};
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
-        put_typed_key(&backend, "ml-witness", "witness").await;
+        put_conferred_key(
+            &backend,
+            "ml-witness",
+            "witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         put_typed_key(&backend, "ml-S", "user").await; // adult-user steward
         put_typed_key(&backend, "ml-M", "user").await; // minor-user ward
         put_typed_key(&backend, "ml-A", "user").await; // adult-user (self-sovereign)

@@ -151,6 +151,13 @@ pub mod witness;
 static CIRIS_PERSIST_BUILD_VERSION: &[u8] =
     concat!("ciris-persist ", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
+/// v30.2.0 (CIRISPersist#17) — one postgres database per test process, so the
+/// suite stops needing `--test-threads=1`. See the module docs for the measured
+/// 2.8x serial penalty this removes, and for why
+/// `#[serial_test::serial(postgres)]` was never the remedy.
+#[cfg(all(test, feature = "postgres"))]
+mod test_pg;
+
 #[cfg(test)]
 mod build_version_tests {
     /// The embedded literal carries the live `CARGO_PKG_VERSION` and is

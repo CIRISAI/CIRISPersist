@@ -779,7 +779,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn regime_replicates_postgres() {
         use crate::store::Backend;
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -944,7 +944,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn a_consent_grant_naming_regime_federates_a_regime_row_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

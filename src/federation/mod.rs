@@ -605,6 +605,25 @@ pub trait FederationDirectory: Send + Sync {
         std::sync::Arc::new(HardwareAttestationPolicy::default())
     }
 
+    /// v30.2.0 (CIRISPersist#607) — **this node's own federation key id**, when
+    /// the host has told the directory who it is.
+    ///
+    /// Admission gates that must ask *"do **I** trust the root that conferred
+    /// this?"* need an identity to ask on behalf of. Without one the question
+    /// has no non-circular form: asking whether the ATTESTER trusts the root
+    /// that vouches for the attester is answered by two rows the attester signs
+    /// itself, which is forgery, not verification.
+    ///
+    /// `None` is the honest default for a directory nobody configured, and
+    /// callers MUST treat it as *cannot verify* — which for an
+    /// authority-bearing row means REFUSE, never admit. Injected exactly like
+    /// [`hardware_attestation_policy`](Self::hardware_attestation_policy): the
+    /// host sets it, the trait exposes it, and no gate reaches past the host to
+    /// invent one.
+    fn node_key_id(&self) -> Option<String> {
+        None
+    }
+
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
     /// Key-plane apply** for anti-entropy replication, dyn-dispatchable.
     ///

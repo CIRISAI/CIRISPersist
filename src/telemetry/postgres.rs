@@ -1362,7 +1362,7 @@ mod tests {
     use chrono::Duration;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     fn obs(name: &str, tenant: &str, value: f64, when: DateTime<Utc>) -> MetricObservation {

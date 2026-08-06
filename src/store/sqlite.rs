@@ -90,6 +90,10 @@ pub struct SqliteBackend {
     /// for accord-holder `put_public_key` admission.
     hardware_attestation_policy:
         std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v30.2.0 (CIRISPersist#607) — this node's own federation key id, set by
+    /// the host via `set_node_key_id`. `None` until told, and gates that need
+    /// it MUST fail secure rather than invent one.
+    node_key_id: std::sync::RwLock<Option<String>>,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
@@ -211,6 +215,7 @@ impl SqliteBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            node_key_id: std::sync::RwLock::new(None),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -313,6 +318,21 @@ impl SqliteBackend {
             .unwrap_or_else(|p| p.into_inner()) = policy;
     }
 
+    /// v30.2.0 (CIRISPersist#607) — tell this backend which federation key IS
+    /// this node.
+    ///
+    /// Required before any reserved-prefix rule carrying a
+    /// `required_delegation_scope` can admit: resolving "does THIS NODE trust
+    /// the root that conferred the emitter's role" needs an identity to ask on
+    /// behalf of, and asking on behalf of the ATTESTER is answered by rows the
+    /// attester signs itself.
+    ///
+    /// Set by the host (`Engine`), never inferred here. A backend that guesses
+    /// its own identity is a backend that can be told the wrong one.
+    pub fn set_node_key_id(&self, key_id: impl Into<String>) {
+        *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
+    }
+
     /// Snapshot the currently-installed hardware-attestation policy.
     pub fn hardware_attestation_policy(
         &self,
@@ -389,6 +409,7 @@ impl SqliteBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            node_key_id: std::sync::RwLock::new(None),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -2680,6 +2701,9 @@ impl SqliteBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
+    fn node_key_id(&self) -> Option<String> {
+        self.node_key_id.read().expect("node_key_id lock").clone()
+    }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
     // the same predicate `put_public_key` uses. Delegates to the inherent
@@ -35153,6 +35177,18 @@ mod tests {
                 .unwrap();
         }
 
+        // v30.2.0 (CIRISPersist#607) — the witness rung now resolves a
+        // trust-root conferral.
+        backend.set_node_key_id("sl-node");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            &backend,
+            "sl-node",
+            "sl-root",
+            "sl-witness",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
+
         // Age-attest S + A as adults (witness rung), M as a minor.
         let age = |emitter: &str, subj: &str, token: &str| {
             let mut a = topo_attestation(
@@ -35258,6 +35294,19 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        // v30.2.0 (CIRISPersist#607) — the assessor is a witness, and
+        // `age_assurance:` now resolves a trust-root conferral rather than
+        // membership-testing the claim.
+        backend.set_node_key_id("si-node");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            &backend,
+            "si-node",
+            "si-root",
+            "si-assessor",
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
 
         // A capacity/age attestation ABOUT `subj` from `emitter` carrying a
         // bare `attestation_type` token (like the age fixtures).

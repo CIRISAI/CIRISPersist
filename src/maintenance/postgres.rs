@@ -402,7 +402,7 @@ mod tests {
     use uuid::Uuid;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     async fn fresh_backend() -> Option<(Arc<PostgresBackend>, PostgresMaintenanceBackend)> {

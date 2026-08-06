@@ -1472,7 +1472,7 @@ mod tests {
     use crate::store::postgres::PostgresBackend;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     /// v0.7.1 — produce the contributor's base64-encoded Ed25519

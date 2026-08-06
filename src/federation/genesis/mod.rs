@@ -1286,7 +1286,7 @@ mod tests {
         use crate::store::backend::Backend as _;
         use crate::store::postgres::PostgresBackend;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

@@ -5,6 +5,75 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.2.0] — 2026-08-06 — the claim a stranger could write, and the suite that needed one thread
+
+- **#607 — a self-asserted `witness` could assert an age-assurance rung about any third party.
+  Closed.** `check_privileged_identity_type_admission` enforced only `AccordCoScrubbed` claims, and
+  three reserved-prefix rules — `age_assurance:`, `capacity_assurance:`,
+  `transparency_log:cosigned:` — were **pure membership tests** against the `identity_type` string
+  on a registration row the stranger wrote themselves. Same for `lenscore_detector` over the whole
+  `detection:*` wildcard. CC 3.4.11 reserves that rung to a witness *precisely because a subject
+  must not reach it*.
+
+  `ReservedPrefixRule` gains `required_delegation_scope`. Where set, the identity check becomes a
+  **precondition** and the door additionally resolves a live `trust:confers:v1` grant of that scope
+  from a root **this node** trusts. Two scopes minted: `infra:attest_assurance` and `infra:detect`
+  — deliberately not reusing `infra:attest`, which already governs the build-manifest plane, because
+  one name carrying two authorities is the fusion class this repo keeps closing.
+
+  **`witness` was MIS-DECLARED, not merely unenforced.** Its `DerivedFromVerifiedState` mode
+  promised the authority is "re-derived at each use" — true of `steward` / `partner` /
+  `wise_authority`, each of which has a real graph edge to walk, and never true of `witness`, for
+  which no verified state exists. It is `DelegatedFromTrustRoot` now: CC 3.4.11 calls a witness *"a
+  registered age-assurance provider"*, and registration is conferral.
+
+  **The near-miss is the part worth keeping.** The first implementation passed
+  `row.attesting_key_id` as the trusting party — asking whether the attester trusts the root that
+  vouches for the attester. An attacker controlling that key signs **both** rows. It would have
+  closed the issue on paper while admitting everything, and every test written for it would have
+  passed. The fix only became real once the node identity came from the **host**:
+  `set_node_key_id()` on all three backends, injected by `Engine` at construction (not only at
+  `register_self`, so a host cannot forget it — AV-77's shape), with the door **refusing** when no
+  identity is present, because "cannot verify" must never mean "admit".
+
+  Witnessed both ways: `a_self_asserted_witness_is_refused_607` is the negative, and every other
+  witness fixture is the positive — same claim, same door, plus a conferral, admitted. Without the
+  positive, "refuse everything" would pass; without the negative, "admit everything" would.
+
+- **#17 — the suite no longer needs `--test-threads=1`, and CI's wall time drops.** Postgres tests
+  shared one database and raced over schema state, so CI serialized everything. Measured on the
+  `cirisaudit` leg, 2326/2326 passing each time:
+
+  | configuration | wall |
+  |---|---|
+  | serial, shared DB (CI before) | 436.5 s |
+  | parallel, isolated, **no template** | 1134.8 s |
+  | parallel, isolated, **templated** | **246.0 s** |
+
+  The middle row matters: per-test isolation **alone is a 2.6× regression**, because each test then
+  runs all 116 migrations into an empty database. `CREATE DATABASE … TEMPLATE` copies an
+  already-migrated database instead, built once under a postgres advisory lock. Anyone adopting half
+  this change gets a slower suite and concludes the approach fails.
+
+  One database per test **process** — which under nextest is one per test — from `src/test_pg.rs`.
+  All 79 helpers converted; the 491 call sites needed no edits because `dsn()` kept its synchronous
+  signature and `None`-skip semantics. Provisioning **fails loud** rather than falling back to the
+  shared database, since a silent fallback would restore the race while everything still passed.
+  Databases are reaped **by dead PID at provision time**, not at exit — this suite gets killed
+  constantly and a killed process runs no exit hook (verified: 354 → 2).
+
+- **`serial_test::serial` never worked here, and the gate enforcing it was worse than none.** nextest
+  runs each test in its own PROCESS; `serial_test`'s lock is process-local. The 43 attributes
+  v30.0.1 added do nothing, and two green runs after adding them were coincidence read as causation.
+  `every_postgres_test_takes_the_serial_lock` enforced that decoration while reporting protection.
+  It is replaced by `every_postgres_test_goes_through_the_provisioner`, which guards the invariant
+  that actually holds isolation — and whose first run correctly caught **itself**, since its own
+  predicate and dye string necessarily contain the pattern they detect.
+
+- **`target/debug/incremental` reached 114 GB** — more than twice the 54 GB of `deps/` it exists to
+  accelerate — and took the host to 97% disk mid-run. Cleared, and `incremental = false` for dev
+  builds: this repo's loop is "run the nine-leg suite", where the cache is invalidated wholesale.
+
 ## [30.1.0] — 2026-08-05 — a re-scoped row stopped being servable, and the peer asking for it got silence
 
 - **#610 — `set_attestation_cohort_scope` recomputed the row hash and never touched the wire index.**

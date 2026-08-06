@@ -1367,7 +1367,7 @@ mod ingest_gate_proof {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!(
                 "skipping erasable::ingest_gate_proof::postgres: CIRIS_PERSIST_TEST_PG_URL unset"
             );

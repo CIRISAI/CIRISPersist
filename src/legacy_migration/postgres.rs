@@ -665,7 +665,7 @@ mod tests {
     use uuid::Uuid;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     /// Create the legacy 2.8.x agent-shaped tables (in the `public`

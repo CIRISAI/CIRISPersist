@@ -1154,7 +1154,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn tier_ingest_matrix_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping tier_ingest_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

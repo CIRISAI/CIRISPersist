@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "30.1.0"
+version = "30.2.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -967,6 +967,14 @@ required-features = ["encrypted-kv"]
 # per-build footprint several-fold. The `test` profile inherits this.
 [profile.dev]
 debug = "line-tables-only"
+# v30.2.0 — incremental compilation OFF. `target/debug/incremental` reached
+# **114 GB** on this tree and took the host to 97% disk mid-test-run, against
+# 54 GB for `deps/` — the cache was more than twice the size of the artifacts
+# it accelerates. It buys rebuild speed for an edit-compile-edit loop; this
+# repo's actual loop is "run the full nine-leg suite", where the cache is
+# re-invalidated wholesale and pays for almost nothing. `debug =
+# "line-tables-only"` above is the same trade already made for debuginfo.
+incremental = false
 
 # v3.12.x (CIRISPersist#156) — full-DWARF profile for the cohabitation
 # diagnostic harness (mirrors CIRISEdge's `panic-debug`). Inherits

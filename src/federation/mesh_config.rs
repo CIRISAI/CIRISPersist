@@ -3571,7 +3571,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn mesh_config_door_and_fold_postgres() {
         use crate::store::Backend;
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

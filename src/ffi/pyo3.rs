@@ -30362,7 +30362,7 @@ mod tests {
     fn current_rust_engine_shares_singleton_backend_postgres() {
         use crate::store::Backend;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -30841,7 +30841,7 @@ mod tests {
         use base64::Engine as _;
         use ed25519_dalek::Signer;
         use ed25519_dalek::SigningKey;
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -30903,7 +30903,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn audit_chain_proof_empty_pg() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };

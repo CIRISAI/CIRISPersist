@@ -28,7 +28,6 @@ the message names the file, the line, and the phantom version.
 """
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -47,22 +46,24 @@ NAMED_CRATE = re.compile(
 
 
 def released_versions() -> set[str]:
-    """Versions that shipped: a CHANGELOG entry OR a git tag.
+    """Versions that shipped, read from CHANGELOG.md ONLY.
 
-    Both, because they disagree at the edges -- the CHANGELOG does not reach
-    back to the earliest tags, and the cut in flight has an entry before it has
-    a tag. A version in either is real.
+    **Deliberately not `git tag`.** An earlier version of this consulted tags
+    as well, on the reasoning that they disagree at the edges. They do — nine
+    versions (2.0.3 … 2.1.1, 5.5.1, 6.0.0) are tagged with no CHANGELOG entry —
+    and consulting both made the gate ENVIRONMENT-DEPENDENT: green on a full
+    local clone, RED in CI, whose checkout is shallow and carries no tags.
+
+    That is the worst failure mode a gate has. It passed for the author, failed
+    for everyone else, and the red was invisible for three releases because the
+    run it failed in also contained an unschedulable macOS job that held the
+    whole workflow at `queued`.
+
+    One source, present in every checkout, same answer everywhere. The
+    tag-only versions live in the ratchet instead.
     """
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    out = set(re.findall(r"^##\s*\[(\d+\.\d+\.\d+)\]", text, re.MULTILINE))
-    try:
-        tags = subprocess.run(
-            ["git", "tag"], capture_output=True, text=True, cwd=ROOT, check=True
-        ).stdout.split()
-        out |= {t[1:] for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)}
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass  # CHANGELOG alone still gates; a tagless checkout is not a failure
-    return out
+    return set(re.findall(r"^##\s*\[(\d+\.\d+\.\d+)\]", text, re.MULTILINE))
 
 
 def baseline() -> set[str]:

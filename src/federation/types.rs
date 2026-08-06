@@ -380,7 +380,24 @@ pub mod identity_type {
             // witness-target walks. The registration claim is descriptive; the
             // authority is re-derived from persist's own verified state, so a
             // self-asserted claim buys nothing.
-            WITNESS | STEWARD | PARTNER | WISE_AUTHORITY => ConferralMode::DerivedFromVerifiedState,
+            // v30.2.0 (CIRISPersist#607) — WITNESS moved to
+            // DelegatedFromTrustRoot. It was declared DerivedFromVerifiedState
+            // on the reasoning that "the AUTHORITY is re-derived at each use,
+            // so a self-asserted claim buys nothing". That holds for STEWARD /
+            // PARTNER / WISE_AUTHORITY, each of which has a real graph edge to
+            // walk (steward-binding, partner licensure, WA adjudication). It
+            // was never true of WITNESS: there is no verified state that makes
+            // a key a witness, so nothing was re-derived and the three doors it
+            // opens — age_assurance:, capacity_assurance:,
+            // transparency_log:cosigned: — were bare membership tests against a
+            // string the holder wrote themselves.
+            //
+            // CC 3.4.11 calls a witness "a registered age-assurance provider".
+            // Registered BY someone: that is conferral, and the delegation
+            // plane is where conferral lives. The mode was mis-declared, not
+            // merely unenforced.
+            WITNESS => ConferralMode::DelegatedFromTrustRoot,
+            STEWARD | PARTNER | WISE_AUTHORITY => ConferralMode::DerivedFromVerifiedState,
             _ => return None,
         })
     }
@@ -701,6 +718,28 @@ pub mod delegation_scope {
     /// CC 4.4.3.4.3 / CC 1.13.5 — the brain-only scope prefix. FORBIDDEN
     /// for a `node`-role delegate.
     pub const AGENCY_PREFIX: &str = "agency:";
+
+    /// v30.2.0 (CIRISPersist#607) — `infra:attest_assurance` — issue
+    /// **assurance attestations about third parties**: the `age_assurance:` and
+    /// `capacity_assurance:` rungs, and `transparency_log:cosigned:`.
+    ///
+    /// The scope a `witness` must hold from a trust root before those doors
+    /// open. It is deliberately NOT `infra:attest` — that scope already
+    /// governs the build-manifest plane (#422), and reusing it would let an
+    /// attest-scoped key silently gain the power to declare a third party's age
+    /// band. One name, two authorities is the fusion class this repo keeps
+    /// closing.
+    pub const INFRA_ATTEST_ASSURANCE: &str = "infra:attest_assurance";
+
+    /// v30.2.0 (CIRISPersist#607) — `infra:detect` — emit on the adversarial
+    /// detection plane (`detection:*`) about other parties.
+    ///
+    /// The scope a `lenscore_detector` must hold. Its
+    /// `DelegatedFromTrustRoot` mode always named
+    /// [`capability_roots_to_trusted_root`](crate::federation::trust_root::capability_roots_to_trusted_root)
+    /// as the resolver; nothing ever called it, so the whole `detection:*`
+    /// wildcard was a membership test on a self-asserted string.
+    pub const INFRA_DETECT: &str = "infra:detect";
 
     /// `infra:network_presence` — be reachable / present on the network
     /// as the node (the infra realization of presence; cf. the legacy

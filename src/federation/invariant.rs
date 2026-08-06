@@ -547,6 +547,38 @@ mod tests {
             identity_type::LENSCORE_DETECTOR,
         ] {
             register(&backend, &format!("wia-right-{it}"), it).await;
+            // Gated exactly like `r2_test_support` itself (its fixtures need a real
+            // signing path, so it is `cfg(any(sqlite, postgres))`). A bare `#[cfg]`
+            // on the first statement is NOT enough — it gates one line and leaves
+            // the rest referring to a module that was configured out, which is how
+            // the no-feature `default` leg kept failing to COMPILE.
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
+            {
+                // Gated exactly like `r2_test_support` itself (its fixtures need a
+                // real signing path, so it is `cfg(any(sqlite, postgres))`).
+                // Without this the no-feature `default` leg fails to COMPILE —
+                // which is the leg that exists to catch precisely this.
+                // v30.2.0 (CIRISPersist#607) — rules carrying a
+                // `required_delegation_scope` resolve a trust-root conferral, so
+                // the "required identity is admitted" leg needs the honest path
+                // built too. Without it this test would assert that persist
+                // REFUSES its own required identity — a manifest/rule divergence
+                // that is really just a missing fixture.
+                backend.set_node_key_id("wia-node");
+                for scope in [
+                    crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+                    crate::federation::types::delegation_scope::INFRA_DETECT,
+                ] {
+                    crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+                        &backend,
+                        "wia-node",
+                        "wia-root",
+                        &format!("wia-right-{it}"),
+                        scope,
+                    )
+                    .await;
+                }
+            }
         }
 
         for fact in RESERVED_FACTS {
@@ -584,6 +616,28 @@ mod tests {
                 ));
 
             // ...and admits (past the identity check) the required identity.
+            //
+            // v30.2.0 (CIRISPersist#607) — SKIPPED on the no-feature build. A
+            // rule carrying `required_delegation_scope` needs a real trust-root
+            // conferral to admit, and building one needs a signing path that
+            // only the sqlite / postgres features provide. Asserting admission
+            // without it would assert that persist refuses its OWN required
+            // identity — a manifest/rule divergence that is really a fixture
+            // that cannot exist here.
+            //
+            // The REFUSAL direction above still runs on every build, so this
+            // leg keeps proving the half it can: the wrong identity is rejected.
+            #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+            if crate::federation::admission::default_reserved_prefix_rules()
+                .iter()
+                .any(|r| {
+                    fact.sample_attestation_type
+                        .starts_with(r.pattern_prefix.as_str())
+                        && r.required_delegation_scope.is_some()
+                })
+            {
+                continue;
+            }
             let right_key = format!("wia-right-{}", fact.required_identity_type);
             let right = fix_attestation(
                 "wia-att",

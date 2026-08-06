@@ -273,6 +273,10 @@ pub struct PostgresBackend {
     /// Override via [`PostgresBackend::with_hardware_attestation_policy`].
     hardware_attestation_policy:
         std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v30.2.0 (CIRISPersist#607) — this node's own federation key id, set by
+    /// the host via `set_node_key_id`. `None` until told, and gates that need
+    /// it MUST fail secure rather than invent one.
+    node_key_id: std::sync::RwLock<Option<String>>,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no trust gate is installed (bootstrap-permissive — the
     /// historical pre-#123 behavior). Set via
@@ -464,6 +468,7 @@ impl PostgresBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            node_key_id: std::sync::RwLock::new(None),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -506,6 +511,7 @@ impl PostgresBackend {
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
+            node_key_id: std::sync::RwLock::new(None),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -614,6 +620,21 @@ impl PostgresBackend {
             .hardware_attestation_policy
             .write()
             .unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
+    /// v30.2.0 (CIRISPersist#607) — tell this backend which federation key IS
+    /// this node.
+    ///
+    /// Required before any reserved-prefix rule carrying a
+    /// `required_delegation_scope` can admit: resolving "does THIS NODE trust
+    /// the root that conferred the emitter's role" needs an identity to ask on
+    /// behalf of, and asking on behalf of the ATTESTER is answered by rows the
+    /// attester signs itself.
+    ///
+    /// Set by the host (`Engine`), never inferred here. A backend that guesses
+    /// its own identity is a backend that can be told the wrong one.
+    pub fn set_node_key_id(&self, key_id: impl Into<String>) {
+        *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
     }
 
     /// Snapshot the currently-installed hardware-attestation policy.
@@ -3289,6 +3310,9 @@ impl PostgresBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
+    fn node_key_id(&self) -> Option<String> {
+        self.node_key_id.read().expect("node_key_id lock").clone()
+    }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
     // the same predicate `put_public_key` uses. Delegates to the inherent
@@ -19729,46 +19753,31 @@ fn row_to_calibration_bundle(r: tokio_postgres::Row) -> crate::derived::Calibrat
 /// means a clean tree proves nothing about whether it can fire.
 #[cfg(all(test, feature = "postgres"))]
 pub(crate) mod postgres_serial_scan {
-    /// Does this attribute block describe a postgres-gated test with no serial
-    /// lock? Operates on the joined attribute text, so it is callable on a
-    /// planted string.
-    pub(crate) fn is_unserialized(attrs: &str) -> bool {
-        // Require a REAL test attribute, not the substring "test". A helper
-        // carrying `#[cfg(all(test, feature = "postgres"))]` contains both
-        // "test" and the feature gate and is not a test at all — the gate's
-        // first run flagged `run_in_isolated_pg_db` for exactly that, which is
-        // why the dye test asserts the clean case too. A gate that fires on
-        // correct code gets deleted by the next person who hits it.
-        let is_test =
-            attrs.contains("#[test]") || attrs.contains("::test]") || attrs.contains("::test(");
-        if !(is_test && attrs.contains("feature = \"postgres\"")) {
+    /// Does this source line read the test DSN env var directly, instead of
+    /// going through [`crate::test_pg::dsn`]?
+    ///
+    /// Kept separate from the walk so the predicate is dye-testable on a
+    /// planted string: a gate whose predicate can only be exercised by the tree
+    /// it polices proves nothing on a clean tree.
+    /// A line may exempt itself with this marker. Exactly two lines need it —
+    /// this predicate's own body and the dye test's planted string — because
+    /// both necessarily CONTAIN the pattern they exist to detect. Without the
+    /// marker the gate flags its own implementation: the same self-match that
+    /// makes `pgrep -f` kill the shell that ran it.
+    ///
+    /// The marker is deliberately ugly and greppable. An exemption that is easy
+    /// to add quietly is a suppression file waiting to happen.
+    pub(crate) const EXEMPT: &str = "SCAN-EXEMPT-SELF-MATCH";
+
+    pub(crate) fn is_direct_env_read(line: &str) -> bool {
+        if line.contains(EXEMPT) {
             return false;
         }
-        // v30.1.0 — the group must be `postgres` SPECIFICALLY, not merely
-        // "serialized". serial_test's lock is per GROUP, so
-        // `#[serial_test::serial(engine_singleton)]` does not exclude a single
-        // member of the `postgres` group. The first version of this predicate
-        // only looked for the substring "serial", and passed
-        // `current_rust_engine_shares_singleton_backend_postgres` while it ran
-        // concurrently against the same database as 562 postgres-group tests.
-        //
-        // A test touching two shared resources names both:
-        // `#[serial_test::serial(engine_singleton, postgres)]`.
-        !postgres_group(attrs)
+        line.contains("CIRIS_PERSIST_TEST_PG_URL") && line.contains("env::var") // SCAN-EXEMPT-SELF-MATCH
     }
 
-    /// Is this attribute block in the `postgres` serial group, under either the
-    /// single-key or the multi-key form?
-    fn postgres_group(attrs: &str) -> bool {
-        attrs.split("serial(").skip(1).any(|rest| {
-            rest.split(')')
-                .next()
-                .is_some_and(|keys| keys.split(',').any(|k| k.trim() == "postgres"))
-        })
-    }
-
-    /// Walk `src/**.rs`, returning (blocks examined, offenders).
-    pub(crate) fn scan() -> (usize, Vec<String>) {
+    /// Walk `src/**.rs`, returning (files examined, offending `file:line  text`).
+    pub(crate) fn scan_direct_env_reads() -> (usize, Vec<String>) {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
                 return;
@@ -19790,59 +19799,24 @@ pub(crate) mod postgres_serial_scan {
         let mut scanned = 0usize;
         let mut bad = Vec::new();
         for f in files {
+            // `test_pg.rs` is the ONE place allowed to read it — it is the
+            // provisioner that turns the base DSN into a per-test one.
+            if f.file_name().is_some_and(|n| n == "test_pg.rs") {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&f) else {
                 continue;
             };
-            let lines: Vec<&str> = text.split('\n').collect();
-            for (i, l) in lines.iter().enumerate() {
-                let t = l.trim_start();
-                if !(t.starts_with("fn ") || t.starts_with("async fn ")) {
-                    continue;
-                }
-                // Gather the contiguous attribute/doc block above.
-                let mut attrs: Vec<&str> = Vec::new();
-                let mut j = i as isize - 1;
-                while j >= 0 {
-                    let s = lines[j as usize].trim();
-                    if s.starts_with("#[") {
-                        attrs.push(s);
-                    } else if s.starts_with("//") {
-                        // Doc lines AND plain `//` comments belong to the
-                        // block. `///` alone was not enough: a plain comment
-                        // interleaved between attributes ended the walk, so
-                        // everything ABOVE it — including `#[cfg(feature =
-                        // "postgres")]` and `#[test]` — became invisible and
-                        // the test silently stopped being policed. Found by
-                        // mutation: this gate's own explanatory comment, added
-                        // above a `#[serial_test::serial(...)]` line, hid that
-                        // test from it. A gate a COMMENT can disable is worse
-                        // than no gate, because it still reports green.
-                    } else if !(s.is_empty() && attrs.is_empty()) {
-                        // A blank line BEFORE any attribute is the gap between
-                        // a doc block and its `fn`, so keep walking. Anything
-                        // else — a blank after attributes, or another item —
-                        // ends this block.
-                        break;
-                    }
-                    j -= 1;
-                }
-                if attrs.is_empty() {
-                    continue;
-                }
-                let joined = attrs.join(" ");
-                if !joined.contains("test") {
-                    continue;
-                }
-                scanned += 1;
-                if is_unserialized(&joined) {
-                    let name = t.trim_start_matches("async ").trim_start_matches("fn ");
-                    let name = name.split('(').next().unwrap_or(name);
+            scanned += 1;
+            for (i, l) in text.split('\n').enumerate() {
+                if is_direct_env_read(l) {
                     bad.push(format!(
-                        "  {}:{}  {name}",
+                        "  {}:{}  {}",
                         f.strip_prefix(env!("CARGO_MANIFEST_DIR"))
                             .unwrap_or(&f)
                             .display(),
-                        i + 1
+                        i + 1,
+                        l.trim()
                     ));
                 }
             }
@@ -19855,10 +19829,9 @@ pub(crate) mod postgres_serial_scan {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::env;
 
     fn pg_dsn() -> Option<String> {
-        env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     // ── v24.1.0 (CIRISPersist#559) — startup DDL composes with a shared PG ──
@@ -28653,93 +28626,61 @@ mod tests {
     /// field happened to be set. It compiled, and it would have passed any test
     /// that set a subject. Parity is not inherited from the sqlite test; it is
     /// measured here.
-    /// v30.0.1 — **every postgres-gated test takes the postgres serial lock.**
+    /// v30.2.0 (CIRISPersist#17) — **no test reaches postgres except through
+    /// the per-test provisioner.**
     ///
-    /// GateSpec (CIRISOntology/GATES.md):
+    /// GateSpec: family `procedural` (the wrong it prevents is `empirical` — a
+    /// suite green by scheduling luck) · headwaters: every `src/**.rs`,
+    /// searched for a direct read of `CIRIS_PERSIST_TEST_PG_URL` · references:
+    /// CIRISPersist#17, `src/test_pg.rs` · dye test:
+    /// `a_direct_env_read_is_caught` below · depth: TEXTUAL — it cannot see a
+    /// test handed a DSN as an argument, nor one reading the var through an
+    /// alias · owner: persist.
     ///
-    /// - **family** — `procedural`. Varying it changes orchestration — when a
-    ///   test runs relative to others — not what is true. But the *symptom* is
-    ///   an `empirical` wrong: a green suite that is green by scheduling luck.
-    /// - **headwaters** — the attribute block of every `fn` in `src/**`.
-    /// - **references** — the flakes this explains:
-    ///   `add_then_remove_moderator_round_trip_postgres`,
-    ///   `v053_pg_access_columns_present`, `av26_concurrent_boot_advisory_lock`
-    ///   — each reported as "passed in isolation", which is the signature.
-    /// - **dye test** — `an_unserialized_postgres_test_is_caught` below.
-    /// - **depth** — attribute-shape only. It cannot see a test that takes the
-    ///   lock but still races through a helper spawning its own connection,
-    ///   nor one gated on postgres by a route other than
-    ///   `#[cfg(feature = "postgres")]`.
-    /// - **owner** — persist.
+    /// # What this replaced, and why the old gate was worse than none
     ///
-    /// # Why one unserialized test breaks 289 serialized ones
+    /// This slot held `every_postgres_test_takes_the_serial_lock`, enforcing
+    /// `#[serial_test::serial(postgres)]` on every postgres test. That
+    /// attribute **does nothing under nextest** — nextest runs each test in its
+    /// own PROCESS and `serial_test`'s lock is process-local. The gate enforced
+    /// a decoration while reporting protection: the check-that-cannot-fail
+    /// class in a costume, and it passed cleanly the whole time it was useless.
     ///
-    /// `serial_test`'s group lock only excludes other **serial** members. A
-    /// non-serial test ignores it entirely, so a single unmarked test mutating
-    /// shared database state can perturb any serialized peer — including ones
-    /// whose own docs say *"so co-resident fixtures cannot perturb it"*.
-    ///
-    /// 42 tests were in that state when this gate was written, against 289
-    /// that took the lock. Both legs that went red did so on **seeding**, not
-    /// on logic, and both had passed the previous run: the tell for a race, and
-    /// the reason "it passed in isolation" must never be read as "it was a
-    /// flake".
+    /// The invariant that actually holds isolation is this one. A test reading
+    /// the env var directly gets the SHARED database and silently rejoins the
+    /// races that cost this project a `--test-threads=1` config and a measured
+    /// 2.8x wall-time penalty.
     #[test]
-    fn every_postgres_test_takes_the_serial_lock() {
-        let (scanned, bad) = super::postgres_serial_scan::scan();
+    fn every_postgres_test_goes_through_the_provisioner() {
+        let (scanned, bad) = super::postgres_serial_scan::scan_direct_env_reads();
         assert!(
-            scanned >= 200,
-            "scanned only {scanned} test attribute blocks — the scan is not reaching the \
-             tests it is supposed to police"
+            scanned > 100,
+            "scanned only {scanned} source files — the scan is not reaching the tree"
         );
         assert!(
             bad.is_empty(),
-            "{} postgres-gated test(s) do NOT take the postgres serial lock:\n{}\n\n\
-             `serial_test`'s lock only excludes other SERIAL tests, so one unmarked test can \
-             perturb any of the {} that do. Add `#[serial_test::serial(postgres)]`.",
+            "{} direct read(s) of CIRIS_PERSIST_TEST_PG_URL outside src/test_pg.rs:\n{}\n\n\
+             Each gets the SHARED database and rejoins the cross-test races per-test \
+             isolation exists to end. Use `crate::test_pg::dsn()`.",
             bad.len(),
-            bad.join("\n"),
-            scanned
+            bad.join("\n")
         );
     }
 
-    /// The **dye test**: a planted attribute block missing the lock is caught.
+    /// The **dye test**: a planted direct read is caught, and a correct call is
+    /// not. The second half matters as much as the first — the predecessor gate
+    /// produced two false positives on clean code before this pairing existed.
     #[test]
-    fn an_unserialized_postgres_test_is_caught() {
-        let planted = "#[cfg(feature = \"postgres\")] #[tokio::test]";
-        // A postgres-gated HELPER is not a test and must not be flagged.
+    fn a_direct_env_read_is_caught() {
         assert!(
-            !super::postgres_serial_scan::is_unserialized(
-                "#[cfg(all(test, feature = \"postgres\"))]"
+            super::postgres_serial_scan::is_direct_env_read(
+                "let dsn = std::env::var(\"CIRIS_PERSIST_TEST_PG_URL\").unwrap();" // SCAN-EXEMPT-SELF-MATCH
             ),
-            "a `#[cfg(all(test, feature = \"postgres\"))]` helper is not a test; flagging it \
-             makes the gate fire on correct code"
+            "the predicate missed a direct env read — the gate cannot fire"
         );
         assert!(
-            super::postgres_serial_scan::is_unserialized(planted),
-            "the predicate did not flag a postgres test with no serial attribute — the gate \
-             cannot fire, and a passing run means nothing"
-        );
-        let ok = "#[cfg(feature = \"postgres\")] #[tokio::test] #[serial_test::serial(postgres)]";
-        assert!(
-            !super::postgres_serial_scan::is_unserialized(ok),
-            "the predicate flagged a correctly serialized test — it would fail on clean code"
-        );
-        // Serialized, but in the WRONG GROUP — the case that shipped past this
-        // gate's first version and raced 562 postgres-group tests.
-        let wrong_group =
-            "#[cfg(feature = \"postgres\")] #[test] #[serial_test::serial(engine_singleton)]";
-        assert!(
-            super::postgres_serial_scan::is_unserialized(wrong_group),
-            "a test serialized under a DIFFERENT group is not excluded from the postgres group; \
-             the predicate must require the postgres KEY, not merely the word `serial`"
-        );
-        // The multi-key form names both resources and must NOT be flagged.
-        let both = "#[cfg(feature = \"postgres\")] #[test] \
-                    #[serial_test::serial(engine_singleton, postgres)]";
-        assert!(
-            !super::postgres_serial_scan::is_unserialized(both),
-            "the multi-key form names the postgres group and must pass"
+            !super::postgres_serial_scan::is_direct_env_read("let dsn = crate::test_pg::dsn();"),
+            "the predicate flagged a correct provisioner call — it would fail on clean code"
         );
     }
 

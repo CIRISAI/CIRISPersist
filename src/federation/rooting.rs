@@ -1384,7 +1384,7 @@ mod postgres_conformance {
     use crate::store::Backend;
 
     fn pg_dsn() -> Option<String> {
-        std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+        crate::test_pg::dsn()
     }
 
     /// Delete the test rows. federation_keys has a self-referential

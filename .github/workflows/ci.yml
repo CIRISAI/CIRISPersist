@@ -189,20 +189,35 @@ jobs:
         timeout-minutes: ${{ matrix.substrate.leg == 'rest' && 50 || 35 }}
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
-        # --test-threads=1 — nextest spawns each test in its own
-        # PROCESS. The substrate PG tests share schema state in
-        # cirislens_secrets/cirislens.federation_*/cirislens.audit_log
-        # and use process-local caches (SOFTWARE_KEYS); two concurrent
-        # processes racing TRUNCATEs leave caches+rows mismatched.
-        # `#[serial_test::serial(postgres)]` only serializes within a
-        # process. The CI gap-closure (every substrate now actually
-        # tested in CI) made this visible across cirisaudit + secrets
-        # + cirisnode entries. Per-test PG advisory locks fix it
-        # cleanly for individual tests, but extending them everywhere
-        # is a death-by-1000-cuts; --test-threads=1 kills the entire
-        # class in one line at the cost of slightly higher per-entry
-        # wall time (still bounded by `timeout-minutes: 25` below,
-        # and the matrix axis still parallelizes across substrates).
+        # v30.2.0 (CIRISPersist#17) — `--test-threads=1` is GONE, and with it
+        # the reason for it.
+        #
+        # The old note (kept here because the reasoning was right and only the
+        # remedy was wrong): nextest spawns each test in its own PROCESS, the
+        # substrate PG tests shared schema state in
+        # cirislens_secrets / cirislens.federation_* / cirislens.audit_log plus
+        # process-local caches (SOFTWARE_KEYS), and two concurrent processes
+        # racing TRUNCATEs left caches and rows mismatched.
+        # `#[serial_test::serial(postgres)]` cannot help — its lock is
+        # process-local, so under nextest it does nothing at all.
+        #
+        # `--test-threads=1` did kill the class, at a MEASURED 2.8x: the
+        # cirisaudit leg ran 154.8 s parallel against 436.5 s serial.
+        #
+        # `src/test_pg.rs` removes the shared state instead of serializing
+        # around it: one postgres database PER TEST PROCESS, copied from an
+        # already-migrated template. Tests cannot race over state they no
+        # longer share. Measured on the same leg, 2326/2326 passing:
+        #
+        #     serial, shared DB      436.5 s   (what this line used to do)
+        #     parallel, no template 1134.8 s   (isolation alone is a REGRESSION —
+        #                                       116 migrations per test)
+        #     parallel, templated     246.0 s  (+ ~23 s once per cold runner to
+        #                                       build the template)
+        #
+        # The template is what makes it pay; isolation without it is 2.6x worse
+        # than the serial config it replaces. Per-test databases are reaped by
+        # PID at provision time, so a killed process cannot leak them.
         #
         # v25.x (CIRISPersist#585) — the feature list is DERIVED from
         # `Cargo.toml [features]`, never spelled here. It is echoed first so a
@@ -212,7 +227,7 @@ jobs:
           FEATURES="$(python3 scripts/ci_feature_matrix.py set '${{ matrix.substrate.leg }}')"
           echo "leg '${{ matrix.substrate.leg }}' → --features \"${FEATURES}\""
           cargo nextest run --all-targets --no-fail-fast \
-            --test-threads=1 --features "${FEATURES}" \
+            --features "${FEATURES}" \
             ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
       - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core'
@@ -416,7 +431,20 @@ jobs:
   # different target/ subtree + fingerprints that would NOT overlay onto server's
   # native build. --release so target/release/ warms server's release wheel
   # (server pins the same dtolnay 1.97.0 → the rustc<X> key matches).
+  # v30.2.0 — NON-BLOCKING. `runs-on: macos-13` is GitHub's INTEL macOS image,
+  # and this file already says of the wheel matrix that those runners "have
+  # ongoing capacity issues (jobs queue indefinitely)". That lesson was applied
+  # to the wheel matrix and not here, so this one job sat unschedulable while
+  # every other job in the run completed — and because a workflow's status is
+  # the aggregate, THREE RELEASES reported `queued` for hours with a real
+  # clippy failure hidden inside them.
+  #
+  # darwin-x86_64 is a "sunset target — keep CI green only" per
+  # FSD/PLATFORM_ARCHITECTURE.md §3.5, so warming its cache must never gate a
+  # release. `continue-on-error` lets the run reach a verdict; if Intel capacity
+  # returns, the job still does its job.
   darwin-x86_64-cachewarm:
+    continue-on-error: true
     name: darwin-x86_64 (CIRISCache warm only — #463)
     # main + release tags (NOT PRs — PR builds are unmerged, saving them poisons
     # the shared cache). Off publish-pypi's needs graph, so warming on a tag

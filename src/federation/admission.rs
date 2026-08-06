@@ -196,6 +196,32 @@ pub struct ReservedPrefixRule {
     /// NOT in this list is rejected with
     /// [`super::Error::ReservedPrefixEmitterMismatch`].
     pub required_identity_types: Vec<String>,
+    /// v30.2.0 (CIRISPersist#607) — the delegation scope the emitter must hold
+    /// from a trust root this node trusts, resolved at the door.
+    ///
+    /// `Some(scope)` makes the identity-type check a **precondition rather than
+    /// the whole test**: the claim must be present AND a live
+    /// `trust:confers:v1` edge must confer `scope` on the attester. `None`
+    /// keeps membership-only, which is correct for claims that are gated at
+    /// REGISTRATION by a ceremony (`HardwareAttested`, `AnchorScrubbed`,
+    /// `AccordCoScrubbed`) — for those the stored string is already a fact
+    /// somebody proved.
+    ///
+    /// # Why this exists
+    ///
+    /// `identity_type` is self-asserted at registration for every claim whose
+    /// [`ConferralMode`](crate::federation::types::identity_type::ConferralMode)
+    /// defers enforcement to use. Those modes promise the authority is
+    /// "re-derived at each use" — and a `required_identity_types` membership
+    /// test re-derives NOTHING; it reads the string off the registration row a
+    /// stranger wrote. #607 measured the consequence: a self-registered
+    /// `witness` could assert an age-assurance LEVEL about any third party, the
+    /// rung CC 3.4.11 reserves to a witness *precisely because a subject must
+    /// not reach it*.
+    ///
+    /// The resolver is [`trust_root::capability_roots_to_trusted_root`], which
+    /// is the one the mode table already named and which nothing was calling.
+    pub required_delegation_scope: Option<String>,
 }
 
 /// Machine-readable reason tokens emitted alongside
@@ -392,26 +418,34 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
             required_identity_types: vec![substrate_persist.clone()],
+            required_delegation_scope: None,
         },
         ReservedPrefixRule {
             pattern_prefix: "audit_chain:".into(),
             required_identity_types: vec![substrate_persist.clone()],
+            required_delegation_scope: None,
         },
         ReservedPrefixRule {
             pattern_prefix: "corpus_health:".into(),
             required_identity_types: vec![substrate_persist.clone()],
+            required_delegation_scope: None,
         },
         ReservedPrefixRule {
             pattern_prefix: "identity_continuity:".into(),
             required_identity_types: vec![substrate_persist.clone()],
+            required_delegation_scope: None,
         },
         ReservedPrefixRule {
             pattern_prefix: "federation_directory:".into(),
             required_identity_types: vec![substrate_persist.clone()],
+            required_delegation_scope: None,
         },
         ReservedPrefixRule {
             pattern_prefix: "transparency_log:cosigned:".into(),
             required_identity_types: vec![witness.clone()],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE.to_owned(),
+            ),
         },
         // CEG 0.3 §5.6.8.3 + §11.5.3 added FOUR reserved-prefix families for
         // media-sharing admission. **Three of them are gone as of the rc3
@@ -451,6 +485,9 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: "age_assurance:".into(),
             required_identity_types: vec![witness.clone()],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE.to_owned(),
+            ),
         },
         // v11.9.0 (CIRISPersist#309, CC 3.4.12) — the capacity-assurance
         // ladder, the witness-reserved sibling of `age_assurance:`. A
@@ -463,6 +500,9 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX.into(),
             required_identity_types: vec![witness],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE.to_owned(),
+            ),
         },
         // v12.7.0 (CIRISPersist#366, CC 3.4.8) — the detector-only
         // prefixes. `detection:correlated_action:*` and
@@ -477,10 +517,16 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: "detection:correlated_action:".into(),
             required_identity_types: vec![lenscore_detector.clone()],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_DETECT.to_owned(),
+            ),
         },
         ReservedPrefixRule {
             pattern_prefix: "detection:distributive:access:".into(),
             required_identity_types: vec![lenscore_detector.clone()],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_DETECT.to_owned(),
+            ),
         },
         // CIRISPersist#379 (CC 3.4.8) — the `detection:*` prefix-WILDCARD.
         // The two leaves above enumerate the known detector families;
@@ -510,6 +556,9 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: "detection:".into(),
             required_identity_types: vec![lenscore_detector],
+            required_delegation_scope: Some(
+                crate::federation::types::delegation_scope::INFRA_DETECT.to_owned(),
+            ),
         },
     ]
 }
@@ -2804,7 +2853,7 @@ pub async fn check_capacity_consent_admission(
     let Some(claim) = consent_gated_claim(row) else {
         return Ok(());
     };
-    if row.tier != super::types::attestation_tier::FEDERATION {
+    if row.tier != crate::federation::types::attestation_tier::FEDERATION {
         return Ok(());
     }
     if row.attesting_key_id == row.attested_key_id {
@@ -8818,6 +8867,52 @@ pub async fn check_reserved_prefix_admission(
         // keys encode identically to scalar (`X ∈ {X}` ≡ `X == X`), so this
         // is behavior-preserving for every existing reserved prefix and
         // only newly-admits conformant folded keys (CC 3.4.8 detector fold).
+        // v30.2.0 (CIRISPersist#607) — RESOLVE, don't just membership-test.
+        //
+        // For a rule carrying a delegation scope the identity check below is a
+        // PRECONDITION, not the whole test: the emitter must ALSO hold that
+        // scope from a trust root THIS NODE trusts, re-derived from this node's
+        // own state — which is what the claim's ConferralMode always promised
+        // and nothing ever did.
+        //
+        // The node identity is load-bearing and must come from the host. An
+        // earlier draft of this passed `row.attesting_key_id` as the trusting
+        // party, which asks "does the attester trust the root that vouches for
+        // the attester" — answered by two rows the attester signs itself. That
+        // is forgery wearing the shape of verification, and it would have
+        // reported the hole as closed.
+        //
+        // No identity ⇒ cannot verify ⇒ REFUSE. Admitting here would restore
+        // the self-assertable state #607 measured, silently.
+        if let Some(scope) = rule.required_delegation_scope.as_deref() {
+            let Some(node) = directory.node_key_id() else {
+                return Err(Error::ReservedPrefixEmitterMismatch {
+                    dimension: at.to_owned(),
+                    prefix: rule.pattern_prefix.clone(),
+                    required: vec![format!(
+                        "delegated scope {scope} — but this directory has no node identity,                          so conferral cannot be verified. Call set_node_key_id()."
+                    )],
+                    got_identity_type: got.clone(),
+                });
+            };
+            let conferred = super::trust_root::capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &row.attesting_key_id,
+                scope,
+            )
+            .await?;
+            if conferred.is_none() {
+                return Err(Error::ReservedPrefixEmitterMismatch {
+                    dimension: at.to_owned(),
+                    prefix: rule.pattern_prefix.clone(),
+                    required: vec![format!(
+                        "delegated scope {scope} from a root this node trusts"
+                    )],
+                    got_identity_type: got.clone(),
+                });
+            }
+        }
         if !rule
             .required_identity_types
             .iter()
@@ -9964,12 +10059,6 @@ mod tests {
             ("substrate_persist", "corpus_health:"),
             ("substrate_persist", "identity_continuity:"),
             ("substrate_persist", "federation_directory:"),
-            ("witness", "transparency_log:cosigned:"),
-            ("witness", "age_assurance:"),
-            ("witness", "capacity_assurance:"),
-            ("lenscore_detector", "detection:correlated_action:"),
-            ("lenscore_detector", "detection:distributive:access:"),
-            ("lenscore_detector", "detection:"),
         ];
         let rules = default_reserved_prefix_rules();
         let mut violations: Vec<String> = Vec::new();
@@ -9989,6 +10078,13 @@ mod tests {
             }
             checked += 1;
             for rule in &rules {
+                // v30.2.0 (#607) — a rule that RESOLVES a delegation at the
+                // door is not a membership test, so a deferred-mode claim
+                // backing it is exactly right. Recognising the fix is what lets
+                // this ratchet SHRINK rather than be suppressed.
+                if rule.required_delegation_scope.is_some() {
+                    continue;
+                }
                 if rule.required_identity_types.iter().any(|t| t == claim) {
                     if GRANDFATHERED_607
                         .iter()
@@ -10057,6 +10153,7 @@ mod tests {
         let planted_rule = ReservedPrefixRule {
             pattern_prefix: "dye_test_planted:".into(),
             required_identity_types: vec![planted.to_owned()],
+            required_delegation_scope: None,
         };
         // The same predicate the gate applies, over a table containing the
         // planted rule.
@@ -12020,7 +12117,7 @@ mod canonical_gate_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn canonical_gate_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping canonical_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12410,7 +12507,7 @@ mod canonical_gate_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn infra_attest_gate_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping infra_attest_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12513,7 +12610,7 @@ mod canonical_gate_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn set_path_parity_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping set_path_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12630,7 +12727,7 @@ mod canonical_gate_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn announced_peer_parity_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping announced_peer_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12780,7 +12877,7 @@ mod canonical_gate_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn costeward_gate_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping costeward_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13299,7 +13396,7 @@ mod canonical_withdrawal_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn canonical_withdrawal_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping canonical_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13564,7 +13661,7 @@ mod canonical_withdrawal_tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn infra_attest_withdrawal_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping infra_attest_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13912,6 +14009,126 @@ pub(crate) mod r2_test_support {
     /// pack path reads the index and cannot serve it. Downstream that appears as
     /// `wanted=6 packed=5 dropped=1` — a peer asking for a row this node just
     /// advertised, and getting silence.
+    /// v30.2.0 (CIRISPersist#607) — build the HONEST conferral path a
+    /// reserved-prefix rule now resolves, and return the node key id the caller
+    /// must give the backend.
+    ///
+    /// Three rows, and each is required for a different reason:
+    ///
+    /// 1. the root **charters itself** — `trust:charter:v1` (declaring yourself is
+    ///    a different job from conferring on someone else), carrying BOTH
+    ///    `infra:serve` and `infra:attest` (the RC3 AND-minimum, #488) and a
+    ///    `pre_rotation_commitment`, without which root-key compromise is
+    ///    unrecoverable by construction;
+    /// 2. **this node accepts** that root — `trust:accepts:v1`; this is the leg
+    ///    that makes the check non-circular, because it is signed by the NODE, not
+    ///    by the emitter;
+    /// 3. the root **confers** `scope` on the emitter — `trust:confers:v1`.
+    ///
+    /// Shared rather than copied per backend: a fixture that builds this graph
+    /// slightly differently on one backend would prove the gate works there and
+    /// silently not test it elsewhere, which is this repo's recurring class.
+    pub(crate) async fn confer_scope_from_trusted_root(
+        dir: &dyn FederationDirectory,
+        node: &str,
+        root: &str,
+        subject: &str,
+        scope: &str,
+    ) {
+        use crate::federation::trust_root::{
+            pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+            TRUST_CONFERS_DIMENSION,
+        };
+        // The FK on attesting_key_id is real: every signer of the three rows must
+        // already exist in federation_keys. Seeding them here rather than at each
+        // call site keeps the helper self-sufficient — a fixture that has to
+        // remember two extra keys is a fixture that gets copied wrong.
+        for k in [node, root] {
+            // Only register what is missing. A caller may legitimately pass a key
+            // that already exists — in the Engine-level age fixtures the node's own
+            // signer IS the witness — and re-registering it with helper-derived
+            // pubkeys is a content conflict, not a fixture error.
+            if dir.lookup_public_key(k).await.ok().flatten().is_none() {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+        }
+        // Postgres stores attestation_id as a UUID column, so readable ids are
+        // refused at the driver. v5 (name-based) keeps them DETERMINISTIC,
+        // which is what makes re-asserting the shared charter / accept row
+        // idempotent instead of a fresh duplicate on every call.
+        let uid = |name: &str| {
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+        };
+        let now = chrono::Utc::now();
+        let rows: [(String, &str, &str, &str, serde_json::Value); 3] = [
+            (
+                uid(&format!("conf-charter-{root}")),
+                root,
+                root,
+                TRUST_CHARTER_DIMENSION,
+                serde_json::json!({
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": ["infra:serve", "infra:attest"],
+                    "pre_rotation_commitment":
+                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                }),
+            ),
+            (
+                uid(&format!("conf-accept-{node}-{root}")),
+                node,
+                root,
+                TRUST_ACCEPTS_DIMENSION,
+                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
+            ),
+            (
+                uid(&format!("conf-grant-{subject}-{scope}")),
+                root,
+                subject,
+                TRUST_CONFERS_DIMENSION,
+                serde_json::json!({"dimension": TRUST_CONFERS_DIMENSION, "scope": [scope]}),
+            ),
+        ];
+        for (id, from, to, _dim, envelope) in rows {
+            let (och, sc, sp) =
+                crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
+            let att = Attestation {
+                attestation_id: id,
+                attesting_key_id: from.to_owned(),
+                attested_key_id: to.to_owned(),
+                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
+                    .to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: from.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            match dir
+                .put_attestation(crate::federation::SignedAttestation { attestation: att })
+                .await
+            {
+                Ok(()) => {}
+                // Re-asserting the shared charter / accept row is idempotence when
+                // a test confers on several subjects, not a failure.
+                Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
+                Err(e) if e.to_string().contains("duplicate key") => {}
+                Err(e) => panic!("conferral row must admit: {e}"),
+            }
+        }
+    }
+
     pub(crate) async fn exercise_rescope_keeps_row_servable(
         dir: &dyn FederationDirectory,
         tag: &str,

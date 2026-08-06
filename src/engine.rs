@@ -720,7 +720,7 @@ impl Engine {
         // wrap the caller's `Arc<LocalSigner>` so the constructor stays
         // source-compatible.
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
-        Ok(Engine {
+        let engine = Engine {
             backend,
             signer,
             local_signer,
@@ -729,7 +729,17 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        })
+        };
+        // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
+        // so the backend is told here rather than waiting on
+        // `register_self_federation_key`. Reserved-prefix rules that resolve a
+        // delegation need this identity, and a gate that only becomes reachable
+        // if the host remembers an optional call is a gate that passes its
+        // tests and protects nothing in production (AV-77's shape).
+        if let Ok(id) = engine.local_derived_key_id().await {
+            engine.set_backend_node_key_id(&id);
+        }
+        Ok(engine)
     }
 
     /// v13.3.1 (CIRISPersist#387) — **TEST-ONLY** constructor: identical to
@@ -757,7 +767,7 @@ impl Engine {
         let backend = build_backend(dsn, false).await?;
         let local_signer = Some(signer.clone());
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
-        Ok(Engine {
+        let engine = Engine {
             backend,
             signer,
             local_signer,
@@ -766,7 +776,17 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        })
+        };
+        // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
+        // so the backend is told here rather than waiting on
+        // `register_self_federation_key`. Reserved-prefix rules that resolve a
+        // delegation need this identity, and a gate that only becomes reachable
+        // if the host remembers an optional call is a gate that passes its
+        // tests and protects nothing in production (AV-77's shape).
+        if let Ok(id) = engine.local_derived_key_id().await {
+            engine.set_backend_node_key_id(&id);
+        }
+        Ok(engine)
     }
 
     /// Variant accepting raw signer Arcs — matches the issue's
@@ -2581,6 +2601,17 @@ impl Engine {
         let key_id = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!("register_self derive key_id: {e}"))
         })?;
+        // v30.2.0 (CIRISPersist#607) — tell the backend WHO THIS NODE IS.
+        //
+        // Reserved-prefix rules carrying a `required_delegation_scope` resolve
+        // "does THIS NODE trust the root that conferred the emitter's role",
+        // and that question needs an identity to ask on behalf of. Registering
+        // itself is precisely the act in which a node states that identity, so
+        // it is where the backend learns it — not a separate call a host can
+        // forget, which is how a gate ends up unreachable from every real
+        // caller while its tests pass (AV-77's shape).
+        self.set_backend_node_key_id(&key_id);
+
         let pubkey = self.signer.public_key().await.map_err(|e| {
             crate::federation::Error::Backend(format!("register_self signer public_key: {e}"))
         })?;
@@ -4221,6 +4252,26 @@ impl Engine {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         self.emit_attestation(signer, input).await
+    }
+
+    /// v30.2.0 (CIRISPersist#607) — push this node's federation key id down to
+    /// whichever concrete backend is wired, so admission gates can resolve
+    /// "does THIS NODE trust that root" instead of asking the attester about
+    /// itself.
+    ///
+    /// Covers every backend the Engine can hold. A gate reachable on one
+    /// backend and silently absent on another is this repo's recurring class
+    /// (#541, AV-77), so the fan-out is exhaustive rather than
+    /// whichever-one-the-test-used.
+    fn set_backend_node_key_id(&self, key_id: &str) {
+        #[cfg(feature = "sqlite")]
+        if let Some(b) = self.sqlite_backend() {
+            b.set_node_key_id(key_id);
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(b) = self.postgres_backend() {
+            b.set_node_key_id(key_id);
+        }
     }
 
     /// Borrow the SQLite backend Arc, if this Engine was constructed
@@ -7887,7 +7938,7 @@ mod tests {
         use ed25519_dalek::{Signer as _, SigningKey};
         use uuid::Uuid;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -7968,7 +8019,7 @@ mod tests {
         use ed25519_dalek::{Signer as _, SigningKey};
         use uuid::Uuid;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -8942,7 +8993,7 @@ mod tests {
     async fn get_detection_events_facade_dispatches_to_backend_postgres() {
         use crate::derived::{DerivedSchema, EventFilter};
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -8976,7 +9027,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn get_edge_detection_events_returns_v020_rows_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -9095,7 +9146,7 @@ mod tests {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -9144,7 +9195,7 @@ mod tests {
     async fn subscribe_detection_events_drop_terminates_poll_task_postgres() {
         use crate::derived::EventFilter;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -9628,7 +9679,7 @@ mod tests {
         use crate::verify::canonical::ceg_produce_canonicalize;
         use sha2::{Digest, Sha256};
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -10331,7 +10382,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn install_storage_budget_v1_happy_and_anti_rollback_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -10533,7 +10584,7 @@ mod tests {
     /// `(dsn, db_name)`; `None` (skip) when the twin is unset.
     #[cfg(feature = "postgres")]
     async fn pg_isolated_db(tag: &str) -> Option<(String, String)> {
-        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(base) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return None;
         };
@@ -10556,7 +10607,7 @@ mod tests {
     /// pool connection the dropped Engine hasn't torn down yet).
     #[cfg(feature = "postgres")]
     async fn pg_drop_isolated_db(db: &str) {
-        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(base) = crate::test_pg::dsn() else {
             return;
         };
         if let Ok((client, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
@@ -11141,7 +11192,7 @@ mod tests {
         use crate::federation::types::attestation_type::SCORES;
         use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -11750,7 +11801,7 @@ mod tests {
             types::{attestation_tier, cohort_scope},
             FederationDirectory,
         };
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12540,7 +12591,7 @@ mod tests {
         use crate::federation::types::attestation_type::SCORES;
         use crate::federation::FederationDirectory;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -12816,7 +12867,7 @@ mod tests {
         use crate::federation::types::attestation_type::SCORES;
         use crate::federation::FederationDirectory;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13390,6 +13441,20 @@ mod tests {
         sq.put_public_key(witness_test_key_derived_for(&w, "cap-witness"))
             .await
             .expect("seed witness");
+
+        // v30.2.0 (CIRISPersist#607) — the witness rung resolves a trust-root
+        // conferral now. The node identity is pinned to one this fixture can
+        // SIGN as: the accept edge must be signed by the node, and that leg is
+        // what makes the check non-circular.
+        sq.set_node_key_id("cap-node-607");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            sq.as_ref(),
+            "cap-node-607",
+            "cap-root-607",
+            &w,
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         for k in ["ward-A", "adult-B"] {
             let mut key = sweeper_test_key(k);
             key.record.identity_type = crate::federation::types::identity_type::USER.into();
@@ -13558,6 +13623,25 @@ mod tests {
             .await
             .expect("seed subject");
 
+        // v30.2.0 (CIRISPersist#607) — the witness now needs a CONFERRAL, not
+        // just the claim. This is the honest operator path: a root charters
+        // itself, this node accepts that root, and the root confers
+        // infra:attest_assurance on the witness.
+        // Pin a node identity the fixture can SIGN as. The accept edge must be
+        // signed by the node — that is the leg that makes the check
+        // non-circular — and this engine's own signer is the WITNESS, whose
+        // registered pubkey is not the helper's derived one. The identity is
+        // injectable precisely so a host can state it; here the test states it.
+        sq.set_node_key_id("age-node-607");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            sq.as_ref(),
+            "age-node-607",
+            "age-root-607",
+            &w,
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
+
         // The subject self-declares MINOR (self rung; attested defaults to
         // the emitter — subject-signed by design).
         let self_minor = crate::federation::EmitAttestationInput::with_envelope(
@@ -13655,7 +13739,7 @@ mod tests {
         use crate::federation::age::{age_band, AgeBand};
         use crate::federation::FederationDirectory;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13676,6 +13760,19 @@ mod tests {
         pg.put_public_key(user_test_key_derived_for(&t, &t_label))
             .await
             .expect("seed subject");
+
+        // v30.2.0 (CIRISPersist#607) — the POSTGRES twin needs the same
+        // conferral. Missing a twin is this repo's recurring class, so it is
+        // done in the same change rather than found by CI later.
+        pg.set_node_key_id("age-node-607-pg");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            pg.as_ref(),
+            "age-node-607-pg",
+            "age-root-607-pg",
+            &w,
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
 
         // Subject self-declares minor.
         engine
@@ -13754,6 +13851,20 @@ mod tests {
         sq.put_public_key(witness_test_key_derived_for(&w, "mg-witness"))
             .await
             .expect("seed witness");
+
+        // v30.2.0 (CIRISPersist#607) — the witness rung resolves a trust-root
+        // conferral now. The node identity is pinned to one this fixture can
+        // SIGN as: the accept edge must be signed by the node, and that leg is
+        // what makes the check non-circular.
+        sq.set_node_key_id("mg-node-607");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            sq.as_ref(),
+            "mg-node-607",
+            "mg-root-607",
+            &w,
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         sq.put_public_key(user_test_key_derived_for(&s, "mg-steward"))
             .await
             .expect("seed steward");
@@ -13899,7 +14010,7 @@ mod tests {
         use crate::federation::types::delegation_scope;
         use crate::federation::FederationDirectory;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -13918,6 +14029,19 @@ mod tests {
         pg.put_public_key(witness_test_key_derived_for(&w, &w_label))
             .await
             .expect("seed witness");
+
+        // v30.2.0 (CIRISPersist#607) — the POSTGRES twin needs the conferral
+        // too. Fixing sqlite and missing its twin is this repo's recurring
+        // class, so both move in the same change.
+        pg.set_node_key_id("mg-node-607-pg");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            pg.as_ref(),
+            "mg-node-607-pg",
+            "mg-root-607-pg",
+            &w,
+            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+        )
+        .await;
         pg.put_public_key(user_test_key_derived_for(&s, &s_label))
             .await
             .expect("seed steward");
@@ -14126,7 +14250,7 @@ mod tests {
         use crate::federation::types::{delegation_scope, owner_binding};
         use crate::federation::FederationDirectory;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -14574,7 +14698,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn cohort_surface_roundtrip_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -14731,7 +14855,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn supersede_versioning_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -14938,7 +15062,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn quorum_supersede_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -15158,7 +15282,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn g4_rekey_events_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -15393,7 +15517,7 @@ mod tests {
         use crate::federation::admission::is_named_moderator;
         use crate::federation::types::delegation_scope::SCOPE_MODERATE;
         use crate::federation::FederationDirectory;
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -15442,7 +15566,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn file_moderation_stores_moderation_scores_postgres() {
         use crate::federation::FederationDirectory;
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -15647,7 +15771,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn local_identity_aggregate_v1_conformance_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -16158,7 +16282,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn list_takedowns_for_filters_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -16208,7 +16332,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn list_key_grants_for_filters_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -16660,7 +16784,7 @@ mod tests {
     async fn self_at_login_lands_full_flow_postgres() {
         use crate::federation::types::identity_type;
 
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
