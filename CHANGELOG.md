@@ -5,6 +5,28 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.3.1] — 2026-08-06 — the certification script was weaker than CI, so a green verdict lied
+
+- **`set_backend_node_key_id` failed the no-feature build.** Both its arms are `cfg`-gated on
+  `sqlite` / `postgres`, so on a build with neither, `key_id` is genuinely unused — and `ci.yml`
+  sets `RUSTFLAGS: -D warnings` at **workflow level**, making that an error. Fixed with an explicit
+  `#[cfg(not(any(...)))] let _ = key_id;` rather than renaming the parameter `_key_id`, which would
+  read as "unused" in the builds where it is the entire point of the method.
+
+- **The real defect is that local certification could not have caught it.** The script set no
+  `RUSTFLAGS` at all, so every leg ran with materially weaker flags than CI, and v30.3.0 was
+  certified **14/14 green by exit code** on a tree CI then rejected. The clippy leg was no help:
+  it runs with the LINT feature set, where `key_id` *is* used.
+
+  The script now **derives** `RUSTFLAGS` from the workflow-level `env:` block in `ci.yml` and
+  **refuses to run** if it cannot find one or derives an empty value — the same
+  derive-don't-restate rule already applied to the feature matrix. A certification script that
+  restates CI by hand drifts from CI by hand, and every such drift is silent and in the optimistic
+  direction.
+
+  Third time this class has been named in this repo: *a check that cannot fail is a report.* Here
+  the check could fail, but only on strictly easier terms than the thing it claimed to predict.
+
 ## [30.3.0] — 2026-08-06 — the last two claims in #607: who may write your record, and who may vouch
 
 - **#607 (final claim) — a self-asserted `substrate_persist` could file a `hard_case:` record about
