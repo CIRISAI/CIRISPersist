@@ -4394,6 +4394,13 @@ impl Engine {
     /// (#541, AV-77), so the fan-out is exhaustive rather than
     /// whichever-one-the-test-used.
     fn set_backend_node_key_id(&self, key_id: &str) {
+        // v30.3.1 — on the NO-BACKEND build every arm below is configured out,
+        // so `key_id` is genuinely unused and `-D warnings` (set workflow-wide
+        // in ci.yml) makes that an error. Said explicitly here rather than
+        // renaming the parameter `_key_id`, which would read as "unused" in the
+        // builds where it is the entire point of the method.
+        #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+        let _ = key_id;
         #[cfg(feature = "sqlite")]
         if let Some(b) = self.sqlite_backend() {
             b.set_node_key_id(key_id);
