@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.5.0] — 2026-08-08 — there are no classical-only paths
+
+- **#620 — a half identity is no longer representable.** Six incidents across four repos are one
+  defect, and every seam was individually reasonable: the PQC half was optional, its absence was
+  not fatal *here*, and some gate downstream would catch it. True and insufficient — it is caught
+  on a **peer**, hours later, as somebody else's rejection, while the producing node reports
+  healthy. Zero arrivals and zero rejections, nothing to grep for on either side. 71 hours once
+  (CIRISAgent#1009), a full investigation twice more (CIRISServer#380, CIRISEdge#458).
+
+  The newest instance was **ours, from v30.4.0**: `create_identity_if_missing=True` minted the
+  classical half and never the post-quantum one, beside a comment reading *"Absent is not fatal —
+  a classical-only node is a valid (if HNDL-exposed) configuration, and the federation-tier ingest
+  gate is what refuses it, not this constructor."* That sentence is the class. Four repos reached
+  it independently.
+
+- **Stricter than the issue asked for, by owner ruling: there is no `allow_classical_only`
+  opt-in.** #620 proposed one. A classical-only node does not make sense in CIRIS, so the state is
+  not something a caller may request — it is simply not constructible.
+
+  | condition | v30.4.0 | now |
+  |---|---|---|
+  | `ml_dsa_65.seed` missing, no create flag | silent `None` → classical-only node | **error**, naming the path and why no such configuration exists |
+  | `create_identity_if_missing=True` | minted classical only | mints **both halves** — 32 OS-CSPRNG bytes, `0600`, in the bare shape `federation_pqc_signer` already reads |
+  | chmod fails after minting | — | **refuses** rather than proceed with a world-readable private key |
+
+  `getrandom` is a direct dependency rather than routing through `ciris-crypto/random`, which is
+  only enabled under `secrets` / `encrypted-kv` — absent on exactly the sqlite-only PyO3 shape that
+  provisions mobile nodes. It fills a `[u8; 32]` and crosses no type boundary, so it cannot split
+  the graph the way a shared `rand_core` RNG type would.
+
+- **`local_sign` now names its replacement instead of returning a transient-looking failure.** Once
+  the classical key is sealed its signer is async, `sign_ed25519` refuses, and the raw error reads
+  like a blip — so callers retried and **sealed nothing**. Three CIRISLensCore sites died that way,
+  one of them already migrated under a comment claiming it was "the last surviving copy," which was
+  wrong because nobody re-grepped. New `LocalSigner::is_hardware_backed` lets the verb distinguish a
+  PERMANENT refusal from a transient one and point at `local_sign_hybrid`, which keeps the
+  classical/PQC binding rule to one implementation.
+
+- **`no_sync_signing_verb_is_called_from_persists_own_tree`** enforces #620's grep-level acceptance
+  criterion. Mutation-verified: a planted `call_method("local_sign")` in `store/memory.rs` turns it
+  red, and it refuses to pass on a zero denominator.
+
 ## [30.4.1] — 2026-08-07 — a cfg naming the feature NEXT TO the one that gates the code
 
 - **#618 — v30.4.0 broke every consumer building the sqlite-only PyO3 shape.** The #616 keystore

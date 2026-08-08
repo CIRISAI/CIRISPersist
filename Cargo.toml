@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "30.4.1"
+version = "30.5.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -493,6 +493,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # PLATFORM_ARCHITECTURE.md §3.4 — Phase 3 stretch).
 
 [dependencies]
+# v30.5.0 (CIRISPersist#620) — OS CSPRNG for minting the ML-DSA-65 half of a node
+# identity. Direct dep rather than routing through `ciris-crypto/random`, which
+# is only enabled under the `secrets` / `encrypted-kv` features and so is absent
+# on exactly the sqlite-only PyO3 shape that provisions mobile nodes. Pinned to
+# 0.2 to match the copy already in the graph. Nothing crosses a type boundary —
+# it fills a `[u8; 32]` — so this cannot split a dependency the way a shared
+# `rand_core` RNG type would.
+getrandom = "0.2"
 # v0.1.9 — bumped from v1.6.4 to v1.8.0. v1.7 brought
 # `HardwareSigner::storage_descriptor()` (closes the prediction
 # shim in src/ffi/pyo3.rs); v1.8 brought the generic BuildManifest
