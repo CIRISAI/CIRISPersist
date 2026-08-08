@@ -147,6 +147,9 @@ class Engine:
         local_key_path: str | None = None,
         local_pqc_key_id: str | None = None,
         local_pqc_key_path: str | None = None,
+        identity_dir: str | None = None,
+        keystore_alias: str | None = None,
+        create_identity_if_missing: bool = False,
         pqc_sweep_on_init: bool = True,
         replication_sweeper_enabled: bool = True,
         cache_mode: str | None = None,
@@ -155,6 +158,34 @@ class Engine:
         disk_pressure: Any = None,
     ) -> None:
         """Build (or attach to) the process-singleton engine.
+
+        IDENTITY — two ways, and production wants the first.
+
+        ``identity_dir`` + ``keystore_alias`` (CIRISPersist#616) resolve **this
+        node's own** identity from its keystore, so no key material crosses the
+        boundary::
+
+            Engine(dsn, signing_key_id,
+                   identity_dir="/var/lib/ciris/identity",
+                   keystore_alias="ciris-agent-bootstrap")
+
+        The classical half is opened from its sealed blob (TPM / Secure Enclave /
+        StrongBox, or software-encrypted); the ML-DSA-65 half is read from
+        ``<identity_dir>/ml_dsa_65.seed`` if present, and its absence is not fatal
+        — no TPM does ML-DSA, and a classical-only node is refused by the
+        federation-tier ingest gate, not by this constructor.
+
+        **A missing identity is an ERROR, not a new identity.** This path uses the
+        keystore's ``open_existing``, never ``open_or_create``: minting on a
+        missing seed is how a node silently acquires a SECOND identity, which is
+        CIRISAgent#1009 and CIRISServer#380 (71 hours between them). Pass
+        ``create_identity_if_missing=True`` only from a provisioning tool that
+        intends to create one; a booting node never should.
+
+        ``local_key_id`` + ``local_key_path`` remain for tests and harnesses. They
+        take a 32-byte **bare** Ed25519 seed, which a keystore-custodied node does
+        not have — its plaintext seed is archived to ``ed25519.seed.migrated``
+        once adopted. Passing both pairs is refused: a node has one identity.
 
         ``signing_key_id`` is REQUIRED — persist instantiates the scrub-signing
         key through ciris-keyring, generating it if absent and returning the

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     # v0.1.12 — also fire on v-prefixed release tags. Without this,
-    # tag pushes don't trigger CI at all and the publish-pypi job
+    # tag pushes don't trigger CI at all and the tag-gated jobs
     # (gated on `refs/tags/v*`) never runs even when the tag exists.
     tags: ['v*']
   pull_request:
@@ -421,7 +421,7 @@ jobs:
   # produced a macos-x86_64 blob. Consequence: CIRISServer's macos-x86_64
   # release wheel restored only the verify leaf and COLD-COMPILED persist+edge
   # every release (~19-min leg). This is a SAVE-ONLY warm job — no wheel, no
-  # artifact, not in publish-pypi's needs graph — so the Intel-runner capacity
+  # artifact, not in any release job's needs graph — so the Intel-runner capacity
   # objection doesn't bind: it runs on main AND release tags, and being off the
   # needs graph + continue-on-error means a queued/failed Intel runner never
   # blocks a release; worst case is a stale blob (strictly better than absence).
@@ -447,7 +447,7 @@ jobs:
     continue-on-error: true
     name: darwin-x86_64 (CIRISCache warm only — #463)
     # main + release tags (NOT PRs — PR builds are unmerged, saving them poisons
-    # the shared cache). Off publish-pypi's needs graph, so warming on a tag
+    # the shared cache). Off the release needs graph, so warming on a tag
     # doesn't delay the release; it just guarantees the released version's blob
     # exists for CIRISServer instead of leaving it to cold-compile.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
@@ -1530,178 +1530,34 @@ jobs:
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
 
-  # v0.1.12 — publish abi3 wheel to PyPI on every tag push.
+  # ── PyPI publishing REMOVED (CIRISPersist#615) ──────────────────────────
   #
-  # Lens (and any future Python consumer) currently rebuilds persist
-  # from source on every cold cache because there's no PyPI artifact
-  # — that's ~75min of Rust compile per cold build, dominated by the
-  # ciris-keyring + ciris-verify-core + tokio-postgres + ed25519
-  # graph. With this job, lens collapses to
-  # `pip install ciris-persist==<version>` (~10s).
+  # `publish-pypi` and `assert-published` (the #458 release tripwire) lived here
+  # and were deleted deliberately. Recorded rather than silently dropped, because
+  # the tripwire was a real control and its absence should be a decision someone
+  # can find.
   #
-  # Trust posture: the BuildManifest round-trip
-  # (build-manifest job above) is the cryptographic root of trust.
-  # PyPI is just a fast distribution channel — peers verifying
-  # authenticity check the registry-side hybrid Ed25519 + ML-DSA-65
-  # signature on the manifest, not the PyPI artifact itself. PEP 740
-  # attestations (enabled below) compound the two: sigstore-attested
-  # PyPI upload that ties the wheel to the GitHub Actions identity
-  # that produced it.
+  # WHY. The upload had been failing since 22.0.1 — eight majors — with a hard
+  # `400 Project size too large`: 342 releases totalling 10.73 GB against PyPI's
+  # 10 GB per-project cap. Every publish since was rejected at upload. The only
+  # remedies were a PyPI quota increase, or deleting released artifacts, which
+  # would break `pip install ciris-persist==X` for anyone pinned and is contrary
+  # to this crate's reproducibility posture.
   #
-  # Auth: OIDC trusted publishing. NO API token in CI secrets — PyPI
-  # validates the workflow's GitHub identity directly. One-time setup
-  # on PyPI side is required (project owner reserves the name +
-  # configures the trusted publisher to allow this exact repo +
-  # workflow + environment); see docs/PYPI_PUBLISH.md.
-  publish-pypi:
-    name: Publish wheel to PyPI (tag-gated)
-    runs-on: ubuntu-latest
-    # v0.3.3 — gate publish on every quality job, not just wheel build.
-    # v0.3.2's tag run shipped wheels to PyPI despite a `cargo fmt --check`
-    # failure because publish-pypi only required pyo3-wheel + build-manifest.
-    # The lint job (clippy + fmt + audit), license-audit, and the
-    # full-features integration test (linux-x86_64-test) all need to pass
-    # before the wheel reaches PyPI — those are quality gates that
-    # presence-of-wheel doesn't otherwise enforce. ios-package + darwin-test
-    # are platform-specific build sanity, included for the same reason.
-    # v3.6.6 — `build-manifest` re-added as a HARD gate. v2.5.0 made it
-    # soft because the hybrid-signing secrets weren't configured; with
-    # the secrets now in place + the v3.6.5 PyPI publish surviving a
-    # transient registry outage anyway (manifest job failed, soft-fail
-    # let publish proceed), the cryptographic-root-of-trust posture is
-    # restored. A red manifest job MUST block PyPI publish — otherwise
-    # the wheel's BuildManifest round-trip can't be verified by
-    # consumers checking `/v1/builds/<v>?project=ciris-persist`.
-    needs:
-      - pyo3-wheel
-      - build-manifest
-      - lint
-      - license-audit
-      - linux-x86_64-test
-      - darwin-aarch64-test
-      - ios-package
-      - android-package
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/project/ciris-persist/
-    permissions:
-      # OIDC token-issuance permission. Required for PyPI's trusted
-      # publishing. Scope is the workflow's GitHub-issued JWT only;
-      # no long-lived secret.
-      id-token: write
-      # v1.6.0 hardening — `gh run download` (used below to absorb
-      # transient ListArtifacts 403s) needs actions:read on the
-      # GITHUB_TOKEN.
-      actions: read
-      contents: read
-    steps:
-      - name: download all multi-arch wheels (with retry)
-        # v1.6.0 — replaces `actions/download-artifact@v8` to absorb
-        # transient `403 Forbidden: Error from intermediary` failures
-        # from the v4 action's ListArtifacts call (v1.5.24's tag CI
-        # hit this exact mode — see commit 0df1665's CI run 26105591714).
-        # Same retry shape as the `gh release download` block in the
-        # build-manifest job below.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p dist
-          for attempt in 1 2 3 4 5; do
-            if gh run download "$GITHUB_RUN_ID" \
-                --repo "$GITHUB_REPOSITORY" \
-                --pattern 'ciris_persist-wheel-*' \
-                --dir dist; then
-              echo "✓ wheel download succeeded on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" = "5" ]; then
-              echo "::error::wheel download failed 5 times — investigate"
-              exit 1
-            fi
-            echo "::warning::wheel download attempt $attempt failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-          # `gh run download` nests artifacts under per-artifact
-          # subdirs (no merge-multiple equivalent). Flatten so the
-          # PyPI publish step sees a single dist/*.whl listing.
-          find dist -mindepth 2 -name '*.whl' -exec mv {} dist/ \;
-          find dist -mindepth 1 -type d -empty -delete
-      - name: sanity-check wheel shapes before publish
-        # Reject anything that isn't cp310-abi3 — the v0.1.10
-        # regression showed mixed-mode maturin can silently emit
-        # cp31N-cp31N wheels which break consumer install. Catch
-        # at publish time too (also caught at build time per
-        # matrix entry).
-        run: |
-          ls -la dist/
-          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
-          if [ "${COUNT}" -lt 3 ]; then
-            echo "::error::Expected 3 wheels (linux x86_64 + aarch64, darwin arm64); got ${COUNT}"
-            ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
-            exit 1
-          fi
-          for wheel in dist/*.whl; do
-            if ! [[ "${wheel}" =~ -cp310-abi3- ]]; then
-              echo "::error::Non-abi3 wheel detected: ${wheel}"
-              exit 1
-            fi
-            echo "✓ ${wheel}"
-          done
-          echo "✓ All ${COUNT} wheels conform to cp310-abi3."
-      - name: publish to PyPI via OIDC trusted publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # No `password:` — OIDC trusted publishing handles auth.
-          packages-dir: dist
-          # skip-existing protects against accidental re-publish on
-          # tag re-runs. PyPI rejects same-version re-uploads anyway,
-          # but failing softly here keeps re-runs idempotent.
-          skip-existing: true
-          # PEP 740 — sigstore-attested upload. Compounds with the
-          # BuildManifest hybrid signature already in place. Free
-          # provenance bonus; consumers verifying the manifest can
-          # also verify the PyPI artifact ties to this exact GH
-          # workflow identity.
-          attestations: true
+  # The deciding fact is simpler: **nobody consumes the PyPI wheel.** Consumers
+  # build from the git tag. A publish path nothing installs from is not worth a
+  # quota negotiation, and the tripwire guarding it was paging about an artifact
+  # with no audience.
+  #
+  # WHAT REMAINS. `pyo3-wheel` still BUILDS the abi3 wheels on every run — they
+  # are still CI artifacts, still shape-checked, and still the input to
+  # `build-manifest`'s signed CanonicalBuild registration. Nothing about how a
+  # consumer verifies a build changed; only the upload to PyPI is gone.
+  #
+  # IF PYPI EVER MATTERS AGAIN, restore BOTH jobs together. `publish-pypi`
+  # without `assert-published` is precisely the #458 failure: a tagged release
+  # whose publish was silently skipped, with nothing paging.
 
-  # CIRISPersist#458 (ask #3) — release tripwire. The v17.5.0 tag existed while
-  # PyPI still served 17.4.0: a CIRISCache restore hang killed the wheel + lint
-  # jobs, so `publish-pypi`'s `needs:` never satisfied and the job was SILENTLY
-  # SKIPPED — a tagged release that never shipped, with nothing paging. This job
-  # runs on EVERY tag regardless of upstream outcome (`always()` overrides a
-  # skipped/failed `publish-pypi`), and FAILS LOUDLY if the tagged version isn't
-  # on PyPI. A red X on the release run is the page. Extends the dedup-orphans
-  # lesson (assert the artifact EXISTS after a release) to the publish side.
-  assert-published:
-    name: Assert tag reached PyPI (release tripwire)
-    runs-on: ubuntu-latest
-    needs: [publish-pypi]
-    # always() so a SKIPPED/FAILED publish-pypi (the exact #458 failure) still
-    # triggers the check instead of skipping the tripwire along with it.
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
-    steps:
-      - name: Assert PyPI serves this tag's version
-        run: |
-          set -uo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          URL="https://pypi.org/pypi/ciris-persist/${VERSION}/json"
-          echo "Tripwire: does PyPI serve ciris-persist ${VERSION} for tag ${GITHUB_REF_NAME}?"
-          echo "  ${URL}"
-          # Poll — PyPI index propagation after a fresh upload is usually seconds,
-          # occasionally ~a minute. Up to ~3 min before we call it a real miss.
-          CODE=000
-          for attempt in 1 2 3 4 5 6; do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)
-            if [ "$CODE" = "200" ]; then
-              echo "✅ PyPI serves ciris-persist ${VERSION} — tag ${GITHUB_REF_NAME} shipped."
-              exit 0
-            fi
-            echo "::warning::attempt ${attempt}/6: PyPI has no ${VERSION} yet (HTTP ${CODE}); retrying in 30s"
-            sleep 30
-          done
-          echo "::error title=Release orphaned::Tag ${GITHUB_REF_NAME} exists but PyPI has NO ciris-persist ${VERSION} (last HTTP ${CODE}). publish-pypi failed or was skipped by an upstream failure — the release did NOT ship. Re-run the publish path or investigate the blocking job."
-          exit 1
 
   # Build manifest registration (v0.9.2+, CIRISPersist#42 closed).
   # Signs FOUR per-target BuildManifests covering:
@@ -1822,7 +1678,7 @@ jobs:
         # can match. Single artifact dir per target.
         #
         # v1.6.0 — replaces `actions/download-artifact@v8` to absorb
-        # transient ListArtifacts 403s (see publish-pypi for the
+        # transient ListArtifacts 403s (the same retry shape the removed
         # underlying GitHub Actions infrastructure flake the v1.5.24
         # tag run surfaced). No flatten step here — the sign script
         # below walks per-target subdirs to map wheel → arch.
