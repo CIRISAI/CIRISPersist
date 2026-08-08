@@ -1801,7 +1801,20 @@ impl PyEngine {
         // get that identity or a loud error, never a new one. Minting is
         // available only behind `create_identity_if_missing=True`, which a
         // provisioning tool passes deliberately and a booting node never does.
-        #[cfg(feature = "pyo3")]
+        // v30.4.1 (CIRISPersist#618) — NO `cfg` here, deliberately.
+        //
+        // v30.4.0 carried `#[cfg(feature = "pyo3")]` on this binding while its
+        // use below was unguarded. This module is gated on **`_pyffi`**, not
+        // `pyo3` — and `pyo3-sqlite = ["_pyffi"]` is a public feature that turns
+        // `_pyffi` on WITHOUT `pyo3`. In that configuration the file compiles,
+        // the binding is configured out, and the `match` cannot resolve it.
+        //
+        // It broke every consumer building the sqlite-only PyO3 shape, which is
+        // the mobile cross-compile shape (CIRISEdge's iOS + Android lanes). It
+        // did not break here because every leg of persist's own matrix that
+        // compiles this module enables `pyo3`. A cfg naming a feature ADJACENT
+        // to the one that gates the code is invisible to a matrix that never
+        // separates them.
         let keystore_signer: Option<ResolvedKeystoreIdentity> = match (
             identity_dir.as_ref(),
             keystore_alias.as_ref(),

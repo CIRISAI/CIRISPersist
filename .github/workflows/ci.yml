@@ -1109,6 +1109,29 @@ jobs:
       - name: cargo clippy (--all-features — every feature compiled, none omittable)
         run: cargo clippy --all-features --all-targets -- -D warnings
 
+      # v30.4.1 (CIRISPersist#618) — the SUBSET leg, and it is not redundant
+      # with --all-features above.
+      #
+      # --all-features is totality by UNION: every feature is compiled, so a
+      # feature that compiles nowhere cannot exist. It is structurally blind to
+      # the other direction — a configuration that enables feature A WITHOUT
+      # feature B — because it can never omit anything.
+      #
+      # v30.4.0 shipped exactly that bug. `src/ffi/pyo3.rs` is gated on `_pyffi`;
+      # `pyo3 = ["_pyffi", "postgres"]` and `pyo3-sqlite = ["_pyffi"]` both turn
+      # it on. A `#[cfg(feature = "pyo3")]` on a binding whose USE was unguarded
+      # compiled fine everywhere persist tests — every leg touching that module
+      # enables `pyo3` — and broke every consumer building the sqlite-only PyO3
+      # shape, which is the mobile cross-compile shape (CIRISEdge iOS + Android).
+      #
+      # This leg builds `_pyffi` WITHOUT `pyo3`. `cargo check`, not a test run:
+      # the class it catches is a compile error by construction, and the cost
+      # should stay low enough that nobody deletes it.
+      - name: cargo check (pyo3-sqlite — `_pyffi` WITHOUT `pyo3`)
+        run: |
+          cargo check --no-default-features --features \
+            "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
+
       # No save here — the linux-x86_64-test `core` leg is the single saver for
       # the shared linux-x86_64 key (#311), so this restore-only job can't race
       # it on GHCR.
