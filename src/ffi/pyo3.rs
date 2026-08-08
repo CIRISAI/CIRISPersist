@@ -1373,6 +1373,19 @@ fn accord_vec_json<T: serde::Serialize>(v: Vec<T>) -> PyResult<String> {
     serde_json::to_string(&v).map_err(|e| PyValueError::new_err(format!("accord serialize: {e}")))
 }
 
+/// v30.4.0 (CIRISPersist#616) — a node identity resolved from its own keystore.
+///
+/// The sealed classical signer, the ML-DSA-65 half when one exists on disk, and
+/// the alias that PQC half is registered under. Named rather than left as an
+/// inline tuple because `clippy::type_complexity` is right about it: three
+/// positional slots, two of them `Arc<dyn …>`, is a shape a reader has to decode
+/// at every use site.
+type ResolvedKeystoreIdentity = (
+    Arc<dyn ciris_keyring::HardwareSigner>,
+    Option<Arc<dyn ciris_keyring::PqcSigner>>,
+    String,
+);
+
 #[pymethods]
 impl PyEngine {
     /// Connect to Postgres, run migrations, instantiate the
@@ -1419,6 +1432,8 @@ impl PyEngine {
     #[pyo3(signature = (dsn, signing_key_id, scrubber=None,
                         local_key_id=None, local_key_path=None,
                         local_pqc_key_id=None, local_pqc_key_path=None,
+                        identity_dir=None, keystore_alias=None,
+                        create_identity_if_missing=false,
                         pqc_sweep_on_init=true,
                         replication_sweeper_enabled=true,
                         cache_mode=None, max_cache_bytes=None,
@@ -1433,6 +1448,11 @@ impl PyEngine {
         local_key_path: Option<String>,
         local_pqc_key_id: Option<String>,
         local_pqc_key_path: Option<String>,
+        // v30.4.0 (CIRISPersist#616) — resolve the NODE'S OWN identity from a
+        // keystore instead of demanding 32 bare bytes. See the branch below.
+        identity_dir: Option<String>,
+        keystore_alias: Option<String>,
+        create_identity_if_missing: bool,
         pqc_sweep_on_init: bool,
         replication_sweeper_enabled: bool,
         // v6.8.0 (CIRISPersist#148) — operator cache-size knob. Mode
@@ -1755,6 +1775,87 @@ impl PyEngine {
         // single-source-of-truth — both PyO3 callers (this) and
         // Rust callers (CIRISLensCore, CIRISEdge) hit the same
         // construction path.
+        // v30.4.0 (CIRISPersist#616) — **the node's OWN identity, resolved by
+        // persist, with no key material crossing the boundary.**
+        //
+        // Before this, the Python constructor accepted identity exactly one
+        // way: `local_key_path`, a 32-byte BARE Ed25519 seed. A composed CIRIS
+        // node does not keep its classical half bare — `federation_signer`
+        // adopts any plaintext `identity/ed25519.seed` into the sealed keystore
+        // and renames the plaintext to `ed25519.seed.migrated`, so at rest the
+        // classical half is a TPM/SE/StrongBox-sealed blob. The PQC half stays
+        // bare only because no TPM does ML-DSA.
+        //
+        // So the one thing a host could express was the one thing it must not
+        // do. Its remaining options were: mint a second identity (CIRISAgent#1009
+        // and CIRISServer#380, 71 hours between them), write the classical half
+        // back out bare (undoing hardware custody), or implement custody itself.
+        // Everyone picks the first, because it is the only one the API made easy.
+        // That is the API selecting for the failure, not a consumer mistake.
+        //
+        // **`open_existing`, NOT `open_or_create`.** This is the whole safety of
+        // the branch. `open_or_create(alias, dir, None)` mints a fresh sealed key
+        // when the seed is absent — its own doc names that the CIRISVerify#134
+        // hazard — which would reproduce the second-identity bug INSIDE the fix
+        // that exists to prevent it. A host asking for "my node's identity" must
+        // get that identity or a loud error, never a new one. Minting is
+        // available only behind `create_identity_if_missing=True`, which a
+        // provisioning tool passes deliberately and a booting node never does.
+        #[cfg(feature = "pyo3")]
+        let keystore_signer: Option<ResolvedKeystoreIdentity> = match (
+            identity_dir.as_ref(),
+            keystore_alias.as_ref(),
+        ) {
+            (None, None) => None,
+            (Some(dir), Some(alias)) => {
+                if local_key_id.is_some() || local_key_path.is_some() {
+                    return Err(PyValueError::new_err(
+                        "identity_dir + keystore_alias resolve the node's own identity;                          local_key_id / local_key_path supply a different one. Passing both                          is ambiguous — a node has ONE identity. Use the keystore pair in                          production and the local_* pair in tests.",
+                    ));
+                }
+                let dir = std::path::PathBuf::from(dir);
+                let classical = if create_identity_if_missing {
+                    ciris_keyring::SealedEd25519Signer::open_or_create(alias.clone(), dir.clone(), None)
+                } else {
+                    ciris_keyring::SealedEd25519Signer::open_existing(alias.clone(), dir.clone())
+                }
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "could not open sealed Ed25519 identity {alias:?} under {}: {e}.                          The node's classical half is sealed at rest and is NOT a bare seed                          file. If this node has never been provisioned, pass                          create_identity_if_missing=True — but note that MINTS A NEW IDENTITY,                          which is what CIRISAgent#1009 was.",
+                        dir.display()
+                    ))
+                })?;
+                // The PQC half is a bare 32-byte seed by necessity: no TPM does
+                // ML-DSA-65. Absent is not fatal — a classical-only node is a
+                // valid (if HNDL-exposed) configuration, and the federation-tier
+                // ingest gate is what refuses it, not this constructor.
+                let pqc_path = dir.join("ml_dsa_65.seed");
+                let pqc_alias = format!("{alias}-pqc");
+                let pqc: Option<Arc<dyn ciris_keyring::PqcSigner>> = if pqc_path.exists() {
+                    Some(Arc::new(
+                        ciris_keyring::MlDsa65SoftwareSigner::from_seed_file(
+                            &pqc_path,
+                            pqc_alias.clone(),
+                        )
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "ML-DSA-65 seed at {} is present but unusable: {e}",
+                                pqc_path.display()
+                            ))
+                        })?,
+                    ))
+                } else {
+                    None
+                };
+                Some((Arc::new(classical), pqc, pqc_alias))
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "identity_dir and keystore_alias must both be provided or both omitted",
+                ));
+            }
+        };
+
         let local_signer: Option<Arc<crate::signing::LocalSigner>> =
             match (local_key_id, local_key_path) {
                 (None, None) => {
@@ -1800,6 +1901,35 @@ impl PyEngine {
         // local Ed25519 key — wrapped exactly as [`crate::Engine::with_signer`]
         // does (`LocalSignerHardwareAdapter`), the canonical Rust path. Real
         // hardware signers (non-`SoftwareOnly`) are left untouched.
+        // v30.4.0 (CIRISPersist#616) — a resolved keystore identity REPLACES the
+        // signer pair. Composed exactly as `Engine::with_hardware_signer_hybrid`
+        // does, so the Python and Rust surfaces reach the same object rather than
+        // two constructions that can drift.
+        let (signer, local_signer) = match keystore_signer {
+            Some((classical, pqc, pqc_alias)) => {
+                let key_id = classical.current_alias().to_owned();
+                // CIRISPersist#580 clause 1 — `py.detach` is REQUIRED, not
+                // stylistic. `from_hardware_parts` reads the classical public
+                // key, which on a real TPM / Secure Enclave is a device round
+                // trip; blocking on it while holding the GIL wedges the whole
+                // interpreter and no watchdog can fire through it. Caught by
+                // `no_block_on_reaches_the_pyo3_boundary_holding_the_gil`,
+                // which is exactly why that gate exists.
+                let ls = py
+                    .detach(|| {
+                        runtime.block_on(crate::signing::LocalSigner::from_hardware_parts(
+                            classical.clone(),
+                            key_id,
+                            pqc.clone(),
+                            pqc.is_some().then_some(pqc_alias),
+                        ))
+                    })
+                    .map_err(local_signer_err_to_py)?;
+                (classical, Some(Arc::new(ls)))
+            }
+            None => (signer, local_signer),
+        };
+
         let signer: Arc<dyn HardwareSigner> = match local_signer.as_ref() {
             // The platform signer is NOT an Ed25519 key (e.g. the
             // P-256/`EcdsaP256` software/TPM fallback `get_platform_signer`

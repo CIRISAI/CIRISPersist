@@ -5,6 +5,53 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.4.0] — 2026-08-07 — a node can finally say "use my own identity"
+
+- **#616 — the Python `Engine(...)` could only take a BARE 32-byte seed, so a keystore-custodied
+  node could not construct one.** New `identity_dir` + `keystore_alias` kwargs resolve **this
+  node's own** identity, with no key material crossing the boundary.
+
+  The old surface offered exactly one way to express identity: `local_key_path`, a bare Ed25519
+  seed. A composed CIRIS node does not keep its classical half bare — `federation_signer` adopts
+  any plaintext `identity/ed25519.seed` into the sealed keystore and renames the plaintext to
+  `ed25519.seed.migrated`, so at rest it is a TPM/SE/StrongBox-sealed blob. The one thing a host
+  could express was the one thing it must not do, leaving three wrong options: mint a second
+  identity (**CIRISAgent#1009** and **CIRISServer#380**, 71 hours between them), write the
+  classical half back out bare (undoing hardware custody), or implement custody in the consumer.
+  Everyone picks the first, because it was the only one the API made easy. **The API was selecting
+  for the failure.**
+
+  `Engine::with_hardware_signer_hybrid` already existed in Rust — and `grep with_hardware_signer
+  src/ffi/pyo3.rs` returned **nothing**. Not a worse Python option than Rust; no Python expression
+  at all. This repo's most-repeated class, and it has a name here: *SHIPPED means HOST-REACHABLE,
+  not code-path-exists*.
+
+- **`open_existing`, NOT `open_or_create` — the part the issue's own proposed snippet got wrong.**
+  The suggested call was `SealedEd25519Signer::open_or_create(alias, dir, None)`. That constructor's
+  doc names the hazard directly: with `None` on a missing seed it **mints a fresh sealed key**
+  (CIRISVerify#134). Wiring it that way would reproduce the second-identity bug *inside the fix
+  that exists to prevent it*. A host asking for "my node's identity" gets that identity or a loud,
+  actionable error — never a new one. Minting is available only behind an explicit
+  `create_identity_if_missing=True`, which a provisioning tool passes deliberately and a booting
+  node never does.
+
+  Passing both the keystore pair and the `local_*` pair is refused: a node has one identity. The
+  `local_*` kwargs stay for tests and harnesses. The ML-DSA-65 half is read from
+  `<identity_dir>/ml_dsa_65.seed` when present, and its absence is not fatal — no TPM does ML-DSA,
+  and it is the federation-tier ingest gate that refuses a classical-only node, not this
+  constructor.
+
+- **PyPI publishing removed (#615).** `publish-pypi` and the #458 `assert-published` tripwire are
+  deleted, with a decision record left in `ci.yml` where they stood — the tripwire was a real
+  control and its absence should be findable. Upload had failed since **22.0.1**, eight majors, on
+  a hard `400 Project size too large`: **342 releases, 10.73 GB** against PyPI's 10 GB per-project
+  cap. The remedies were a quota increase or deleting released artifacts, and deletion would break
+  `pip install ciris-persist==X` for anyone pinned. The deciding fact is simpler: **nobody consumes
+  the PyPI wheel** — consumers build from the git tag. `pyo3-wheel` still builds the abi3 wheels as
+  CI artifacts and still feeds `build-manifest`'s signed CanonicalBuild registration; only the
+  upload is gone. If PyPI ever matters again, restore **both** jobs together — publish without the
+  tripwire is precisely the #458 failure.
+
 ## [30.3.1] — 2026-08-06 — the certification script was weaker than CI, so a green verdict lied
 
 - **`set_backend_node_key_id` failed the no-feature build.** Both its arms are `cfg`-gated on
