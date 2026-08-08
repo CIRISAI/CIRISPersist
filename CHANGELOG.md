@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.4.1] — 2026-08-07 — a cfg naming the feature NEXT TO the one that gates the code
+
+- **#618 — v30.4.0 broke every consumer building the sqlite-only PyO3 shape.** The #616 keystore
+  binding carried `#[cfg(feature = "pyo3")]` while its `match` use was unguarded. `src/ffi/pyo3.rs`
+  is gated on **`_pyffi`**, not `pyo3` — and `pyo3-sqlite = ["_pyffi"]` is a public feature that
+  turns the module on **without** `pyo3`. In that configuration the file compiles, the binding is
+  configured out, and the use cannot resolve it: `cannot find value keystore_signer in this scope`.
+
+  That is the mobile cross-compile shape, so it took out CIRISEdge's five iOS + Android PyO3 lanes
+  and regressed the edge→agent iOS chain. Reproduced here exactly before fixing, and the fix is the
+  absence of a cfg: the module is already gated by `_pyffi`, so the binding needs none.
+
+- **Why persist's own CI could not see it, and the leg that now can.** Every leg of persist's matrix
+  that compiles that module enables `pyo3`. The `--all-features` totality anchor (#585) does not
+  help and structurally cannot: it is totality by **union** — it guarantees no feature compiles
+  nowhere, and is blind by construction to a configuration that enables **A without B**, because it
+  can never omit anything.
+
+  New subset leg, in CI and mirrored into `scripts/certify.sh`'s fast tier:
+  `cargo check --no-default-features --features "pyo3-sqlite …"` — `_pyffi` **without** `pyo3`. A
+  `cargo check` rather than a test run, because the class it catches is a compile error by
+  construction and the cost should stay low enough that nobody deletes it.
+
+  The general lesson, since this repo keeps meeting variants of it: **a `cfg` naming a feature
+  ADJACENT to the one that gates the surrounding code is invisible to any matrix that never
+  separates them.** Union coverage cannot find it. Only a proper-subset build can.
+
 ## [30.4.0] — 2026-08-07 — a node can finally say "use my own identity"
 
 - **#616 — the Python `Engine(...)` could only take a BARE 32-byte seed, so a keystore-custodied

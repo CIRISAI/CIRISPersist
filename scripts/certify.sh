@@ -80,7 +80,7 @@ fi
 echo "lanes=$LANES  test-threads/lane=$PER_LANE  cores=$CORES  free=${FREE_G}G"
 
 LEGS="core cirisaudit secrets cirisnode cirisgraph telemetry rest test-anchor"
-ALL_KEYS="$LEGS default fmt clippy pyi featmatrix docver"
+ALL_KEYS="$LEGS default fmt clippy pyi featmatrix docver pyo3sqlite"
 
 # ── stage 1: fast non-cargo gates, concurrent, fail-fast ─────────────────
 echo
@@ -90,16 +90,23 @@ run_bg fmt        cargo fmt --all --check
 run_bg pyi        python3 scripts/pyi_surface.py check
 run_bg featmatrix python3 scripts/ci_feature_matrix.py check
 run_bg docver     python3 scripts/doc_version_refs.py
+# v30.4.1 (CIRISPersist#618) — the SUBSET compile leg: `_pyffi` WITHOUT `pyo3`.
+# `--all-features` is totality by union and structurally cannot omit a feature,
+# so it is blind to "A without B". v30.4.0 shipped a `#[cfg(feature = "pyo3")]`
+# on a binding whose use was unguarded; every leg here that compiles that module
+# enables `pyo3`, so it was invisible locally and broke CIRISEdge's mobile
+# cross-compiles. Cheap `cargo check`, kept in the FAST tier on purpose.
+run_bg pyo3sqlite cargo check --no-default-features --features "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
 wait
 fast_fail=0
-for g in fmt pyi featmatrix docver; do
+for g in fmt pyi featmatrix docver pyo3sqlite; do
     rc="$(cat "$LOG_DIR/$g.rc" 2>/dev/null || echo 99)"
     printf '  %-22s exit=%s\n' "$g" "$rc"
     [ "$rc" -ne 0 ] && fast_fail=1
 done
 if [ "$fast_fail" -ne 0 ]; then
     echo; echo "NOT CERTIFIED — a fast gate is red; the expensive legs were not run."
-    for g in fmt pyi featmatrix docver; do
+    for g in fmt pyi featmatrix docver pyo3sqlite; do
         [ "$(cat "$LOG_DIR/$g.rc" 2>/dev/null || echo 99)" -ne 0 ] && {
             echo "--- $g ---"; tail -20 "$LOG_DIR/$g.log"; }
     done
