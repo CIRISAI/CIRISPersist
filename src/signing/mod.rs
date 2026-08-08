@@ -259,6 +259,17 @@ impl std::fmt::Debug for LocalSigner {
 }
 
 impl LocalSigner {
+    /// v30.5.0 (CIRISPersist#620) — is the classical half SEALED (hardware /
+    /// keystore-custodied) rather than a plaintext seed this process holds?
+    ///
+    /// Exists so a synchronous signing verb can tell a PERMANENT refusal from a
+    /// transient one. `sign_ed25519` cannot drive a sealed signer — it is async
+    /// — and the raw error reads like a blip, so callers retried and sealed
+    /// nothing. Three CIRISLensCore sites died that way.
+    pub fn is_hardware_backed(&self) -> bool {
+        matches!(self.classical, ClassicalSigner::Hardware { .. })
+    }
+
     /// Load local identity from filesystem seeds.
     ///
     /// Mirrors PyO3 `Engine::__init__`'s local-* wiring exactly:

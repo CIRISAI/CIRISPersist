@@ -1386,6 +1386,76 @@ type ResolvedKeystoreIdentity = (
     String,
 );
 
+#[cfg(test)]
+mod half_identity_620 {
+    //! v30.5.0 (CIRISPersist#620) — **a half identity must be unrepresentable.**
+    //!
+    //! Six incidents across four repos are one defect, and each seam was
+    //! individually reasonable: the PQC half was optional, its absence was not
+    //! fatal *here*, and some gate downstream would catch it. That is true and
+    //! insufficient — it is caught on a PEER, hours later, as somebody else's
+    //! rejection, while the producing node reports healthy. Zero arrivals and
+    //! zero rejections, nothing to grep for on either side. 71 hours once, a
+    //! full investigation twice more.
+    //!
+    //! Ruling from the owner, stricter than the issue asked for: **there are no
+    //! classical-only paths in CIRIS.** So there is no `allow_classical_only`
+    //! opt-in to test — the state is simply not constructible.
+
+    /// The grep-level acceptance criterion from #620, enforced.
+    ///
+    /// The sync verbs `local_sign` / `local_pqc_sign` silently seal NOTHING once
+    /// the classical key is sealed. persist's own tree must not reach for them;
+    /// `local_sign_hybrid` is the one verb, and it keeps the classical/PQC
+    /// binding rule to a single implementation.
+    #[test]
+    fn no_sync_signing_verb_is_called_from_persists_own_tree() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for entry in walk_rs("src") {
+            let text = std::fs::read_to_string(&entry).unwrap_or_default();
+            for (i, line) in text.lines().enumerate() {
+                // SCAN-EXEMPT-SELF-MATCH: this predicate names the verbs it
+                // bans, and the surrounding module documents them.
+                if line.contains("SCAN-EXEMPT-SELF-MATCH") || entry.ends_with("pyo3.rs") {
+                    continue;
+                }
+                scanned += 1;
+                for verb in ["\"local_sign\"", "\"local_pqc_sign\""] {
+                    if line.contains("call_method") && line.contains(verb) {
+                        offenders.push(format!("{}:{}", entry, i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            scanned > 1000,
+            "scanned only {scanned} lines — the walk is broken, so this gate proves nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "persist calls a SYNC signing verb, which seals nothing once the classical key is \
+             sealed (CIRISPersist#620): {offenders:?}. Use local_sign_hybrid."
+        );
+    }
+
+    fn walk_rs(dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk_rs(&p.to_string_lossy()));
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p.to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+}
+
 #[pymethods]
 impl PyEngine {
     /// Connect to Postgres, run migrations, instantiate the
@@ -1823,7 +1893,7 @@ impl PyEngine {
             (Some(dir), Some(alias)) => {
                 if local_key_id.is_some() || local_key_path.is_some() {
                     return Err(PyValueError::new_err(
-                        "identity_dir + keystore_alias resolve the node's own identity;                          local_key_id / local_key_path supply a different one. Passing both                          is ambiguous — a node has ONE identity. Use the keystore pair in                          production and the local_* pair in tests.",
+                        "identity_dir + keystore_alias resolve the node's own identity; local_key_id / local_key_path supply a different one. Passing both is ambiguous — a node has ONE identity. Use the keystore pair in production and the local_* pair in tests.",
                     ));
                 }
                 let dir = std::path::PathBuf::from(dir);
@@ -1834,32 +1904,91 @@ impl PyEngine {
                 }
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
-                        "could not open sealed Ed25519 identity {alias:?} under {}: {e}.                          The node's classical half is sealed at rest and is NOT a bare seed                          file. If this node has never been provisioned, pass                          create_identity_if_missing=True — but note that MINTS A NEW IDENTITY,                          which is what CIRISAgent#1009 was.",
+                        "could not open sealed Ed25519 identity {alias:?} under {}: {e}. The node's classical half is sealed at rest and is NOT a bare seed file. If this node has never been provisioned, pass create_identity_if_missing=True — but note that MINTS A NEW COMPLETE IDENTITY (both halves), which is what CIRISAgent#1009 was.",
                         dir.display()
                     ))
                 })?;
-                // The PQC half is a bare 32-byte seed by necessity: no TPM does
-                // ML-DSA-65. Absent is not fatal — a classical-only node is a
-                // valid (if HNDL-exposed) configuration, and the federation-tier
-                // ingest gate is what refuses it, not this constructor.
+                // v30.5.0 (CIRISPersist#620) — **THERE ARE NO CLASSICAL-ONLY
+                // PATHS.** A missing ML-DSA-65 half is an ERROR, always. There is
+                // deliberately no `allow_classical_only` escape hatch: a
+                // classical-only node does not make sense in CIRIS, so the state
+                // is not something a caller may opt into.
+                //
+                // v30.4.0 shipped the opposite, with this rationalisation beside
+                // it: *"Absent is not fatal — a classical-only node is a valid
+                // (if HNDL-exposed) configuration, and the federation-tier ingest
+                // gate is what refuses it, not this constructor."* Every seam in
+                // four repos reached that same sentence independently, and it is
+                // the whole defect: true, locally reasonable, and collectively
+                // meaning a half identity is easy to build and detected — if at
+                // all — hours later on a PEER, as somebody else's rejection,
+                // while the producing node reports healthy. Zero arrivals and
+                // zero rejections, nothing to grep for on either side.
+                //
+                // The PQC half is a BARE 32-byte seed, not a sealed blob: no TPM
+                // does ML-DSA-65. That asymmetry is real; "therefore optional" is
+                // the non-sequitur.
                 let pqc_path = dir.join("ml_dsa_65.seed");
                 let pqc_alias = format!("{alias}-pqc");
-                let pqc: Option<Arc<dyn ciris_keyring::PqcSigner>> = if pqc_path.exists() {
-                    Some(Arc::new(
-                        ciris_keyring::MlDsa65SoftwareSigner::from_seed_file(
-                            &pqc_path,
-                            pqc_alias.clone(),
-                        )
-                        .map_err(|e| {
+                if !pqc_path.exists() {
+                    if !create_identity_if_missing {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "no ML-DSA-65 seed at {} — this node has a classical half and no \
+                             post-quantum half. CIRIS has no classical-only configuration: such \
+                             a node signs rows that every federation-tier peer refuses, while \
+                             reporting healthy itself. Provision the seed, or pass \
+                             create_identity_if_missing=True to mint a COMPLETE identity.",
+                            pqc_path.display()
+                        )));
+                    }
+                    // "Create my identity" must never mean "create half of it."
+                    // 32 OS-CSPRNG bytes, 0600, in the bare shape every consumer
+                    // already reads (CIRISServer::federation_pqc_signer).
+                    let mut seed = [0u8; 32];
+                    getrandom::getrandom(&mut seed).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "OS CSPRNG unavailable, refusing to mint an ML-DSA-65 seed: {e}"
+                        ))
+                    })?;
+                    if let Some(parent) = pqc_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
                             PyRuntimeError::new_err(format!(
-                                "ML-DSA-65 seed at {} is present but unusable: {e}",
-                                pqc_path.display()
+                                "could not create {}: {e}",
+                                parent.display()
                             ))
-                        })?,
-                    ))
-                } else {
-                    None
-                };
+                        })?;
+                    }
+                    std::fs::write(&pqc_path, seed).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "could not write ML-DSA-65 seed to {}: {e}",
+                            pqc_path.display()
+                        ))
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&pqc_path, std::fs::Permissions::from_mode(0o600))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "minted the ML-DSA-65 seed but could not chmod 0600 {}: {e} \
+                                     — refusing to proceed with a world-readable private key",
+                                    pqc_path.display()
+                                ))
+                            })?;
+                    }
+                }
+                let pqc: Option<Arc<dyn ciris_keyring::PqcSigner>> = Some(Arc::new(
+                    ciris_keyring::MlDsa65SoftwareSigner::from_seed_file(
+                        &pqc_path,
+                        pqc_alias.clone(),
+                    )
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "ML-DSA-65 seed at {} is present but unusable: {e}",
+                            pqc_path.display()
+                        ))
+                    })?,
+                ));
                 Some((Arc::new(classical), pqc, pqc_alias))
             }
             _ => {
@@ -4350,9 +4479,28 @@ impl PyEngine {
                  to the Engine constructor)",
                 )
             })?;
-            let sig = signer
-                .sign_ed25519(message.as_bytes())
-                .map_err(local_signer_err_to_py)?;
+            // v30.5.0 (CIRISPersist#620) — a SEALED classical half cannot sign
+            // through this synchronous verb, and the raw failure reads as a
+            // transient. It is not: it is permanent, and it means the caller
+            // sealed NOTHING. Three CIRISLensCore sites died exactly this way,
+            // and one had already been migrated under a comment claiming it was
+            // "the last surviving copy" — which was wrong, because nobody
+            // re-grepped. Name the replacement verb in the error so the next
+            // caller does not have to find it.
+            let sig = signer.sign_ed25519(message.as_bytes()).map_err(|e| {
+                if signer.is_hardware_backed() {
+                    PyRuntimeError::new_err(format!(
+                        "local_sign cannot sign with a SEALED classical key — this is permanent, \
+                         not transient, and the signature was NOT produced. Use \
+                         local_sign_hybrid, which dispatches the classical half through the \
+                         sealed signer and composes the bound preimage in one place. An \
+                         Ed25519-only wire format takes its [\"classical_sig\"] — identical \
+                         bytes, no migration. (underlying: {e})"
+                    ))
+                } else {
+                    local_signer_err_to_py(e)
+                }
+            })?;
             Ok(PyBytes::new(py, &sig).unbind())
         })
     }

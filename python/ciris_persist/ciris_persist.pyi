@@ -182,6 +182,14 @@ class Engine:
         ``create_identity_if_missing=True`` only from a provisioning tool that
         intends to create one; a booting node never should.
 
+        **There are no classical-only paths (CIRISPersist#620).** A missing
+        ``ml_dsa_65.seed`` is an ERROR, not a silently classical-only node, and
+        there is deliberately no ``allow_classical_only`` opt-in — the state does
+        not make sense in CIRIS, so it is not something a caller may request.
+        ``create_identity_if_missing=True`` mints BOTH halves or fails naming
+        what it could not create: "create my identity" never means "create half
+        of it."
+
         ``local_key_id`` + ``local_key_path`` remain for tests and harnesses. They
         take a 32-byte **bare** Ed25519 seed, which a keystore-custodied node does
         not have — its plaintext seed is archived to ``ed25519.seed.migrated``
