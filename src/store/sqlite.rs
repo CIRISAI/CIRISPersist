@@ -20387,6 +20387,19 @@ mod tests {
             .await;
     }
 
+    /// v30.6.0 (CIRISPersist#622) — the SQLITE leg of the three-backend genesis
+    /// witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn genesis_seed_installs_parity_sqlite_622() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
     /// v30.3.0 (CIRISPersist#611) — the SQLITE leg of the shared
     /// publisher-vouch-conferral witness (see the memory + postgres legs).
     #[tokio::test]
