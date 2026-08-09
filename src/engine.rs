@@ -9910,7 +9910,11 @@ mod tests {
                 "SELECT encode(original_content_hash, 'hex'), scrub_key_id \
                  FROM cirislens.federation_attestations \
                  WHERE attestation_id = $1 AND attestation_type = $2",
-                &[&attestation_id, &attestation_type],
+                // v30.6.0 (CIRISPersist#622) — bind TEXT. `put_blob_signing` still
+                // takes a `uuid::Uuid` and that is correct: persist MINTS these
+                // blob-signing ids, they are never ceremony ids. Only the column
+                // changed, so only the bind changes.
+                &[&attestation_id.to_string(), &attestation_type],
             )
             .await
             .expect("stored row present");

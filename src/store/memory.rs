@@ -16334,6 +16334,21 @@ mod tests {
     // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────
     //    I1 age band + user-target steward-binding gate + minor liveness.
 
+    /// v30.6.0 (CIRISPersist#622) — the MEMORY leg of the three-backend genesis
+    /// witness. All three install the REAL baked bundle through the REAL
+    /// directory; the Postgres leg is the one that was failing in production.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn genesis_seed_installs_parity_memory_622() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
     /// v30.3.0 (CIRISPersist#611) — the MEMORY leg of the shared
     /// publisher-vouch-conferral witness. All three backends call the SAME
     /// `admission::r2_test_support::exercise_publisher_vouch_conferral` body.

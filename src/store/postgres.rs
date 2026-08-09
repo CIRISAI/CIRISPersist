@@ -52,6 +52,106 @@ mod embedded {
     refinery::embed_migrations!("migrations/postgres/lens");
 }
 
+#[cfg(test)]
+mod attestation_id_is_text_622 {
+    //! v30.6.0 (CIRISPersist#622) — **no attestation id is parsed as a UUID.**
+    //!
+    //! `federation_attestations.attestation_id` was `uuid`-typed and this file
+    //! parsed every id into a `uuid::Uuid` before binding it. The baked genesis
+    //! bundle signs SYMBOLIC ids (`genesis-charter`, `genesis-grant:…`,
+    //! `genesis-lifecycle`), so every Postgres node failed genesis while every
+    //! SQLite node was immune — two production agents crash-looped 151 and 223
+    //! times (CIRISServer#381 / CIRISAgent#1020).
+    //!
+    //! V121 relaxed the columns; that was necessary and NOT sufficient. Ten
+    //! Rust sites produced the identical `attestation_id is not a valid UUID`
+    //! refusal with the schema already fixed. One of them did not even error:
+    //! `get_attestation` had `let Ok(..) else { return Ok(None) }`, so it
+    //! answered "no such row" on Postgres and returned the row on SQLite — a
+    //! silent divergence.
+    //!
+    //! This gate keeps the Rust half from regressing. Revocation ids and other
+    //! UUID columns are untouched and deliberately still parse.
+    //!
+    //! SCOPE, stated because it is narrower than it looks: this catches a
+    //! `Uuid::parse_str` on an attestation id. It does NOT catch a `Uuid`
+    //! CONSTRUCTED elsewhere and bound against the column — two such sites
+    //! (`Uuid::new_v4()` handed straight to a query) survived this gate and were
+    //! caught by the SUITE instead, as
+    //! `WrongType { postgres: Text, rust: "uuid::Uuid" }`. That is the right
+    //! division of labour: a type mismatch at a bind is what a driver and a test
+    //! are for, and a textual scanner for it would be guesswork.
+
+    /// Scans this file for a UUID parse applied to an attestation id.
+    #[test]
+    fn no_attestation_id_is_parsed_as_a_uuid() {
+        let src = include_str!("postgres.rs");
+        let mut offenders = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            // SCAN-EXEMPT-SELF-MATCH: this predicate necessarily names the
+            // pattern it bans, and the module docs quote it.
+            if line.contains("SCAN-EXEMPT-SELF-MATCH") {
+                continue;
+            }
+            let l = line.trim_start();
+            if l.starts_with("//") || l.starts_with("///") || l.starts_with("//!") {
+                continue;
+            }
+            // The needle is SPLIT so this predicate cannot match itself. A
+            // trailing `SCAN-EXEMPT` marker does not survive here: `cargo fmt`
+            // moves a trailing comment off a long line onto its own, and the
+            // skip test reads the line's own text — so the marker silently
+            // stops exempting anything. `concat!` builds the literal at compile
+            // time while keeping it out of the source line.
+            let needle = concat!("Uuid::", "parse_str");
+            if line.contains(needle) && line.to_lowercase().contains("attestation") {
+                offenders.push(format!("{}: {}", i + 1, line.trim()));
+            }
+        }
+        assert!(
+            src.len() > 100_000,
+            "include_str! read {} bytes — the scan is broken, so this gate proves nothing",
+            src.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "an attestation id is being parsed as a UUID again (CIRISPersist#622). The column is \
+             TEXT since V121 precisely so the ids the genesis ceremony SIGNED can be stored; a \
+             parse here re-breaks every Postgres node's boot:\n{}",
+            offenders.join("\n")
+        );
+    }
+}
+
+/// v30.6.0 (CIRISPersist#622) — a stable fingerprint of the embedded migration
+/// set: every migration's version, name AND CONTENT CHECKSUM, folded with FNV-1a.
+///
+/// Exists so the test harness can key its cached template database on the
+/// schema it was built from. A fixed template name went STALE the moment a
+/// migration was added or edited, and the suite then ran green against a schema
+/// the tree no longer described — a silent-wrong-answer that bit in both
+/// directions while landing V121.
+///
+/// Keyed on refinery's own `checksum()` — the SAME value refinery compares when
+/// it refuses a migration whose content changed under a fixed version. An
+/// earlier draft folded version+name and claimed that "an edited migration that
+/// keeps its number still moves the hash". **That was false**: editing V121's
+/// body changed neither its version nor its name, the stale template was reused,
+/// and refinery rejected it with *"applied migration … is different than
+/// filesystem one"*. Content is the only thing that answers the question being
+/// asked.
+#[cfg(test)]
+pub(crate) fn embedded_migration_fingerprint() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for m in embedded::migrations::runner().get_migrations() {
+        for b in format!("{}:{}:{}", m.version(), m.name(), m.checksum()).bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
 /// v3.11.0 — count of embedded `migrations/postgres/lens/*` scripts
 /// the backend ships. Public so the `av26_concurrent_boot_advisory_lock`
 /// QA harness can assert on the live migration set instead of a
@@ -4469,11 +4569,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v0.5.8 — parse attestation_id to uuid::Uuid before binding;
         // see put_revocation comment for context (the same `$1::uuid`
         // String-binding rejection applies here).
-        let attestation_uuid = uuid::Uuid::parse_str(&row.attestation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "attestation_id is not a valid UUID: {e}"
-            ))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
 
         // postgres-types has no built-in `f64`→`NUMERIC` conversion
         // (neither `Some(f64)` nor `None::<f64>` against a NUMERIC
@@ -4513,7 +4614,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     tier, promoted_at, additional_scrubs\
                  ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
                 &[
-                    &attestation_uuid,
+                    &row.attestation_id,
                     &row.attesting_key_id,
                     &row.attested_key_id,
                     &row.attestation_type,
@@ -4566,7 +4667,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         pg_project_attestation_subjects(
             &**client,
             &row,
-            &attestation_uuid,
+            &row.attestation_id,
             crate::federation::types::attestation_tier::FEDERATION,
         )
         .await
@@ -4859,9 +4960,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         // get_attestation already succeeded above → attestation_id parses.
-        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
 
         let client = self
             .get_client()
@@ -4871,7 +4975,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.federation_attestations \
                  SET cohort_scope = $1, persist_row_hash = $2 WHERE attestation_id = $3",
-                &[&cohort_scope, &new_hash, &att_uuid],
+                &[&cohort_scope, &new_hash, &attestation_id],
             )
             .await
             .map_err(|e| {
@@ -8787,9 +8891,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // Parse to uuid::Uuid before binding — the driver refuses a &str
         // against a `uuid`-typed param (see the 1693 / put_revocation note).
-        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
         // Read existing row to recompute the hash with new fields.
         let row_opt = client
             .query_opt(
@@ -8799,7 +8906,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1",
-                &[&att_uuid],
+                &[&attestation_id],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
@@ -8827,7 +8934,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "UPDATE cirislens.federation_attestations \
                  SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
                  WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
-                &[&scrub_signature_pqc, &now, &new_hash, &att_uuid],
+                &[&scrub_signature_pqc, &now, &new_hash, &attestation_id],
             )
             .await
             .map_err(|e| {
@@ -8852,9 +8959,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // Parse attestation_id to uuid::Uuid before binding — the driver
         // refuses to serialize a &str against a `uuid`-typed param (see
         // put_revocation / the 1693 comment). Invalid → no such row.
-        let Ok(att_uuid) = uuid::Uuid::parse_str(attestation_id) else {
-            return Ok(None);
-        };
+        // v30.6.0 (CIRISPersist#622) — this was the WORST of the nine: a
+        // non-UUID id did not error, it returned `Ok(None)`. So
+        // `get_attestation("genesis-charter")` answered "no such row" on
+        // Postgres and returned the row on SQLite — a silent divergence, not a
+        // refusal. Bound as TEXT now; there is nothing left to fail to parse.
         let row_opt = client
             .query_opt(
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
@@ -8862,7 +8971,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1",
-                &[&att_uuid],
+                &[&attestation_id],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))?;
@@ -8932,9 +9041,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         let pqc_completed = row.pqc_completed_at;
         // get_attestation already succeeded above → attestation_id parses.
-        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
 
         let client = self
             .get_client()
@@ -8956,7 +9068,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &now,
                     &pqc_completed,
                     &new_hash,
-                    &att_uuid,
+                    &attestation_id,
                     &cohort_scope,
                 ],
             )
@@ -8981,7 +9093,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
                  WHERE attestation_id = $1",
-                &[&att_uuid],
+                &[&attestation_id],
             )
             .await
             .map_err(|e| {
@@ -9054,9 +9166,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         let pqc_completed = row.pqc_completed_at;
-        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
 
         let client = self
             .get_client()
@@ -9080,7 +9195,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &now,
                     &pqc_completed,
                     &new_hash,
-                    &att_uuid,
+                    &attestation_id,
                     &cohort_scope,
                 ],
             )
@@ -9098,7 +9213,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
                  WHERE attestation_id = $1",
-                &[&att_uuid],
+                &[&attestation_id],
             )
             .await
             .map_err(|e| {
@@ -10779,11 +10894,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             }
             crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
         }
-        let attestation_uuid = uuid::Uuid::parse_str(&attestation.attestation_id).map_err(|e| {
-            crate::federation::BlobError::InvalidArgument(format!(
-                "attestation_id is not a valid UUID: {e}"
-            ))
-        })?;
+        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
+        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
+        // the column can hold the ids the genesis ceremony SIGNED
+        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
+        // column alone was NOT enough — this Rust-side parse produced the identical
+        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
         let original_content_hash =
             hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
                 crate::federation::BlobError::InvalidArgument(format!(
@@ -10901,7 +11017,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             &[
-                &attestation_uuid,
+                &attestation.attestation_id,
                 &attestation.attesting_key_id,
                 &attestation.attesting_key_id,
                 &attestation_type,
@@ -14171,8 +14287,9 @@ impl PostgresBackend {
         // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
         let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
             .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
-        let attestation_uuid = uuid::Uuid::parse_str(&attestation_id)
-            .map_err(|e| Error::Backend(format!("uuid parse: {e}")))?;
+        // v30.6.0 (CIRISPersist#622) — no parse: the column is TEXT since V121 so
+        // the id binds as itself. This site had a different `map_err` shape than
+        // its eight siblings, which is exactly how one survives a sweep.
 
         let tx = client
             .transaction()
@@ -14200,7 +14317,7 @@ impl PostgresBackend {
                        $13, $14, $15, $16, $17, $18, 'local', NULL, $19) \
              ON CONFLICT (attestation_id) DO NOTHING",
             &[
-                &attestation_uuid,
+                &attestation_id,
                 &row.attesting_key_id,
                 &row.attested_key_id,
                 &row.attestation_type,
@@ -14233,7 +14350,7 @@ impl PostgresBackend {
         pg_project_attestation_subjects(
             &*tx,
             &row,
-            &attestation_uuid,
+            &attestation_id,
             crate::federation::types::attestation_tier::LOCAL,
         )
         .await
@@ -14392,10 +14509,13 @@ fn pg_scores_shared_predicates(
 /// for `row` on the given client/transaction. Expands `subject_key_ids[]` into
 /// one projection row per element at `tier`; upsert on the (subject,
 /// attestation) PK keeps it idempotent.
+// v30.6.0 (CIRISPersist#622) — takes the id as `&str`, not `&uuid::Uuid`. The
+// projection table's FK moved to TEXT in V121 alongside its parent, so a UUID
+// here would be the one remaining place a genesis-shaped id could not reach.
 async fn pg_project_attestation_subjects<C>(
     client: &C,
     row: &crate::federation::Attestation,
-    attestation_uuid: &uuid::Uuid,
+    attestation_id: &str,
     tier: &str,
 ) -> Result<(), tokio_postgres::Error>
 where
@@ -14415,7 +14535,7 @@ where
                     subj,
                     &dimension,
                     &row.asserted_at,
-                    attestation_uuid,
+                    &attestation_id,
                     &tier,
                     &row.cohort_scope,
                 ],
@@ -20795,6 +20915,27 @@ mod tests {
         .await;
     }
 
+    /// v30.6.0 (CIRISPersist#622) — the POSTGRES leg of the three-backend
+    /// genesis witness. **This is the leg that was red in production**: the
+    /// baked bundle's symbolic ids (`genesis-charter`, …) could not be written
+    /// while `attestation_id` was `UUID`, so every Postgres node failed genesis
+    /// and every SQLite node was immune. Fails on the pre-V121 schema.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn genesis_seed_installs_parity_postgres_622() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
     /// v30.3.0 (CIRISPersist#611) — the POSTGRES leg of the shared
     /// publisher-vouch-conferral witness (see the memory + sqlite legs).
     #[tokio::test]
@@ -21344,15 +21485,15 @@ mod tests {
         );
 
         // Promote (tier=federation) → drops out of subsequent scans.
-        // (Bind a parsed Uuid — see the put_revocation `$1::uuid` note.)
-        let att_uuid = uuid::Uuid::parse_str(&att_id).unwrap();
+        // v30.6.0 (CIRISPersist#622) — bound as TEXT; the column stopped being
+        // `uuid` in V121.
         let client = backend.get_client().await.unwrap();
         client
             .execute(
                 "UPDATE cirislens.federation_attestations \
                  SET tier = 'federation', promoted_at = $2 \
                  WHERE attestation_id = $1",
-                &[&att_uuid, &after],
+                &[&att_id, &after],
             )
             .await
             .unwrap();
@@ -34939,7 +35080,10 @@ mod tests {
             .await
             .unwrap();
 
-        let seed = |id: uuid::Uuid,
+        // v30.6.0 (CIRISPersist#622) — `String`, not `uuid::Uuid`: the column is
+        // TEXT since V121 and the driver rejects a Uuid against it with
+        // `WrongType { postgres: Text, rust: "uuid::Uuid" }`.
+        let seed = |id: String,
                     dim: &'static str,
                     weight: f64,
                     subjects: serde_json::Value,
@@ -34972,10 +35116,24 @@ mod tests {
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
         );
-        seed(a, "config:filter:v1", 0.9, serde_json::json!([]), None).await;
-        seed(b, "config:other:v1", 0.4, serde_json::json!([]), None).await;
         seed(
-            c,
+            a.to_string(),
+            "config:filter:v1",
+            0.9,
+            serde_json::json!([]),
+            None,
+        )
+        .await;
+        seed(
+            b.to_string(),
+            "config:other:v1",
+            0.4,
+            serde_json::json!([]),
+            None,
+        )
+        .await;
+        seed(
+            c.to_string(),
             "goal:x:v1",
             0.95,
             serde_json::json!(["subj-1"]),
@@ -34983,7 +35141,7 @@ mod tests {
         )
         .await;
         seed(
-            d,
+            d.to_string(),
             "goal:y:v1",
             0.7,
             serde_json::json!([]),
@@ -36625,7 +36783,9 @@ mod tests {
         {
             let anomaly =
                 ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner2, &node);
-            let anomaly_uuid = uuid::Uuid::parse_str(&anomaly.attestation_id).unwrap();
+            // v30.6.0 (CIRISPersist#622) — no parse; the column is TEXT since V121.
+            // This fixture mints a UUID id of its own, which still round-trips
+            // fine — TEXT accepts the old shape as well as the ceremony's.
             let ts_stamp: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
             let hash_bytes: Vec<u8> = vec![0u8];
             let client = backend.get_client().await.expect("client");
@@ -36638,7 +36798,7 @@ mod tests {
                         persist_row_hash\
                      ) VALUES ($1, $2, $3, 'delegates_to', $4, $5, $6, 'c2ln', $2, $4, '0')",
                     &[
-                        &anomaly_uuid,
+                        &anomaly.attestation_id,
                         &owner2,
                         &node,
                         &ts_stamp,

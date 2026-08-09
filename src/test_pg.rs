@@ -143,7 +143,31 @@ fn provision() -> Option<String> {
 
 /// The shared, already-migrated database every per-test database is copied
 /// from. Created once per server, by whichever process gets there first.
-const TEMPLATE_DB: &str = "ciris_t_template";
+///
+/// # The name carries the migration set's fingerprint, and that is load-bearing
+///
+/// v30.6.0 (CIRISPersist#622). A fixed name made the template STALE the moment
+/// anyone added or edited a migration: every per-test database was cloned from
+/// the OLD schema, so the suite ran green against a schema the tree no longer
+/// describes. That is a silent-wrong-answer, not a slow one.
+///
+/// It bit twice while landing V121 — a dye test that removed the migration still
+/// passed, because the template kept the applied column type, and then the
+/// FIXED build failed because the template kept the unfixed one. Both directions
+/// wrong, neither obvious.
+///
+/// Keying the name on a fingerprint of the embedded migration set means a schema
+/// change automatically lands on a fresh template. Old ones become garbage
+/// nobody reads; `reap_dead` and a human sweep them.
+fn template_db() -> String {
+    use std::sync::OnceLock;
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let h = crate::store::postgres::embedded_migration_fingerprint();
+        format!("ciris_t_template_{h:016x}")
+    })
+    .clone()
+}
 
 /// A postgres advisory-lock key, so exactly one process builds the template
 /// while the rest wait rather than racing 116 migrations against each other.
@@ -153,29 +177,29 @@ const TEMPLATE_DB: &str = "ciris_t_template";
 /// database, so they genuinely contend.
 const TEMPLATE_LOCK: i64 = 0x0C11_3507_E570;
 
-/// Build [`TEMPLATE_DB`] if it does not exist, and return its name.
+/// Build [`template_db()`] if it does not exist, and return its name.
 ///
 /// Returns `None` on any failure, which degrades to "create an empty database
 /// and let the test migrate it" — slower, still correct, never silently
 /// shared.
 fn ensure_template(admin: &str) -> Option<String> {
     // Fast path: already built.
-    if database_exists(admin, TEMPLATE_DB).unwrap_or(false) {
-        return Some(TEMPLATE_DB.to_owned());
+    if database_exists(admin, &template_db()).unwrap_or(false) {
+        return Some(template_db());
     }
     // Serialize construction. `pg_advisory_lock` blocks until acquired and is
     // released when the session ends, so a process that dies mid-build cannot
     // wedge the others.
     let built = with_advisory_lock(admin, TEMPLATE_LOCK, || {
-        if database_exists(admin, TEMPLATE_DB).unwrap_or(false) {
+        if database_exists(admin, &template_db()).unwrap_or(false) {
             return Ok(()); // another process won the race while we waited
         }
-        run_sql(admin, &format!("CREATE DATABASE \"{TEMPLATE_DB}\""))?;
+        run_sql(admin, &format!("CREATE DATABASE \"{}\"", template_db()))?;
         let (host, _) = split(admin).ok_or_else(|| "admin dsn".to_owned())?;
-        migrate(&format!("{host}/{TEMPLATE_DB}"))
+        migrate(&format!("{host}/{}", template_db()))
     });
     match built {
-        Ok(()) => Some(TEMPLATE_DB.to_owned()),
+        Ok(()) => Some(template_db()),
         Err(_) => None,
     }
 }

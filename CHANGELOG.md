@@ -5,6 +5,75 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.6.0] — 2026-08-09 — the genesis bundle's signed ids can finally be stored
+
+- **#622 — every Postgres node failed genesis; every SQLite node was immune.** The baked production
+  trust root signs SYMBOLIC attestation ids — `genesis-charter`,
+  `genesis-grant:ciris-canonical-1-d7bdeu223k`, `genesis-lifecycle` — inside an envelope covered by
+  an 88-byte Ed25519 and a 4412-byte ML-DSA-65 signature. `attestation_id` was `UUID PRIMARY KEY`
+  (V004:198), so stage 1 of boot aborted and the embedding agent died. Two production agents
+  crash-looped **151 and 223 restarts** with no operator remedy (CIRISServer#381 / CIRISAgent#1020).
+
+  Renaming the ids was implemented downstream and reverted, correctly: it invalidates a trust root
+  that took four mints and two hardware-key holders, and it INVERTS the failure —
+  `capability_roots_to_trusted_root` then stops resolving on **every** backend, turning a loud
+  Postgres-only outage into a quiet fleet-wide trust-root loss.
+
+- **The fix is TWO halves, and the issue only described one.** #622 reads as a one-line column
+  relaxation. It is not: the error `attestation_id is not a valid UUID` is **persist's own Rust
+  validation**, not the Postgres driver. With V121 applied and the template confirmed holding
+  `text`, the write still failed with the identical message.
+
+  1. **V121** relaxes four columns — `federation_attestations.attestation_id`,
+     `attestation_subjects.attestation_id`, `identity_canonical_binding.binding_attestation_id`,
+     and `cirisnode.promotion_attestations.attestation_id` — dropping and restoring both FKs with
+     their original delete semantics. `uuid::text` is total, so existing rows keep their exact
+     values and nothing is re-signed. **This removes a backend asymmetry rather than creating one:**
+     SQLite has typed these `TEXT` since V004, and V071/V109 already carry TEXT attestation ids.
+  2. **Ten Rust sites** in `src/store/postgres.rs` parsed the id into a `uuid::Uuid` before binding.
+     All now bind TEXT, including `pg_project_attestation_subjects`, whose signature took
+     `&uuid::Uuid`.
+
+  Both halves are dye-tested independently: revert either and the Postgres genesis leg goes red.
+
+- **The worst of the ten was not an error.** `get_attestation` had
+  `let Ok(att_uuid) = parse_str(..) else { return Ok(None) }` — so `get_attestation("genesis-charter")`
+  answered *"no such row"* on Postgres and returned the row on SQLite. A silent divergence, not a
+  refusal, with nothing to grep for on either side.
+
+- **A three-backend genesis witness, and the first version of it was decorative.**
+  `seed_family_and_canonical` installs KEYS; the symbolic ids live in the bundle's ATTESTATIONS,
+  which the host writes at stage 1. A witness that only seeded keys passed on the broken schema.
+  It now installs the real bundle attestations through the real `put_attestation` and asserts
+  byte-exact round-trip, and it reproduces the production error verbatim on the unfixed tree.
+
+- **`no_attestation_id_is_parsed_as_a_uuid`** keeps the Rust half from regressing. Mutation-verified.
+  Its predicate builds the search needle with `concat!` so it cannot match itself — a trailing
+  `SCAN-EXEMPT` marker does **not** survive here, because `cargo fmt` moves a trailing comment onto
+  its own line and the marker silently stops exempting anything.
+
+- **The test template was silently lying, in both directions.** `src/test_pg.rs` cached its
+  already-migrated template under a fixed name, so it went stale the moment any migration changed:
+  a dye test with V121 removed still passed, and then the FIXED build failed, because the template
+  kept whichever schema it was born with. Every per-test database is cloned from it, so the whole
+  suite could run green against a schema the tree no longer describes. The template name is now
+  keyed on an FNV-1a fingerprint of the embedded migration set — folding refinery's own
+  `checksum()`, the same value it compares when refusing a migration whose content changed under a
+  fixed version.
+
+  A first draft folded version+name and claimed an edited migration would still move the hash. That
+  was **false** — editing V121's body changed neither — and it was caught the only way it could be:
+  refinery refused the stale template with *"applied migration … is different than filesystem one"*.
+  Content is the only thing that answers the question being asked.
+
+- **Scope discipline: `cirisnode.promotion_attestations` is deliberately NOT relaxed.** A draft of
+  V121 relaxed it too, reasoning it was "the same class waiting to happen". That was scope creep
+  past the reported defect, and the code disagrees: `src/cirisnode/postgres.rs::parse_id` documents
+  a deliberate UUID discipline for that surface, and the genesis bundle never writes a promotion
+  attestation. Relaxing it broke `put_promotion_attestation`, which correctly binds a parsed
+  `Uuid`. If a symbolic id ever needs to reach that table, the column and `parse_id` move together,
+  as one deliberate change with its own witness.
+
 ## [30.5.0] — 2026-08-08 — there are no classical-only paths
 
 - **#620 — a half identity is no longer representable.** Six incidents across four repos are one

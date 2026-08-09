@@ -562,6 +562,80 @@ where
     Ok(())
 }
 
+/// v30.6.0 (CIRISPersist#622) — the THREE-BACKEND genesis witness.
+///
+/// # Why this exists
+///
+/// `federation_attestations.attestation_id` was `UUID PRIMARY KEY` on Postgres
+/// while the baked ceremony bundle carries SYMBOLIC ids — `genesis-charter`,
+/// `genesis-grant:…`, `genesis-lifecycle`. The driver refused the write before
+/// any persist logic ran, so **every Postgres node failed genesis and every
+/// SQLite node was immune**: same binary, same constant, same value. Two
+/// production agents crash-looped 151 and 223 times (CIRISServer#381 /
+/// CIRISAgent#1020).
+///
+/// persist had already NAMED this trap — *"memory tolerates what postgres
+/// rejects"* — and built a three-backend witness for it. That witness works.
+/// **The genesis path simply was not under it**, so the trap reached production
+/// instead of a fixture. This closes that gap: the bundle every node actually
+/// bakes is installed and verified through the REAL directory on all three
+/// backends.
+///
+/// Run against the pre-V121 Postgres schema this fails with
+/// `attestation_id is not a valid UUID`, which is the dye test.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDirectory) {
+    // NOTE: each leg seeds the accord holders BEFORE calling this, via the
+    // concrete `seed_genesis_accord_holders` (it is a backend method, not a
+    // `FederationDirectory` one). Holders must exist first because
+    // `verify_bundle_quorum` and the m-of-n put gate re-derive the roster from
+    // THIS node's directory — the #377 rule, never the roster the bundle
+    // carries — so the seats have to be there before anything is tallied
+    // against them.
+
+    seed_family_and_canonical(dir)
+        .await
+        .expect("the baked genesis bundle must install on EVERY backend");
+    verify_family_seeded(dir)
+        .await
+        .expect("accord family must verify after seeding");
+    verify_canonical_seeded(dir)
+        .await
+        .expect("canonical servers must verify after seeding");
+
+    // **THE PART THAT WAS BREAKING.** `seed_family_and_canonical` installs KEYS;
+    // the bundle's ATTESTATIONS — the rows carrying the symbolic ids
+    // `genesis-charter`, `genesis-grant:…`, `genesis-lifecycle` — are written by
+    // the host as stage 1 of boot. That write is what Postgres refused while
+    // `attestation_id` was `UUID`, and it is why a witness that only seeds keys
+    // passes on the broken schema and proves nothing. (It did: the first version
+    // of this body was green on unfixed Postgres.)
+    for att in &canonical_genesis_bundle().attestations {
+        dir.put_attestation(att.clone()).await.unwrap_or_else(|e| {
+            panic!(
+                "genesis attestation {:?} must install on EVERY backend: {e}",
+                att.attestation.attestation_id
+            )
+        });
+        let back = dir
+            .get_attestation(&att.attestation.attestation_id)
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| {
+                panic!(
+                    "genesis attestation {:?} vanished after write",
+                    att.attestation.attestation_id
+                )
+            });
+        // Byte-exact: a backend that rewrote the id (to a UUID, say) would break
+        // every signature over the envelope that names it.
+        assert_eq!(
+            back.attestation_id, att.attestation.attestation_id,
+            "the id the ceremony SIGNED must round-trip unchanged"
+        );
+    }
+}
+
 /// v13.4.1 (CIRISPersist#392) — the **single shared genesis-seed routine** run
 /// by BOTH engine constructors ([`Engine::with_signer`](crate::engine::Engine::with_signer)
 /// AND the pyo3 `PyEngine::new`), so they are **seed-identical by construction**
