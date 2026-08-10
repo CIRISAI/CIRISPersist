@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.7.0] — 2026-08-09 — the wire vocabularies enumerate, so a picker can exist
+
+- **#625 — eight vocabularies, two of which could be enumerated.** CIRISServer's operator pickers
+  require no free-form entry: every value a human selects must come from the substrate's own
+  vocabulary. For six of the eight there was no list to read. Now there is:
+  `delegation_scope::ALL` (19), `identity_type::ALL` (15), `attestation_type::ALL` (5),
+  `cohort_scope::ALL` (7), and new `transmission_principle` (5) / `consent_state` (3) modules.
+  `device_class::ALL` and the verify regions already existed.
+
+- **CURATED, not globbed — and `delegation_scope` is why.** That module holds THREE vocabularies
+  (11 `infra:*`, 4 `agency:*`, 4 moderation scopes re-exported from `admission`) **plus two
+  constants that are not values at all**: `INFRA_PREFIX` (`"infra:"`) and `AGENCY_PREFIX`. A client
+  enumerating the module mechanically would put **"infra:"** on an operator's dropdown. Only this
+  repo knows which constant is a member of which vocabulary.
+
+  So `NON_MEMBERS: &[(&str, &str)]` names every excluded constant **with its reason** — "not a
+  selectable value" is a recorded decision, not an omission.
+
+- **Three axis subsets, because the axis is constitutional.** `INFRA` / `AGENCY` / `MODERATION`
+  ship alongside `ALL`. infra-vs-agency is not a naming convention: **CC 4.4.3.4.3 —
+  "infrastructure must not have agency"** — is cryptographically enforced at the write gate, so a
+  `node`-only key may carry `infra:*` and never `agency:*`. A picker that mixed them would offer an
+  operator a delegation the substrate will refuse.
+
+  Both forms are exported deliberately. The validator needs the union (`scope` is one wire field
+  and any member is legal in it); a picker is always contextual (the act determines the axis).
+  Ship only `ALL` and every consumer partitions it by prefix-matching and hardcoding the moderation
+  four, then diverges. Ship only the subsets and the validator unions them and drifts the other way.
+
+- **Two gates, both mutation-verified.** `every_delegation_scope_const_is_classified` fails the
+  build when a constant is in neither `ALL` nor `NON_MEMBERS` — completeness by memory is not a
+  plan, since four scopes were minted in v30.2.0–v30.4.0 alone and a fifth nobody lists is silently
+  absent from every operator screen. `delegation_scope_axes_partition_all` asserts the subsets
+  partition the union exactly — without it, "the axes partition ALL" is a comment. The first gate
+  caught the second gate's own subsets within minutes of existing, which is the mechanism working
+  on its author.
+
+- **The transmission principles were literals inside a hash-pinned JSON blob.** They are named in
+  `transmission_principle` and referenced from the consent grammar, so the wire bytes are
+  unchanged — `consent_grammar_hash_is_pinned` proves it.
+
+- **`consent_state::ALL` deliberately omits `Unspecified`.** It is what the resolver returns when
+  no stance exists; offering it in a picker would invite an operator to "set" a state that means
+  "unset".
+
+- **The issue's own table was substantially wrong, and checking it mattered.** It reported
+  `cohort_scope` as holding device classes and `attestation_type` as holding scope prefixes — both
+  clean — and delegation scope as five members when it has 22. Building to it would have split two
+  modules that need no splitting and shipped a delegation list missing 14 real scopes. The reporter
+  diagnosed the cause themselves: vocabularies extracted by hardcoded line ranges that swept across
+  four module boundaries, so four modules were read as two. Their words, worth keeping: *"I asserted
+  'this module holds two vocabularies' while reading four modules as two, by addressing them by
+  position — the same defect the issue is about, committed in the act of reporting it."*
+
 ## [30.6.0] — 2026-08-09 — the genesis bundle's signed ids can finally be stored
 
 - **#622 — every Postgres node failed genesis; every SQLite node was immune.** The baked production

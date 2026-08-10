@@ -456,7 +456,9 @@ pub fn consent_grammar_manifest() -> serde_json::Value {
         "contract": "consent_grammar",
         "version": "consent-grammar:v1",
         "directions": ["egress", "ingress"],
-        "principles": ["retain", "share", "analyze", "train", "publish"],
+        // v30.7.0 (CIRISPersist#625) — one source of truth. Same bytes, so
+        // CONSENT_GRAMMAR_HASH is unchanged; the hash test below proves it.
+        "principles": crate::federation::types::transmission_principle::ALL,
         "restriction_ops": [
             {"op": "strip_field", "args": ["path"]},
             {"op": "recipient_capability", "args": ["capability"]},

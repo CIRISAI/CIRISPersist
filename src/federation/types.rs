@@ -137,6 +137,29 @@ pub mod identity_type {
     /// Carried alongside [`USER`] in the `identity_type` set when the
     /// human is also a WA (e.g. `"user,wise_authority"`).
     pub const WISE_AUTHORITY: &str = "wise_authority";
+
+    /// v30.7.0 (CIRISPersist#625) — every value an `identity_type` may hold.
+    ///
+    /// CURATED: this module also holds `AUTHORITY_CONFERRING_IDENTITY_TYPES` and
+    /// `CO_STEWARD_ROLES`, which are SETS OVER these members, not members. A
+    /// mechanical glob would offer a human a list-of-lists.
+    pub const ALL: &[&str] = &[
+        AGENT,
+        NODE,
+        USER,
+        STEWARD,
+        PARTNER,
+        CANONICAL,
+        REGISTRY,
+        WITNESS,
+        PRIMITIVE,
+        ACCORD_HOLDER,
+        SUBSTRATE_PERSIST,
+        TRUSTED_PUBLISHER,
+        WISE_AUTHORITY,
+        LENSCORE_DETECTOR,
+        VERIFY,
+    ];
     /// v8.9.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
     /// fabric/infrastructure role. A CIRISServer (or any pure
     /// infrastructure node) self-registers its federation signing key
@@ -648,6 +671,13 @@ pub mod attestation_type {
     /// Wire-distinct from [`WITHDRAWS`] even when consumer UIs
     /// collapse the two — see module-level note.
     pub const RECANTS: &str = "recants";
+
+    /// v30.7.0 (CIRISPersist#625) — the five structural attestation types.
+    ///
+    /// CC 1.7's "1+4 lockdown": one workhorse primitive (`scores`) plus four
+    /// structural composers. This list is closed by constitutional rule, not by
+    /// convention, so an addition here is a governance change.
+    pub const ALL: &[&str] = &[SCORES, DELEGATES_TO, SUPERSEDES, WITHDRAWS, RECANTS];
 }
 
 /// v12.6.0 (CIRISPersist#363 / CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the
@@ -865,6 +895,107 @@ pub mod delegation_scope {
     /// Stamp it on a `delegates_to` exactly as the other three are stamped;
     /// the duty walk matches it under the same policy.
     pub const SCOPE_SLASH: &str = crate::federation::admission::DELEGATION_SCOPE_SLASH;
+
+    /// v30.7.0 (CIRISPersist#625) — **every value a `scope` entry may hold, and
+    /// nothing else.** For operator pickers: no free-form entry, so the list a
+    /// human chooses from must come from here.
+    ///
+    /// CURATED, not globbed, and this module is exactly why. It holds THREE
+    /// vocabularies:
+    ///
+    ///  1. the capability scopes below (`infra:*` + `agency:*`),
+    ///  2. the moderation scopes re-exported from `admission` (`SCOPE_*`),
+    ///  3. **two PREFIX constants that are not values at all** — `INFRA_PREFIX`
+    ///     (`"infra:"`) and `AGENCY_PREFIX` (`"agency:"`).
+    ///
+    /// A client enumerating this module mechanically would offer a human
+    /// **"infra:"** as a selectable scope. `LEGACY_AGENCY_KINDS` is likewise a
+    /// set, not a member. Only this repo knows which is which, which is the
+    /// whole reason the set is curated here rather than derived downstream.
+    ///
+    /// Kept honest by [`tests::every_delegation_scope_const_is_classified`]: a
+    /// newly minted scope that is not placed in this list — or explicitly named
+    /// as a non-member — fails the build. Four scopes were minted in v30.2.0 –
+    /// v30.4.0 alone, so "remember to update the list" is not a plan.
+    pub const ALL: &[&str] = &[
+        // infra:* — what a node may do as infrastructure.
+        INFRA_SERVE,
+        INFRA_STORE,
+        INFRA_TRANSPORT,
+        INFRA_ATTEST,
+        INFRA_NETWORK_PRESENCE,
+        INFRA_HOLD_COMMUNITY_MEMBERSHIP,
+        INFRA_HOLD_FAMILY_MEMBERSHIP,
+        INFRA_ATTEST_ASSURANCE,
+        INFRA_DETECT,
+        INFRA_RECORD_HARD_CASE,
+        INFRA_PUBLISH_RATING,
+        // agency:* — what an agent may do on someone's behalf.
+        AGENCY_ACT_ON_BEHALF,
+        AGENCY_MESSAGE_IO,
+        AGENCY_REASON,
+        AGENCY_DECIDE,
+        // moderation / admin ladder, re-exported from `admission`.
+        SCOPE_MODERATE,
+        SCOPE_TAKEDOWN,
+        SCOPE_REVIEW,
+        SCOPE_SLASH,
+    ];
+
+    /// v30.7.0 (CIRISPersist#625) — the `infra:*` axis: what a key may do as
+    /// INFRASTRUCTURE.
+    ///
+    /// This is a real axis, not a naming convention. **CC 4.4.3.4.3 —
+    /// "infrastructure must not have agency"** — is cryptographically enforced
+    /// at the write gate: a `node`-only key's `delegates_to` may carry these and
+    /// never [`AGENCY`]. A picker that mixed them would offer an operator a
+    /// delegation the substrate will refuse.
+    pub const INFRA: &[&str] = &[
+        INFRA_SERVE,
+        INFRA_STORE,
+        INFRA_TRANSPORT,
+        INFRA_ATTEST,
+        INFRA_NETWORK_PRESENCE,
+        INFRA_HOLD_COMMUNITY_MEMBERSHIP,
+        INFRA_HOLD_FAMILY_MEMBERSHIP,
+        INFRA_ATTEST_ASSURANCE,
+        INFRA_DETECT,
+        INFRA_RECORD_HARD_CASE,
+        INFRA_PUBLISH_RATING,
+    ];
+
+    /// v30.7.0 (CIRISPersist#625) — the `agency:*` axis: what a key may do ON
+    /// SOMEONE'S BEHALF. The other side of CC 4.4.3.4.3; see [`INFRA`].
+    pub const AGENCY: &[&str] = &[
+        AGENCY_ACT_ON_BEHALF,
+        AGENCY_MESSAGE_IO,
+        AGENCY_REASON,
+        AGENCY_DECIDE,
+    ];
+
+    /// v30.7.0 (CIRISPersist#625) — the moderation / admin-ladder axis,
+    /// re-exported from [`crate::federation::admission`]. Distinct from [`INFRA`]
+    /// and [`AGENCY`]: these authorise action ABOUT ANOTHER PARTY rather than
+    /// capability of the holder.
+    pub const MODERATION: &[&str] = &[SCOPE_MODERATE, SCOPE_TAKEDOWN, SCOPE_REVIEW, SCOPE_SLASH];
+
+    /// The constants in this module that are deliberately **NOT** members of
+    /// [`ALL`], with the reason. Read by
+    /// [`tests::every_delegation_scope_const_is_classified`] so that "not a
+    /// member" is a recorded decision rather than an omission.
+    pub const NON_MEMBERS: &[(&str, &str)] = &[
+        ("INFRA_PREFIX", "a prefix (\"infra:\"), not a scope value"),
+        ("AGENCY_PREFIX", "a prefix (\"agency:\"), not a scope value"),
+        (
+            "LEGACY_AGENCY_KINDS",
+            "a set of legacy kinds, not a single value",
+        ),
+        ("ALL", "this list itself"),
+        ("NON_MEMBERS", "this exclusion list itself"),
+        ("INFRA", "an axis subset of ALL, not a single value"),
+        ("AGENCY", "an axis subset of ALL, not a single value"),
+        ("MODERATION", "an axis subset of ALL, not a single value"),
+    ];
 
     /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
     /// `self_at_login` agency profile + `reason`/`decide`) that MUST also
@@ -1704,6 +1835,23 @@ pub mod cohort_scope {
     /// pre-v3.9.0 semantic.
     pub const FEDERATION: &str = "federation";
 
+    /// v30.7.0 (CIRISPersist#625) — every value a `cohort_scope` may hold, in
+    /// widening order (self → biosphere), which is the order an operator picker
+    /// should present.
+    ///
+    /// Distinct from [`super::device_class::ALL`], which is a different
+    /// vocabulary in its own module. CIRISPersist#625 reported the two as mixed
+    /// under one name; they are not, and were not.
+    pub const ALL: &[&str] = &[
+        SELF,
+        FAMILY,
+        COMMUNITY,
+        AFFILIATIONS,
+        SPECIES,
+        BIOSPHERE,
+        FEDERATION,
+    ];
+
     /// True iff `s` is one of the closed-set values. Substrate
     /// admission-gate work in v3.10.0+ uses this for early rejection
     /// of malformed envelopes.
@@ -2040,6 +2188,51 @@ pub mod device_class {
 
     /// All six values in spec order.
     pub const ALL: [&str; 6] = [PHONE, LAPTOP, SERVER, EMBEDDED, AGENT, SERVICE];
+}
+
+/// v30.7.0 (CIRISPersist#625) — the **transmission principle** vocabulary: what
+/// a recipient may DO with data, as distinct from who may see it
+/// ([`cohort_scope`]).
+///
+/// The members were literals inside the consent-grammar JSON blob, which is
+/// hash-pinned by `CONSENT_GRAMMAR_HASH`. They are named here and referenced
+/// there, so the wire bytes are unchanged — the grammar-hash test proves it —
+/// and an operator picker has a list to read.
+pub mod transmission_principle {
+    /// Keep a copy.
+    pub const RETAIN: &str = "retain";
+    /// Pass on to others in the permitted audience.
+    pub const SHARE: &str = "share";
+    /// Derive statistics or inferences.
+    pub const ANALYZE: &str = "analyze";
+    /// Use as training data.
+    pub const TRAIN: &str = "train";
+    /// Make publicly available.
+    pub const PUBLISH: &str = "publish";
+
+    /// Every transmission principle, in consent-grammar order. That order is
+    /// load-bearing: it is the order serialized into the hash-pinned grammar.
+    pub const ALL: &[&str] = &[RETAIN, SHARE, ANALYZE, TRAIN, PUBLISH];
+}
+
+/// v30.7.0 (CIRISPersist#625) — the **consent state** vocabulary.
+///
+/// The wire values are the `consent:state:*` dimension prefixes in
+/// [`crate::federation::consent`]; `Unspecified` is a resolved outcome (the
+/// subject was named but never declared a stance), not a value anyone emits, so
+/// it is deliberately absent from [`ALL`].
+pub mod consent_state {
+    /// Latest stance is `granted` — processing may proceed in scope.
+    pub const GRANTED: &str = "granted";
+    /// Latest stance is `revoked` — the subject withdrew; the SLA clock runs.
+    pub const REVOKED: &str = "revoked";
+    /// Latest stance is `expired`, or a `valid_until` passed.
+    pub const EXPIRED: &str = "expired";
+
+    /// The three states a subject can DECLARE. `Unspecified` is not here: it is
+    /// what the resolver returns when no stance exists, and offering it in a
+    /// picker would invite an operator to "set" a state that means "unset".
+    pub const ALL: &[&str] = &[GRANTED, REVOKED, EXPIRED];
 }
 
 /// §5.6.8.9 `consensus_protocol` canonical-kinds vocabulary.
@@ -3806,5 +3999,158 @@ mod tests {
         let json = serde_json::to_string(&row).unwrap();
         let deser: KeyRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(row, deser);
+    }
+
+    /// v30.7.0 (CIRISPersist#625) — **the axis subsets PARTITION the union.**
+    ///
+    /// `ALL` and the three subsets serve different consumers and neither may
+    /// re-derive the other: the validator needs the union, because `scope` is one
+    /// wire field and any member is a legal value in it; a picker is always
+    /// contextual, because the ACT determines the axis. Shipping only `ALL` makes
+    /// every consumer partition it by prefix-matching and hardcoding the
+    /// moderation four — and the next moderation scope is then missing from
+    /// screens whose authors never knew a list existed. Shipping only the subsets
+    /// makes the validator union them and drift the other way.
+    ///
+    /// So both are exported, and this asserts they cannot disagree: every member
+    /// of `ALL` is in exactly one subset, and every subset member is in `ALL`.
+    /// Without it, "the subsets partition the union" is a comment.
+    #[test]
+    fn delegation_scope_axes_partition_all() {
+        use super::delegation_scope as ds;
+        use std::collections::HashSet;
+
+        let all: HashSet<&str> = ds::ALL.iter().copied().collect();
+        assert_eq!(
+            all.len(),
+            ds::ALL.len(),
+            "delegation_scope::ALL has duplicates"
+        );
+
+        let mut union: HashSet<&str> = HashSet::new();
+        for (name, set) in [
+            ("INFRA", ds::INFRA),
+            ("AGENCY", ds::AGENCY),
+            ("MODERATION", ds::MODERATION),
+        ] {
+            for v in set {
+                assert!(
+                    all.contains(v),
+                    "{name} lists {v:?}, which is not in ALL — the union is not a union"
+                );
+                assert!(
+                    union.insert(*v),
+                    "{v:?} appears in more than one axis subset; the axes are meant to be disjoint \
+                     (CC 4.4.3.4.3 makes infra/agency a real boundary, not a naming convention)"
+                );
+            }
+        }
+
+        let missing: Vec<&&str> = ds::ALL.iter().filter(|v| !union.contains(*v)).collect();
+        assert!(
+            missing.is_empty(),
+            "scope(s) in ALL belong to no axis subset: {missing:?}. Every scope has an axis — add \
+             it to INFRA, AGENCY or MODERATION, or say why a fourth axis exists."
+        );
+
+        // Non-vacuity: an empty or tiny set would satisfy everything above.
+        assert!(ds::INFRA.len() >= 10 && ds::AGENCY.len() >= 4 && ds::MODERATION.len() >= 4);
+    }
+
+    /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either
+    /// a member of `ALL` or a named non-member.**
+    ///
+    /// The picker requirement is no free-form entry, so `ALL` must be complete.
+    /// Completeness by memory is not a plan: FOUR scopes were minted in
+    /// v30.2.0–v30.4.0 alone (`infra:attest_assurance`, `infra:detect`,
+    /// `infra:record_hard_case`, `infra:publish_rating`). A fifth that nobody
+    /// adds to `ALL` is silently missing from every operator screen — a
+    /// carried-but-unoffered gap, invisible from downstream.
+    ///
+    /// Non-members are NAMED with a reason rather than merely absent, so
+    /// "not a scope value" is a recorded decision. The two prefixes are the
+    /// live example: `INFRA_PREFIX` is `"infra:"`, and a mechanical glob would
+    /// put it on a human's dropdown.
+    #[test]
+    fn every_delegation_scope_const_is_classified() {
+        use super::delegation_scope as ds;
+        let src = include_str!("types.rs");
+        let module = src
+            .split("pub mod delegation_scope {")
+            .nth(1)
+            .expect("delegation_scope module present")
+            .split("\n}\n")
+            .next()
+            .expect("module body");
+
+        let declared: Vec<String> = module
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const "))
+            .filter_map(|r| r.split(&[':', ' '][..]).next())
+            .map(|n| n.to_owned())
+            .collect();
+        assert!(
+            declared.len() >= 15,
+            "parsed only {} consts from delegation_scope — the scan is broken, so this gate \
+             proves nothing",
+            declared.len()
+        );
+
+        let non_member: Vec<&str> = ds::NON_MEMBERS.iter().map(|(n, _)| *n).collect();
+        let mut unclassified = Vec::new();
+        for name in &declared {
+            if non_member.contains(&name.as_str()) {
+                continue;
+            }
+            // A member's VALUE must appear in ALL. Comparing values rather than
+            // names keeps the re-exported `SCOPE_*` constants in scope.
+            let value_in_all = match name.as_str() {
+                "INFRA_SERVE" => ds::ALL.contains(&ds::INFRA_SERVE),
+                "INFRA_STORE" => ds::ALL.contains(&ds::INFRA_STORE),
+                "INFRA_TRANSPORT" => ds::ALL.contains(&ds::INFRA_TRANSPORT),
+                "INFRA_ATTEST" => ds::ALL.contains(&ds::INFRA_ATTEST),
+                "INFRA_NETWORK_PRESENCE" => ds::ALL.contains(&ds::INFRA_NETWORK_PRESENCE),
+                "INFRA_HOLD_COMMUNITY_MEMBERSHIP" => {
+                    ds::ALL.contains(&ds::INFRA_HOLD_COMMUNITY_MEMBERSHIP)
+                }
+                "INFRA_HOLD_FAMILY_MEMBERSHIP" => {
+                    ds::ALL.contains(&ds::INFRA_HOLD_FAMILY_MEMBERSHIP)
+                }
+                "INFRA_ATTEST_ASSURANCE" => ds::ALL.contains(&ds::INFRA_ATTEST_ASSURANCE),
+                "INFRA_DETECT" => ds::ALL.contains(&ds::INFRA_DETECT),
+                "INFRA_RECORD_HARD_CASE" => ds::ALL.contains(&ds::INFRA_RECORD_HARD_CASE),
+                "INFRA_PUBLISH_RATING" => ds::ALL.contains(&ds::INFRA_PUBLISH_RATING),
+                "AGENCY_ACT_ON_BEHALF" => ds::ALL.contains(&ds::AGENCY_ACT_ON_BEHALF),
+                "AGENCY_MESSAGE_IO" => ds::ALL.contains(&ds::AGENCY_MESSAGE_IO),
+                "AGENCY_REASON" => ds::ALL.contains(&ds::AGENCY_REASON),
+                "AGENCY_DECIDE" => ds::ALL.contains(&ds::AGENCY_DECIDE),
+                "SCOPE_MODERATE" => ds::ALL.contains(&ds::SCOPE_MODERATE),
+                "SCOPE_TAKEDOWN" => ds::ALL.contains(&ds::SCOPE_TAKEDOWN),
+                "SCOPE_REVIEW" => ds::ALL.contains(&ds::SCOPE_REVIEW),
+                "SCOPE_SLASH" => ds::ALL.contains(&ds::SCOPE_SLASH),
+                _ => false,
+            };
+            if !value_in_all {
+                unclassified.push(name.clone());
+            }
+        }
+
+        assert!(
+            unclassified.is_empty(),
+            "delegation_scope constant(s) are in neither ALL nor NON_MEMBERS: {unclassified:?}.\n\
+             A scope missing from ALL is silently absent from every operator picker \
+             (CIRISPersist#625). Add it to ALL, or to NON_MEMBERS with the reason it is not a \
+             selectable value (a prefix, a set, …), and extend this test's match arm."
+        );
+
+        // ALL itself must hold no duplicates and no prefixes.
+        let mut seen = std::collections::HashSet::new();
+        for v in ds::ALL {
+            assert!(seen.insert(*v), "delegation_scope::ALL lists {v:?} twice");
+            assert!(
+                *v != ds::INFRA_PREFIX && *v != ds::AGENCY_PREFIX,
+                "delegation_scope::ALL contains the bare prefix {v:?} — not a selectable value"
+            );
+        }
     }
 }
