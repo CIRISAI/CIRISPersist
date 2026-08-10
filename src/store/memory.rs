@@ -1755,13 +1755,23 @@ fn mem_scores_row_matches(
             return false;
         }
     }
-    if let Some(k) = &filter.attesting_key_id {
-        if &r.attesting_key_id != k {
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, OR-combined.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() && !keys.iter().any(|k| k == &r.attesting_key_id) {
             return false;
         }
     }
-    if let Some(k) = &filter.attested_key_id {
-        if &r.attested_key_id != k {
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, OR-combined.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() && !keys.iter().any(|k| k == &r.attested_key_id) {
             return false;
         }
     }

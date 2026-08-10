@@ -5,6 +5,59 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.9.0] — 2026-08-10 — a moderation act can address a set, and CI stops taking 38 minutes
+
+- **#627 — `AttestationFilter`'s key predicates are set-valued.** New
+  `attesting_key_ids` / `attested_key_ids`, OR-combined and pushed into the query as `IN (…)` /
+  `= ANY(…)` — **never an application-side loop**, which is the CIRISServer#343 lesson this
+  module's own doc already states. `dimension_prefixes` is the precedent: same struct, already
+  `Vec<String>`, already pushed down.
+
+  The incident that filed it: 61 exposed dev/QA key ids to de-admit, which under singular
+  predicates is 61 preview→commit pairs, each with its own hash, reason and authority walk. At 61
+  that is merely bad; at mesh scale no predicate over a population is expressible at all, and the
+  operator's alternative is a script hammering a tier-4 door in a loop — worse than what the
+  tiering exists to prevent.
+
+  **The ladder's safety property never required the singular form.** Its guarantee is preview-hash
+  commit — *what was previewed is what executes* — which is a property of the HASH, not of
+  cardinality. A preview over 61 keys produces one hash over that row set and is exactly as
+  TOCTOU-closed as a preview over one. It audits better, too: one decision, one reason, one ledger
+  entry naming the whole set, instead of 61 rows a reader must infer were a single act.
+
+  The singular fields remain as convenience aliases and are OR-combined with the set. One shared
+  `merge_key_predicate` folds them, so all three backends cannot drift on what "singular ∪ set"
+  means — this struct already carries that scar (#596 item 2: three axes silently ignored by one
+  backend). Four legs, three mutations killed. The two that matter least obviously: singular ∪ set
+  is the **union** so neither silently wins, and an **empty predicate matches anything, not
+  nothing** — reading it as `IN ()` would silently empty every unfiltered listing in the mesh,
+  which presents as a working system returning no results.
+
+- **CI wall time: 38m → ~21m**, config-only.
+
+  Measured on run 31397353461: the critical path was **two co-critical jobs**, so cutting either
+  alone bought nothing — `linux-x86_64 (secrets)` at 28m and `maturin wheel (windows-x86_64)` at
+  27m, the latter running on every PR with no job-level gate.
+
+  Cross-platform wheels now build on **tags only**. Nothing consumes them on a PR, and since
+  v30.4.0 nothing consumes them at all outside a release (#615 removed PyPI publishing), so their
+  only reader is `build-manifest`, which tolerates absence by construction. `linux-x86_64` still
+  builds on every event deliberately — it is the shape the pyo3 surface compiles in, and one
+  platform is enough to catch a wheel break; four is paying 52 minutes to catch it three more times.
+
+  The three slowest legs are **partitioned across two runners** via `nextest --partition`. Verified
+  empirically, not assumed: `secrets` 62 tests → 33 + 29, exactly covering.
+
+  **The bug this nearly shipped with:** the first version pinned the gauntlet to shard 1 and
+  excluded it on shard 2. Partitioning splits the 10 `substrate_machine` bodies 5/5, so shard 2's
+  exclusion would have left **five gauntlet tests running nowhere, with both runners green**. Both
+  shards now carry `gauntlet: true`; the numbers are in the YAML so nobody re-derives the
+  "obvious" arrangement.
+
+  Also: a job-level `if:` referencing `matrix` does not skip the job — it fails the **entire
+  workflow at startup** with zero jobs run and no annotation, and `python-yaml` parses the broken
+  file happily. The matrix is varied by ref via `fromJSON` instead.
+
 ## [30.8.0] — 2026-08-09 — conferral is not stewardship, and a grant can say how far it travels
 
 - **CIRISConstitution#87 — conferring a capability on a person is not becoming their steward.**
