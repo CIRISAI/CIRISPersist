@@ -5061,6 +5061,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // anti-rollback monotonicity. Both run BEFORE persist_row_hash
         // is computed and BEFORE INSERT (same discipline as v3.9.1
         // cohort_scope admission).
+        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
+        // moderation act. Self-revocation passes untouched.
+        crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
         let client = self
             .get_client()
@@ -20915,6 +20918,76 @@ mod tests {
         .await;
     }
 
+    /// v30.8.0 (CIRISPersist#596 item 1) — give `revoker` the `slash` authority
+    /// that revoking SOMEONE ELSE'S key now requires. These fixtures test
+    /// revocation MECHANICS, not who may revoke, so they get the authority they
+    /// would hold in production rather than being narrowed to self-revocations.
+    async fn grant_slash(backend: &PostgresBackend, revoker: &str) {
+        {
+            backend.set_node_key_id("rev-authority-node");
+            crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+                backend,
+                "rev-authority-node",
+                "rev-authority-root",
+                revoker,
+                crate::federation::admission::DELEGATION_SCOPE_SLASH,
+            )
+            .await;
+        }
+    }
+
+    /// v30.8.0 (CIRISConstitution#87) — the POSTGRES leg.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn conferral_is_not_stewardship_postgres_87() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_conferral_is_not_stewardship(
+            &backend,
+            &format!("pg87{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// v30.8.0 — the POSTGRES leg of the PRE-BAKE charter rehearsal.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn moderation_charter_rehearsal_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_charter_rehearsal(
+            &backend,
+            &format!("pgreh{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// v30.8.0 (CIRISPersist#628) — the POSTGRES leg of the re-delegation-budget
+    /// witness (see the memory + sqlite legs).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn sub_delegation_budget_parity_postgres_628() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_sub_delegation_budget(
+            &backend,
+            &format!("pg628{}", uuid_like()),
+        )
+        .await;
+    }
+
     /// v30.6.0 (CIRISPersist#622) — the POSTGRES leg of the three-backend
     /// genesis witness. **This is the leg that was red in production**: the
     /// baked bundle's symbolic ids (`genesis-charter`, …) could not be written
@@ -21061,6 +21134,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
+        backend.set_node_key_id("rb-node-postgres");
         crate::federation::register::bound_test_support::exercise_revocation_bound(
             &backend, &suffix,
         )
@@ -25152,6 +25226,7 @@ mod tests {
             revoked_after: None,
             persist_row_hash: String::new(),
         };
+        grant_slash(&backend, &revoking_id).await;
         backend
             .put_revocation(crate::federation::SignedRevocation { revocation: rev })
             .await
@@ -29542,6 +29617,7 @@ mod tests {
             revoked_after: None,
             persist_row_hash: String::new(),
         };
+        grant_slash(&backend, &steward).await;
         backend
             .put_revocation(crate::federation::SignedRevocation { revocation: rev })
             .await
@@ -31102,6 +31178,7 @@ mod tests {
         let __rev_env = serde_json::json!({"id": rev_id});
         let (__rev_och, __rev_sc, __rev_sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(&steward, &__rev_env);
+        grant_slash(&backend, &steward).await;
         backend
             .put_revocation(crate::federation::SignedRevocation {
                 revocation: crate::federation::Revocation {

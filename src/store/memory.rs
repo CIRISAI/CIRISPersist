@@ -3227,6 +3227,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
+        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
+        // moderation act. Self-revocation passes untouched.
+        crate::federation::admission::check_revocation_authority(self, &row).await?;
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Hybrid-Strict vs the revoking key's registered
@@ -8628,6 +8631,30 @@ mod tests {
         assert_eq!(ids, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 
+    /// v30.8.0 (CIRISPersist#596 item 1) — give `revoker` the `slash` authority
+    /// that revoking SOMEONE ELSE'S key now requires.
+    ///
+    /// These fixtures test revocation MECHANICS (round-trip, region,
+    /// anti-rollback, PQC attach), not who may revoke — so they get the
+    /// authority they would hold in production rather than being rewritten as
+    /// self-revocations, which would quietly narrow what they exercise.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn grant_slash(backend: &MemoryBackend, revoker: &str) {
+        backend.set_node_key_id("rev-authority-node");
+        // NOT self-registering: these fixtures register their own keys with
+        // their own pubkeys, and `register_hybrid_key`'s deterministic ones
+        // collide as a content conflict. Call this AFTER the fixture has
+        // registered the revoker.
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            backend,
+            "rev-authority-node",
+            "rev-authority-root",
+            revoker,
+            crate::federation::admission::DELEGATION_SCOPE_SLASH,
+        )
+        .await;
+    }
+
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
         let __rev_env = serde_json::json!({"id": id});
@@ -8658,6 +8685,36 @@ mod tests {
     /// Build a `delegates_to` row from `attesting` to `attested` carrying
     /// the given scope set (array wire shape). Re-uses `fix_attestation`
     /// then overrides the type + scope envelope.
+    /// v30.8.0 (CIRISConstitution#87) — a delegation carrying the CC 2.4.1.2
+    /// **owner-binding marker**: an explicit claim of custody over the target.
+    ///
+    /// The steward-gate tests need this now. Before the ruling, an UNMARKED
+    /// `delegates_to(user → user)` was itself read as a steward binding, so those
+    /// tests could assert CC 3.2's refusals against a bare edge. CC 3.2 rc3 ruled
+    /// that unmarked edge is a capability CONFERRAL — giving a person a job — and
+    /// it is now admitted. Testing the custody rule therefore requires stating
+    /// custody, which is what this helper does.
+    ///
+    /// The refusals those tests assert are unchanged; only the shape that
+    /// triggers them is now explicit.
+    fn fix_owner_binding_delegates_to(
+        id: &str,
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+        scope: &[&str],
+    ) -> Attestation {
+        let mut att = fix_attestation(id, attesting, attested, scrub_key_id);
+        att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        att.attestation_envelope = serde_json::json!({
+            "id": id,
+            "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+        });
+        resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        att
+    }
+
     fn fix_node_delegates_to(
         id: &str,
         attesting: &str,
@@ -9094,6 +9151,14 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    // v30.8.0 (CIRISPersist#596 item 1) — gated with `grant_slash`, which needs
+    // the conferral builder in `r2_test_support` (itself cfg(any(sqlite,
+    // postgres)) because it requires a real signing path). A cfg on the helper
+    // but not its CALL SITES is the v30.4.1 `_pyffi` defect exactly, and the
+    // no-feature leg is what catches it. Coverage note: this test stops running
+    // on the default build; its subject (revocation mechanics on the memory
+    // backend) is covered on every featured leg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     /// v2.6.0 (CIRISPersist#108) — confirm `persist_row_hash` is
     /// surfaced on every federation row-read path. Verify will pass
     /// the hex value into `FederationProvenance::persist_row_hash`
@@ -9123,6 +9188,7 @@ mod tests {
             })
             .await
             .unwrap();
+        grant_slash(&backend, "steward-1").await;
         backend
             .put_revocation(SignedRevocation {
                 revocation: fix_revocation("rev-1", "k-target", "steward-1", "steward-1"),
@@ -9798,6 +9864,14 @@ mod tests {
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
     }
 
+    // v30.8.0 (CIRISPersist#596 item 1) — gated with `grant_slash`, which needs
+    // the conferral builder in `r2_test_support` (itself cfg(any(sqlite,
+    // postgres)) because it requires a real signing path). A cfg on the helper
+    // but not its CALL SITES is the v30.4.1 `_pyffi` defect exactly, and the
+    // no-feature leg is what catches it. Coverage note: this test stops running
+    // on the default build; its subject (revocation mechanics on the memory
+    // backend) is covered on every featured leg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn attach_pqc_for_attestation_and_revocation() {
         let backend = MemoryBackend::new();
@@ -9825,6 +9899,7 @@ mod tests {
             .unwrap();
         let atts = backend.list_attestations_for("k-target").await.unwrap();
         assert!(atts[0].is_pqc_complete());
+        grant_slash(&backend, "steward").await;
 
         backend
             .put_revocation(SignedRevocation {
@@ -9877,7 +9952,11 @@ mod tests {
             .unwrap();
         backend
             .put_revocation(SignedRevocation {
-                revocation: fix_revocation("rev-z", "k-c", "steward", "steward"),
+                revocation: // v30.8.0 (#596 item 1) — SELF-revocation: this test counts rows, and the
+                // trust-root scaffolding a third-party conferral needs would
+                // pollute the count it measures. Self-revocation needs no
+                // authority and changes nothing else here.
+                fix_revocation("rev-z", "steward", "steward", "steward"),
             })
             .await
             .unwrap();
@@ -10324,6 +10403,14 @@ mod tests {
         assert!(none.is_none());
     }
 
+    // v30.8.0 (CIRISPersist#596 item 1) — gated with `grant_slash`, which needs
+    // the conferral builder in `r2_test_support` (itself cfg(any(sqlite,
+    // postgres)) because it requires a real signing path). A cfg on the helper
+    // but not its CALL SITES is the v30.4.1 `_pyffi` defect exactly, and the
+    // no-feature leg is what catches it. Coverage note: this test stops running
+    // on the default build; its subject (revocation mechanics on the memory
+    // backend) is covered on every featured leg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn revocation_round_trip() {
         let backend = MemoryBackend::new();
@@ -10339,6 +10426,7 @@ mod tests {
             })
             .await
             .unwrap();
+        grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation {
                 revocation: fix_revocation(
@@ -11223,6 +11311,14 @@ mod tests {
         let _ = &admin;
     }
 
+    // v30.8.0 (CIRISPersist#596 item 1) — gated with `grant_slash`, which needs
+    // the conferral builder in `r2_test_support` (itself cfg(any(sqlite,
+    // postgres)) because it requires a real signing path). A cfg on the helper
+    // but not its CALL SITES is the v30.4.1 `_pyffi` defect exactly, and the
+    // no-feature leg is what catches it. Coverage note: this test stops running
+    // on the default build; its subject (revocation mechanics on the memory
+    // backend) is covered on every featured leg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     /// v21.0.0 (CIRISPersist#502 E1) — a forged revocation (scrub sig by a
     /// key OTHER than the declared revoking key) is REJECTED. The attack:
     /// any linked peer forging `{revoked: victim, revoking: any-existing}`
@@ -11240,6 +11336,7 @@ mod tests {
         }
         // Honest revocation (revoker signs) — admits.
         let good = fix_revocation("e1-good", "e1-victim", "e1-revoker", "e1-revoker");
+        grant_slash(&backend, "e1-revoker").await;
         backend
             .put_revocation(crate::federation::SignedRevocation { revocation: good })
             .await
@@ -15937,6 +16034,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn revocation_bound_parity_memory_570() {
         let backend = MemoryBackend::new();
+        backend.set_node_key_id("rb-node-memory");
         crate::federation::register::bound_test_support::exercise_revocation_bound(
             &backend,
             "memory-rb",
@@ -16333,6 +16431,46 @@ mod tests {
 
     // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────
     //    I1 age band + user-target steward-binding gate + minor liveness.
+
+    /// v30.8.0 (CIRISConstitution#87) — the MEMORY leg of the
+    /// conferral-is-not-stewardship witness.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn conferral_is_not_stewardship_memory_87() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_conferral_is_not_stewardship(
+            &backend, "memory-87",
+        )
+        .await;
+    }
+
+    /// v30.8.0 — the MEMORY leg of the PRE-BAKE charter rehearsal. Proves the
+    /// re-genesis charter shape works before the ceremony mints it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn moderation_charter_rehearsal_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_charter_rehearsal(
+            &backend, "memory-reh",
+        )
+        .await;
+    }
+
+    /// v30.8.0 (CIRISPersist#628) — the MEMORY leg of the re-delegation-budget
+    /// witness. All three backends drive the SAME body.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn sub_delegation_budget_parity_memory_628() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_sub_delegation_budget(
+            &backend,
+            "memory-628",
+        )
+        .await;
+    }
 
     /// v30.6.0 (CIRISPersist#622) — the MEMORY leg of the three-backend genesis
     /// witness. All three install the REAL baked bundle through the REAL
@@ -16740,8 +16878,9 @@ mod tests {
                 .unwrap();
         }
 
-        let deleg =
-            |id: &str, s: &str, t: &str| fix_node_delegates_to(id, s, t, s, &[ds::INFRA_SERVE]);
+        let deleg = |id: &str, s: &str, t: &str| {
+            fix_owner_binding_delegates_to(id, s, t, s, &[ds::INFRA_SERVE])
+        };
 
         // S(adult user) → A(adult user) : REJECTED (target_is_self_sovereign).
         let e = backend
@@ -16816,7 +16955,7 @@ mod tests {
         // U(unknown-age user) → M(minor) : REJECTED (granter not proven adult).
         let e = backend
             .put_attestation(SignedAttestation {
-                attestation: fix_node_delegates_to(
+                attestation: fix_owner_binding_delegates_to(
                     "ugd-UM",
                     "ug-U",
                     "ug-M",
@@ -16837,7 +16976,7 @@ mod tests {
         // node target (infra:* scope clears the node-agency gate) → ADMITTED.
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_node_delegates_to(
+                attestation: fix_owner_binding_delegates_to(
                     "ugd-UN",
                     "ug-U",
                     "ug-N",
@@ -17032,6 +17171,19 @@ mod tests {
         let mut env = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            // v30.8.0 (CIRISConstitution#87) — an incapacity binding is a CUSTODY
+            // CLAIM by construction, so it declares itself as one. Since the
+            // ruling, custody must be DECLARED: an undeclared `delegates_to` to a
+            // person is a capability conferral. That matters most for the
+            // `missing_legitimacy_source` case — a binding that omits its
+            // justification is otherwise indistinguishable from a conferral, and
+            // would slip past the gate that exists to punish exactly that
+            // omission. Declaring custody is what makes the omission visible.
+            //
+            // Fail-safe either way: an undeclared edge confers no custody, so a
+            // host that forgets the marker gets a grant that establishes nothing
+            // rather than silent stewardship.
+            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
         });
         let obj = env.as_object_mut().unwrap();
         if let Some(l) = legit {
@@ -17605,7 +17757,7 @@ mod tests {
         // Bind the minor to the adult steward (live edge) → steward-bound.
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_node_delegates_to(
+                attestation: fix_owner_binding_delegates_to(
                     "ml-bind",
                     "ml-S",
                     "ml-M",
@@ -17644,7 +17796,7 @@ mod tests {
         // withdrawn→false) — the node path never used clauses (1)/(2).
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_node_delegates_to(
+                attestation: fix_owner_binding_delegates_to(
                     "ml-nbind",
                     "ml-S",
                     "ml-N",

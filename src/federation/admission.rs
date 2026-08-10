@@ -1331,6 +1331,83 @@ pub fn envelope_dimension(envelope: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// v30.8.0 (CIRISConstitution#87) — **can `key_id` accept for itself?**
+///
+/// This is THE predicate behind CC 3.2 rc3's ruling, written once because both
+/// halves of the custody rule read it and they must never disagree:
+/// `check_user_target_steward_binding_admission` (the write gate) and
+/// `steward_bindings_of` clause (3) (the read fold).
+///
+/// The ruling's sentence is *an act the target must accept for itself cannot be
+/// custody of the target*. So custody is possible exactly where acceptance is
+/// not. The substrate encodes "cannot accept for itself" in three separate
+/// places, which is why an earlier implementation of this rule took four
+/// successive corrections — each fix found the next encoding:
+///
+///  * **a node has no agency** (`identity_type` contains `node`). This is why
+///    node stewardship is a distinct act from agent partnership: the targets
+///    differ in agency, not in wire shape.
+///  * **a minor cannot accept for itself** (`user` whose [`age_band`] is
+///    `Minor`) — guardianship.
+///  * everything else CAN: an adult, an agent, a primitive. For those, custody
+///    exists only where the envelope DECLARES it
+///    ([`is_custody_claim_envelope`]).
+///
+/// An **unverified** age counts as able to accept — CC 3.2's own presumption of
+/// sovereignty. Failing the other way would let anyone claim custody over any
+/// unaged key.
+///
+/// An unresolved key also counts as able: inventing custody over a key this node
+/// has never seen is the worse error.
+pub async fn can_accept_for_itself(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    use super::age::{age_band, AgeBand};
+    let Some(rec) = directory.lookup_public_key(key_id).await? else {
+        return Ok(true);
+    };
+    if identity_type::set_contains(&rec.identity_type, identity_type::NODE) {
+        return Ok(false);
+    }
+    if identity_type::set_contains(&rec.identity_type, identity_type::USER)
+        && age_band(directory, key_id).await? == AgeBand::Minor
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// v30.8.0 (CIRISConstitution#87) — is this envelope a **claim of CUSTODY** over
+/// its target, as opposed to a capability conferral?
+///
+/// This is the predicate the CC 3.2 gate and the steward fold share, and it is
+/// deliberately WIDER than [`is_owner_binding_envelope`]:
+///
+///  * the CC 2.4.1.2 owner-binding marker (or the internal owner-binding
+///    dimension) — an explicit custody claim; and
+///  * **any envelope carrying `binding_legitimacy_source`** — a guardianship or
+///    adult-incapacity binding. That field exists to JUSTIFY custody, so its
+///    presence is a custody claim by construction, and such bindings do not
+///    carry the owner-binding marker.
+///
+/// Missing the second clause is a hole, not a narrowing: keying the gate on
+/// `is_owner_binding_envelope` alone left the entire adult-incapacity aperture
+/// UNGATED, because those bindings are marked by their legitimacy source rather
+/// than by `delegation_purpose`. Caught by the incapacity decision tables.
+///
+/// Kept separate from [`is_owner_binding_envelope`] rather than widening it: that
+/// one drives the OWNERSHIP projection (`nodes_stewarded_by`), and silently
+/// changing what counts as ownership is a different decision from what counts as
+/// custody for CC 3.2.
+#[must_use]
+pub fn is_custody_claim_envelope(envelope: &serde_json::Value) -> bool {
+    is_owner_binding_envelope(envelope)
+        || envelope
+            .get(super::capacity::binding_field::LEGITIMACY_SOURCE)
+            .is_some()
+}
+
 /// v13.2.1 (CIRISPersist#378) — is this `delegates_to` envelope an
 /// **owner-binding** (CC 3.2 single-owner sub-relation)? True iff EITHER
 /// the internal versioned [`owner_binding::DIMENSION`](super::types::owner_binding::DIMENSION)
@@ -4054,6 +4131,34 @@ pub fn scopes_are_infra_only(scopes: &std::collections::HashSet<String>) -> bool
 /// but MUST NOT deputize anyone further (UCAN-style; §13.3 deputization
 /// gate). The root duty-holder is NOT subject to this gate (it holds the
 /// duty natively, not by delegation).
+/// v30.8.0 (CIRISPersist#628) — the **re-delegation BUDGET**: how many further
+/// hops the recipient's own chain may run.
+///
+/// # This EXTENDS `sub_delegation`; it does not sit beside it
+///
+/// #628 asked for a separate `redelegation_depth` with `absent ⇒ 0`. That would
+/// be a second answer to the question `sub_delegation` already answers — *may
+/// this recipient pass the duty on?* — and two fields that can disagree about
+/// one property is the class this substrate keeps paying for (#532's
+/// one-name-two-axes, #541's two-lists-that-disagree). The boolean stays the
+/// gate; this is only the BOUND on a gate already open:
+///
+/// | envelope | meaning |
+/// |---|---|
+/// | `sub_delegation` absent / `false` | leaf — may exercise, may not pass on (**unchanged**, still the default) |
+/// | `sub_delegation: true`, no depth | may pass on, bounded only by the global rail (**unchanged** — every already-issued grant keeps its exact meaning) |
+/// | `sub_delegation: true, sub_delegation_depth: N` | may pass on; the chain below may run `N` further hops |
+///
+/// `redelegation_depth: 0` from the issue is spelled `sub_delegation: false`,
+/// which is what every envelope without the field already says. The new field
+/// can only ever TIGHTEN.
+fn delegation_sub_delegation_depth(envelope: &serde_json::Value) -> Option<usize> {
+    envelope
+        .get("sub_delegation_depth")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 fn delegation_grants_sub_delegation(envelope: &serde_json::Value) -> bool {
     envelope
         .get("sub_delegation")
@@ -4310,6 +4415,10 @@ async fn scoped_delegation_reach(
         depth: usize,
         parent_scope: Option<HashSet<String>>,
         parent_sub_delegation: bool,
+        /// v30.8.0 (CIRISPersist#628) — hops this node's OWN chain may still
+        /// run, granted by its incoming edge. `None` = no bound declared
+        /// (legacy), so only the global rail applies.
+        budget: Option<usize>,
     }
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<Node> = VecDeque::new();
@@ -4323,6 +4432,8 @@ async fn scoped_delegation_reach(
         depth: 0,
         parent_scope: None,
         parent_sub_delegation: false,
+        // The root duty-holder holds the duty natively; no issuer bounded it.
+        budget: None,
     });
     visited.insert(issuer.to_owned());
 
@@ -4338,6 +4449,14 @@ async fn scoped_delegation_reach(
             && node.parent_scope.is_some()
             && !node.parent_sub_delegation
         {
+            continue;
+        }
+        // v30.8.0 (CIRISPersist#628) — the granted budget is SPENT. This node
+        // may still EXERCISE the duty (it was reached and counted) but may not
+        // pass it on: its issuer said how far the chain could run and it has run
+        // that far. Distinct from the guard above — that one is "you were never
+        // deputized", this one is "you were, and the allowance is gone".
+        if policy.enforce_attenuation_and_sub_delegation && node.budget == Some(0) {
             continue;
         }
         let rows = directory.list_attestations_by(&node.key).await?;
@@ -4421,6 +4540,19 @@ async fn scoped_delegation_reach(
             }
             if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
                 visited.insert(r.attested_key_id.clone());
+                // v30.8.0 (CIRISPersist#628) — the budget ATTENUATES, exactly as
+                // scope does: the child gets the smaller of what this edge
+                // declares and what remains of the parent's allowance. Without
+                // this the field is advisory — any holder could restore an
+                // unbounded chain by declaring a bigger number than it was given.
+                let declared = delegation_sub_delegation_depth(&r.attestation_envelope);
+                let inherited = node.budget.map(|b| b.saturating_sub(1));
+                let budget = match (declared, inherited) {
+                    (Some(d), Some(i)) => Some(d.min(i)),
+                    (Some(d), None) => Some(d),
+                    (None, Some(i)) => Some(i),
+                    (None, None) => None,
+                };
                 queue.push_back(Node {
                     key: r.attested_key_id,
                     depth: node.depth + 1,
@@ -4428,6 +4560,7 @@ async fn scoped_delegation_reach(
                     parent_sub_delegation: delegation_grants_sub_delegation(
                         &r.attestation_envelope,
                     ),
+                    budget,
                 });
             }
         }
@@ -5167,6 +5300,77 @@ pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
 /// chain longer than 5 cannot confer a moderation duty.
 pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 
+/// v30.8.0 (CIRISPersist#596 item 1 / CIRISServer#383) — **revoking SOMEONE
+/// ELSE'S key is a moderation act and needs moderation authority.**
+///
+/// # What was there before
+///
+/// `put_revocation`'s only gate was `check_federation`, which is a **trust-score
+/// threshold** — it asks whether the revoker is trusted enough to write at all,
+/// never whether it has any standing over the key it is revoking. So any
+/// sufficiently-trusted key could revoke any other key in the mesh. That was
+/// recorded as CIRISPersist#596 item 1 and deliberately deferred; a live
+/// key-rotation drill (CIRISServer#383) turned it from backlog into the thing
+/// standing between an operator and a clean slash.
+///
+/// # The split, and why it is exactly #620's
+///
+/// **Self-revocation is always allowed.** A holder must be able to retire its
+/// own key — that is the whole remedy for a compromised one, and gating it
+/// would mean a leaked key can only be retired by someone else, which is
+/// backwards. This is the same attester-vs-attested discriminator the
+/// `hard_case:` door uses (v30.5.0), for the same reason.
+///
+/// **Third-party revocation requires [`DELEGATION_SCOPE_SLASH`]** conferred by a
+/// root THIS NODE trusts, re-derived at use through
+/// [`super::trust_root::capability_roots_to_trusted_root`] — never a flag on the
+/// row, never the revoker vouching for itself. `slash` is the scope the
+/// substrate already documents as *"the authority to take something away"*, and
+/// removing a key from the mesh is the sharpest form of that.
+///
+/// # Deliberately NOT gated here
+///
+/// The trust-score threshold stays where it is. It answers a different question
+/// (may this peer write at all) and removing it would widen a different door
+/// while narrowing this one.
+pub async fn check_revocation_authority(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Revocation,
+) -> Result<(), Error> {
+    // Self-revocation: always. See the doc above — this is the remedy path.
+    if row.revoking_key_id == row.revoked_key_id {
+        return Ok(());
+    }
+    // An unattributed revocation cannot be authorised against anything. The
+    // existing `revoking_key_id.is_empty()` paths predate attribution and are
+    // left alone rather than silently re-classified as self-revocation.
+    if row.revoking_key_id.is_empty() {
+        return Ok(());
+    }
+    let Some(node) = directory.node_key_id() else {
+        return Err(Error::NodeIdentityUnset {
+            method: "check_revocation_authority",
+            needed_for: "resolving the revoker's slash conferral against this node's own trust \
+                         root",
+        });
+    };
+    let conferred = super::trust_root::capability_roots_to_trusted_root(
+        directory,
+        &node,
+        &row.revoking_key_id,
+        DELEGATION_SCOPE_SLASH,
+    )
+    .await?;
+    if conferred.is_none() {
+        return Err(Error::DelegatedScopeUnauthorized {
+            signer: row.revoking_key_id.clone(),
+            on_behalf_of: row.revoked_key_id.clone(),
+            scope: DELEGATION_SCOPE_SLASH.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Which incoming `delegates_to` edges [`live_delegation_granters`] admits.
 /// The ONLY axis on which its four consumers differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5443,8 +5647,42 @@ pub async fn steward_bindings_of(
             }
         }
     }
-    // (3) each granter U of a LIVE delegates_to(U → k) with U user-role.
-    out.extend(live_delegation_granters(directory, k, DelegationEdgeFilter::AnyDelegation).await?);
+    // (3) each user-role granter U of a LIVE delegates_to(U → k) — with the
+    // filter chosen by **whether `k` has agency**.
+    //
+    // v30.8.0 (CIRISConstitution#87). CC 3.2 rc3's discriminator is consent
+    // structure: an act the target must accept for itself cannot be custody of
+    // the target. So the question is never "what does the edge look like" but
+    // "can this target accept for itself?"
+    //
+    //  * **A node has no agency.** It cannot accept anything for itself, so a
+    //    person's delegation to it IS custody — every such edge is a steward
+    //    binding, marker or not. This is why node stewardship is a separate act
+    //    from agent partnership: the two targets differ in agency, not in wire
+    //    shape.
+    //  * **A key that CAN accept for itself** (a person) is stewarded only by an
+    //    explicit owner-binding — the CC 2.4.1.2 marker. An unmarked delegation
+    //    to a person is a capability conferral: giving them a job, not owning
+    //    them.
+    //
+    // An earlier draft of this narrowed BOTH cases to the marker, which dropped
+    // real node-stewardship relations from deployed data — inverting what CC 3.2
+    // protects. 26 tests caught it.
+    //
+    // PAIRED with `check_user_target_steward_binding_admission`, which fires only
+    // on USER targets and now only on marker-bearing edges: the two halves agree
+    // on "a person is stewarded only by an explicit custody claim", and neither
+    // touches the node case.
+    // ONE predicate, shared with `check_user_target_steward_binding_admission`.
+    // A target that cannot accept for itself (a node, or a minor) is stewarded by
+    // ANY delegation naming it; one that can is stewarded only where the envelope
+    // declares custody.
+    let filter = if can_accept_for_itself(directory, k).await? {
+        DelegationEdgeFilter::OwnerBindingOnly
+    } else {
+        DelegationEdgeFilter::AnyDelegation
+    };
+    out.extend(live_delegation_granters(directory, k, filter).await?);
     let mut out: Vec<String> = out.into_iter().collect();
     out.sort();
     Ok(out)
@@ -8344,6 +8582,37 @@ pub async fn check_user_target_steward_binding_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
+    // v30.8.0 (CIRISConstitution#87) — **CONFERRAL IS NOT STEWARDSHIP.**
+    //
+    // This gate fired on EVERY `delegates_to` targeting a `user`, so a quorum
+    // could not confer a moderation duty (`slash`, `moderate`, `takedown`,
+    // `review`) on a named human: the grant was refused `target_age_unverified`
+    // unless that human was a proven minor. The only way through was to register
+    // moderators as `agent`/`primitive`/`accord_holder` — dressing a person as
+    // infrastructure to get past a rule about persons, which CC 3.2 rc3 now
+    // names as the ontological misclassification it was.
+    //
+    // The ruling's discriminator is CONSENT STRUCTURE, and it was already
+    // ratified: T3's own-acceptance rule says no conferral, however strong its
+    // ceremony, substitutes for the target's own acceptance. So **an act the
+    // target must accept for itself cannot be custody of the target.**
+    // Stewardship is custody over a key that CANNOT accept for itself (a node
+    // or agent rooted in an accountable human, an adult under adjudicated
+    // incapacity, a minor under guardianship); a capability conferral is a
+    // consensual grant. Different acts, by their consent shape.
+    //
+    // PAIRED, not optional (CIRISPersist#541's two-lists discipline): this gate
+    // and `steward_bindings_of` clause (3) key on the SAME predicate. Narrowing
+    // one alone would let a conferral silently establish a stewardship relation
+    // the other would have refused — a state the substrate can create but not
+    // describe.
+    //
+    // WHAT THIS DELIBERATELY GIVES UP: the conflation was silently doing a
+    // second job — for conferrals, this was an accidental AGE gate. Per the
+    // ruling that duty is now explicit: a duty scope needing an age or
+    // assurance floor declares it on its own CC 4.5.5 row via the CC 3.4.11
+    // ladders, never inherits it from a custody rule. **Today no duty scope
+    // declares one**, which is now a visible choice rather than an accident.
     // Resolve the target. An unresolved target is out of scope here (and
     // FK-rejected downstream — it can never be persisted).
     let Some(target) = directory.lookup_public_key(&row.attested_key_id).await? else {
@@ -8364,6 +8633,23 @@ pub async fn check_user_target_steward_binding_admission(
     // this dispatches to. An unverified age is neither (presumption of
     // sovereignty).
     let target_band = age_band(directory, &row.attested_key_id).await?;
+    // v30.8.0 (CIRISConstitution#87) — the discriminator applies PER AGE BAND,
+    // because it is about who can accept for themselves.
+    //
+    // A **minor** cannot, so a delegation naming one is custody whether or not it
+    // says so — guardianship is checked below exactly as before. Only an **adult**
+    // can accept for itself, so for an adult an undeclared edge is a capability
+    // conferral (giving a person a job) and not this gate's business.
+    //
+    // An earlier draft returned early on any non-custody envelope BEFORE resolving
+    // age. That let an unmarked delegation to a MINOR through as a conferral —
+    // the guardianship gate never ran. Caught by
+    // `minor_guardianship_grant_and_withdraw_end_to_end`.
+    if can_accept_for_itself(directory, &row.attested_key_id).await?
+        && !is_custody_claim_envelope(&row.attestation_envelope)
+    {
+        return Ok(());
+    }
     match target_band {
         AgeBand::Minor => { /* fall through to minor-guardianship checks */ }
         AgeBand::Adult => {
@@ -14241,7 +14527,7 @@ pub(crate) mod r2_test_support {
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::types::cohort_scope;
         use chrono::Timelike as _;
 
         let author = format!("rescope-author-{tag}");
@@ -14282,8 +14568,8 @@ pub(crate) mod r2_test_support {
                 persist_row_hash: String::new(),
                 subject_key_ids: Vec::new(),
                 withdraws_admission_rule: None,
-                cohort_scope: cohort_scope::FEDERATION.to_owned(),
-                tier: attestation_tier::FEDERATION.to_owned(),
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             },
@@ -16049,6 +16335,436 @@ pub(crate) mod moderation_walk_liveness_test_support {
              walk's doc claims, and identical to the moderation plane's (1) because the two planes \
              now run the same gates. A `for` count above `by` here means the memo is not shared \
              across the walk"
+        );
+    }
+
+    /// v30.8.0 (CIRISPersist#628) — the same edge, carrying a re-delegation
+    /// BUDGET: how many further hops the recipient's chain may run.
+    fn moderation_edge_bounded(
+        granter: &str,
+        recipient: &str,
+        scope: &[&str],
+        subjects: &[&str],
+        sub_delegation: bool,
+        depth: usize,
+    ) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = signed_row(
+            granter,
+            recipient,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "sub_delegation": sub_delegation,
+                "sub_delegation_depth": depth,
+            }),
+        );
+        row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        row
+    }
+
+    /// v30.8.0 (CIRISPersist#628) — **a re-delegation budget bounds the chain,
+    /// and it attenuates.**
+    ///
+    /// The governance need (CIRISServer#383): an accord quorum delegating a
+    /// moderation duty to a named human must be able to say *"you, and one
+    /// deputy"* rather than only "you, and anyone, sixteen deep".
+    ///
+    /// # The semantics, stated because I got them wrong first
+    ///
+    /// `sub_delegation_depth: N` on edge A→B means **B's chain may run N
+    /// further hops**, matching #628's wording (*"1 = may pass it on once; that
+    /// holder may not"*). So on `founder →(depth 1) deputy → leaf → tail`, the
+    /// LEAF is reachable — the deputy spent its one hop — and the TAIL is not.
+    /// My first witness asserted the leaf was unreachable, which would have made
+    /// `depth: 1` mean the same as `sub_delegation: false` and left the field
+    /// unable to express the one case the issue actually asked for.
+    ///
+    /// Four legs, each killing a different wrong implementation:
+    ///  1. the deputy is reached — else the field breaks delegation outright;
+    ///  2. the leaf is reached — `depth 1` really does buy one hop;
+    ///  3. the tail is NOT — the bound bites. **The dye test**;
+    ///  4. attenuation — a holder with no allowance left cannot declare 5 and
+    ///     resurrect the chain. Without it the field is advisory.
+    pub(crate) async fn exercise_sub_delegation_budget(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let duty = DELEGATION_SCOPE_MODERATE;
+        let founder = format!("bud-founder-{suffix}");
+        let deputy = format!("bud-deputy-{suffix}");
+        let leaf = format!("bud-leaf-{suffix}");
+        let tail = format!("bud-tail-{suffix}");
+        // Chain members are `primitive`, not `user`: a `user` target needs an
+        // age-verified steward binding, a different gate than this is about.
+        register(dir, &founder, &[identity_type::USER]).await;
+        for k in [&deputy, &leaf, &tail] {
+            register(dir, k, &[identity_type::PRIMITIVE]).await;
+        }
+
+        store(
+            dir,
+            &moderation_edge_bounded(&founder, &deputy, &[duty], &[&deputy], true, 1),
+        )
+        .await
+        .expect("founder -> deputy admitted");
+        store(
+            dir,
+            &moderation_edge(&deputy, &leaf, &[duty], &[&leaf], true),
+        )
+        .await
+        .expect("deputy -> leaf admitted");
+        store(dir, &moderation_edge(&leaf, &tail, &[duty], &[&tail], true))
+            .await
+            .expect("leaf -> tail admitted");
+
+        let reach = async |t: &str| -> bool {
+            reachable_under_scope(dir, &founder, t, duty, MAX_MODERATION_DELEGATION_DEPTH)
+                .await
+                .expect("walk")
+        };
+
+        assert!(
+            reach(&deputy).await,
+            "the direct recipient must be reached — otherwise the field is not a bound, it is a \
+             break"
+        );
+        assert!(
+            reach(&leaf).await,
+            "depth 1 means the deputy MAY pass it on once, so the leaf is reachable. If this \
+             fails, `depth: 1` collapses into `sub_delegation: false` and cannot express the one \
+             case CIRISPersist#628 asked for"
+        );
+        assert!(
+            !reach(&tail).await,
+            "budget 1 must NOT reach three hops out. This is CIRISPersist#628: without it, \
+             granting a scope grants the right to pass it on, sixteen deep, with no way to say \
+             otherwise"
+        );
+        // ── (4) ATTENUATION, on a SEPARATE chain ─────────────────────────
+        //
+        // This needs its own chain, and the reason is worth recording: my first
+        // version hung the attenuation leg off the chain above, where the
+        // over-declaring holder's allowance was ALREADY 0. The budget-spent
+        // guard refused it before the attenuation arithmetic ever ran, so the
+        // leg passed for the wrong reason — a mutation that deleted attenuation
+        // entirely left all four legs green. Caught by mutation testing, not by
+        // reading it.
+        //
+        // Here the over-declaring holder still HAS allowance, so the guard does
+        // not fire and only attenuation can produce the refusal:
+        //   f2 →(depth 2) d2 →(declares 9!) l2 → t2 → x2
+        // With attenuation  d2=2, l2=min(9,1)=1, t2=min(-,0)=0 → x2 UNREACHABLE.
+        // Without it        d2=2, l2=9,         t2=min(-,8)=8 → x2 reachable.
+        let f2 = format!("att-f-{suffix}");
+        let d2 = format!("att-d-{suffix}");
+        let l2 = format!("att-l-{suffix}");
+        let t2 = format!("att-t-{suffix}");
+        let x2 = format!("att-x-{suffix}");
+        register(dir, &f2, &[identity_type::USER]).await;
+        for k in [&d2, &l2, &t2, &x2] {
+            register(dir, k, &[identity_type::PRIMITIVE]).await;
+        }
+        store(
+            dir,
+            &moderation_edge_bounded(&f2, &d2, &[duty], &[&d2], true, 2),
+        )
+        .await
+        .expect("f2 -> d2 admitted");
+        // d2 declares NINE, far beyond the 1 it has left to give.
+        store(
+            dir,
+            &moderation_edge_bounded(&d2, &l2, &[duty], &[&l2], true, 9),
+        )
+        .await
+        .expect("d2 -> l2 admitted (the WRITE is not gated; the WALK is)");
+        store(dir, &moderation_edge(&l2, &t2, &[duty], &[&t2], true))
+            .await
+            .expect("l2 -> t2 admitted");
+        store(dir, &moderation_edge(&t2, &x2, &[duty], &[&x2], true))
+            .await
+            .expect("t2 -> x2 admitted");
+
+        let reach2 = async |t: &str| -> bool {
+            reachable_under_scope(dir, &f2, t, duty, MAX_MODERATION_DELEGATION_DEPTH)
+                .await
+                .expect("walk")
+        };
+        assert!(
+            reach2(&t2).await,
+            "depth 2 must reach two hops past the deputy — otherwise this chain proves nothing \
+             about attenuation, only that it is short"
+        );
+        assert!(
+            !reach2(&x2).await,
+            "a holder given 2 hops declared 9 and must not get them: the budget attenuates \
+             exactly as scope does. Without this the field is advisory — any holder could restore \
+             an unbounded chain by writing a bigger number than its issuer allowed"
+        );
+    }
+
+    /// v30.8.0 — **the CHARTER SCOPE does not bound what a root may confer**
+    /// (CIRISServer#383 / CIRISPersist#628).
+    ///
+    /// # Why this witness exists, and what it corrected
+    ///
+    /// I advised the operator that `humanity-accord`'s charter had to be
+    /// re-minted carrying the four moderation scopes, on the reasoning that
+    /// `⊆`-parent attenuation means a family can only delegate what it holds —
+    /// so no charter scope ⇒ no quorum could ever confer `slash`, and that would
+    /// need a **new genesis ceremony**.
+    ///
+    /// **That was wrong**, and this witness is what proved it. `⊆`-parent
+    /// attenuation belongs to the MODERATION walk
+    /// (`enforce_attenuation_and_sub_delegation` in `scoped_delegation_reach`).
+    /// The CAPABILITY plane — `capability_roots_to_trusted_root` — is
+    /// single-hop: it finds a `trust:confers:v1` edge about the subject, then
+    /// asks only whether this node trusts the granter as a ROOT. `trust_root_valid`
+    /// checks the charter's AND-minimum (`infra:serve` + `infra:attest`) and
+    /// nothing about the conferred scope.
+    ///
+    /// So the charter answers *"is this a root at all"*, never *"what may it
+    /// confer"* — which is why `trust_root.rs` calls extra charter scopes merely
+    /// *"tolerated"*. The node's lever is whether to accept the root, not a
+    /// per-scope allowlist.
+    ///
+    /// The operational consequence is the whole point: **an existing accord can
+    /// confer `slash` with the charter it already has.** No re-mint, no ceremony.
+    ///
+    /// Four legs. Note the charter here carries the BARE minimum on purpose:
+    ///
+    ///  1. a bare-minimum charter is a valid trust root;
+    ///  2. that root confers `slash` — a scope its charter never mentions;
+    ///  3. the walk resolves it, so the human really holds the duty;
+    ///  4. a scope with NO conferral row does not resolve — the discriminator is
+    ///     the conferral, not the charter, and without this leg 2 could be read
+    ///     as "everything resolves".
+    pub(crate) async fn exercise_moderation_charter_rehearsal(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, pre_rotation_commitment, trust_root_valid,
+            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
+        };
+        let node = format!("reh-node-{suffix}");
+        let root = format!("reh-root-{suffix}");
+        let human = format!("reh-human-{suffix}");
+        for k in [&node, &root, &human] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+
+        // The charter the ceremony will actually mint: the RC3 AND-minimum plus
+        // the full moderation vocabulary.
+        // DELIBERATELY the bare AND-minimum, NOT the moderation scopes. See the
+        // doc above: this witness exists to prove the charter's scope does not
+        // bound what the root may confer.
+        let charter_scope = vec!["infra:serve".to_owned(), "infra:attest".to_owned()];
+        let uid =
+            |n: &str| uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, n.as_bytes()).to_string();
+        let now = chrono::Utc::now();
+        let rows: [(String, &str, &str, &str, serde_json::Value); 3] = [
+            (
+                uid(&format!("reh-charter-{root}")),
+                &root,
+                &root,
+                TRUST_CHARTER_DIMENSION,
+                serde_json::json!({
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": charter_scope,
+                    "pre_rotation_commitment":
+                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                }),
+            ),
+            (
+                uid(&format!("reh-accept-{node}-{root}")),
+                &node,
+                &root,
+                TRUST_ACCEPTS_DIMENSION,
+                serde_json::json!({ "dimension": TRUST_ACCEPTS_DIMENSION }),
+            ),
+            (
+                uid(&format!("reh-confer-{root}-{human}")),
+                &root,
+                &human,
+                TRUST_CONFERS_DIMENSION,
+                serde_json::json!({
+                    "dimension": TRUST_CONFERS_DIMENSION,
+                    "scope": [DELEGATION_SCOPE_SLASH],
+                }),
+            ),
+        ];
+        for (id, by, about, dim, env) in rows {
+            let (och, sc, sp) =
+                crate::federation::tier_ingest::test_support::sign_envelope(by, &env);
+            let att = Attestation {
+                attestation_id: id,
+                attesting_key_id: by.to_owned(),
+                attested_key_id: about.to_owned(),
+                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
+                    .to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: env,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: by.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            dir.put_attestation(crate::federation::SignedAttestation { attestation: att })
+                .await
+                .unwrap_or_else(|e| panic!("{dim} row must admit: {e}"));
+        }
+
+        // (1) the charter is a valid trust root DESPITE carrying moderation scopes.
+        let verdict = trust_root_valid(dir, &node, &root).await.expect("walk");
+        assert!(
+            verdict.valid,
+            "the bare AND-minimum charter must be a valid trust root"
+        );
+
+        // (2) + (3) the root can confer `slash`, and the walk resolves it.
+        let granted = capability_roots_to_trusted_root(dir, &node, &human, DELEGATION_SCOPE_SLASH)
+            .await
+            .expect("resolve");
+        assert!(
+            granted.is_some(),
+            "a trusted root must be able to confer `slash` even though its charter never mentions \
+             it — the charter's AND-minimum answers 'is this a root', not 'what may it confer'. \
+             If this ever fails, an existing accord can no longer delegate moderation duties \
+             without a NEW GENESIS CEREMONY, which is exactly the cost this witness exists to \
+             keep from being paid by surprise"
+        );
+
+        // (4) a scope the charter does NOT carry is still refused.
+        let ungranted = capability_roots_to_trusted_root(
+            dir,
+            &node,
+            &human,
+            crate::federation::types::delegation_scope::INFRA_DETECT,
+        )
+        .await
+        .expect("resolve");
+        assert!(
+            ungranted.is_none(),
+            "a scope neither chartered nor conferred must NOT resolve — otherwise leg 1 proves \
+             tolerance of anything, not tolerance of extra CHARTER scopes"
+        );
+    }
+
+    /// v30.8.0 (CIRISConstitution#87) — **conferral is not stewardship, and the
+    /// gate and the fold say so together.**
+    ///
+    /// CC 3.2 rc3 ruled on the discriminator: an act the target must accept for
+    /// itself cannot be custody of the target. Stewardship is custody over a key
+    /// that cannot accept for itself; a capability conferral is a consensual
+    /// grant.
+    ///
+    /// Four legs, and the two REFUSAL legs are what keep this from being a hole:
+    ///
+    ///  1. a capability conferral on an age-UNVERIFIED adult human is ADMITTED —
+    ///     the case that was refused `target_age_unverified` and blocked
+    ///     delegating moderation duties to people;
+    ///  2. an OWNER-BINDING on that same human is still REFUSED — CC 3.2 /
+    ///     CC 1.15.6 survive untouched; steward-binding an adult stays forbidden;
+    ///  3. the fold does NOT count the conferral as stewardship;
+    ///  4. the fold DOES still count an owner-binding.
+    ///
+    /// Legs 3 and 4 are the paired half. Without them the gate could narrow while
+    /// the fold kept counting conferrals, and a grant would silently establish a
+    /// stewardship relation the gate had just refused — CIRISPersist#541's
+    /// two-lists-that-disagree, on a constitutional rule.
+    pub(crate) async fn exercise_conferral_is_not_stewardship(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::owner_binding;
+        let root = format!("cns-root-{suffix}");
+        let human = format!("cns-human-{suffix}");
+        let owner = format!("cns-owner-{suffix}");
+        // A `user` with NO age attestation — the exact band (`Unknown`) that was
+        // refused, and the ordinary state of a human moderator.
+        register(dir, &human, &[identity_type::USER]).await;
+        register(dir, &owner, &[identity_type::USER]).await;
+        // The conferral granter is USER-role ON PURPOSE. `live_delegation_granters`
+        // only ever returns user-role granters, so a non-user granter makes leg 3
+        // vacuous — it would pass whatever filter the fold used. Mutation testing
+        // caught exactly that: reverting the fold to `AnyDelegation` left all four
+        // legs green until this key became a `user`.
+        register(dir, &root, &[identity_type::USER]).await;
+
+        // ── (1) the CONFERRAL is admitted ────────────────────────────────
+        let conferral = moderation_edge(&root, &human, &[DELEGATION_SCOPE_SLASH], &[&human], true);
+        store(dir, &conferral).await.unwrap_or_else(|e| {
+            panic!(
+                "a capability conferral on an age-unverified human must be ADMITTED — this is \
+                 CIRISConstitution#87: giving a person a job is not owning them. Got: {e}"
+            )
+        });
+
+        // ── (2) the OWNER-BINDING is still refused ───────────────────────
+        let binding = signed_row(
+            &owner,
+            &human,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "scope": [DELEGATION_SCOPE_SLASH],
+                "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            }),
+        );
+        let err = store(dir, &binding).await.expect_err(
+            "steward-binding an age-unverified adult must STILL be refused — CC 3.2 / CC 1.15.6 \
+             are untouched by CIRISConstitution#87, and if this ever admits the ruling has been \
+             read as a licence rather than a distinction",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_user_target_steward_binding_forbidden",
+            "must be refused by the CC 3.2 gate specifically, not incidentally elsewhere: {err}"
+        );
+
+        // ── (3) the FOLD does not count the conferral ────────────────────
+        let bound = steward_bindings_of(dir, &human).await.expect("fold");
+        assert!(
+            !bound.contains(&root),
+            "the conferral granter must NOT appear as a steward of the human — the fold half of \
+             the paired narrowing. If it does, a conferral silently establishes the custody the \
+             gate just refused"
+        );
+
+        // ── (4) the FOLD still counts a real owner-binding ───────────────
+        let target = format!("cns-node-{suffix}");
+        register(dir, &target, &[identity_type::NODE]).await;
+        let real = signed_row(
+            &owner,
+            &target,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "scope": [crate::federation::types::delegation_scope::INFRA_SERVE],
+                "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            }),
+        );
+        store(dir, &real)
+            .await
+            .expect("owner-binding a node admits");
+        let bound = steward_bindings_of(dir, &target).await.expect("fold");
+        assert!(
+            bound.contains(&owner),
+            "a real owner-binding MUST still register as stewardship — otherwise the narrowing \
+             emptied the fold instead of focusing it, and leg 3 proves nothing"
         );
     }
 }

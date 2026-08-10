@@ -4318,6 +4318,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // anti-rollback monotonicity. Both run BEFORE persist_row_hash
         // is computed and BEFORE INSERT, so a rejected row leaves no
         // trace (same discipline as v3.9.1 cohort_scope admission).
+        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
+        // moderation act. Self-revocation passes untouched.
+        crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
         check_revocation_anti_rollback_sqlite(&self.conn, &row.revoked_key_id, row.scrub_timestamp)
             .await?;
@@ -20387,6 +20390,59 @@ mod tests {
             .await;
     }
 
+    /// v30.8.0 (CIRISPersist#596 item 1) — give `revoker` the `slash` authority
+    /// that revoking SOMEONE ELSE'S key now requires. These fixtures test
+    /// revocation MECHANICS, not who may revoke, so they get the authority they
+    /// would hold in production rather than being narrowed to self-revocations.
+    async fn grant_slash(backend: &SqliteBackend, revoker: &str) {
+        {
+            backend.set_node_key_id("rev-authority-node");
+            crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+                backend,
+                "rev-authority-node",
+                "rev-authority-root",
+                revoker,
+                crate::federation::admission::DELEGATION_SCOPE_SLASH,
+            )
+            .await;
+        }
+    }
+
+    /// v30.8.0 (CIRISConstitution#87) — the SQLITE leg.
+    #[tokio::test]
+    async fn conferral_is_not_stewardship_sqlite_87() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_conferral_is_not_stewardship(
+            &backend, "sqlite-87",
+        )
+        .await;
+    }
+
+    /// v30.8.0 — the SQLITE leg of the PRE-BAKE charter rehearsal.
+    #[tokio::test]
+    async fn moderation_charter_rehearsal_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_charter_rehearsal(
+            &backend, "sqlite-reh",
+        )
+        .await;
+    }
+
+    /// v30.8.0 (CIRISPersist#628) — the SQLITE leg of the re-delegation-budget
+    /// witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn sub_delegation_budget_parity_sqlite_628() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_sub_delegation_budget(
+            &backend,
+            "sqlite-628",
+        )
+        .await;
+    }
+
     /// v30.6.0 (CIRISPersist#622) — the SQLITE leg of the three-backend genesis
     /// witness (see the memory + postgres legs).
     #[tokio::test]
@@ -20487,6 +20543,7 @@ mod tests {
     async fn revocation_bound_parity_sqlite_570() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        backend.set_node_key_id("rb-node-sqlite");
         crate::federation::register::bound_test_support::exercise_revocation_bound(
             &backend,
             "sqlite-rb",
@@ -22212,6 +22269,7 @@ mod tests {
             })
             .await
             .unwrap();
+        grant_slash(&backend, "steward-1").await;
         backend
             .put_revocation(SignedRevocation {
                 revocation: fed_revocation(
@@ -22810,6 +22868,7 @@ mod tests {
             })
             .await
             .unwrap();
+        grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation {
                 revocation: fed_revocation(
@@ -22855,6 +22914,7 @@ mod tests {
             .unwrap();
         let mut rev = fed_revocation("rev-eu1", "k-bad", "registry-steward", "registry-steward");
         rev.observed_region = "us-east-1".into();
+        grant_slash(&backend, "registry-steward").await;
         let err = backend
             .put_revocation(SignedRevocation { revocation: rev })
             .await
@@ -22896,6 +22956,7 @@ mod tests {
         let t0: chrono::DateTime<chrono::Utc> = "2026-06-03T12:00:00Z".parse().unwrap();
         let mut rev0 = fed_revocation("rev-0", "k-bad", "registry-steward", "registry-steward");
         rev0.scrub_timestamp = t0;
+        grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation { revocation: rev0 })
             .await
@@ -22978,6 +23039,7 @@ mod tests {
             .unwrap();
         let mut rev = fed_revocation("rev-eu", "k-bad", "registry-steward", "registry-steward");
         rev.observed_region = crate::federation::verify_coord::region::EU.into();
+        grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation { revocation: rev })
             .await
@@ -32203,7 +32265,11 @@ mod tests {
             .unwrap();
         backend
             .put_revocation(SignedRevocation {
-                revocation: fed_revocation("rev-1", "k-b", "k-a", "k-a"),
+                revocation: // v30.8.0 (CIRISPersist#596 item 1) — SELF-revocation. Revoking a THIRD
+                // party now needs a `slash` conferral, whose trust-root rows would
+                // pollute the counts this pagination test measures. Which key is
+                // revoked is incidental here; that a revocation surfaces is not.
+                fed_revocation("rev-1", "k-a", "k-a", "k-a"),
             })
             .await
             .unwrap();
@@ -32239,7 +32305,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.items.len(), 1);
-        assert_eq!(revoked.items[0].key_id, "k-b");
+        assert_eq!(revoked.items[0].key_id, "k-a");
 
         let atts = backend
             .list_attestations(
@@ -35262,14 +35328,30 @@ mod tests {
         assert_eq!(age_band(&backend, "sl-A").await.unwrap(), AgeBand::Adult);
         assert_eq!(age_band(&backend, "sl-M").await.unwrap(), AgeBand::Minor);
 
-        // user-target gate: S(adult) → A(adult user) REJECTED (self-sovereign).
-        let e = backend
+        // v30.8.0 (CIRISConstitution#87) — S(adult) → A(adult user), UNMARKED, is
+        // a capability CONFERRAL and is ADMITTED. It used to be refused
+        // `target_is_self_sovereign`, because any `delegates_to` to a user was
+        // read as a claim of custody.
+        //
+        // The safety property the old assertion protected is not lost — it is
+        // stated more precisely below: the conferral establishes NO custody.
+        // "Refused" and "admitted but confers nothing" both prevent an adult from
+        // being stewarded by accident; only the second also lets a quorum give a
+        // person a job.
+        backend
             .put_attestation(SignedAttestation {
                 attestation: node_delegates_to_sqlite("sl-S", "sl-A", &[ds::INFRA_SERVE]),
             })
             .await
-            .unwrap_err();
-        assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
+            .expect("an unmarked delegation to an adult is a conferral, not a custody claim");
+        assert!(
+            !crate::federation::admission::steward_bindings_of(&backend, "sl-A")
+                .await
+                .unwrap()
+                .contains(&"sl-S".to_string()),
+            "the conferral must establish NO stewardship over the adult — this is what replaces \
+             the old refusal, and it is the stronger claim"
+        );
 
         // A steward-less minor does NOT self-anchor (fail-secure).
         assert!(!is_steward_bound(&backend, "sl-M").await.unwrap());
@@ -35397,6 +35479,10 @@ mod tests {
                 "id": id,
                 "scope": ["financial"],
                 "binding_legitimacy_source": "prior_will_proxy",
+            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+                // v30.8.0 (CIRISConstitution#87) — declare custody; see the
+                // memory-backend `fix_incapacity_binding` note.
+                "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
                 "valid_until": valid_until,
             });
             resign_fed(&mut a);
@@ -35455,6 +35541,7 @@ mod tests {
             "id": "si-lapsed",
             "scope": ["financial"],
             "binding_legitimacy_source": "prior_will_proxy",
+            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
             "valid_until": lapsed,
         });
         resign_fed(&mut b);

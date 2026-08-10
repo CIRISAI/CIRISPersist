@@ -231,6 +231,37 @@ fn job_dimension_admits(envelope: &serde_json::Value, expected: &str) -> bool {
 /// Extra charter scopes (`infra:store`, `infra:transport` — the accord's
 /// full charter) are tolerated; `infra:network_presence` and
 /// `infra:hold_*_membership` are owner-granted, never charter scopes.
+///
+/// # THE CHARTER SCOPE DOES NOT BOUND WHAT A ROOT MAY CONFER
+///
+/// v30.8.0 — read this before reasoning about a root's authority from its
+/// charter, because "tolerated" is doing more work than it looks.
+///
+/// Beyond the `[infra:serve, infra:attest]` AND-minimum, the charter's `scope`
+/// array constrains **nothing**. [`capability_roots_to_trusted_root`] is
+/// single-hop: it finds a `trust:confers:v1` edge about the subject and asks
+/// only whether this node trusts the granter as a ROOT — and [`trust_root_valid`]
+/// checks the AND-minimum and never compares the charter's scope against the
+/// scope being conferred. A root chartered with exactly the two minimum scopes
+/// can confer `slash`, `infra:detect`, anything.
+///
+/// So the charter answers *"is this a root at all"*. It never answers *"what
+/// may it confer"*. The node's lever is whether to accept the root
+/// (`trust:accepts:v1`), not a per-scope allowlist.
+///
+/// **`⊆`-parent attenuation is a different plane.** That lives in
+/// `scoped_delegation_reach` under `enforce_attenuation_and_sub_delegation` and
+/// governs the MODERATION walk. Carrying it across to the capability plane is
+/// the mistake this note exists to prevent: it led to advice that an existing
+/// accord needed a NEW GENESIS CEREMONY to widen its charter before it could
+/// delegate `slash`. It does not — it can confer with the charter it already
+/// has. Pinned by `exercise_moderation_charter_rehearsal`, which charters with
+/// the bare minimum ON PURPOSE and then confers a scope the charter never
+/// mentions.
+///
+/// If a per-scope bound on roots is ever wanted, it has to be BUILT; today's
+/// charter scope field will not provide it, and reading it as though it does is
+/// the one-field-two-meanings class this substrate keeps paying for.
 pub const INFRA_ATTEST_SCOPE: &str = "infra:attest";
 /// See [`INFRA_ATTEST_SCOPE`].
 pub const INFRA_SERVE_SCOPE: &str = "infra:serve";
