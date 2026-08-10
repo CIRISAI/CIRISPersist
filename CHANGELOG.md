@@ -5,6 +5,99 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.8.0] — 2026-08-09 — conferral is not stewardship, and a grant can say how far it travels
+
+- **CIRISConstitution#87 — conferring a capability on a person is not becoming their steward.**
+  `check_user_target_steward_binding_admission` fired on **every** `delegates_to` targeting a
+  `user`, so a quorum could not confer a moderation duty on a named human: refused
+  `target_age_unverified` unless that human was a proven minor. The only way through was to register
+  moderators as `agent` / `primitive` / `accord_holder` — dressing a person as infrastructure to get
+  past a rule about persons.
+
+  Persist did not decide this. CC 3.2 is what the old behaviour implemented, so the question went to
+  the Constitution and came back ruled in-text, with a discriminator already ratified elsewhere:
+  T3's own-acceptance rule says no conferral substitutes for the target's own acceptance — so **an
+  act the target must accept for itself cannot be custody of the target.** Stewardship is custody
+  over a key that cannot accept for itself; a capability conferral is a consensual grant.
+
+- **The narrowing is PAIRED, and that is the whole engineering content.** The gate and
+  `steward_bindings_of` clause (3) both keyed on "any `delegates_to`" — clause (3) via
+  `DelegationEdgeFilter::AnyDelegation`, whose own doc reads *"Every `delegates_to`"*. Narrowing one
+  alone would let a conferral silently establish the stewardship relation the other had just
+  refused: a state the substrate can create but not describe (#541's two-lists class, on a
+  constitutional rule). Both now key on `delegation_purpose: "owner_binding"` — existing CC 2.4.1.2
+  wire vocabulary, no new primitive.
+
+  Witnessed four ways, and the two REFUSAL legs are what keep it from being a hole: a conferral on
+  an age-unverified adult is **admitted**; an owner-binding on that same human is **still refused**;
+  the fold does **not** count the conferral; the fold **does** still count a real owner-binding.
+  Three mutations, three killed — reverting the gate alone, or the fold alone, turns it red.
+
+  **One predicate, `can_accept_for_itself`, written once and read by both halves.** The substrate
+  encodes "cannot accept for itself" in three separate places, and implementing this rule took four
+  successive corrections before that was clear — each fix surfaced the next encoding. A node has no
+  agency; a minor cannot accept for itself; everything else can, and for those custody exists only
+  where the envelope declares it. An unverified age counts as able (CC 3.2's own presumption of
+  sovereignty), as does an unresolved key — inventing custody over a key this node has never seen is
+  the worse error.
+
+  **Custody must now be DECLARED, and the failure mode is safe.** An undeclared `delegates_to` to a
+  person is a conferral, so a host that omits the marker gets a grant establishing nothing rather
+  than silent stewardship. The production guardianship builder
+  (`Engine::steward_bind_incapacity`) declares it; so do incapacity fixtures, which are custody
+  claims by construction.
+
+  **Three end-to-end tests changed meaning, not coverage.** They asserted that an unmarked
+  delegation to an adult or age-unverified user was REFUSED. Each now asserts it is admitted **and
+  establishes no stewardship** — the stronger claim, since the old refusal only proved one call
+  failed while this proves no custody exists however it was reached. `steward_bind_incapacity`'s
+  aperture leg keeps its original property exactly: a plain bind still cannot reach CC 3.4.12,
+  because it stamps none of the binding fields.
+
+  **What this deliberately gives up**, per the ruling: the conflation was silently doing a second
+  job — for conferrals it was an accidental AGE gate. That duty is now explicit. A duty scope
+  needing an age or assurance floor declares it on its own CC 4.5.5 row via the CC 3.4.11 ladders,
+  never inherits it from a custody rule. Today **no duty scope declares one**, which is now a
+  visible choice rather than an accident.
+
+- **CIRISPersist#628 — a grant can say how far it may travel.** New `sub_delegation_depth` on a
+  `delegates_to` envelope bounds the recipient's chain. #628 asked for a separate
+  `redelegation_depth` with `absent ⇒ 0`; that would have been a second answer to the question
+  `sub_delegation` already answers, so this **extends** the existing boolean instead:
+
+  | envelope | meaning |
+  |---|---|
+  | `sub_delegation` absent / `false` | leaf (**unchanged**, still the default) |
+  | `sub_delegation: true`, no depth | bounded only by the global rail (**unchanged** — every issued grant keeps its meaning) |
+  | `sub_delegation: true, sub_delegation_depth: N` | the chain below may run `N` further hops |
+
+  The budget **attenuates**: a holder given 2 hops cannot declare 9. Without that the field would be
+  advisory. Four legs on three backends, three mutations killed.
+
+- **CIRISPersist#596 item 1 — revoking someone else's key now needs moderation authority.**
+  `put_revocation`'s only gate was `check_federation`, a **trust-score threshold** that asks whether
+  the revoker may write at all and never whether it has standing over the key it is revoking. Any
+  sufficiently-trusted key could revoke any other. Self-revocation is untouched — a holder must be
+  able to retire its own key, and gating that would mean a leaked key can only be retired by someone
+  else. Third-party revocation now requires `slash` conferred by a root this node trusts, the same
+  attester-vs-attested split the `hard_case:` door uses.
+
+  **BREAKING for hosts** that revoke third-party keys without a conferral. Twelve fixtures were
+  updated by granting them the authority they would hold in production, not by narrowing them to
+  self-revocations.
+
+- **The charter's scope field does not bound what a root may confer**, and that is now written where
+  a reader will hit it (`trust_root.rs`). Beyond the `[infra:serve, infra:attest]` AND-minimum it
+  constrains nothing: `capability_roots_to_trusted_root` is single-hop and `trust_root_valid` never
+  compares the charter's scope against the scope being conferred.
+
+  This correction came out of advising the operator that a **new genesis ceremony** was needed to
+  widen the accord's charter before it could delegate `slash`. It was not — an existing accord can
+  confer with the charter it already has. `⊆`-parent attenuation belongs to the moderation walk;
+  carrying it across to the capability plane was the mistake. Pinned by
+  `exercise_moderation_charter_rehearsal`, which charters with the bare minimum **on purpose** and
+  then confers a scope the charter never mentions.
+
 ## [30.7.0] — 2026-08-09 — the wire vocabularies enumerate, so a picker can exist
 
 - **#625 — eight vocabularies, two of which could be enumerated.** CIRISServer's operator pickers

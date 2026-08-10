@@ -4180,6 +4180,20 @@ impl Engine {
         let mut envelope = crate::federation::delegates_to_envelope(ward_key_id, &domains, false);
         // …plus the CC 3.4.12 binding fields the gate reads.
         if let Some(obj) = envelope.as_object_mut() {
+            // v30.8.0 (CIRISConstitution#87) — DECLARE CUSTODY. Since the ruling,
+            // an undeclared `delegates_to` to a person is a capability conferral,
+            // so a guardianship that does not say it is one would be admitted as
+            // a conferral and establish no custody at all. This is the PRODUCTION
+            // builder, so the declaration belongs here rather than in fixtures.
+            //
+            // Fail-safe if ever dropped: the binding confers nothing rather than
+            // silently stewarding an adult.
+            obj.insert(
+                "delegation_purpose".to_owned(),
+                serde_json::Value::String(
+                    crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE.to_owned(),
+                ),
+            );
             obj.insert(
                 binding_field::LEGITIMACY_SOURCE.to_owned(),
                 serde_json::Value::String(legitimacy_source.to_owned()),
@@ -13639,15 +13653,30 @@ mod tests {
                 .expect("witness attestation admitted");
         }
 
-        // (1) The #433 probe shape: plain steward_bind on the ward is STILL
-        // rejected — it cannot stamp the CC 3.4.12 binding fields.
-        let err = engine
+        // (1) The #433 probe shape. v30.8.0 (CIRISConstitution#87) — a plain
+        // `steward_bind` with `delegation_purpose: None` is an UNMARKED edge, so
+        // it is now a capability CONFERRAL and is admitted.
+        //
+        // The property this leg protects is UNCHANGED and still the point: a
+        // plain bind CANNOT reach the CC 3.4.12 aperture, because it stamps none
+        // of the binding fields. Before the ruling that showed up as a refusal;
+        // now it shows up as a grant that confers no custody. Both keep an adult
+        // from being stewarded by the back door — and this version also proves
+        // the ward is not left half-bound, which the refusal never checked.
+        engine
             .steward_bind(&s_signer, "ward-A", vec!["financial".into()], None)
             .await
-            .expect_err("(1) plain steward_bind cannot reach the aperture");
-        assert_eq!(
-            err.kind(),
-            "federation_user_target_steward_binding_forbidden"
+            .expect("(1) an unmarked steward_bind is a conferral");
+        assert!(
+            !crate::federation::admission::steward_bindings_of(
+                engine.sqlite_backend().expect("sqlite").as_ref(),
+                "ward-A",
+            )
+            .await
+            .unwrap()
+            .contains(&"inc-S".to_string()),
+            "(1) a plain steward_bind must NOT reach the aperture — it stamps no CC 3.4.12 \
+             binding fields, so it establishes no custody over the ward"
         );
 
         // (2) The aperture: a conforming CC 3.4.12 binding ADMITS end-to-end.
@@ -14117,9 +14146,16 @@ mod tests {
             "no anchors remain after the withdraw",
         );
 
-        // An age-UNVERIFIED user target is still rejected (presumption of
-        // sovereignty — nothing in this cut widened the wall).
-        let e = engine
+        // v30.8.0 (CIRISConstitution#87) — an age-UNVERIFIED user target now
+        // receives a CONFERRAL, not a refusal.
+        //
+        // `grant_delegation` builds an UNMARKED `delegates_to`. Since the ruling
+        // that is a capability grant — giving a person a job — and CC 3.2's
+        // presumption of sovereignty is not a reason to refuse someone a job. It
+        // is a reason they cannot be OWNED, which is asserted directly below and
+        // is the stronger statement: the old refusal only proved this particular
+        // call failed; this proves no custody exists however it was reached.
+        engine
             .grant_delegation(
                 &s_signer,
                 "mg-unverified",
@@ -14128,13 +14164,18 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("an unverified user target stays rejected");
-        match e {
-            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
-                assert_eq!(reason, "target_age_unverified");
-            }
-            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
-        }
+            .expect("an unmarked delegation to an unverified user is a conferral");
+        assert!(
+            !crate::federation::admission::steward_bindings_of(
+                engine.sqlite_backend().expect("sqlite").as_ref(),
+                "mg-unverified",
+            )
+            .await
+            .unwrap()
+            .contains(&"mg-S".to_string()),
+            "the presumption of sovereignty is preserved where it matters: the conferral \
+             establishes NO stewardship over the unverified user"
+        );
     }
 
     /// #367 PG twin of

@@ -1423,6 +1423,24 @@ pub(crate) mod bound_test_support {
         let victim = format!("rb-victim-{suffix}");
         register_key(dir, &admin).await;
         register_key(dir, &victim).await;
+        // v30.8.0 (CIRISPersist#596 item 1) — `admin` revokes `victim`, a THIRD
+        // PARTY, which now needs `slash` conferred by a root this node trusts.
+        // This body tests revocation BOUNDS, not who may revoke, so it gets the
+        // authority it would hold in production rather than being narrowed to a
+        // self-revocation.
+        // The node identity is set by each backend leg before calling (it is a
+        // concrete method, not a trait one); read it back here.
+        let node = dir
+            .node_key_id()
+            .expect("each leg must call set_node_key_id before exercise_revocation_bound");
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            dir,
+            &node,
+            &format!("rb-root-{suffix}"),
+            &admin,
+            crate::federation::admission::DELEGATION_SCOPE_SLASH,
+        )
+        .await;
 
         // Anti-rollback keys on scrub_timestamp per revoked key, so the two
         // revocations this witness stores must advance. Everything is anchored

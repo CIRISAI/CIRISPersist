@@ -173,8 +173,29 @@ echo "=== expensive legs (${LANES} lanes; feature sets DERIVED from ci_feature_m
 T_START=$(date +%s)
 FIFO="$LOG_DIR/sem"; mkfifo "$FIFO"; exec 9<>"$FIFO"; rm -f "$FIFO"
 for _ in $(seq "$LANES"); do printf '.' >&9; done
+# ── FAIL FAST ────────────────────────────────────────────────────────────
+# Once any leg is red the run cannot certify, so dispatching more legs buys
+# nothing but wall clock — a red at leg 2 of 15 used to cost ten more minutes of
+# compute for a verdict already decided.
+#
+# In-flight lanes are NOT killed: they are already paid for, and letting them
+# finish is what tells you whether a failure is systematic (several legs, same
+# cause) or local to one feature set. Two legs failing identically is a
+# different diagnosis from one, and that distinction was worth having the time
+# this rule was written for.
+any_red() {
+    for f in "$LOG_DIR"/*.rc; do
+        [ -f "$f" ] || continue
+        [ "$(cat "$f")" != "0" ] && return 0
+    done
+    return 1
+}
 pids=()
 while read -r job; do
+    if any_red; then
+        echo "  !! STOPPING DISPATCH — a leg is already red; in-flight lanes will finish."
+        break
+    fi
     read -r -n 1 -u 9
     # `< /dev/null` is LOAD-BEARING. Without it the backgrounded job inherits
     # stdin — which is the job queue — and cargo/nextest read from it, silently
@@ -203,7 +224,11 @@ for k in $ALL_KEYS; do
     rc="$(cat "$LOG_DIR/$k.rc" 2>/dev/null || echo 99)"
     secs="$(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo -)"
     cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 99 ]; then
+        # 99 is this script's sentinel for a missing .rc — the leg never ran.
+        # Calling that RED would claim a failure nobody observed.
+        printf '  UNKNOWN %-21s (not run)\n' "$k"; fail=1
+    elif [ "$rc" -ne 0 ]; then
         printf '  RED    %-22s exit=%-3s %4ss  %s\n' "$k" "$rc" "$secs" "$cnt"; fail=1
     else
         printf '  green  %-22s exit=%-3s %4ss  %s\n' "$k" "$rc" "$secs" "$cnt"
