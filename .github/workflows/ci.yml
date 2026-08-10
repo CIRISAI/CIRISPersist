@@ -94,13 +94,40 @@ jobs:
         # row above and not held out in `NOT_TESTED`), so a feature added to
         # Cargo.toml is tested without anyone remembering to come here.
         substrate:
-          - { name: core,       leg: core,       gauntlet: true }
+          # v30.9.0 — the three slowest legs are PARTITIONED across two runners
+          # each. Measured on run 31397353461: secrets 28m, core 25m, rest 22m
+          # were the critical path. `nextest --partition count:N/M` shards by
+          # test, so each half runs ~half the tests with no fixture changes.
+          #
+          # This is the CI analogue of the offline certify script's lanes, which
+          # took a serial 4302s to 1620s. CI already parallelises across FEATURE
+          # legs; what it did not do is parallelise WITHIN one. `part` is the
+          # shard index and `parts` the count — absent means "run everything",
+          # so the untouched legs keep their exact current invocation.
+          # BOTH core shards carry `gauntlet: true`, and that is load-bearing.
+          #
+          # `--partition` shards BY TEST, so the 10 `substrate_machine` bodies
+          # split 5/5 across the two shards. Pinning the gauntlet to shard 1 and
+          # excluding it on shard 2 — the obvious-looking arrangement — would
+          # leave **shard 2's five gauntlet tests running NOWHERE**, while both
+          # runners reported green. Measured before this comment was written:
+          # total=10, shard1=5, shard2=5.
+          #
+          # With `gauntlet: true` on both, the exclusion filter is off on both and
+          # the partition itself does the splitting: 5 bodies per runner, all ten
+          # executed, none twice. The gauntlet is a set of independent proptest
+          # bodies, so splitting them loses no depth — each still runs its own
+          # full case count.
+          - { name: core-1,     leg: core,       gauntlet: true,  part: 1, parts: 2 }
+          - { name: core-2,     leg: core,       gauntlet: true,  part: 2, parts: 2 }
+          - { name: secrets-1,  leg: secrets,    gauntlet: false, part: 1, parts: 2 }
+          - { name: secrets-2,  leg: secrets,    gauntlet: false, part: 2, parts: 2 }
+          - { name: rest-1,     leg: rest,       gauntlet: false, part: 1, parts: 2 }
+          - { name: rest-2,     leg: rest,       gauntlet: false, part: 2, parts: 2 }
           - { name: cirisaudit, leg: cirisaudit, gauntlet: false }
-          - { name: secrets,    leg: secrets,    gauntlet: false }
           - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
           - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
           - { name: telemetry,  leg: telemetry,  gauntlet: false }
-          - { name: rest,       leg: rest,       gauntlet: false }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -228,9 +255,10 @@ jobs:
           echo "leg '${{ matrix.substrate.leg }}' → --features \"${FEATURES}\""
           cargo nextest run --all-targets --no-fail-fast \
             --features "${FEATURES}" \
+            ${{ matrix.substrate.parts && format('--partition count:{0}/{1}', matrix.substrate.part, matrix.substrate.parts) || ' ' }} \
             ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
       - name: cargo nextest (default — fixture suite)
-        if: matrix.substrate.name == 'core'
+        if: matrix.substrate.name == 'core-1'
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
       # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI
@@ -271,11 +299,11 @@ jobs:
       # feature axis doesn't change what this test exercises (the
       # FFI panic-catch layer), so a single execution suffices.
       - uses: actions/setup-python@v6
-        if: matrix.substrate.name == 'core'
+        if: matrix.substrate.name == 'core-1'
         with:
           python-version: "3.11"
       - name: install maturin + pytest
-        if: matrix.substrate.name == 'core'
+        if: matrix.substrate.name == 'core-1'
         # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
         # against PyPI transient blips. 3 attempts with backoff.
         run: |
@@ -286,7 +314,7 @@ jobs:
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
       - name: maturin develop (test-panic + sqlite)
-        if: matrix.substrate.name == 'core'
+        if: matrix.substrate.name == 'core-1'
         run: |
           python -m venv .venv
           source .venv/bin/activate
@@ -311,7 +339,7 @@ jobs:
           # `--release` codegen for it rather than a cold build.
           maturin develop --features test-panic,pyo3,sqlite --release
       - name: pytest tests/python/
-        if: matrix.substrate.name == 'core'
+        if: matrix.substrate.name == 'core-1'
         run: |
           source .venv/bin/activate
           pytest tests/python/ -v
@@ -328,7 +356,7 @@ jobs:
       # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
       # run); now push-once + ~1s retag.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'   # always warm: save on main AND release tags — a released version's blob MUST exist or edge/server/next-build cold-compile persist from source (far more than the ~9min save)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'   # always warm: save on main AND release tags — a released version's blob MUST exist or edge/server/next-build cold-compile persist from source (far more than the ~9min save)
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -1173,20 +1201,41 @@ jobs:
   # since 2025-01.
   pyo3-wheel:
     name: maturin abi3-py311 wheel (${{ matrix.label }})
+    # v30.9.0 — the CROSS-PLATFORM wheels build on TAGS ONLY.
+    #
+    # Measured on the last successful PR run (31397353461), which took 38m wall:
+    # `windows-x86_64` alone was **27m** — co-critical with the slowest test leg,
+    # so cutting one without the other bought nothing. linux-aarch64 (11m) and
+    # darwin-aarch64 (14m) are the same shape.
+    #
+    # Nothing consumes them on a PR. Since v30.4.0 nothing consumes them at ALL
+    # outside a release: PyPI publishing was removed (CIRISPersist#615), so their
+    # only reader is `build-manifest`'s signed CanonicalBuild registration, which
+    # matters at a tag.
+    #
+    # `linux-x86_64` still builds on EVERY event, deliberately: it is the shape
+    # the pyo3 surface is actually compiled in, and losing per-PR signal that the
+    # wheel builds at all would trade wall time for a class of break that only
+    # surfaces at release. One platform is enough to catch that; four is paying
+    # 52 minutes to catch it three more times.
+    #
+    # `build-manifest` tolerates the absence: a missing wheel dir emits
+    # `::warning::No wheel found … skipping`, not a failure.
+    if: ${{ !matrix.tag_only || startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
-          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
-          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64, tag_only: true }
+          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64,   tag_only: true }
           # windows-x86_64 wheel — standard `x86_64-pc-windows-msvc` target
           # on stable (Win10+ baseline; Win7 support dropped, which
           # removed the Tier-3 win7 target + `-Zbuild-std` machinery). Runs
           # unchanged on Win10/11. openssl-sys is satisfied by vcpkg static
           # x64-windows-static (the `pyo3`→`postgres`→`dep:openssl` chain),
           # mirroring the proven CIRISEdge#90 setup.
-          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
+          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64,          tag_only: true }
           # darwin-x86_64 (macos-13) intentionally omitted — GitHub
           # Actions Intel macOS runners have ongoing capacity issues
           # (jobs queue indefinitely). CIRISAgent's matrix dropped it
