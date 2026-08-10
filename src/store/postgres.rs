@@ -14463,13 +14463,27 @@ fn pg_scores_shared_predicates(
         params.push(Box::new(t.clone()));
         where_parts.push(format!("fa.attestation_type = ${}", params.len()));
     }
-    if let Some(k) = &filter.attesting_key_id {
-        params.push(Box::new(k.clone()));
-        where_parts.push(format!("fa.attesting_key_id = ${}", params.len()));
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("fa.attesting_key_id = ANY(${})", params.len()));
+        }
     }
-    if let Some(k) = &filter.attested_key_id {
-        params.push(Box::new(k.clone()));
-        where_parts.push(format!("fa.attested_key_id = ${}", params.len()));
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("fa.attested_key_id = ANY(${})", params.len()));
+        }
     }
     if let Some(pqc) = filter.pqc_completed {
         where_parts.push(if pqc {
@@ -17273,13 +17287,27 @@ impl crate::read::ReadEngine for PostgresBackend {
 
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        if let Some(k) = &filter.attesting_key_id {
-            params.push(Box::new(k.clone()));
-            where_parts.push(format!("attesting_key_id = ${}", params.len()));
+        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+        {
+            let keys = crate::ceg::list::federation::merge_key_predicate(
+                filter.attesting_key_id.as_ref(),
+                &filter.attesting_key_ids,
+            );
+            if !keys.is_empty() {
+                params.push(Box::new(keys));
+                where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
+            }
         }
-        if let Some(k) = &filter.attested_key_id {
-            params.push(Box::new(k.clone()));
-            where_parts.push(format!("attested_key_id = ${}", params.len()));
+        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+        {
+            let keys = crate::ceg::list::federation::merge_key_predicate(
+                filter.attested_key_id.as_ref(),
+                &filter.attested_key_ids,
+            );
+            if !keys.is_empty() {
+                params.push(Box::new(keys));
+                where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
+            }
         }
         if let Some(t) = &filter.attestation_type {
             params.push(Box::new(t.clone()));

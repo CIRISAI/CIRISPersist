@@ -14049,13 +14049,35 @@ fn sqlite_scores_shared_predicates(
         binds.push(SqlValue::Text(t.clone()));
         parts.push(format!("fa.attestation_type = ?{}", binds.len()));
     }
-    if let Some(k) = &filter.attesting_key_id {
-        binds.push(SqlValue::Text(k.clone()));
-        parts.push(format!("fa.attesting_key_id = ?{}", binds.len()));
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("fa.attesting_key_id IN ({})", ph.join(", ")));
+        }
     }
-    if let Some(k) = &filter.attested_key_id {
-        binds.push(SqlValue::Text(k.clone()));
-        parts.push(format!("fa.attested_key_id = ?{}", binds.len()));
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("fa.attested_key_id IN ({})", ph.join(", ")));
+        }
     }
     if let Some(pqc) = filter.pqc_completed {
         parts.push(if pqc {
@@ -16905,13 +16927,35 @@ impl crate::read::ReadEngine for SqliteBackend {
         }
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<SqlValue> = Vec::new();
-        if let Some(k) = &filter.attesting_key_id {
-            binds.push(SqlValue::Text(k.clone()));
-            parts.push(format!("attesting_key_id = ?{}", binds.len()));
+        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+        {
+            let keys = crate::ceg::list::federation::merge_key_predicate(
+                filter.attesting_key_id.as_ref(),
+                &filter.attesting_key_ids,
+            );
+            if !keys.is_empty() {
+                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    binds.push(SqlValue::Text(k));
+                    ph.push(format!("?{}", binds.len()));
+                }
+                parts.push(format!("attesting_key_id IN ({})", ph.join(", ")));
+            }
         }
-        if let Some(k) = &filter.attested_key_id {
-            binds.push(SqlValue::Text(k.clone()));
-            parts.push(format!("attested_key_id = ?{}", binds.len()));
+        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+        {
+            let keys = crate::ceg::list::federation::merge_key_predicate(
+                filter.attested_key_id.as_ref(),
+                &filter.attested_key_ids,
+            );
+            if !keys.is_empty() {
+                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    binds.push(SqlValue::Text(k));
+                    ph.push(format!("?{}", binds.len()));
+                }
+                parts.push(format!("attested_key_id IN ({})", ph.join(", ")));
+            }
         }
         if let Some(t) = &filter.attestation_type {
             binds.push(SqlValue::Text(t.clone()));
@@ -28807,6 +28851,92 @@ mod tests {
             .into_iter()
             .map(|a| a.attestation_id)
             .collect()
+    }
+
+    /// v30.9.0 (CIRISPersist#627) — **a moderation act can address a SET of keys.**
+    ///
+    /// The incident that filed this: 61 exposed dev/QA key ids to de-admit, which
+    /// under singular predicates is 61 preview→commit pairs, each with its own
+    /// hash, reason and authority walk. At mesh scale that is not slow, it is
+    /// unusable — no predicate over a population is expressible at all.
+    ///
+    /// The ladder's guarantee is preview-hash commit, a property of the HASH and
+    /// not of cardinality: a preview over 61 keys yields one hash over that row
+    /// set and is exactly as TOCTOU-closed as a preview over one.
+    ///
+    /// Four legs; the last two are what make this more than a convenience:
+    ///  1. the SET selects exactly its members;
+    ///  2. the SINGULAR field still works — it is an alias, not a casualty;
+    ///  3. singular ∪ set is the UNION, so neither silently wins;
+    ///  4. an EMPTY predicate matches ANYTHING, not nothing. Reading it as
+    ///     `IN ()` would silently empty every unfiltered listing in the mesh —
+    ///     which presents as a working system returning no results.
+    #[tokio::test]
+    async fn sqlite_list_scores_key_predicates_are_set_valued_627() {
+        use crate::federation::FederationDirectory;
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        put_score(&be, "k1-row", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        put_score(&be, "k2-row", "k2", "subj", "trust:demo:v1", 0.6, 1.0, 20).await;
+        put_score(&be, "k3-row", "k3", "subj", "trust:demo:v1", 0.7, 1.0, 30).await;
+
+        let attesters = |f: AttestationFilter| async {
+            let mut v: Vec<String> = be
+                .list_scores("", f, None, 100)
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|a| a.attesting_key_id)
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+
+        // (1) the SET selects exactly its members.
+        assert_eq!(
+            attesters(AttestationFilter {
+                attesting_key_ids: vec!["k1".into(), "k3".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["k1".to_string(), "k3".to_string()],
+            "the set predicate must select exactly its members — the whole ask of #627: one act \
+             naming many subjects"
+        );
+
+        // (2) the SINGULAR field still works.
+        assert_eq!(
+            attesters(AttestationFilter {
+                attesting_key_id: Some("k2".into()),
+                ..Default::default()
+            })
+            .await,
+            vec!["k2".to_string()],
+            "the singular field must keep working — every existing caller depends on it"
+        );
+
+        // (3) singular ∪ set is the UNION.
+        assert_eq!(
+            attesters(AttestationFilter {
+                attesting_key_id: Some("k1".into()),
+                attesting_key_ids: vec!["k3".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["k1".to_string(), "k3".to_string()],
+            "singular and set must OR-combine. If either silently won, a caller setting both \
+             would get a SUBSET of what it asked for and never know"
+        );
+
+        // (4) an EMPTY predicate matches ANYTHING.
+        assert_eq!(
+            attesters(AttestationFilter::default()).await,
+            vec!["k1".to_string(), "k2".to_string(), "k3".to_string()],
+            "an unset key predicate must match anything — reading it as `IN ()` would silently \
+             empty every unfiltered listing in the mesh"
+        );
     }
 
     #[tokio::test]

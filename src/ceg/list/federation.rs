@@ -154,6 +154,31 @@ pub enum AttesterSet {
     Explicit(Vec<String>),
 }
 
+/// v30.9.0 (CIRISPersist#627) — fold a singular convenience field and its
+/// set-valued twin into ONE effective OR-list.
+///
+/// Every backend's query builder calls this so the singular/plural combination
+/// has a single definition. Two builders deriving "OR them together" separately
+/// is how they drift, and this struct already carries the scar (`#596 item 2`:
+/// three axes silently ignored by one backend).
+///
+/// Empty result ⇒ the caller emits NO predicate, which is "match anything" —
+/// not "match nothing". That is the existing meaning of an unset filter field
+/// and changing it here would silently empty every unfiltered listing.
+#[must_use]
+pub fn merge_key_predicate(one: Option<&String>, many: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(many.len() + 1);
+    if let Some(k) = one {
+        out.push(k.clone());
+    }
+    for k in many {
+        if !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
 /// Filter for [`crate::ceg::ReadEngine::list_attestations`] and the
 /// v17.4.0 `scores` read handles. Composes AND-style.
 ///
@@ -168,10 +193,62 @@ pub enum AttesterSet {
 #[non_exhaustive]
 pub struct AttestationFilter {
     /// Filter by the key id that DID the attesting.
+    ///
+    /// Convenience alias for a one-element [`Self::attesting_key_ids`]. When both
+    /// are set they are OR-combined, matching how `dimension_prefixes` behaves.
     pub attesting_key_id: Option<String>,
 
     /// Filter by the key id that WAS attested.
+    ///
+    /// Convenience alias for a one-element [`Self::attested_key_ids`]; see that
+    /// field.
     pub attested_key_id: Option<String>,
+
+    /// v30.9.0 (CIRISPersist#627) — filter by a SET of attesting key ids,
+    /// OR-combined and pushed into the query as `IN (…)`.
+    ///
+    /// # Why the set form exists
+    ///
+    /// Every graded moderation act (`refuse-writes`, `deadmit`, `quarantine`,
+    /// `descend`) addresses the subjects this filter names. With only the
+    /// singular field, de-admitting 61 leaked keys is 61 preview→commit pairs,
+    /// each with its own hash, reason and authority walk — and the operator's
+    /// alternative is a script hammering a tier-4 door in a loop, which is worse
+    /// than what the tiering exists to prevent. At mesh scale it is not slow, it
+    /// is unusable: no predicate over a population is expressible at all.
+    ///
+    /// **The ladder's safety property does not require the singular form.** Its
+    /// guarantee is preview-hash commit — *what was previewed is what executes* —
+    /// which is a property of the HASH, not of cardinality. A preview over 61
+    /// keys produces one hash over that row set and is exactly as TOCTOU-closed
+    /// as a preview over one. It also audits better: one decision, one stated
+    /// reason, one ledger entry naming the whole set, instead of 61 rows a reader
+    /// must infer were a single act.
+    ///
+    /// Pushed into the QUERY, never an application-side loop — the CIRISServer#343
+    /// lesson this module's own doc already states. `dimension_prefixes` is the
+    /// precedent: same struct, already `Vec<String>`, already OR-combined,
+    /// already pushed down.
+    ///
+    /// # `#[serde(default)]` is REQUIRED, not decoration
+    ///
+    /// `AttestationFilter` is `Serialize`/`Deserialize`, and filters are
+    /// persisted and sent over the wire. A bare new field is MANDATORY on
+    /// deserialize, so every filter written before this release fails to load
+    /// with `missing field ...`. That is not hypothetical — three trace-plane
+    /// tests went red on stored filters the moment these fields landed
+    /// (`backfill_trace_attestations_478`, and the two ingest replays).
+    ///
+    /// `#[serde(default)]` makes an absent field the empty set, which is exactly
+    /// "no additional key predicate" and preserves every existing document. Any
+    /// future field on this struct needs the same treatment.
+    #[serde(default)]
+    pub attesting_key_ids: Vec<String>,
+
+    /// v30.9.0 (CIRISPersist#627) — filter by a SET of attested key ids.
+    /// See [`Self::attesting_key_ids`].
+    #[serde(default)]
+    pub attested_key_ids: Vec<String>,
 
     /// Filter by attestation_type token (e.g. `"identity"`,
     /// `"capability"`).
