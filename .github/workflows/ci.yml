@@ -94,9 +94,10 @@ jobs:
         # row above and not held out in `NOT_TESTED`), so a feature added to
         # Cargo.toml is tested without anyone remembering to come here.
         substrate:
-          # v30.9.0 — the three slowest legs are PARTITIONED across two runners
-          # each. Measured on run 31397353461: secrets 28m, core 25m, rest 22m
-          # were the critical path. `nextest --partition count:N/M` shards by
+          # v30.9.0 — the slowest legs are PARTITIONED across two runners each
+          # (originally three legs; `secrets` was reverted — see below).
+          # Measured on run 31397353461: secrets 28m, core 25m, rest 22m were
+          # the critical path. `nextest --partition count:N/M` shards by
           # test, so each half runs ~half the tests with no fixture changes.
           #
           # This is the CI analogue of the offline certify script's lanes, which
@@ -118,10 +119,34 @@ jobs:
           # executed, none twice. The gauntlet is a set of independent proptest
           # bodies, so splitting them loses no depth — each still runs its own
           # full case count.
+          #
+          # ── WHY `secrets` IS NOT PARTITIONED, THOUGH IT ONCE WAS ──────────
+          # A partition is not free: each shard is a whole JOB, and every job
+          # pays ~7m45s of fixed cost (Free-runner-disk + ciriscache restore)
+          # before it runs a single test. Splitting is only worth it when the
+          # leg's TEST time exceeds that overhead. Measured on run 31420018561:
+          #
+          #     leg      fixed    nextest    verdict
+          #     secrets  ~8m      6m16s+6m41s (12m57s total)  -> LOSS
+          #     rest     ~8m      8m42s+8m21s (17m03s total)  -> keeps its split
+          #     core     ~8m      7m28s+6m32s + 8m python     -> keeps its split
+          #
+          # Splitting `secrets` duplicated ~8m of restore to save ~6m30s of
+          # tests. That is a loss before queueing even enters it — and queueing
+          # did enter it: the run holds 24 jobs against ~16 concurrent slots, so
+          # `secrets-2` (same matrix as `secrets-1`, no `needs:`) sat **16m44s
+          # waiting for a runner** and finished at 32m26s, making it the true
+          # critical path. `core-1`, the job everyone looks at, was only third
+          # at 24m11s.
+          #
+          # The lesson generalises: **partitioning helps only if a free slot
+          # exists.** Past the slot ceiling the marginal shard does not run in
+          # parallel, it runs LATER, and it has paid the fixed cost twice for
+          # the privilege. Adding runners is the intuitive fix and is exactly
+          # backwards — it lengthens the same queue.
           - { name: core-1,     leg: core,       gauntlet: true,  part: 1, parts: 2 }
           - { name: core-2,     leg: core,       gauntlet: true,  part: 2, parts: 2 }
-          - { name: secrets-1,  leg: secrets,    gauntlet: false, part: 1, parts: 2 }
-          - { name: secrets-2,  leg: secrets,    gauntlet: false, part: 2, parts: 2 }
+          - { name: secrets,    leg: secrets,    gauntlet: false }
           - { name: rest-1,     leg: rest,       gauntlet: false, part: 1, parts: 2 }
           - { name: rest-2,     leg: rest,       gauntlet: false, part: 2, parts: 2 }
           - { name: cirisaudit, leg: cirisaudit, gauntlet: false }

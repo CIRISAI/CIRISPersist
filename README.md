@@ -236,6 +236,35 @@ because every test then replays the full migration set into an empty database;
 than more expensive. Anyone adopting half of that change gets a slower suite and
 concludes the approach failed.
 
+**Fix the database before tuning parallelism.** The same full certification, one
+warm tree, 19,340 tests, as a 2×2 — either row alone gives the wrong answer:
+
+| | 5 lanes × 4 | 8 lanes × 4 |
+|---|---|---|
+| stock postgres | 1437s | 1443s |
+| tuned postgres | 917s | 731s |
+| tuned + PGDATA on tmpfs | — | **643s** |
+
+On a stock cluster, asking for 32 test threads and asking for 20 produce the
+same wall clock — the signature of work that is not CPU-bound, and the reason
+two rounds of lane tuning bought 0.4%. The database was the constraint, and it
+was *hiding* the CPU one. Fix it and the same comparison becomes a real 20%.
+
+So tune postgres, once, and only then think about lanes:
+
+```bash
+scripts/pg_tune_test_cluster.sh                  # fsync/synchronous_commit/full_page_writes/jit off
+scripts/pg_tune_test_cluster.sh --recreate-tmpfs # PGDATA in RAM (DESTRUCTIVE, a further 12%)
+scripts/pg_tune_test_cluster.sh --reset          # back to stock
+```
+
+Every database in the test cluster is created from a template and dropped
+afterwards, so crash safety on it is a cost with nothing bought. That trade is
+only sound *because* the data is disposable — `fsync = off` can leave a cluster
+corrupt rather than merely missing recent commits — so the script refuses to run
+until a marker file is deliberately placed inside the container, and prints the
+command to place it.
+
 Parallel worktrees each grow a large `target/`. To reclaim the finished ones:
 
 ```bash
