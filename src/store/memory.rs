@@ -16442,6 +16442,25 @@ mod tests {
     // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────
     //    I1 age band + user-target steward-binding gate + minor liveness.
 
+    /// v30.10.0 (CIRISPersist#632) — the MEMORY leg of the federation
+    /// duty-holder witness.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn federation_duty_holders_memory_632() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(
+                crate::federation::genesis::accord_holder_genesis_records(),
+            )
+            .await
+            .expect("holders seed");
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_federation_duty_holders(
+            &backend, "memory-632",
+        )
+        .await;
+    }
+
     /// v30.8.0 (CIRISConstitution#87) — the MEMORY leg of the
     /// conferral-is-not-stewardship witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

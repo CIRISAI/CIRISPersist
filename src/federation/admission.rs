@@ -8341,6 +8341,66 @@ pub async fn duty_holders_for_content(
 // state (see `feedback_authority_from_own_verified_state`) — not from a set
 // handed in by the row being admitted.
 
+/// v30.10.0 (CIRISPersist#632) — the **federation-scope** duty-holder resolver:
+/// who may act on a key admitted to the FEDERATION, as opposed to one inside a
+/// community.
+///
+/// # The gap this closes
+///
+/// De-admitting a federation directory key is neither content moderation nor
+/// community moderation, so neither existing resolver applies and
+/// `duty_holders` came back empty for the whole class — meaning the emission
+/// could never be admitted, as-self or by delegation. That is not a policy
+/// refusal, it is an unreachable surface: 61 exposed keys with no expressible
+/// act (CIRISServer#383).
+///
+/// # NO steward-bound filter, and the asymmetry is deliberate
+///
+/// [`duty_holders_for_community`] intersects its authority set with
+/// [`is_steward_bound`], because a community member may be a node or an agent
+/// and CC 3.2 requires authority to trace to an accountable human.
+///
+/// Copying that here returns the EMPTY SET and reproduces the bug one level up.
+/// Accord holders are `identity_type: accord_holder`, not `user` — verified
+/// against the baked seed, where A1/B1/C1 are all accord-holder-only — and
+/// `steward_bindings_of` clause (1) self-anchors only a `user`-role key. Nothing
+/// steward-binds an accord holder, so the filter would erase the roster.
+///
+/// It should not be there regardless: `accord_holder` is
+/// [`ConferralMode::HardwareAttested`](super::types::identity_type::ConferralMode)
+/// — established by ceremony at registration behind a co-scrub quorum, which is
+/// STRICTLY STRONGER than the steward-bound heuristic. Asking the constitutional
+/// root to prove it has a root is a category error.
+///
+/// # The LIVE roster, not the pinned anchor
+///
+/// Read through [`FederationDirectory::active_family_members`], so the set is
+/// revocation-folded: a holder removed from the accord stops being a duty-holder
+/// immediately. Same reasoning `family_quorum_over` documents for charter
+/// quorum — a roster that once reached a threshold must stop reaching it.
+///
+/// # An unresolvable roster is a REFUSAL, not an empty set
+///
+/// If the accord family cannot be resolved this returns
+/// [`Error::InvalidArgument`], never `Ok(empty)`. Empty-set-as-refusal is the
+/// exact shape that let `tier_4_deadmit` pass for years while reading absence of
+/// evidence as evidence of authority — the bypass v30.8.0 closed. A node that
+/// cannot see the accord must say so, not silently conclude nobody may act.
+pub async fn duty_holders_for_federation(
+    directory: &dyn super::FederationDirectory,
+    _duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let members = directory.active_family_members(family).await.map_err(|e| {
+        Error::InvalidArgument(format!(
+            "federation-scope duty-holders are the live accord roster, and this node cannot \
+                 resolve family {family:?}: {e}. Returning an empty holder set here would read \
+                 as \"nobody may act\" — the absent-⇒-admit shape inverted (CIRISPersist#632)."
+        ))
+    })?;
+    Ok(members.into_iter().map(|m| m.key_id).collect())
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG §11.10) — the duty-holders of a
 /// **community-scoped action** with no content subject (a bare
 /// `moderation:*` / `reconsideration:*` over a community): the named
@@ -8434,7 +8494,42 @@ pub async fn check_delegated_duty_scores_admission(
     // the row's own envelope. (`duty_holders_from_signed_subjects` is retained
     // for that future referenced-action resolver; it is no longer reachable
     // from this self-declared path.)
-    let duty_holders = duty_holders_for_community(directory, community_id, duty).await?;
+    // v30.10.0 (CIRISPersist#632) — SCOPE SELECTS THE RESOLVER.
+    //
+    // An act naming a `community_id` is community-scoped and resolves its
+    // duty-holders from that community's authority set. An act naming NO
+    // community is FEDERATION-scoped — de-admitting a key admitted to the
+    // federation is neither content nor community moderation — and resolves
+    // from the live accord roster instead.
+    //
+    // Before this, the community resolver was hardcoded, so a federation-scope
+    // act got `community_id == ""` ⇒ empty holder set ⇒ never admissible, as-self
+    // or by delegation. That is an unreachable surface, not a policy: 61 exposed
+    // keys with no expressible act (CIRISServer#383).
+    //
+    // GATED ON THE QUARANTINE ARM, not merely on an empty `community_id`.
+    //
+    // `moderation:*` and `reconsideration:*` are community acts. One of those
+    // arriving without a community is MALFORMED, and its existing refusal
+    // (`DelegatedScopeUnauthorized`, via an empty community authority set) is
+    // correct. Routing them to the federation resolver changed that refusal into
+    // `InvalidArgument` on any node without the accord seeded — five moderation
+    // tests caught it, and they were right to.
+    //
+    // `quarantine:*` is the removal arm — `slash` — and a de-admission with no
+    // community IS the federation scope. That is the only class that had no
+    // resolver.
+    //
+    // Note what does NOT change: an act that names a community it is not
+    // authorised in still fails through the community resolver. This adds a
+    // resolver for a scope that had none; it does not give anyone a second try
+    // at a scope that refused them.
+    let duty_holders =
+        if community_id.is_empty() && dimension.starts_with(QUARANTINE_DIMENSION_PREFIX) {
+            duty_holders_for_federation(directory, duty).await?
+        } else {
+            duty_holders_for_community(directory, community_id, duty).await?
+        };
     check_moderation_admission(
         directory,
         &row.attesting_key_id,
@@ -16766,5 +16861,111 @@ pub(crate) mod moderation_walk_liveness_test_support {
             "a real owner-binding MUST still register as stewardship — otherwise the narrowing \
              emptied the fold instead of focusing it, and leg 3 proves nothing"
         );
+    }
+
+    /// v30.10.0 (CIRISPersist#632) — **a federation-scope act resolves its
+    /// duty-holders from the accord roster.**
+    ///
+    /// De-admitting a key admitted to the FEDERATION is neither content nor
+    /// community moderation, so before this the caller got an empty holder set
+    /// and the emission could never be admitted — an unreachable surface, not a
+    /// policy refusal (CIRISServer#383: 61 exposed keys, no expressible act).
+    ///
+    /// Three legs:
+    ///
+    ///  1. an unresolvable accord family is a typed REFUSAL, not `Ok(empty)`.
+    ///     This is the leg that matters most: empty-set-as-refusal is the exact
+    ///     shape that let `tier_4_deadmit` pass for years while reading absence
+    ///     of evidence as evidence of authority. A node that cannot see the
+    ///     accord must SAY so, not silently conclude nobody may act.
+    ///  2. with the accord seeded, the roster resolves and is NON-EMPTY —
+    ///     without this, leg 1 passes for a resolver that always errors.
+    ///  3. the holders are the accord's own members, and are NOT filtered by
+    ///     `is_steward_bound`. Copying the community resolver's filter would
+    ///     return empty, because accord holders are `accord_holder`-role and
+    ///     `steward_bindings_of` clause (1) self-anchors only `user`-role keys.
+    ///     `accord_holder` is HardwareAttested — strictly stronger than the
+    ///     steward-bound heuristic, so the filter is a category error here.
+    pub(crate) async fn exercise_federation_duty_holders(
+        dir: &dyn FederationDirectory,
+        _suffix: &str,
+    ) {
+        use crate::federation::admission::duty_holders_for_federation;
+        use crate::federation::admission::DELEGATION_SCOPE_SLASH;
+
+        // (1) no accord seeded yet ⇒ typed refusal, never an empty set.
+        let err = duty_holders_for_federation(dir, DELEGATION_SCOPE_SLASH)
+            .await
+            .expect_err(
+                "an unresolvable accord roster MUST refuse, not return an empty holder set — \
+                 empty-set-as-refusal is the absent-⇒-admit shape inverted, and it is what let \
+                 tier_4_deadmit pass while reading absence of evidence as evidence of authority",
+            );
+        assert_eq!(
+            err.kind(),
+            "federation_invalid_argument",
+            "the refusal must be typed and name what could not be resolved: {err}"
+        );
+
+        // Seed the accord FAMILY. Holders are seeded by each backend leg before
+        // calling (it is a concrete method, not a trait one), which is also what
+        // keeps leg 1 honest: holders present, family absent, so the refusal is
+        // about the roster and not about an empty directory.
+        crate::federation::genesis::seed_accord_family(dir)
+            .await
+            .expect("accord family seeds");
+
+        // (2) + (3) the roster resolves, is non-empty, and is the accord's own
+        // members — unfiltered by steward-binding.
+        let got = duty_holders_for_federation(dir, DELEGATION_SCOPE_SLASH)
+            .await
+            .expect("the accord roster resolves once seeded");
+        assert!(
+            !got.is_empty(),
+            "the seeded accord roster must be NON-EMPTY — otherwise leg 1 proves only that this \
+             resolver always errors, and the federation scope stays unreachable"
+        );
+        // ── (4) THE GATE reaches the resolver ────────────────────────────
+        //
+        // Legs 1-3 prove the resolver works. They do NOT prove anything CALLS it:
+        // a mutation disabling the scope selection in
+        // `check_quarantine_admission` left all three green. That is the leg
+        // CIRISServer actually depends on — their tier-4 deadmit names no
+        // community, so it is the empty-`community_id` branch or nothing.
+        //
+        // An accord holder emitting a federation-scope `quarantine:*` row must
+        // now be admitted as-self. Before #632 this was unreachable: the gate
+        // hardcoded the community resolver, `community_id == ""` yielded an empty
+        // holder set, and no signer could ever satisfy it.
+        let holder = got.iter().next().expect("roster is non-empty").clone();
+        let row = signed_row(
+            &holder,
+            &holder,
+            attestation_type::SCORES,
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "dimension": "quarantine:deadmit:v1",
+                // NO community_id — this is the federation scope.
+            }),
+        );
+        check_delegated_duty_scores_admission(dir, &row)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "an accord holder must be able to emit a FEDERATION-scope quarantine row \
+                     as-self. If this refuses, the gate is not reaching \
+                     duty_holders_for_federation and CIRISServer#383's 61 keys stay \
+                     unactionable: {e}"
+                )
+            });
+
+        for h in &got {
+            assert!(
+                !is_steward_bound(dir, h).await.expect("steward check"),
+                "accord holder {h:?} is steward-bound, which means this witness can no longer \
+                 tell whether the resolver filters. The whole point is that it must NOT: holders \
+                 are accord_holder-role, HardwareAttested, and filtering them returns empty"
+            );
+        }
     }
 }
