@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.10.0] — 2026-08-10 — federation-scope moderation has a duty-holder resolver
+
+- **#632 — de-admitting a federation directory key could never be admitted.** `check_moderation_admission`
+  takes a `duty_holders` set the caller supplies, and v30.9.0 offered exactly two resolvers:
+  content and community. De-admitting a key admitted to the *federation* is neither, so the holder
+  set was empty for that whole class and no signer could satisfy it — as-self or by delegation.
+  That is an unreachable surface, not a policy refusal: 61 exposed keys with no expressible act
+  (CIRISServer#383).
+
+  New `duty_holders_for_federation` resolves from the **live accord roster** via
+  `active_family_members`, so a holder removed from the accord stops being a duty-holder
+  immediately — the same reasoning `family_quorum_over` documents for charter quorum.
+
+- **NO steward-bound filter, and the asymmetry is deliberate.** `duty_holders_for_community`
+  intersects its authority set with `is_steward_bound`, because a community member may be a node or
+  an agent and CC 3.2 requires authority to trace to an accountable human. Copying that here
+  returns the **empty set** and reproduces the bug one level up: accord holders are
+  `identity_type: accord_holder`, not `user` — verified against the baked seed, where A1/B1/C1 are
+  all accord-holder-only — and `steward_bindings_of` clause (1) self-anchors only a `user`-role key.
+
+  It should not be there regardless. `accord_holder` is `HardwareAttested`: established by ceremony
+  at registration behind a co-scrub quorum, which is strictly stronger than the steward-bound
+  heuristic. Asking the constitutional root to prove it has a root is a category error.
+
+- **An unresolvable roster is a typed REFUSAL, never `Ok(empty)`.** Empty-set-as-refusal is the
+  exact shape that let `tier_4_deadmit` pass for years while reading absence of evidence as evidence
+  of authority — the bypass v30.8.0 closed. A node that cannot see the accord must say so.
+
+- **Scope selects the resolver, gated on the QUARANTINE arm — not merely on an empty
+  `community_id`.** `moderation:*` and `reconsideration:*` are community acts; one arriving without
+  a community is malformed and its existing `DelegatedScopeUnauthorized` refusal is correct. My
+  first version routed *any* community-less act to the federation resolver, which turned that
+  refusal into `InvalidArgument` on every node without the accord seeded. **Five moderation tests
+  caught it**, and they were right to. `quarantine:*` is the removal arm — `slash` — and a
+  de-admission with no community *is* the federation scope.
+
+- **Four legs, three mutations killed — and one survived until the fourth leg existed.** Legs 1-3
+  prove the resolver works; they did not prove anything *calls* it. Disabling the gate's scope
+  selection left all three green. Leg 4 drives the real door: an accord holder emitting a
+  federation-scope `quarantine:*` row as-self, which is precisely the path CIRISServer's tier-4
+  deadmit takes.
+
 ## [30.9.0] — 2026-08-10 — a moderation act can address a set, and CI stops taking 38 minutes
 
 - **#627 — `AttestationFilter`'s key predicates are set-valued.** New

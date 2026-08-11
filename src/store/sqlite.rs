@@ -20452,6 +20452,24 @@ mod tests {
         }
     }
 
+    /// v30.10.0 (CIRISPersist#632) — the SQLITE leg of the federation
+    /// duty-holder witness.
+    #[tokio::test]
+    async fn federation_duty_holders_sqlite_632() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(
+                crate::federation::genesis::accord_holder_genesis_records(),
+            )
+            .await
+            .expect("holders seed");
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_federation_duty_holders(
+            &backend, "sqlite-632",
+        )
+        .await;
+    }
+
     /// v30.8.0 (CIRISConstitution#87) — the SQLITE leg.
     #[tokio::test]
     async fn conferral_is_not_stewardship_sqlite_87() {
