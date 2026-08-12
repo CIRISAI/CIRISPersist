@@ -815,6 +815,33 @@ impl PostgresBackend {
         )))
     }
 
+    /// v30.13.0 (CIRISPersist#640) — re-read `key_id` and upsert the Key-plane
+    /// `signed_wire_index` entry for the row **as this backend stores it**.
+    ///
+    /// Every `federation_keys` writer calls this AFTER its primary write
+    /// instead of hashing the struct it happened to hold. `TIMESTAMPTZ` is
+    /// microsecond precision and `consent_role` is normalized at the storage
+    /// boundary, so the in-memory row and the reloaded row are not the same
+    /// bytes — and the reloaded row is the one every read the offer path
+    /// advertises from returns. See
+    /// [`wire_index::key_entry_as_stored`](crate::federation::wire_index::key_entry_as_stored).
+    ///
+    /// Callers must RELEASE any pooled client they hold before calling: the
+    /// reload takes its own, and nesting two checkouts can exhaust a small
+    /// pool.
+    async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
+        if let Some((wire_index_hash, wire_index_key)) =
+            crate::federation::wire_index::key_entry_as_stored(self, key_id).await?
+        {
+            let client = self
+                .get_client()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+        }
+        Ok(())
+    }
+
     /// v4.7.0 (CIRISPersist#177) — register an `accord_public_keys`
     /// pubkey and return a typed [`KeyRegistrationOutcome`] instead of a
     /// bare `Ok(())` that hid insert-vs-match-vs-rotation. Inserts
@@ -3152,9 +3179,16 @@ impl PostgresBackend {
         // row. Without this a scrub-upgraded node advertises its new content
         // hash (`list_signed_key_records_since` re-serializes the CURRENT row)
         // while the index still points at the pre-adopt one, so the ref it just
-        // advertised point-reads to `None`. See `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+        // advertised point-reads to `None`.
+        // v30.13.0 (CIRISPersist#640) — from the row AS STORED, not the one
+        // this call held: TIMESTAMPTZ rounds a sub-microsecond `valid_from` /
+        // `scrub_timestamp` on the way in, so hashing `row` indexes bytes this
+        // backend's read surface never returns. See
+        // `wire_index::key_entry_as_stored`. The pooled client is RELEASED
+        // before the reload — `lookup_public_key` takes its own, and holding
+        // one while acquiring another is how a small pool deadlocks itself.
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
@@ -3285,8 +3319,10 @@ impl PostgresBackend {
         }
         // v24.1.0 (CIRISPersist#547) — index the successor; a canonical rotation
         // that skipped this advertised the rotated record and could not serve it.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+        // v30.13.0 (CIRISPersist#640) — from the row AS STORED (see
+        // `wire_index::key_entry_as_stored`); the client is released first.
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
         Ok(ReplicatedKeyOutcome::Superseded)
     }
 
@@ -3552,10 +3588,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 row.key_id
             )));
         }
-        // v24.1.0 (CIRISPersist#547) — index the re-anchored row; see
-        // `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+        // v24.1.0 (CIRISPersist#547) — index the re-anchored row.
+        // v30.13.0 (CIRISPersist#640) — from the row AS STORED; see
+        // `wire_index::key_entry_as_stored`.
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
         Ok(())
     }
 
@@ -3720,12 +3757,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             }
         }
         // v21.1.0 (CIRISPersist#507b) — reached only on a fresh insert or an
-        // idempotent identical-content replay; `SignedKeyRecord` wraps the
-        // exact `row` the read surface re-serializes.
+        // idempotent identical-content replay.
         // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
         // path and the four mutators cannot compute the entry differently.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+        // v30.13.0 (CIRISPersist#640) — and that shared derivation now reads
+        // the row BACK: `row` is the caller's struct, which differs from the
+        // stored one whenever `TIMESTAMPTZ` rounds a sub-microsecond instant
+        // (reachable over the wire from a sqlite-backed origin, whose
+        // `to_rfc3339()` TEXT round-trips nanoseconds) or the storage boundary
+        // normalizes `consent_role`. See `wire_index::key_entry_as_stored`.
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
         Ok(())
     }
 
@@ -3831,20 +3873,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::types::consent_role::check_admissible(consent_role)?;
         let stored =
             crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
-        // The post-write row, from this node's own state — never a guess about
-        // what the rest of the columns hold.
-        let indexed =
-            match <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
-                .await?
-            {
-                Some(mut r) => {
-                    r.consent_role =
-                        crate::federation::types::consent_role::wire_from_stored(&stored)
-                            .map(str::to_owned);
-                    Some(crate::federation::wire_index::key_entry(&r)?)
-                }
-                None => None,
-            };
         let client = self
             .get_client()
             .await
@@ -3863,9 +3891,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "set_consent_role: no federation_keys row for {key_id}"
             )));
         }
-        if let Some((wire_index_hash, wire_index_key)) = &indexed {
-            pg_upsert_wire_index(&**client, "Key", wire_index_hash, wire_index_key).await?;
-        }
+        // v30.13.0 (CIRISPersist#640) — index AFTER the write, from the row as
+        // stored. This used to reload BEFORE the UPDATE and hand-patch
+        // `consent_role` onto the result — a model of what the write was about
+        // to produce, which is the same guess `key_entry(&row)` was making
+        // everywhere else. Reading it back removes the model.
+        drop(client);
+        self.index_stored_key_row(key_id).await?;
         Ok(())
     }
 
@@ -8872,14 +8904,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // sqlite twin stayed green (sqlite stores RFC-3339 text and round-trips
         // the nanoseconds). Re-reading makes the index agree with the read
         // surface by construction, whatever a backend rounds.
-        if let Some(stored) =
-            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
-                .await?
-        {
-            let (wire_index_hash, wire_index_key) =
-                crate::federation::wire_index::key_entry(&stored)?;
-            pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
-        }
+        // v30.13.0 (CIRISPersist#640) — through the shared helper; this site's
+        // remedy is now every site's remedy.
+        drop(client);
+        self.index_stored_key_row(key_id).await?;
         Ok(())
     }
 
@@ -20960,6 +20988,26 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &be,
             &format!("pg-634-{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#640) — the POSTGRES leg, and the one that
+    /// actually reddens without the fix: `TIMESTAMPTZ` drops the fixture's
+    /// 789ns tail, so an index written from the in-memory row carries a hash
+    /// this backend's read surface can never reproduce.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn nanosecond_key_wire_ref_resolves_postgres_640() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &be,
+            &format!("pg-640-{}", uuid_like()),
         )
         .await;
     }

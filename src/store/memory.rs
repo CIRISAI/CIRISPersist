@@ -113,6 +113,37 @@ pub struct MemoryBackend {
     attestation_reads_for: std::sync::atomic::AtomicU64,
 }
 
+/// v30.13.0 (CIRISPersist#640) — upsert the Key-plane `signed_wire_index`
+/// entry for `key_id` from the row **as stored**, from inside the state lock.
+///
+/// The memory twin of `PostgresBackend`/`SqliteBackend::index_stored_key_row`.
+/// Those re-read through `lookup_public_key`; this cannot, because the state
+/// `Mutex` is not reentrant and every writer already holds it. It does not
+/// need to: memory's `lookup_public_key` hands back `federation_keys.get(..)`
+/// cloned, so hashing that map value IS hashing what the read surface returns
+/// — the same derivation, without the round trip.
+///
+/// Memory rounds nothing, so this is not where #640 bites; it is here so the
+/// rule ("index the stored row, never the writer's struct") holds on all three
+/// backends. A rule only the failing backend follows is a rule the next writer
+/// will not know about — the shape #547 already paid for once.
+///
+/// No-ops when the row is absent: an index entry for a row that does not exist
+/// is the dangling ref this is meant to prevent.
+fn memory_index_stored_key_row(
+    state: &mut State,
+    key_id: &str,
+) -> Result<(), crate::federation::Error> {
+    let Some(row) = state.federation_keys.get(key_id) else {
+        return Ok(());
+    };
+    let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
+    state
+        .signed_wire_index
+        .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+    Ok(())
+}
+
 struct State {
     /// Inserted `trace_events` rows, keyed by dedup tuple
     /// (THREAT_MODEL.md AV-9). See [`DedupKey`].
@@ -1908,15 +1939,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 row.key_id
             )));
         }
-        // v21.1.0 (CIRISPersist#507b) — `SignedKeyRecord` wraps the exact
-        // `row` the read surface re-serializes.
+        // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
         // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
         // path and the mutators cannot compute the entry differently.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        state.federation_keys.insert(row.key_id.clone(), row);
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        // v30.13.0 (CIRISPersist#640) — indexed from the STORED row, after the
+        // insert; see `memory_index_stored_key_row`.
+        let key_id = row.key_id.clone();
+        state.federation_keys.insert(key_id.clone(), row);
+        memory_index_stored_key_row(&mut state, &key_id)?;
         Ok(())
     }
 
@@ -1977,13 +2007,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             });
         }
         // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
-        // row through EVERY mutator, not only `put_public_key`. See
-        // `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        state.federation_keys.insert(row.key_id.clone(), row);
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        // row through EVERY mutator, not only `put_public_key`.
+        // v30.13.0 (CIRISPersist#640) — from the STORED row; see
+        // `memory_index_stored_key_row`.
+        let key_id = row.key_id.clone();
+        state.federation_keys.insert(key_id.clone(), row);
+        memory_index_stored_key_row(&mut state, &key_id)?;
         Ok(())
     }
 
@@ -2051,10 +2080,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
         // `persist_row_hash` but IS in the bytes the read surface returns, so
         // the WIRE content hash moves here. Re-index.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        // v30.13.0 (CIRISPersist#640) — through the shared stored-row helper.
+        memory_index_stored_key_row(&mut state, key_id)?;
         Ok(())
     }
 
@@ -5869,11 +5896,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
-        // the wire content hash moved with them. See `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        // the wire content hash moved with them.
+        // v30.13.0 (CIRISPersist#640) — through the shared stored-row helper.
+        memory_index_stored_key_row(&mut state, key_id)?;
         Ok(())
     }
 
@@ -15971,6 +15996,22 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &backend,
             "memory-634",
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#640) — the MEMORY leg (the CONTROL: memory
+    /// neither rounds timestamps nor normalizes `consent_role`, so it must be
+    /// green before and after the fix; a red here means the shared derivation
+    /// broke, not that the skew was caught).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn nanosecond_key_wire_ref_resolves_memory_640() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &backend,
+            "memory-640",
         )
         .await;
     }

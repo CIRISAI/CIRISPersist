@@ -14762,6 +14762,116 @@ pub(crate) mod r2_test_support {
         }
     }
 
+    /// v30.13.0 (CIRISPersist#640) — a key whose timestamps carry
+    /// SUB-MICROSECOND precision, and a `consent_role` submitted in its STORED
+    /// form, must still resolve through the ref this node advertises for it.
+    ///
+    /// # Why this exists separately from the #634 witness
+    ///
+    /// #634's witness seeds keys through
+    /// [`register_hybrid_key`](crate::federation::tier_ingest::test_support::register_hybrid_key),
+    /// which truncates to microseconds. That truncation was added because the
+    /// postgres leg went red, and it was read as a fixture defect. It was not:
+    /// the write paths hashed the row the WRITER held while every read
+    /// re-serializes the row the BACKEND reloaded, and those differ whenever
+    /// storage normalizes anything. Truncating the fixture hid the mechanism
+    /// instead of closing it, and a witness that only fails when the fixture
+    /// cooperates is not a witness.
+    ///
+    /// So this one supplies the divergence ITSELF, deterministically, and does
+    /// not depend on the shared fixture's precision policy:
+    ///
+    /// * **789 nanoseconds** of sub-microsecond tail on `valid_from` /
+    ///   `scrub_timestamp`. Postgres `TIMESTAMPTZ` drops it; sqlite (RFC-3339
+    ///   TEXT) and memory keep it. Deterministic rather than clock-dependent —
+    ///   `Utc::now()` *usually* carries nanoseconds, and a probe that fires
+    ///   "usually" is a flake, not a gate. Kept under 1µs so `valid_from` is
+    ///   never meaningfully in the future.
+    /// * **`consent_role: Some("unregistered")`** — the STORED token, which
+    ///   both SQL backends normalize to wire `None` on read. That instance has
+    ///   nothing to do with clocks, and it is why the remedy is "hash the
+    ///   stored row" rather than "truncate the timestamps": a fix aimed at
+    ///   precision leaves this one live.
+    ///
+    /// Runs on all three backends. Memory normalizes nothing and rounds
+    /// nothing, so it is the CONTROL — it must pass before and after; a change
+    /// that reds memory has broken the derivation, not caught the skew.
+    pub(crate) async fn exercise_nanosecond_key_wire_ref_resolves(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use chrono::Timelike as _;
+
+        let subject = format!("nanokey-subject-{tag}");
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&subject);
+        // A DETERMINISTIC sub-microsecond tail: keep the current microsecond
+        // and append 789ns. Postgres truncates it away on the way in.
+        let now = {
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000 + 789)
+                .expect("789ns tail is a valid nanosecond field")
+        };
+        assert_ne!(
+            now.nanosecond() % 1_000,
+            0,
+            "[{tag}] the fixture must actually carry sub-microsecond precision, \
+             or this witness cannot fail"
+        );
+
+        let rec = crate::federation::KeyRecord {
+            key_id: subject.clone(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+            identity_ref: subject.clone(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": subject }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: subject.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            // The STORED form on the wire — reads back as `None` on both SQL
+            // backends. See the doc above.
+            consent_role: Some(crate::federation::types::consent_role::UNREGISTERED.to_owned()),
+            additional_scrubs: Vec::new(),
+        };
+        dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] nanosecond-bearing key must register: {e}"));
+
+        let refs = crate::federation::wire_index::wire_refs_for_subject(dir, &subject)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] wire_refs_for_subject: {e}"));
+
+        // NON-VACUITY. An empty ref set resolves every ref it returns.
+        assert!(
+            refs.iter().any(|(k, _, _)| *k == "Key"),
+            "[{tag}] no Key ref for the registered subject; got {refs:?}"
+        );
+
+        for (kind, content_hash, record_key) in &refs {
+            let served = dir
+                .lookup_signed_record_by_content_hash(kind, content_hash)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] lookup {kind}/{content_hash}: {e}"));
+            assert!(
+                served.is_some(),
+                "[{tag}] ref ({kind}, {content_hash}) does not resolve (record_key \
+                 {record_key}). The wire index was written from the row this node HELD, \
+                 not the row it STORED — CIRISPersist#640. A peer asking for the ref \
+                 this node just advertised would get None."
+            );
+        }
+    }
+
     pub(crate) async fn exercise_rescope_keeps_row_servable(
         dir: &dyn FederationDirectory,
         tag: &str,
