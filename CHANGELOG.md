@@ -32,6 +32,119 @@ column on postgres have already lost the producer's numeric literals
 release, and no migration recovers it — re-publish is the only remedy.
 
 
+### Added — BREAKING — 31.0.0 is the binary that RUNS the ceremony, so it had to boot without the thing the ceremony produces (#648)
+
+The release plan is: cut 31.0.0 with no valid seed → roll it onto a new server →
+run a genesis ceremony on it → bake the resulting trust root in 31.1.0. That
+plan did not work, because `Engine::with_signer` installed the genesis seed
+unconditionally and failed the boot if it could not. The only seedless
+constructor, `with_signer_no_genesis_seed`, was fenced behind the
+`test-genesis-seam` cargo feature — default off, absent from every release
+build — on the reasoning that *"a node without the baked trust root is broken"*.
+31.0.0 is the release that disproves that sentence.
+
+**The easy half is making the state reachable. The dangerous half is that a
+node with no trust root must not become a node that CHECKS nothing.**
+
+Absence of a root is not absence of a rule. The failure mode is specific and it
+has bitten this substrate before (#632, the duty-holder resolver): a gate
+re-derives an authority set, the set comes back empty because nothing was ever
+seeded, and the emptiness reads as *nothing to check* rather than *nothing to
+check WITH*. A strict majority of an empty roster is zero, and zero-of-zero is
+trivially met. Three real inversions were found on the way in and all three are
+closed here.
+
+**What ships:**
+
+- **`Engine::with_signer_pre_genesis`** — supported, default-features. Boots,
+  reports, and refuses. `test-genesis-seam` is **removed**, subsumed; downstream
+  test builds drop the feature and call this on an ordinary build.
+- **`Engine::with_signer` no longer dies on an ABSENT seed.** `GenesisFault`
+  splits what one `Err(String)` used to fuse: `Absent` (a node before its
+  ceremony — boots, gates refuse), `Unreadable` (backend could not answer —
+  boots, gates refuse, never "entrenched"), and `Divergent` (a constitutional
+  row present and WRONG: a squatted holder `key_id`, mutated founder seats, a
+  canonical stripped of its role — **still refuses to boot**). Fusing those two
+  is *why* the seed had to be unconditional. #648 makes a MISSING root
+  survivable and a TAMPERED one exactly as fatal as before.
+- **`GenesisPosture`**, from `Engine::genesis_posture()` and folded into the
+  operator surface as `NodeState::genesis`, carrying `GenesisPosture::banner()`
+  — the sentence a node-mode host renders. Re-derived per call, never cached
+  from boot, because the pre-genesis → entrenched transition happens while the
+  process runs. Persist REPORTS; the agent-mode refusal is CIRISServer's and
+  this crate still has no `node_mode` / `agent_mode` concept.
+- **`Error::NoConstitutionalRootYet`** (`federation_no_constitutional_root_yet`)
+  from every gate in the new `genesis::ROOT_REQUIRING_GATES`:
+  `canonical_role_admission`, `infra_attest_role_admission`,
+  `accord_role_admission`, `canonical_withdraw_authority`,
+  `family_charter_admission`. The constant is the contract — the witness asserts
+  the listed set equals the witnessed set, so a gate added to one without the
+  other reds.
+- **`Error::ConstitutionalFamilyReserved`** — the sharpest hole opening the
+  seedless door would have created. The `humanity-accord` id was protected by an
+  accident of ordering: the seed was unconditional, so the primary key was
+  always taken before a peer could write. Without it, a registered peer declares
+  a `humanity-accord` family with itself as the sole seat and `founder_only` as
+  the protocol, `family_charter_threshold` resolves that to **1**, and one
+  signature charters the constitutional root of the mesh. The id now enters a
+  directory through the genesis seeder and the assemble ceremony
+  (`put_family_local`) and through nothing else.
+- **`check_family_charter_admission` no longer skips when the family is absent.**
+  It returned `Ok(())` for a subject it could not resolve, so on a pre-genesis
+  node a `trust:charter:v1` naming `humanity-accord` was admitted with no quorum
+  and no pre-rotation commitment. Unchanged for every other subject.
+- **`mesh_config::root_quorum_reached` no longer downgrades.** An unresolvable
+  family root fell through to `attesting_key_id == root_ref` — a 2-of-3 became a
+  string comparison, and `humanity-accord` holds no key, so no legitimate signer
+  could answer it and a squatted key id could.
+
+**What has NOT changed, and is the property that must not be lost:** the
+assemble ceremony is still idempotent. An already-entrenched family is a no-op,
+never a replacement, so a node owner cannot overwrite the constitutional family
+with their own holders. Trust roots **co-exist** — a new ceremony ADDS a root,
+addressed by its own `root_ref` and resolved per user — so there is no
+replacement semantics here and none was built.
+
+**Where the chokepoint sits, and where it deliberately does not.** It runs after
+each gate's own fast path (a pre-genesis node must still register the ordinary
+identities that run its ceremony) and it gates on the **roster**, not the family
+row. The roster is the authority set the m-of-n is tallied against; the family
+row is established by the ceremony *through* the conferral gate, so demanding it
+as a precondition of that gate would have made "the ceremony can run on a
+seedless node" false. It also asks about the roster the CALLING gate uses, not
+the baked one — a precondition that refuses what the gate would have admitted is
+not a stricter gate, it is a second gate.
+
+**Mutation-tested, because the arithmetic already refused and that was the
+point.** `verify_accord_family_coscrub_with` does reject an empty roster today
+(`m` floors at 1 while `n` is 0), but incidentally. Four mutations, all on all
+three backends: making the chokepoint return `Ok(())` **reds** the witness;
+making the *arithmetic* fail open on an empty roster leaves it **green** — the
+chokepoint holds the line alone; doing both **reds** it, with the gate returning
+`Ok(())` on a self-claimed `canonical`; and restoring the old
+`check_family_charter_admission` skip **reds** it. The belt is load-bearing.
+
+### Testing — the four genesis tests are honest now, not carved out
+
+`genesis_seed_installs_parity_{memory,sqlite,postgres}_622`,
+`bake_real_genesis_v2_artifact_490` and
+`genesis_candidate_bundle_roots_to_the_family_under_quorum_557` failed because
+the baked bundle's attestations predate the #643 row mirror. The #643 gate is
+**not** weakened — a genesis-shaped carve-out would be a permanent hole in
+exactly the rows that grant everything.
+
+Instead each branches on `genesis::bundle_delegation_plane_row_bound`, a
+predicate over the ARTIFACT. Pre-v31 bundle: assert the delegation rows are
+REFUSED, naming #643, on every backend, writing nothing — a real property of a
+real build and the state 31.0.0 ships in. Re-signed bundle: the original
+install assertions. 31.1.0's re-bake flips them back on by itself; nobody has to
+remember to.
+
+Two fixtures also stopped relying on an accident: `run_set_path_parity` and
+`envelope_attested_roles_lift_then_gate_486` ran on bare backends, so every
+refusal they asserted came from the empty-roster arithmetic and none reached the
+conferral gate they are named after. They seat a roster now.
+
 ### Fixed — JSONB is not a byte-preserving container, and eleven signed envelopes were stored in one (#644)
 
 Eleven columns holding **producer-signed envelope bytes** were `JSONB` on

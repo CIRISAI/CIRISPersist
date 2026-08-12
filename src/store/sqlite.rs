@@ -20624,6 +20624,18 @@ mod tests {
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
     }
 
+    /// v31.0.0 (CIRISPersist#648) — the SQLITE leg of the **anti-fail-open**
+    /// witness (see the memory + postgres legs): a node with no accord roster
+    /// refuses every root-requiring gate with the typed
+    /// `federation_no_constitutional_root_yet`.
+    #[tokio::test]
+    async fn seedless_gate_refusals_parity_sqlite_648() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::genesis::posture::exercise_seedless_gate_refusals(&backend, "sqlite")
+            .await;
+    }
+
     /// v30.3.0 (CIRISPersist#611) — the SQLITE leg of the shared
     /// publisher-vouch-conferral witness (see the memory + postgres legs).
     #[tokio::test]

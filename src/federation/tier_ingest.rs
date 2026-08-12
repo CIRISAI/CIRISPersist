@@ -323,6 +323,29 @@ where
 /// wholesale. Run BEFORE any DB work (mirrors the #502 E1
 /// `verify_revocation_admission` shape this helper replicates for the family
 /// plane).
+///
+/// # v31.0.0 (CIRISPersist#648) — the constitutional family id is RESERVED here
+///
+/// Until this cut the `humanity-accord` id was protected by an accident of
+/// ordering rather than by a rule: the genesis seed was unconditional, so the
+/// primary key was always already taken before any peer could reach this door,
+/// and `put_family` refuses a collision that carries different content.
+///
+/// #648 makes boot-without-a-seed a supported state, which removes the
+/// accident. What it would have opened is the sharpest hole in the issue: a
+/// registered peer declares a `humanity-accord` family with itself as the sole
+/// seat and `founder_only` as the protocol,
+/// [`family_charter_threshold`](super::trust_root) resolves that to 1, and a
+/// single signature charters the constitutional root of the mesh. The
+/// signature check above would have passed — the peer really did sign it.
+///
+/// So the id is now reserved at the door. It enters this node's directory
+/// through the genesis seeder and the assemble ceremony
+/// ([`put_family_local`](FederationDirectory::put_family_local), which carries
+/// no authority signature because a keyless family has none to carry) and
+/// through nothing else. That single-door property is also what keeps a SECOND
+/// ceremony from replacing a first: the seeder's own already-entrenched check
+/// is a no-op, never an overwrite.
 pub async fn verify_family_admission<F>(
     directory: &F,
     signed: &super::SignedFamily,
@@ -330,6 +353,14 @@ pub async fn verify_family_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    if signed.family.family_key_id
+        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    {
+        return Err(Error::ConstitutionalFamilyReserved {
+            family_key_id: signed.family.family_key_id.clone(),
+            attesting_key_id: signed.authority_key_id.clone(),
+        });
+    }
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,

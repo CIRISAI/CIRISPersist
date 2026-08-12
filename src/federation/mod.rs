@@ -4941,6 +4941,72 @@ pub enum Error {
         detail: String,
     },
 
+    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis refusal.** The operation
+    /// resolves authority to the constitutional trust root, and this node does
+    /// not hold one: the accord-holder roster and/or the keyless
+    /// `humanity-accord` family row are not installed.
+    ///
+    /// This is the typed answer to *"a node with no root must not become a node
+    /// that checks nothing"*. 31.0.0 is the binary that RUNS the genesis
+    /// ceremony, so it boots pre-genesis on purpose — and every gate in
+    /// [`genesis::ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// returns this rather than tallying a quorum against an empty roster and
+    /// discovering that nothing to check reads like nothing to refuse. That
+    /// inversion is the #632 defect and it is the one most likely to be
+    /// reintroduced here.
+    ///
+    /// The remedy is a ceremony, not a signature, and the message says so —
+    /// `accord family m-of-n not met (1-of-0)` would send an operator hunting
+    /// for a holder who was never going to answer.
+    #[error(
+        "no constitutional trust root yet: {operation} resolves authority to the accord root, \
+         which this node does not hold ({fault_kind} {leg} leg: {detail}). Run the genesis \
+         ceremony (or bake a seed) before this operation."
+    )]
+    NoConstitutionalRootYet {
+        /// WHICH gate refused — a token from
+        /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES).
+        operation: &'static str,
+        /// Which constitutional leg is missing — roster or threshold.
+        leg: genesis::GenesisLeg,
+        /// `absent` / `divergent` / `unreadable` — the
+        /// [`GenesisFault`](crate::federation::genesis::GenesisFault) class.
+        fault_kind: &'static str,
+        /// The specific finding.
+        detail: String,
+    },
+
+    /// v31.0.0 (CIRISPersist#648) — **the constitutional family id is
+    /// reserved.** A `federation_families` write named
+    /// [`HUMANITY_ACCORD_FAMILY_KEY_ID`](ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+    /// through an ordinary admission door.
+    ///
+    /// Before #648 this was defended by an accident of ordering: the seed was
+    /// unconditional, so the primary key was always already occupied by the
+    /// time any peer could write, and `put_family` refuses a collision with
+    /// different content. Allowing boot without a seed removes that accident
+    /// and opens the sharpest hole in the whole issue — a registered peer
+    /// declares a `humanity-accord` family with itself as the sole seat and
+    /// `founder_only` as the protocol, `family_charter_threshold` resolves to
+    /// 1, and one signature charters the constitutional root.
+    ///
+    /// So the reservation is now stated. The name enters this node's directory
+    /// through the genesis seeder / the assemble ceremony
+    /// ([`put_family_local`](FederationDirectory::put_family_local)) and
+    /// through nothing else — which is also the property that keeps a second
+    /// assemble from becoming a replacement.
+    #[error(
+        "family_key_id {family_key_id:?} is the constitutional accord family and is reserved: \
+         it is established by the genesis ceremony, never by a peer declaration \
+         (attesting key {attesting_key_id:?})"
+    )]
+    ConstitutionalFamilyReserved {
+        /// The reserved id the caller tried to claim.
+        family_key_id: String,
+        /// Who tried.
+        attesting_key_id: String,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -6123,6 +6189,10 @@ impl Error {
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
+            Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
+            Error::ConstitutionalFamilyReserved { .. } => {
+                "federation_constitutional_family_reserved"
+            }
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }

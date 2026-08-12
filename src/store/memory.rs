@@ -11388,14 +11388,48 @@ mod tests {
             vec![(canon.to_owned(), BakeItemOutcome::ReAnchored)],
             "the anchored-but-different canonical is re-anchored under quorum"
         );
+        // v31.0.0 (CIRISPersist#648) — the delegation plane is regime-branched
+        // on the ARTIFACT, not on an edited expectation.
+        //
+        // `genesis_v2.json` is the REAL 2026-07-23 ceremony artifact and it was
+        // signed before the #643 row mirror existed, so its delegation rows
+        // carry no signed `row` object and `put_attestation` refuses them. That
+        // gate closes the verb-substitution and authority-injection attacks and
+        // is not weakened here: a genesis-shaped carve-out would be a permanent
+        // hole in exactly the rows that grant everything.
+        //
+        // The KEY plane above is untouched and still proves the whole #490
+        // acceptance story (quorum verifies, the anchored-but-different
+        // canonical re-anchors under quorum, the #486 lift opens the trace
+        // plane). What the delegation half asserts now is the truth of a
+        // pre-v31 build: every row is SKIPPED, naming #643. When the same
+        // holders re-sign under the new envelope shape for 31.1.0, this flips
+        // back to `Anchored` by itself.
+        let artifact_bundle: crate::federation::genesis::GenesisBundle =
+            serde_json::from_str(artifact).expect("artifact parses");
+        let row_bound =
+            crate::federation::genesis::bundle_delegation_plane_row_bound(&artifact_bundle);
         for (id, outcome) in &report.attestations {
-            assert!(
-                matches!(
-                    outcome,
-                    BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
+            match &row_bound {
+                Ok(()) => assert!(
+                    matches!(
+                        outcome,
+                        BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
+                    ),
+                    "delegation-plane row {id} must land, got {outcome:?}"
                 ),
-                "delegation-plane row {id} must land, got {outcome:?}"
-            );
+                Err(_) => match outcome {
+                    BakeItemOutcome::Skipped(why) => assert!(
+                        why.contains("CIRISPersist#643"),
+                        "row {id} must be skipped BY THE BINDING GATE, not for some other \
+                         reason: {why}"
+                    ),
+                    other => panic!(
+                        "a pre-v31 delegation row {id} must be refused by the #643 gate, \
+                         got {other:?} — the gate has a hole"
+                    ),
+                },
+            }
         }
 
         // The mesh is bright: the re-blessed record claims infra:serve
@@ -11798,6 +11832,18 @@ mod tests {
     #[tokio::test]
     async fn envelope_attested_roles_lift_then_gate_486() {
         let backend = MemoryBackend::new();
+        // v31.0.0 (CIRISPersist#648) — seat the accord roster so the refusal
+        // below comes from the `infra:attest` CONFERRAL gate rather than from
+        // the empty-roster accident this fixture used to rely on. Plain `node`
+        // rows under the roster key_ids resolve without being able to confer
+        // anything. See `run_set_path_parity` for the same correction.
+        for kid in crate::federation::genesis::effective_accord_holder_records().iter() {
+            let mut seat = fix_key(&kid.record.key_id, "ref", &kid.record.key_id);
+            seat.identity_type = "node".to_owned();
+            let _ = backend
+                .put_public_key(SignedKeyRecord { record: seat })
+                .await;
+        }
 
         // Ungated role in the envelope, empty top-level roles (the exact
         // #480 shape): after put, the row CLAIMS infra:serve.
@@ -16769,6 +16815,20 @@ mod tests {
             .await
             .expect("holders seed");
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — the MEMORY leg of the **anti-fail-open**
+    /// witness: a node with no accord roster refuses every root-requiring gate
+    /// with the typed `federation_no_constitutional_root_yet`.
+    ///
+    /// Memory is the leg that historically tolerates what the SQL backends
+    /// refuse, so it is the one most likely to turn a chokepoint into a no-op.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn seedless_gate_refusals_parity_memory_648() {
+        let backend = MemoryBackend::new();
+        crate::federation::genesis::posture::exercise_seedless_gate_refusals(&backend, "memory")
+            .await;
     }
 
     /// v30.3.0 (CIRISPersist#611) — the MEMORY leg of the shared

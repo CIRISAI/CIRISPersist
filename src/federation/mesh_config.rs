@@ -1622,12 +1622,25 @@ async fn root_quorum_reached<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v31.0.0 (CIRISPersist#648) — the constitutional family is judged on the
+    // FAMILY arm or not at all.
+    //
+    // The `None` arm below is correct for a key root, where authorship IS the
+    // 1-of-1 quorum. It is a silent downgrade for a FAMILY root that this node
+    // simply has not seeded yet: `humanity-accord` holds no key, so
+    // "did a key literally named humanity-accord sign this" is a question no
+    // legitimate signer can answer and a squatted key id can. On a pre-genesis
+    // node that turned a 2-of-3 into a string comparison. Absence of the family
+    // row is not permission to use a weaker rule about it.
     match super::trust_root::resolve_family_root(directory, root_ref).await? {
         Some(family) => Ok(
             super::trust_root::family_quorum_over(directory, row, &family)
                 .await?
                 .met(),
         ),
+        None if root_ref == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID => {
+            Ok(false)
+        }
         None => Ok(row.attesting_key_id == root_ref),
     }
 }

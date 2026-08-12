@@ -875,25 +875,52 @@ impl Engine {
         Ok(engine)
     }
 
-    /// v13.3.1 (CIRISPersist#387) — **TEST-ONLY** constructor: identical to
-    /// [`with_signer`](Self::with_signer) (connect + run migrations) but it
+    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**: identical
+    /// to [`with_signer`](Self::with_signer) (connect + run migrations) but it
     /// **SKIPS the HUMANITY_ACCORD genesis seed** — no baked A1/B1/C1 holder
-    /// rows, no entrenched family row. Gated behind the `test-genesis-seam`
-    /// cargo feature (default OFF, absent from release builds), so this cannot
-    /// be reached in production — a node without the baked trust root is broken.
+    /// rows, no entrenched family row, no canonical.
     ///
-    /// The seed is deliberately **unconditional** in prod ([`with_signer`]): the
-    /// baked accord family IS the immutable trust root, and the assemble
-    /// ceremony is idempotent (an already-entrenched family is a no-op, never a
-    /// replacement — else a node owner could overwrite the constitutional family
-    /// with their own holders). This seam exists ONLY so downstream integration
-    /// tests can assemble a *controllable* custom-holder `humanity-accord`
-    /// family (with holders they can sign as) without the baked A1/B1/C1 +
-    /// family causing a UNIQUE conflict or an unsignable roster. Enable it in
-    /// `[dev-dependencies]` (e.g. CIRISServer's test build), never in
-    /// `[dependencies]`.
-    #[cfg(feature = "test-genesis-seam")]
-    pub async fn with_signer_no_genesis_seed(
+    /// This is a **supported, default-features** entry point as of 31.0.0. It
+    /// was `with_signer_no_genesis_seed`, fenced behind the `test-genesis-seam`
+    /// cargo feature and absent from every release build, on the reasoning that
+    /// *"a node without the baked trust root is broken"*. 31.0.0 is the release
+    /// that disproves that: it is the binary that RUNS the genesis ceremony
+    /// which produces the root a later cut bakes, so it has to be able to start
+    /// without one. The seam is not test-only any more; it is the boot mode of
+    /// a node that has not had its ceremony yet, and the feature that fenced it
+    /// is removed.
+    ///
+    /// # This is not a relaxation
+    ///
+    /// An Engine built here reports
+    /// [`GenesisPosture::PreGenesis`](crate::federation::genesis::GenesisPosture::PreGenesis)
+    /// from [`genesis_posture`](Self::genesis_posture), and every gate in
+    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// refuses with
+    /// [`Error::NoConstitutionalRootYet`](crate::federation::Error::NoConstitutionalRootYet).
+    /// A node with no trust root is a node that trusts nothing — it is NOT a
+    /// node that therefore checks nothing. Absence of a root is not absence of
+    /// a rule.
+    ///
+    /// # What it is still for, unchanged
+    ///
+    /// Downstream integration tests that assemble a *controllable*
+    /// custom-holder `humanity-accord` family (holders they can sign as) still
+    /// use it, and for the same reason: the baked A1/B1/C1 + family would
+    /// otherwise cause a UNIQUE conflict or an unsignable roster. That use is
+    /// now a special case of the general one rather than a fenced exception.
+    ///
+    /// # What has NOT changed
+    ///
+    /// The assemble ceremony remains **idempotent**: an already-entrenched
+    /// family is a no-op, never a replacement, so a node owner cannot overwrite
+    /// the constitutional family with their own holders. Trust roots CO-EXIST —
+    /// a second ceremony ADDS a root, addressed by its own `root_ref` and
+    /// resolved per user — and none of that is a licence to mutate a root that
+    /// already stands. See
+    /// [`seed_accord_family`](crate::federation::genesis::seed_accord_family)
+    /// and [`Error::ConstitutionalFamilyReserved`](crate::federation::Error::ConstitutionalFamilyReserved).
+    pub async fn with_signer_pre_genesis(
         signer: Arc<LocalSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
@@ -5667,6 +5694,36 @@ impl Engine {
         }
     }
 
+    /// v31.0.0 (CIRISPersist#648) — **does this node hold a constitutional
+    /// trust root?**
+    ///
+    /// The read a host consults before deciding what it may run.
+    /// [`GenesisPosture::entrenched`](crate::federation::genesis::GenesisPosture::entrenched)
+    /// is the boolean; [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner)
+    /// is the warning line a node-mode host renders; the `leg` and `detail`
+    /// name what is missing.
+    ///
+    /// # Persist reports; the host decides
+    ///
+    /// The operator's rule is per-MODE: node mode ("brainless", no agent) boots
+    /// pre-genesis with a banner, agent mode must not, and the agent-mode
+    /// refusal is enforced in CIRISServer. This crate has no `node_mode` /
+    /// `agent_mode` concept and #648 deliberately does not introduce one. What
+    /// persist owes the layer above is an accurate, fail-closed answer — and it
+    /// enforces the consequences it CAN enforce itself, which is that every gate
+    /// in [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// refuses while this reads anything but `entrenched`.
+    ///
+    /// Re-derived from the directory on every call, never cached from boot: an
+    /// operator boots pre-genesis, runs the ceremony against the live node, and
+    /// this flips to `entrenched` without a restart. A posture captured at
+    /// construction would keep warning about a condition that had passed.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn genesis_posture(&self) -> crate::federation::genesis::GenesisPosture {
+        let dir = self.federation_directory();
+        crate::federation::genesis::genesis_posture(dir.as_ref()).await
+    }
+
     /// v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the **I1 age
     /// band** of `key_id`, resolved from its incoming age attestations
     /// (witness `age_assurance:*` OUTRANKS self-declared `age_self_declared:*`;
@@ -7006,7 +7063,67 @@ pub enum EngineMaintenance {
     not(any(feature = "postgres", feature = "sqlite")),
     allow(unused_variables)
 )]
-async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch, EngineError> {
+/// v31.0.0 (CIRISPersist#648) — **the boot decision: which genesis faults may a
+/// node survive?**
+///
+/// Exactly one may not. Before this cut every seed failure was fatal, and it had
+/// to be, because the seeder returned an `Err(String)` in which "the accord
+/// holders were never seeded" and "somebody else's pubkey is sitting on A1's
+/// key_id" were the same value. With
+/// [`GenesisFault`](crate::federation::genesis::GenesisFault) splitting them:
+///
+/// - [`Absent`](crate::federation::genesis::GenesisFault::Absent) — a node
+///   before its ceremony. **Boots.** 31.0.0 is the binary that RUNS the
+///   ceremony, so refusing to start without the thing the ceremony produces is
+///   a deadlock. The node comes up in the pre-genesis posture, reports it
+///   (`Engine::genesis_posture`, `NodeState::genesis`), and every gate in
+///   `ROOT_REQUIRING_GATES` refuses.
+/// - [`Unreadable`](crate::federation::genesis::GenesisFault::Unreadable) — the
+///   backend could not answer. **Boots**, and is likewise not entrenched: an
+///   unanswered question is not a yes, so the same gates refuse. A node whose
+///   directory is broken should be able to come up far enough to say so.
+/// - [`Divergent`](crate::federation::genesis::GenesisFault::Divergent) —
+///   **REFUSES.** A constitutional row is present and wrong: a squatted holder
+///   key_id, a family whose entrenched protocol or founder seats were mutated,
+///   a canonical stripped of its role. That is an established root altered
+///   underneath the node, and #648 is about making a MISSING root survivable,
+///   never a TAMPERED one. Roots co-exist and a new ceremony adds one; nothing
+///   here may become a path to overwriting one that already stands.
+///
+/// The warning is `tracing::warn!` with a structured `posture` field rather than
+/// a bare message, because the host renders a banner from it — see
+/// [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn classify_genesis_seed(
+    outcome: Result<(), crate::federation::genesis::GenesisFault>,
+) -> Result<(), EngineError> {
+    let Err(fault) = outcome else { return Ok(()) };
+    if fault.refuses_boot() {
+        return Err(EngineError::GenesisSeed(fault.to_string()));
+    }
+    tracing::warn!(
+        posture = "pre_genesis",
+        leg = fault.leg().as_str(),
+        fault = fault.as_str(),
+        detail = fault.detail(),
+        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+         genesis ceremony; until one completes, every operation that resolves authority to \
+         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+         — do not run an agent against this node."
+    );
+    Ok(())
+}
+
+async fn build_backend(
+    dsn: &str,
+    // Read only inside the backend `cfg` arms; a build with neither backend
+    // compiled in reaches the `UnrecognizedDsn` tail without consulting it.
+    #[cfg_attr(
+        not(any(feature = "postgres", feature = "sqlite")),
+        allow(unused_variables)
+    )]
+    seed_genesis: bool,
+) -> Result<BackendDispatch, EngineError> {
     if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
         #[cfg(feature = "postgres")]
         {
@@ -7014,27 +7131,31 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 .await
                 .map_err(EngineError::Store)?;
             pg.run_migrations().await.map_err(EngineError::Store)?;
-            // v13.3.1 (CIRISPersist#387) — the genesis seed is UNCONDITIONAL in
-            // production (`seed_genesis == true`): the baked HUMANITY_ACCORD
-            // holders + family ARE the immutable trust root. `seed_genesis ==
-            // false` is reachable ONLY via the feature-gated
-            // `with_signer_no_genesis_seed` (test-only, absent from prod builds),
-            // so downstream integration tests can assemble a controllable
-            // custom-holder family without the baked A1/B1/C1 + family blocking it.
+            // v31.0.0 (CIRISPersist#648) — the genesis seed is ATTEMPTED in
+            // production and no longer fatal when it is merely ABSENT. See
+            // `attempt_genesis_seed` for the classification and why divergence
+            // is still fatal. `seed_genesis == false` is the supported
+            // pre-genesis constructor `Engine::with_signer_pre_genesis`.
             if seed_genesis {
                 // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
-                // rooting-anchor rows (idempotent), then fail-secure verify.
-                pg.seed_genesis_accord_holders(
-                    &crate::federation::genesis::effective_accord_holder_records(),
-                )
-                .await
-                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                // rooting-anchor rows (idempotent). A write failure here is NOT
+                // decided on: `seed_family_and_canonical` opens with
+                // `verify_anchor_seeded`, which is the one place that can tell
+                // "never seeded" from "seeded by somebody else".
+                if let Err(e) = pg
+                    .seed_genesis_accord_holders(
+                        &crate::federation::genesis::effective_accord_holder_records(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                }
                 // v13.4.1 (#392) — the SHARED seed routine (verify anchor →
                 // family #386 → canonical #390), identical to the pyo3
                 // `PyEngine::new` path so they can't drift.
-                crate::federation::genesis::seed_family_and_canonical(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
+                classify_genesis_seed(
+                    crate::federation::genesis::seed_family_and_canonical(&pg).await,
+                )?;
             }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
@@ -7073,21 +7194,24 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                     .map_err(EngineError::Store)?
             };
             sq.run_migrations().await.map_err(EngineError::Store)?;
-            // v13.3.1 (CIRISPersist#387) — see the postgres leg: seed is
-            // unconditional in prod; skipped only via the feature-gated
-            // test-only `with_signer_no_genesis_seed`.
+            // v31.0.0 (CIRISPersist#648) — see the postgres leg: the seed is
+            // attempted, an ABSENT seed leaves a pre-genesis node that boots and
+            // refuses, a DIVERGENT one still refuses to boot.
             if seed_genesis {
                 // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
-                sq.seed_genesis_accord_holders(
-                    &crate::federation::genesis::effective_accord_holder_records(),
-                )
-                .await
-                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                if let Err(e) = sq
+                    .seed_genesis_accord_holders(
+                        &crate::federation::genesis::effective_accord_holder_records(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                }
                 // v13.4.1 (#392) — shared seed routine (verify anchor → family
                 // #386 → canonical #390); identical to the pyo3 path.
-                crate::federation::genesis::seed_family_and_canonical(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
+                classify_genesis_seed(
+                    crate::federation::genesis::seed_family_and_canonical(&sq).await,
+                )?;
             }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
@@ -7459,31 +7583,56 @@ mod tests {
         assert!(sq.admission_gate().is_none());
     }
 
-    /// v13.3.1 (CIRISPersist#387) — the TEST-ONLY seam: `with_signer_no_genesis_seed`
-    /// yields a clean engine with **no baked trust root** — no accord holders
-    /// (A1 absent), no entrenched family — so downstream integration tests can
-    /// assemble a controllable custom-holder `humanity-accord` family. The
-    /// default `with_signer` (prev test) DOES seed both. Gated behind the
-    /// `test-genesis-seam` feature so it is absent from release builds.
-    #[cfg(all(feature = "sqlite", feature = "test-genesis-seam"))]
+    /// v31.0.0 (CIRISPersist#648) — **a seedless node BOOTS**, and says so.
+    ///
+    /// Was `no_genesis_seed_seam_yields_a_clean_engine`, fenced behind
+    /// `test-genesis-seam`. The constructor is supported on a default build
+    /// now, so the witness is too: 31.0.0 is the binary that runs the ceremony
+    /// which produces the root, and a release build that could not reach this
+    /// state could not run the ceremony.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn no_genesis_seed_seam_yields_a_clean_engine() {
-        let engine = Engine::with_signer_no_genesis_seed(test_signer(), "sqlite::memory:")
+    async fn seedless_node_boots_and_reports_pre_genesis_648() {
+        use crate::federation::genesis::{GenesisLeg, GenesisPosture};
+
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
             .await
-            .expect("construct no-seed engine");
+            .expect("a node with no constitutional trust root must BOOT");
         let dir = engine.federation_directory();
         assert!(
             dir.lookup_family("humanity-accord")
                 .await
                 .unwrap()
                 .is_none(),
-            "the seam must NOT seed the entrenched accord family"
+            "pre-genesis: no entrenched accord family"
         );
         assert!(
             dir.lookup_public_key("A1").await.unwrap().is_none(),
-            "the seam must NOT seed the A1 accord holder"
+            "pre-genesis: no A1 accord holder"
         );
-        // And a normally-constructed engine DOES have both (the prod path).
+
+        // The state is REPORTED, typed, and names the leg — this is the half a
+        // server reads to render its banner and gate agent mode.
+        let posture = engine.genesis_posture().await;
+        assert!(
+            matches!(
+                posture,
+                GenesisPosture::PreGenesis {
+                    leg: GenesisLeg::Anchor,
+                    ..
+                }
+            ),
+            "the missing leg is the ROSTER, named: {posture:?}"
+        );
+        assert!(!posture.entrenched());
+        assert_eq!(posture.as_str(), "pre_genesis");
+        let banner = posture.banner().expect("node mode renders a banner");
+        assert!(
+            banner.contains("PRE-GENESIS"),
+            "the banner says what it is: {banner}"
+        );
+
+        // And a normally-constructed engine IS entrenched (the prod path).
         let seeded = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct seeded engine");
@@ -7493,6 +7642,177 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        assert!(
+            seeded.genesis_posture().await.entrenched(),
+            "a baked-seed node is entrenched and renders NO banner"
+        );
+        assert!(seeded.genesis_posture().await.banner().is_none());
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the anti-fail-open witness, and the most
+    /// important assertion in this cut.**
+    ///
+    /// A node with no trust root must not become a node that trusts nothing and
+    /// therefore CHECKS nothing. Every gate in
+    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// must refuse with the TYPED `federation_no_constitutional_root_yet` —
+    /// never `Ok(())`, never an empty-set-means-yes.
+    ///
+    /// The body lives in
+    /// [`exercise_seedless_gate_refusals`](crate::federation::genesis::posture::exercise_seedless_gate_refusals)
+    /// and runs identically on memory, sqlite and postgres; this leg proves it
+    /// of a directory reached through a real seedless ENGINE rather than a bare
+    /// backend, so the constructor and the gates are witnessed together.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seedless_node_refuses_every_root_requiring_gate_648() {
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let dir = engine.federation_directory();
+        crate::federation::genesis::posture::exercise_seedless_gate_refusals(
+            dir.as_ref(),
+            "engine-sqlite",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the ceremony can run on a seedless node,
+    /// and a second one does NOT replace the first.**
+    ///
+    /// Two properties in one witness because they are the same property seen
+    /// from either side: the pre-genesis state must be ENTERABLE (else 31.0.0
+    /// cannot produce the root 31.1.0 bakes) and it must be EXITABLE ONLY BY
+    /// ADDITION (else a node owner could overwrite the constitutional family
+    /// with their own holders).
+    ///
+    /// Trust roots co-exist — a new ceremony ADDS a root, addressed by its own
+    /// `root_ref` — so there is no replacement semantics to build. What there
+    /// is, is the idempotent-assemble behaviour that must not be lost.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn ceremony_runs_on_a_seedless_node_and_never_replaces_648() {
+        use crate::federation::genesis;
+        use crate::federation::FederationDirectory as _;
+
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let sq = engine.sqlite_backend().expect("sqlite");
+        assert!(!engine.genesis_posture().await.entrenched());
+
+        // ── the ceremony: roster, then threshold ──
+        sq.seed_genesis_accord_holders(&genesis::effective_accord_holder_records())
+            .await
+            .expect("the ceremony seats the roster on a pre-genesis node");
+        genesis::seed_accord_family(sq.as_ref())
+            .await
+            .expect("the ceremony entrenches the family on a pre-genesis node");
+
+        // The seat is established, so the gates that were refusing now adjudicate
+        // on the merits again — the refusal was about the ROOT, not about the row.
+        genesis::require_constitutional_root(sq.as_ref(), "witness")
+            .await
+            .expect("roster + threshold present ⇒ the chokepoint passes");
+
+        // ── a SECOND assemble is a no-op, never a replacement ──
+        let before = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("entrenched");
+        // A hostile re-assemble: same family id, the node owner's own sole seat,
+        // `founder_only` so the charter threshold would resolve to 1.
+        let hostile = crate::federation::types::Family {
+            family_key_id: "humanity-accord".into(),
+            family_name: "MINE".into(),
+            members: vec![crate::federation::types::FamilyMember {
+                key_id: "rogue-1".into(),
+                joined_at: chrono::Utc::now(),
+                role: Some("founder".into()),
+            }],
+            founded_at: chrono::Utc::now(),
+            consensus_protocol: "founder_only".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        let _ = sq.put_family_local(hostile).await; // whatever it returns…
+        let after = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(
+            after.members.len(),
+            before.members.len(),
+            "an entrenched family's seats are NOT replaceable"
+        );
+        assert_eq!(after.consensus_protocol, before.consensus_protocol);
+        assert!(after.consensus_protocol_entrenched);
+
+        // The seeder itself is idempotent by the same rule.
+        genesis::seed_accord_family(sq.as_ref())
+            .await
+            .expect("re-seed is a no-op");
+        let again = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(again.members.len(), before.members.len());
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the constitutional family id is
+    /// RESERVED**, which is the hole that opening the seedless door would
+    /// otherwise have created.
+    ///
+    /// Until this cut the id was protected by an accident of ordering: the seed
+    /// was unconditional, so the primary key was always taken before any peer
+    /// could write. On a pre-genesis node a registered peer could declare a
+    /// `humanity-accord` family with itself as the sole seat and `founder_only`
+    /// as the protocol, `family_charter_threshold` resolves that to 1, and one
+    /// signature charters the constitutional root of the mesh.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn constitutional_family_id_is_reserved_at_the_peer_door_648() {
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let dir = engine.federation_directory();
+
+        let squat = crate::federation::SignedFamily {
+            family: crate::federation::types::Family {
+                family_key_id: "humanity-accord".into(),
+                family_name: "MINE".into(),
+                members: vec![crate::federation::types::FamilyMember {
+                    key_id: "rogue-1".into(),
+                    joined_at: chrono::Utc::now(),
+                    role: Some("founder".into()),
+                }],
+                founded_at: chrono::Utc::now(),
+                consensus_protocol: "founder_only".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+            authority_key_id: "rogue-1".into(),
+            scrub_signature_classical: "AA==".into(),
+            scrub_signature_pqc: None,
+        };
+        let err = dir
+            .put_family(squat)
+            .await
+            .expect_err("the constitutional family id must not be claimable by a peer");
+        assert_eq!(err.kind(), "federation_constitutional_family_reserved");
+        assert!(
+            dir.lookup_family("humanity-accord")
+                .await
+                .unwrap()
+                .is_none(),
+            "and nothing was written"
+        );
     }
 
     /// v13.4.0 (CIRISPersist#390) — the operator's success criterion: a FRESH

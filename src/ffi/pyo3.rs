@@ -60,6 +60,35 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 const POSTGRES_ONLY_MSG: &str = "this build has no postgres backend — build \
 ciris-persist with feature `pyo3` (not `pyo3-sqlite`) for postgres";
 
+/// v31.0.0 (CIRISPersist#648) — the wheel's half of
+/// [`classify_genesis_seed`](crate::engine::classify_genesis_seed): an ABSENT
+/// or UNREADABLE constitutional seed leaves a pre-genesis node that boots and
+/// refuses every root-requiring gate; a DIVERGENT one still refuses to boot.
+///
+/// Shaped as an `.or_else` over the seeder's own `Result` so the wheel and
+/// `Engine::with_signer` share one rule. Two boot paths that disagree about
+/// which faults are survivable is precisely the drift #392 collapsed
+/// `seed_family_and_canonical` to prevent.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn pre_genesis_or_refuse(
+    fault: crate::federation::genesis::GenesisFault,
+) -> Result<(), crate::federation::genesis::GenesisFault> {
+    if fault.refuses_boot() {
+        return Err(fault);
+    }
+    tracing::warn!(
+        posture = "pre_genesis",
+        leg = fault.leg().as_str(),
+        fault = fault.as_str(),
+        detail = fault.detail(),
+        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+         genesis ceremony; until one completes, every operation that resolves authority to \
+         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+         — do not run an agent against this node."
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // v1.0.0-scaffold (CIRISPersist#193 + #194) — backend dispatch, typed
 // exception hierarchy, URL-sniff constructor. v1.4.0 ported the 9
@@ -1599,13 +1628,12 @@ impl PyEngine {
         #[cfg(feature = "postgres")]
         #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
         let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
-        let backend: BackendDispatch = if dsn.starts_with("postgresql://")
-            || dsn.starts_with("postgres://")
-        {
-            #[cfg(feature = "postgres")]
-            {
-                let pg = py.detach(|| {
-                    runtime.block_on(async {
+        let backend: BackendDispatch =
+            if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+                #[cfg(feature = "postgres")]
+                {
+                    let pg = py.detach(|| {
+                        runtime.block_on(async {
                         let pg = PostgresBackend::connect(dsn)
                             .await
                             .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
@@ -1615,52 +1643,59 @@ impl PyEngine {
                         // v12.0.2 (CIRISPersist#347) — first-boot-seed the
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
-                        pg.seed_genesis_accord_holders(
-                            &crate::federation::genesis::effective_accord_holder_records(),
-                        )
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        if let Err(e) = pg
+                            .seed_genesis_accord_holders(
+                                &crate::federation::genesis::effective_accord_holder_records(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                        }
                         // v13.4.1 (CIRISPersist#392) — run the SAME shared seed
                         // routine `Engine::with_signer` does (verify anchor →
                         // family #386 → canonical #390). Previously this pyo3 ctor
                         // stopped at the holder seed, so wheel consumers got no
                         // family + no canonical row — the seed paths had drifted.
+                        // v31.0.0 (CIRISPersist#648) — and the SAME survivability
+                        // classification, so the wheel and the Rust ctor cannot
+                        // disagree about which faults a node may boot through.
                         crate::federation::genesis::seed_family_and_canonical(&pg)
                             .await
+                            .or_else(pre_genesis_or_refuse)
                             .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(pg))
                     })
-                })?;
-                pg_backend_for_sweep = Some(pg.clone());
-                BackendDispatch::Postgres(pg)
-            }
-            // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
-            // backend compiled in, so a `postgresql://` dsn is rejected
-            // cleanly rather than silently falling through.
-            #[cfg(not(feature = "postgres"))]
-            {
-                return Err(PyValueError::new_err(format!(
-                    "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
-                )));
-            }
-        } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
-            #[cfg(feature = "sqlite")]
-            {
-                // URL parsing follows the SQLAlchemy / Python sqlite3
-                // convention the CIRISAgent ecosystem already uses:
-                //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
-                //   `sqlite:///relative.db`  → file at `relative.db`
-                //                              (strip leading `/`)
-                //   `sqlite:///:memory:`     → in-memory
-                //   `sqlite::memory:`        → in-memory (compact form)
-                //
-                // The `sqlite://` prefix is the URL scheme;
-                // `sqlite:///` is scheme + empty authority + path.
-                let in_memory = dsn == "sqlite::memory:"
-                    || dsn == "sqlite:///:memory:"
-                    || dsn == "sqlite://:memory:";
-                let sq = py.detach(|| {
-                    runtime.block_on(async {
+                    })?;
+                    pg_backend_for_sweep = Some(pg.clone());
+                    BackendDispatch::Postgres(pg)
+                }
+                // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
+                // backend compiled in, so a `postgresql://` dsn is rejected
+                // cleanly rather than silently falling through.
+                #[cfg(not(feature = "postgres"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
+                    )));
+                }
+            } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
+                #[cfg(feature = "sqlite")]
+                {
+                    // URL parsing follows the SQLAlchemy / Python sqlite3
+                    // convention the CIRISAgent ecosystem already uses:
+                    //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
+                    //   `sqlite:///relative.db`  → file at `relative.db`
+                    //                              (strip leading `/`)
+                    //   `sqlite:///:memory:`     → in-memory
+                    //   `sqlite::memory:`        → in-memory (compact form)
+                    //
+                    // The `sqlite://` prefix is the URL scheme;
+                    // `sqlite:///` is scheme + empty authority + path.
+                    let in_memory = dsn == "sqlite::memory:"
+                        || dsn == "sqlite:///:memory:"
+                        || dsn == "sqlite://:memory:";
+                    let sq = py.detach(|| {
+                        runtime.block_on(async {
                         let sq = if in_memory {
                             SqliteBackend::open_in_memory()
                                 .await
@@ -1684,40 +1719,45 @@ impl PyEngine {
                         // v12.0.2 (CIRISPersist#347) — first-boot-seed the
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
-                        sq.seed_genesis_accord_holders(
-                            &crate::federation::genesis::effective_accord_holder_records(),
-                        )
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        if let Err(e) = sq
+                            .seed_genesis_accord_holders(
+                                &crate::federation::genesis::effective_accord_holder_records(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                        }
                         // v13.4.1 (CIRISPersist#392) — same shared seed routine as
                         // Engine::with_signer (verify anchor → family #386 →
                         // canonical #390); this pyo3 ctor previously stopped at the
                         // holder seed, so wheel consumers got no family + canonical.
+                        // v31.0.0 (CIRISPersist#648) — same survivability rule too.
                         crate::federation::genesis::seed_family_and_canonical(&sq)
                             .await
+                            .or_else(pre_genesis_or_refuse)
                             .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(sq))
                     })
-                })?;
-                #[cfg(feature = "postgres")]
-                {
-                    pg_backend_for_sweep = None;
+                    })?;
+                    #[cfg(feature = "postgres")]
+                    {
+                        pg_backend_for_sweep = None;
+                    }
+                    BackendDispatch::Sqlite(sq)
                 }
-                BackendDispatch::Sqlite(sq)
-            }
-            #[cfg(not(feature = "sqlite"))]
-            {
-                return Err(PyValueError::new_err(format!(
-                    "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
                      was not compiled in for this ciris_persist build"
-                )));
-            }
-        } else {
-            return Err(PyValueError::new_err(format!(
-                "unrecognized dsn scheme: {dsn:?} \
+                    )));
+                }
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "unrecognized dsn scheme: {dsn:?} \
                  (expected `postgresql://…`, `postgres://…`, `sqlite:///…`, or `sqlite::memory:`)"
-            )));
-        };
+                )));
+            };
 
         // ciris-keyring: hardware-backed signer where available,
         // SoftwareSigner fallback otherwise. get_platform_signer
@@ -28934,6 +28974,23 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
+        // v31.0.0 (CIRISPersist#648) — NOT caller-fixable by fixing the
+        // argument: the node has no constitutional trust root, and the remedy
+        // is a genesis ceremony, not a better-formed request. A `ValueError`
+        // would tell a caller to edit its payload and retry forever.
+        //
+        // The `operation` token rides in the message so a Python consumer can
+        // branch on WHICH gate refused without a second copy of the taxonomy —
+        // same shape as `AdminActionUnattributed` below.
+        crate::federation::Error::NoConstitutionalRootYet { operation, leg, .. } => {
+            PyRuntimeError::new_err(format!("{kind}: {operation} ({} leg)", leg.as_str()))
+        }
+        // v31.0.0 (CIRISPersist#648) — caller-fixable only in the sense that
+        // the caller must stop: the constitutional family id is established by
+        // the genesis ceremony and is never a peer declaration.
+        crate::federation::Error::ConstitutionalFamilyReserved { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v25.1.0 (CIRISPersist#570 ask 3/4) — caller-fixable, and the typed
         // token rides in the message so a Python consumer can branch on WHICH
         // branch refused without a second copy of the taxonomy. Both are
