@@ -636,6 +636,87 @@ where
     Ok(())
 }
 
+/// v31.0.0 (CIRISPersist#648) — **the DELEGATION-PLANE leg**: are the rows that
+/// say what this root actually CONFERS installed, and still bound?
+///
+/// # Why this leg exists
+///
+/// The other three legs are all the KEY plane. [`verify_anchor_seeded`] checks
+/// `federation_keys` rows, [`verify_family_seeded`] a `federation_families`
+/// row, [`verify_canonical_seeded`] more `federation_keys` rows. The binding
+/// gates this release added — `check_row_column_binding` (#643) and
+/// `check_instant_binding` (#598) — are ATTESTATION gates, so not one of them
+/// touches any of those three legs, and the stale baked seed's key plane
+/// therefore installs perfectly on a 31.0.0 node.
+///
+/// The consequence, before this leg existed, was MEASURED, and is the reason it
+/// does: a normally-constructed 31.0.0 `Engine` reported `Entrenched`, rendered
+/// NO banner, and a server reading `entrenched()` would enable agent mode — on
+/// a root whose `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle`
+/// rows are refused at every `put_attestation` and can never be installed. That
+/// is a fail-open banner: the operator sees green while conferral is dead.
+///
+/// # Absent vs divergent
+///
+/// A row that is MISSING, or present in the pre-#643 shape, is
+/// [`GenesisFault::absent`] — a node awaiting its ceremony, which BOOTS. That
+/// follows [`seed_canonical_servers`]'s precedent deliberately: 31.0.0 is the
+/// binary that RUNS the ceremony, and a posture that bricked the node on the
+/// exact state the release ships in would put the ceremony out of reach.
+///
+/// A row present whose `original_content_hash` is not the baked one is
+/// [`GenesisFault::divergent`] — not a stale artifact but a SUBSTITUTED
+/// conferral row, and the one case here that must not serve. Same split, and
+/// the same reasoning, as the canonical leg's squatting check.
+pub async fn verify_delegation_plane_seeded<D>(dir: &D) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Delegation;
+    for sa in &canonical_genesis_bundle().attestations {
+        let want = &sa.attestation;
+        let id = &want.attestation_id;
+        let row = dir
+            .get_attestation(id)
+            .await
+            .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup {id}: {e}")))?
+            .ok_or_else(|| {
+                GenesisFault::absent(LEG, format!("delegation row {id} is not installed"))
+            })?;
+        // Content FIRST: a substituted conferral row is the case that must not
+        // serve, and the signed digest alone separates it from a merely stale one.
+        if row.original_content_hash != want.original_content_hash {
+            return Err(GenesisFault::divergent(
+                LEG,
+                format!(
+                    "delegation row {id} is present with a content hash that is not the baked \
+                     one (stored {}, baked {}) — a substituted conferral row",
+                    row.original_content_hash, want.original_content_hash,
+                ),
+            ));
+        }
+        // Then SHAPE: a row installed under the pre-#643 envelope is the state
+        // 31.0.0 ships in, so it is `absent` — awaiting the re-ceremony.
+        if let Err(e) = crate::federation::admission::check_row_column_binding(&row) {
+            return Err(GenesisFault::absent(
+                LEG,
+                format!("delegation row {id} predates the #643 row mirror: {e}"),
+            ));
+        }
+        if let Err(e) = crate::federation::admission::check_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        ) {
+            return Err(GenesisFault::absent(
+                LEG,
+                format!("delegation row {id} predates the #598 signed instants: {e}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// v31.0.0 (CIRISPersist#648) — **is this bundle's delegation plane bound to
 /// its typed columns (CIRISPersist#643), i.e. is it a v31-shaped bundle?**
 ///
@@ -659,12 +740,36 @@ where
 /// 31.1.0's re-bake turns the seed-install witnesses back on by itself and
 /// nobody has to remember to.
 #[must_use = "the caller branches on which regime the baked bundle is in"]
-pub fn bundle_delegation_plane_row_bound(bundle: &GenesisBundle) -> Result<(), String> {
+pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), String> {
     for att in &bundle.attestations {
-        crate::federation::admission::check_row_column_binding(&att.attestation)
-            .map_err(|e| e.to_string())?;
+        let row = &att.attestation;
+        // BOTH binding gates, because "v31-shaped" is a property of the
+        // envelope, not of one issue number. Asking only about the #643 mirror
+        // was over-specific the moment #598's instant gate widened past
+        // `consent:state:*`: the stale bundle now trips the instant gate FIRST,
+        // and a predicate that answered "row-bound: no" for the wrong reason
+        // would still be answering by accident.
+        crate::federation::admission::check_row_column_binding(row).map_err(|e| e.to_string())?;
+        crate::federation::admission::check_instant_binding(
+            row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// v31.0.0 — the refusal a PRE-v31 delegation row must produce: one of the two
+/// envelope-binding gates, named in the message.
+///
+/// Asserted as a SET rather than as `#643` alone. Both gates refuse the stale
+/// bundle, the tier order decides which speaks first, and pinning one issue
+/// number made a witness that broke when the other gate widened — while the
+/// property it exists to prove never changed.
+#[cfg(test)]
+pub(crate) fn is_v31_binding_refusal(msg: &str) -> bool {
+    msg.contains("CIRISPersist#643") || msg.contains("CIRISPersist#598")
 }
 
 /// v30.6.0 (CIRISPersist#622) — the THREE-BACKEND genesis witness.
@@ -697,7 +802,7 @@ pub fn bundle_delegation_plane_row_bound(bundle: &GenesisBundle) -> Result<(), S
 /// The ATTESTATION half cannot pass while the baked bundle predates #643 — its
 /// rows carry no signed `row` mirror, so `put_attestation` refuses them at
 /// every backend, deliberately and correctly. This witness is therefore
-/// branched on [`bundle_delegation_plane_row_bound`] rather than skipped:
+/// branched on [`bundle_delegation_plane_v31_shaped`] rather than skipped:
 ///
 /// - **pre-v31 bundle** — assert the rows are REFUSED, with the #643 reason,
 ///   and that NOTHING was written. That is a real property of a real build and
@@ -736,7 +841,7 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
     // passes on the broken schema and proves nothing. (It did: the first version
     // of this body was green on unfixed Postgres.)
     let bundle = canonical_genesis_bundle();
-    let row_bound = bundle_delegation_plane_row_bound(bundle);
+    let row_bound = bundle_delegation_plane_v31_shaped(bundle);
     for att in &bundle.attestations {
         let id = &att.attestation.attestation_id;
         match &row_bound {
@@ -766,17 +871,18 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
             //    binding gate, and this reds on it.
             Err(_) => {
                 let err = dir.put_attestation(att.clone()).await.expect_err(
-                    "a pre-v31 genesis attestation must be REFUSED by the #643 row-binding \
+                    "a pre-v31 genesis attestation must be REFUSED by an envelope-binding \
                      gate on EVERY backend",
                 );
                 assert_eq!(
                     err.kind(),
                     "federation_invalid_argument",
-                    "the refusal is the #643 row-binding gate, not a backend accident"
+                    "the refusal is an envelope-binding gate, not a backend accident"
                 );
                 assert!(
-                    err.to_string().contains("CIRISPersist#643"),
-                    "the refusal names the gate that refused: {err}"
+                    is_v31_binding_refusal(&err.to_string()),
+                    "the refusal names an envelope-binding gate (#643 mirror or #598 \
+                     instants): {err}"
                 );
                 assert!(
                     dir.get_attestation(id).await.expect("read back").is_none(),
@@ -906,7 +1012,7 @@ mod tests {
         // operator's 31.0.0 → 31.1.0 plan — and the refusal is asserted rather
         // than skipped. For a re-signed candidate the full trust-root walk runs
         // as before, on the artifact, with nobody editing the test.
-        if let Err(why) = bundle_delegation_plane_row_bound(&b) {
+        if let Err(why) = bundle_delegation_plane_v31_shaped(&b) {
             eprintln!("DRYRUN: candidate is PRE-v31 (delegation plane not row-bound): {why}");
             for att in &b.attestations {
                 let err = sq
@@ -916,8 +1022,9 @@ mod tests {
                     .await
                     .expect_err("a pre-#643 candidate attestation must be REFUSED, not baked");
                 assert!(
-                    err.to_string().contains("CIRISPersist#643"),
-                    "the refusal names the binding gate: {err}"
+                    is_v31_binding_refusal(&err.to_string()),
+                    "the refusal names an envelope-binding gate (#643 mirror or #598 \
+                     instants): {err}"
                 );
             }
             eprintln!(

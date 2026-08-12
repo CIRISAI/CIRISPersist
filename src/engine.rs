@@ -7653,7 +7653,10 @@ mod tests {
             "the banner says what it is: {banner}"
         );
 
-        // And a normally-constructed engine IS entrenched (the prod path).
+        // And a normally-constructed engine — the PROD path, the one 31.0.0
+        // actually ships. Its KEY plane seeds cleanly (the family lands), so
+        // this leg also pins that the three key legs are unaffected by the
+        // binding gates.
         let seeded = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct seeded engine");
@@ -7663,11 +7666,47 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(
-            seeded.genesis_posture().await.entrenched(),
-            "a baked-seed node is entrenched and renders NO banner"
-        );
-        assert!(seeded.genesis_posture().await.banner().is_none());
+        let seeded_posture = seeded.genesis_posture().await;
+
+        // Branch on the ARTIFACT, exactly as the four genesis witnesses do, so
+        // 31.1.0's re-bake flips this back with nobody editing the test.
+        let bundle = crate::federation::genesis::canonical_genesis_bundle();
+        if crate::federation::genesis::bundle_delegation_plane_v31_shaped(bundle).is_err() {
+            // The state 31.0.0 SHIPS IN. Before the delegation plane became a
+            // posture leg this asserted `entrenched()` and no banner — and it
+            // PASSED, which is precisely the fail-open this leg closes: the key
+            // plane seeds, so three of four legs are green, while the rows that
+            // confer everything are refused and can never be installed.
+            assert!(
+                !seeded_posture.entrenched(),
+                "a node whose conferral plane cannot be installed is NOT entrenched: \
+                 {seeded_posture:?}"
+            );
+            assert!(
+                matches!(
+                    seeded_posture,
+                    GenesisPosture::PreGenesis {
+                        leg: GenesisLeg::Delegation,
+                        ..
+                    }
+                ),
+                "the missing leg is the DELEGATION plane, named: {seeded_posture:?}"
+            );
+            let banner = seeded_posture
+                .banner()
+                .expect("a node with a dead conferral plane renders a banner");
+            assert!(
+                banner.contains("PRE-GENESIS"),
+                "the operator is told, not left with a green light: {banner}"
+            );
+        } else {
+            // 31.1.0 onward: the re-baked bundle installs, all four legs seat.
+            assert!(
+                seeded_posture.entrenched(),
+                "a re-baked v31 seed IS entrenched: {seeded_posture:?}"
+            );
+            assert!(seeded_posture.banner().is_none());
+        }
     }
 
     /// v31.0.0 (CIRISPersist#648) — **the anti-fail-open witness, and the most

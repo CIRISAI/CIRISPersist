@@ -79,6 +79,18 @@ pub enum GenesisLeg {
     /// it as a precondition of that gate would make the ceremony unable to
     /// establish the very leg it is establishing.
     Canonical,
+    /// v31.0.0 (CIRISPersist#648) — the baked DELEGATION PLANE: the
+    /// `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle`
+    /// `federation_attestations` rows. The roster says WHO, the family says HOW
+    /// MANY, the canonical says WHERE — and this leg is the only one that says
+    /// WHAT THE ROOT ACTUALLY CONFERS.
+    ///
+    /// Reported for the same reason `Canonical` is, and excluded from
+    /// [`require_constitutional_root`] for the same reason it is: the ceremony
+    /// installs these rows THROUGH the conferral gates, so demanding them as a
+    /// precondition of those gates would stop the ceremony establishing the
+    /// very leg it exists to establish.
+    Delegation,
 }
 
 impl GenesisLeg {
@@ -89,11 +101,17 @@ impl GenesisLeg {
             Self::Anchor => "anchor",
             Self::Family => "family",
             Self::Canonical => "canonical",
+            Self::Delegation => "delegation",
         }
     }
 
     /// Every leg, in establishment order — the closed set.
-    pub const ALL: &'static [Self] = &[Self::Anchor, Self::Family, Self::Canonical];
+    pub const ALL: &'static [Self] = &[
+        Self::Anchor,
+        Self::Family,
+        Self::Canonical,
+        Self::Delegation,
+    ];
 }
 
 impl std::fmt::Display for GenesisLeg {
@@ -394,7 +412,18 @@ where
     if super::test_anchor_override_active() {
         return GenesisPosture::Entrenched;
     }
-    match super::verify_canonical_seeded(dir).await {
+    if let Err(f) = super::verify_canonical_seeded(dir).await {
+        return f.into();
+    }
+    // v31.0.0 (CIRISPersist#648) — the FOURTH leg, and the one 31.0.0 actually
+    // fails. The three legs above are ALL the key plane, which the stale baked
+    // seed still installs cleanly; only the delegation plane is refused by the
+    // #643 mirror and #598 instant gates. Without this check a 31.0.0 node
+    // reports `entrenched`, renders no banner, and a server enables agent mode
+    // — on a root whose conferral rows can never be installed. A posture that
+    // cannot see the plane conferring everything is not reporting on a trust
+    // root; it is reporting on a key list.
+    match super::verify_delegation_plane_seeded(dir).await {
         Ok(()) => GenesisPosture::Entrenched,
         Err(f) => f.into(),
     }

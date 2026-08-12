@@ -11417,7 +11417,7 @@ mod tests {
         let artifact_bundle: crate::federation::genesis::GenesisBundle =
             serde_json::from_str(artifact).expect("artifact parses");
         let row_bound =
-            crate::federation::genesis::bundle_delegation_plane_row_bound(&artifact_bundle);
+            crate::federation::genesis::bundle_delegation_plane_v31_shaped(&artifact_bundle);
         for (id, outcome) in &report.attestations {
             match &row_bound {
                 Ok(()) => assert!(
@@ -11429,7 +11429,7 @@ mod tests {
                 ),
                 Err(_) => match outcome {
                     BakeItemOutcome::Skipped(why) => assert!(
-                        why.contains("CIRISPersist#643"),
+                        crate::federation::genesis::is_v31_binding_refusal(why),
                         "row {id} must be skipped BY THE BINDING GATE, not for some other \
                          reason: {why}"
                     ),
