@@ -327,6 +327,147 @@ impl RowMirror {
             },
         })
     }
+
+    /// v31.0.0 (CIRISPersist#649) — **stamp [`Self::of`] into an envelope
+    /// VALUE**: the ONE placement of the one projection, for every write path
+    /// that owns the bytes it is about to sign.
+    ///
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`] cannot
+    /// use this (at the mint there is no row yet — it builds the mirror from
+    /// the emit input and the id it is minting). Every OTHER producing path
+    /// has a row in hand: the local-tier write, and the two placement-touching
+    /// re-signs (promotion and the #530 repair re-scope). Those go through
+    /// here rather than each spelling `envelope[paths::ROW] =
+    /// to_value(RowMirror::of(row))`, because a copied projection is a second
+    /// definition of the binding and this substrate has a recorded defect
+    /// class for exactly that.
+    ///
+    /// Refuses a non-object envelope rather than silently replacing it — an
+    /// envelope is always an object (see [`EnvelopeCore::from_value`]), and
+    /// `serde_json`'s `IndexMut` would otherwise *overwrite* a scalar with an
+    /// object and lose the producer's bytes.
+    pub fn stamp_into(
+        envelope: &mut serde_json::Value,
+        row: &super::Attestation,
+    ) -> Result<(), super::Error> {
+        let mirror = Self::of(row)?;
+        mirror.insert_into(envelope, &row.attestation_id)
+    }
+
+    /// The ONE write of [`paths::ROW`] — every stamping entry point funnels
+    /// here so there is one placement as well as one projection.
+    fn insert_into(
+        &self,
+        envelope: &mut serde_json::Value,
+        attestation_id: &str,
+    ) -> Result<(), super::Error> {
+        let obj = envelope.as_object_mut().ok_or_else(|| {
+            super::Error::InvalidArgument(format!(
+                "attestation {attestation_id}: attestation_envelope must be a JSON object to \
+                 carry the signed `{}` mirror (CIRISPersist#649)",
+                paths::ROW,
+            ))
+        })?;
+        obj.insert(
+            paths::ROW.to_owned(),
+            serde_json::to_value(self).map_err(|e| {
+                super::Error::Backend(format!("RowMirror serialize: {e} (CIRISPersist#649)"))
+            })?,
+        );
+        Ok(())
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the envelope a PLACEMENT-TOUCHING write
+    /// must sign AND store.**
+    ///
+    /// `base` is the envelope whose bytes will actually be served — the row's
+    /// own for an ordinary promotion, the TRANSFORMED clone for a #510
+    /// restriction pipeline. `row` is the row as it stands; `cohort_scope` is
+    /// the placement it is about to land at. The returned envelope carries the
+    /// mirror of the row **as it will be stored**, so the bytes signed over it
+    /// and the columns written beside it are one statement.
+    ///
+    /// This exists because promotion RE-SIGNS a row and CHANGES `cohort_scope`
+    /// — one of the seven columns #643 bound — so re-signing the pre-promotion
+    /// envelope produced a row asserting its old scope while its column said
+    /// otherwise, and every peer's `put_attestation` refused it. Promotion is
+    /// the local→federation path, so that broke the thing promotion is for.
+    /// The same shape as CIRISPersist#598 (`assemble` sampling `Utc::now()`
+    /// after signing) and #643's blob-eviction sweeper: **a write path that
+    /// constructs signed bytes and then mutates the row.**
+    pub fn restamp_for_scope(
+        base: &serde_json::Value,
+        row: &super::Attestation,
+        cohort_scope: &str,
+    ) -> Result<serde_json::Value, super::Error> {
+        let mut as_stored = row.clone();
+        as_stored.cohort_scope = cohort_scope.to_owned();
+        let mut envelope = base.clone();
+        Self::stamp_into(&mut envelope, &as_stored)?;
+        Ok(envelope)
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the local-tier write STAMPS.** Called by
+    /// all three backends' `write_local_attestation` on the assembled row,
+    /// before `persist_row_hash`.
+    ///
+    /// # The decision, and why
+    ///
+    /// The choice was "stamp at write" vs "stay unstamped until sealed".
+    /// **Stamp**, on the emit path's own rule: *the party that MINTS the bytes
+    /// stamps; the party that RECEIVES them checks.* At this door persist mints
+    /// the bytes — it assigns `attestation_id` (a `Uuid::new_v4()` unless the
+    /// producer supplied a deterministic one), defaults `attested_key_id` to the
+    /// attester, and stamps `tier`/`cohort_scope`. Four of the seven bound
+    /// columns are therefore persist's own values, and a producer literally
+    /// cannot bind them in advance.
+    ///
+    /// Three consequences settle it:
+    ///
+    /// 1. **`put_attestation`'s binding gate is TIER-BLIND** (#643, deliberately
+    ///    — a tier-scoped binding is skippable by writing `tier = "local"`). So
+    ///    an unstamped local row is a row this substrate's OWN put door refuses:
+    ///    two local-write doors, one of which mints rows the other rejects. That
+    ///    is the "door beside the door" class, minted fresh.
+    /// 2. **The promote door now asks the same question**
+    ///    ([`crate::federation::admission::check_promotion_admission`]). Leaving
+    ///    the stamp to promotion means the FIRST time a local row's meaning is
+    ///    bound is the moment it is republished — so nothing at rest at the local
+    ///    tier is self-describing, and the substrate's own copy is the one plane
+    ///    where a rewritten `attestation_type` leaves no trace.
+    /// 3. **It is free and lossless here.** A durable local row carries the
+    ///    deferred empty-sentinel scrub envelope (`scrub_signature_classical =
+    ///    ""`), so there is no signature to invalidate: this is the last moment
+    ///    the bytes are persist's to write. Promotion's re-stamp then becomes a
+    ///    one-column narrowing (`cohort_scope`) of an already-correct mirror
+    ///    rather than a first stamp.
+    ///
+    /// # The transit exclusion (`caller_signed`)
+    ///
+    /// A **subject-side revocation transiting** the local tier
+    /// ([`crate::federation::types::LocalAttestationInput::into_transit_revocation_row`])
+    /// is NOT persist's to stamp: the caller hybrid-signed
+    /// `JCS(attestation_envelope)` and
+    /// [`crate::federation::admission::verify_local_transit_revocation`] has
+    /// already verified that signature and derived `original_content_hash` from
+    /// those exact bytes. Stamping afterwards would rewrite the signed bytes and
+    /// leave a stored hash and signature covering an envelope that no longer
+    /// exists — **this very defect, one door over**. For that shape persist is
+    /// the receiver, so the mirror is the producer's to bind and persist's to
+    /// check; it is checked where the signature is (`put_attestation`, and the
+    /// promote door the SLA watcher drives it through), not silently written
+    /// here.
+    pub fn stamp_local_row(
+        row: &mut super::Attestation,
+        caller_signed: bool,
+    ) -> Result<(), super::Error> {
+        if caller_signed {
+            return Ok(());
+        }
+        let mirror = Self::of(row)?;
+        let attestation_id = row.attestation_id.clone();
+        mirror.insert_into(&mut row.attestation_envelope, &attestation_id)
+    }
 }
 
 impl EnvelopeCore {

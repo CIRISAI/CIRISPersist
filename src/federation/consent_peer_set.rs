@@ -307,14 +307,23 @@ pub(crate) mod test_support {
         );
 
         // ── set_attestation_cohort_scope: write-back + validation ──
-        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION)
+        // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN: `cohort_scope`
+        // is bound into the signed envelope, so the door takes the re-stamped
+        // + re-signed bundle beside the new placement.
+        let local1_row = dir.get_attestation(&local1).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &local1_row.attesting_key_id,
+            &local1_row,
+            cohort_scope::FEDERATION,
+        );
+        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION, &reseal)
             .await
             .expect("cohort_scope write-back");
         let after = dir.get_attestation(&local1).await.unwrap().expect("row");
         assert_eq!(after.cohort_scope, cohort_scope::FEDERATION);
 
         let invalid = dir
-            .set_attestation_cohort_scope(&local1, "not-a-real-scope")
+            .set_attestation_cohort_scope(&local1, "not-a-real-scope", &reseal)
             .await;
         assert!(
             matches!(invalid, Err(crate::federation::Error::InvalidArgument(_))),
@@ -325,6 +334,7 @@ pub(crate) mod test_support {
             .set_attestation_cohort_scope(
                 "00000000-0000-0000-0000-000000000000",
                 cohort_scope::FEDERATION,
+                &reseal,
             )
             .await;
         assert!(

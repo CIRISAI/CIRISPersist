@@ -3129,8 +3129,6 @@ impl Engine {
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
 
         // v21.5.0 (CIRISPersist#519) — a promotion is a PLACEMENT-touching
         // primitive: it MUST carry the placement, not tier alone. Before #519
@@ -3194,61 +3192,30 @@ impl Engine {
         // `(federation, new)` with no intermediate state and no partial
         // application on refusal.
 
-        // 2. Canonicalize the envelope (produce gate → JCS post-cut) + hash.
-        let canonical = crate::verify::canonical::ceg_produce_canonicalize(
-            &row.attestation_envelope,
-        )
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("attestation_promote canonicalize: {e}"))
-        })?;
-        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
+        // 2. RE-STAMP → canonicalize → hash → hybrid-sign, in one recipe (see
+        // [`Self::reseal_for_scope`] — v31.0.0 / CIRISPersist#649).
+        let reseal = self
+            .reseal_for_scope(
+                &row.attestation_envelope,
+                &row,
+                cohort_scope,
+                "attestation_promote",
+            )
+            .await?;
 
-        // 3. Hybrid-sign the canonical bytes (matches the native produce
-        // path: signer.sign(canonical_bytes)).
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("attestation_promote sign_hybrid: {e}"))
-        })?;
-        let classical_b64 = B64.encode(&sig.classical.signature);
-        let pqc_b64 = B64.encode(&sig.pqc.signature);
-        // v9.3.0 (#247) — `scrub_key_id` FKs to `federation_keys(key_id)`,
-        // which is the **derived** wire key_id (`<label>-<fp>`), NOT the
-        // keystore alias `current_alias()`. Using the alias FK-violated on
-        // every node whose alias ≠ derived id (i.e. every real node).
-        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "attestation_promote derive scrub_key_id: {e}"
-            ))
-        })?;
-        let now = chrono::Utc::now();
-
-        // 4. Write back the scrub envelope + flip tier (signed-epoch gate
-        // on the verify side will read these post-cut as JCS).
+        // 3. Write back the re-stamped envelope + scrub envelope + flip tier
+        // (signed-epoch gate on the verify side will read these post-cut as
+        // JCS).
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                b.promote_attestation(
-                    attestation_id,
-                    cohort_scope,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(attestation_id, cohort_scope, &reseal)
+                    .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                b.promote_attestation(
-                    attestation_id,
-                    cohort_scope,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(attestation_id, cohort_scope, &reseal)
+                    .await
             }
         }
     }
@@ -3334,8 +3301,9 @@ impl Engine {
     /// P3 follow-up) — `to_transform_ops` skips them. When the resulting
     /// pipeline is non-empty, [`Self::promote_attestation_with_transforms`]
     /// signs the TRANSFORMED envelope and writes it back via
-    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`];
-    /// with an EMPTY pipeline (no restrictions, or only
+    /// [`crate::federation::FederationDirectory::promote_attestation`] (the
+    /// one promotion primitive since v31.0.0 / CIRISPersist#649); with an
+    /// EMPTY pipeline (no restrictions, or only
     /// `RecipientCapability` ones), [`Self::attestation_promote`] is used
     /// unchanged (the byte-identical-wire property #509 established is
     /// preserved for the common case). v21.7.0 kept the closed
@@ -3602,17 +3570,39 @@ impl Engine {
                     continue;
                 }
 
-                let rescope_result = match &self.backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(b) => {
-                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
-                            .await
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(b) => {
-                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
-                            .await
-                    }
+                // v31.0.0 (CIRISPersist#649) — A RE-SCOPE IS A RE-SIGN. This
+                // motion's own doc used to say `cohort_scope` sits "outside the
+                // signed envelope, so the scrub signature stays valid";
+                // CIRISPersist#643 made that false by binding it into
+                // `envelope.row`. Re-scoping in place therefore produced a row
+                // whose signed mirror asserted the OLD suppressed scope — a row
+                // the repair made visible and every peer refused, which is a
+                // repair that fixes the symptom and breaks the thing. So the
+                // mirror is re-stamped and the row re-signed with this node's
+                // key, exactly as `attestation_promote` does at the first
+                // placement door.
+                let rescope_result = self
+                    .reseal_for_scope(
+                        &row.attestation_envelope,
+                        row,
+                        &target,
+                        "repair_stranded_scope_backlog",
+                    )
+                    .await;
+                let rescope_result = match rescope_result {
+                    Ok(reseal) => match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            b.set_attestation_cohort_scope(&row.attestation_id, &target, &reseal)
+                                .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            b.set_attestation_cohort_scope(&row.attestation_id, &target, &reseal)
+                                .await
+                        }
+                    },
+                    Err(e) => Err(e),
                 };
                 match rescope_result {
                     Ok(()) => report.rescoped += 1,
@@ -3639,7 +3629,10 @@ impl Engine {
     /// hybrid-sign the TRANSFORMED bytes (NEVER the original — the
     /// signature must cover exactly what a recipient will see), and write
     /// back through
-    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`].
+    /// [`crate::federation::FederationDirectory::promote_attestation`] — the ONE
+    /// promotion primitive since v31.0.0 (CIRISPersist#649), which the #510
+    /// `_transformed` variant was folded into once EVERY promotion had to write
+    /// its envelope back.
     /// `original_content_hash` is the hash of the TRANSFORMED canonical —
     /// it is the content actually signed/shipped, matching how
     /// [`Self::attestation_promote`] hashes the (untransformed) canonical
@@ -3669,6 +3662,63 @@ impl Engine {
     /// (`dimension`/`trace_id` never stripped) lives inside
     /// [`crate::federation::transform::apply`]'s `StripField` arm, so it
     /// holds unchanged through the pipeline.
+    /// v31.0.0 (CIRISPersist#649) — **the ONE recipe for a placement-touching
+    /// re-sign**: re-stamp the typed-column mirror for the scope the row is
+    /// about to land at, canonicalize, hash, hybrid-sign, and resolve this
+    /// node's DERIVED federation key_id.
+    ///
+    /// All three placement-touching motions go through here —
+    /// [`Self::attestation_promote`],
+    /// [`Self::promote_attestation_with_transforms`] and
+    /// [`Self::repair_stranded_scope_backlog`] — because the defect this
+    /// closes was three copies of "canonicalize → sign → write a different
+    /// `cohort_scope`", and a fourth copy is how it comes back. `base` is the
+    /// envelope whose bytes will be SERVED: the row's own, or a #510
+    /// restriction pipeline's output.
+    ///
+    /// The re-stamp is [`crate::federation::envelope::RowMirror::restamp_for_scope`],
+    /// which is [`crate::federation::envelope::RowMirror::of`] — the SAME
+    /// projection [`crate::federation::admission::check_row_column_binding`]
+    /// compares against. There is no second spelling of it anywhere.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn reseal_for_scope(
+        &self,
+        base: &serde_json::Value,
+        row: &crate::federation::Attestation,
+        cohort_scope: &str,
+        what: &str,
+    ) -> Result<crate::federation::AttestationReseal, crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let attestation_envelope =
+            crate::federation::envelope::RowMirror::restamp_for_scope(base, row, cohort_scope)?;
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&attestation_envelope)
+            .map_err(|e| {
+            crate::federation::Error::Backend(format!("{what} canonicalize: {e}"))
+        })?;
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let sig = self
+            .sign_hybrid(&canonical)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("{what} sign_hybrid: {e}")))?;
+        // v9.3.0 (#247) — `scrub_key_id` FKs to `federation_keys(key_id)`,
+        // which is the **derived** wire key_id (`<label>-<fp>`), NOT the
+        // keystore alias `current_alias()`. Using the alias FK-violated on
+        // every node whose alias ≠ derived id (i.e. every real node).
+        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("{what} derive scrub_key_id: {e}"))
+        })?;
+        Ok(crate::federation::AttestationReseal {
+            attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            scrub_key_id,
+            scrub_timestamp: chrono::Utc::now(),
+        })
+    }
+
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn promote_attestation_with_transforms(
         &self,
@@ -3678,8 +3728,6 @@ impl Engine {
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
 
         // v21.5.0 (CIRISPersist#519) — placement carriage, same contract as
         // `attestation_promote`: the transform path is also a placement-
@@ -3690,8 +3738,8 @@ impl Engine {
         // `set_attestation_cohort_scope` pre-stamp is GONE for the same reason
         // it is gone from `attestation_promote`: promotion can now be REFUSED
         // by `check_promotion_admission`, and a pre-stamp would leave a refused
-        // row mutated (AV-9). The placement rides
-        // `promote_attestation_transformed` and lands with the tier flip.
+        // row mutated (AV-9). The placement rides the promotion primitive and
+        // lands with the tier flip.
         if !cs::is_valid(cohort_scope) || cohort_scope == cs::SELF {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "promote_attestation_with_transforms: cohort_scope {cohort_scope:?} is not a \
@@ -3705,56 +3753,29 @@ impl Engine {
                 "promote_attestation_with_transforms apply_all: {e}"
             ))
         })?;
-
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&transformed).map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "promote_attestation_with_transforms canonicalize: {e}"
-                ))
-            })?;
-        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "promote_attestation_with_transforms sign_hybrid: {e}"
-            ))
-        })?;
-        let classical_b64 = B64.encode(&sig.classical.signature);
-        let pqc_b64 = B64.encode(&sig.pqc.signature);
-        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "promote_attestation_with_transforms derive scrub_key_id: {e}"
-            ))
-        })?;
-        let now = chrono::Utc::now();
+        // v31.0.0 (CIRISPersist#649) — the SAME recipe the untransformed path
+        // runs, over the TRANSFORMED bytes: a restriction pipeline is just a
+        // different `base`. The mirror is stamped AFTER the pipeline, so a
+        // strip can never leave the binding half-applied.
+        let reseal = self
+            .reseal_for_scope(
+                &transformed,
+                row,
+                cohort_scope,
+                "promote_attestation_with_transforms",
+            )
+            .await?;
 
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                b.promote_attestation_transformed(
-                    &row.attestation_id,
-                    cohort_scope,
-                    &transformed,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+                    .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                b.promote_attestation_transformed(
-                    &row.attestation_id,
-                    cohort_scope,
-                    &transformed,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+                    .await
             }
         }
     }
@@ -11245,8 +11266,25 @@ mod tests {
             "promoter scrub_key_id is the DERIVED federation key_id, not the alias (#247)"
         );
         assert!(after.promoted_at.is_some(), "promoted_at stamped");
-        // Envelope is untouched by promotion (signing reads it, never edits).
-        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+        // v31.0.0 (CIRISPersist#649) — the envelope is touched by promotion in
+        // EXACTLY ONE PLACE: the typed-column mirror's `cohort_scope`, which is
+        // the column the promotion changes. This assertion used to read
+        // "envelope is untouched by promotion (signing reads it, never edits)",
+        // and that WAS the defect: #643 bound `cohort_scope` into the signed
+        // envelope, so a promotion that left the envelope alone signed a mirror
+        // asserting the row's pre-promotion scope and every peer refused the
+        // result. Pinned member-by-member so a future change that edits
+        // anything ELSE is caught here.
+        let mut expected_envelope = before.attestation_envelope.clone();
+        expected_envelope[crate::federation::envelope::paths::ROW]
+            [crate::federation::envelope::row_paths::COHORT_SCOPE] =
+            serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        assert_eq!(
+            after.attestation_envelope, expected_envelope,
+            "promotion re-stamps the mirror's cohort_scope and NOTHING else"
+        );
+        crate::federation::admission::check_row_column_binding(&after)
+            .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
         // Idempotent: re-promoting a federation row is a no-op.
         let again = engine
@@ -11465,7 +11503,20 @@ mod tests {
         assert_eq!(after.original_content_hash.len(), 64);
         assert_eq!(after.scrub_key_id, occ);
         assert!(after.promoted_at.is_some());
-        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+        // v31.0.0 (CIRISPersist#649) — the sqlite twin's rule, on postgres: a
+        // promotion edits EXACTLY the mirror's `cohort_scope` and nothing else.
+        // Leaving the envelope untouched was the defect — it signed a mirror
+        // asserting the pre-promotion scope, and every peer refused the result.
+        let mut expected_envelope = before.attestation_envelope.clone();
+        expected_envelope[crate::federation::envelope::paths::ROW]
+            [crate::federation::envelope::row_paths::COHORT_SCOPE] =
+            serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        assert_eq!(
+            after.attestation_envelope, expected_envelope,
+            "promotion re-stamps the mirror's cohort_scope and NOTHING else"
+        );
+        crate::federation::admission::check_row_column_binding(&after)
+            .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
         // Idempotent re-promote.
         let again = engine
@@ -11824,7 +11875,13 @@ mod tests {
         // closed set) — that asymmetry with attestation_promote (which
         // rejects `self`) is exactly what lets a tier-only path mint the
         // incoherent state we are reproducing.
-        sq.set_attestation_cohort_scope(&id, cohort_scope::SELF)
+        let promoted = sq.get_attestation(&id).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &promoted.attesting_key_id,
+            &promoted,
+            cohort_scope::SELF,
+        );
+        sq.set_attestation_cohort_scope(&id, cohort_scope::SELF, &reseal)
             .await
             .expect("force scope back to self (strand it)");
         let r = sq.get_attestation(&id).await.unwrap().expect("row");
@@ -12016,7 +12073,13 @@ mod tests {
             .attestation_promote(&trace_id, cohort_scope::FEDERATION)
             .await
             .expect("promote to federation");
-        pg.set_attestation_cohort_scope(&trace_id, cohort_scope::SELF)
+        let promoted = pg.get_attestation(&trace_id).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &promoted.attesting_key_id,
+            &promoted,
+            cohort_scope::SELF,
+        );
+        pg.set_attestation_cohort_scope(&trace_id, cohort_scope::SELF, &reseal)
             .await
             .expect("force scope back to self (strand it)");
 
@@ -12462,10 +12525,19 @@ mod tests {
         let pipeline = transform::TransformPipeline(ops);
 
         // What the total algebra itself produces over the row's own
-        // pre-promotion envelope.
-        let expected = pipeline
-            .apply_all(&row.attestation_envelope)
-            .expect("apply_all over a strip_field-only pipeline is total");
+        // pre-promotion envelope — plus the ONE edit v31.0.0 (CIRISPersist#649)
+        // adds after it: the typed-column mirror re-stamped for the placement
+        // the promotion is about to land at. The strip must still be exactly
+        // `apply_all`'s output in every OTHER respect; a bespoke loop
+        // reappearing inside the transform path still fails here.
+        let expected = crate::federation::envelope::RowMirror::restamp_for_scope(
+            &pipeline
+                .apply_all(&row.attestation_envelope)
+                .expect("apply_all over a strip_field-only pipeline is total"),
+            &row,
+            crate::federation::types::cohort_scope::FEDERATION,
+        )
+        .expect("finite weight");
 
         // What the engine's promotion primitive actually signs and writes.
         let promoted = engine

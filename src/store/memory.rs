@@ -924,6 +924,7 @@ impl MemoryBackend {
         // the instant binding at the promote door.
         let now =
             crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
+        let is_transit = transit.is_some();
         let mut row = match transit {
             Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
                 attestation_id.clone(),
@@ -934,6 +935,11 @@ impl MemoryBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
+        // See `crate::federation::envelope::RowMirror::stamp_local_row` for
+        // the decision and the transit exclusion. One helper, all three
+        // backends.
+        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, is_transit)?;
         // v31.0.0 (CIRISPersist#598) — the same binding the federation door
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
@@ -3256,13 +3262,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
-    /// write-back: validate against the closed cohort_scope set, stamp
-    /// it, and recompute `persist_row_hash`.
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
+    /// validate against the closed cohort_scope set, stamp it alongside the
+    /// re-signed envelope, and recompute `persist_row_hash`.
     async fn set_attestation_cohort_scope(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<(), crate::federation::Error> {
         if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -3295,9 +3302,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // reject is exactly the class this ordering exists to deny.
             let mut candidate = row.clone();
             candidate.cohort_scope = cohort_scope.to_owned();
+            candidate.attestation_envelope = reseal.attestation_envelope.clone();
             crate::federation::admission::check_promotion_cohort_standing(&candidate)?;
+            // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING at the
+            // SECOND placement door. `cohort_scope` is one of the seven columns
+            // #643 bound into the signed envelope, so re-scoping in place made
+            // the row's own mirror diverge from its column and every peer's
+            // `put_attestation` refused it. The caller re-stamps and re-signs;
+            // this refuses a caller that did not.
+            crate::federation::admission::check_row_column_binding(&candidate)?;
 
             row.cohort_scope = cohort_scope.to_owned();
+            row.attestation_envelope = reseal.attestation_envelope.clone();
+            row.original_content_hash = reseal.original_content_hash.clone();
+            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
+            row.scrub_key_id = reseal.scrub_key_id.clone();
+            row.scrub_timestamp = reseal.scrub_timestamp;
+            row.pqc_completed_at = reseal
+                .scrub_signature_pqc
+                .as_ref()
+                .map(|_| reseal.scrub_timestamp);
             let mut for_hash = row.clone();
             for_hash.persist_row_hash = String::new();
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -6014,11 +6039,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
         // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
@@ -6028,6 +6049,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // critical section would deadlock this backend. Running it first is
         // also verify-before-mutation (AV-9) — a refused promotion never
         // touches the row.
+        //
+        // v31.0.0 (CIRISPersist#649) — gated on the RE-STAMPED envelope, the
+        // same discipline the transformed path always had: the gate must read
+        // the bytes this row will federate as, and `check_row_column_binding`
+        // inside it compares the mirror in THOSE bytes against the
+        // post-promotion columns.
         {
             let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
                 crate::federation::Error::InvalidArgument(format!(
@@ -6036,6 +6063,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })?;
             if current.tier != attestation_tier::FEDERATION {
                 let mut as_promoted = current;
+                as_promoted.attestation_envelope = reseal.attestation_envelope.clone();
                 as_promoted.tier = attestation_tier::FEDERATION.to_string();
                 as_promoted.cohort_scope = cohort_scope.to_owned();
                 crate::federation::admission::check_promotion_admission(
@@ -6060,14 +6088,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             if row.tier == attestation_tier::FEDERATION {
                 return Ok(false);
             }
-            let now = scrub_timestamp;
+            let now = reseal.scrub_timestamp;
             row.cohort_scope = cohort_scope.to_owned();
-            row.original_content_hash = original_content_hash_hex.to_owned();
-            row.scrub_signature_classical = scrub_signature_classical.to_owned();
-            row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
-            row.scrub_key_id = scrub_key_id.to_owned();
+            row.attestation_envelope = reseal.attestation_envelope.clone();
+            row.original_content_hash = reseal.original_content_hash.clone();
+            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
+            row.scrub_key_id = reseal.scrub_key_id.clone();
             row.scrub_timestamp = now;
-            row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
+            row.pqc_completed_at = reseal.scrub_signature_pqc.as_ref().map(|_| now);
             row.tier = attestation_tier::FEDERATION.to_string();
             row.promoted_at = Some(now);
             // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
@@ -6087,90 +6116,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
             // tier and therefore wire-servable; index it under its final
             // post-promotion shape (matches `list_attestations_since`).
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)])
-        };
-        self.index_stored_record("Attestation", &wire_index_key)
-            .await?;
-        Ok(true)
-    }
-
-    async fn promote_attestation_transformed(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        envelope_json: &serde_json::Value,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, crate::federation::Error> {
-        use crate::federation::types::attestation_tier;
-        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
-        // over the TRANSFORMED envelope. Runs before the state lock for the
-        // same deadlock reason as `promote_attestation`.
-        {
-            let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-            if current.tier != attestation_tier::FEDERATION {
-                let mut as_promoted = current;
-                as_promoted.attestation_envelope = envelope_json.clone();
-                as_promoted.tier = attestation_tier::FEDERATION.to_string();
-                as_promoted.cohort_scope = cohort_scope.to_owned();
-                crate::federation::admission::check_promotion_admission(
-                    self,
-                    &as_promoted,
-                    self.self_key_id().as_deref(),
-                )
-                .await?;
-            }
-        }
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let row = state
-                .federation_attestations
-                .iter_mut()
-                .find(|a| a.attestation_id == attestation_id)
-                .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "federation_attestations row {attestation_id} does not exist"
-                    ))
-                })?;
-            if row.tier == attestation_tier::FEDERATION {
-                return Ok(false);
-            }
-            let now = scrub_timestamp;
-            row.cohort_scope = cohort_scope.to_owned();
-            row.attestation_envelope = envelope_json.clone();
-            row.original_content_hash = original_content_hash_hex.to_owned();
-            row.scrub_signature_classical = scrub_signature_classical.to_owned();
-            row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
-            row.scrub_key_id = scrub_key_id.to_owned();
-            row.scrub_timestamp = now;
-            row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
-            row.tier = attestation_tier::FEDERATION.to_string();
-            row.promoted_at = Some(now);
-            // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
-            // A local-tier row defers its signature, so any `additional_scrubs` it
-            // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
-            // the row with this node's key and moves it into the federation plane,
-            // where the ingest verifier DOES check every scrub — so carrying the
-            // unverified set across would either launder it into the signed plane or
-            // (once corrupt) make the promoted row unverifiable at every peer with
-            // no error at the promote site. That is the #541 shape: the preserve set
-            // must equal the verified set. Co-signatures are earned at the ceremony
-            // that mints a federation-tier row, never inherited by a promotion.
-            row.additional_scrubs.clear();
-            let mut for_hash = row.clone();
-            for_hash.persist_row_hash = String::new();
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-            // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
-            // served bytes, so the wire index must carry the NEW content hash —
-            // same hook as `promote_attestation`. (Hash computed while the row
-            // borrow is live; the map insert happens after it ends.)
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)])
         };
         self.index_stored_record("Attestation", &wire_index_key)
@@ -8071,6 +8016,20 @@ mod accord_tests {
             &backend,
             "mem589-self",
             "mem589",
+        )
+        .await;
+    }
+
+    /// #649 B11 — a PROMOTED row is accepted by a DIFFERENT directory's
+    /// `put_attestation`, on memory. Two independent `MemoryBackend`s are two
+    /// genuinely separate corpora, so this arm is the strictest of the three.
+    /// Shared exercise body with sqlite + postgres.
+    #[tokio::test]
+    async fn promoted_row_crosses_to_a_peer_memory_649() {
+        let origin = MemoryBackend::new();
+        let peer = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
+            &origin, &peer, "mem649",
         )
         .await;
     }

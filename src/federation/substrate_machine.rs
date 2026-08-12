@@ -1127,19 +1127,19 @@ pub mod test_support {
             // failed on `Promote{scope: Community}` and on
             // `Promote{scope: Family}` within one run. The harness mirrors the
             // primitive, so it mirrors the fix — one gated write.
-            let (hash, classical, pqc) =
-                ts::sign_envelope(&row.attesting_key_id, &row.attestation_envelope);
+            //
+            // v31.0.0 (CIRISPersist#649) — and it RE-STAMPS the typed-column
+            // mirror before signing, because the promotion changes
+            // `cohort_scope` and #643 bound that column into the signed bytes.
+            // Signing the pre-promotion envelope produced a row every peer
+            // refused; the harness mirrors the primitive, so it mirrors that
+            // fix too.
+            let mut reseal =
+                ts::reseal_for_scope(&row.attesting_key_id, &row, op.cohort_scope.as_str());
+            reseal.scrub_timestamp = at;
             let res = self
                 .dir
-                .promote_attestation(
-                    &target,
-                    op.cohort_scope.as_str(),
-                    &classical,
-                    pqc.as_deref(),
-                    &hash,
-                    &row.attesting_key_id,
-                    at,
-                )
+                .promote_attestation(&target, op.cohort_scope.as_str(), &reseal)
                 .await;
             match res {
                 Ok(_) => OpOutcome {

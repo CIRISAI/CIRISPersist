@@ -1889,6 +1889,53 @@ impl LocalAttestationInput {
     }
 }
 
+/// v31.0.0 (CIRISPersist#649) — **the re-stamped envelope and the scrub that
+/// covers it**: everything a PLACEMENT-TOUCHING write must carry now that
+/// `cohort_scope` lives INSIDE the signed bytes (CIRISPersist#643).
+///
+/// # Why this type exists
+///
+/// Before #643, `cohort_scope` was an unsigned column, so
+/// [`crate::federation::FederationDirectory::promote_attestation`] and
+/// [`crate::federation::FederationDirectory::set_attestation_cohort_scope`]
+/// could rewrite it in place and leave the signature alone. #643 bound it into
+/// `envelope.row`, and both primitives kept rewriting the column without
+/// re-stamping the mirror — so a promoted row asserted its PRE-promotion scope
+/// while its column said otherwise, and **every peer's `put_attestation`
+/// refused it** (CIRISPersist#649). Promotion succeeded locally the whole time,
+/// which is exactly what hid it.
+///
+/// A placement-touching write therefore re-signs, and the three things that
+/// must move together — the re-stamped envelope, the digest of its canonical
+/// bytes, and the signature over them — travel as ONE value rather than as six
+/// positional arguments a caller can get half-right. Build the envelope half
+/// with [`crate::federation::envelope::RowMirror::restamp_for_scope`]; both
+/// primitives re-run
+/// [`crate::federation::admission::check_row_column_binding`] over the row as
+/// it will be stored, so a caller that skips the re-stamp is REFUSED rather
+/// than silently minting a row no peer will take.
+#[derive(Debug, Clone)]
+pub struct AttestationReseal {
+    /// The envelope as it will be STORED and SERVED — the mirror already
+    /// re-stamped for the new placement, and the exact bytes
+    /// [`Self::original_content_hash`] / [`Self::scrub_signature_classical`]
+    /// were computed over.
+    pub attestation_envelope: serde_json::Value,
+    /// Hex `SHA-256` of the §0.9-canonical form of
+    /// [`Self::attestation_envelope`].
+    pub original_content_hash: String,
+    /// Base64 Ed25519 over the same canonical bytes.
+    pub scrub_signature_classical: String,
+    /// Base64 ML-DSA-65 over `canonical ‖ ed25519_sig` (CC 3.1.2.1).
+    pub scrub_signature_pqc: Option<String>,
+    /// The DERIVED federation `key_id` of the re-signer (never a keystore
+    /// alias — CIRISPersist#247); FKs to `federation_keys(key_id)`.
+    pub scrub_key_id: String,
+    /// The instant stamped onto `scrub_timestamp` (and `promoted_at`, on the
+    /// promotion path).
+    pub scrub_timestamp: DateTime<Utc>,
+}
+
 /// v9.3.0 (CIRISPersist#248) — inputs to
 /// [`crate::Engine::emit_attestation`], the high-level "produce ONE
 /// signed federation-tier CEG attestation" primitive.

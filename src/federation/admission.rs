@@ -2032,7 +2032,7 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
 /// # The hole this closes
 ///
 /// `Engine::attestation_promote` and the backends' `promote_attestation` /
-/// `promote_attestation_transformed` re-sign a row and flip `tier`
+/// `promote_attestation` re-signs a row and flips `tier`
 /// local→federation. Before this gate they ran **no** put-gate at all: the
 /// promote path validated `cohort_scope`, refused `(federation, self)`, and was
 /// idempotent on an already-federation row, and that was the whole of it.
@@ -2171,8 +2171,8 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
 ///
 /// # Where it is called
 ///
-/// Every backend's `promote_attestation` AND `promote_attestation_transformed`,
-/// **before any mutation** (verify-before-mutation, AV-9) and — on the memory
+/// Every backend's `promote_attestation` (the ONE promotion primitive since
+/// v31.0.0 / CIRISPersist#649), **before any mutation** (verify-before-mutation, AV-9) and — on the memory
 /// backend — before the state lock is taken, since every gate here reads the
 /// directory through the same lock. One chokepoint per backend means
 /// `Engine::attestation_promote`, `Engine::promote_attestation_with_transforms`,
@@ -2202,6 +2202,23 @@ pub async fn check_promotion_admission(
             row.cohort_scope
         )));
     }
+
+    // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING, at the promote
+    // door. #643 could not put it here: promotion re-signed the PRE-promotion
+    // envelope while changing `cohort_scope`, so this gate would have refused
+    // every promotion rather than fixing any — a rule no producer could obey.
+    // Now that `promote_attestation` carries the RE-STAMPED envelope
+    // (`RowMirror::restamp_for_scope`), the rule is satisfiable at the mint and
+    // therefore enforceable, exactly the #598 sequence.
+    //
+    // It is load-bearing rather than belt-and-braces: `put_attestation` asks
+    // this of every INBOUND row, and promotion is the door OUTBOUND rows are
+    // minted at. Without it a caller of the primitive that forgets the
+    // re-stamp mints a federation-tier row that this node will happily serve
+    // and every peer will refuse — the #649 defect wearing a new caller.
+    // Pure function of the row (no directory read, no crypto), and a REFUSAL,
+    // so it leads with the other free arms.
+    check_row_column_binding(row)?;
 
     // AV-84 — a TARGETED cohort placement (`family` / `community`) is a
     // producer self-declaration or it is refused. Pure and free, so it leads
@@ -15482,31 +15499,36 @@ pub(crate) mod r2_test_support {
         let envelope = serde_json::json!({
             "id": att_id, "dimension": "trust:nskinds:v1", "score": 1.0, "confidence": 0.9,
         });
-        let (och, sc, sp) = ts::sign_envelope(&author, &envelope);
+        // v31.0.0 (CIRISPersist#643) — SEAL, don't hand-sign: the row must carry
+        // its typed-column mirror inside the signed bytes or `put_attestation`
+        // refuses it. `seal_row_in_place` stamps the mirror from the SAME
+        // projection the gate compares against and then signs.
+        let mut att_row = crate::federation::Attestation {
+            attestation_id: att_id.clone(),
+            attesting_key_id: author.clone(),
+            attested_key_id: author.clone(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        ts::seal_row_in_place(&author, &mut att_row);
         dir.put_attestation(crate::federation::SignedAttestation {
-            attestation: crate::federation::Attestation {
-                attestation_id: att_id.clone(),
-                attesting_key_id: author.clone(),
-                attested_key_id: author.clone(),
-                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: author.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: Some(now),
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: att_row,
         })
         .await
         .unwrap_or_else(|e| panic!("[{tag}] nanosecond attestation must admit: {e}"));
@@ -15709,7 +15731,15 @@ pub(crate) mod r2_test_support {
             "[{tag}] precondition: a freshly put federation row must be servable by its own hash"
         );
 
-        dir.set_attestation_cohort_scope(&id, cohort_scope::COMMUNITY)
+        // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN: `cohort_scope`
+        // is bound into the signed envelope, so the mirror is re-stamped and
+        // the row re-signed before the door is asked.
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &author,
+            &before,
+            cohort_scope::COMMUNITY,
+        );
+        dir.set_attestation_cohort_scope(&id, cohort_scope::COMMUNITY, &reseal)
             .await
             .unwrap_or_else(|e| panic!("[{tag}] re-scope must succeed: {e}"));
 
