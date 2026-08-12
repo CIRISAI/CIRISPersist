@@ -5870,8 +5870,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| Error::Backend(e.to_string()))?;
         let next: i32 = match cohort {
             Cohort::Family => {
-                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
-                    .map_err(|e| {
+                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                // wrapper. Decoding the bare record here is what silently
+                // stranded the caller's signature while every field
+                // `signing_envelope()` covers was replaced below.
+                let crate::federation::SignedFamily {
+                    family: mut new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 new_fam.persist_row_hash =
@@ -5922,7 +5930,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "UPDATE cirislens.federation_families SET \
                         family_name = $2, members = $3, founded_at = $4, \
                         consensus_protocol = $5, consensus_protocol_entrenched = $6, \
-                        persist_row_hash = $7, version = $8 \
+                        persist_row_hash = $7, version = $8, \
+                        authority_key_id = $9, scrub_signature_classical = $10, \
+                        scrub_signature_pqc = $11 \
                      WHERE family_key_id = $1",
                     &[
                         &new_fam.family_key_id,
@@ -5933,6 +5943,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &new_fam.consensus_protocol_entrenched,
                         &new_fam.persist_row_hash,
                         &next,
+                        // v31.0.0 (CIRISPersist#651) — the signature moves with
+                        // the record it authorizes, in the SAME statement, so a
+                        // future edit cannot rewrite the roster and forget the
+                        // authorship.
+                        &authority_key_id,
+                        &scrub_signature_classical,
+                        &scrub_signature_pqc,
                     ],
                 )
                 .await
@@ -5943,10 +5960,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 next
             }
             Cohort::Community | Cohort::Affiliations => {
-                let mut new_comm: crate::federation::Community =
-                    serde_json::from_value(new_snapshot).map_err(|e| {
-                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                    })?;
+                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                // family arm above.
+                let crate::federation::SignedCommunity {
+                    community: mut new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
+                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                })?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let members_value = serde_json::to_value(&new_comm.members)
@@ -5996,7 +6019,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "UPDATE cirislens.federation_communities SET \
                         community_name = $2, members = $3, founded_at = $4, \
                         consensus_protocol = $5, policy_blob = $6, \
-                        persist_row_hash = $7, version = $8 \
+                        persist_row_hash = $7, version = $8, \
+                        authority_key_id = $9, scrub_signature_classical = $10, \
+                        scrub_signature_pqc = $11 \
                      WHERE community_key_id = $1",
                     &[
                         &new_comm.community_key_id,
@@ -6007,6 +6032,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &new_comm.policy_blob,
                         &new_comm.persist_row_hash,
                         &next,
+                        // v31.0.0 (CIRISPersist#651) — see the family arm.
+                        &authority_key_id,
+                        &scrub_signature_classical,
+                        &scrub_signature_pqc,
                     ],
                 )
                 .await

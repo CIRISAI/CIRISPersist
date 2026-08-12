@@ -4068,8 +4068,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend lock");
         match cohort {
             Cohort::Family => {
-                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
-                    .map_err(|e| {
+                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                // wrapper. Decoding the bare record here is what silently
+                // stranded the caller's signature while every field
+                // `signing_envelope()` covers was replaced below.
+                let crate::federation::SignedFamily {
+                    family: mut new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 new_fam.persist_row_hash =
@@ -4103,6 +4111,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         is_current: false,
                     });
                 state.federation_families.insert(key.clone(), new_fam);
+                // v31.0.0 (CIRISPersist#651) — the signature moves with the
+                // record it authorizes, in the same critical section.
+                state.federation_family_authority_sigs.insert(
+                    key.clone(),
+                    (
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    ),
+                );
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
@@ -4110,10 +4128,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 Ok(next)
             }
             Cohort::Community | Cohort::Affiliations => {
-                let mut new_comm: crate::federation::Community =
-                    serde_json::from_value(new_snapshot).map_err(|e| {
-                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                    })?;
+                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                // family arm above.
+                let crate::federation::SignedCommunity {
+                    community: mut new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
+                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                })?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let key = new_comm.community_key_id.clone();
@@ -4145,6 +4169,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         is_current: false,
                     });
                 state.federation_communities.insert(key.clone(), new_comm);
+                // v31.0.0 (CIRISPersist#651) — see the family arm.
+                state.federation_community_authority_sigs.insert(
+                    key.clone(),
+                    (
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    ),
+                );
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
