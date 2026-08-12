@@ -3953,6 +3953,53 @@ pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 /// without re-walking the graph on every page.
 pub const DELEGATION_SCOPE_SLASH: &str = "slash";
 
+/// v30.11.0 (CIRISPersist#637) — **the delegated-duty ladder, as an array.**
+/// Import this; do not hand-pick the `DELEGATION_SCOPE_*` constants above.
+///
+/// | scope | grants |
+/// |---|---|
+/// | [`DELEGATION_SCOPE_CONSENT_REVOCATION`] | proxy revocation authority (CEG §3.2.3 rule 3/4) |
+/// | [`DELEGATION_SCOPE_MODERATE`] | emit a `ModerationEvent` on the delegator's behalf |
+/// | [`DELEGATION_SCOPE_TAKEDOWN`] | emit a `takedown_notice` Contribution |
+/// | [`DELEGATION_SCOPE_REVIEW`] | emit a report → `scores` reconsideration |
+/// | [`DELEGATION_SCOPE_SLASH`] | take something AWAY — quarantine, time-bounded de-admission |
+///
+/// # Why this exists — five `pub const`s and no array cost a shipped defect
+///
+/// CIRISServer's duty-conferral card shipped able to confer **three of five**;
+/// `takedown` and `consent_revocation` were simply absent. The constants were
+/// imported, not retyped — spelling was never the problem. **There was nothing
+/// to import for MEMBERSHIP**, so every consumer hand-picked the subset it knew
+/// about, and a hand-picked mirror of another crate's vocabulary drifts the
+/// moment that vocabulary grows.
+///
+/// A missing option is uniquely hard to notice: the dropdown looked complete,
+/// and nobody scans a menu wondering what is *not* on it. It surfaced only
+/// because an operator asked whether the verbs had come from an authoritative
+/// list — and they had not, because there wasn't one.
+///
+/// # `owner_binding_recovery` is excluded, deliberately
+///
+/// [`crate::federation::ownership_reclaim::DELEGATION_SCOPE_OWNER_BINDING_RECOVERY`]
+/// carries the same `DELEGATION_SCOPE_` prefix and is **not** a delegated duty:
+/// it is CC 3.2 succession standing, traversed on a different plane by a
+/// different walk. It answers "who speaks for this key now", not "what may be
+/// done about this party". Excluded by decision, not by the accident of living
+/// in another file — see [`crate::federation::types::delegation_scope::RECOVERY`].
+///
+/// # Single definition
+///
+/// [`crate::federation::types::delegation_scope::MODERATION`] IS this array, not
+/// a copy of it. Two arrays over one vocabulary would be the defect this
+/// constant exists to remove.
+pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
+    DELEGATION_SCOPE_CONSENT_REVOCATION,
+    DELEGATION_SCOPE_MODERATE,
+    DELEGATION_SCOPE_TAKEDOWN,
+    DELEGATION_SCOPE_REVIEW,
+    DELEGATION_SCOPE_SLASH,
+];
+
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
 /// `scores` dimension prefix for a **canonical-binding** claim. A bare
 /// `scores` on `identity:canonical_binding:{H}` with `attesting_key_id =
