@@ -198,6 +198,38 @@ chokepoint holds the line alone; doing both **reds** it, with the gate returning
 `Ok(())` on a self-claimed `canonical`; and restoring the old
 `check_family_charter_admission` skip **reds** it. The belt is load-bearing.
 
+### Fixed — BREAKING — the genesis posture reported `Entrenched` on a root that confers nothing (#648)
+
+`genesis_posture` walked three legs — roster, family, canonical — and **all
+three are the KEY plane**. Both binding gates this release added are ATTESTATION
+gates, so neither touches any of them, and the stale baked seed's key plane
+installs perfectly on a 31.0.0 node. Only the delegation plane —
+`genesis-charter` / `genesis-grant:…` / `genesis-lifecycle` — is refused.
+
+So a normally-constructed 31.0.0 `Engine` reported `Entrenched`, rendered **no
+banner**, and a server reading `entrenched()` would have enabled agent mode — on
+a trust root whose conferral rows can never be installed. The previous test
+asserted exactly that and PASSED: *"a baked-seed node is entrenched and renders
+NO banner."* A fail-open banner: the operator sees green while conferral is dead.
+
+A posture that cannot see the plane conferring everything is not reporting on a
+trust root; it is reporting on a key list.
+
+`GenesisLeg::Delegation` and `verify_delegation_plane_seeded` close it. The
+absent/divergent split follows `seed_canonical_servers`' precedent deliberately:
+
+- a row **missing, or present in the pre-#643 shape**, is `absent` — a node
+  awaiting its ceremony, which BOOTS. 31.0.0 is the binary that RUNS that
+  ceremony, and a posture that bricked the node on the exact state the release
+  ships in would put the ceremony out of reach.
+- a row whose `original_content_hash` is **not the baked one** is `divergent` —
+  not a stale artifact but a SUBSTITUTED conferral row, and the one case here
+  that must not serve.
+
+Consequence for operators: on upgrade, a node whose delegation plane predates
+v31 reports `pre_genesis`, renders the banner, and agent mode stays gated until
+the new root is baked in 31.1.0. That is the mesh reset, made mechanical.
+
 ### Testing — the four genesis tests are honest now, not carved out
 
 `genesis_seed_installs_parity_{memory,sqlite,postgres}_622`,
@@ -207,17 +239,145 @@ the baked bundle's attestations predate the #643 row mirror. The #643 gate is
 **not** weakened — a genesis-shaped carve-out would be a permanent hole in
 exactly the rows that grant everything.
 
-Instead each branches on `genesis::bundle_delegation_plane_row_bound`, a
+Instead each branches on `genesis::bundle_delegation_plane_v31_shaped`, a
 predicate over the ARTIFACT. Pre-v31 bundle: assert the delegation rows are
-REFUSED, naming #643, on every backend, writing nothing — a real property of a
-real build and the state 31.0.0 ships in. Re-signed bundle: the original
-install assertions. 31.1.0's re-bake flips them back on by itself; nobody has to
-remember to.
+REFUSED on every backend, writing nothing — a real property of a real build and
+the state 31.0.0 ships in. Re-signed bundle: the original install assertions.
+31.1.0's re-bake flips them back on by itself; nobody has to remember to.
+
+**These four were briefly written off as unfixable, and they were not.** The
+predicate first asked only about the #643 mirror, and the witnesses asserted the
+refusal *names #643*. Once #598's instant gate widened past `consent:state:*`
+it refuses the stale bundle FIRST — so all four went red for a reason unrelated
+to the property they prove, and were being carried as a sanctioned red set.
+
+The lesson generalizes past genesis: **do not pin one issue number in an
+assertion when a neighbouring gate can legitimately refuse first.** The
+predicate now asks BOTH binding gates, and the refusal is asserted as a set
+(`is_v31_binding_refusal`). All four pass, honestly. The sanctioned red set is
+empty.
 
 Two fixtures also stopped relying on an accident: `run_set_path_parity` and
 `envelope_attested_roles_lift_then_gate_486` ran on bare backends, so every
 refusal they asserted came from the empty-roster arithmetic and none reached the
 conferral gate they are named after. They seat a roster now.
+
+### Changed — BREAKING — the instant binding gate covers EVERY dimension, not just consent (#598)
+
+The gate below shipped consent-only, because consent is where the replay was
+FOUND — not because consent is where it works. `asserted_at` is a bare,
+unsigned, verbatim-stored column on **every** row, and what the replay exploits
+is *"a fold picks a winner by that column"*, which is not a consent-specific
+property. A sweep of the fold sites finds it in `scores.rs` (latest per
+attester), `content_class.rs` (latest-wins on a flag), `mesh_config.rs`,
+`age.rs` (head of an `asserted_at DESC` list), the withdraw/supersede
+precedence walks, and every `ORDER BY asserted_at` the three backends serve.
+
+Worse than the missed coverage: restricting the gate BY DIMENSION made it
+evadable BY DIMENSION. The dimension lives in the envelope and is therefore
+signed, so this was never forgery — the producer simply **chose which gate it
+faced**. A check a writer selects is not a check.
+
+Universality is free at the mint: `stamp_and_canonicalize` never filtered by
+dimension and has always stamped both instants into every envelope it seals.
+Only the CHECK was narrow. `check_consent_state_instant_binding` is renamed
+`check_instant_binding` (no alias) at all six backend doors.
+
+The cost was 57 red tests, which is the gate working. Two were production
+defects wearing fixture clothes, and both are fixed below.
+
+### Fixed — BREAKING — the local write door refused the row it had just stamped (#598)
+
+All three backends called `RowMirror::stamp_local_row` and then
+`check_instant_binding`. The stamp covered the #643 mirror and **not** the #598
+instants, so `local_row_instant`'s "envelope carries no `asserted_at`, fall back
+to `now`" branch walked into a refusal three lines later: **the entire durable
+local-tier write path was dead.** Five production producers reached it.
+
+Fixed with a shared `envelope::stamp_signed_instants`, called inside the
+existing `caller_signed` early return so the transit exclusion holds verbatim —
+**transit rows are CHECKED, never stamped**, because the caller signed those
+bytes and `verify_local_transit_revocation` already derived the stored hash
+from them. Stamping after signing is the very defect this release exists to
+close.
+
+Two legs of that fix survived the entire 1878-test corpus under mutation — the
+`expires_at` truncation and its twin — because **no test in the tree performed a
+durable local write with an `expires_at` at all.** Witnesses added for both.
+
+### Fixed — BREAKING — `put_blob` was a THIRD, ungated insert door into `federation_attestations` (#652)
+
+`put_blob` raw-INSERTed the `holds_bytes` holder attestation, never calling
+`put_attestation`, so neither binding gate ran. The whole envelope was
+`{"kind":"holds_bytes","evidence_refs":[…]}`. Three defects in one door:
+
+1. **No bindings**, so every holder row was refused by every peer.
+2. **`asserted_at` populated from `scrub_timestamp`** — a different field
+   meaning a different thing. `asserted_at` is when the claim is asserted;
+   `scrub_timestamp` is when the scrub happened. Folds order on the former, so
+   a caller controlling `scrub_timestamp` controlled where the row landed in
+   every `ORDER BY asserted_at` in the substrate.
+3. **`tier` omitted from both INSERT column lists**, taking the schema default
+   `'federation'` — which is exactly what `list_attestations_since` serves. *The
+   tier nobody chose is the tier that replicates.*
+
+The fix had a subtlety worth recording: neither backend stores the caller's
+envelope — both **reconstruct** it and store the reconstruction while keeping
+the caller's hash and signature over it. So introducing the v31 shape on the
+signing side alone would have persist storing bytes its own stored hash does
+not cover, which is strictly worse than the bug. Instead
+`holds_bytes_attestation_envelope` takes the row-shaping inputs
+(`sha256, attesting_key_id, attestation_id, asserted_at`) and stays
+DETERMINISTIC, so persist can still reconstruct it and still verify the caller
+signed the row being stored. `holds_bytes_attestation_row` is now the one row
+definition, shared by the signing side and both doors.
+
+### Fixed — BREAKING — family and community supersede dropped the caller's signature (#651)
+
+`Family`/`Community` sign their whole record minus `persist_row_hash`, so
+`members`, `family_name`, `founded_at`, `consensus_protocol` and `policy_blob`
+are all inside the signing preimage. `supersede_family`/`supersede_community`
+**received** a freshly-signed record and serialized only `.family`/`.community`
+— discarding the caller's signature — while `supersede_group_row` left
+`authority_key_id`/`scrub_signature_*` describing the previous roster. Since
+`list_signed_families_since` re-serializes those columns, the row federated in
+that state and every peer refused it. #649's shape, one table over.
+
+`put_family` has hybrid-verified since v21.0.0 closed *"the keyless-declaration
+hole"*. **`supersede_family` verified nothing** — a second, ungated write door
+into the same table. It now runs the authorship gate, and the snapshot IS the
+signed wrapper, with the signature columns written in the same statement as the
+roster. `supersede_affiliations` is gated too: it shares `SignedCommunity` and
+the same storage under a different discriminator, so fixing only the two named
+arms would have left the hole reachable by naming a different cohort.
+
+`add_family_member`/`add_community_member` are NOT fixed here and are split out
+as #654 — the only production roster-mutator holds no key material, so it can
+neither produce a re-signed record nor be refused without breaking every
+roster-grow path. It needs a decision about who signs a roster growth.
+
+### Fixed — a row sized just under the cap was admitted locally and refused by every peer (#653)
+
+Both trace-mint sites chose inline-vs-manifest by measuring the PRODUCER's
+envelope, but the stored bytes also carry the #643 mirror and #598 instants
+stamped at the door — about 250 bytes more. The local door measured pre-stamp
+too, so such a row was admitted locally and refused at the federation door on
+promotion or replication. Measured on sqlite:
+
+```text
+PRODUCER canonical bytes = 1048575 (cap 1048576)  -> local door ADMITS
+STORED   canonical bytes = 1048822 (cap 1048576)  -> grew 247 bytes
+federation door on the STORED row: EnvelopeTooLarge { bytes: 1048822 }
+```
+
+`check_envelope_size_admission`'s own doc already claimed the property it had
+lost: *"Measures the REAL canonical bytes … the signed thing is the sized
+thing."* It is true again. Both calls stay at each local door — the early one is
+a cheap pre-filter keeping hostile input away from the directory reads below it,
+the post-stamp one is authoritative.
+
+Producer-side headroom was deliberately REJECTED: it would be a second spelling
+of the door's projection, which is how #643 and #598 each acquired their defect.
 
 ### Fixed — JSONB is not a byte-preserving container, and eleven signed envelopes were stored in one (#644)
 
