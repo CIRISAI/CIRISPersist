@@ -172,6 +172,14 @@ pub(crate) fn key_entry(row: &crate::federation::KeyRecord) -> Result<(String, S
 /// One extra point-read per `federation_keys` write. Key registration and the
 /// anchor mutators are cold paths (registration, scrub-upgrade, supersede,
 /// re-anchor, PQC completion), not per-request work.
+// v30.13.0 (CIRISPersist#640) — gated to match its CALLERS, which are the two
+// SQL backends (`memory` hashes its own map value under the lock it already
+// holds, so it never calls this). Without the gate the default-feature build
+// sees a `pub(crate)` fn nobody calls and `-D warnings` fails the leg —
+// the #618 shape exactly: a symbol whose only uses are feature-gated while its
+// definition is not. Caught by the `default` certification leg, which is the
+// one a `--features sqlite` verification never compiles.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn key_entry_as_stored(
     dir: &dyn super::FederationDirectory,
     key_id: &str,
