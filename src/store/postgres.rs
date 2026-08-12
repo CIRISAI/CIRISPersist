@@ -14205,7 +14205,7 @@ where
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#644) — serialize a signature-covered envelope for a
+/// v30.13.0 (CIRISPersist#645) — serialize a signature-covered envelope for a
 /// **TEXT** column, byte-identically to the SQLite leg.
 ///
 /// V122 turned every one of these columns from JSONB into TEXT. Binding a
@@ -38536,7 +38536,7 @@ mod tests {
         assert_eq!(rehit, expected_bytes);
     }
 
-    /// v30.13.0 (CIRISPersist#644) — the postgres leg of the shared
+    /// v30.13.0 (CIRISPersist#645) — the postgres leg of the shared
     /// envelope byte-exactness witness (see
     /// `sqlite::tests::envelope_bytes_round_trip_sqlite_644`). Both legs call
     /// the SAME
@@ -38562,7 +38562,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#644) — **every column V122 converted is `text`.**
+    /// v30.13.0 (CIRISPersist#645) — **every column V122 converted is `text`.**
     ///
     /// The round-trip witness above covers three of the eleven planes end to
     /// end; the other eight (the operational trio, the V102 occurrence trio,
@@ -38622,7 +38622,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "a signature-covered envelope column is not TEXT (CIRISPersist#644 / V122). JSONB \
+            "a signature-covered envelope column is not TEXT (CIRISPersist#645 / V122). JSONB \
              reparses numbers into `numeric` and drops exponent notation (1e+2 -> 100), which \
              rewrites the bytes `wire_index::content_hash_of` hashes — measured, and it moved \
              the hash. SQLite stores all of these as TEXT; a JSONB column here is a backend \

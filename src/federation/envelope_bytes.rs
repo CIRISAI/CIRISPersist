@@ -1,4 +1,4 @@
-//! v30.13.0 (CIRISPersist#644) — **the signature-covered envelope columns must
+//! v30.13.0 (CIRISPersist#645) — **the signature-covered envelope columns must
 //! round-trip byte-exact, on every backend.**
 //!
 //! # What went wrong

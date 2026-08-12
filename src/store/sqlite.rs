@@ -20415,7 +20415,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#644) — the sqlite leg of the shared envelope
+    /// v30.13.0 (CIRISPersist#645) — the sqlite leg of the shared envelope
     /// byte-exactness witness (see
     /// `postgres::tests::envelope_bytes_round_trip_postgres_644`). Both legs
     /// call the SAME
@@ -20436,7 +20436,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#644) — the sqlite twin of
+    /// v30.13.0 (CIRISPersist#645) — the sqlite twin of
     /// `postgres::tests::every_v122_envelope_column_is_text_postgres_644`:
     /// every signature-covered envelope column is declared `TEXT`.
     ///
@@ -20493,7 +20493,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "a signature-covered envelope column is not TEXT on sqlite (CIRISPersist#644). \
+            "a signature-covered envelope column is not TEXT on sqlite (CIRISPersist#645). \
              These columns hold the exact bytes a producer signed and must round-trip \
              byte-identically on BOTH backends — see V122:\n{}",
             offenders.join("\n")
