@@ -182,6 +182,59 @@ second run changes nothing. Mutating the fold to replay the interim states turns
 the withdrawn grant from `Purge` into `Restamp` and reds the resurrection
 witness.
 
+### Fixed — the migration's own audit: eight defects, six of them delete-shaped (#650)
+
+An adversarial review of `federation::migration` found eight, and the pattern is
+worth more than the list: **every one was a predicate answering a question it
+was not being asked.**
+
+- **A clock running behind DELETED the peer corpus.** `classify_shape` mapped
+  any `check_instant_binding` error to `Legacy`, but that gate's fourth arm is a
+  wall-clock SKEW bound, not a shape property. A correctly sealed peer row read
+  as legacy on a node an hour behind — a VM snapshot restore or a pre-NTP
+  container boot — and a legacy peer row's disposition is PURGE. Shape is now
+  judged at the row's own `asserted_at`, so the skew term is identically zero;
+  freshness is still enforced at the doors, against the real clock.
+- **The purge-on-inert arm was circular, and its only demonstrated firing was
+  a false positive.** It required `LoadBearing::No` AND "outside the owner
+  closure" — but the closure walk PRUNES a row precisely because its verdict is
+  `No`, so that was one fact counted twice; and `tier == federation` was
+  standing in for the residence proof `anti_entropy_satisfied` refuses to make.
+  It deleted an unretracted `consent:replication:v1` grant naming a peer with no
+  rows yet — i.e. **a peer you have just added**, which can then never
+  bootstrap. Arm removed. `classify` no longer receives the closure at all, so
+  reachability evidence can only ever RETAIN.
+- **A re-stamp silently turned an m-of-n into a 1-of-1.** `additional_scrubs`
+  was cleared on re-seal, citing promotion's precedent — which is the opposite
+  case (promotion drops co-scrubs that were never verified, on its way INTO the
+  plane that verifies them). A co-scrubbed row is now retained, never
+  re-stamped, and counted under its own `retained_co_scrubbed` heading.
+- **#647 was broken for the rows this release re-mints.** `build_restamped`
+  hashed and signed the canonical bytes but stored the un-canonicalized
+  envelope, and `classify_shape` never asked. The trigger is `weight: 1.0` —
+  `serde_json` writes `1.0`, JCS writes `1` — which half this repo's fixtures
+  carry. Now canonicalized before hashing, checked in `classify_shape`, and
+  gated at the reseal door.
+- **The never-purge list relied on remembering.** One leaf matched with `==`
+  while every sibling used a prefix, so `revocation:partner:fraud` (declared
+  NON-ROLLBACKABLE) and a future `:v2` were purged; an unreadable `dimension`
+  fell through as "safe to delete". Replaced by a closed `ExclusionClass`
+  partition with wildcard-free matches and a reachability gate, so adding a
+  class without declaring it is a compile or test failure.
+- **Arm 7 deleted rows the substrate positively asserts are load bearing**
+  (`trust:*` is manifest-declared "can never be inferred inert"). A
+  `LoadBearing::Yes` now retains.
+- **A corpus over the row budget never finished migrating** — the scan restarted
+  from the beginning every boot with no persisted cursor. The budget now bounds
+  the WORK, so every run makes progress and the routine converges with no cursor
+  to get wrong.
+- **`run_v31_migration` with no node identity mass-purged its own corpus.** True
+  of the boot wrapper, which bails; asserted of the routine, which did not.
+
+`purge_attestation_v31` also gained a door-level gate: an exclusion-bearing row
+is refused there regardless of what the caller believes, because a delete door
+whose safety lives entirely in its callers is #652's shape in reverse.
+
 ### Added — BREAKING — 31.0.0 is the binary that RUNS the ceremony, so it had to boot without the thing the ceremony produces (#648)
 
 The release plan is: cut 31.0.0 with no valid seed → roll it onto a new server →

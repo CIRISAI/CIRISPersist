@@ -3362,6 +3362,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#650) — the door's own gate (AV-9:
+        // verify-before-mutation). Asked BEFORE the lock is taken, so a refusal
+        // cannot interleave with a mutation.
+        if let Some(row) = self.get_attestation(attestation_id).await? {
+            crate::federation::migration::check_purge_admission(&row)?;
+        }
         let mut state = self.state.lock().expect("memory backend lock");
         let before = state.federation_attestations.len();
         state
@@ -8230,6 +8236,20 @@ mod accord_tests {
         let backend = MemoryBackend::new();
         crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
             &backend, "mem650c",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+    /// land after the migration, through the transit-revocation door. Memory
+    /// arm; shared body with sqlite + postgres. This is the finding that keeps
+    /// `run_v31_migration` marker-free — read its doc before changing it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn a_v30_row_can_still_land_after_migration_memory_650() {
+        let backend = MemoryBackend::new();
+        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
+            &backend, "mem650g",
         )
         .await;
     }

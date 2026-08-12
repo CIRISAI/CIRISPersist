@@ -5226,6 +5226,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#650) — the door's own gate, over a LOADED
+        // COPY, before any statement runs (AV-9).
+        if let Some(row) = self.get_attestation(attestation_id).await? {
+            crate::federation::migration::check_purge_admission(&row)?;
+        }
         let client = self
             .get_client()
             .await
@@ -21262,6 +21267,25 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg650c{}", uuid_like());
         crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+    /// land after the migration, through the transit-revocation door. Postgres
+    /// arm; shared body with memory + sqlite.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn a_v30_row_can_still_land_after_migration_postgres_650() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg650g{}", uuid_like());
+        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
             &backend, &tag,
         )
         .await;

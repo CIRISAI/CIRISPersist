@@ -120,10 +120,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::load_bearing::{
-    is_load_bearing, load_bearing_closure, ClosureCompleteness, LoadBearing, LoadBearingClosure,
-    ObjectRef, DEFAULT_CLOSURE_BUDGET,
-};
+use super::load_bearing::{is_load_bearing, LoadBearing, ObjectRef};
 use super::types::{attestation_tier, attestation_type, Attestation};
 use super::{Error, FederationDirectory};
 
@@ -132,10 +129,24 @@ use super::{Error, FederationDirectory};
 /// pages.
 pub const MIGRATION_PAGE_SIZE: u32 = 500;
 
-/// A hard cap on how many rows one run will visit. A migration that would
-/// exceed it reports [`MigrationOutcome::budget_exhausted`] and stops — and
-/// because the routine is idempotent and resumable, the NEXT boot continues
-/// from where it left off rather than starting over.
+/// A hard cap on how many rows one run will ACT ON — re-stamp, purge or retain
+/// — not on how many it scans.
+///
+/// # Why it bounds the work and not the scan
+///
+/// It bounded the SCAN, and that made the routine non-resumable in the one case
+/// the budget exists for. `scan_corpus` starts from the beginning every call
+/// and no cursor is persisted, so a corpus larger than the budget re-processed
+/// the same leading rows forever and never reached the tail: the boot cost was
+/// paid, the "budget exhausted" flag was set, and the far end of the table
+/// stayed v30-shaped indefinitely.
+///
+/// Bounding the WORK instead makes every run make progress. The scan runs to
+/// the end (one indexed keyset walk, no per-row I/O), the pending set is capped,
+/// and the rows this run fixes are conformant on the next — so the next run's
+/// pending set is a different, later slice. It converges with no cursor to
+/// persist and no state to get wrong, which is the same reasoning that makes an
+/// interrupted run safe.
 pub const MIGRATION_ROW_BUDGET: usize = 200_000;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -208,19 +219,42 @@ impl RetractionFold {
 /// [`test_support::exercise_v31_migration`]'s witness reds on it.
 #[must_use]
 pub fn fold_retractions(rows: &[Attestation]) -> RetractionFold {
-    use super::precedence::{
-        is_structural_composer, precedence_winner, references_attestation_id_from_envelope,
-    };
+    let composers: Vec<Attestation> = rows
+        .iter()
+        .filter(|r| super::precedence::is_structural_composer(&r.attestation_type))
+        .cloned()
+        .collect();
+    let authors: BTreeMap<String, String> = rows
+        .iter()
+        .map(|r| (r.attestation_id.clone(), r.attesting_key_id.clone()))
+        .collect();
+    fold_retractions_from(&composers, &authors)
+}
+
+/// [`fold_retractions`] over the two things it actually needs: every structural
+/// composer, and an `attestation_id → attesting_key_id` map for the WHOLE
+/// corpus.
+///
+/// Split out so the boot scan can stream the corpus and keep only these two —
+/// the composers are a small fraction of any real corpus, and the author map is
+/// two short strings a row — instead of materializing every envelope in memory
+/// to answer a question about a handful of them.
+#[must_use]
+pub fn fold_retractions_from(
+    composers: &[Attestation],
+    authors: &BTreeMap<String, String>,
+) -> RetractionFold {
+    use super::precedence::{precedence_winner, references_attestation_id_from_envelope};
 
     // Group composers by (attester, target). CEG §6.1 rule 4: cross-attester
     // chains are INDEPENDENT, so each group resolves its own winner.
     let mut groups: BTreeMap<(&str, &str), Vec<&Attestation>> = BTreeMap::new();
-    let mut composers: BTreeSet<String> = BTreeSet::new();
-    for row in rows {
-        if !is_structural_composer(&row.attestation_type) {
-            continue;
-        }
-        composers.insert(row.attestation_id.clone());
+    let mut composer_ids: BTreeSet<String> = BTreeSet::new();
+    for row in composers {
+        debug_assert!(super::precedence::is_structural_composer(
+            &row.attestation_type
+        ));
+        composer_ids.insert(row.attestation_id.clone());
         let Some(target) = references_attestation_id_from_envelope(&row.attestation_envelope)
         else {
             // A composer with no target retracts nothing (it fails its own
@@ -243,14 +277,12 @@ pub fn fold_retractions(rows: &[Attestation]) -> RetractionFold {
         };
         // A composer that targets a row from a DIFFERENT attester is a
         // cross-attester chain; the read plane's Live filter requires
-        // same-attester, and so does this. Enforced by the grouping key: the
-        // group's attester is the composer's, and we only retract a target
-        // that is in fact authored by that same key. Rows not present in the
-        // corpus are ignored (nothing here to retract).
-        let Some(target_row) = rows.iter().find(|r| r.attestation_id == target) else {
+        // same-attester, and so does this. A target absent from the corpus is
+        // ignored — there is nothing here to retract.
+        let Some(target_author) = authors.get(target) else {
             continue;
         };
-        if target_row.attesting_key_id != winner.attesting_key_id {
+        if *target_author != winner.attesting_key_id {
             continue;
         }
         retracted.insert(target.to_owned(), winner.attestation_id.clone());
@@ -258,7 +290,7 @@ pub fn fold_retractions(rows: &[Attestation]) -> RetractionFold {
 
     RetractionFold {
         retracted,
-        composers,
+        composers: composer_ids,
     }
 }
 
@@ -294,7 +326,8 @@ impl RowShape {
     }
 }
 
-/// Classify a stored row against the two v31 binding gates.
+/// Classify a stored row against the v31 gates — both bindings AND the #647
+/// at-rest invariant.
 ///
 /// Asks the REAL gates ([`super::admission::check_row_column_binding`] and
 /// [`super::admission::check_instant_binding`]) rather than probing for the
@@ -303,12 +336,45 @@ impl RowShape {
 /// deterministic in a witness.
 #[must_use]
 pub fn classify_shape(row: &Attestation, now: chrono::DateTime<chrono::Utc>) -> RowShape {
-    if let Err(e) =
-        super::admission::check_instant_binding(row, now, super::admission::DEFAULT_MAX_TOUCH_SKEW)
-    {
+    // v31.0.0 (CIRISPersist#650) — **EVALUATED AT THE ROW'S OWN INSTANT, NOT
+    // AT THE WALL CLOCK.**
+    //
+    // `check_instant_binding` has four arms, and only three are about SHAPE
+    // (the signed twins are present, they parse, they equal their columns, they
+    // are at substrate resolution). The fourth is a FRESHNESS bound: reject
+    // `asserted_at > now + max_skew`. Mapping that arm to `Legacy` made this
+    // routine read a CLOCK PROBLEM as a shape problem — and the disposition of
+    // a legacy peer row is `purge_unauthorable_legacy`.
+    //
+    // So on a node whose clock is an hour behind (a VM snapshot restore, a
+    // container booting before NTP), a correctly-sealed peer corpus classified
+    // as legacy and was DELETED, at boot, silently. Our own rows survived by
+    // accident: the reseal door re-checks skew against the real clock and
+    // errors out, which is recorded as a per-row error rather than a purge.
+    //
+    // Passing the row's own `asserted_at` as `now` makes the skew term
+    // identically zero, so what remains is exactly the binding. Freshness is a
+    // real property and is still enforced where it belongs — at the put doors,
+    // at promotion, and in `check_reseal_admission`, all against the true
+    // clock. It is not evidence about an envelope's shape.
+    if let Err(e) = super::admission::check_instant_binding(
+        row,
+        row.asserted_at,
+        super::admission::DEFAULT_MAX_TOUCH_SKEW,
+    ) {
         return RowShape::Legacy { why: e.to_string() };
     }
+    let _ = now;
     if let Err(e) = super::admission::check_row_column_binding(row) {
+        return RowShape::Legacy { why: e.to_string() };
+    }
+    // v31.0.0 (CIRISPersist#647) — the at-rest form is part of "v31-shaped".
+    // A row whose stored column does not sha256 to its `original_content_hash`
+    // is one the substrate's own audit predicate rejects, so calling it
+    // conformant would let the idempotence arm skip a row that still needs
+    // work. It also makes the short-circuit in `run_v31_migration` honest: a
+    // corpus it calls finished is one every at-rest check passes.
+    if let Err(e) = super::canonical_at_rest::check_canonical_at_rest(&row.attestation_envelope) {
         return RowShape::Legacy { why: e.to_string() };
     }
     RowShape::V31Conformant
@@ -373,68 +439,253 @@ pub fn classify_authorship(row: &Attestation, self_key_id: Option<&str>) -> Auth
     }
 }
 
-/// **The rows that carry an EXCLUSION — never purged, by name.**
+/// v31.0.0 (CIRISPersist#650) — the CLOSED set of never-purge classes.
+///
+/// # Why an enum and a table rather than an `if`-chain
+///
+/// The first cut of [`is_exclusion_bearing`] was a hand-maintained chain of
+/// prefix tests. It shipped three defects of one kind, and an audit found all
+/// three: `revocation:peer_admission:v1` was matched with `==` while every
+/// other class used `starts_with`, so `revocation:partner:fraud` (declared
+/// NON-ROLLBACKABLE in the manifest) and even a future `:v2` of the same class
+/// fell through and were purged; an unreadable `dimension` fell through the
+/// `?` and was treated as "not exclusion-bearing", i.e. an unreadable input
+/// answered PROVEN-SAFE-TO-DELETE; and a class added later would simply not be
+/// on the list, with nothing to notice.
+///
+/// All three are the same defect: **a never-purge list that relies on someone
+/// remembering.** The file next door states the opposite discipline in its own
+/// doc — *"adding an arm without declaring its predicate is a compile
+/// failure … exhaustive by construction rather than by anyone remembering"* —
+/// and this was the one place across the two that did not follow it.
+///
+/// So: a closed enum, an [`ExclusionClass::ALL`] array whose length the
+/// compiler checks, and two `match`es with no wildcard arm. Adding a variant
+/// without declaring its rationale and its matcher is a **compile failure**;
+/// adding one without listing it in `ALL` is a **test failure**
+/// ([`tests::every_exclusion_class_is_reachable_and_declared`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionClass {
+    /// A `supersedes` / `withdraws` / `recants` row — the TOMBSTONES.
+    StructuralComposer,
+    /// Any `delegates_to` row — the plane that AUTHORIZES the acts below, and
+    /// the plane the owner claim itself lives on.
+    Delegation,
+    /// `revocation:*` — peer de-admission (AV-77) and every other revocation
+    /// leaf. Prefix-matched, deliberately: the `==` on one leaf is the defect
+    /// that produced this type.
+    Revocation,
+    /// `quarantine:*` — withhold / release markers.
+    Quarantine,
+    /// `moderation:*` — §11.10 reports.
+    Moderation,
+    /// `reconsideration:*` — §11.10 review reports.
+    Reconsideration,
+    /// `slashing:*` — slashing outcomes.
+    Slashing,
+    /// `objection:*` — reverse-quorum objections, dismissals and ballots.
+    Objection,
+    /// **The dimension could not be read** — absent, or not a string.
+    ///
+    /// FAIL-SECURE, and the polarity is the whole point: this predicate asks
+    /// *"is this too dangerous to delete?"*, so an unreadable input must answer
+    /// YES. Treating it as "not exclusion-bearing" is the substrate's own
+    /// [`LoadBearing`](super::load_bearing::LoadBearing) rule inverted — an
+    /// unproven `No` read as a proven one.
+    UnreadableDimension,
+}
+
+impl ExclusionClass {
+    /// Every class, in declaration order. The gate iterates this; its LENGTH is
+    /// compiler-checked against the variant set by
+    /// [`tests::every_exclusion_class_is_reachable_and_declared`].
+    pub const ALL: [ExclusionClass; 9] = [
+        ExclusionClass::StructuralComposer,
+        ExclusionClass::Delegation,
+        ExclusionClass::Revocation,
+        ExclusionClass::Quarantine,
+        ExclusionClass::Moderation,
+        ExclusionClass::Reconsideration,
+        ExclusionClass::Slashing,
+        ExclusionClass::Objection,
+        ExclusionClass::UnreadableDimension,
+    ];
+
+    /// The dimension PREFIX that identifies this class, or `None` for the
+    /// classes identified structurally (by `attestation_type`) or by the
+    /// absence of a readable dimension. Exhaustive — no wildcard arm.
+    #[must_use]
+    pub const fn dimension_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::StructuralComposer | Self::Delegation | Self::UnreadableDimension => None,
+            // The #650 audit's finding: PREFIX, never `==`. A versioned leaf
+            // (`:v2`) and a sibling leaf (`revocation:partner:fraud`) are the
+            // same class and must inherit the same protection.
+            Self::Revocation => Some("revocation:"),
+            Self::Quarantine => Some(super::admission::QUARANTINE_DIMENSION_PREFIX),
+            Self::Moderation => Some(super::admission::MODERATION_DIMENSION_PREFIX),
+            Self::Reconsideration => Some(super::admission::RECONSIDERATION_DIMENSION_PREFIX),
+            Self::Slashing => Some("slashing:"),
+            Self::Objection => Some("objection:"),
+        }
+    }
+
+    /// Why deleting a row of this class would be unsafe. Exhaustive.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::StructuralComposer => {
+                "a structural composer is a TOMBSTONE: purging it resurrects everything it \
+                 retracted"
+            }
+            Self::Delegation => {
+                "the delegation plane AUTHORIZES quarantine / moderation / slashing acts and \
+                 carries the owner claim; without it those acts are inadmissible on refill"
+            }
+            Self::Revocation => {
+                "a revocation row — peer de-admission is AV-77's entire defence against a \
+                 sanctioned peer, and the manifest declares other leaves of this family \
+                 NON-ROLLBACKABLE"
+            }
+            Self::Quarantine => "a quarantine marker withholds a key's rows from serving",
+            Self::Moderation => "a §11.10 moderation report",
+            Self::Reconsideration => "a §11.10 reconsideration / review report",
+            Self::Slashing => "a slashing outcome",
+            Self::Objection => "a reverse-quorum objection, dismissal or ballot",
+            Self::UnreadableDimension => {
+                "the row's `dimension` is absent or not a string, so this predicate cannot tell \
+                 what it is. It asks whether the row is too dangerous to delete, and an \
+                 unreadable input answers YES — an unproven `No` is not a proven one"
+            }
+        }
+    }
+}
+
+/// **The rows that carry an EXCLUSION — never purged.**
 ///
 /// See the module doc: exclusion of a previously slashed / leaked / de-admitted
 /// key is not structural, does not come from the trust root, and for the rows
 /// that live in `federation_attestations` it depends on those rows surviving.
-/// Returns `Some(reason)` for the classes whose deletion would re-admit exactly
-/// what a reset is meant to remove:
-///
-/// - **structural composers** (`withdraws` / `supersedes` / `recants`) — the
-///   tombstones. Purging one resurrects everything it retracted, which is the
-///   single worst outcome this routine can have.
-/// - **peer de-admission** rows ([`PEER_DEADMISSION_DIMENSION`]) — AV-77's
-///   whole defence, folded from rows THIS node authored.
-/// - **quarantine** markers — withhold/release, folded by
-///   [`resolve_quarantine`](super::quarantine::resolve_quarantine).
-/// - **moderation / reconsideration / slashing / objection** reports — the
-///   §11.10 duty plane.
-/// - **every `delegates_to` row** — the plane that AUTHORIZES all of the above
-///   (a quarantine marker is inadmissible without its `slash` chain), and the
-///   plane the OWNER CLAIM itself lives on. Broad on purpose: retaining a
-///   delegation that turned out not to matter costs a stored row; dropping one
-///   that did costs the authority of every act hanging off it.
+/// Returns the [`ExclusionClass`] whose deletion would re-admit exactly what a
+/// reset is meant to remove.
 ///
 /// A retracted exclusion-bearing row stays retained too — the fold already
 /// hides it from every read, so retention is inert, while deletion would be
 /// irreversible on a class whose refill is order-dependent and, for
 /// `federation_revocations`, impossible.
-///
-/// [`PEER_DEADMISSION_DIMENSION`]: super::admission::PEER_DEADMISSION_DIMENSION
 #[must_use]
-pub fn is_exclusion_bearing(row: &Attestation) -> Option<&'static str> {
-    use super::admission::{
-        MODERATION_DIMENSION_PREFIX, PEER_DEADMISSION_DIMENSION, QUARANTINE_DIMENSION_PREFIX,
-        RECONSIDERATION_DIMENSION_PREFIX,
-    };
+pub fn is_exclusion_bearing(row: &Attestation) -> Option<ExclusionClass> {
+    // Structural first: these are identified by `attestation_type` and must not
+    // depend on a readable dimension.
     if super::precedence::is_structural_composer(&row.attestation_type) {
-        return Some(
-            "a structural composer is a TOMBSTONE: purging it resurrects everything it retracted",
-        );
+        return Some(ExclusionClass::StructuralComposer);
     }
     if row.attestation_type == attestation_type::DELEGATES_TO {
-        return Some(
-            "the delegation plane AUTHORIZES quarantine / moderation / slashing acts and carries \
-             the owner claim; without it those acts are inadmissible on refill",
-        );
+        return Some(ExclusionClass::Delegation);
     }
-    let dimension = super::admission::envelope_dimension(&row.attestation_envelope)?;
-    if dimension == PEER_DEADMISSION_DIMENSION {
-        return Some("a peer de-admission row is AV-77's entire defence against a sanctioned peer");
+    // FAIL-SECURE on an unreadable dimension. `envelope_dimension` returns
+    // `None` for an absent key AND for a non-string one; the earlier `?` here
+    // turned both into "safe to delete".
+    let Some(dimension) = super::admission::envelope_dimension(&row.attestation_envelope) else {
+        return Some(ExclusionClass::UnreadableDimension);
+    };
+    ExclusionClass::ALL.into_iter().find(|c| {
+        c.dimension_prefix()
+            .is_some_and(|p| dimension.starts_with(p))
+    })
+}
+
+/// v31.0.0 (CIRISPersist#650) — **the purge door's own gate.**
+///
+/// [`classify`] is where the decision is made, and it is careful. That is not
+/// enough: a delete door whose safety lives entirely in its caller is the shape
+/// CIRISPersist#652 had (a write door bypassing the gates its siblings ran), and
+/// the failure mode here is worse because it is unrecoverable. So the door
+/// re-asks the one question whose wrong answer cannot be undone — **is this row
+/// exclusion-bearing?** — and refuses if so, whatever the caller believes.
+///
+/// Deliberately NOT a re-run of the whole matrix. The door cannot see the fold
+/// or the corpus, so it cannot re-derive "retracted" or "foreign"; re-asking
+/// only what it can answer from the row alone is what keeps this a real check
+/// rather than a second, weaker copy of `classify` that could drift from it.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] naming the class, if the row is exclusion-bearing.
+pub fn check_purge_admission(row: &Attestation) -> Result<(), Error> {
+    if let Some(class) = is_exclusion_bearing(row) {
+        return Err(Error::InvalidArgument(format!(
+            "refusing to purge attestation {}: {} (CIRISPersist#650). Deleting it would \
+             re-admit exactly what the reset excludes, and this substrate cannot refill it — \
+             the dedicated revocation plane has no replication cursor at all",
+            row.attestation_id,
+            class.why(),
+        )));
     }
-    if dimension.starts_with(QUARANTINE_DIMENSION_PREFIX) {
-        return Some("a quarantine marker withholds a key's rows from serving");
-    }
-    if dimension.starts_with(MODERATION_DIMENSION_PREFIX)
-        || dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX)
-    {
-        return Some("a §11.10 moderation / reconsideration report");
-    }
-    if dimension.starts_with("slashing:") || dimension.starts_with("objection:") {
-        return Some("a slashing outcome / reverse-quorum objection");
-    }
-    None
+    Ok(())
+}
+
+/// **Does this row carry co-signatures this node cannot reconstruct?**
+///
+/// A row with a non-empty `additional_scrubs` set is an m-of-n statement: the
+/// base `scrub_key_id`/`scrub_signature_*` is signature #1 and every entry here
+/// is another party's, all over the SAME canonical envelope bytes
+/// ([`Attestation::scrubs`](super::types::Attestation::scrubs)). Persist holds
+/// exactly one of those keys.
+///
+/// So a re-stamp — which necessarily changes the bytes — can re-sign OUR part
+/// and nobody else's. The row would survive, still validly signed, **by one
+/// key**: an m-of-n silently degraded to a 1-of-1, with no attacker involved
+/// and no error at the site that did it. That is worse than a purge. A purge is
+/// visible and the row is gone; this leaves a row that LOOKS valid and has
+/// quietly lost the evidence its authority rests on.
+///
+/// # Which rows, and what breaks
+///
+/// The field is authority-bearing on attestation rows in four places, and every
+/// one of them counts DISTINCT VERIFIED co-signatures through the single shared
+/// body [`count_distinct_roster_scrubs`](super::reverse_quorum):
+///
+/// - [`trust_root::family_quorum_over`](super::trust_root) — the FAMILY CHARTER
+///   quorum. Losing co-scrubs here means the charter no longer reaches its
+///   threshold and the node's constitutional trust root stops validating.
+/// - [`reverse_quorum`](super::reverse_quorum) — the m-of-n UNDO half of the
+///   reverse quorum (`objection:dismissed:v1`). A dismissal below threshold is
+///   not counted, so the objection stands.
+/// - [`ownership_reclaim`](super::ownership_reclaim) — the WA finding that
+///   authorizes a CC 3.2 reclaim, and the node's own co-signature on the fresh
+///   post-reclaim owner-binding.
+///
+/// **The direction is uniformly fail-CLOSED**, which is the one piece of good
+/// news: a thinned scrub set makes a quorum read as NOT MET, never as met. The
+/// 1-of-N *protect* side of the reverse quorum does not read this field at all,
+/// so no exclusion is ever weakened by losing it. But fail-closed here means an
+/// authority that WAS conferred silently reads as never conferred, and only a
+/// re-run of the original ceremony can restore it — which a boot-time migration
+/// has no way to perform.
+///
+/// # Why promotion's precedent does NOT transfer
+///
+/// `promote_attestation` clears `additional_scrubs`, and this routine originally
+/// cited that as precedent. It is the opposite case, and the promotion code says
+/// so in its own words: *"A local-tier row defers its signature, so any
+/// `additional_scrubs` it carried were STORED WITHOUT EVER BEING VERIFIED …
+/// Co-signatures are earned at the ceremony that mints a federation-tier row,
+/// never inherited by a promotion."* Promotion discards co-scrubs that were
+/// **never verified**, on its way INTO the plane that verifies them. This
+/// routine would discard co-scrubs that **were** verified — every one of them
+/// checked at ingest by
+/// [`verify_federation_tier_ingest`](super::tier_ingest) — and there is no
+/// ceremony after a migration to earn them back.
+///
+/// So a co-scrubbed row is treated exactly like one this node did not author:
+/// retained, reported, and left for an operator. We can re-sign our own part;
+/// we cannot reconstruct anyone else's, and degrading authority we cannot
+/// restore is not a migration's decision to make.
+#[must_use]
+pub fn is_co_scrubbed(row: &Attestation) -> bool {
+    !row.additional_scrubs.is_empty()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -455,22 +706,35 @@ pub enum PurgeReason {
     },
     /// Legacy shape, not ours to re-author, federation tier. Unusable at every
     /// door AND — because `put_attestation` inserts on a primary key — it
-    /// BLOCKS its own v31 replacement from landing. Its author is its source;
-    /// the replication plane refills it.
+    /// BLOCKS its own v31 replacement from landing.
+    ///
+    /// # This is licensed by an OPERATOR DECISION, not by a proof
+    ///
+    /// Stated plainly because the distinction is what separates this arm from
+    /// the `ProvablyInert` arm that was removed. The operator's instruction is
+    /// that *"the rest can be dumped and re-popped when valid via replication
+    /// plane"*, and the asymmetry that makes it defensible is that these rows
+    /// are PEER-SOURCED: a federation-tier row this node cannot re-author
+    /// arrived from somewhere, so a copy demonstrably existed elsewhere at
+    /// least once.
+    ///
+    /// **That is still not "they kept it."** `AntiEntropy`'s own doc demolishes
+    /// the stronger reading — *"a pull surface does not learn who pulled, nor
+    /// whether they kept it"* — and `anti_entropy_satisfied` is structurally
+    /// `Unverifiable` on this substrate. So `tier == federation` is standing in
+    /// for a residence proof this substrate cannot produce. What can go wrong,
+    /// concretely: the origin peer is gone, has been de-admitted, or dropped the
+    /// row itself, and then nothing refills it.
+    ///
+    /// Two things make it survivable, and both must stay:
+    /// [`is_exclusion_bearing`] carves out every class whose loss would
+    /// re-admit a key the mesh excluded, and the count is reported in
+    /// [`MigrationOutcome::purged_unauthorable`] so an operator can see how much
+    /// was dumped on the assumption.
     UnauthorableLegacy {
         /// Who signed it.
         attesting_key_id: String,
     },
-    /// Ours, legacy, FEDERATION-tier, and PROVABLY inert: [`LoadBearing::No`]
-    /// and outside a COMPLETE owner closure. The CIRISPersist#563 shape — a
-    /// `consent:replication` grant that reduces to nothing here.
-    ///
-    /// Four conjuncts, deliberately: on a truncated walk, on a local-tier row
-    /// (which the walk structurally cannot see), or on anything but a proven
-    /// `No`, this arm is unreachable and the row is re-stamped instead. It is
-    /// the ONLY licence in this routine to delete a row of ours that nobody has
-    /// retracted, and it is meant to be hard to obtain.
-    ProvablyInert,
 }
 
 /// What the migration will do with one row.
@@ -502,7 +766,6 @@ impl Disposition {
             Self::RetainInert { .. } => "retain_inert",
             Self::Purge(PurgeReason::Retracted { .. }) => "purge_retracted",
             Self::Purge(PurgeReason::UnauthorableLegacy { .. }) => "purge_unauthorable_legacy",
-            Self::Purge(PurgeReason::ProvablyInert) => "purge_provably_inert",
         }
     }
 
@@ -520,90 +783,149 @@ impl Disposition {
 ///
 /// The arms, in order, each naming its fail-secure side:
 ///
-/// 1. **Exclusion-bearing ⇒ NEVER purge.** Ahead of the retraction arm on
+/// 1. **Conformant ⇒ untouched, whatever else is true of it.** This routine is
+///    a SHAPE transition, not a garbage collector. It leads because putting it
+///    anywhere else made the migration delete rows that were never a v31
+///    problem — see the note below, which is a defect this arm order fixes.
+/// 2. **Co-scrubbed ⇒ retain, never re-stamp.** We hold one key of an m-of-n.
+///    Re-signing drops everyone else's signature and degrades authority we
+///    cannot restore — see [`is_co_scrubbed`]. Ahead of the exclusion arm
+///    because the rows that carry co-scrubs are largely the same rows.
+/// 3. **Exclusion-bearing ⇒ NEVER purge.** Ahead of the retraction arm on
 ///    purpose: a retracted tombstone that got deleted would revive whatever it
 ///    retracted. `Unknown`-adjacent by nature (we cannot prove an exclusion is
 ///    spent), so keeping is the safe side. Re-stamped when we can author it,
 ///    otherwise [`Disposition::RetainInert`].
-/// 2. **Retracted ⇒ purge.** The author's own later statement is the proof.
-///    This is the arm that makes the migration carry the FINAL state and not
-///    the interim ones. Not `Unknown` — a live composer is a decisive `No`.
-/// 3. **Conformant ⇒ untouched.** Idempotence.
-/// 4. **Ours ⇒ re-stamp**, unless PROVABLY inert (`LoadBearing::No` AND
-///    federation-tier AND outside a COMPLETE closure). `Unknown` lands on the
-///    re-stamp side, which is the fail-secure side.
-/// 5. **Not ours, local tier ⇒ retain inert.** A local-tier row lives nowhere
+/// 4. **Retracted AND legacy ⇒ purge.** The author's own later statement is the
+///    proof. This is the arm that makes the migration carry the FINAL state and
+///    not the interim ones. Not `Unknown` — a live composer is a decisive `No`.
+/// 5. **Ours ⇒ re-stamp.** Unconditionally: this routine has NO arm that
+///    deletes a row of ours that nobody retracted. See the note below.
+/// 6. **Not ours, local tier ⇒ retain inert.** A local-tier row lives nowhere
 ///    else; no peer can refill it, so deletion is unrecoverable.
-/// 6. **Not ours, federation tier ⇒ purge.** Its author is its source and the
-///    replication plane refills it in v31 shape. This is the only arm that
-///    deletes something we did not prove dead, and it is licensed by
-///    RECOVERABILITY rather than by deadness — stated here so the difference is
-///    on the record.
+/// 7. **Not ours, federation tier, and NOT positively load-bearing ⇒ purge.**
+///    A [`LoadBearing::Yes`](super::load_bearing::LoadBearing) retains: the
+///    operator's licence covers rows we merely hold, not rows this node can see
+///    something depends on. The ONLY arm that deletes
+///    something nobody retracted, and it is licensed by an OPERATOR DECISION
+///    ("dumped and re-popped via the replication plane"), not by a proof of
+///    deadness or of residence — see [`PurgeReason::UnauthorableLegacy`], which
+///    names what can go wrong.
+///
+/// # Why there is no "provably inert" purge, and why the closure is not consulted
+///
+/// An earlier cut had a fifth disposition: ours, legacy, federation-tier,
+/// [`LoadBearing::No`] and absent from a COMPLETE
+/// [`load_bearing_closure`](super::load_bearing::load_bearing_closure) ⇒ purge.
+/// It was documented as four independent conjuncts. **Three of them were one
+/// fact wearing three hats**, and a reviewer's probe found it by running the
+/// real routine:
+///
+/// 1. `retained_replication` returns `No` for a `consent:replication:v1` grant
+///    whose named peer holds no rows here yet;
+/// 2. the closure walk reaches that row and **prunes it BECAUSE the verdict is
+///    `No`** (a dead branch does not keep its children alive);
+/// 3. the arm then read "absent from the closure" as INDEPENDENT evidence.
+///
+/// So the guard reduced to `verdict == No`, and the row it deleted was a grant
+/// naming a **newly-added peer** — the normal state of a peer you have added
+/// and not yet synced with. Deleting it makes that peer's rows inadmissible, so
+/// it can never bootstrap: self-fulfilling, silent, and permanent, with the
+/// operator seeing a successful migration.
+///
+/// The arm should never have existed, and the reason is written in
+/// [`super::load_bearing`]'s own module doc: *"a `No` from this module is NOT a
+/// licence to drop anything, because dropping a copy that has nowhere else to
+/// live is data loss wearing a GC costume."* Release is
+/// [`may_release_copy`](super::load_bearing::may_release_copy) —
+/// `is_load_bearing == No` **∧** `anti_entropy_satisfied` — and the second
+/// conjunct is structurally unsatisfiable on this substrate (no peer transport,
+/// no acknowledgment plane), so `MayRelease::Yes` is unreachable BY DESIGN and
+/// there is a test pinning that. This routine had built precisely the thing
+/// that module warns about: *"a helper that returned only the first half would
+/// be worse than nothing, because it would look complete."*
+///
+/// Hence the standing rule, enforced by this function's SIGNATURE rather than
+/// by its body: **`classify` cannot see the closure at all.** Closure
+/// membership is reachability evidence, and reachability evidence may only ever
+/// RETAIN. Nothing here can be talked into deleting on it, because nothing here
+/// is given it. `load_bearing_closure` remains what CIRISPersist#650 asked for
+/// and is separately witnessed; the re-stamp set this routine produces is a
+/// SUPERSET of the closure, which satisfies "re-stamp that closure" without
+/// letting the walk license a deletion.
+///
+/// # Why arm 1 leads — a migration is not a garbage collector
+///
+/// With the retraction arm ahead of the conformance arm, a v31-shaped row that
+/// some live composer had retracted was purged — **on every boot, forever.**
+/// That is fine for the v30 rows this routine exists to clear, and wrong for
+/// everything after: ordinary CEG history (a withdrawn grant, both rows minted
+/// under v31) would be deleted by a routine whose remit is the envelope shape.
+/// The retraction arm now applies only to rows that are also LEGACY, so the
+/// migration converges: once a corpus is v31 it is a no-op, and retracted
+/// history stays exactly as retracted history is meant to — at rest, hidden by
+/// the fold, not collected.
 #[must_use]
 pub fn classify(
     row: &Attestation,
     shape: &RowShape,
     fold: &RetractionFold,
-    closure: &LoadBearingClosure,
-    verdict: &LoadBearing,
     authorship: &Authorship,
+    positively_load_bearing: bool,
 ) -> Disposition {
-    // 1. EXCLUSION-BEARING — never purge. Leads the retraction arm.
-    if let Some(why) = is_exclusion_bearing(row) {
-        if shape.is_conformant() {
-            return Disposition::AlreadyConformant;
-        }
+    // 1. ALREADY v31 — nothing to do, whatever else is true of it. The
+    //    idempotence arm, and the arm that keeps this routine from turning into
+    //    a collector of retracted history.
+    if shape.is_conformant() {
+        return Disposition::AlreadyConformant;
+    }
+
+    // 2. CO-SCRUBBED — an m-of-n we hold ONE key of. Ahead of every arm that
+    //    could re-stamp, including the exclusion arm: a dismissal, a charter
+    //    and an owner-binding are all exclusion-bearing AND co-scrubbed, so
+    //    checking this second is the difference between retaining the evidence
+    //    and silently re-minting the row as a 1-of-1.
+    if is_co_scrubbed(row) {
+        return Disposition::RetainInert {
+            why: format!(
+                "the row carries {} co-scrub(s) over the OLD envelope bytes and this node holds \
+                 only its own key. Re-stamping would re-sign our part and drop everyone else's, \
+                 turning an m-of-n into a 1-of-1 with no error at the site that did it — worse \
+                 than a purge, because the result LOOKS valid. Retained for operator review \
+                 (CIRISPersist#650)",
+                row.additional_scrubs.len(),
+            ),
+        };
+    }
+
+    // 3. EXCLUSION-BEARING — never purge. Leads the retraction arm.
+    if let Some(class) = is_exclusion_bearing(row) {
         if authorship.can_reauthor() {
             return Disposition::Restamp;
         }
         return Disposition::RetainInert {
             why: format!(
-                "{why} — and this node cannot re-author it, so it is kept in v30 shape rather \
+                "{} — and this node cannot re-author it, so it is kept in v30 shape rather \
                  than deleted (CIRISPersist#650: exclusion is not structural and the dedicated \
-                 revocation plane has no replication cursor)"
+                 revocation plane has no replication cursor)",
+                class.why(),
             ),
         };
     }
 
-    // 2. RETRACTED — the author's own later statement. Proven dead.
+    // 4. RETRACTED, and legacy. The author's own later statement is the proof.
     if let Some(by) = fold.retracted_by(&row.attestation_id) {
         return Disposition::Purge(PurgeReason::Retracted { by: by.to_owned() });
     }
 
-    // 3. Already v31. The idempotence arm.
-    if shape.is_conformant() {
-        return Disposition::AlreadyConformant;
-    }
-
-    // 4. OURS. `Unknown` re-stamps — the fail-secure side.
+    // 5. OURS. Unconditional: there is no arm here that deletes a row of ours
+    //    that nobody retracted, and the closure is not consulted at all — see
+    //    the note on this function.
     if authorship.can_reauthor() {
-        // FOUR conjuncts, and every one of them is a refusal to guess.
-        //
-        // The `tier` conjunct is the one that is easy to miss and would be
-        // wrong to omit: the recursive walk reaches attestations through
-        // `list_attestations_by` / `list_attestations_for`, and BOTH are
-        // `tier = 'federation'` reads (the E5 invariant — a local row must
-        // never reach the serve wire). So the walk STRUCTURALLY cannot see a
-        // local-tier row, and "not in the closure" carries no information about
-        // one. Reading it as evidence of inertness would delete a draft that
-        // exists nowhere else on the strength of a read that was never looking.
-        //
-        // What remains reachable is exactly the CIRISPersist#563 shape: a
-        // federation-tier grant we authored, proven `No` by its family's own
-        // declared predicate, that a COMPLETE walk from the owner claim did not
-        // reach. That is a narrow arm by design — it is the only licence in
-        // this routine to delete a row of ours that no one has retracted.
-        let provably_inert = matches!(verdict, LoadBearing::No)
-            && row.tier == attestation_tier::FEDERATION
-            && !closure.contains_attestation(&row.attestation_id)
-            && closure.completeness.complement_is_trustworthy();
-        if provably_inert {
-            return Disposition::Purge(PurgeReason::ProvablyInert);
-        }
         return Disposition::Restamp;
     }
 
-    // 5. Not ours, and nowhere else to come back from.
+    // 6. Not ours, and nowhere else to come back from.
     if row.tier == attestation_tier::LOCAL {
         return Disposition::RetainInert {
             why:
@@ -614,7 +936,29 @@ pub fn classify(
         };
     }
 
-    // 6. Not ours, federation tier: its author is its source.
+    // 7. Not ours, federation tier: its author is its source.
+    //
+    // …UNLESS the substrate POSITIVELY asserts the row is load bearing.
+    // `trust:*` is manifest-declared *"can never be inferred inert"*, and
+    // deleting a row this node's own predicate says something depends on —
+    // while betting on a refill it cannot verify — is indefensible whatever
+    // the operator's recoverability licence says.
+    //
+    // The polarity is deliberately ASYMMETRIC and this is the only place in the
+    // routine where that is true: a `Yes` RETAINS, and a `No`/`Unknown` does
+    // NOT license the delete — the operator's decision does. Reachability
+    // evidence may only ever retain (see the note on this function), so reading
+    // `Unknown` as permission would be the removed arm's mistake again.
+    if positively_load_bearing {
+        return Disposition::RetainInert {
+            why: "this node's own reachability predicate returns `Yes` — something held here \
+                  depends on this row. The operator's \"dump and re-pop via replication\" \
+                  licence covers rows we merely hold, not rows we can see are load bearing \
+                  (CIRISPersist#650)"
+                .to_owned(),
+        };
+    }
+
     Disposition::Purge(PurgeReason::UnauthorableLegacy {
         attesting_key_id: row.attesting_key_id.clone(),
     })
@@ -643,6 +987,11 @@ pub fn classify(
 ///    that hands over a row it forgot to stamp is REFUSED here rather than
 ///    silently writing a row no peer will take. That is CIRISPersist#649's
 ///    rule, applied to the door #650 adds.
+/// 3. **THE #647 AT-REST INVARIANT.** This is the fourth writer of
+///    `attestation_envelope`; the other three canonicalize on the way in. A row
+///    whose stored column does not `sha256sum` to its `original_content_hash`
+///    is one the substrate's own audit predicate rejects, so it is refused here
+///    rather than written.
 pub fn check_reseal_admission(
     stored: &Attestation,
     resealed: &Attestation,
@@ -717,6 +1066,17 @@ pub fn check_reseal_admission(
         super::admission::DEFAULT_MAX_TOUCH_SKEW,
     )?;
     super::admission::check_row_column_binding(resealed)?;
+    // v31.0.0 (CIRISPersist#647) — THE AT-REST INVARIANT, at the door.
+    //
+    // #647's promise is that `sha256sum` over the stored `attestation_envelope`
+    // column equals `original_content_hash`, so the artifact is decipherable by
+    // hand. The three ingest doors keep it by canonicalizing on the way in;
+    // this door is a FOURTH writer of that column, so it has to ask. Gating
+    // rather than silently canonicalizing here is deliberate: the caller
+    // computed a hash and a signature over some bytes, and a door that quietly
+    // rewrote those bytes afterwards would recreate the #649 defect — the
+    // stored envelope and the signature covering it drifting apart.
+    super::canonical_at_rest::check_canonical_at_rest(&resealed.attestation_envelope)?;
     Ok(())
 }
 
@@ -799,21 +1159,35 @@ pub struct MigrationOutcome {
     pub restamped: usize,
     /// Rows purged, by reason.
     pub purged_retracted: usize,
-    /// Rows purged because they are legacy, foreign and refillable.
+    /// Rows purged because they are legacy, foreign and *assumed* refillable.
+    ///
+    /// Surfaced on its own so an operator can see how much was dumped on an
+    /// assumption this substrate cannot verify — see
+    /// [`PurgeReason::UnauthorableLegacy`].
     pub purged_unauthorable: usize,
-    /// Rows purged because they are ours, legacy and provably inert.
-    pub purged_provably_inert: usize,
     /// Rows kept in v30 shape because deleting them was unsafe.
     pub retained_inert: usize,
+    /// Of [`Self::retained_inert`], how many were retained because they carry
+    /// CO-SCRUBS this node cannot reconstruct ([`is_co_scrubbed`]).
+    ///
+    /// Its own counter because it is its own operator decision: these rows are
+    /// m-of-n statements whose quorum evidence is intact but whose envelope is
+    /// v30-shaped, so they are unfederatable until the original co-signers
+    /// re-run the ceremony that produced them. **A silent authority reduction is
+    /// the worst possible shape for this**, so the alternative — re-stamping
+    /// them into 1-of-1 rows — is refused, and the count is surfaced here and in
+    /// the boot log rather than buried in `retained_inert`.
+    pub retained_co_scrubbed: usize,
     /// Per-row detail.
     pub rows: Vec<RowOutcome>,
     /// Whether the corpus walk hit [`MIGRATION_ROW_BUDGET`].
     pub budget_exhausted: bool,
-    /// Whether the reachability closure was complete. When `false`, the
-    /// `ProvablyInert` purge arm was disabled for the whole run.
-    pub closure_complete: bool,
     /// Rows the walk could not act on. Non-empty means the next run has work.
     pub errors: usize,
+    /// The node has no derived key id, so nothing is authored by it, nothing is
+    /// re-stampable, and — critically — nothing may be purged. The run did
+    /// NOTHING; it is not a completed migration.
+    pub skipped_no_identity: bool,
 }
 
 impl MigrationOutcome {
@@ -821,13 +1195,10 @@ impl MigrationOutcome {
     /// idempotence property, stated as a value rather than as a comment.
     #[must_use]
     pub const fn changed_anything(&self) -> bool {
-        self.restamped > 0
-            || self.purged_retracted > 0
-            || self.purged_unauthorable > 0
-            || self.purged_provably_inert > 0
+        self.restamped > 0 || self.purged_retracted > 0 || self.purged_unauthorable > 0
     }
 
-    fn record(&mut self, outcome: RowOutcome) {
+    fn record(&mut self, outcome: RowOutcome, co_scrubbed: bool) {
         self.visited += 1;
         if outcome.error.is_some() {
             self.errors += 1;
@@ -836,13 +1207,15 @@ impl MigrationOutcome {
             match &outcome.disposition {
                 Disposition::AlreadyConformant => self.already_conformant += 1,
                 Disposition::Restamp => self.restamped += 1,
-                Disposition::RetainInert { .. } => self.retained_inert += 1,
+                Disposition::RetainInert { .. } => {
+                    self.retained_inert += 1;
+                    if co_scrubbed {
+                        self.retained_co_scrubbed += 1;
+                    }
+                }
                 Disposition::Purge(PurgeReason::Retracted { .. }) => self.purged_retracted += 1,
                 Disposition::Purge(PurgeReason::UnauthorableLegacy { .. }) => {
                     self.purged_unauthorable += 1;
-                }
-                Disposition::Purge(PurgeReason::ProvablyInert) => {
-                    self.purged_provably_inert += 1;
                 }
             }
         }
@@ -856,8 +1229,6 @@ pub struct MigrationOptions {
     /// Decide but do not write. Used by an operator preview and by the witness
     /// that asserts a decision without paying for it.
     pub dry_run: bool,
-    /// The [`load_bearing_closure`] expansion budget.
-    pub closure_budget: usize,
     /// The corpus-walk row budget.
     pub row_budget: usize,
 }
@@ -866,31 +1237,83 @@ impl Default for MigrationOptions {
     fn default() -> Self {
         Self {
             dry_run: false,
-            closure_budget: DEFAULT_CLOSURE_BUDGET,
             row_budget: MIGRATION_ROW_BUDGET,
         }
     }
 }
 
-/// Read the whole corpus, every tier, in one stable keyset order.
-async fn read_corpus(
+/// What one streaming pass over the corpus keeps.
+///
+/// # Why it is not just `Vec<Attestation>`
+///
+/// This runs at EVERY boot, on a corpus that is fully migrated almost all of
+/// the time, and it scales with the database. Materializing every envelope to
+/// answer a question about a handful of them is the cost that made a completion
+/// marker look necessary. Three things are retained and nothing else:
+///
+/// - `pending` — rows that are NOT v31-conformant. **The only rows that need a
+///   decision at all**, because [`classify`]'s first arm returns
+///   [`Disposition::AlreadyConformant`] for everything else.
+/// - `composers` — every structural composer, whole. A small fraction of any
+///   real corpus, and the fold's input.
+/// - `authors` — `attestation_id -> attesting_key_id` for EVERY row. Two short
+///   strings a row, and the fold needs it to apply the same-attester rule to a
+///   target it is no longer holding.
+///
+/// Conformant rows are counted and dropped. On a migrated node the scan is one
+/// indexed keyset walk plus a pure per-row shape check, with no per-row
+/// directory reads and no closure walk (see [`run_v31_migration`]).
+struct CorpusScan {
+    pending: Vec<Attestation>,
+    composers: Vec<Attestation>,
+    authors: BTreeMap<String, String>,
+    visited: usize,
+    conformant: usize,
+    budget_exhausted: bool,
+}
+
+/// Stream the whole corpus, every tier, in one stable keyset order.
+async fn scan_corpus(
     directory: &dyn FederationDirectory,
     row_budget: usize,
-) -> Result<(Vec<Attestation>, bool), Error> {
-    let mut out: Vec<Attestation> = Vec::new();
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CorpusScan, Error> {
+    let mut scan = CorpusScan {
+        pending: Vec::new(),
+        composers: Vec::new(),
+        authors: BTreeMap::new(),
+        visited: 0,
+        conformant: 0,
+        budget_exhausted: false,
+    };
     let mut after: Option<String> = None;
     loop {
         let page = directory
             .list_attestations_for_migration(after.as_deref(), MIGRATION_PAGE_SIZE)
             .await?;
         if page.is_empty() {
-            return Ok((out, false));
+            return Ok(scan);
         }
         after = page.last().map(|r| r.attestation_id.clone());
-        out.extend(page);
-        if out.len() >= row_budget {
-            out.truncate(row_budget);
-            return Ok((out, true));
+        for row in page {
+            scan.authors
+                .insert(row.attestation_id.clone(), row.attesting_key_id.clone());
+            if super::precedence::is_structural_composer(&row.attestation_type) {
+                scan.composers.push(row.clone());
+            }
+            if classify_shape(&row, now).is_conformant() {
+                scan.conformant += 1;
+            } else if scan.pending.len() < row_budget {
+                scan.pending.push(row);
+            } else {
+                // The WORK budget, not the scan budget — see
+                // `MIGRATION_ROW_BUDGET`. The scan continues so `visited` and
+                // `authors` stay total (the fold needs every row's author, and
+                // an under-populated author map can only cause UNDER-retraction
+                // — the safe direction), but this run will not act on more.
+                scan.budget_exhausted = true;
+            }
+            scan.visited += 1;
         }
     }
 }
@@ -918,6 +1341,24 @@ async fn build_restamped(
     let mut next = row.clone();
     super::envelope::stamp_signed_instants(&mut next)?;
     super::envelope::RowMirror::stamp_row(&mut next)?;
+    // v31.0.0 (CIRISPersist#647) — CANONICALIZE BEFORE HASHING, so the STORED
+    // bytes and the HASHED bytes are the same bytes by construction.
+    //
+    // The three canonicalizing doors (`put_attestation` / `put_public_key` /
+    // `put_revocation`) call this before storing; the re-stamp writes
+    // `attestation_envelope` through `reseal_attestation_v31`, which is not one
+    // of them. Without this line the envelope stored is whatever `serde_json`
+    // built while the hash covers the JCS form — and #647's invariant is that
+    // an operator can run `sha256sum` over the stored column and get
+    // `original_content_hash` back. The stamps above insert members through
+    // `serde_json` (`weight` as a NUMBER, which JCS §3.2.2.3 serializes through
+    // ECMAScript `Number::toString`), so "they probably agree" is exactly the
+    // reasoning #644/#645 disproved one column over.
+    //
+    // Done here — once, on the value that is about to be both signed and stored
+    // — rather than separately at the hash site and the store site, because two
+    // spellings of one projection is the defect this release keeps finding.
+    super::canonical_at_rest::canonicalize_in_place(&mut next.attestation_envelope)?;
 
     match authorship {
         Authorship::UnsealedLocal => {
@@ -946,10 +1387,21 @@ async fn build_restamped(
             })?;
             next.scrub_timestamp =
                 super::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-            // A re-seal is a FRESH scrub set: the co-scrubs covered the OLD
-            // envelope bytes and cannot cover these. Same rule promotion
-            // applies (#556/#557).
-            next.additional_scrubs = Vec::new();
+            // DEFENCE IN DEPTH. `classify` already refuses to re-stamp a
+            // co-scrubbed row, so reaching here with one is a routing bug — and
+            // the failure mode is silent AUTHORITY LOSS, which is exactly the
+            // kind that must not be recoverable by accident. See
+            // [`is_co_scrubbed`] for the full account.
+            if !next.additional_scrubs.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "v31 migration refuses to re-stamp attestation {}: it carries {} co-scrub(s) \
+                     over the OLD envelope bytes, and this node holds only its own key. \
+                     Re-signing would drop them and silently turn an m-of-n into a 1-of-1 \
+                     (CIRISPersist#650)",
+                    next.attestation_id,
+                    next.additional_scrubs.len(),
+                )));
+            }
         }
         Authorship::Foreign { .. } => {
             return Err(Error::InvalidArgument(format!(
@@ -975,71 +1427,93 @@ pub async fn run_v31_migration(
     let now = chrono::Utc::now();
     let self_key_id = signer.signing_key_id().await;
 
-    let (corpus, budget_exhausted) = read_corpus(directory, options.row_budget).await?;
-    let fold = fold_retractions(&corpus);
+    // v31.0.0 (CIRISPersist#650) — **NO IDENTITY, NO MIGRATION.** This was true
+    // of `run_v31_migration_at_boot`, which bails early, and the doc claimed it
+    // of the ROUTINE — but `run_v31_migration` is `pub`, and without a key id
+    // `classify_authorship` returns `Foreign` for every signed row, so arm 7
+    // would mass-purge the node's OWN federation corpus. A property asserted of
+    // a function has to hold in that function.
+    if self_key_id.is_none() {
+        return Ok(MigrationOutcome {
+            skipped_no_identity: true,
+            ..MigrationOutcome::default()
+        });
+    }
 
-    // The recursive walk from the owner claim. A node with no identity has no
-    // owner claim to anchor on; the closure is then empty, which disables the
-    // `ProvablyInert` arm (an empty closure with `Complete` completeness would
-    // otherwise mark every `No` row purgeable). Guard it explicitly.
-    let closure = match &self_key_id {
-        Some(me) => {
-            let roots = owner_roots(directory, me).await?;
-            load_bearing_closure(directory, roots, options.closure_budget).await?
-        }
-        None => LoadBearingClosure {
-            roots: Vec::new(),
-            members: Vec::new(),
-            attestation_ids: BTreeSet::new(),
-            key_ids: BTreeSet::new(),
-            revisits: 0,
-            excluded_proven_not_load_bearing: 0,
-            // NOT `Complete`: without an anchor the walk saw nothing, and a
-            // caller must not read "nothing reachable" as "everything is
-            // purgeable".
-            completeness: ClosureCompleteness::Truncated {
-                budget: options.closure_budget,
-                frontier_remaining: 0,
-            },
-        },
-    };
+    let scan = scan_corpus(directory, options.row_budget, now).await?;
+
+    // THE STEADY-STATE SHORT-CIRCUIT. Nothing is legacy => every arm of
+    // `classify` returns `AlreadyConformant`, so the fold and the recursive
+    // walk cannot change a single answer. Skipping them is what keeps a
+    // fully-migrated node's boot to one indexed keyset scan — and it is a
+    // CONSEQUENCE of the arm order, not an optimization bolted beside it: it is
+    // sound exactly because arm 1 leads. If any arm could act on a conformant
+    // row (as the retraction arm once could), this would silently skip it.
+    if scan.pending.is_empty() {
+        return Ok(MigrationOutcome {
+            visited: scan.visited,
+            already_conformant: scan.conformant,
+            budget_exhausted: scan.budget_exhausted,
+            ..MigrationOutcome::default()
+        });
+    }
+
+    let fold = fold_retractions_from(&scan.composers, &scan.authors);
+
+    // NO CLOSURE WALK, and no per-row `is_load_bearing`. Both existed to feed
+    // the removed `ProvablyInert` arm, and both were the wrong second opinion:
+    // the walk consults the SAME predicate it was being used to corroborate.
+    // Removing the arm removes the reads, which is also what makes a
+    // legacy-bearing boot cost one scan plus one write per row rather than a
+    // graph traversal. See `classify`.
 
     let mut outcome = MigrationOutcome {
-        budget_exhausted,
-        closure_complete: closure.completeness.complement_is_trustworthy(),
+        budget_exhausted: scan.budget_exhausted,
+        // Conformant rows never reach the loop below; they are counted here so
+        // `visited` still means "every row the scan saw".
+        visited: scan.conformant,
+        already_conformant: scan.conformant,
         ..MigrationOutcome::default()
     };
 
-    for row in &corpus {
+    for row in &scan.pending {
         let shape = classify_shape(row, now);
         let authorship = classify_authorship(row, self_key_id.as_deref());
-        // The per-row predicate is only consulted where it can change the
-        // answer — the `ProvablyInert` arm. Skipping it elsewhere keeps a boot
-        // sweep from doing two directory reads per row for a verdict no arm
-        // reads.
-        let verdict = if authorship.can_reauthor() && !shape.is_conformant() {
-            is_load_bearing(
-                directory,
-                ObjectRef::Attestation {
-                    attestation_id: row.attestation_id.clone(),
-                },
+        // Consulted ONLY where it can RETAIN — a foreign federation row that
+        // arm 7 would otherwise purge. Never where it could license a delete;
+        // that was the removed arm's defect. Also keeps the boot sweep from
+        // paying two directory reads per row for a verdict no other arm reads.
+        let positively_load_bearing = if !shape.is_conformant()
+            && !authorship.can_reauthor()
+            && row.tier == attestation_tier::FEDERATION
+            && is_exclusion_bearing(row).is_none()
+            && !fold.is_retracted(&row.attestation_id)
+        {
+            matches!(
+                is_load_bearing(
+                    directory,
+                    ObjectRef::Attestation {
+                        attestation_id: row.attestation_id.clone(),
+                    },
+                )
+                .await?,
+                LoadBearing::Yes { .. }
             )
-            .await?
         } else {
-            LoadBearing::Unknown {
-                family: "<not-consulted>".to_owned(),
-                reason: "the predicate cannot change this row's disposition".to_owned(),
-            }
+            false
         };
-        let disposition = classify(row, &shape, &fold, &closure, &verdict, &authorship);
+        let disposition = classify(row, &shape, &fold, &authorship, positively_load_bearing);
 
         if options.dry_run {
-            outcome.record(RowOutcome {
-                attestation_id: row.attestation_id.clone(),
-                disposition,
-                applied: false,
-                error: None,
-            });
+            outcome.record(
+                RowOutcome {
+                    attestation_id: row.attestation_id.clone(),
+                    disposition,
+                    applied: false,
+                    error: None,
+                },
+                is_co_scrubbed(row),
+            );
             continue;
         }
 
@@ -1055,21 +1529,27 @@ pub async fn run_v31_migration(
                 .map(|_| ()),
         };
         match applied {
-            Ok(()) => outcome.record(RowOutcome {
-                attestation_id: row.attestation_id.clone(),
-                disposition,
-                applied: true,
-                error: None,
-            }),
+            Ok(()) => outcome.record(
+                RowOutcome {
+                    attestation_id: row.attestation_id.clone(),
+                    disposition,
+                    applied: true,
+                    error: None,
+                },
+                is_co_scrubbed(row),
+            ),
             // One unwritable row does not stop the sweep. The routine is
             // resumable by construction, so the honest response is to report
             // it and let the next boot retry.
-            Err(e) => outcome.record(RowOutcome {
-                attestation_id: row.attestation_id.clone(),
-                disposition,
-                applied: false,
-                error: Some(e.to_string()),
-            }),
+            Err(e) => outcome.record(
+                RowOutcome {
+                    attestation_id: row.attestation_id.clone(),
+                    disposition,
+                    applied: false,
+                    error: Some(e.to_string()),
+                },
+                is_co_scrubbed(row),
+            ),
         }
     }
 
@@ -1077,10 +1557,7 @@ pub async fn run_v31_migration(
     // `rebuild_signed_wire_index` is the sanctioned repair for exactly this and
     // is already implemented on all three backends — reused rather than
     // hand-rolling three index deletes.
-    if !options.dry_run
-        && (outcome.purged_retracted + outcome.purged_unauthorable + outcome.purged_provably_inert)
-            > 0
-    {
+    if !options.dry_run && (outcome.purged_retracted + outcome.purged_unauthorable) > 0 {
         match directory.rebuild_signed_wire_index().await {
             Ok(_) | Err(Error::Unsupported { .. }) => {}
             Err(e) => return Err(e),
@@ -1169,16 +1646,16 @@ pub async fn run_v31_migration_at_boot(engine: &crate::Engine) -> Option<Migrati
     .await
     {
         Ok(outcome) => {
-            if outcome.changed_anything() || outcome.errors > 0 {
+            if outcome.changed_anything() || outcome.errors > 0 || outcome.retained_co_scrubbed > 0
+            {
                 tracing::info!(
                     visited = outcome.visited,
                     restamped = outcome.restamped,
                     purged_retracted = outcome.purged_retracted,
                     purged_unauthorable = outcome.purged_unauthorable,
-                    purged_provably_inert = outcome.purged_provably_inert,
                     retained_inert = outcome.retained_inert,
+                    retained_co_scrubbed = outcome.retained_co_scrubbed,
                     errors = outcome.errors,
-                    closure_complete = outcome.closure_complete,
                     "v31 in-place migration (CIRISPersist#650)"
                 );
             }
@@ -1236,25 +1713,6 @@ mod tests {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
-    }
-
-    fn empty_closure(complete: bool) -> LoadBearingClosure {
-        LoadBearingClosure {
-            roots: Vec::new(),
-            members: Vec::new(),
-            attestation_ids: BTreeSet::new(),
-            key_ids: BTreeSet::new(),
-            revisits: 0,
-            excluded_proven_not_load_bearing: 0,
-            completeness: if complete {
-                ClosureCompleteness::Complete
-            } else {
-                ClosureCompleteness::Truncated {
-                    budget: 1,
-                    frontier_remaining: 1,
-                }
-            },
         }
     }
 
@@ -1328,109 +1786,52 @@ mod tests {
             env(crate::federation::consent_peer_set::DIMENSION, Some("g1")),
         );
         let fold = fold_retractions(&[grant.clone(), tombstone.clone()]);
-        let closure = empty_closure(true);
         let ours = Authorship::OwnKey;
 
         assert!(matches!(
-            classify(
-                &grant,
-                &legacy(),
-                &fold,
-                &closure,
-                &LoadBearing::Unknown {
-                    family: "consent:*".to_owned(),
-                    reason: String::new()
-                },
-                &ours
-            ),
+            classify(&grant, &legacy(), &fold, &ours, false,),
             Disposition::Purge(PurgeReason::Retracted { .. })
         ));
         // The TOMBSTONE is re-stamped, never purged — purging it is the other
         // way the grant comes back.
         assert_eq!(
-            classify(
-                &tombstone,
-                &legacy(),
-                &fold,
-                &closure,
-                &LoadBearing::No,
-                &ours
-            ),
+            classify(&tombstone, &legacy(), &fold, &ours, false,),
             Disposition::Restamp
         );
     }
 
+    /// v31.0.0 (CIRISPersist#650) — **THE RULING: there is no purge-on-inert
+    /// arm, and a proven `No` on a row of OURS is not a licence to delete it.**
+    ///
+    /// The removed arm was `LoadBearing::No AND federation tier AND outside a
+    /// COMPLETE owner closure`, documented as four independent conjuncts. Three
+    /// of them were one fact: the closure walk PRUNES a row precisely because
+    /// its verdict is `No`, so "outside the closure" was the verdict counted
+    /// twice, and `tier == federation` was standing in for a residence proof
+    /// `anti_entropy_satisfied` refuses to make.
+    ///
+    /// This pins the outcome rather than the reasoning: for a row we authored,
+    /// EVERY verdict lands on the re-stamp side. The function no longer takes a
+    /// verdict or a closure at all, so the property is enforced by the
+    /// signature; this test is the behavioural statement of it.
     #[test]
-    fn unknown_never_purges_and_no_only_purges_on_a_complete_closure() {
-        let r = row("a1", "me", attestation_type::SCORES, env("x:y:v1", None));
+    fn a_proven_no_on_our_own_row_is_re_stamped_never_purged() {
+        let mut r = row("a1", "me", attestation_type::SCORES, env("x:y:v1", None));
         let fold = RetractionFold::default();
-        let unknown = LoadBearing::Unknown {
-            family: "x:*".to_owned(),
-            reason: "undeclared".to_owned(),
-        };
-
-        // Unknown ⇒ re-stamp, on a COMPLETE closure. The fail-secure polarity.
-        assert_eq!(
-            classify(
-                &r,
-                &legacy(),
-                &fold,
-                &empty_closure(true),
-                &unknown,
-                &Authorship::OwnKey
-            ),
-            Disposition::Restamp
-        );
-        // A proven No, complete closure, outside it ⇒ the only arm that
-        // deletes one of OUR rows.
-        assert_eq!(
-            classify(
-                &r,
-                &legacy(),
-                &fold,
-                &empty_closure(true),
-                &LoadBearing::No,
-                &Authorship::OwnKey
-            ),
-            Disposition::Purge(PurgeReason::ProvablyInert)
-        );
-        // The SAME No on a TRUNCATED closure must not delete.
-        assert_eq!(
-            classify(
-                &r,
-                &legacy(),
-                &fold,
-                &empty_closure(false),
-                &LoadBearing::No,
-                &Authorship::OwnKey
-            ),
-            Disposition::Restamp
-        );
-        // …and the SAME No on a LOCAL-tier row must not delete either, on a
-        // COMPLETE closure. The walk reaches attestations only through
-        // `tier = 'federation'` reads, so "absent from the closure" says
-        // nothing about a local row — and a local row lives nowhere else.
-        let mut local = r.clone();
-        local.tier = attestation_tier::LOCAL.to_owned();
-        assert_eq!(
-            classify(
-                &local,
-                &legacy(),
-                &fold,
-                &empty_closure(true),
-                &LoadBearing::No,
-                &Authorship::UnsealedLocal
-            ),
-            Disposition::Restamp,
-            "the closure walk cannot see local-tier rows, so its complement must never license \
-             deleting one"
-        );
+        for tier in [attestation_tier::FEDERATION, attestation_tier::LOCAL] {
+            r.tier = tier.to_owned();
+            assert_eq!(
+                classify(&r, &legacy(), &fold, &Authorship::OwnKey, false),
+                Disposition::Restamp,
+                "a row we authored is never deleted on a reachability verdict — release is \
+                 `may_release_copy`, whose anti-entropy conjunct this substrate cannot satisfy"
+            );
+        }
     }
 
     #[test]
     fn every_exclusion_bearing_class_survives_a_purge() {
         let fold = RetractionFold::default();
-        let closure = empty_closure(true);
         let foreign = Authorship::Foreign {
             attesting_key_id: "peer".to_owned(),
         };
@@ -1503,11 +1904,10 @@ mod tests {
                 r,
                 &legacy(),
                 &fold,
-                &closure,
-                &LoadBearing::No,
-                // Foreign AND `LoadBearing::No` AND federation tier — every
-                // condition that would otherwise purge.
+                // Foreign AND federation tier — every condition that would
+                // otherwise purge.
                 &foreign,
+                false,
             );
             assert!(
                 matches!(d, Disposition::RetainInert { .. }),
@@ -1526,16 +1926,329 @@ mod tests {
         );
         assert!(is_exclusion_bearing(&ordinary).is_none());
         assert!(matches!(
+            classify(&ordinary, &legacy(), &fold, &foreign, false,),
+            Disposition::Purge(PurgeReason::UnauthorableLegacy { .. })
+        ));
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **THE EXHAUSTIVENESS GATE.**
+    ///
+    /// The never-purge list used to be a hand-maintained `if`-chain, and it
+    /// shipped three defects of one kind: a leaf matched with `==` instead of a
+    /// prefix, an unreadable dimension falling through as "safe to delete", and
+    /// no way to notice a class that was never added. This is the mechanism that
+    /// replaces remembering — the `ALL` array's LENGTH is compiler-checked
+    /// against the variant set, both `match`es are wildcard-free, and every
+    /// declared class is exercised here from its OWN declaration rather than
+    /// from a second hand-written list that could drift.
+    #[test]
+    fn every_exclusion_class_is_reachable_and_declared() {
+        use crate::federation::types::ScrubSig;
+        let mut seen = std::collections::BTreeSet::new();
+        for class in ExclusionClass::ALL {
+            assert!(
+                !class.why().is_empty(),
+                "{class:?} must declare why deleting it is unsafe"
+            );
+            // Build a probe row FROM the class's own declaration, so a new
+            // class cannot be "covered" by a fixture nobody updated.
+            let probe = match class {
+                ExclusionClass::StructuralComposer => row(
+                    "p",
+                    "k",
+                    attestation_type::WITHDRAWS,
+                    env("anything:at:all:v1", Some("t")),
+                ),
+                ExclusionClass::Delegation => row(
+                    "p",
+                    "k",
+                    attestation_type::DELEGATES_TO,
+                    env("d:x:v1", None),
+                ),
+                ExclusionClass::UnreadableDimension => {
+                    // Dimension present but NOT a string — the exact shape
+                    // `envelope_dimension`'s `as_str()` returns `None` for.
+                    let mut r = row("p", "k", attestation_type::SCORES, env("x:y:v1", None));
+                    r.attestation_envelope["dimension"] = serde_json::json!(42);
+                    r
+                }
+                // INDEPENDENT examples, hardcoded — never derived from
+                // `dimension_prefix()`. Building the probe from the
+                // declaration under test makes the test self-referential: it
+                // followed the prefix wherever it moved, so narrowing
+                // `revocation:` back to the single `peer_admission:v1` leaf
+                // left it green. These are real dimensions from the manifest
+                // and from the audit, and they only match if the PREFIX is
+                // right.
+                ExclusionClass::Revocation => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    // Manifest-declared NON-ROLLBACKABLE, and a sibling leaf of
+                    // the one the `==` match protected.
+                    env("revocation:partner:fraud", None),
+                ),
+                ExclusionClass::Quarantine => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("quarantine:withheld:v1", None),
+                ),
+                ExclusionClass::Moderation => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("moderation:harassment:v1", None),
+                ),
+                ExclusionClass::Reconsideration => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("reconsideration:new_evidence:v1", None),
+                ),
+                ExclusionClass::Slashing => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("slashing:upheld:v1", None),
+                ),
+                ExclusionClass::Objection => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("objection:dismissed:v1", None),
+                ),
+            };
+            let got = is_exclusion_bearing(&probe).unwrap_or_else(|| {
+                panic!("{class:?} is declared but NOT reachable through is_exclusion_bearing")
+            });
+            assert_eq!(got, class, "{class:?} resolved to the wrong class");
+            seen.insert(class);
+        }
+        assert_eq!(
+            seen.len(),
+            ExclusionClass::ALL.len(),
+            "ALL contains duplicates"
+        );
+
+        // THE `==`-vs-`starts_with` CASE, pinned by name. A future `:v2` of the
+        // one leaf the original chain protected, and a SIBLING leaf of it, must
+        // both resolve — that is the whole defect the partition replaced.
+        for dimension in [
+            "revocation:peer_admission:v1",
+            "revocation:peer_admission:v2",
+            "revocation:partner:fraud",
+            "revocation:agent:compromise",
+        ] {
+            assert_eq!(
+                is_exclusion_bearing(&row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env(dimension, None)
+                )),
+                Some(ExclusionClass::Revocation),
+                "{dimension} must be protected — the family is prefix-matched, never one leaf \
+                 by equality"
+            );
+        }
+
+        // NEGATIVE CONTROL: an ordinary row is NOT exclusion-bearing, so the
+        // gate above is measuring the partition and not a predicate that says
+        // yes to everything.
+        assert!(is_exclusion_bearing(&row(
+            "p",
+            "k",
+            attestation_type::SCORES,
+            env("weather:today:v1", None)
+        ))
+        .is_none());
+
+        // And the door refuses every declared class, so the invariant is not
+        // only in `classify`.
+        let mut tomb = row(
+            "p",
+            "k",
+            attestation_type::WITHDRAWS,
+            env("x:y:v1", Some("t")),
+        );
+        tomb.additional_scrubs = vec![ScrubSig {
+            scrub_key_id: "a".into(),
+            scrub_signature_classical: "s".into(),
+            scrub_signature_pqc: None,
+        }];
+        assert!(check_purge_admission(&tomb).is_err());
+        assert!(check_purge_admission(&row(
+            "p",
+            "k",
+            attestation_type::SCORES,
+            env("weather:today:v1", None)
+        ))
+        .is_ok());
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **a CLOCK is not a SHAPE.**
+    ///
+    /// `check_instant_binding`'s fourth arm is a wall-clock skew bound. Mapping
+    /// it to `Legacy` made a node whose clock ran behind classify a correctly
+    /// sealed PEER corpus as legacy — whose disposition is `purge`. A VM
+    /// snapshot restore or a pre-NTP container boot was sufficient to delete it.
+    #[test]
+    fn a_clock_running_behind_does_not_make_a_row_legacy() {
+        let mut r = row("a1", "peer", attestation_type::SCORES, env("x:y:v1", None));
+        r.asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        // Seal it properly, so the only thing that could make it non-conformant
+        // is the clock.
+        crate::federation::envelope::stamp_signed_instants(&mut r).expect("instants");
+        crate::federation::envelope::RowMirror::stamp_row(&mut r).expect("mirror");
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut r.attestation_envelope)
+            .expect("canonical");
+        assert!(
+            classify_shape(&r, chrono::Utc::now()).is_conformant(),
+            "precondition: the fixture is a correctly sealed v31 row"
+        );
+
+        // THE FINDING: the same row, judged by a node an hour behind.
+        let behind = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(
+            classify_shape(&r, behind).is_conformant(),
+            "a node whose clock runs behind must NOT read a correctly sealed row as legacy — \
+             the disposition of a legacy peer row is PURGE, so this turns a clock problem into \
+             silent peer data loss at boot (CIRISPersist#650)"
+        );
+        // And a peer row IS the population at risk: confirm the disposition it
+        // would have received.
+        let mut legacy_peer = r.clone();
+        legacy_peer.attestation_envelope["row"] = serde_json::json!(null);
+        assert!(matches!(
             classify(
-                &ordinary,
-                &legacy(),
-                &fold,
-                &closure,
-                &LoadBearing::No,
-                &foreign
+                &legacy_peer,
+                &classify_shape(&legacy_peer, chrono::Utc::now()),
+                &RetractionFold::default(),
+                &Authorship::Foreign {
+                    attesting_key_id: "peer".into()
+                },
+                false,
             ),
             Disposition::Purge(PurgeReason::UnauthorableLegacy { .. })
         ));
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — arm 7 does not delete what this node's own
+    /// predicate positively asserts is load bearing.
+    #[test]
+    fn a_positively_load_bearing_foreign_row_is_retained() {
+        let r = row(
+            "a1",
+            "peer",
+            attestation_type::SCORES,
+            env("trust:accepts:v1", None),
+        );
+        let foreign = Authorship::Foreign {
+            attesting_key_id: "peer".into(),
+        };
+        assert!(matches!(
+            classify(&r, &legacy(), &RetractionFold::default(), &foreign, true),
+            Disposition::RetainInert { .. }
+        ));
+        // Negative control: the same row with a non-`Yes` verdict is purged, so
+        // the retention above is the predicate's doing.
+        assert!(matches!(
+            classify(&r, &legacy(), &RetractionFold::default(), &foreign, false),
+            Disposition::Purge(PurgeReason::UnauthorableLegacy { .. })
+        ));
+    }
+
+    #[test]
+    fn a_co_scrubbed_row_is_never_re_stamped() {
+        // THE m-of-n CASE. This row is ours, exclusion-bearing (an
+        // `objection:dismissed:v1` is the reverse quorum's m-of-n UNDO), and
+        // legacy — every condition that routes to `Restamp`. The co-scrubs must
+        // override all of them.
+        let mut r = row(
+            "d1",
+            "me",
+            attestation_type::SCORES,
+            env(
+                crate::federation::reverse_quorum::DIMENSION_DISMISSAL,
+                Some("obj-1"),
+            ),
+        );
+        r.additional_scrubs = vec![
+            crate::federation::types::ScrubSig {
+                scrub_key_id: "holder-b".into(),
+                scrub_signature_classical: "sig-b".into(),
+                scrub_signature_pqc: None,
+            },
+            crate::federation::types::ScrubSig {
+                scrub_key_id: "holder-c".into(),
+                scrub_signature_classical: "sig-c".into(),
+                scrub_signature_pqc: None,
+            },
+        ];
+        assert!(is_co_scrubbed(&r));
+        // Precondition: every OTHER signal points at Restamp.
+        assert!(is_exclusion_bearing(&r).is_some());
+        assert!(Authorship::OwnKey.can_reauthor());
+
+        let d = classify(
+            &r,
+            &legacy(),
+            &RetractionFold::default(),
+            &Authorship::OwnKey,
+            false,
+        );
+        assert!(
+            matches!(d, Disposition::RetainInert { .. }),
+            "a co-scrubbed row must be RETAINED, not re-stamped — re-signing drops the other \
+             holders' signatures and turns an m-of-n into a 1-of-1. Got {d:?}"
+        );
+
+        // NEGATIVE CONTROL: the SAME row without co-scrubs IS re-stamped, so
+        // the assertion above measures the co-scrub arm and not a routine that
+        // retains everything.
+        r.additional_scrubs.clear();
+        assert_eq!(
+            classify(
+                &r,
+                &legacy(),
+                &RetractionFold::default(),
+                &Authorship::OwnKey,
+                false,
+            ),
+            Disposition::Restamp
+        );
+    }
+
+    /// Defence in depth: even if a future edit routes a co-scrubbed row to the
+    /// re-stamp builder, it REFUSES rather than silently dropping the set. A
+    /// silent authority reduction is the worst possible shape for this.
+    #[tokio::test]
+    async fn the_restamp_builder_refuses_a_co_scrubbed_row() {
+        struct NullSigner;
+        #[async_trait::async_trait]
+        impl MigrationSigner for NullSigner {
+            async fn signing_key_id(&self) -> Option<String> {
+                Some("me".to_owned())
+            }
+            async fn sign_canonical(&self, _: &[u8]) -> Result<(String, Option<String>), Error> {
+                Ok(("ed".to_owned(), None))
+            }
+        }
+        let mut r = row("d1", "me", attestation_type::SCORES, env("x:y:v1", None));
+        r.additional_scrubs = vec![crate::federation::types::ScrubSig {
+            scrub_key_id: "holder-b".into(),
+            scrub_signature_classical: "sig-b".into(),
+            scrub_signature_pqc: None,
+        }];
+        let e = build_restamped(&r, &NullSigner, &Authorship::OwnKey)
+            .await
+            .expect_err("the builder must refuse a co-scrubbed row");
+        assert!(
+            e.to_string().contains("co-scrub"),
+            "the refusal must name the reason: {e}"
+        );
     }
 
     #[test]
@@ -1558,9 +2271,8 @@ mod tests {
                 &r,
                 &legacy(),
                 &RetractionFold::default(),
-                &empty_closure(true),
-                &LoadBearing::No,
-                &classify_authorship(&r, Some("me"))
+                &classify_authorship(&r, Some("me")),
+                false,
             ),
             Disposition::RetainInert { .. }
         ));
@@ -1601,12 +2313,8 @@ mod tests {
                 &r,
                 &RowShape::V31Conformant,
                 &RetractionFold::default(),
-                &empty_closure(true),
-                &LoadBearing::Unknown {
-                    family: String::new(),
-                    reason: String::new()
-                },
-                &Authorship::OwnKey
+                &Authorship::OwnKey,
+                false,
             ),
             Disposition::AlreadyConformant
         );
@@ -1711,14 +2419,25 @@ pub(crate) mod test_support {
     }
 
     /// A `scores` row on `dimension`, no subjects — the plain shape.
+    ///
+    /// Carries `weight = 1.0`, and that is load-bearing rather than incidental:
+    /// `serde_json` writes an integral f64 as `1.0` while JCS writes `1`, so a
+    /// row with this weight is one whose STORED bytes and CANONICAL bytes
+    /// differ. That is the ordinary case — half this repo's fixtures use
+    /// `weight: Some(1.0)` — and it is what makes the #647 at-rest assertions
+    /// below able to fail. Without it, `sha256(column) == original_content_hash`
+    /// holds by coincidence and the witness measures nothing.
     fn scores_row(id: &str, attester: &str, dimension: &str) -> Attestation {
-        row_with(
+        let mut r = row_with(
             id,
             attester,
             serde_json::json!({ "dimension": dimension }),
             &[],
             attestation_type::SCORES,
-        )
+        );
+        r.weight = Some(1.0);
+        seal::seal_row_in_place(attester, &mut r);
+        r
     }
 
     /// The #650 witness. `dir` is the node under migration, `peer` is a SECOND
@@ -1737,13 +2456,23 @@ pub(crate) mod test_support {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let me = format!("mig-node-{suffix}-{run}");
         let other = format!("mig-peer-{suffix}-{run}");
+        let fresh_peer = format!("mig-fresh-peer-{suffix}-{run}");
         for d in [dir, peer] {
             seal::register_hybrid_key(d, &me).await;
             seal::register_hybrid_key(d, &other).await;
+            seal::register_hybrid_key(d, &fresh_peer).await;
         }
         let new_id = || uuid::Uuid::new_v4().to_string();
-        let (grant_id, tomb_id, live_id, deadm_id, alien_id, alien_del_id) =
-            (new_id(), new_id(), new_id(), new_id(), new_id(), new_id());
+        let (grant_id, tomb_id, live_id, deadm_id, alien_id, alien_del_id, quorum_id, newpeer_id) = (
+            new_id(),
+            new_id(),
+            new_id(),
+            new_id(),
+            new_id(),
+            new_id(),
+            new_id(),
+            new_id(),
+        );
 
         // ── The corpus ──────────────────────────────────────────────────
         //
@@ -1785,6 +2514,27 @@ pub(crate) mod test_support {
             &[],
             attestation_type::WITHDRAWS,
         );
+        // 8. `newpeer` — THE REVIEWER'S CASE, and the one that had to be found
+        //    by running the routine rather than by reading it. An UNRETRACTED
+        //    legacy `consent:replication:v1` grant we authored, naming a peer
+        //    that has authored no rows here yet.
+        //
+        //    `retained_replication` returns `LoadBearing::No` for it — nothing
+        //    is retained under the grant — and the removed `ProvablyInert` arm
+        //    deleted it. But a grant naming a peer with no rows is a peer you
+        //    have JUST ADDED: deleting the grant makes that peer's rows
+        //    inadmissible, so it can never bootstrap. Self-fulfilling, silent,
+        //    permanent, and the operator sees a successful migration.
+        let newpeer = row_with(
+            &newpeer_id,
+            &me,
+            serde_json::json!({
+                "dimension": crate::federation::consent_peer_set::DIMENSION,
+                "payload": {"grants": "replication", "attestation_prefixes": ["mig-650-new:"]},
+            }),
+            &[&format!("mig-fresh-peer-{suffix}-{run}")],
+            attestation_type::SCORES,
+        );
         let live = scores_row(&live_id, &me, "transparency_log:inclusion:v1");
         let deadm = scores_row(
             &deadm_id,
@@ -1792,6 +2542,28 @@ pub(crate) mod test_support {
             crate::federation::admission::PEER_DEADMISSION_DIMENSION,
         );
         let alien = scores_row(&alien_id, &other, "transparency_log:inclusion:v1");
+        // 7. `quorum` — a row WE authored carrying a real co-signature from
+        //    `other`. Everything about it routes to `Restamp` except the
+        //    co-scrub, which must win: re-stamping would re-sign our half and
+        //    drop `other`'s, silently turning an m-of-n into a 1-of-1.
+        let mut quorum = row_with(
+            &quorum_id,
+            &me,
+            serde_json::json!({
+                "dimension": crate::federation::reverse_quorum::DIMENSION_DISMISSAL,
+                "dismisses": "objection-fixture",
+            }),
+            &[],
+            attestation_type::SCORES,
+        );
+        {
+            let (_h, ed, pqc) = seal::sign_envelope(&other, &quorum.attestation_envelope);
+            quorum.additional_scrubs = vec![crate::federation::types::ScrubSig {
+                scrub_key_id: other.clone(),
+                scrub_signature_classical: ed,
+                scrub_signature_pqc: pqc,
+            }];
+        }
         // Targets `me`, not itself: a SELF-`delegates_to` is a root charter and
         // carries the whole `check_trust_charter_admission` stack, which is a
         // different subject.
@@ -1808,7 +2580,9 @@ pub(crate) mod test_support {
         alien_del.attested_key_id = me.clone();
         seal::seal_row_in_place(&other, &mut alien_del);
 
-        let corpus = [&grant, &tomb, &live, &deadm, &alien, &alien_del];
+        let corpus = [
+            &grant, &tomb, &live, &deadm, &alien, &alien_del, &quorum, &newpeer,
+        ];
         for row in corpus {
             dir.put_attestation(SignedAttestation {
                 attestation: row.clone(),
@@ -1864,25 +2638,11 @@ pub(crate) mod test_support {
                 .disposition
                 .clone()
         };
-        // WITNESS: an `Unknown`-verdict row is KEPT, not purged. `live` sits on
-        // a family with no declared load-bearing predicate, so the per-row
-        // predicate returns `Unknown` — and `Unknown` is treated as
-        // load-bearing, which is the direction the whole routine turns on.
-        assert!(
-            matches!(
-                is_load_bearing(
-                    dir,
-                    ObjectRef::Attestation {
-                        attestation_id: live_id.clone()
-                    }
-                )
-                .await
-                .expect("verdict"),
-                LoadBearing::Unknown { .. }
-            ),
-            "({suffix}) the fixture no longer produces an Unknown verdict, so the Unknown arm \
-             below is vacuous — pick a family with no declared predicate"
-        );
+        // WITNESS: a row whose family declares NO load-bearing predicate is
+        // KEPT and re-stamped. `classify` no longer consults the predicate at
+        // all for a row we authored — there is no arm that could delete one on
+        // a reachability verdict — so this is now a statement about the
+        // OUTCOME rather than about the verdict that used to gate it.
         assert_eq!(
             decided(&live_id),
             Disposition::Restamp,
@@ -2001,6 +2761,97 @@ pub(crate) mod test_support {
              (CIRISPersist#650)"
         );
 
+        // ── WITNESS 5b: THE m-of-n. The co-scrubbed row is RETAINED with its
+        //    co-signature intact, counted under its own heading, and NOT
+        //    re-stamped into a 1-of-1. ─────────────────────────────────────
+        let quorum_after = dir
+            .get_attestation(&quorum_id)
+            .await
+            .expect("read")
+            .expect("({suffix}) a co-scrubbed row must survive");
+        assert_eq!(
+            quorum_after.additional_scrubs.len(),
+            1,
+            "({suffix}) the co-signature was DROPPED. `Attestation::scrubs()` is what the \
+             charter quorum, the reverse-quorum undo and the ownership-reclaim finding all \
+             count, so this silently turned an m-of-n into a 1-of-1 — worse than a purge, \
+             because the row still looks valid (CIRISPersist#650)"
+        );
+        assert_eq!(
+            quorum_after.additional_scrubs[0].scrub_key_id, other,
+            "({suffix}) the surviving co-scrub must be the one that was there"
+        );
+        assert_eq!(
+            outcome.retained_co_scrubbed, 1,
+            "({suffix}) a retained m-of-n row must be VISIBLE under its own counter, not \
+             buried in retained_inert: {outcome:?}"
+        );
+
+        // ── WITNESS 5c: THE NEWLY-ADDED PEER. An unretracted legacy grant
+        //    naming a peer that holds no rows must SURVIVE — it is a peer you
+        //    just added, and deleting its grant makes it permanently
+        //    un-bootstrappable. ────────────────────────────────────────────
+        let newpeer_after = dir
+            .get_attestation(&newpeer_id)
+            .await
+            .expect("read")
+            .expect(
+                "({suffix}) an UNRETRACTED consent:replication grant naming a peer with no rows \
+                 yet was DELETED. That peer is one you have just added and not yet synced with; \
+                 without the grant its rows are inadmissible, so it can never bootstrap — \
+                 silently, permanently, and with the migration reporting success \
+                 (CIRISPersist#650)",
+            );
+        assert!(
+            classify_shape(&newpeer_after, chrono::Utc::now()).is_conformant(),
+            "({suffix}) the new-peer grant survived but was not re-stamped"
+        );
+
+        // ── WITNESS 5d: #647 AT REST, over EVERY surviving row. ─────────
+        //
+        //    The headline promise of #647 is that an operator can run
+        //    `sha256sum` over the stored `attestation_envelope` column and get
+        //    `original_content_hash` back. The three ingest doors keep it by
+        //    canonicalizing on the way in; the re-stamp writes that column
+        //    through a FOURTH door. Asserted over the whole corpus rather than
+        //    over one row, because "the door I remembered" is the failure mode.
+        //    Restricted to rows the migration declared CONFORMANT: a
+        //    `RetainInert` row is v30-shaped on purpose and its stored bytes
+        //    were never persist's to canonicalize. The counter below keeps the
+        //    filter from quietly emptying the loop.
+        let mut checked_at_rest = 0usize;
+        for id in [&tomb_id, &live_id, &deadm_id, &newpeer_id, &quorum_id] {
+            let Some(r) = dir.get_attestation(id).await.expect("read") else {
+                continue;
+            };
+            if !classify_shape(&r, chrono::Utc::now()).is_conformant() {
+                continue;
+            }
+            checked_at_rest += 1;
+            crate::federation::canonical_at_rest::check_canonical_at_rest(&r.attestation_envelope)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "({suffix}) row {id} is NOT canonical at rest after migration, so \
+                         `sha256sum` over the stored column will not equal \
+                         `original_content_hash` — #647 broken for exactly the rows this \
+                         release re-mints: {e}"
+                    )
+                });
+            if !r.original_content_hash.is_empty() {
+                let stored = serde_json::to_vec(&r.attestation_envelope).expect("serialize");
+                assert_eq!(
+                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&stored)),
+                    r.original_content_hash,
+                    "({suffix}) row {id}: sha256(stored column) != original_content_hash"
+                );
+            }
+        }
+        assert!(
+            checked_at_rest >= 4,
+            "({suffix}) only {checked_at_rest} rows reached the at-rest assertion — the filter \
+             emptied the loop and the check became a report"
+        );
+
         // ── WITNESS 6: IDEMPOTENCE. A second run changes nothing. ────────
         let second = run_v31_migration(dir, &signer, &MigrationOptions::default())
             .await
@@ -2050,6 +2901,156 @@ pub(crate) mod test_support {
         );
     }
 
+    /// v31.0.0 (CIRISPersist#650) — **THE PINNED GAP: why there is no
+    /// completion marker.**
+    ///
+    /// A marker ("this corpus is migrated, skip the scan") is safe if and only
+    /// if a v30-shaped row cannot appear AFTER the migration. It can. This
+    /// witness is the proof, run against a real door on every backend, and it
+    /// exists so that the day the gap closes is a day this test goes RED rather
+    /// than a day nobody notices.
+    ///
+    /// # The path
+    ///
+    /// The local write door stamps the #643 mirror and the #598 instants
+    /// (`RowMirror::stamp_local_row`) — **except for a subject-side revocation
+    /// in TRANSIT**, which is deliberately excluded, because the caller
+    /// hybrid-signed those bytes and stamping would invalidate the signature
+    /// and the hash derived from it. That exclusion is right.
+    ///
+    /// What it leaves open is that the local door then asks
+    /// `check_instant_binding` and **not** `check_row_column_binding` — by
+    /// design too, since #649 chose to STAMP at this door rather than GATE at
+    /// it, and a transit row is checked "where the signature is", i.e. at the
+    /// promote door the consent-SLA watcher drives it through.
+    ///
+    /// Compose the two and a caller can land a row whose signed envelope
+    /// carries `asserted_at` and no `row` mirror. It rests at `tier = local`,
+    /// v30-shaped, at any time — including long after this migration has run.
+    ///
+    /// # What that means for the marker, and for this routine
+    ///
+    /// A marker would be a claim about the corpus that the corpus can falsify,
+    /// which makes it a cache that goes stale rather than a record of an
+    /// irreversible transition. So: no marker. The steady-state cost is instead
+    /// paid down by making a migrated corpus cost ONE indexed keyset scan —
+    /// `scan_corpus` keeps only the non-conformant rows, and
+    /// `run_v31_migration` short-circuits before the fold and the recursive walk
+    /// when there are none.
+    ///
+    /// The migration handles such a row correctly and conservatively: it is
+    /// foreign (the caller signed it) and local-tier (no peer can refill it), so
+    /// it is `RetainInert` — never purged.
+    pub(crate) async fn exercise_a_v30_row_can_still_land_after_migration(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{cohort_scope, LocalAttestationInput};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        // THREE distinct keys, and the split matters: the SUBJECT signs the
+        // revocation, the NODE runs the migration. A subject-side revocation is
+        // by definition authored by someone other than the node it transits, so
+        // conflating them would test the one case where re-stamping is
+        // legitimate (we hold the key) and miss the real one.
+        let node = format!("mig-node-{suffix}-{run}");
+        let subject = format!("mig-subj-{suffix}-{run}");
+        let target = format!("mig-tgt-{suffix}-{run}");
+        for k in [&node, &subject, &target] {
+            seal::register_hybrid_key(dir, k).await;
+        }
+
+        let signer = FixtureSigner {
+            key_id: node.clone(),
+        };
+        // Start from a migrated corpus: whatever is here is dealt with first,
+        // so anything non-conformant afterwards arrived through a door.
+        run_v31_migration(dir, &signer, &MigrationOptions::default())
+            .await
+            .expect("({suffix}) baseline migration");
+        let baseline = run_v31_migration(dir, &signer, &MigrationOptions::default())
+            .await
+            .expect("({suffix}) baseline is stable");
+        assert!(
+            !baseline.changed_anything(),
+            "({suffix}) precondition: the corpus must be fully migrated before the probe"
+        );
+
+        // A subject-side consent revocation in TRANSIT. The envelope carries a
+        // signed `asserted_at` (so `check_instant_binding` is satisfied) and NO
+        // `row` mirror — which no gate on this path asks for.
+        let envelope = serde_json::json!({
+            "id": "marker-probe",
+            "dimension": "consent:state:revoked:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT:
+                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                    .to_rfc3339(),
+        });
+        let (_hash, sig_classical, sig_pqc) = seal::sign_envelope(&subject, &envelope);
+        let id = dir
+            .attestation_insert_local(LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    envelope,
+                )
+                .expect("envelope"),
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("({suffix}) a crypto-valid subject-side revocation transits the local tier");
+
+        let stored = dir
+            .get_attestation(&id)
+            .await
+            .expect("read")
+            .expect("({suffix}) the transit row was written");
+
+        // THE FINDING. If this ever starts failing, the transit door has begun
+        // asking for the mirror — and a completion marker becomes implementable.
+        // Read the doc above before deleting this assertion.
+        assert!(
+            !classify_shape(&stored, chrono::Utc::now()).is_conformant(),
+            "({suffix}) a TRANSIT revocation now lands v31-shaped. That closes the only path \
+             CIRISPersist#650 found for a v30-shaped row to appear after the migration, which \
+             means a completion marker is now safe — see this test's doc and revisit \
+             `run_v31_migration`'s no-marker design"
+        );
+
+        // And the migration treats it conservatively: foreign bytes, local
+        // tier, nowhere else to come back from.
+        let preview = run_v31_migration(
+            dir,
+            &signer,
+            &MigrationOptions {
+                dry_run: true,
+                ..MigrationOptions::default()
+            },
+        )
+        .await
+        .expect("({suffix}) preview");
+        let d = preview
+            .rows
+            .iter()
+            .find(|r| r.attestation_id == id)
+            .unwrap_or_else(|| panic!("({suffix}) the transit row must be visited"))
+            .disposition
+            .clone();
+        assert!(
+            matches!(d, Disposition::RetainInert { .. }),
+            "({suffix}) a caller-signed local-tier row must be RetainInert, got {d:?}"
+        );
+    }
+
     /// The MUTATION witness: a fold that keeps the INTERIM states (nothing is
     /// treated as retracted) resurrects the withdrawn grant.
     ///
@@ -2072,48 +3073,17 @@ pub(crate) mod test_support {
         let shape = RowShape::Legacy {
             why: "v30".to_owned(),
         };
-        let closure = LoadBearingClosure {
-            roots: Vec::new(),
-            members: Vec::new(),
-            attestation_ids: BTreeSet::new(),
-            key_ids: BTreeSet::new(),
-            revisits: 0,
-            excluded_proven_not_load_bearing: 0,
-            completeness: ClosureCompleteness::Truncated {
-                budget: 0,
-                frontier_remaining: 0,
-            },
-        };
-        let verdict = LoadBearing::Unknown {
-            family: "consent:*".to_owned(),
-            reason: String::new(),
-        };
-
         // The REAL fold: the grant is retracted, so it is purged.
         let real = fold_retractions(&corpus);
         assert!(matches!(
-            classify(
-                &grant,
-                &shape,
-                &real,
-                &closure,
-                &verdict,
-                &Authorship::OwnKey
-            ),
+            classify(&grant, &shape, &real, &Authorship::OwnKey, false),
             Disposition::Purge(PurgeReason::Retracted { .. })
         ));
 
         // The MUTATED fold — "replay the interim states": nothing retracts.
         let mutated = RetractionFold::default();
         assert_eq!(
-            classify(
-                &grant,
-                &shape,
-                &mutated,
-                &closure,
-                &verdict,
-                &Authorship::OwnKey
-            ),
+            classify(&grant, &shape, &mutated, &Authorship::OwnKey, false),
             Disposition::Restamp,
             "with the fold disabled the withdrawn grant is RE-MINTED as a valid v31 row — that \
              is the resurrection this witness exists to detect"
