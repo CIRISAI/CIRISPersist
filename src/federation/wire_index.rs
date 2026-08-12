@@ -89,7 +89,7 @@ pub fn content_hash_of_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// v30.13.0 (CIRISPersist#643) — the microsecond-truncated RFC-3339 spelling
+/// v30.13.0 (CIRISPersist#646) — the microsecond-truncated RFC-3339 spelling
 /// used for the ONE `record_key` field that is not a byte-transparent TEXT id:
 /// `LocationProof.asserted_at`.
 ///
@@ -123,7 +123,7 @@ pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
         .to_rfc3339()
 }
 
-/// v30.13.0 (CIRISPersist#643) — THE index entry for any kind, derived from
+/// v30.13.0 (CIRISPersist#646) — THE index entry for any kind, derived from
 /// the row **as stored**: reload through [`reload_record_bytes`] — the exact
 /// function the point-read resolves with — and hash those bytes.
 ///
@@ -320,7 +320,7 @@ pub async fn reload_record_bytes(
             let rows = dir
                 .list_signed_location_proofs_since(None, u32::MAX)
                 .await?;
-            // v30.13.0 (CIRISPersist#643) — compared through
+            // v30.13.0 (CIRISPersist#646) — compared through
             // `locator_instant`, the microsecond-floor spelling the put path
             // and `all_kind_hash_keys` both write. A raw `to_rfc3339()`
             // comparison could not match on postgres, whose `TIMESTAMPTZ`
@@ -685,12 +685,12 @@ mod tests {
         assert!(record_key_field(&rk, "nope").is_err());
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the locator floor. A `LocationProof`
+    /// v30.13.0 (CIRISPersist#646) — the locator floor. A `LocationProof`
     /// written with a nanosecond `asserted_at` must produce the SAME record_key
     /// as the same row reloaded from a backend that rounded it, or the
     /// point-read cannot find the row its own index points at.
     #[test]
-    fn locator_instant_floors_at_microseconds_643() {
+    fn locator_instant_floors_at_microseconds_646() {
         use chrono::Timelike as _;
         let ns: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00.123456789Z".parse().unwrap();
         assert_ne!(

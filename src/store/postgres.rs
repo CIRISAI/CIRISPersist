@@ -837,7 +837,7 @@ impl PostgresBackend {
         .await
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the #640 remedy for EVERY kind: reload the
+    /// v30.13.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
     /// row through the read path's own dispatcher and index the bytes it
     /// returns. See
     /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored)
@@ -4730,7 +4730,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // only, the E5 invariant; `put_attestation` is the federation write
         // path so this always holds in practice). `Attestation` IS its own
         // signed wrapper (inline scrub signature).
-        // v30.13.0 (CIRISPersist#643) — deferred to after the client is
+        // v30.13.0 (CIRISPersist#646) — deferred to after the client is
         // released and derived from the STORED row; see `index_stored_record`.
         let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
             .then(|| {
@@ -5570,7 +5570,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        // v30.13.0 (CIRISPersist#643) — that reload is now the SHARED one. This
+        // v30.13.0 (CIRISPersist#646) — that reload is now the SHARED one. This
         // site had the right instinct and its own implementation of it; the
         // instinct is now the rule and the implementation is one function.
         drop(client);
@@ -6812,7 +6812,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .map_err(map_revocation_pg_err("community_membership_revocation"))?;
         // v21.1.0 (CIRISPersist#507b) — was upserted in the SAME transaction as
         // the INSERT above.
-        // v30.13.0 (CIRISPersist#643) — it cannot stay there. Deriving the hash
+        // v30.13.0 (CIRISPersist#646) — it cannot stay there. Deriving the hash
         // from the row AS STORED means READING the row back, and the reload
         // runs on a pooled connection that cannot see this transaction's
         // uncommitted rows: inside the tx it would find nothing and index
@@ -7038,7 +7038,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("subject_key_id", &row.subject_key_id),
-            // v30.13.0 (CIRISPersist#643) — the microsecond-floor spelling.
+            // v30.13.0 (CIRISPersist#646) — the microsecond-floor spelling.
             // `to_rfc3339()` here wrote a locator postgres could never match
             // back, because the reloaded `asserted_at` comes out rounded.
             (
@@ -7430,7 +7430,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         }
         // v21.1.0 (CIRISPersist#507b) — indexed under the shape
         // `list_signed_transport_destinations_since` re-serializes.
-        // v30.13.0 (CIRISPersist#643) — "the stored row is byte-identical to
+        // v30.13.0 (CIRISPersist#646) — "the stored row is byte-identical to
         // `signed`" was the assumption this whole class is made of. It is not
         // this site's to make: read the row back and hash that.
         let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -9102,7 +9102,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
             })?;
         drop(client);
-        // v30.13.0 (CIRISPersist#643) — THE confirmed live instance. `engine.rs`
+        // v30.13.0 (CIRISPersist#646) — THE confirmed live instance. `engine.rs`
         // mints `chrono::Utc::now()` for `scrub_timestamp` at nanosecond
         // precision and hands it straight in; it lands in `scrub_timestamp`,
         // `promoted_at` and `pqc_completed_at`, all `TIMESTAMPTZ`. Hashing the
@@ -21096,7 +21096,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the POSTGRES leg of the every-kind
+    /// v30.13.0 (CIRISPersist#646) — the POSTGRES leg of the every-kind
     /// witness, and the one that actually reddens without the fix.
     /// `TIMESTAMPTZ` drops the fixture's 789ns tail, so an index written from
     /// the in-memory row carries, for EVERY kind, a hash this backend's read
@@ -21104,7 +21104,7 @@ mod tests {
     /// can never match either.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn nanosecond_wire_refs_resolve_every_kind_postgres_643() {
+    async fn nanosecond_wire_refs_resolve_every_kind_postgres_646() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -21113,7 +21113,7 @@ mod tests {
         be.run_migrations().await.expect("migrations");
         crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
             &be,
-            &format!("pg-643-{}", uuid_like()),
+            &format!("pg-646-{}", uuid_like()),
         )
         .await;
     }

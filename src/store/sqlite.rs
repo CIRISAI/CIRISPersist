@@ -2143,7 +2143,7 @@ impl SqliteBackend {
         .await
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the #640 remedy for EVERY kind: reload the
+    /// v30.13.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
     /// row through the read path's own dispatcher and index the bytes it
     /// returns. See
     /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored)
@@ -3918,7 +3918,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // `Attestation` IS its own signed wrapper (carries the scrub
         // signature inline), so this hashes the exact `list_attestations_since`
         // read-surface value.
-        // v30.13.0 (CIRISPersist#643) — only the LOCATOR is derived here; the
+        // v30.13.0 (CIRISPersist#646) — only the LOCATOR is derived here; the
         // hash comes from the stored row, after the write. See
         // `index_stored_record`.
         let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
@@ -4801,7 +4801,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        // v30.13.0 (CIRISPersist#643) — that reload is now the SHARED one. This
+        // v30.13.0 (CIRISPersist#646) — that reload is now the SHARED one. This
         // site had the right instinct and its own implementation of it; the
         // instinct is now the rule and the implementation is one function.
         self.index_stored_record(
@@ -6073,7 +6073,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            // v30.13.0 (CIRISPersist#643) — the index entry LEFT this
+            // v30.13.0 (CIRISPersist#646) — the index entry LEFT this
             // transaction. Deriving the hash from the row as stored means
             // reading the row back, and this closure holds the only
             // connection: reading inside the tx would see state a rollback
@@ -6244,7 +6244,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // moves everything.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("subject_key_id", &row.subject_key_id),
-            // v30.13.0 (CIRISPersist#643) — the microsecond-floor spelling; see
+            // v30.13.0 (CIRISPersist#646) — the microsecond-floor spelling; see
             // `wire_index::locator_instant`.
             (
                 "asserted_at",
@@ -19496,18 +19496,18 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the SQLITE leg of the every-kind witness.
+    /// v30.13.0 (CIRISPersist#646) — the SQLITE leg of the every-kind witness.
     /// SQLite round-trips nanoseconds, so the timestamp half cannot bite here;
     /// it runs anyway because a rule only the failing backend follows is a rule
     /// the next writer will not know about, and because the LOCATOR floor on
     /// `LocationProof.asserted_at` must agree across backends or a rebuilt
     /// index and an incrementally written one spell the same row two ways.
     #[tokio::test]
-    async fn nanosecond_wire_refs_resolve_every_kind_sqlite_643() {
-        let backend = fresh_backend_with_occurrence("occ-643").await;
+    async fn nanosecond_wire_refs_resolve_every_kind_sqlite_646() {
+        let backend = fresh_backend_with_occurrence("occ-646").await;
         crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
             &backend,
-            "sqlite-643",
+            "sqlite-646",
         )
         .await;
     }

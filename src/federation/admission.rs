@@ -15172,7 +15172,7 @@ pub(crate) mod r2_test_support {
         }
     }
 
-    /// v30.13.0 (CIRISPersist#643) — a DETERMINISTIC sub-microsecond tail on
+    /// v30.13.0 (CIRISPersist#646) — a DETERMINISTIC sub-microsecond tail on
     /// every seeded row of four MORE kinds, each written through a different
     /// put chokepoint, all of which must still resolve through the ref this
     /// node advertises for them.
@@ -15194,7 +15194,7 @@ pub(crate) mod r2_test_support {
     /// * `put_location_proof` — `asserted_at`, which is ALSO half the
     ///   `record_key`, so this row exercises the locator floor
     ///   ([`wire_index::locator_instant`](crate::federation::wire_index::locator_instant))
-    ///   as well as the hash. Before #643 a nanosecond-bearing location proof
+    ///   as well as the hash. Before #646 a nanosecond-bearing location proof
     ///   was unresolvable on postgres for two independent reasons;
     /// * `put_family` and `put_community` — `founded_at`, and each member's
     ///   `joined_at`.
@@ -15374,7 +15374,7 @@ pub(crate) mod r2_test_support {
                 served.is_some(),
                 "[{tag}] ref ({kind}, {content_hash}) does not resolve (record_key \
                  {record_key}). The {kind} write path indexed the row this node HELD, \
-                 not the row it STORED — CIRISPersist#643, the #640 defect at the \
+                 not the row it STORED — CIRISPersist#646, the #640 defect at the \
                  twelve kinds #640 did not reach. A peer asking for this exact ref \
                  gets None."
             );
@@ -15397,7 +15397,7 @@ pub(crate) mod r2_test_support {
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(&author, &envelope);
-        // v30.13.0 (CIRISPersist#643) — NANOSECOND-BEARING, deliberately.
+        // v30.13.0 (CIRISPersist#646) — NANOSECOND-BEARING, deliberately.
         //
         // This fixture used to truncate to microseconds, with a comment calling
         // the skew "a property of the FIXTURE, not of the backend". That was

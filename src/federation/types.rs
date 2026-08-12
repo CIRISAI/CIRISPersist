@@ -3702,7 +3702,7 @@ pub struct AnnouncedPeer {
     pub announce_count: i64,
 }
 
-/// v30.13.0 (CIRISPersist#643) — truncate one RFC-3339 timestamp string to
+/// v30.13.0 (CIRISPersist#646) — truncate one RFC-3339 timestamp string to
 /// microsecond precision, or return `None` when the string is not an RFC-3339
 /// instant carrying a sub-microsecond tail.
 ///
@@ -3727,7 +3727,7 @@ fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
     Some(out)
 }
 
-/// v30.13.0 (CIRISPersist#643) — rewrite every RFC-3339 instant in `value` to
+/// v30.13.0 (CIRISPersist#646) — rewrite every RFC-3339 instant in `value` to
 /// microsecond precision, recursively.
 ///
 /// # Why `persist_row_hash` must not see nanoseconds
@@ -3812,7 +3812,7 @@ fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
 ///
 /// Returns the hex-encoded SHA-256 string.
 ///
-/// v30.13.0 (CIRISPersist#643) — every instant in the hashed value is first
+/// v30.13.0 (CIRISPersist#646) — every instant in the hashed value is first
 /// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
@@ -3836,7 +3836,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
         obj.remove("persist_row_hash");
         obj.remove("consent_role");
     }
-    // v30.13.0 (CIRISPersist#643) — TRUNCATE EVERY INSTANT TO MICROSECONDS
+    // v30.13.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
     // BEFORE HASHING. See `truncate_instants_to_microseconds`.
     truncate_instants_to_microseconds(&mut value);
     let bytes = PythonJsonDumpsCanonicalizer
@@ -3850,7 +3850,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 mod tests {
     use super::*;
 
-    /// v30.13.0 (CIRISPersist#643) — `persist_row_hash` does not depend on a
+    /// v30.13.0 (CIRISPersist#646) — `persist_row_hash` does not depend on a
     /// precision no participant can reproduce.
     ///
     /// The row identity has to be a function of the RECORD, not of who stored
@@ -3864,7 +3864,7 @@ mod tests {
     /// depending on which backend had touched it, and a byte-identical
     /// re-apply could be refused as "different content".
     #[test]
-    fn persist_row_hash_is_microsecond_stable_643() {
+    fn persist_row_hash_is_microsecond_stable_646() {
         use chrono::Timelike as _;
         let with_ns: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456789Z".parse().unwrap();
         let truncated = with_ns.with_nanosecond(123_456_000).unwrap();
@@ -3912,7 +3912,7 @@ mod tests {
     /// two instants that differ AT microsecond resolution must still hash
     /// differently, or the identity would stop distinguishing real versions.
     #[test]
-    fn persist_row_hash_still_separates_distinct_microseconds_643() {
+    fn persist_row_hash_still_separates_distinct_microseconds_646() {
         let a: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456Z".parse().unwrap();
         let b: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123457Z".parse().unwrap();
         let row = |t: chrono::DateTime<Utc>| serde_json::json!({ "asserted_at": t.to_rfc3339() });
@@ -3927,7 +3927,7 @@ mod tests {
     /// arbitrary JSON string. A base64 signature, a hex digest, a version
     /// string — none may be touched however many dots and digits they carry.
     #[test]
-    fn instant_truncation_never_touches_a_non_timestamp_643() {
+    fn instant_truncation_never_touches_a_non_timestamp_646() {
         for s in [
             "1.2345678901234567890",
             "sha256.1234567890abcdef",

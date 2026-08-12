@@ -91,7 +91,7 @@ check reds the replay AND divergent-order legs on both backends;
 the tie leg on the `revoke-first` order (and only that order, which is why the
 witness drives both).
 
-### Fixed — the #640 remedy reached one kind of thirteen, and the row identity it left behind could refuse a legitimate write (#643)
+### Fixed — the #640 remedy reached one kind of thirteen, and the row identity it left behind could refuse a legitimate write (#646)
 
 #547 fixed the wire index's KEY COVERAGE at three sites. #640 fixed its HASH
 DERIVATION — index the row **as stored**, not the struct the writer holds — at
@@ -197,7 +197,7 @@ Witnesses — deterministic 789ns tails, never `Utc::now()`'s luck, each asserti
 the fixture really carries sub-microsecond precision so the check cannot become
 unfailable:
 
-- `nanosecond_wire_refs_resolve_every_kind_{memory,sqlite,postgres}_643` — one
+- `nanosecond_wire_refs_resolve_every_kind_{memory,sqlite,postgres}_646` — one
   row through each of four MORE chokepoints (`put_attestation`,
   `put_location_proof`, `put_family`, `put_community`), then asserts that every
   entry `all_kind_hash_keys` derives from the RELOADED rows already resolves
@@ -206,17 +206,17 @@ unfailable:
   The comment called the skew "a property of the FIXTURE, not of the backend";
   it was not, and deleting the truncation is what turns that test into a
   regression net for `set_attestation_cohort_scope`.
-- `persist_row_hash_is_microsecond_stable_643`,
-  `persist_row_hash_still_separates_distinct_microseconds_643` (the floor is a
-  floor, not an erasure), `instant_truncation_never_touches_a_non_timestamp_643`,
-  `locator_instant_floors_at_microseconds_643`.
+- `persist_row_hash_is_microsecond_stable_646`,
+  `persist_row_hash_still_separates_distinct_microseconds_646` (the floor is a
+  floor, not an erasure), `instant_truncation_never_touches_a_non_timestamp_646`,
+  `locator_instant_floors_at_microseconds_646`.
 
 Mutation-tested. Reverting the derivation at ONE site — `postgres.rs`
 `put_location_proof`, back to hashing the in-memory `SignedLocationProof` with a
 `to_rfc3339()` locator — reds the postgres leg with the dangling ref named, while
 memory and sqlite (the controls, which round nothing) stay green. Removing the
 `compute_persist_row_hash` truncation reds
-`persist_row_hash_is_microsecond_stable_643`.
+`persist_row_hash_is_microsecond_stable_646`.
 
 2156/2156 lib tests green on postgres+sqlite; 1813/1813 on sqlite+memory; clippy
 `-D warnings` clean on default, `sqlite`, and `postgres,sqlite` — including

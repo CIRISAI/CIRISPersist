@@ -481,7 +481,7 @@ impl MemoryBackend {
         Self::default()
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the memory twin of
+    /// v30.13.0 (CIRISPersist#646) — the memory twin of
     /// `PostgresBackend`/`SqliteBackend::index_stored_record`: reload the row
     /// through the read path's own dispatcher and index the bytes it returns.
     /// See
@@ -513,7 +513,7 @@ impl MemoryBackend {
         Ok(())
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the Key-plane shorthand for
+    /// v30.13.0 (CIRISPersist#646) — the Key-plane shorthand for
     /// [`index_stored_record`](Self::index_stored_record).
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
         self.index_stored_record(
@@ -1968,7 +1968,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
             // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
             // path and the mutators cannot compute the entry differently.
-            // v30.13.0 (CIRISPersist#640/#643) — indexed from the STORED row, after
+            // v30.13.0 (CIRISPersist#640/#646) — indexed from the STORED row, after
             // the insert AND after the guard is released; see
             // `MemoryBackend::index_stored_record`.
             let key_id = row.key_id.clone();
@@ -2036,7 +2036,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
             // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
             // row through EVERY mutator, not only `put_public_key`.
-            // v30.13.0 (CIRISPersist#640/#643) — from the STORED row; see
+            // v30.13.0 (CIRISPersist#640/#646) — from the STORED row; see
             // `MemoryBackend::index_stored_record`.
             let key_id = row.key_id.clone();
             state.federation_keys.insert(key_id.clone(), row);
@@ -2111,7 +2111,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
             // `persist_row_hash` but IS in the bytes the read surface returns, so
             // the WIRE content hash moves here. Re-index.
-            // v30.13.0 (CIRISPersist#640/#643) — through the shared stored-row
+            // v30.13.0 (CIRISPersist#640/#646) — through the shared stored-row
             // helper, after the guard is released.
         }
         self.index_stored_key_row(key_id).await?;
@@ -2645,7 +2645,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
-        // v30.13.0 (CIRISPersist#643) — carried OUT of the guard scope: the
+        // v30.13.0 (CIRISPersist#646) — carried OUT of the guard scope: the
         // reload the index derivation needs takes the same lock.
         let wire_index_key: Option<String>;
 
@@ -2736,7 +2736,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // tier only, the E5 invariant). `Attestation` IS its own signed
             // wrapper (inline scrub signature). Computed before the push
             // moves `row`.
-            // v30.13.0 (CIRISPersist#643) — indexed after the guard is
+            // v30.13.0 (CIRISPersist#646) — indexed after the guard is
             // released, from the STORED row; see `index_stored_record`.
             wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
                 .then(|| {
@@ -3387,7 +3387,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #446 — the projection is computed inside the lock scope but applied
         // after it (put_transport_destination takes the lock itself), ONLY
         // when the occurrence write applied.
-        // v30.13.0 (CIRISPersist#643) — same for the wire-index derivation: it
+        // v30.13.0 (CIRISPersist#646) — same for the wire-index derivation: it
         // reloads through the read surface, which takes this lock.
         let mut indexed: Option<String> = None;
         let projected_route = {
@@ -5913,7 +5913,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
             // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
             // the wire content hash moved with them.
-            // v30.13.0 (CIRISPersist#640/#643) — through the shared stored-row
+            // v30.13.0 (CIRISPersist#640/#646) — through the shared stored-row
             // helper, after the guard is released.
         }
         self.index_stored_key_row(key_id).await?;
@@ -16096,18 +16096,18 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#643) — the MEMORY leg of the every-kind witness.
+    /// v30.13.0 (CIRISPersist#646) — the MEMORY leg of the every-kind witness.
     /// The CONTROL: memory rounds nothing, so this must be green before AND
     /// after the fix. A red here means the shared derivation broke, not that
     /// the skew was caught.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn nanosecond_wire_refs_resolve_every_kind_memory_643() {
+    async fn nanosecond_wire_refs_resolve_every_kind_memory_646() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
             &backend,
-            "memory-643",
+            "memory-646",
         )
         .await;
     }
