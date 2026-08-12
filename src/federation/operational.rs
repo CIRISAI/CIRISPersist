@@ -3971,14 +3971,14 @@ pub mod test_support {
 
     /// The instants these witnesses use, substrate-truncated so a
     /// postgres round-trip cannot make a row fail its own binding.
-    fn w642_now() -> DateTime<Utc> {
+    fn w644_now() -> DateTime<Utc> {
         crate::federation::admission::truncate_to_substrate_resolution(Utc::now())
     }
 
     /// Register `id` as a directory STEWARD carrying its own real hybrid
     /// pubkeys, so `resolve_steward_roster` finds it AND
     /// `lookup_public_key` can verify what it signs.
-    async fn w642_register_steward(
+    async fn w644_register_steward(
         dir: &dyn crate::federation::FederationDirectory,
         id: &Identity,
     ) {
@@ -4006,9 +4006,9 @@ pub mod test_support {
         tag: &str,
     ) {
         let steward = Identity::new(&format!("{tag}-stw"));
-        w642_register_steward(dir, &steward).await;
+        w644_register_steward(dir, &steward).await;
         let org_id = format!("{tag}-org");
-        let now = w642_now();
+        let now = w644_now();
 
         // (a) The genuine row admits — the gate is not simply refusing
         //     everything, which is the failure mode a one-sided witness
@@ -4082,9 +4082,9 @@ pub mod test_support {
         tag: &str,
     ) {
         let steward = Identity::new(&format!("{tag}-stw"));
-        w642_register_steward(dir, &steward).await;
+        w644_register_steward(dir, &steward).await;
         let org_id = format!("{tag}-org");
-        let now = w642_now();
+        let now = w644_now();
 
         let good = signed_organization(&format!("{tag}-o-live"), &org_id, &steward, "active", now);
         dir.put_organization(good.clone())
@@ -4185,10 +4185,10 @@ pub mod test_support {
         let s1 = Identity::new(&format!("{tag}-s1"));
         let s2 = Identity::new(&format!("{tag}-s2"));
         for s in [&s1, &s2] {
-            w642_register_steward(dir, s).await;
+            w644_register_steward(dir, s).await;
         }
         let license = format!("{tag}-lic");
-        let now = w642_now();
+        let now = w644_now();
         let stewards: Vec<&Identity> = vec![&s1, &s2];
 
         // (a) A legitimate 2-of-2 record at revision 1.
