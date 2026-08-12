@@ -899,9 +899,9 @@ pub mod test_support {
         async fn apply_inner(&mut self, op: &Op, seq: usize, at: DateTime<Utc>) -> OpOutcome {
             let id = Self::id_for(&self.tag, seq);
             match op.kind {
-                OpKind::InsertLocal => self.local_write(op, id, false).await,
-                OpKind::UpsertLocal => self.local_write(op, id, true).await,
-                OpKind::UnsignedLocalWrite => self.unsigned_local_write(op, id).await,
+                OpKind::InsertLocal => self.local_write(op, id, false, at).await,
+                OpKind::UpsertLocal => self.local_write(op, id, true, at).await,
+                OpKind::UnsignedLocalWrite => self.unsigned_local_write(op, id, at).await,
                 OpKind::Put => self.put(op, seq, id, op.tier, None, at).await,
                 OpKind::Withdraw => {
                     self.revocation_put(op, seq, id, attestation_type::WITHDRAWS, at)
@@ -927,8 +927,15 @@ pub mod test_support {
 
         // ── the individual surfaces ──────────────────────────────────
 
-        async fn local_write(&mut self, op: &Op, id: String, replace: bool) -> OpOutcome {
-            let input = self.local_input(op, id.clone(), op.attester, op.family, op.cohort_scope);
+        async fn local_write(
+            &mut self,
+            op: &Op,
+            id: String,
+            replace: bool,
+            at: DateTime<Utc>,
+        ) -> OpOutcome {
+            let input =
+                self.local_input(op, id.clone(), op.attester, op.family, op.cohort_scope, at);
             let res = if replace {
                 self.dir.attestation_upsert_local(input).await
             } else {
@@ -947,10 +954,15 @@ pub mod test_support {
         /// it (CEG §10.1.5). That is deliberate: the point of this op is to be
         /// ADMITTED and actually do work next to a signed row, not to bounce off
         /// the scope gate — a refused collision proves nothing.
-        async fn unsigned_local_write(&mut self, op: &Op, id: String) -> OpOutcome {
+        async fn unsigned_local_write(
+            &mut self,
+            op: &Op,
+            id: String,
+            at: DateTime<Utc>,
+        ) -> OpOutcome {
             let (attester_key, dimension) = self.pick_coordinates(op);
             let mut input =
-                self.local_input(op, id.clone(), op.attester, op.family, Scope::SelfScope);
+                self.local_input(op, id.clone(), op.attester, op.family, Scope::SelfScope, at);
             input.attesting_key_id = attester_key.clone();
             input.attestation_envelope.dimension = Some(dimension.clone());
             let res = self.dir.attestation_upsert_local(input).await;
@@ -1179,6 +1191,26 @@ pub mod test_support {
 
         // ── row / input builders ─────────────────────────────────────
 
+        /// v31.0.0 (CIRISPersist#598) — `at` is the MODEL clock, and it is
+        /// supplied in the envelope rather than left for the door to mint.
+        ///
+        /// [`local_row_instant`](crate::federation::admission::local_row_instant)
+        /// honours a caller-supplied `asserted_at` and mints `Utc::now()` only
+        /// when the envelope is silent. Both are real production shapes; the
+        /// harness must take the caller-supplied one, because the local door now
+        /// stamps whatever instant it settles on into the SIGNED envelope — and
+        /// promotion re-signs those bytes. A minted instant would therefore make
+        /// the promoted row's SIGNATURE differ between two runs of the same op
+        /// sequence, and I3 (replay) and I5 (the memory/sqlite differential)
+        /// would be comparing a clock. The only alternatives were to stop
+        /// comparing signatures on promoted rows — blinding the differential to
+        /// exactly the divergence class this module exists to catch — or this.
+        ///
+        /// Determinism here is a strict GAIN in what is compared: with the
+        /// instant supplied, `asserted_at`, `scrub_timestamp` and
+        /// `persist_row_hash` are all functions of the drawn sequence, so the
+        /// normalization that used to elide all three is gone and local rows
+        /// are compared byte-for-byte like every other row.
         fn local_input(
             &self,
             op: &Op,
@@ -1186,8 +1218,12 @@ pub mod test_support {
             attester: Principal,
             family: Family,
             scope: Scope,
+            at: DateTime<Utc>,
         ) -> LocalAttestationInput {
             let envelope = envelope_for(family, attester, op.subject);
+            let mut core = crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("harness envelopes are objects");
+            core.asserted_at = Some(at.to_rfc3339());
             LocalAttestationInput {
                 attestation_id: Some(id),
                 attesting_key_id: self.kid(attester),
@@ -1195,10 +1231,7 @@ pub mod test_support {
                 attestation_type: op.att_type_str(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    envelope,
-                )
-                .expect("harness envelopes are objects"),
+                attestation_envelope: core,
                 subject_key_ids: vec![self.kid(op.subject)],
                 cohort_scope: scope.as_str().to_owned(),
                 scrub_signature_classical: None,
@@ -1241,6 +1274,64 @@ pub mod test_support {
                     .as_object_mut()
                     .expect("harness envelopes are objects")
                     .insert("references_attestation_id".into(), target.into());
+            }
+            // v31.0.0 (CIRISPersist#598) — THE SIGNED INSTANTS, stamped BEFORE
+            // the signature, from the very expressions the struct literal below
+            // assigns to the columns.
+            //
+            // This is a WELL-FORMEDNESS stamp, and stamping it does not blunt a
+            // single property. `check_instant_binding` is a TIER-1 gate: an
+            // unstamped row is refused there, BEFORE the hybrid verify, before
+            // the §6.1 dedup short-circuit, before the AV-77 fold. Leaving the
+            // instants off would therefore have made every one of this module's
+            // properties measure the same trivial refusal — including
+            // `dedup_short_circuit_never_accepts_an_unverified_row`, whose
+            // whole subject is a row that reaches the CRYPTO gate. The
+            // deliberately-broken axes stay exactly where they were and where
+            // the generator can reason about them: [`SigState`] (the signature),
+            // [`CoSign`] (the co-signature set), and [`Narrowing`] (the I4
+            // probes). None of them is the instant binding, and none of them is
+            // reached by a row this substrate refuses at the door.
+            //
+            // Neither instant needs truncating: the harness clock is a
+            // whole-second walk from a fixed RFC-3339 constant and
+            // [`harness_expires_at`] is another, so both already sit on the
+            // microsecond substrate floor. That is asserted, not assumed —
+            // `harness_instants_are_writable` pins it, so a future clock drawn
+            // with sub-microsecond precision fails as a NAMED claim rather than
+            // as every property at once.
+            let expires_at = if op.kind == OpKind::Deadmit {
+                // A de-admission carries NO expiry: the constant's contract is
+                // "live unless the node `withdraws` it", and an expiring
+                // sanction would be lifted by the calendar rather than by a
+                // decision anybody made. Everything else gets
+                // [`HARNESS_EXPIRES_AT`] — see there for why it is not a
+                // relative offset.
+                None
+            } else {
+                Some(harness_expires_at())
+            };
+            {
+                let obj = envelope
+                    .as_object_mut()
+                    .expect("harness envelopes are objects");
+                obj.insert(
+                    crate::federation::envelope::paths::ASSERTED_AT.into(),
+                    at.to_rfc3339().into(),
+                );
+                // Bound in BOTH directions, so the absent case is an ABSENT
+                // key, not a null.
+                match expires_at {
+                    None => {
+                        obj.remove(crate::federation::envelope::paths::EXPIRES_AT);
+                    }
+                    Some(t) => {
+                        obj.insert(
+                            crate::federation::envelope::paths::EXPIRES_AT.into(),
+                            t.to_rfc3339().into(),
+                        );
+                    }
+                }
             }
             // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, stamped
             // into the envelope BEFORE it is signed. Built here for the same
@@ -1295,17 +1386,11 @@ pub mod test_support {
                     .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
                 weight: None,
                 asserted_at: at,
-                // A de-admission carries NO expiry: the constant's contract is
-                // "live unless the node `withdraws` it", and an expiring
-                // sanction would be lifted by the calendar rather than by a
-                // decision anybody made. Everything else gets
-                // [`HARNESS_EXPIRES_AT`] — see there for why it is not a
-                // relative offset.
-                expires_at: if op.kind == OpKind::Deadmit {
-                    None
-                } else {
-                    Some(harness_expires_at())
-                },
+                // Decided ABOVE, where it is stamped into the signed envelope:
+                // the column and its signed twin come from one expression, so
+                // the #598 binding holds by construction rather than by two
+                // sites agreeing.
+                expires_at,
                 attestation_envelope: envelope,
                 original_content_hash: hash,
                 scrub_signature_classical: classical,
@@ -1489,13 +1574,27 @@ pub mod test_support {
         /// The NORMALIZED corpus, for comparisons across two independently
         /// executed runs (I3's replay, I5's differential).
         ///
-        /// Three fields are elided, and ONLY on rows written through a local
+        /// **Nothing is elided** — every field of every row is compared.
+        ///
+        /// It used to elide three, and ONLY on rows written through a local
         /// path: `asserted_at` and `scrub_timestamp` (minted from the server's
-        /// own `Utc::now()`, so two runs legitimately differ) and
+        /// own `Utc::now()`, so two runs legitimately differed) and
         /// `persist_row_hash` (a pure function of the row, hence of those two).
-        /// Rows submitted through `put_attestation` keep ALL THREE — their
-        /// timestamps are caller-supplied, so there is no excuse for them to
-        /// differ and the comparison stays byte-exact where it can be.
+        ///
+        /// v31.0.0 (CIRISPersist#598) removed the need. The local door now
+        /// stamps its instant into the SIGNED envelope
+        /// ([`crate::federation::envelope::stamp_signed_instants`]), and
+        /// promotion re-signs those bytes — so a server-minted instant would
+        /// have leaked into `original_content_hash` and both signature halves,
+        /// where NO elision could reach it without blinding the differential to
+        /// signature divergence. [`Machine::local_input`] therefore supplies the
+        /// model clock in the envelope, which
+        /// [`local_row_instant`](crate::federation::admission::local_row_instant)
+        /// honours. Every local row is now a pure function of the drawn
+        /// sequence, so the honest normalization is none at all.
+        ///
+        /// Deleting an elision is the direction this should always move: an
+        /// elided field is a field no invariant is watching.
         pub async fn snapshot_normalized(&self) -> String {
             let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
             for id in self.corpus_ids().await {
@@ -1504,17 +1603,7 @@ pub mod test_support {
                     .get_attestation(&id)
                     .await
                     .expect("get_attestation")
-                    .map(|r| {
-                        let mut v = serde_json::to_value(&r).expect("Attestation serializes");
-                        if self.server_clocked.contains(&id) {
-                            if let Some(o) = v.as_object_mut() {
-                                o.remove("asserted_at");
-                                o.remove("scrub_timestamp");
-                                o.remove("persist_row_hash");
-                            }
-                        }
-                        v
-                    });
+                    .map(|r| serde_json::to_value(&r).expect("Attestation serializes"));
                 out.insert(id, row.unwrap_or(serde_json::Value::Null));
             }
             // `serde_json::Map` is a `BTreeMap` here (no `preserve_order`
@@ -2218,8 +2307,14 @@ pub mod test_support {
             let id = Self::id_for(&self.tag, seq);
             match op.kind {
                 OpKind::InsertLocal | OpKind::UpsertLocal | OpKind::UnsignedLocalWrite => {
-                    let mut input =
-                        self.local_input(op, id.clone(), op.attester, op.family, op.cohort_scope);
+                    let mut input = self.local_input(
+                        op,
+                        id.clone(),
+                        op.attester,
+                        op.family,
+                        op.cohort_scope,
+                        at,
+                    );
                     match narrowing {
                         Narrowing::UnregisteredAttester => {
                             input.attesting_key_id = UNREGISTERED_KEY_ID.to_owned();
@@ -3130,11 +3225,31 @@ mod proptests {
                     "cohort_scope": cohort,
                 }),
             );
-        let (original_content_hash, classical, pqc) =
-            signature_for_key(sig, &Principal::A.key_id_in(tag), &envelope);
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("fixed instant")
             .with_timezone(&chrono::Utc);
+        // v31.0.0 (CIRISPersist#598) — the SIGNED INSTANTS, stamped before the
+        // signature, exactly as `Machine::row_for` does for the generated
+        // corpus. `expires_at` is `None` on every witness this builder makes,
+        // and the gate binds that in both directions, so the key is REMOVED
+        // rather than written as null.
+        //
+        // The teeth of every caller live on the [`SigState`] argument above,
+        // not here: the binding is a TIER-1 gate, so an unstamped row never
+        // reaches the crypto check that `dedup_short_circuit_never_accepts_an_
+        // unverified_row` and the AV-78 tier witness are both about.
+        {
+            let obj = envelope
+                .as_object_mut()
+                .expect("harness envelopes are objects");
+            obj.insert(
+                crate::federation::envelope::paths::ASSERTED_AT.into(),
+                now.to_rfc3339().into(),
+            );
+            obj.remove(crate::federation::envelope::paths::EXPIRES_AT);
+        }
+        let (original_content_hash, classical, pqc) =
+            signature_for_key(sig, &Principal::A.key_id_in(tag), &envelope);
         crate::federation::Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: Principal::A.key_id_in(tag),
@@ -3577,6 +3692,95 @@ mod proptests {
             clock_start < harness_expires_at(),
             "EXPIRY HORIZON: the model clock start must precede the declared expiry"
         );
+    }
+
+    /// **THE INSTANT-BINDING HORIZON GUARD** (v31.0.0, CIRISPersist#598) — the
+    /// harness's own clock constants must be ones the binding gate ACCEPTS.
+    ///
+    /// [`Machine::row_for`] stamps `asserted_at` / `expires_at` into the signed
+    /// envelope from the model clock and [`harness_expires_at`], and asserts in
+    /// a comment that neither needs truncating. That comment is the whole
+    /// argument, so it is pinned HERE rather than believed:
+    /// [`check_instant_binding`](crate::federation::admission::check_instant_binding)
+    /// refuses sub-microsecond precision outright, and refuses an `asserted_at`
+    /// more than [`DEFAULT_MAX_TOUCH_SKEW`](crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW)
+    /// in the future.
+    ///
+    /// This is `every_row_the_harness_writes_is_live_at_wall_clock`'s lesson on
+    /// a second axis, and it is the same trap: a model clock and a gate reading
+    /// wall-clock time. There the danger was drifting PAST the expiry; here it
+    /// is drifting past `now` in the other direction. Either way the failure is
+    /// silent in the sense that matters — every property in this module would go
+    /// red at once, for a reason none of them names. This names it.
+    ///
+    /// Run over the REAL gate on a REAL row rather than by arithmetic on the
+    /// constants: the arithmetic is what a future edit would get wrong.
+    #[test]
+    fn harness_instants_are_writable_by_the_binding_gate() {
+        use super::test_support::harness_expires_at;
+        use crate::federation::admission::{check_instant_binding, DEFAULT_MAX_TOUCH_SKEW};
+        use crate::federation::envelope::paths;
+        use crate::federation::types::{attestation_tier, attestation_type};
+
+        // The LATEST instant any sequence can reach: the pinned clock start
+        // plus the largest advance `arb_clock` can draw, at every op.
+        let clock_start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("fixed instant")
+            .with_timezone(&chrono::Utc);
+        let latest = clock_start + chrono::Duration::seconds(3600 * MAX_OPS as i64);
+
+        for (label, at, expires) in [
+            (
+                "clock start, with an expiry",
+                clock_start,
+                Some(harness_expires_at()),
+            ),
+            // The `Deadmit` shape: no expiry at all, which the gate binds in
+            // the other direction (envelope key ABSENT ⇔ column `None`).
+            ("latest reachable clock, no expiry", latest, None),
+        ] {
+            let mut envelope = serde_json::json!({ "dimension": "identity:handle:v1" });
+            let obj = envelope.as_object_mut().expect("object");
+            obj.insert(paths::ASSERTED_AT.into(), at.to_rfc3339().into());
+            if let Some(t) = expires {
+                obj.insert(paths::EXPIRES_AT.into(), t.to_rfc3339().into());
+            }
+            let row = crate::federation::Attestation {
+                attestation_id: format!("harness-instant-{label}"),
+                attesting_key_id: "k".into(),
+                attested_key_id: "k".into(),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                asserted_at: at,
+                expires_at: expires,
+                attestation_envelope: envelope,
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".into(),
+                scrub_timestamp: at,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: Scope::SelfScope.as_str().into(),
+                tier: attestation_tier::FEDERATION.into(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            check_instant_binding(&row, chrono::Utc::now(), DEFAULT_MAX_TOUCH_SKEW).unwrap_or_else(
+                |e| {
+                    panic!(
+                        "INSTANT HORIZON ({label}): the harness mints `asserted_at = {at}` / \
+                         `expires_at = {expires:?}` into every row it signs, and the binding \
+                         gate REFUSES them: {e}. Every property in this module would now be \
+                         measuring this refusal instead of what it names. Fix the constant \
+                         (truncate it, or move the model clock back before `Utc::now()`); do \
+                         not relax this test and do not weaken the gate."
+                    );
+                },
+            );
+        }
     }
 
     /// **The provenance trail, proven on the case that motivated it.**
