@@ -122,7 +122,12 @@ fi
 #   * `ALTER SYSTEM` writes postgresql.auto.conf INSIDE PGDATA, so under tmpfs
 #     it does not survive a restart. The tuning therefore moves to `-c` flags on
 #     the container command, which live in container config, not in the volume.
-#   * The cluster is empty on every start. postgres' entrypoint re-runs initdb
+#   * The cluster is empty on every start — VERIFIED: after a host shutdown and
+#     a bare `docker start`, PGDATA was tmpfs, the databases were gone, and all
+#     eleven `-c` settings were still in force. Had they been ALTER SYSTEM they
+#     would have silently reverted to stock and the suite would have run 2x
+#     slower with nothing saying why.
+#   * postgres' entrypoint re-runs initdb
 #     and recreates the role/database from POSTGRES_* env; test_pg.rs rebuilds
 #     the template on first use. Sibling repos rebuild theirs the same way.
 if [ "$MODE" = "recreate-tmpfs" ]; then
@@ -141,7 +146,15 @@ if [ "$MODE" = "recreate-tmpfs" ]; then
     echo "DESTROYING '$CONTAINER' (image=$IMAGE port=$PORT vol=${VOL:-none}) and rebuilding on tmpfs (${SIZE})..."
     docker rm -f "$CONTAINER" >/dev/null
     [ -n "$VOL" ] && docker volume rm "$VOL" >/dev/null 2>&1
+    # `--restart unless-stopped` is not cosmetic under tmpfs. The container
+    # this replaced had `--restart no`; it exited on a host shutdown and stayed
+    # down for eight hours, and the next certification failed at the template
+    # warm with "need either psql on PATH or a running ciris-plainpg container"
+    # — a message about the container, for a run that was really about a code
+    # change. A cluster that does not come back turns every postgres test red
+    # for a reason that is not in the tree.
     docker run -d --name "$CONTAINER" \
+        --restart unless-stopped \
         --label ciris.disposable=true \
         -e POSTGRES_USER="$PGUSER_" -e POSTGRES_PASSWORD="$PW" -e POSTGRES_DB="$PGDB" \
         -p "127.0.0.1:${PORT}:5432" \

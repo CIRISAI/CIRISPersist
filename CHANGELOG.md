@@ -5,6 +5,118 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.11.0] - 2026-08-11
+
+### Added — a canonical array over the duty scopes (#637)
+
+`admission::DELEGATED_DUTY_SCOPES` — import this; do not hand-pick the
+`DELEGATION_SCOPE_*` constants.
+
+CIRISServer's duty-conferral card shipped able to confer **three of five**;
+`takedown` and `consent_revocation` were absent. The constants were imported,
+not retyped — spelling was never the problem. **There was nothing to import for
+MEMBERSHIP**, so every consumer hand-picked the subset it knew about, and a
+hand-picked mirror of another crate's vocabulary drifts the moment that
+vocabulary grows. A missing option is uniquely hard to notice: the dropdown
+looked complete, and nobody scans a menu wondering what is *not* on it.
+
+`delegation_scope::MODERATION` **is** that array — `pub const MODERATION: &[&str]
+= admission::DELEGATED_DUTY_SCOPES;` — not a copy, pinned by a pointer-equality
+assert. Two arrays over one vocabulary would be the defect this removes.
+
+`owner_binding_recovery` is excluded by decision and the exclusion is recorded
+in the gate, not left to the accident of which file it lives in: it is CC 3.2
+succession standing, a different plane and a different walk. It has its own
+`RECOVERY` axis.
+
+Gated: every `DELEGATION_SCOPE_*` const crate-wide must be in the ladder or in
+the recorded exclusions.
+
+**Not done:** #637 also suggests an enum with an exhaustive `as_str()`, which
+would make the compile-failure property real rather than conventional. The
+precedents it cites (`EnvelopeKind::policy_for`, `ObjectClass`) are enums
+because each variant carries a per-variant DECISION the compiler can demand.
+Duty scopes have no such match today — they are compared as strings against
+wire data by set-containment — so an enum would add a conversion boundary
+without adding an exhaustiveness obligation. Revisit when a per-scope decision
+table exists.
+
+### Fixed — the inventory said four, the vocabulary said five (#636)
+
+A CIRISServer integrator needed the moderation ladder, read the
+`DELEGATION_SCOPE_*` constants directly, and shipped **three of five**. They
+concluded persist had no authoritative list. Persist *has* one —
+`delegation_scope::ALL`, added in #625, documented as **"every value a `scope`
+entry may hold, and nothing else."** It was missing two:
+
+| scope | minted in |
+|---|---|
+| `consent_revocation` | `admission.rs` |
+| `owner_binding_recovery` | `ownership_reclaim.rs` |
+
+`admission`'s own `slash` doc says *"The four scopes above it are all
+authorities to emit"* — and the four above it are `consent_revocation`,
+`moderate`, `takedown`, `review`. **The prose counted five while the
+machine-readable list counted four.** A consumer reading the constants had no
+way to be right.
+
+#### Why the gate that exists for this was green over it
+
+`every_delegation_scope_const_is_classified` guards exactly this, and its own
+doc says *"remember to update the list is not a plan."* It did:
+
+```rust
+let src = include_str!("types.rs");
+let module = src.split("pub mod delegation_scope {").nth(1)...
+```
+
+**It scanned the module that HOLDS the inventory, not the modules where scopes
+are MINTED.** Both missing scopes live elsewhere and are not aliased in, so
+neither was ever a candidate. The gate was green over both from the day it was
+written.
+
+Same class as #607, where the conferral gate scanned the rules TABLE and could
+not see an inline branch or a read door. **A gate whose scan domain is narrower
+than the vocabulary it certifies reports on the part it can reach — and reports
+green.**
+
+It also carried a hand-written `match name { "INFRA_SERVE" => ... }` mapping
+every name to its value check: a *third* list to maintain, inside a gate built
+to abolish hand-maintained lists.
+
+#### What changed
+
+- The scan walks the **whole crate** (`CARGO_MANIFEST_DIR/src`, recursive),
+  behind a file-count assert so narrowing it again fails loudly instead of
+  silently proving less.
+- Classification is by **VALUE against `ALL`**; the name→value match arm is
+  deleted. Sets (`[&str; N]`) and aliases (`= crate::…`) are skipped, which is
+  safe *only because* the walk is exhaustive: every scope has exactly one
+  literal definition and that definition is scanned.
+- `NON_MEMBERS` is keyed `module::NAME`. Crate-wide, a bare name is ambiguous —
+  `SCOPE` is a field name in `envelope` and a value prefix in three modules.
+- Everything the widened scan newly sees is classified: `envelope::SCOPE` (a
+  field name), `admission::ANALYZE_CONSENT_SCOPE` (CC 3.3.1 consent-grammar
+  vocabulary with its own closed inventory), and the four
+  `self_at_login::SCOPE_*` (§8.1.12.7 login vocabulary, closed set
+  `SELF_AT_LOGIN_DELEGATION_SCOPE`).
+
+### Added
+
+- `delegation_scope::SCOPE_CONSENT_REVOCATION` and
+  `SCOPE_OWNER_BINDING_RECOVERY` — aliases by value, so the inventory and the
+  minting sites cannot disagree.
+- `delegation_scope::RECOVERY` — a new axis. `owner_binding_recovery` is
+  succession standing ("who speaks for this key now"), not a moderation action
+  ("what may be done about this party"); a picker offering it beside `slash`
+  would present them as the same kind of thing.
+- `MODERATION` is now **five rungs** and is the array downstream should read.
+  Pinned by count *and* by membership, so swapping one for another cannot pass.
+
+Mutation-tested: dropping `consent_revocation` from `ALL`, dropping it from
+`MODERATION`, narrowing the scan back to one file, and minting a new scope in a
+third module were all killed.
+
 ## [30.10.0] — 2026-08-10 — federation-scope moderation has a duty-holder resolver
 
 - **#632 — de-admitting a federation directory key could never be admitted.** `check_moderation_admission`

@@ -873,6 +873,19 @@ pub mod delegation_scope {
     //
     // [`delegation_scope_grants`]: crate::federation::admission
 
+    /// v30.11.0 (CIRISPersist#636) — `consent_revocation`, the FIRST rung of
+    /// the ladder, aliasing
+    /// [`crate::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION`]
+    /// by value. Confers proxy revocation authority under CEG §3.2.3 rule
+    /// 3/4.
+    ///
+    /// It was minted in `admission` and never aliased here, so it was absent
+    /// from [`ALL`] and [`MODERATION`] while `admission`'s own `slash` doc
+    /// described it as one of "the four scopes above" — the vocabulary said
+    /// five, the machine-readable list said four, and a consumer that
+    /// hand-picked from the constants shipped three. See [`ALL`].
+    pub const SCOPE_CONSENT_REVOCATION: &str =
+        crate::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION;
     /// `moderate` — the §11.10 moderation duty. Aliases
     /// [`crate::federation::admission::DELEGATION_SCOPE_MODERATE`] by value
     /// (the token the duty walk matches). A `delegates_to` bearing this
@@ -895,6 +908,17 @@ pub mod delegation_scope {
     /// Stamp it on a `delegates_to` exactly as the other three are stamped;
     /// the duty walk matches it under the same policy.
     pub const SCOPE_SLASH: &str = crate::federation::admission::DELEGATION_SCOPE_SLASH;
+
+    /// v30.11.0 (CIRISPersist#636) — `owner_binding_recovery`, aliasing
+    /// [`crate::federation::ownership_reclaim::DELEGATION_SCOPE_OWNER_BINDING_RECOVERY`]
+    /// by value: CC 3.2's recovery-delegation token, the standing to file the
+    /// gated `withdraws` on a key's behalf when its owner is gone.
+    ///
+    /// A member of [`ALL`] but deliberately NOT of [`MODERATION`] — see
+    /// [`RECOVERY`]. Minted in `ownership_reclaim`, it was the second scope
+    /// the classification gate could not see.
+    pub const SCOPE_OWNER_BINDING_RECOVERY: &str =
+        crate::federation::ownership_reclaim::DELEGATION_SCOPE_OWNER_BINDING_RECOVERY;
 
     /// v30.7.0 (CIRISPersist#625) — **every value a `scope` entry may hold, and
     /// nothing else.** For operator pickers: no free-form entry, so the list a
@@ -936,10 +960,13 @@ pub mod delegation_scope {
         AGENCY_REASON,
         AGENCY_DECIDE,
         // moderation / admin ladder, re-exported from `admission`.
+        SCOPE_CONSENT_REVOCATION,
         SCOPE_MODERATE,
         SCOPE_TAKEDOWN,
         SCOPE_REVIEW,
         SCOPE_SLASH,
+        // recovery / succession standing, re-exported from `ownership_reclaim`.
+        SCOPE_OWNER_BINDING_RECOVERY,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `infra:*` axis: what a key may do as
@@ -977,24 +1004,110 @@ pub mod delegation_scope {
     /// re-exported from [`crate::federation::admission`]. Distinct from [`INFRA`]
     /// and [`AGENCY`]: these authorise action ABOUT ANOTHER PARTY rather than
     /// capability of the holder.
-    pub const MODERATION: &[&str] = &[SCOPE_MODERATE, SCOPE_TAKEDOWN, SCOPE_REVIEW, SCOPE_SLASH];
+    ///
+    /// **FIVE rungs, in ascending order of what they permit.** v30.11.0
+    /// (CIRISPersist#636) added `consent_revocation`, which had been missing
+    /// since this array was minted:
+    ///
+    /// | scope | grants |
+    /// |---|---|
+    /// | `consent_revocation` | proxy revocation authority (CEG §3.2.3 rule 3/4) |
+    /// | `moderate` | emit a `ModerationEvent` on the delegator's behalf |
+    /// | `takedown` | emit a `takedown_notice` Contribution |
+    /// | `review` | emit a report → `scores` reconsideration |
+    /// | `slash` | take something AWAY — quarantine, time-bounded de-admission |
+    ///
+    /// The first four are authorities to EMIT; `slash` is the middle rung
+    /// between writing a note and the node-wide kill switch. That framing is
+    /// `admission`'s own, and it counted five while this array held four —
+    /// which is how a consumer reading the constants directly shipped three.
+    /// **Read this array; do not hand-pick `DELEGATION_SCOPE_*` constants.**
+    ///
+    /// v30.11.0 (CIRISPersist#637) — this **IS**
+    /// [`crate::federation::admission::DELEGATED_DUTY_SCOPES`], not a copy of
+    /// it. The ladder is defined once, beside the constants it is built from,
+    /// and re-exported here so the inventory and the minting site cannot
+    /// disagree. Two arrays over one vocabulary would be the defect both #636
+    /// and #637 exist to remove.
+    pub const MODERATION: &[&str] = crate::federation::admission::DELEGATED_DUTY_SCOPES;
+
+    /// v30.11.0 (CIRISPersist#636) — the recovery / succession axis: standing
+    /// to act on a key's OWN behalf when its holder cannot, rather than
+    /// authority ABOUT another party ([`MODERATION`]) or capability of the
+    /// holder ([`INFRA`] / [`AGENCY`]).
+    ///
+    /// Its own axis rather than a fifth moderation rung on purpose: a picker
+    /// offering `owner_binding_recovery` beside `slash` would present
+    /// succession standing as a moderation action, and they answer different
+    /// questions — "who speaks for this key now" versus "what may be done
+    /// about this party".
+    pub const RECOVERY: &[&str] = &[SCOPE_OWNER_BINDING_RECOVERY];
 
     /// The constants in this module that are deliberately **NOT** members of
     /// [`ALL`], with the reason. Read by
     /// [`tests::every_delegation_scope_const_is_classified`] so that "not a
     /// member" is a recorded decision rather than an omission.
+    /// v30.11.0 (CIRISPersist#636) — entries are `module::NAME`. The gate now
+    /// scans the WHOLE crate, so a bare name is ambiguous: `SCOPE` exists in
+    /// `envelope` as a field name and `SCOPE_*` in three modules as values.
     pub const NON_MEMBERS: &[(&str, &str)] = &[
-        ("INFRA_PREFIX", "a prefix (\"infra:\"), not a scope value"),
-        ("AGENCY_PREFIX", "a prefix (\"agency:\"), not a scope value"),
         (
-            "LEGACY_AGENCY_KINDS",
+            "types::INFRA_PREFIX",
+            "a prefix (\"infra:\"), not a scope value",
+        ),
+        (
+            "types::AGENCY_PREFIX",
+            "a prefix (\"agency:\"), not a scope value",
+        ),
+        (
+            "types::LEGACY_AGENCY_KINDS",
             "a set of legacy kinds, not a single value",
         ),
-        ("ALL", "this list itself"),
-        ("NON_MEMBERS", "this exclusion list itself"),
-        ("INFRA", "an axis subset of ALL, not a single value"),
-        ("AGENCY", "an axis subset of ALL, not a single value"),
-        ("MODERATION", "an axis subset of ALL, not a single value"),
+        ("types::ALL", "this list itself"),
+        ("types::NON_MEMBERS", "this exclusion list itself"),
+        ("types::INFRA", "an axis subset of ALL, not a single value"),
+        ("types::AGENCY", "an axis subset of ALL, not a single value"),
+        (
+            "types::MODERATION",
+            "an axis subset of ALL, not a single value",
+        ),
+        (
+            "types::RECOVERY",
+            "an axis subset of ALL, not a single value",
+        ),
+        // ── newly VISIBLE once the scan went crate-wide (#636) ──
+        (
+            "envelope::SCOPE",
+            "the envelope FIELD NAME (\"scope\"), not a value that field may hold",
+        ),
+        (
+            "admission::ANALYZE_CONSENT_SCOPE",
+            "CC 3.3.1's `analyze` CONSENT-GRAMMAR kind, pinned to \
+             consent_grammar::TransmissionPrinciple::Analyze — a different vocabulary from \
+             delegates_to scopes, with its own closed inventory (CONSENT_GRAMMAR_HASH)",
+        ),
+        (
+            "self_at_login::SCOPE_ACT_ON_BEHALF",
+            "§8.1.12.7 user→agent login vocabulary; its closed set is \
+             self_at_login::SELF_AT_LOGIN_DELEGATION_SCOPE, and the prefixed AGENCY_ACT_ON_BEHALF \
+             is the form offered here",
+        ),
+        (
+            "self_at_login::SCOPE_MESSAGE_IO",
+            "§8.1.12.7 user→agent login vocabulary; prefixed form AGENCY_MESSAGE_IO is the \
+             offered one",
+        ),
+        (
+            "self_at_login::SCOPE_NETWORK_PRESENCE",
+            "§8.1.12.7 user→agent login vocabulary; the offered form is INFRA_NETWORK_PRESENCE \
+             (presence is an infra duty, not agency — see LEGACY_AGENCY_KINDS)",
+        ),
+        (
+            "self_at_login::SCOPE_SUB_DELEGATION",
+            "§8.1.12.7 user→agent login vocabulary. In the DUTY walk `sub_delegation` is an \
+             envelope BOOLEAN grant, not a scope token, so it is not a value this inventory \
+             offers",
+        ),
     ];
 
     /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
@@ -4028,10 +4141,18 @@ mod tests {
         );
 
         let mut union: HashSet<&str> = HashSet::new();
+        // v30.11.0 (CIRISPersist#636) — RECOVERY is the fourth axis this test's
+        // own failure message invited ("or say why a fourth axis exists"), and
+        // it is why the invitation was written that way. `owner_binding_recovery`
+        // is CC 3.2 succession standing: it answers "who speaks for this key
+        // now", where MODERATION answers "what may be done about this party".
+        // Folding it into MODERATION would tell an operator picker that
+        // succession is a moderation action.
         for (name, set) in [
             ("INFRA", ds::INFRA),
             ("AGENCY", ds::AGENCY),
             ("MODERATION", ds::MODERATION),
+            ("RECOVERY", ds::RECOVERY),
         ] {
             for v in set {
                 assert!(
@@ -4050,11 +4171,16 @@ mod tests {
         assert!(
             missing.is_empty(),
             "scope(s) in ALL belong to no axis subset: {missing:?}. Every scope has an axis — add \
-             it to INFRA, AGENCY or MODERATION, or say why a fourth axis exists."
+             it to INFRA, AGENCY, MODERATION or RECOVERY, or say why a FIFTH axis exists."
         );
 
         // Non-vacuity: an empty or tiny set would satisfy everything above.
-        assert!(ds::INFRA.len() >= 10 && ds::AGENCY.len() >= 4 && ds::MODERATION.len() >= 4);
+        assert!(
+            ds::INFRA.len() >= 10
+                && ds::AGENCY.len() >= 4
+                && ds::MODERATION.len() >= 5
+                && !ds::RECOVERY.is_empty()
+        );
     }
 
     /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either
@@ -4074,73 +4200,119 @@ mod tests {
     #[test]
     fn every_delegation_scope_const_is_classified() {
         use super::delegation_scope as ds;
-        let src = include_str!("types.rs");
-        let module = src
-            .split("pub mod delegation_scope {")
-            .nth(1)
-            .expect("delegation_scope module present")
-            .split("\n}\n")
-            .next()
-            .expect("module body");
 
-        let declared: Vec<String> = module
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("pub const "))
-            .filter_map(|r| r.split(&[':', ' '][..]).next())
-            .map(|n| n.to_owned())
-            .collect();
-        assert!(
-            declared.len() >= 15,
-            "parsed only {} consts from delegation_scope — the scan is broken, so this gate \
-             proves nothing",
-            declared.len()
-        );
-
-        let non_member: Vec<&str> = ds::NON_MEMBERS.iter().map(|(n, _)| *n).collect();
-        let mut unclassified = Vec::new();
-        for name in &declared {
-            if non_member.contains(&name.as_str()) {
-                continue;
-            }
-            // A member's VALUE must appear in ALL. Comparing values rather than
-            // names keeps the re-exported `SCOPE_*` constants in scope.
-            let value_in_all = match name.as_str() {
-                "INFRA_SERVE" => ds::ALL.contains(&ds::INFRA_SERVE),
-                "INFRA_STORE" => ds::ALL.contains(&ds::INFRA_STORE),
-                "INFRA_TRANSPORT" => ds::ALL.contains(&ds::INFRA_TRANSPORT),
-                "INFRA_ATTEST" => ds::ALL.contains(&ds::INFRA_ATTEST),
-                "INFRA_NETWORK_PRESENCE" => ds::ALL.contains(&ds::INFRA_NETWORK_PRESENCE),
-                "INFRA_HOLD_COMMUNITY_MEMBERSHIP" => {
-                    ds::ALL.contains(&ds::INFRA_HOLD_COMMUNITY_MEMBERSHIP)
+        // ── SCAN THE WHOLE CRATE, NOT ONE MODULE ──────────────────────────
+        // v30.11.0 (CIRISPersist#636). The previous version did
+        // `include_str!("types.rs").split("pub mod delegation_scope {")` — it
+        // scanned the module that HOLDS the inventory, not the places scopes
+        // are MINTED. `consent_revocation` lives in `admission`,
+        // `owner_binding_recovery` in `ownership_reclaim`; neither was aliased
+        // here, so both were invisible to the gate whose entire job was to
+        // notice them, and `ALL` sat four-fifths complete while claiming
+        // "every value a scope entry may hold". A downstream consumer read the
+        // constants directly and shipped three of five.
+        //
+        // Same defect class as CIRISPersist#607, where the conferral gate
+        // scanned the rules TABLE and could not see an inline branch or a read
+        // door. **A gate whose scan domain is narrower than the vocabulary it
+        // certifies reports on the part it can reach.** The fix is not another
+        // entry; it is widening the domain to the whole crate.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
                 }
-                "INFRA_HOLD_FAMILY_MEMBERSHIP" => {
-                    ds::ALL.contains(&ds::INFRA_HOLD_FAMILY_MEMBERSHIP)
-                }
-                "INFRA_ATTEST_ASSURANCE" => ds::ALL.contains(&ds::INFRA_ATTEST_ASSURANCE),
-                "INFRA_DETECT" => ds::ALL.contains(&ds::INFRA_DETECT),
-                "INFRA_RECORD_HARD_CASE" => ds::ALL.contains(&ds::INFRA_RECORD_HARD_CASE),
-                "INFRA_PUBLISH_RATING" => ds::ALL.contains(&ds::INFRA_PUBLISH_RATING),
-                "AGENCY_ACT_ON_BEHALF" => ds::ALL.contains(&ds::AGENCY_ACT_ON_BEHALF),
-                "AGENCY_MESSAGE_IO" => ds::ALL.contains(&ds::AGENCY_MESSAGE_IO),
-                "AGENCY_REASON" => ds::ALL.contains(&ds::AGENCY_REASON),
-                "AGENCY_DECIDE" => ds::ALL.contains(&ds::AGENCY_DECIDE),
-                "SCOPE_MODERATE" => ds::ALL.contains(&ds::SCOPE_MODERATE),
-                "SCOPE_TAKEDOWN" => ds::ALL.contains(&ds::SCOPE_TAKEDOWN),
-                "SCOPE_REVIEW" => ds::ALL.contains(&ds::SCOPE_REVIEW),
-                "SCOPE_SLASH" => ds::ALL.contains(&ds::SCOPE_SLASH),
-                _ => false,
-            };
-            if !value_in_all {
-                unclassified.push(name.clone());
             }
         }
+        assert!(
+            files.len() >= 40,
+            "walked only {} .rs files — the scan is broken, so this gate proves nothing",
+            files.len()
+        );
 
+        // A constant is a CANDIDATE scope if its name says scope, or its value
+        // carries a scope prefix. Both, because neither alone is sufficient:
+        // `DELEGATION_SCOPE_SLASH` has no prefix in its value, and a const
+        // named for its role could still hold `"infra:serve"`.
+        let mut candidates: Vec<(String, String, String)> = Vec::new(); // (module, name, value)
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source");
+            let module = path.file_stem().unwrap().to_string_lossy().to_string();
+            for line in text.lines() {
+                let t = line.trim();
+                let Some(rest) = t.strip_prefix("pub const ") else {
+                    continue;
+                };
+                let Some((name, tail)) = rest.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                let Some((ty, val)) = tail.split_once('=') else {
+                    continue;
+                };
+                // Only SINGLE-VALUED, STRING-LITERAL consts are classified:
+                //   * `[&str; N]` / `&[&str]` is a SET, not a value
+                //     (`SELF_AT_LOGIN_DELEGATION_SCOPE`, `LEGACY_AGENCY_KINDS`).
+                //     A set's members are consts in their own right and are
+                //     reached on their own lines.
+                //   * `= crate::…::OTHER` is an ALIAS. Its value is whatever the
+                //     target holds, and this walk visits the target's
+                //     definition — demanding the alias resolve here would
+                //     re-introduce the name→value match arm this rewrite exists
+                //     to delete.
+                // Both skips are safe only BECAUSE the walk is exhaustive over
+                // the crate: a scope reachable through an alias or a set still
+                // has exactly one literal definition, and that is scanned.
+                let ty = ty.trim();
+                if ty != "&str" && ty != "&'static str" {
+                    continue;
+                }
+                let val = val.trim().trim_end_matches(';').trim();
+                let Some(literal) = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+                    continue;
+                };
+                let name_says_scope = name.contains("SCOPE");
+                let value_says_scope =
+                    literal.starts_with("infra:") || literal.starts_with("agency:");
+                if name_says_scope || value_says_scope {
+                    candidates.push((module.clone(), name.to_owned(), literal.to_owned()));
+                }
+            }
+        }
+        assert!(
+            candidates.len() >= 25,
+            "found only {} candidate scope consts crate-wide — scan is broken",
+            candidates.len()
+        );
+
+        // Classification is by VALUE against ALL, never by a name→value match
+        // arm. The old gate carried one, which was a THIRD hand-maintained list
+        // in a gate built to abolish hand-maintained lists; adding a scope meant
+        // editing three places and forgetting one was the whole failure mode.
+        let non_member: Vec<&str> = ds::NON_MEMBERS.iter().map(|(n, _)| *n).collect();
+        let mut unclassified = Vec::new();
+        for (module, name, value) in &candidates {
+            if non_member.contains(&format!("{module}::{name}").as_str()) {
+                continue;
+            }
+            if ds::ALL.contains(&value.as_str()) {
+                continue;
+            }
+            unclassified.push(format!("{module}::{name} = {value:?}"));
+        }
         assert!(
             unclassified.is_empty(),
-            "delegation_scope constant(s) are in neither ALL nor NON_MEMBERS: {unclassified:?}.\n\
+            "scope-valued constant(s) in neither ALL nor NON_MEMBERS: {unclassified:#?}\n\
              A scope missing from ALL is silently absent from every operator picker \
-             (CIRISPersist#625). Add it to ALL, or to NON_MEMBERS with the reason it is not a \
-             selectable value (a prefix, a set, …), and extend this test's match arm."
+             (CIRISPersist#625) and from any consumer reading the inventory (#636). Add it to \
+             delegation_scope::ALL, or name it in NON_MEMBERS with the reason it is not a \
+             selectable value (a field name, a prefix, a set, a different vocabulary)."
         );
 
         // ALL itself must hold no duplicates and no prefixes.
@@ -4150,6 +4322,85 @@ mod tests {
             assert!(
                 *v != ds::INFRA_PREFIX && *v != ds::AGENCY_PREFIX,
                 "delegation_scope::ALL contains the bare prefix {v:?} — not a selectable value"
+            );
+        }
+
+        // Every axis must be a subset of ALL, or a picker built from an axis
+        // offers a token the inventory does not admit.
+        for (axis_name, axis) in [
+            ("INFRA", ds::INFRA),
+            ("AGENCY", ds::AGENCY),
+            ("MODERATION", ds::MODERATION),
+            ("RECOVERY", ds::RECOVERY),
+        ] {
+            for v in axis {
+                assert!(
+                    ds::ALL.contains(v),
+                    "delegation_scope::{axis_name} holds {v:?}, absent from ALL"
+                );
+            }
+        }
+
+        // #637 — every `DELEGATION_SCOPE_*` const crate-wide is either IN the
+        // ladder or NAMED as a deliberate exclusion. This is the membership
+        // question the loose constants could not answer: CIRISServer imported
+        // the constants correctly and still shipped three of five, because
+        // there was nothing to import for MEMBERSHIP.
+        const LADDER_EXCLUSIONS: &[(&str, &str)] = &[(
+            "DELEGATION_SCOPE_OWNER_BINDING_RECOVERY",
+            "CC 3.2 succession standing — a different plane and a different walk; \
+             see delegation_scope::RECOVERY",
+        )];
+        let mut unplaced = Vec::new();
+        for (module, name, value) in &candidates {
+            if !name.starts_with("DELEGATION_SCOPE_") {
+                continue;
+            }
+            if LADDER_EXCLUSIONS.iter().any(|(n, _)| *n == name.as_str()) {
+                continue;
+            }
+            if !crate::federation::admission::DELEGATED_DUTY_SCOPES.contains(&value.as_str()) {
+                unplaced.push(format!("{module}::{name} = {value:?}"));
+            }
+        }
+        assert!(
+            unplaced.is_empty(),
+            "DELEGATION_SCOPE_* const(s) in neither DELEGATED_DUTY_SCOPES nor the recorded \
+             exclusions: {unplaced:#?}\n\
+             A consumer importing the ladder would silently not know about these (#637)."
+        );
+
+        // The re-export must BE the array, not a copy of it. Compared by
+        // pointer as well as value: two arrays with equal contents today are
+        // still two things to keep equal tomorrow.
+        assert!(
+            std::ptr::eq(
+                ds::MODERATION as *const [&str],
+                crate::federation::admission::DELEGATED_DUTY_SCOPES as *const [&str]
+            ),
+            "delegation_scope::MODERATION is a COPY of admission::DELEGATED_DUTY_SCOPES, not the \
+             same array — one vocabulary, one definition (#637)"
+        );
+
+        // The ladder is FIVE rungs. Pinned by count AND by membership so that
+        // dropping one and adding another cannot pass.
+        assert_eq!(
+            ds::MODERATION.len(),
+            5,
+            "the moderation ladder is five rungs (consent_revocation, moderate, takedown, \
+             review, slash); MODERATION has {}",
+            ds::MODERATION.len()
+        );
+        for expected in [
+            crate::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION,
+            crate::federation::admission::DELEGATION_SCOPE_MODERATE,
+            crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
+            crate::federation::admission::DELEGATION_SCOPE_REVIEW,
+            crate::federation::admission::DELEGATION_SCOPE_SLASH,
+        ] {
+            assert!(
+                ds::MODERATION.contains(&expected),
+                "moderation ladder is missing {expected:?}"
             );
         }
     }
