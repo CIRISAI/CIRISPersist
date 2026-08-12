@@ -398,3 +398,210 @@ mod tests {
         assert!(!AuthorityClass::ProducerSteward.is_trust_root());
     }
 }
+
+/// v30.12.0 (CIRISPersist#635) — **may the DATA-SUBJECT of a row carrying this
+/// `dimension` retain a copy on its own node?**
+///
+/// `true` only for families where the subject is NECESSARILY the author.
+/// Everything else — including every dimension this build has never heard of —
+/// is `false`.
+///
+/// # The hole this closes
+///
+/// CIRISEdge#462's subject-scoped RECEIVE-axis pull lets a fedID pull its own
+/// testimony onto a fresh node. Serving a peer-authored score *about* the
+/// subject onto the node where that subject is the **sole writer** conflates a
+/// read-copy with write-authority — the shape that produced the **G2
+/// self-revocation hole**. Edge carved it out with a local prefix denylist
+/// (`capacity:` / `capacity_assurance:` / `moderation:`), which silently
+/// re-opens G2 the moment a scoring family lands persist-side and not
+/// edge-side. The taxonomy is persist's, so the predicate is persist's.
+///
+/// # Why an ALLOWLIST, and why the manifest does not decide this at runtime
+///
+/// A denylist defaults a NEW family to retainable — which is the very drift
+/// this replaces, just relocated into persist. So the runtime answer comes
+/// from [`SUBJECT_RETAINABLE_FAMILIES`] and nothing else: an unclassified
+/// family, a renamed family and an unknown dimension all read `false`. That is
+/// the same fail-secure posture
+/// [`LoadBearing::treated_as_load_bearing`](crate::federation::load_bearing::LoadBearing::treated_as_load_bearing)
+/// takes — only a proven `No` is a `No`.
+///
+/// The manifest DOES record the authorship fact, in `emit_authority`, but as
+/// prose: *"self-emission MANDATORY (attesting_key_id in subject_key_ids)"*,
+/// *"scored-by-canonical (reserved: attesting_key_id != attested…)"*,
+/// *"witness-reserved; attester not in {subject, …}"*. Deriving a security
+/// predicate by string-matching English would be an inference dressed as a
+/// rule. So prose is read by a TEST — `manifest_self_emission_families_are_all_retainable`
+/// — which fails the build when the manifest gains a self-emission family this
+/// list does not name. The runtime decision stays explicit; the manifest is
+/// the alarm, not the authority.
+///
+/// # Orthogonal to the sender axis
+///
+/// A score I AUTHORED is mine to recover. This predicate is consulted only on
+/// the data-subject axis.
+#[must_use]
+pub fn is_subject_retainable(dimension: &str) -> bool {
+    crate::federation::load_bearing::family_for_dimension(dimension).is_some_and(|family| {
+        SUBJECT_RETAINABLE_FAMILIES
+            .iter()
+            .any(|(f, _)| *f == family)
+    })
+}
+
+/// The families a data-subject may retain about itself, with the manifest
+/// `emit_authority` clause that justifies each. Every entry is a family whose
+/// author is necessarily the subject, so a retained copy conveys no authority
+/// the subject did not already hold.
+///
+/// Adding an entry is a security decision: it says "a node where this subject
+/// is the sole writer may hold this row." Removing one is always safe.
+pub const SUBJECT_RETAINABLE_FAMILIES: &[(&str, &str)] = &[
+    (
+        "trace:*",
+        "emit_authority: self-emission MANDATORY (attesting_key_id in subject_key_ids)",
+    ),
+    (
+        "trace_manifest:*",
+        "emit_authority: self-emission MANDATORY (inherited from trace:*)",
+    ),
+    (
+        "identity_continuity:relational_anchor",
+        "emit_authority: substrate-self-report (the substrate instance itself)",
+    ),
+    (
+        "transport:{kind}",
+        "emit_authority: substrate-self-report (the transport-delivery component)",
+    ),
+    // The drift alarm found these three on its first run — which is the
+    // argument for having it. All three are CC 3.4.3 substrate-self-reports:
+    // the node is the author, so a retained copy conveys no authority it did
+    // not already hold. They are node-plane rather than fedID-plane, so a
+    // subject-scoped pull will rarely match them; that is a reason they were
+    // easy to miss, not a reason to withhold them.
+    (
+        "audit_chain:hash_continuity",
+        "emit_authority: canonical (substrate-self-report per CC 3.4.3)",
+    ),
+    (
+        "corpus_health:n_eff_measurable",
+        "emit_authority: substrate-self-report (CIRISPersist only; reserved per CC 3.4.3)",
+    ),
+    (
+        "federation_directory:replication_lag",
+        "emit_authority: substrate-self-report (the reporting node/replica itself, per CC 3.4.3)",
+    ),
+];
+
+#[cfg(test)]
+mod subject_retainability_tests {
+    use super::*;
+
+    /// The three prefixes CIRISEdge#462 currently denies locally must all be
+    /// refused here, or persist has not actually taken ownership of the carve.
+    #[test]
+    fn edges_denylist_is_covered() {
+        for dim in [
+            "capacity:composite",
+            "capacity:integrity",
+            "capacity_assurance:rung_3",
+            "moderation:harassment",
+        ] {
+            assert!(
+                !is_subject_retainable(dim),
+                "{dim} is peer-authored about the subject; retaining it on the subject's own \
+                 node is the G2 shape"
+            );
+        }
+    }
+
+    /// Self-authored testimony IS retainable — otherwise the predicate is
+    /// vacuously safe and edge's pull returns nothing.
+    #[test]
+    fn self_emitted_testimony_is_retainable() {
+        for dim in [
+            "trace:complete:v1",
+            "trace_manifest:v1",
+            "identity_continuity:relational_anchor",
+        ] {
+            assert!(
+                is_subject_retainable(dim),
+                "{dim} is self-emitted; refusing it would empty the RECEIVE-axis pull"
+            );
+        }
+    }
+
+    /// Fail-CLOSED: a dimension this build has never heard of is NOT
+    /// retainable. The issue asks for this explicitly, and it is what makes an
+    /// allowlist an allowlist.
+    #[test]
+    fn unknown_dimensions_are_not_retainable() {
+        for dim in [
+            "capacity:some_future_metric_we_have_not_seen",
+            "brand_new_scoring_family:leaf",
+            "",
+            "::",
+            "trace",
+        ] {
+            assert!(
+                !is_subject_retainable(dim),
+                "{dim:?} resolved to retainable — an allowlist that admits the unknown is a \
+                 denylist wearing a costume"
+            );
+        }
+    }
+
+    /// THE DRIFT ALARM. The manifest records authorship in `emit_authority`
+    /// prose; this test reads that prose so the runtime predicate never has to.
+    /// A manifest family that MANDATES self-emission and is missing from
+    /// `SUBJECT_RETAINABLE_FAMILIES` fails the build — that is the "new family
+    /// lands persist-side" case #635 was filed about, caught at the taxonomy
+    /// rather than at a consumer.
+    ///
+    /// Note the direction: this can only ever ask for a family to be ADDED.
+    /// It cannot silently make something retainable, because the runtime
+    /// answer is the const list and nothing else.
+    #[test]
+    fn manifest_self_emission_families_are_all_retainable() {
+        let listed: Vec<&str> = SUBJECT_RETAINABLE_FAMILIES
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        let mut missing = Vec::new();
+        for (family, emit) in supersets::family_emit_authorities() {
+            let lower = emit.to_ascii_lowercase();
+            let self_emitted = lower.contains("self-emission mandatory")
+                || lower.contains("substrate-self-report");
+            if self_emitted && !listed.contains(&family) {
+                missing.push(format!("{family}  ({emit})"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "manifest families mandate self-emission but are absent from \
+             SUBJECT_RETAINABLE_FAMILIES: {missing:#?}\n\
+             Either add them (the subject is necessarily the author, so a retained copy conveys \
+             no new authority) or record why they are still withheld."
+        );
+        assert!(
+            !listed.is_empty(),
+            "the allowlist is empty — every pull would return nothing"
+        );
+    }
+
+    /// Every allowlisted family must actually exist in the vendored manifest.
+    /// A typo would silently withhold rows forever, and a fail-CLOSED default
+    /// makes that invisible — nothing errors, the pull just quietly shrinks.
+    #[test]
+    fn allowlisted_families_exist_in_the_manifest() {
+        let declared = supersets::family_prefixes();
+        for (family, _) in SUBJECT_RETAINABLE_FAMILIES {
+            assert!(
+                declared.contains(family),
+                "SUBJECT_RETAINABLE_FAMILIES names {family:?}, which the manifest does not \
+                 declare — a typo here withholds rows silently, because unknown is refused"
+            );
+        }
+    }
+}

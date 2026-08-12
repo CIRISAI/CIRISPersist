@@ -352,6 +352,118 @@ pub async fn reload_record_bytes(
     Ok(bytes)
 }
 
+/// v30.12.0 (CIRISPersist#634) — the **subject-scoped** wire refs: every
+/// `(kind_token, content_hash, record_key)` the signed-wire index holds for
+/// `subject_key_id`, computed from the same reads and the same
+/// [`content_hash_of`] the index write hooks use.
+///
+/// # What this is for
+///
+/// CIRISEdge#462's subject-scoped RECEIVE-axis pull needs `EnvelopeRef`s that
+/// resolve through [`FederationDirectory::lookup_signed_record_by_content_hash`](super::FederationDirectory::lookup_signed_record_by_content_hash).
+/// Edge could not use `list_signed_records(kind, subject)` for this: it returns
+/// `canonical_json = serde_json::to_value(row)`, and with no
+/// `serde_json/preserve_order` in the workspace `to_value` SORTS object keys,
+/// so `sha256(to_vec(canonical_json)) != sha256(to_vec(row))` — not the wire
+/// index hash. So edge composed the per-kind subject reads and hashed the
+/// STRUCTS itself, which works only while those `_for` reads serialize
+/// byte-identically to what the `_since` reads hashed. That held, but it was
+/// edge asserting a property about persist's serialization.
+///
+/// Now persist asserts it, in one place, gated.
+///
+/// # The kind token is `EnvelopeKind`, NOT `ReplicatedKind`
+///
+/// #634 proposed returning `ReplicatedKind`. It cannot: `ReplicatedKind::as_str`
+/// is `"key_record"` / `"identity_occurrence"`, while `signed_wire_index.kind`
+/// — and therefore the `kind` argument of
+/// `lookup_signed_record_by_content_hash` — is the `EnvelopeKind` token
+/// `"Key"` / `"IdentityOccurrence"`. Two vocabularies name these same planes,
+/// and handing back the one that does NOT key the index would leave every
+/// caller writing the same mapping, each free to get it wrong. The token
+/// returned here goes straight into the fetch call.
+///
+/// # Cost, honestly
+///
+/// Four of the five planes have a subject-scoped read. The Key plane does not
+/// — there is no `lookup_signed_key_record`, only the bulk
+/// `list_signed_key_records_since` the index itself is built from — so that
+/// plane is filtered from a full scan. #634 hoped this would be cheaper than
+/// edge's compose-and-rehash; for four planes it is the same work, and for the
+/// Key plane it is more. The value delivered is the byte-exactness guarantee
+/// moving into persist, not a speedup. A subject-indexed signed key read would
+/// fix the asymmetry and is not in this cut.
+///
+/// `seq` is not returned: `signed_wire_index` has no seq column and the
+/// subject-scoped reads do not surface one. #634 marked it optional.
+pub async fn wire_refs_for_subject(
+    dir: &dyn super::FederationDirectory,
+    subject_key_id: &str,
+) -> Result<Vec<(&'static str, String, String)>, Error> {
+    let mut out = Vec::new();
+
+    // Key — no subject-scoped signed read; filtered from the same bulk read
+    // the index is built from, which is what keeps it byte-exact.
+    for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
+        if r.record.key_id == subject_key_id {
+            let rk = record_key(&[("key_id", &r.record.key_id)]);
+            out.push(("Key", content_hash_of(&r)?, rk));
+        }
+    }
+    for a in dir.list_attestations_for(subject_key_id).await? {
+        let rk = record_key(&[("attestation_id", &a.attestation_id)]);
+        out.push(("Attestation", content_hash_of(&a)?, rk));
+    }
+    for r in dir
+        .list_signed_identity_occurrences_for(subject_key_id)
+        .await?
+    {
+        let rk = record_key(&[
+            ("identity_key_id", &r.identity_occurrence.identity_key_id),
+            (
+                "occurrence_key_id",
+                &r.identity_occurrence.occurrence_key_id,
+            ),
+        ]);
+        out.push(("IdentityOccurrence", content_hash_of(&r)?, rk));
+    }
+    // Transport destinations hang off the OCCURRENCE, so the subject's
+    // occurrences are the key set — a subject with no occurrence has no routes.
+    for occ in dir
+        .list_signed_identity_occurrences_for(subject_key_id)
+        .await?
+    {
+        let occ_id = &occ.identity_occurrence.occurrence_key_id;
+        for r in dir.list_signed_transport_destinations_for(occ_id).await? {
+            let rk = record_key(&[
+                (
+                    "occurrence_key_id",
+                    &r.transport_destination.occurrence_key_id,
+                ),
+                ("transport_kind", &r.transport_destination.transport_kind),
+            ]);
+            out.push(("TransportDestination", content_hash_of(&r)?, rk));
+        }
+    }
+    for r in dir
+        .list_signed_identity_occurrence_revocations_for(subject_key_id)
+        .await?
+    {
+        let rk = record_key(&[
+            (
+                "identity_key_id",
+                &r.identity_occurrence_revocation.identity_key_id,
+            ),
+            (
+                "occurrence_key_id",
+                &r.identity_occurrence_revocation.occurrence_key_id,
+            ),
+        ]);
+        out.push(("IdentityOccurrenceRevocation", content_hash_of(&r)?, rk));
+    }
+    Ok(out)
+}
+
 /// v21.1.0 (CIRISPersist#507b) — the shared full-scan half of
 /// `rebuild_signed_wire_index`: bulk-lists every covered kind via its
 /// EXISTING `list_signed_*_since(None, u32::MAX)` / `list_*_since(None,

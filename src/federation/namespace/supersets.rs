@@ -879,6 +879,30 @@ pub fn load_bearing_predicate(family_prefix: &str) -> Option<(&'static str, &'st
         .map(|(_, kind, rationale)| (*kind, *rationale))
 }
 
+/// v30.12.0 (CIRISPersist#635) — the `emit_authority` prose of every family
+/// the manifest declares, for the retainability drift alarm. Prose, so it is
+/// read by a TEST and never by the runtime predicate — see
+/// [`crate::federation::namespace::is_subject_retainable`].
+#[must_use]
+pub fn family_emit_authorities() -> Vec<(&'static str, String)> {
+    families()
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str(),
+                        v.get("emit_authority")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every family prefix the vendored manifest declares, sorted. The universe
 /// [`crate::federation::load_bearing`] resolves a dimension against.
 pub fn family_prefixes() -> Vec<&'static str> {

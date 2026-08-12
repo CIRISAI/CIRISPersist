@@ -19516,6 +19516,21 @@ mod tests {
         .await;
     }
 
+    /// v30.12.0 (CIRISPersist#634) — the SQLITE leg: every wire ref a subject
+    /// read returns must resolve through the content-hash fetch path. Runs on
+    /// all three backends because the skew it guards (a `_for` read
+    /// serializing differently than the `_since` read the index was built
+    /// from) is a PER-BACKEND property.
+    #[tokio::test]
+    async fn wire_refs_for_subject_resolve_sqlite_634() {
+        let backend = fresh_backend_with_occurrence("occ-634").await;
+        crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
+            &backend,
+            "sqlite-634",
+        )
+        .await;
+    }
+
     /// Smoke: open in-memory, run migrations, both lens tables exist.
     #[tokio::test]
     async fn migrations_run_clean_in_memory() {
