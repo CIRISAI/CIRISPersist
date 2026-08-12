@@ -3038,6 +3038,13 @@ impl Engine {
             );
             // CC#38 size discipline — oversize reassemblies take the
             // manifest form, same as the live mint.
+            //
+            // v31.0.0 — and it inherits the live mint's stated residue with
+            // it: these are the PRODUCER's bytes, not the stored ones, which
+            // also carry persist's own #643 mirror and #598 instants stamped
+            // at the local write door. See
+            // `ingest::IngestPipeline::build_trace_attestation_input` for why
+            // the headroom is not reserved on this side of the door.
             let value = envelope.to_value();
             let canonical = crate::verify::canonical::ceg_produce_canonicalize(&value)
                 .map_err(|e| Error::InvalidArgument(format!("backfill canonicalize: {e}")))?;
@@ -3083,7 +3090,32 @@ impl Engine {
             };
             match outcome {
                 Ok(_) => report.minted += 1,
-                Err(e) => report.skipped.push((trace_id, e.kind().to_owned())),
+                Err(e) => {
+                    // v31.0.0 (CIRISPersist#598) — the refusal REACHES A LOG,
+                    // not only the report. `TraceBackfillReport::skipped`
+                    // carries `(trace_id, error KIND)` and is a public
+                    // serde-stable shape, so the gate's own sentence — the one
+                    // naming the column and the issue — had nowhere to go and
+                    // was dropped on the floor at the only site that saw it.
+                    //
+                    // Same lesson as the live mint's warn in
+                    // `ingest::receive_and_persist_with`, one door over: when
+                    // #598 made the local write door refuse every durable mint,
+                    // this loop reported one `(trace_id,
+                    // "federation_invalid_argument")` pair per trace in the
+                    // corpus and said nothing else. A backfill is an
+                    // operator-run repair;
+                    // it must be able to tell an operator why it repaired
+                    // nothing.
+                    tracing::warn!(
+                        write_path = "trace_backfill",
+                        trace_id = %trace_id,
+                        reason = %e.kind(),
+                        error = %e,
+                        "ciris-persist: trace attestation backfill skipped (#478)"
+                    );
+                    report.skipped.push((trace_id, e.kind().to_owned()));
+                }
             }
         }
         Ok(report)
