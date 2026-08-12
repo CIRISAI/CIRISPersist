@@ -3065,6 +3065,13 @@ impl Engine {
             );
             // CC#38 size discipline — oversize reassemblies take the
             // manifest form, same as the live mint.
+            //
+            // v31.0.0 (CIRISPersist#653) — and it inherits the live mint's caveat with
+            // it: these are the PRODUCER's bytes, not the stored ones, which
+            // also carry persist's own #643 mirror and #598 instants stamped
+            // at the local write door. See
+            // `ingest::IngestPipeline::build_trace_attestation_input` for why
+            // the headroom is not reserved on this side of the door.
             let value = envelope.to_value();
             let canonical = crate::verify::canonical::ceg_produce_canonicalize(&value)
                 .map_err(|e| Error::InvalidArgument(format!("backfill canonicalize: {e}")))?;
@@ -3110,7 +3117,32 @@ impl Engine {
             };
             match outcome {
                 Ok(_) => report.minted += 1,
-                Err(e) => report.skipped.push((trace_id, e.kind().to_owned())),
+                Err(e) => {
+                    // v31.0.0 (CIRISPersist#598) — the refusal REACHES A LOG,
+                    // not only the report. `TraceBackfillReport::skipped`
+                    // carries `(trace_id, error KIND)` and is a public
+                    // serde-stable shape, so the gate's own sentence — the one
+                    // naming the column and the issue — had nowhere to go and
+                    // was dropped on the floor at the only site that saw it.
+                    //
+                    // Same lesson as the live mint's warn in
+                    // `ingest::receive_and_persist_with`, one door over: when
+                    // #598 made the local write door refuse every durable mint,
+                    // this loop reported one `(trace_id,
+                    // "federation_invalid_argument")` pair per trace in the
+                    // corpus and said nothing else. A backfill is an
+                    // operator-run repair;
+                    // it must be able to tell an operator why it repaired
+                    // nothing.
+                    tracing::warn!(
+                        write_path = "trace_backfill",
+                        trace_id = %trace_id,
+                        reason = %e.kind(),
+                        error = %e,
+                        "ciris-persist: trace attestation backfill skipped (#478)"
+                    );
+                    report.skipped.push((trace_id, e.kind().to_owned()));
+                }
             }
         }
         Ok(report)
@@ -15401,16 +15433,28 @@ mod tests {
         .expect("genesis put_family");
 
         // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
-        // #502 E4 note: `supersede_family` writes via `supersede_group_row`, NOT
-        // the newly-gated `put_family` — the wrapper's authority fields are
-        // unused on this path (out of scope; the quorum authorization below is
-        // this path's OWN real authority check), so empty placeholders satisfy
-        // the type only.
+        //
+        // v31.0.0 (CIRISPersist#651) — this comment used to say that because
+        // `supersede_family` writes via `supersede_group_row` and not the
+        // gated `put_family`, "the wrapper's authority fields are unused on
+        // this path", so empty placeholders satisfied the type. That sentence
+        // WAS the hole, written down and accepted as intentional: supersede
+        // was a SECOND, ungated write door into `federation_families`,
+        // admitting a re-baselined roster, a new `consensus_protocol` and a
+        // new `family_name` on FK-existence alone.
+        //
+        // The `authorization` below never substituted for authorship. It is
+        // the membership-change JUSTIFICATION recorded on the superseded prior
+        // version — a note about why the change was made, not a proof of who
+        // made it. `supersede_family` now hybrid-verifies the wrapper exactly
+        // as `put_family` does, so the fixture seals it through the same
+        // helper the genesis write above uses.
         let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
         let new_version = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(5),
@@ -15419,10 +15463,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 Some(auth.clone()),
             )
             .await
@@ -15460,10 +15501,19 @@ mod tests {
         assert!(d.group_at(Cohort::Family, &fam, 9).await.unwrap().is_none());
 
         // supersede on an unknown group is rejected.
+        //
+        // v31.0.0 (CIRISPersist#651) — SIGNED, deliberately, even though the
+        // row is meant to be refused. This assertion is about the UNKNOWN-GROUP
+        // rule, and `supersede_family` now hybrid-verifies authorship first, so
+        // an unsigned wrapper would be refused for having no registered
+        // attester and this test would silently start measuring the authorship
+        // gate instead of the rule it was written for. Sealing it with a
+        // registered key keeps the refusal under test the intended one.
         let err = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -15472,10 +15522,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 None,
             )
             .await
