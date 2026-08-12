@@ -50,6 +50,10 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+// (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
+// write door is open by constitutional decision (#571 / CC 3.3.12); this is
+// where the discrimination lives.
+pub mod content_class;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 // (CIRISPersist#519 / #520) — the family-rule INVENTORY: every namespace family
@@ -4356,6 +4360,39 @@ pub trait FederationDirectory: Send + Sync {
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),
         ))
+    }
+
+    /// v30.13.0 (CIRISPersist#612, CC 4.5.13) — the **other half** of the
+    /// infohazard reveal gate: fold the `content_class:{class}` flag plane for
+    /// `subject_key_id`, honouring a cross-emitter CLEAR only from a key holding
+    /// [`INFRA_CLASSIFY_CONTENT`](types::delegation_scope::INFRA_CLASSIFY_CONTENT)
+    /// conferred by a root **this node** accepts.
+    ///
+    /// [`Self::resolve_scoped_consent`] above answers *"did the subject consent
+    /// to this reveal?"*. This answers *"is the content flagged, by anyone whose
+    /// clearing I am obliged to honour?"* — the arm CIRISServer#363 reported as
+    /// a live fail-open, where an ordinary `agent`-typed key withdrew a flag it
+    /// had never raised and the gate returned `Allow`.
+    ///
+    /// The whole design, including why RAISES are deliberately **not**
+    /// conferral-filtered, lives in [`content_class`]. Default impl over
+    /// [`Self::list_attestations_for`] + the capability walk — no per-backend
+    /// SQL, so memory / sqlite / postgres inherit one fold.
+    ///
+    /// # Errors
+    ///
+    /// See [`content_class::resolve_content_class_flag`]: `InvalidArgument` for
+    /// a dimension outside [`content_class::FAMILY_STEM`],
+    /// [`Error::NodeIdentityUnset`] when the directory has no node identity to
+    /// resolve conferrals against, plus any backend/walk error. A caller that
+    /// cannot complete the fold must withhold.
+    async fn resolve_content_class_flag(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<content_class::ContentClassFlag, Error> {
+        content_class::resolve_content_class_flag(self, subject_key_id, dimension, now).await
     }
 
     /// Subject-side revocations (consent observability scan, §8.1.11.3 /

@@ -9582,6 +9582,21 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "mem").await;
     }
 
+    /// v30.13.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
+    /// memory backend. Shares its body with the sqlite and postgres twins.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn content_class_flag_plane_memory() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("cc-node-mem");
+        crate::federation::content_class::parity_test_support::assert_content_class_flag_plane(
+            &backend,
+            "cc-node-mem",
+            "mem",
+        )
+        .await;
+    }
+
     /// CIRISServer#356 — the operator read surface on the memory backend:
     /// unknown-not-green, the distinguished zeroes, and the read-only overdue
     /// query's zero-write proof. Shares its body with the sqlite and postgres

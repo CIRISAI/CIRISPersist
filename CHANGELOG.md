@@ -7,6 +7,63 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
+### Added — the flag plane could be cleared by anyone, and there was no name for the authority to clear it (#612)
+
+CIRISServer#363 drove the fail-open **end to end through the real
+`put_attestation` door**: an ordinary admitted `agent`-typed key authored
+`content_class:infohazard:v1 {"withdrawn": true}` naming a subject it had never
+flagged, persist admitted the row, and the CC 4.5.13 reveal gate — folding the
+family latest-wins with no emitter predicate — returned `Allow`.
+
+That is v28.3.0's *"discriminate on read"* landing without a read door to
+discriminate with. `lookup_trusted_publisher_chain`, which the note pointed at,
+is scoped to `content_rating:*` dimensions and keyed by a hex `content_sha256`
+in `evidence_refs`; these rows are `content_class:*` keyed on the **subject**.
+It cannot see them at all.
+
+- **`delegation_scope::INFRA_CLASSIFY_CONTENT` (`infra:classify_content`)** —
+  the standing to speak about a THIRD PARTY's content class. A **CAPABILITY**
+  scope, not a sixth rung on the moderation ladder, and the axis test is
+  mechanical: the intended holder is a peer's own `substrate_persist` flag
+  signer, a NODE key, and `scopes_are_infra_only` refuses every unprefixed duty
+  token on one; the resolver is `capability_roots_to_trusted_root` against the
+  ASKING node's root, not the §11.10 duty walk over a roster we govern; and CC
+  3.4.14 R5 keeps classification (the input) distinct from takedown/slash (the
+  sanction). `MODERATION` stays at five rungs, now with the rejection recorded
+  in its own doc. A fifth `infra:*` name rather than reuse: `infra:detect` would
+  let any adversarial-detection key clear a child-safety flag.
+- **`FederationDirectory::resolve_content_class_flag`** — the read door, a
+  default trait method over `list_attestations_for` + the capability walk, so
+  memory / sqlite / postgres inherit one fold. Its asymmetry is the whole
+  design: **any** emitter may RAISE (withholding is the safe error on a CC
+  4.5.13 gate, so filtering raises by conferral would be the same fail-open in
+  reverse), **any** emitter may retract its OWN raise (an emitter that cannot
+  take back its statement is a permanent withholding lever), and only a holder
+  of `infra:classify_content` conferred by a root **this node** trusts may clear
+  a flag it did not raise. Refusals are returned, not swallowed —
+  `refused_withdrawals` names every key that tried.
+- Dimensions match **exactly**, never by family stem: CC 3.4.14 R1 makes
+  `content_class:generated:v1` mandatory on machine-authored Contributions, and
+  a family-wide fold would read every lawful AI-disclosure marking as an
+  infohazard flag.
+- `admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN` and
+  `family_rules::NOT_A_FAMILY_RULE` now record the read door beside the reason
+  the write gate is gone (#571), so "open write door" reads as a decision rather
+  than a hole.
+
+Witnessed on memory + sqlite + postgres by one shared body
+(`content_class::parity_test_support`) driving the real `put_attestation` write
+path. Its step 2 is the dye test — CIRISServer#363's exact attack — and it fails
+on any fold without the conferral check.
+
+**Not** in this cut: `withdraws`/`recants` tombstones on flag rows are not
+folded (only the envelope's `withdrawn` field, which is the mechanism the plane
+uses). Ignoring them over-withholds rather than over-reveals, so the omission is
+fail-closed in both directions. The issue's second half — enforcing the declared
+`conferral_mode`s so `identity_type = substrate_persist` stops being
+self-assertable — is untouched here; CIRISServer already chose key identity over
+identity_type for exactly that reason.
+
 ### Fixed — the doc-version gate was manufacturing its own backlog (#599)
 
 223 phantom references → **2**. Ten baseline rows (170 references) were retired
