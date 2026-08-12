@@ -2434,20 +2434,38 @@ pub mod test_support {
             for k in [&subject, &attester] {
                 crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
             }
-            let mk = |dimension: &str| {
-                consent_scope_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &subject,
-                    &attester,
-                    dimension,
-                    &[analyze],
-                    base,
-                )
+            // The ids are ADVERSARIAL, not incidental. `fold_ordering_key` is
+            // `(asserted_at, restriction_rank, attestation_id)` resolved by
+            // `max_by_key`, so at a true instant-tie the id is the THIRD
+            // component — and with two random uuids it decides the winner
+            // roughly half the time. This arm then passed or failed by luck:
+            // deleting the restriction-rank tie-break entirely left it GREEN on
+            // whichever backend drew the kinder uuid, which is how it was
+            // caught (green on sqlite, red on memory, same binary).
+            //
+            // So: give the GRANT the lexically LARGER id. If the rank component
+            // is ever removed or reordered, the grant wins on id and the
+            // assertion below fails on every backend, deterministically. The
+            // ids stay real uuids because `attestation_id` is a UUID column on
+            // postgres — a symbolic id fails in the driver, before any fold.
+            let (lo, hi) = {
+                let (a, b) = (
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                );
+                if a < b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            };
+            let mk = |id: &str, dimension: &str| {
+                consent_scope_row(id, &subject, &attester, dimension, &[analyze], base)
             };
             let pair = if first_is_grant {
-                [mk(&granted), mk(&revoked)]
+                [mk(&hi, &granted), mk(&lo, &revoked)]
             } else {
-                [mk(&revoked), mk(&granted)]
+                [mk(&lo, &revoked), mk(&hi, &granted)]
             };
             for row in pair {
                 dir.put_attestation(SignedAttestation { attestation: row })
