@@ -20415,6 +20415,91 @@ mod tests {
         .await;
     }
 
+    /// v30.13.0 (CIRISPersist#644) — the sqlite leg of the shared envelope
+    /// byte-exactness witness (see
+    /// `postgres::tests::envelope_bytes_round_trip_postgres_644`). Both legs
+    /// call the SAME
+    /// `envelope_bytes::test_support::exercise_envelope_byte_exactness` body.
+    ///
+    /// This leg passed before V122 too — these columns have been TEXT on SQLite
+    /// since the day they were created, which is exactly why the divergence ran
+    /// undetected. It is here so the parity claim is a claim about both
+    /// backends and not an assertion about one.
+    #[tokio::test]
+    async fn envelope_bytes_round_trip_sqlite_644() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::envelope_bytes::test_support::exercise_envelope_byte_exactness(
+            &backend,
+            "sqlite-644",
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#644) — the sqlite twin of
+    /// `postgres::tests::every_v122_envelope_column_is_text_postgres_644`:
+    /// every signature-covered envelope column is declared `TEXT`.
+    ///
+    /// SQLite would tolerate a wrong declared type (it is dynamically typed and
+    /// stores whatever is bound), so this gate is about the SCHEMA staying the
+    /// reference the Postgres side is held to — the postgres leg is the one
+    /// that would fail on a real regression. It reds if someone "fixes" a
+    /// column here by declaring it `JSON`/`JSONB`, which is how the two
+    /// backends would drift apart again.
+    #[tokio::test]
+    async fn every_v122_envelope_column_is_text_sqlite_644() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        const COLUMNS: &[(&str, &str)] = &[
+            ("federation_keys", "registration_envelope"),
+            ("federation_attestations", "attestation_envelope"),
+            ("federation_revocations", "revocation_envelope"),
+            ("federation_organizations", "signed_envelope"),
+            ("federation_org_memberships", "signed_envelope"),
+            ("federation_partner_records", "signed_envelope"),
+            ("federation_identity_occurrences", "signed_envelope"),
+            ("federation_identity_occurrences", "signature"),
+            ("federation_identity_occurrences", "transport_binding"),
+            (
+                "federation_identity_occurrence_revocations",
+                "signed_envelope",
+            ),
+            ("federation_identity_occurrence_revocations", "signature"),
+        ];
+
+        let conn = backend.conn_handle();
+        let mut offenders = Vec::new();
+        for (table, column) in COLUMNS {
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("pragma prepares");
+            let found: Option<String> = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .expect("pragma runs")
+                .filter_map(Result::ok)
+                .find(|(name, _)| name == column)
+                .map(|(_, decl)| decl);
+            match found {
+                None => offenders.push(format!("  {table}.{column} does not exist")),
+                Some(decl) if !decl.eq_ignore_ascii_case("TEXT") => {
+                    offenders.push(format!("  {table}.{column} is declared {decl}"));
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a signature-covered envelope column is not TEXT on sqlite (CIRISPersist#644). \
+             These columns hold the exact bytes a producer signed and must round-trip \
+             byte-identically on BOTH backends — see V122:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// CIRISPersist#579 (CC 4.5.1.1, rc3) — the sqlite leg of the shared
     /// "the pointer confers no subject authority" witness (see the postgres +
     /// memory legs). This leg also exercises the subject-keyed READ surface

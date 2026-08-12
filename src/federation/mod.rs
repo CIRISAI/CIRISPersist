@@ -109,6 +109,9 @@ pub mod read;
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
 pub mod envelope;
+/// v30.13.0 (CIRISPersist#644) — the byte-exactness witness for the V122
+/// signature-covered envelope columns.
+pub mod envelope_bytes;
 // v21.6.0 (CIRISPersist#519 item 2a-iii) — the signed `fresh_as_of`
 // freshness floor: SignedTouchClaim's storage + monotonic-max merge
 // (persist's half; the producer surface is edge/agent's, documented for

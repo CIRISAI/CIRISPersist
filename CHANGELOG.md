@@ -7,6 +7,67 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
+### Fixed — JSONB is not a byte-preserving container, and eleven signed envelopes were stored in one (#644)
+
+Eleven columns holding **producer-signed envelope bytes** were `JSONB` on
+Postgres and `TEXT` on SQLite. V105 had already written the rule down in this
+repo — *"TEXT (not JSONB) for signed_envelope: the envelope must round-trip
+BYTE-EXACT for re-publish, and JSONB does not preserve the producer's
+serialization"* — and V112 followed it; these eleven predate it.
+
+**Measured, not inferred.** A signed `KeyRecord` carrying awkward-but-legal JSON
+went through the real `put_public_key` → `lookup_public_key` path on Postgres 16:
+
+```text
+submitted: {…,"exp":1e+2,…,"neg":1.5e-3,…}   content_hash bf61b57c…
+reloaded:  {…,"exp":100,…,"neg":0.0015,…}    content_hash a6b819b3…
+```
+
+`jsonb` parses numbers into `numeric`, which discards exponent notation.
+`wire_index::content_hash_of` is `sha256(serde_json::to_vec(record))` with **no**
+canonicalization step — deliberately, so persist's hash equals CIRISEdge's by
+construction — so rewriting those bytes breaks fetch-by-content-hash: persist
+advertises `H`, a peer asks for `H`, and the reloaded record no longer hashes to
+`H`. `serde_json` is built here with `arbitrary_precision`, so the SQLite/TEXT
+leg round-trips the producer's token unchanged; only Postgres mangled it. Python's
+`json.dumps` emits `1e-05` and JavaScript's `JSON.stringify` emits `1.5e-6`, and
+the producers upstream of these envelopes are Python and JS.
+
+**The SIGNATURE was not affected** — now proven rather than assumed
+(`envelope_bytes::tests::jcs_number_normalization_versus_jsonb`): the JCS
+canonicalizer normalizes `1e+2` and `1.5e-3` to exactly what `jsonb` renders, so
+the producer-token envelope and its jsonb-shaped twin canonicalize to identical
+bytes. The damage was confined to the content-hash plane.
+
+- **V122 (postgres only)** — `ALTER COLUMN … TYPE TEXT` on
+  `federation_keys.registration_envelope`,
+  `federation_attestations.attestation_envelope`,
+  `federation_revocations.revocation_envelope`, `signed_envelope` on
+  `federation_organizations` / `federation_org_memberships` /
+  `federation_partner_records`, the `federation_identity_occurrences` trio
+  (`signed_envelope` / `signature` / `transport_binding`) and the
+  `federation_identity_occurrence_revocations` pair. **No SQLite twin: every one
+  of these has been TEXT there since it was created**, which is precisely why the
+  divergence ran undetected. Four of the eleven were outside the audit's list and
+  were found by reading the migrations.
+- **`attestation_envelope` had dependents.** V106's STORED generated `dimension`
+  column is dropped and re-added over `(attestation_envelope::jsonb)->>'dimension'`
+  (derived — the re-add recomputes every row); V106's `evidence_refs` GIN and
+  V107's composer expression index are re-created over the same immutable cast;
+  eleven query sites now cast explicitly.
+- **What a migration CANNOT recover.** Number tokens for pre-V122 rows are gone
+  — they were destroyed on the way IN, by the `jsonb` parse, and no copy exists.
+  A row whose envelope held `1e-5` reads back as `0.00001` forever; the remedy is
+  a re-publish from the producer. Spacing and key order are NOT a loss: every read
+  path parses the column into a `Value` first, so legacy rows yield the identical
+  `Value` — and hence the identical content hash — as rows written after V122.
+- **Witness** — `federation::envelope_bytes::test_support::exercise_envelope_byte_exactness`,
+  one shared body run by BOTH SQL suites (the bug was exactly a backend divergence,
+  so a one-backend witness proves nothing), plus an exhaustive per-backend schema
+  gate over all eleven columns. Mutation-tested: routing the envelope through
+  `$9::text::jsonb::text` in `put_public_key` — the old container's behaviour with
+  every Rust type unchanged — reds the witness with the exact `1e+2` → `100` drift.
+
 ### Fixed — BREAKING — the consent fold ordered on a column no signature covered (#598)
 
 `asserted_at` is a ROW COLUMN, stored **verbatim** from the caller by all three
