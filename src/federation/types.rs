@@ -160,7 +160,7 @@ pub mod identity_type {
         LENSCORE_DETECTOR,
         VERIFY,
     ];
-    /// v8.9.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
+    /// v9.0.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
     /// fabric/infrastructure role. A CIRISServer (or any pure
     /// infrastructure node) self-registers its federation signing key
     /// with this `identity_type`. **A `node`-role key MUST NOT carry
@@ -175,7 +175,7 @@ pub mod identity_type {
     /// this publishes the canonical token so producer + verifier agree
     /// byte-for-byte.
     pub const NODE: &str = "node";
-    /// v12.7.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
+    /// v13.0.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
     /// Only `federation_keys` rows whose `identity_type` **set** contains
     /// this token may emit the detector-only reserved prefixes
     /// `detection:correlated_action:*` and `detection:distributive:access:*`
@@ -189,7 +189,7 @@ pub mod identity_type {
     /// prefix (ungated here), so anything on `detection:*` is a primary
     /// detector emission and gate-able with no envelope field.
     pub const LENSCORE_DETECTOR: &str = "lenscore_detector";
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
     /// **canonical / founding bootstrap server**. This role marks a node
     /// as a member of the founding canonical set; it is **accord-CONFERRED,
     /// never self-claimed**.
@@ -491,7 +491,7 @@ pub mod roles {
     pub const INFRA_ATTEST: &str = "infra:attest";
 }
 
-/// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+/// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
 /// **Counter-RII `consent_role`** vocabulary: the role tokens carried on
 /// [`KeyRecord::consent_role`] that gate Counter-RII probe detection
 /// (RATCHET `FSD/COUNTER_RII_DETECTION.md`; Lean `ConsentGate.lean`, 8
@@ -513,7 +513,7 @@ pub mod roles {
 /// admission in `put_public_key`/`set_consent_role` keeps the backends
 /// symmetric). CC 3.4.7.2's "non-breaking against the shipped flat
 /// substrate" language is literal: OQ-1's flat overwrite-on-revoke IS the
-/// natural UPDATE semantics of that column. v12.7.0 puts the field **on
+/// natural UPDATE semantics of that column. v13.0.0 puts the field **on
 /// the wire** ([`KeyRecord`]`::consent_role`, `None` ⇔ the stored
 /// `'unregistered'` default) and exposes the resolver + mutation surface.
 pub mod consent_role {
@@ -702,7 +702,7 @@ pub mod owner_binding {
     /// The owner-binding `delegation_purpose` (producer-side marker; the
     /// substrate gate keys on [`DIMENSION`], this documents the pair).
     pub const PURPOSE: &str = "responsible_for";
-    /// v13.2.1 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
+    /// v13.3.0 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
     /// marker carried as `registration/attestation_envelope.delegation_purpose`.
     /// The substrate recognizes an owner-binding by EITHER this
     /// `delegation_purpose` value OR the internal [`DIMENSION`] (the
@@ -713,7 +713,7 @@ pub mod owner_binding {
     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
 /// **two-prefix delegation scope split** that makes "infrastructure
 /// must not have agency" wire-checkable.
 ///
@@ -1283,7 +1283,7 @@ pub struct KeyRecord {
     /// computations stay stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_evidence: Option<serde_json::Value>,
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
     /// **Counter-RII `consent_role`**. A single role token (see the
     /// [`consent_role`] vocabulary module — `temporary` / `partnered` /
     /// `anonymous` / `authorized_review` / `peer`) that gates the
@@ -1307,7 +1307,7 @@ pub struct KeyRecord {
     /// overwrite does NOT disturb the registration hash / CIRISRegistry
     /// vendored-shape parity, and `adopt_scrub_upgrade` deliberately does
     /// NOT touch it (an anchor-scrub upgrade must not clobber an assigned
-    /// role). Backward-compatible default: pre-v12.7.0 rows + rows with no
+    /// role). Backward-compatible default: pre-v13.0.0 rows + rows with no
     /// assigned role serialize without the field
     /// (`skip_serializing_if = "Option::is_none"`), so `persist_row_hash`
     /// stays byte-stable.
@@ -3653,7 +3653,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
     // stable across populate/depopulate cycles (read response carries
     // the field; write submission may or may not).
     //
-    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1): also drop
+    // v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1): also drop
     // `consent_role`. It is a MUTABLE, overwrite-on-revoke operational
     // role marker — NOT part of the signed registration content — so it
     // MUST NOT enter the registration hash. Excluding it keeps
@@ -3936,7 +3936,7 @@ mod tests {
         assert_eq!(round.additional_scrubs, two.additional_scrubs);
     }
 
-    /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
+    /// v13.0.0 (CIRISPersist#368) — the FFI wire contract for the
     /// witness-targets-subject age surface: `EmitAttestationInput` JSON
     /// (the exact `PyEngine::emit_attestation` / `emit_attestation_self`
     /// input) carries the optional `attested_key_id` naming the SUBJECT,

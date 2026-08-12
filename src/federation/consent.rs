@@ -1,4 +1,4 @@
-//! v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+//! v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
 //! **Counter-RII `consent_role`** resolver.
 //!
 //! `federation_keys.consent_role` is the role token (see the
@@ -12,7 +12,7 @@
 //! substrate (no longer a reserved slot). The COLUMN itself already
 //! shipped in V020 (v1.3.0, the CIRISAgent#760 §RC "consent role lock"
 //! that CC 3.4.7.2 ratifies — `TEXT NOT NULL DEFAULT 'unregistered'`);
-//! v12.7.0 puts it on the wire ([`KeyRecord::consent_role`](super::KeyRecord),
+//! v13.0.0 puts it on the wire ([`KeyRecord::consent_role`](super::KeyRecord),
 //! `None` ⇔ the stored `'unregistered'`) and exposes this resolver.
 //!
 //! **What persist owns (and does NOT own).** The three ratified
@@ -57,7 +57,7 @@ pub mod consent_dimension {
 
 use super::{Error, FederationDirectory};
 
-/// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
+/// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
 /// `consent_role` of `key_id`.
 ///
 /// Returns `Ok(Some(role))` when the key exists and carries an assigned

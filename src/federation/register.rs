@@ -229,7 +229,7 @@ impl std::fmt::Display for KeyRefusalReason {
     }
 }
 
-/// v12.7.0 (CIRISPersist#371) — outcome of an
+/// v13.0.0 (CIRISPersist#371) — outcome of an
 /// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record),
 /// the **upgrade-aware replicated Key-plane apply**. Serde tokens are
 /// snake_case strings (`"inserted"` / `"upgraded"` / `"unchanged"` /
@@ -305,7 +305,7 @@ pub(crate) enum ReplicatedKeyPlan {
     },
 }
 
-/// v12.7.0 (CIRISPersist#371) — decide what an **upgrade-aware replicated
+/// v13.0.0 (CIRISPersist#371) — decide what an **upgrade-aware replicated
 /// Key-plane apply** does with `record`, WITHOUT mutating anything. The
 /// shared (backend-agnostic) policy core behind both backends'
 /// `apply_replicated_key_record`, so postgres and sqlite cannot drift.
@@ -2007,7 +2007,7 @@ mod tests {
         run_register_matrix(&engine, &tag).await;
     }
 
-    // ─── v12.7.0 (CIRISPersist#371) — apply_replicated_key_record ───
+    // ─── v13.0.0 (CIRISPersist#371) — apply_replicated_key_record ───
     //
     // The upgrade-aware replicated Key-plane apply decision table, run
     // identically against sqlite and (when CIRIS_PERSIST_TEST_PG_URL is

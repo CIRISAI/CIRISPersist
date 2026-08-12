@@ -779,7 +779,7 @@ pub struct PyEngine {
     /// state — `set_multimedia_config_json` mutates the shared slot.
     #[cfg(feature = "cirisnode")]
     multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
-    /// v12.2.1 (CIRISPersist#320) — the directory-ops-proxy capsule, built
+    /// v12.3.0 (CIRISPersist#320) — the directory-ops-proxy capsule, built
     /// once and **cached on the engine**. Consumers (CIRISEdge#245) extract the
     /// raw `Directory { data, vtable }` pointer and rely on the capsule (and
     /// thus the boxed `Arc<dyn FederationDirectory>` it owns + frees on GC)
@@ -789,7 +789,7 @@ pub struct PyEngine {
     /// `data` → `Arc::clone` UAF → SIGSEGV. Caching keeps it alive for the
     /// engine's lifetime, making the consumer contract sound.
     directory_ops_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
-    /// v12.2.1 (CIRISPersist#320) — same UAF fix for the other capsules that
+    /// v12.3.0 (CIRISPersist#320) — same UAF fix for the other capsules that
     /// hand out a raw pointer with a GC-freeing destructor. The executor one is
     /// the load-bearing case for the transport deadlock: `spawn` on a GC'd
     /// executor lands the task on a torn-down runtime (task never runs → the
@@ -5916,7 +5916,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**. FFI mirror of
     /// [`Engine::apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record)
     /// — the apply the replication bridge routes `apply_key` to instead of
@@ -5976,7 +5976,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? Returns `True` iff its `federation_keys`
     /// row's `identity_type` set contains `canonical`. Because the substrate
     /// admission gate only ever admits `canonical` on an anchor-scrub-conferred
@@ -6067,7 +6067,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers** as a JSON array of `KeyRecord`s
     /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
     /// stable-sorted by `key_id`). Every returned row is anchor-scrub-conferred
@@ -6836,7 +6836,7 @@ impl PyEngine {
     /// did. Requires a PQC-configured local signer (the hybrid sign);
     /// raises if absent.
     ///
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
     /// names the row's **SUBJECT** (the cross-subject edge shape
     /// `delegates_to` uses). Omitted ⇒ self-attestation. This is the
     /// **witness-targets-subject** age surface: a `witness`-role engine
@@ -6903,7 +6903,7 @@ impl PyEngine {
     /// floor), computed internally. Surfaces a clear error if the engine
     /// has no composed hybrid signer (no local signer / no PQC half).
     ///
-    /// v12.7.0 (CIRISPersist#368) — despite the `_self` name (which refers
+    /// v13.0.0 (CIRISPersist#368) — despite the `_self` name (which refers
     /// to signing with the engine's OWN composed signer), the input's
     /// optional `attested_key_id` still names the row's SUBJECT, exactly as
     /// on [`PyEngine::emit_attestation`] — so a witness-role hardware-hybrid
@@ -11105,7 +11105,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+    /// v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
     /// no-moderator-no-federate admission VERDICT for one community: exactly
     /// the decision the federation-apply gate
     /// ([`admission::check_no_moderator_federate_apply`](crate::federation::admission::check_no_moderator_federate_apply),
@@ -11172,7 +11172,7 @@ impl PyEngine {
     /// not steward-bound). The most-reconstructed walk; exposing it stops
     /// consumers re-deriving the §5.6.8.10 graph.
     ///
-    /// v12.7.0 (CIRISPersist#367, CC 3.2) — this is also THE
+    /// v13.0.0 (CIRISPersist#367, CC 3.2) — this is also THE
     /// **steward-less-minor liveness predicate**: a PROVEN minor (witness
     /// `age_assurance:*:minor` about it, emittable cross-subject per #368)
     /// does NOT self-anchor, so it returns `true` only while a live
@@ -11314,7 +11314,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
     /// **Counter-RII `consent_role`** of `key_id`. Returns a JSON string: the
     /// assigned role token (`"temporary"` / `"partnered"` / `"anonymous"` /
     /// `"authorized_review"` / `"peer"` — the V020 vocabulary CC 3.4.7.2
@@ -11364,7 +11364,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
     /// Counter-RII `consent_role` of `key_id`. `consent_role=None` revokes it
     /// (resets the V020 column to its `'unregistered'` default). This is the
     /// OQ-1 non-recursive overwrite: a subsequent call overwrites the single
@@ -12889,7 +12889,7 @@ impl PyEngine {
         })
     }
 
-    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys). Unlike `delete_traces_for_agent` (per-signing-key),
     /// this erases the agent's ENTIRE corpus and tombstones the derived
@@ -28721,7 +28721,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // shape as the other admission-gate rejections.
         // v10.3.0 (#288, CC 3.4.5) — capacity:* self-emission is the same
         // admission-gate-rejection shape (caller-fault, ValueError).
-        // v12.7.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
+        // v13.0.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
         // exact sibling (subject-must-not-emit; caller-fault, ValueError).
         // (#590, CC 3.1.7 R2(b)) — emission on a governed family with no
         // registry row is a CONFORMANCE failure, and conformance failures are
@@ -28831,7 +28831,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // as-self nor a live scoped delegation) is caller-side
         // authorization failure; ValueError (4xx).
         crate::federation::Error::DelegatedScopeUnauthorized { .. } => PyValueError::new_err(kind),
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
@@ -28851,7 +28851,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // error and widening it per-step would fork the FFI vocabulary on a
         // path no Python caller drives today.
         crate::federation::Error::OwnershipReclaimRefused { .. } => PyValueError::new_err(kind),
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
         // (founding-server) role that is not accord-conferred (self-claimed /
         // non-anchor-scrubbed) is a caller-side authorization failure;
         // ValueError (4xx). The `canonical` role is accord-CONFERRED, never
@@ -30218,7 +30218,7 @@ mod tests {
 
     /// **CIRISPersist#571 — the quota reason survives the FFI boundary.**
     ///
-    /// v24.3.0 (#575) typed the refusal and v24.4.0 (#583) made the set a
+    /// v24.3.0 (#575) typed the refusal and v25.1.0 (#583) made the set a
     /// product with the byte budgets; this boundary then mapped the whole thing
     /// to `PyRuntimeError::new_err(kind)` and dropped it, so Python saw only
     /// `federation_rate_limited` and could not tell a row-budget refusal from a

@@ -383,7 +383,7 @@ impl Default for DimensionAdmissionPolicy {
 ///   doesn't reject single-source emissions; per §7.3, consumers
 ///   mark them `confidence ≤ 0.5` until the second co-owner attests.
 /// - `detection:correlated_action:*` / `detection:distributive:access:*`
-///   (CC 3.4.8) ARE gated here (v12.7.0, CIRISPersist#366): they are
+///   (CC 3.4.8) ARE gated here (v13.0.0, CIRISPersist#366): they are
 ///   LensCore-only emission — emitter rule `lenscore_detector ∈
 ///   attesting_key.identity_type`. Per CC 3.4.8 a cross-attestation by a
 ///   non-LensCore peer MUST use the DISTINCT `truth_grounding:detection:*`
@@ -504,7 +504,7 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
                 crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE.to_owned(),
             ),
         },
-        // v12.7.0 (CIRISPersist#366, CC 3.4.8) — the detector-only
+        // v13.0.0 (CIRISPersist#366, CC 3.4.8) — the detector-only
         // prefixes. `detection:correlated_action:*` and
         // `detection:distributive:access:*` are LensCore-only emission:
         // emitter rule `lenscore_detector ∈ attesting_key.identity_type`.
@@ -1408,7 +1408,7 @@ pub fn is_custody_claim_envelope(envelope: &serde_json::Value) -> bool {
             .is_some()
 }
 
-/// v13.2.1 (CIRISPersist#378) — is this `delegates_to` envelope an
+/// v13.3.0 (CIRISPersist#378) — is this `delegates_to` envelope an
 /// **owner-binding** (CC 3.2 single-owner sub-relation)? True iff EITHER
 /// the internal versioned [`owner_binding::DIMENSION`](super::types::owner_binding::DIMENSION)
 /// is set (the `steward_bind`/`grant_delegation(Some(purpose))` path) OR the
@@ -4136,7 +4136,7 @@ pub fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::H
     }
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the CC 1.13.5
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the CC 1.13.5
 /// verifier: is `scopes` a delegation scope set a pure `node`-role
 /// delegate is allowed to carry?
 ///
@@ -5512,7 +5512,7 @@ async fn live_delegation_granters(
         }
         // Only OWNER-BINDING edges for the ownership projection — the internal
         // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding`
-        // marker (v13.2.1 #378). This is what keeps ownership single-valued
+        // marker (v13.3.0 #378). This is what keeps ownership single-valued
         // WITHOUT constraining act-on-behalf / hierarchy delegations (multi-
         // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
         // exactly so the gate and the `owner_of` resolver agree on what an
@@ -5939,7 +5939,7 @@ pub async fn check_single_node_owner_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
-    // v13.2.1 (#378): recognize the owner-binding by EITHER the internal
+    // v13.3.0 (#378): recognize the owner-binding by EITHER the internal
     // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding` marker —
     // the raw `emit_attestation_self` path carries only the latter, and gating
     // on the dimension alone let it bypass the single-owner gate.
@@ -7896,7 +7896,7 @@ pub async fn check_no_moderator_federate_admission_by_id(
 /// apply step keyed on C"; it is refused if `C` has no live `moderate`-holder
 /// ([`check_no_moderator_federate_admission_by_id`]).
 ///
-/// # Keying — what "keyed on C" means for an attestation row (v12.7.0, #369)
+/// # Keying — what "keyed on C" means for an attestation row (v13.0.0, #369)
 ///
 /// §11.11 requires the re-check on **every** federation apply step keyed on
 /// `C`, not only rows that ride one envelope convention. A federation-tier
@@ -7975,7 +7975,7 @@ pub async fn check_no_moderator_federate_apply(
     Ok(())
 }
 
-/// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+/// v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
 /// federate-admission **verdict** over one community id: exactly the decision
 /// [`check_no_moderator_federate_apply`] takes for a federation apply step
 /// keyed on `community_id`, returned as data instead of an error so a
@@ -8612,7 +8612,7 @@ pub async fn check_delegated_duty_scores_admission(
     .await
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the
 /// reject-agency-on-node-key gate: the `put_attestation` entry point that
 /// makes "infrastructure must not have agency" cryptographically enforced.
 ///
@@ -9133,7 +9133,7 @@ pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(),
 /// - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id ==
 ///   attested_key_id`) — CC 3.4.5's "Critical enforcement" anti-Goodhart rule
 ///   (an `identity_type`-independent attester==attested check).
-/// - `age_assurance:*` → MUST NOT be self-emitted either (v12.7.0,
+/// - `age_assurance:*` → MUST NOT be self-emitted either (v13.0.0,
 ///   CIRISPersist#368) — CC 3.4.11 "A subject MUST NOT emit on
 ///   `age_assurance:`". The witness-RESERVED half rides the rule table; this
 ///   attester==attested half stops a `witness`-typed key from graduating
@@ -9177,7 +9177,7 @@ pub async fn check_reserved_prefix_admission(
         });
     }
 
-    // v12.7.0 (CIRISPersist#368) — CC 3.4.11: "A subject MUST NOT emit on
+    // v13.0.0 (CIRISPersist#368) — CC 3.4.11: "A subject MUST NOT emit on
     // `age_assurance:`". The witness rung is an attestation ABOUT a subject
     // (`attested_key_id` = the subject, the same cross-subject edge shape
     // `delegates_to` uses); the SUBJECT-must-not-emit half is an
@@ -12049,7 +12049,7 @@ where
     let _ = admin_task.await;
 }
 
-/// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the accord-conferred `canonical`
+/// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the accord-conferred `canonical`
 /// admission decision table, run identically against SQLite and (when
 /// `CIRIS_PERSIST_TEST_PG_URL` is set) Postgres. Exercises the PRODUCTION gate
 /// (`check_canonical_role_admission`) end-to-end through `put_public_key` +

@@ -291,7 +291,7 @@ struct State {
     /// pressure/decay evict (by `retention_priority DESC`). Parity with
     /// the postgres/sqlite `content_symbols` table (V084).
     fountain_symbols: HashMap<String, HashMap<u32, crate::fountain::FountainSymbolV1>>,
-    /// v12.7.0 (§Q / CIRISPersist#370) — installed `StorageBudgetV1` pin
+    /// v13.0.0 (§Q / CIRISPersist#370) — installed `StorageBudgetV1` pin
     /// state, keyed by owner `node_id`. Parity with the postgres/sqlite
     /// `storage_budget_installed` table (V093). Replaced only by a
     /// strictly-higher revision (§Q B3 anti-rollback).
@@ -1511,7 +1511,7 @@ impl Backend for MemoryBackend {
         Ok(out)
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
 
     async fn put_installed_storage_budget(
         &self,
@@ -1867,7 +1867,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )?;
         }
 
-        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
         // admission gate + 'unregistered'⇔None normalization as the SQL
         // backends (a stored-form 'unregistered' submitted on the wire
         // reads back as None everywhere).
@@ -1877,7 +1877,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .as_deref()
             .and_then(crate::federation::types::consent_role::wire_from_stored)
             .map(str::to_owned);
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — accord-conferred `canonical`
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — accord-conferred `canonical`
         // gate. Runs BEFORE the state lock (it calls lookup_public_key on self,
         // which acquires the lock itself) and BEFORE persist — a self-signed /
         // non-anchor-scrubbed `canonical` claim leaves no trace. Backend-
@@ -2026,7 +2026,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
     /// consent_role. `None` revokes (back to the unset/'unregistered'
     /// default). No chain; a subsequent call overwrites. `consent_role`
     /// is excluded from `persist_row_hash`, so mutating it does not
@@ -2466,7 +2466,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // scoped delegates_to chain. Absence ⇒ REJECT.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate. A no-op for non-`delegates_to` rows; for a
         // `delegates_to` whose recipient (`attested_key_id`) resolves to a
         // node-ONLY identity it REJECTS any scope set that is not
@@ -3439,7 +3439,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v17.0.0 (#443) — route-table PK (occ, kind) + the (epoch,
         // asserted_at) monotonic guard: a stale assertion is a silent no-op.
         //
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
         // unsigned writer never demotes a signed row. The signature
         // container is NEVER dropped by this path; a content-CHANGING
         // unsigned write against a signed row is a silent no-op (the
@@ -3497,7 +3497,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let d = &signed.transport_destination;
         let mut state = self.state.lock().expect("memory backend lock");
         let key = (d.occurrence_key_id.clone(), d.transport_kind.clone());
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
         // monotonic-clock refusal applies only against a stored row that is
         // itself SIGNED; a signed write always reclaims an unsigned row
         // (occurrence-projection / announce state) regardless of clocks.
@@ -8119,7 +8119,7 @@ mod tests {
         assert_eq!(got.to_bytes(), vkey.to_bytes());
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trip,
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trip,
     /// OQ-1 overwrite-on-revoke via set_consent_role, and the
     /// consent_role_of resolver, on the memory backend.
     #[tokio::test]
@@ -9595,7 +9595,7 @@ mod tests {
         .await;
     }
 
-    /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
+    /// v25.1.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
     /// the real envelope, on this backend, through the real host API. Shares
     /// the assertion body with the sqlite and postgres twins — a dimension
     /// wired on two backends out of three is the #541 recurrence class.
@@ -10188,7 +10188,7 @@ mod tests {
         assert_eq!(remaining[0].trace_id, "trace-k2-t1");
     }
 
-    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure deletes the
+    /// v7.0.0 (CIRISPersist#222) — full Art. 17 erasure deletes the
     /// agent's traces across ALL signing keys (contrast the per-key
     /// `delete_traces_for_agent`), cascades LLM calls by trace_id,
     /// emits a `hard_case:trace_erasure` audit row, and is idempotent.
@@ -15509,7 +15509,7 @@ mod tests {
         );
     }
 
-    /// v13.2.1 (CIRISPersist#378) — the owner-binding built with the **CC
+    /// v13.3.0 (CIRISPersist#378) — the owner-binding built with the **CC
     /// 2.4.1.2 canonical marker only** (`delegation_purpose: "owner_binding"`,
     /// **no `dimension`**) — the shape a raw `emit_attestation_self` `delegates_to`
     /// carries, and exactly what CIRISConformance `test_551` probes. Before the
@@ -15532,7 +15532,7 @@ mod tests {
         att
     }
 
-    /// v13.2.1 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
+    /// v13.3.0 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
     /// on the **CC-marker raw-emit path** (`delegation_purpose: "owner_binding"`,
     /// no dimension), not only persist's internal-dimension `steward_bind` path.
     /// A second distinct owner via the raw path is rejected; `owner_of` resolves
@@ -17031,7 +17031,7 @@ mod tests {
             .expect("a node target is governed by the node-agency gate, not the user-target gate");
     }
 
-    // ── v12.7.0 (CIRISPersist#368, CC 3.4.11 / CC 3.4.13) ────────────────
+    // ── v13.0.0 (CIRISPersist#368, CC 3.4.11 / CC 3.4.13) ────────────────
     //    Witness-targets-subject age_assurance admission decision table.
 
     /// CC 3.4.11 witness-targets-subject decision table, through the REAL
@@ -17137,7 +17137,7 @@ mod tests {
 
     /// #368 read-side defense-in-depth: a self-emitted `age_assurance:*` row
     /// that PRE-DATES the admission gate (or arrived via replication before
-    /// v12.7.0) must not graduate its own emitter either. Injected directly
+    /// v13.0.0) must not graduate its own emitter either. Injected directly
     /// into backend state (bypassing `put_attestation`) to simulate the
     /// legacy row; `age_band` / `age_band_fine` skip it.
     #[tokio::test]

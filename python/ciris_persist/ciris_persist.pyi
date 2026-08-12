@@ -562,7 +562,7 @@ class Engine:
         self,
         signed_key_record_json: str,
     ) -> str:
-        """v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated
+        """v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated
         Key-plane apply**. FFI mirror of the Rust
         `Engine.apply_replicated_key_record` — the apply the replication
         bridge routes `apply_key` to instead of raw `put_public_key`
@@ -615,7 +615,7 @@ class Engine:
         """(derived) deontic — #356 (CC 6.1.5.2 §Q / CIRISVerify#170) — build a signed StorageBudgetV1 wire JSON from a payload JSON, bound-hybrid signing its CC 6.1.3 preimage w..."""
 
     def check_no_moderator_federate_json(self, community_id: str) -> str:
-        """v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+        """v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
         **no-moderator-no-federate admission verdict** for one community: exactly
         the decision the federation-apply gate makes inside every backend's
         ``put_attestation``.
@@ -1319,7 +1319,7 @@ class Engine:
         """(derived) deontic — #302 (H2) — set the active CONSTITUTIONAL halt for a family."""
 
     def set_consent_role(self, key_id: str, consent_role: str | None = None) -> None:
-        """(derived) deontic — v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or overwrite the Counter-RII consent_role of key_id. consent_role=None revokes it (resets the..."""
+        """(derived) deontic — v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or overwrite the Counter-RII consent_role of key_id. consent_role=None revokes it (resets the..."""
 
     def set_multimedia_config_json(self, config_json: str | None) -> None:
         """(derived) deontic — v3.6.0 (CIRISPersist#134) — install / clear the media-sharing operator config ([MultimediaConfig](crate::cirisnode::MultimediaConfig)). Wire shape:... [build-conditional: #[cfg(feature = "cirisnode")]]"""
@@ -1578,7 +1578,7 @@ class Engine:
         """(derived) testimonial — v0.3.6 (CIRISPersist#15, CIRISLens#8 ASK 1) — GDPR Article 17 / DSAR primitive. Per-key scope: deletion is scoped to (agent_id_hash, signing_key_id)."""
 
     def delete_traces_for_agent_id_hash(self, agent_id_hash: str) -> dict[str, Any]:
-        """(derived) testimonial — v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR full erasure of an agent's trace corpus, keyed on agent_id_hash alone (all signing keys). Unlike de..."""
+        """(derived) testimonial — v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR full erasure of an agent's trace corpus, keyed on agent_id_hash alone (all signing keys). Unlike de..."""
 
     def descend_aggregated_sources(self, aggregate_content_id: str, sources_json: str, consent: str, under_capacity_pressure: bool, target_tier: str | None = None) -> int:
         """(derived) testimonial — v8.4.0 (CEG 1.0-RC14 §19.7 / CIRISPersist#230) — descent orchestration for a completed fold, JSON-over-FFI, gated on §19.7.1.1 descent integrity an..."""
@@ -1999,7 +1999,7 @@ class Engine:
         """(derived) nomological — v20.0.0 (CIRISPersist#495) — the pinned envelope-vocabulary manifest and its sha256, as {"manifest_json", "sha256"}. A cross-repo harness asserts e..."""
 
     def is_canonical(self, key_id: str) -> bool:
-        """(derived) nomological — v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is key_id a canonical / founding bootstrap server? Returns True iff its federation_keys row's identity_typ..."""
+        """(derived) nomological — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is key_id a canonical / founding bootstrap server? Returns True iff its federation_keys row's identity_typ..."""
 
     def maintenance_tighten_vocabulary(self, target_json: str, dry_run: bool = False) -> str:
         """(derived) nomological — v25.1.0 (CIRISPersist#582) — Run one vocabulary tightening: retire every federation-tier attestation carrying a non-conformant wire value at a name..."""
@@ -2407,7 +2407,7 @@ class Engine:
         """(derived) empirical — #249 Cut G1 (§1) — look up a group uniformly. Returns the [crate::federation::cohort::GroupRef] JSON, or None if unknown."""
 
     def consent_role_json(self, key_id: str) -> str:
-        """(derived) empirical — v12.7.0 (CIRISPersist#365, CC 3.4.7.2 consent-counter) — resolve the Counter-RII consent_role of key_id. Returns a JSON string: the assigned role t..."""
+        """(derived) empirical — v13.0.0 (CIRISPersist#365, CC 3.4.7.2 consent-counter) — resolve the Counter-RII consent_role of key_id. Returns a JSON string: the assigned role t..."""
 
     def continuity_get_latest(self, agent_id: str) -> str | None:
         """v1.5.17 — Get the most recent shutdown for an agent —
@@ -2722,7 +2722,7 @@ class Engine:
         """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
     def list_canonical_servers(self) -> str:
-        """(derived) empirical — v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""
+        """(derived) empirical — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""
 
     def list_canonical_withdrawals(self) -> str:
         """(derived) empirical — v13.1.0 (CIRISPersist#377) — the canonical-role withdrawal tombstones (V095) as a JSON array of CanonicalWithdrawals (stable-sorted by key_id) — th..."""
