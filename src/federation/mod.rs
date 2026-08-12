@@ -5422,6 +5422,44 @@ pub enum Error {
     #[error("operational-data authority not established: {0}")]
     OperationalAuthority(String),
 
+    /// v30.13.0 (CIRISPersist#642, CEG 1.0-RC2 §5.6.8.13) — an
+    /// `organization` / `org_membership` / `partner_record` row carried a
+    /// typed column that its signature does not cover and that disagrees
+    /// with the signed envelope it claims to project.
+    ///
+    /// The three operational planes are **producer envelope + typed
+    /// projection**: the signature (or the M-of-N steward quorum) covers
+    /// `signed_envelope` and nothing else, while `resolve_lww` /
+    /// `resolve_monotonic_quorum` / the read surface all decide on the
+    /// COLUMNS beside it. Before this gate those columns — including the
+    /// `withdrawn_at` tombstone, `status`, `role`, the `asserted_at` LWW
+    /// key and the `partner_record` `revision` anti-rollback counter —
+    /// were authored by whoever wrote the row rather than by whoever
+    /// signed it, so replaying a still-validly-signed envelope with edited
+    /// columns needed no forgery at all.
+    ///
+    /// Fail-closed, and no legacy regime: an unbound row is REFUSED, not
+    /// downgraded. See
+    /// [`operational::check_organization_binding`] /
+    /// [`operational::check_org_membership_binding`] /
+    /// [`operational::check_partner_record_binding`].
+    #[error(
+        "{plane} row {attestation_id:?}: typed column `{field}` is not bound to the \
+         signed envelope — {detail}. The signature covers `signed_envelope` only, so an \
+         unbound column is authored by whoever wrote the row, not by whoever signed it \
+         (CIRISPersist#642)"
+    )]
+    OperationalEnvelopeUnbound {
+        /// `organization` | `org_membership` | `partner_record`.
+        plane: &'static str,
+        /// The rejected row's `attestation_id`.
+        attestation_id: String,
+        /// The typed column that diverged.
+        field: &'static str,
+        /// How it diverged (column value vs signed value, or absence).
+        detail: String,
+    },
+
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, F-AV-ROLLBACK) — a
     /// `partner_record` write whose `revision` does not strictly exceed
     /// the most-recent admitted `revision` for the same `license_id`. The
@@ -6122,6 +6160,7 @@ impl Error {
             Error::ClockSkewViolation { .. } => "federation_clock_skew_violation",
             Error::PaymentProcessorIdentifier { .. } => "federation_payment_processor_identifier",
             Error::OperationalAuthority(_) => "federation_operational_authority",
+            Error::OperationalEnvelopeUnbound { .. } => "federation_operational_envelope_unbound",
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",

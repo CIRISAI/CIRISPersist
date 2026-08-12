@@ -28904,6 +28904,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::ClockSkewViolation { .. }
         | crate::federation::Error::PaymentProcessorIdentifier { .. }
         | crate::federation::Error::OperationalAuthority(_)
+        // v30.13.0 (CIRISPersist#642) — a typed column diverging from the
+        // envelope its signature covers is caller-fault too.
+        | crate::federation::Error::OperationalEnvelopeUnbound { .. }
         | crate::federation::Error::PartnerRecordRollback { .. }
         | crate::federation::Error::SetSemanticsUnsorted(_) => PyValueError::new_err(kind),
         // v8.2.0 (CEG 1.0-RC11 §19.1) — a WholenessWitness admission

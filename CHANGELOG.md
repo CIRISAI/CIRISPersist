@@ -7,6 +7,113 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
+### Fixed — BREAKING — the operational planes stored signatures nobody verified, beside columns nobody bound (#642)
+
+`Organization` and `OrgMembership` carry `ed25519_signature_base64` /
+`mldsa65_signature_base64`. **Nothing in the crate ever verified them.** The
+columns were written (`postgres.rs:8130`/`:8192`, `sqlite.rs:7317`/`:7387`,
+`memory.rs:5159`/`:5205`), read back (`postgres.rs:15145`/`:15167`), re-served
+on the anti-entropy wire — and never once checked. The only code that ever fed
+those fields to a verifier was `resolve_role_authority`, which checks the
+signatures of **already-stored grants** when deciding whether some *other*
+actor may act. That is a different question from the one nobody asked: *did
+the claimed signer author THIS row?*
+
+So the forgery needed no key material. `check_role_authority` opens with an
+unconditional bootstrap anchor —
+
+```rust
+if root_stewards.iter().any(|s| s == actor_key_id) { return Ok(()); }
+```
+
+— and `actor_key_id` is `row.attesting_key_id`, a caller-supplied string. Name
+any registered steward, put arbitrary bytes in the signature column, and the
+row lands on all three backends.
+
+**Verifying the signature is necessary and NOT sufficient.** The signature
+covers `signed_envelope` and nothing else, while every decision the substrate
+makes reads a TYPED COLUMN beside it: `resolve_lww` orders on `asserted_at`,
+`is_withdrawn` reads `withdrawn_at` and `status`, `list_org_memberships_since`
+returns `role`, and `partner_wins` orders on `revision` → `status` →
+`asserted_at`. All unbound. A still-validly-signed envelope with edited columns
+was a complete attack requiring no forgery at all.
+
+`PartnerRecord` was the partially-clean plane — it really does verify an M-of-N
+steward quorum — but the quorum verifies `JCS(signed_envelope)` while the
+anti-rollback gate read `signed.partner_record.revision`, the column. That made
+a **permanent denial-of-service reachable with no key**: replay a legitimately
+quorum-signed record with `revision = u64::MAX`. The quorum still verifies, the
+monotonic gate accepts (MAX exceeds everything), and every legitimate revision
+afterwards is refused as a rollback **forever** — the counter only goes up.
+Confirmed by direct probe, not inference: with the new binding disabled the
+inflated write returns `Ok(())` and the next honest write dies with
+`submitted revision 2 does not exceed existing 18446744073709551615`.
+
+**These planes are "producer envelope + typed projection", not
+"row-is-the-envelope".** `Family`/`Community` synthesize their signed bytes from
+the struct (`Family::signing_envelope`), so divergence there is unrepresentable.
+That shape is unavailable here for three independent reasons: the envelope's
+meaning is fixed by an EXTERNAL contract (`MembershipGrant` parses
+`user_id`/`org_id`/`role`/`status`/`attesting_key_id` out of it);
+`PartnerRecord`'s bytes were signed by M stewards before persist ever saw the
+row; and RC2 §5.6.8.13 makes the typed row a deliberately *lossy* projection of
+a larger producer record. So the fix is the other shape — an explicit binding
+gate.
+
+**BREAK NOW, no grandfathering** (standing operator decision — before the first
+agent release). Fixtures that broke ARE the break.
+
+- **`verify_organization_admission` / `verify_org_membership_admission`**
+  (`operational.rs`) — hybrid-**Strict** verify the row's own signature over
+  `JCS(signed_envelope)` against `attesting_key_id`'s **REGISTERED** pubkeys,
+  resolved from persist's own directory. Same contract as
+  `verify_family_admission` / `verify_revocation_admission`; PQC-mandatory, so a
+  classical-only signature is refused. Wired at all six org-plane put doors,
+  before any DB work and before any lock the directory needs.
+- **`check_organization_binding` / `check_org_membership_binding` /
+  `check_partner_record_binding`** — every security-relevant typed column must
+  equal its signed counterpart, with optional columns bound in BOTH directions
+  (absent ⇔ `None`), which is what closes the `withdrawn_at` tombstone: a
+  withdrawal is an AUTHORED act and now requires a freshly signed envelope
+  saying so. New typed refusal `Error::OperationalEnvelopeUnbound`
+  (`federation_operational_envelope_unbound`).
+- **`revision` is bound INTO THE SIGNED BYTES**, not derived from the quorum.
+  The quorum is not a source of ordering — `verify_partner_record_quorum`
+  returns *how many* stewards signed, which says nothing about which of two
+  validly-signed records is later, and M stewards may sign any number of records
+  for one `license_id`. The number that decides precedence must be one the
+  stewards attested to. Binding lives inside `check_partner_set_and_quorum`, so
+  no backend can be added without it.
+- Bound instants are REFUSED below microsecond resolution, reusing #598's
+  `CONSENT_INSTANT_RESOLUTION_NANOS` (no second constant): postgres
+  `TIMESTAMPTZ` cannot hold finer, so a nanosecond row would admit here, store
+  truncated, and then fail its own binding when a replicating peer read it back
+  and re-submitted it.
+
+Witnesses `#642-a/b/c` live in `operational::test_support` and run on **all
+three backends** — the gate was missing from the SHARED admission code, so a
+single-backend witness would have repeated the exact test shape that hid it.
+The `-c` witness asserts the lockout is GONE, not merely that the attack write
+fails: a legitimate revision 2 must still admit afterwards.
+
+Mutation-tested, all four killed: `check_organization_binding` →
+always-accept reds the tombstone witness; `check_org_membership_binding` reds
+its `role`-escalation leg; `check_partner_record_binding` reds the revision
+witness; skipping the signature verify reds the bogus-signature witness.
+
+**Known adjacent hole, NOT fixed here** (needs a policy decision, not a gate):
+`SignedPartnerRecord::threshold` is caller-supplied and unvalidated —
+`check_partner_set_and_quorum` passes it straight to `verify_founder_quorum`
+rather than `verify_quorum_policy`, which is the variant enforcing
+strict-majority `2M > N` against the registered roster. With a 5-steward
+directory a submitter may declare `threshold: 1`. Binding `revision` closes the
+**unauthenticated** lockout; a single rogue steward could still mint a
+`u64::MAX` revision until the threshold floor is decided.
+
+BREAKING: `Error` gains `OperationalEnvelopeUnbound`; the three operational
+`test_support` builders now stamp `asserted_at` (and the partner builder
+`issued_at`/`expires_at`) into the envelope before signing.
+
 ### Fixed — BREAKING — the consent fold ordered on a column no signature covered (#598)
 
 `asserted_at` is a ROW COLUMN, stored **verbatim** from the caller by all three

@@ -5164,6 +5164,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.organization;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v30.13.0 (#642) — bind the projection + hybrid-Strict verify the
+        // row's OWN signature. Before the state lock: the verify resolves
+        // the attester's registered pubkeys, which locks the directory.
+        operational::verify_organization_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — resolve the steward roster from OUR directory
         // BEFORE the state lock (the resolve locks the directory itself).
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
@@ -5210,6 +5214,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v30.13.0 (#642) — bind the projection + hybrid-Strict verify the
+        // row's OWN signature, before the lock (see `put_organization`).
+        operational::verify_org_membership_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let mut state = self.state.lock().expect("memory backend lock");
@@ -7763,6 +7770,39 @@ mod accord_tests {
         let backend = MemoryBackend::new();
         crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
             &backend, "mem598a",
+        )
+        .await;
+    }
+
+    /// #642-a — an org row whose own signature does not verify is REFUSED,
+    /// on the memory backend.
+    #[tokio::test]
+    async fn org_bogus_signature_refused_memory_642() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
+            &backend, "mem642a",
+        )
+        .await;
+    }
+
+    /// #642-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// that the signature does not cover is REFUSED, on the memory backend.
+    #[tokio::test]
+    async fn unsigned_tombstone_refused_memory_642() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
+            &backend, "mem642b",
+        )
+        .await;
+    }
+
+    /// #642-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// legitimate later revision still admits, on the memory backend.
+    #[tokio::test]
+    async fn revision_inflation_refused_memory_642() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_revision_inflation_refused(
+            &backend, "mem642c",
         )
         .await;
     }
@@ -11385,11 +11425,23 @@ mod tests {
         let steward = op::Identity::new("e9-steward");
         let admin = op::Identity::new("e9-admin");
 
-        // Grant BEFORE the steward is registered as a steward key → the
-        // resolved roster is empty → NoQualifyingGrant, refused.
+        // v30.13.0 (CIRISPersist#642) — the outsider is now REGISTERED (as a
+        // plain agent), which sharpens this test rather than weakening it.
+        // Before #642 the first leg refused a key the directory had never
+        // heard of, so "not a steward" and "not registered at all" were
+        // indistinguishable — and the row's own signature was never checked,
+        // so the leg could not have told them apart. Now the outsider's
+        // signature VERIFIES and the ONLY thing it lacks is steward status,
+        // which is precisely the E9 property under test.
+        let outsider = op::Identity::new("e9-outsider");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&backend, "e9-outsider")
+            .await;
+
+        // Grant rooted at a registered NON-steward → the resolved roster
+        // does not contain it → NoQualifyingGrant, refused.
         let grant = op::signed_membership(
             "e9-m1",
-            &steward,
+            &outsider,
             "e9-admin",
             "e9-org",
             "org_admin",
@@ -11399,7 +11451,7 @@ mod tests {
         let err = backend
             .put_org_membership(grant)
             .await
-            .expect_err("(E9) grant rooted at a non-registered steward is refused");
+            .expect_err("(E9) grant rooted at a non-steward is refused");
         assert!(
             err.kind().contains("operational_authority"),
             "kind {}",

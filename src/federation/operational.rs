@@ -29,10 +29,28 @@
 //!   tolerant: it MUST NOT require supersedes-chain completeness
 //!   (supersedes is audit-only).
 //!
-//! # The four admission checks (RC2 §5.6.8.13 / §10.1.6)
+//! # The admission checks (RC2 §5.6.8.13 / §10.1.6)
 //!
 //! Every `put_*` runs, in order:
 //!
+//! 0. **Authorship + envelope binding** (v30.13.0, CIRISPersist#642) —
+//!    [`verify_organization_admission`] /
+//!    [`verify_org_membership_admission`] hybrid-Strict verify the row's
+//!    OWN signature against `attesting_key_id`'s REGISTERED pubkeys, and
+//!    [`check_organization_binding`] /
+//!    [`check_org_membership_binding`] /
+//!    [`check_partner_record_binding`] refuse any typed column that
+//!    disagrees with the envelope the signature (or the M-of-N steward
+//!    quorum) actually covers.
+//!
+//!    These planes are **producer envelope + typed projection**: unlike
+//!    [`super::types::Family`], whose `signing_envelope()` synthesizes the
+//!    signed bytes from the struct so divergence cannot be represented,
+//!    the producer here hands persist an envelope AND a projection of it.
+//!    Everything below decides on the projection — so without check 0 the
+//!    `withdrawn_at` tombstone, `status`, `role`, the `asserted_at` LWW
+//!    key and the `partner_record` `revision` counter were authored by
+//!    whoever wrote the row rather than by whoever signed it.
 //! 1. **Skew-bound** ([`check_skew_bound`]) — `asserted_at <= now +
 //!    §0.7 tolerance` (±5 min) or [`Error::ClockSkewViolation`]. The LWW
 //!    front-running fix: unbounded LWW on `org_membership.role:OrgAdmin`
@@ -502,6 +520,13 @@ pub fn check_partner_set_and_quorum(
     signed: &SignedPartnerRecord,
     steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
 ) -> Result<(), Error> {
+    // v30.13.0 (CIRISPersist#642) — bind the typed projection FIRST. The
+    // quorum below proves M stewards signed `signed_envelope`; it proves
+    // nothing about the columns beside it, and `revision` — the anti-
+    // rollback counter and the first key of the `monotonic_quorum`
+    // comparator — is one of those columns. Binding lives here rather than
+    // at the three put doors so no backend can be added without it.
+    check_partner_record_binding(&signed.partner_record)?;
     ciris_verify_core::operational_admit::check_set_semantics_sorted(
         &signed.partner_record.signed_envelope,
         PARTNER_RECORD_SET_FIELDS,
@@ -539,6 +564,456 @@ pub fn check_partner_revision_monotonic(
         }
     }
     Ok(())
+}
+
+// ── Admission check 0: authorship + envelope binding (#642) ─────────
+//
+// v30.13.0 (CIRISPersist#642). Two holes, one root cause: the signature
+// covers `signed_envelope` and NOTHING ELSE, but every decision the
+// substrate makes reads a TYPED COLUMN beside it.
+//
+// (a) AUTHORSHIP. `Organization` / `OrgMembership` carried
+//     `ed25519_signature_base64` / `mldsa65_signature_base64` that no code
+//     path in this crate ever verified. The row's own signature was
+//     STORED, never checked. `check_role_authority` verifies the
+//     signatures of the *already-stored grants* it walks — that is a
+//     different question (may this actor act?) from the one nobody asked
+//     (did the claimed signer author THIS row?). And its steward
+//     bootstrap anchor returns `Ok(())` on a bare `attesting_key_id`
+//     string match, so naming a registered steward was sufficient to
+//     write any org row on any of the three backends.
+//
+// (b) BINDING. Even a genuinely signed envelope does not defend a typed
+//     column that is not derived from it. The producer hands persist an
+//     envelope AND a projection; the projection is what
+//     `resolve_lww` / `resolve_monotonic_quorum` / the read surface use.
+//     So `withdrawn_at` (the tombstone), `status`, `role`, `asserted_at`
+//     (the LWW key) and `revision` (the anti-rollback counter) were all
+//     authored by whoever wrote the row, not by whoever signed it.
+//
+// These planes are **producer envelope + typed projection**, NOT
+// row-is-the-envelope. `Family`/`Community` synthesize their signed bytes
+// from the struct (`Family::signing_envelope`), so divergence there is
+// unrepresentable. That shape is unavailable here for three independent
+// reasons: the envelope's meaning is fixed by an EXTERNAL contract
+// (`ciris_verify_core::operational_admit::MembershipGrant` parses
+// `user_id`/`org_id`/`role`/`status`/`attesting_key_id` out of it);
+// `PartnerRecord`'s bytes were signed by M stewards before persist ever
+// saw the row, so persist cannot re-synthesize them; and RC2 §5.6.8.13
+// makes the typed row a deliberately *lossy* projection of a larger
+// producer record (PII is dropped), so struct and envelope are not the
+// same object by design. The correct shape for that architecture is the
+// other one: verify the producer's signature, then REFUSE any row whose
+// projection disagrees with the bytes that were signed.
+//
+// Shaped on `check_consent_state_instant_binding` (#598), which refuses
+// exactly this divergence one plane over, in this same release.
+
+/// v30.13.0 (CIRISPersist#642) — build the typed refusal for a projection
+/// column that disagrees with the signed envelope it claims to project.
+fn unbound(plane: &'static str, id: &str, field: &'static str, detail: String) -> Error {
+    Error::OperationalEnvelopeUnbound {
+        plane,
+        attestation_id: id.to_string(),
+        field,
+        detail,
+    }
+}
+
+/// Bind a REQUIRED string column to its signed counterpart.
+fn bind_str(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: &str,
+) -> Result<(), Error> {
+    match env.get(field) {
+        Some(Value::String(signed)) if signed == actual => Ok(()),
+        Some(Value::String(signed)) => Err(unbound(
+            plane,
+            id,
+            field,
+            format!("column is {actual:?}, the signed envelope says {signed:?}"),
+        )),
+        Some(_) => Err(unbound(
+            plane,
+            id,
+            field,
+            "signed envelope carries a non-string value for this field".to_string(),
+        )),
+        None => Err(unbound(
+            plane,
+            id,
+            field,
+            format!(
+                "signed envelope carries no `{field}`, so the column is authored by \
+                 whoever wrote the row rather than by whoever signed it"
+            ),
+        )),
+    }
+}
+
+/// Bind an OPTIONAL string column: absent/null in the envelope ⇔ `None`.
+fn bind_opt_str(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: Option<&str>,
+) -> Result<(), Error> {
+    let signed = match env.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => {
+            return Err(unbound(
+                plane,
+                id,
+                field,
+                "signed envelope carries a non-string value for this field".to_string(),
+            ))
+        }
+    };
+    if signed == actual {
+        return Ok(());
+    }
+    Err(unbound(
+        plane,
+        id,
+        field,
+        format!("column is {actual:?}, the signed envelope says {signed:?}"),
+    ))
+}
+
+/// Bind a REQUIRED unsigned-integer column to its signed counterpart.
+fn bind_u64(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: u64,
+) -> Result<(), Error> {
+    match env.get(field).and_then(Value::as_u64) {
+        Some(signed) if signed == actual => Ok(()),
+        Some(signed) => Err(unbound(
+            plane,
+            id,
+            field,
+            format!("column is {actual}, the signed envelope says {signed}"),
+        )),
+        None => Err(unbound(
+            plane,
+            id,
+            field,
+            format!(
+                "signed envelope carries no unsigned-integer `{field}`, so the column is \
+                 authored by whoever wrote the row rather than by whoever signed it"
+            ),
+        )),
+    }
+}
+
+/// Bind a REQUIRED boolean column to its signed counterpart.
+fn bind_bool(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: bool,
+) -> Result<(), Error> {
+    match env.get(field).and_then(Value::as_bool) {
+        Some(signed) if signed == actual => Ok(()),
+        Some(signed) => Err(unbound(
+            plane,
+            id,
+            field,
+            format!("column is {actual}, the signed envelope says {signed}"),
+        )),
+        None => Err(unbound(
+            plane,
+            id,
+            field,
+            format!("signed envelope carries no boolean `{field}`"),
+        )),
+    }
+}
+
+/// Parse + resolution-guard a signed instant. The microsecond floor is
+/// [`crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS`] and it
+/// is REFUSED rather than truncated for the #598 reason: postgres
+/// `TIMESTAMPTZ` cannot hold finer, so a nanosecond-precision row would be
+/// admitted here, stored truncated, and then FAIL this very binding when a
+/// replicating peer read it back and re-submitted it. Refusing keeps the
+/// property total across all three backends.
+fn bind_instant_value(
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    signed: &str,
+) -> Result<DateTime<Utc>, Error> {
+    use chrono::Timelike as _;
+    let parsed = DateTime::parse_from_rfc3339(signed)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| {
+            unbound(
+                plane,
+                id,
+                field,
+                format!("signed envelope value {signed:?} is not RFC-3339: {e}"),
+            )
+        })?;
+    if parsed.nanosecond() % crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS != 0 {
+        return Err(unbound(
+            plane,
+            id,
+            field,
+            format!(
+                "signed instant {} carries sub-microsecond precision, which postgres \
+                 TIMESTAMPTZ cannot store — the row would fail its own binding after a \
+                 round-trip. Truncate to microseconds at the producer",
+                parsed.to_rfc3339()
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Bind a REQUIRED instant column to its signed counterpart.
+fn bind_instant(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: DateTime<Utc>,
+) -> Result<(), Error> {
+    let Some(Value::String(signed)) = env.get(field) else {
+        return Err(unbound(
+            plane,
+            id,
+            field,
+            format!(
+                "signed envelope carries no RFC-3339 `{field}` string. This column orders \
+                 the merge, and an unbound ordering key is a replay waiting to happen"
+            ),
+        ));
+    };
+    let signed = bind_instant_value(plane, id, field, signed)?;
+    if signed != actual {
+        return Err(unbound(
+            plane,
+            id,
+            field,
+            format!(
+                "column is {}, the signed envelope says {}",
+                actual.to_rfc3339(),
+                signed.to_rfc3339()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Bind an OPTIONAL instant column: absent/null in the envelope ⇔ `None`.
+/// This is the gate the `withdrawn_at` tombstone needs — a withdrawal is an
+/// AUTHORED act, so setting one requires a freshly signed envelope that
+/// says so, not a column edit on a replay of a still-valid grant.
+fn bind_opt_instant(
+    env: &Value,
+    plane: &'static str,
+    id: &str,
+    field: &'static str,
+    actual: Option<DateTime<Utc>>,
+) -> Result<(), Error> {
+    let signed = match env.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(bind_instant_value(plane, id, field, s)?),
+        Some(_) => {
+            return Err(unbound(
+                plane,
+                id,
+                field,
+                "signed envelope must carry an RFC-3339 string or nothing at all".to_string(),
+            ))
+        }
+    };
+    if signed == actual {
+        return Ok(());
+    }
+    Err(unbound(
+        plane,
+        id,
+        field,
+        format!(
+            "column is {:?}, the signed envelope says {:?}",
+            actual.map(|t| t.to_rfc3339()),
+            signed.map(|t| t.to_rfc3339())
+        ),
+    ))
+}
+
+/// v30.13.0 (CIRISPersist#642) — refuse an [`Organization`] whose typed
+/// projection disagrees with the envelope its signature covers.
+///
+/// # Errors
+/// [`Error::OperationalEnvelopeUnbound`] on the first divergent column.
+pub fn check_organization_binding(row: &Organization) -> Result<(), Error> {
+    const PLANE: &str = "organization";
+    let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "org_id", &row.org_id)?;
+    bind_str(env, PLANE, id, "name", &row.name)?;
+    bind_str(env, PLANE, id, "org_type", &row.org_type)?;
+    bind_str(env, PLANE, id, "status", &row.status)?;
+    bind_str(env, PLANE, id, "attesting_key_id", &row.attesting_key_id)?;
+    bind_opt_str(
+        env,
+        PLANE,
+        id,
+        "parent_org_id",
+        row.parent_org_id.as_deref(),
+    )?;
+    bind_opt_str(env, PLANE, id, "partner_id", row.partner_id.as_deref())?;
+    bind_instant(env, PLANE, id, "asserted_at", row.asserted_at)?;
+    bind_opt_instant(env, PLANE, id, "valid_until", row.valid_until)?;
+    bind_opt_instant(env, PLANE, id, "withdrawn_at", row.withdrawn_at)?;
+    Ok(())
+}
+
+/// v30.13.0 (CIRISPersist#642) — refuse an [`OrgMembership`] whose typed
+/// projection disagrees with the envelope its signature covers.
+///
+/// `role` and `status` are the two the role-chain resolver reads out of the
+/// ENVELOPE while the read surface returns the COLUMN; unbound, the two
+/// could disagree, and a `viewer` on the wire could be an `org_admin` to
+/// every consumer of `list_org_memberships_since`.
+///
+/// # Errors
+/// [`Error::OperationalEnvelopeUnbound`] on the first divergent column.
+pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
+    const PLANE: &str = "org_membership";
+    let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "user_id", &row.user_id)?;
+    bind_str(env, PLANE, id, "org_id", &row.org_id)?;
+    bind_str(env, PLANE, id, "role", &row.role)?;
+    bind_str(env, PLANE, id, "status", &row.status)?;
+    bind_str(env, PLANE, id, "attesting_key_id", &row.attesting_key_id)?;
+    bind_instant(env, PLANE, id, "asserted_at", row.asserted_at)?;
+    bind_opt_instant(env, PLANE, id, "valid_until", row.valid_until)?;
+    bind_opt_instant(env, PLANE, id, "withdrawn_at", row.withdrawn_at)?;
+    Ok(())
+}
+
+/// v30.13.0 (CIRISPersist#642) — refuse a [`PartnerRecord`] whose typed
+/// projection disagrees with the envelope the M-of-N steward quorum signed.
+///
+/// **This is what binds `revision`.** The counter is the anti-rollback
+/// gate AND the first key of the `monotonic_quorum` comparator, and it was
+/// a plain caller-supplied column. It is bound INTO THE SIGNED BYTES rather
+/// than derived from the quorum, because the quorum is not a source of
+/// ordering: `verify_partner_record_quorum` returns *how many* stewards
+/// signed, which says nothing about which of two validly-signed records is
+/// later, and M stewards could sign any number of records for one
+/// `license_id`. The number that decides precedence must be a number the
+/// stewards actually attested to. The quorum already verifies
+/// `JCS(signed_envelope)`, so requiring `revision` to live there makes the
+/// counter quorum-attested at zero additional cryptographic cost.
+///
+/// # Errors
+/// [`Error::OperationalEnvelopeUnbound`] on the first divergent column.
+pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
+    const PLANE: &str = "partner_record";
+    let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "license_id", &row.license_id)?;
+    bind_str(env, PLANE, id, "partner_id", &row.partner_id)?;
+    bind_str(env, PLANE, id, "org_id", &row.org_id)?;
+    bind_str(env, PLANE, id, "license_type", &row.license_type)?;
+    bind_str(env, PLANE, id, "max_autonomy_tier", &row.max_autonomy_tier)?;
+    bind_str(env, PLANE, id, "status", &row.status)?;
+    bind_bool(
+        env,
+        PLANE,
+        id,
+        "requires_supervisor",
+        row.requires_supervisor,
+    )?;
+    bind_u64(
+        env,
+        PLANE,
+        id,
+        "deployment_limit",
+        u64::from(row.deployment_limit),
+    )?;
+    bind_u64(
+        env,
+        PLANE,
+        id,
+        "offline_grace_hours",
+        u64::from(row.offline_grace_hours),
+    )?;
+    bind_u64(env, PLANE, id, "revision", row.revision)?;
+    bind_instant(env, PLANE, id, "issued_at", row.issued_at)?;
+    bind_instant(env, PLANE, id, "expires_at", row.expires_at)?;
+    bind_instant(env, PLANE, id, "asserted_at", row.asserted_at)?;
+    bind_opt_instant(env, PLANE, id, "withdrawn_at", row.withdrawn_at)?;
+    Ok(())
+}
+
+/// v30.13.0 (CIRISPersist#642) — the `organization` admission gate nobody
+/// was running: bind the projection, then hybrid-Strict verify the row's
+/// OWN signature over `JCS(signed_envelope)` against `attesting_key_id`'s
+/// **REGISTERED** pubkeys, resolved from persist's own directory.
+///
+/// Same verify contract as [`super::verify_family_admission`] /
+/// [`super::verify_revocation_admission`] — the established shape for
+/// "prove the claimed author actually authored this" — so a hybrid-pending
+/// (classical-only) signature is refused, PQC-mandatory per CC 5.3.2.4.3.1.
+/// Run BEFORE any DB work and before any lock the directory needs.
+///
+/// # Errors
+/// [`Error::OperationalEnvelopeUnbound`] if the projection diverges;
+/// [`Error::FederationTierUnverified`] if the signature does not verify or
+/// the attester is not registered.
+pub async fn verify_organization_admission<F>(
+    directory: &F,
+    row: &Organization,
+) -> Result<(), Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    check_organization_binding(row)?;
+    super::tier_ingest::verify_envelope_hybrid_signature(
+        directory,
+        &row.attesting_key_id,
+        &row.signed_envelope,
+        &row.ed25519_signature_base64,
+        row.mldsa65_signature_base64.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// v30.13.0 (CIRISPersist#642) — the `org_membership` counterpart of
+/// [`verify_organization_admission`]. See there for the contract.
+///
+/// # Errors
+/// [`Error::OperationalEnvelopeUnbound`] or
+/// [`Error::FederationTierUnverified`].
+pub async fn verify_org_membership_admission<F>(
+    directory: &F,
+    row: &OrgMembership,
+) -> Result<(), Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    check_org_membership_binding(row)?;
+    super::tier_ingest::verify_envelope_hybrid_signature(
+        directory,
+        &row.attesting_key_id,
+        &row.signed_envelope,
+        &row.ed25519_signature_base64,
+        row.mldsa65_signature_base64.as_deref(),
+    )
+    .await
+    .map(|_| ())
 }
 
 // ── Merge: lww_skew_bounded + withdrawal_forward_only ───────────────
@@ -865,12 +1340,19 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrgMembership {
+        // v30.13.0 (#642) — the envelope now carries EVERY column the
+        // binding gate checks, and the instant is truncated to the
+        // substrate resolution before it is signed so the row cannot fail
+        // its own binding after a postgres round-trip.
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = json!({
             "user_id": user_id,
             "org_id": org_id,
             "role": role,
             "status": status,
             "attesting_key_id": granter.key_id,
+            "asserted_at": asserted_at.to_rfc3339(),
         });
         let bytes = ciris_verify_core::jcs::canonicalize(&envelope).unwrap();
         let (ed, mldsa) = granter.sign_bytes(&bytes);
@@ -902,12 +1384,16 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrganization {
+        // v30.13.0 (#642) — see `signed_membership`.
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = json!({
             "org_id": org_id,
             "name": "Acme",
             "org_type": "partner",
             "status": status,
             "attesting_key_id": actor.key_id,
+            "asserted_at": asserted_at.to_rfc3339(),
         });
         let bytes = ciris_verify_core::jcs::canonicalize(&envelope).unwrap();
         let (ed, mldsa) = actor.sign_bytes(&bytes);
@@ -952,6 +1438,13 @@ pub mod test_support {
         } else {
             json!(["billing.read", "identity.read"])
         };
+        // v30.13.0 (#642) — `revision` was already in the envelope and the
+        // COLUMN was still the one the anti-rollback gate read; the three
+        // instants join it so every column the comparator touches is
+        // quorum-attested. Truncated before signing (see
+        // `signed_membership`).
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = json!({
             "license_id": license_id,
             "partner_id": "p1",
@@ -967,6 +1460,9 @@ pub mod test_support {
             "offline_grace_hours": 24,
             "status": status,
             "revision": revision,
+            "issued_at": asserted_at.to_rfc3339(),
+            "expires_at": asserted_at.to_rfc3339(),
+            "asserted_at": asserted_at.to_rfc3339(),
         });
         let bytes = ciris_verify_core::jcs::canonicalize(&envelope).unwrap();
         let sigs: Vec<_> = stewards.iter().map(|s| s.threshold_sig(&bytes)).collect();
@@ -3464,6 +3960,311 @@ pub mod test_support {
             "({tag}) after {after}: the served bytes must be the advertised bytes"
         );
         Ok(())
+    }
+
+    // ── #642 witnesses — authorship + envelope binding ──────────────
+    //
+    // One body, driven from memory + sqlite + postgres. The defect was
+    // uniform across all three backends because the gate was missing from
+    // the SHARED admission code, so a single-backend witness would have
+    // been the same test shape that let this live.
+
+    /// The instants these witnesses use, substrate-truncated so a
+    /// postgres round-trip cannot make a row fail its own binding.
+    fn w642_now() -> DateTime<Utc> {
+        crate::federation::admission::truncate_to_substrate_resolution(Utc::now())
+    }
+
+    /// Register `id` as a directory STEWARD carrying its own real hybrid
+    /// pubkeys, so `resolve_steward_roster` finds it AND
+    /// `lookup_public_key` can verify what it signs.
+    async fn w642_register_steward(
+        dir: &dyn crate::federation::FederationDirectory,
+        id: &Identity,
+    ) {
+        dir.put_public_key(crate::federation::SignedKeyRecord {
+            record: id.steward_key_record(),
+        })
+        .await
+        .ok();
+    }
+
+    /// **#642-a — AN ORG ROW WITH A BOGUS SIGNATURE IS REFUSED.**
+    ///
+    /// The reported defect at its simplest. `Organization` and
+    /// `OrgMembership` carry `ed25519_signature_base64` /
+    /// `mldsa65_signature_base64`, and before this cut NOTHING in the crate
+    /// ever verified them — the row's own signature was stored, indexed,
+    /// re-served on the wire, and never once checked. So the forgery needs
+    /// no key material: name a registered steward as `attesting_key_id`,
+    /// put any bytes at all in the signature column, and the write lands.
+    ///
+    /// Proves both directions: the pristine row admits, the corrupted one
+    /// does not, and the corruption is ONLY in the signature half.
+    pub async fn exercise_org_bogus_signature_refused(
+        dir: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        let steward = Identity::new(&format!("{tag}-stw"));
+        w642_register_steward(dir, &steward).await;
+        let org_id = format!("{tag}-org");
+        let now = w642_now();
+
+        // (a) The genuine row admits — the gate is not simply refusing
+        //     everything, which is the failure mode a one-sided witness
+        //     cannot tell apart from a working one.
+        let good = signed_organization(&format!("{tag}-o-ok"), &org_id, &steward, "active", now);
+        dir.put_organization(good.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #642-a: the genuinely signed org row admits: {e}"));
+
+        // (b) The SAME row with only the Ed25519 half replaced. Everything
+        //     else — envelope, attesting_key_id, every typed column — is
+        //     byte-identical to the row that just admitted.
+        let mut forged = good.clone();
+        forged.organization.attestation_id = format!("{tag}-o-forged");
+        forged.organization.ed25519_signature_base64 =
+            base64::engine::general_purpose::STANDARD.encode([0x41u8; 64]);
+        assert_eq!(
+            forged.organization.signed_envelope, good.organization.signed_envelope,
+            "({tag}) #642-a: the forgery must differ ONLY in the signature — otherwise the \
+             witness could pass for the wrong reason"
+        );
+        let err = dir
+            .put_organization(forged)
+            .await
+            .expect_err("({tag}) #642-a: an org row whose signature does not verify is REFUSED");
+        assert_eq!(
+            err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) #642-a: and it is refused as an unverified signature, not incidentally \
+             by some other gate: {err:?}"
+        );
+
+        // (c) The same hole one plane over: org_membership.
+        let mut forged_m = signed_membership(
+            &format!("{tag}-m-forged"),
+            &steward,
+            &format!("{tag}-user"),
+            &org_id,
+            "org_admin",
+            "active",
+            now,
+        );
+        forged_m.org_membership.ed25519_signature_base64 =
+            base64::engine::general_purpose::STANDARD.encode([0x42u8; 64]);
+        let err = dir.put_org_membership(forged_m).await.expect_err(
+            "({tag}) #642-a: an org_membership row whose signature does not verify is REFUSED",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) #642-a: org_membership refuses for the same reason: {err:?}"
+        );
+    }
+
+    /// **#642-b — A TOMBSTONE SET BY A KEY THAT DID NOT SIGN IT IS REFUSED.**
+    ///
+    /// Verifying the signature is necessary and NOT sufficient. The
+    /// signature covers `signed_envelope`; `withdrawn_at` is a column
+    /// beside it, and `LwwRow::is_withdrawn` — the whole
+    /// `withdrawal_forward_only` rule — reads the column. So an attacker
+    /// who never forges anything can take a still-validly-signed grant,
+    /// stamp a tombstone into the projection, and retire an org or revoke
+    /// somebody's membership using the victim's own signature.
+    ///
+    /// Also drives `status` and `role`: the role-chain resolver parses
+    /// those out of the ENVELOPE while `list_org_memberships_since` returns
+    /// the COLUMN, so an unbound projection lets one row be a `viewer` to
+    /// the resolver and an `org_admin` to every consumer.
+    pub async fn exercise_unsigned_tombstone_refused(
+        dir: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        let steward = Identity::new(&format!("{tag}-stw"));
+        w642_register_steward(dir, &steward).await;
+        let org_id = format!("{tag}-org");
+        let now = w642_now();
+
+        let good = signed_organization(&format!("{tag}-o-live"), &org_id, &steward, "active", now);
+        dir.put_organization(good.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #642-b: the in-force org row admits: {e}"));
+
+        // (a) The tombstone. Signature untouched and still valid; only the
+        //     unsigned column moves.
+        let mut tombstoned = good.clone();
+        tombstoned.organization.attestation_id = format!("{tag}-o-tomb");
+        tombstoned.organization.withdrawn_at = Some(now + Duration::seconds(60));
+        assert_eq!(
+            tombstoned.organization.ed25519_signature_base64,
+            good.organization.ed25519_signature_base64,
+            "({tag}) #642-b: the attacker forges NOTHING — that is the point of the witness"
+        );
+        let err = dir.put_organization(tombstoned).await.expect_err(
+            "({tag}) #642-b: a withdrawn_at tombstone the signature does not cover is REFUSED",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_operational_envelope_unbound",
+            "({tag}) #642-b: refused as an unbound column: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("withdrawn_at"),
+            "({tag}) #642-b: the refusal must name the column it is about: {err}"
+        );
+
+        // (b) The org is still in force — the failed write changed nothing.
+        let rows = dir
+            .list_organizations_for(&org_id)
+            .await
+            .expect("list organizations");
+        assert!(
+            rows.iter().all(|r| r.withdrawn_at.is_none()),
+            "({tag}) #642-b: the refused tombstone must not have landed"
+        );
+
+        // (c) `status` is bound too — the other half of the same column.
+        let mut restatused = good.clone();
+        restatused.organization.attestation_id = format!("{tag}-o-status");
+        restatused.organization.status = "deactivated".into();
+        let err = dir
+            .put_organization(restatused)
+            .await
+            .expect_err("({tag}) #642-b: an unsigned `status` flip is REFUSED");
+        assert_eq!(err.kind(), "federation_operational_envelope_unbound");
+
+        // (d) …and `role` on the membership plane — the escalation surface.
+        let mut escalated = signed_membership(
+            &format!("{tag}-m-esc"),
+            &steward,
+            &format!("{tag}-user"),
+            &org_id,
+            "viewer",
+            "active",
+            now,
+        );
+        escalated.org_membership.role = "org_admin".into();
+        let err = dir.put_org_membership(escalated).await.expect_err(
+            "({tag}) #642-b: a membership signed as `viewer` may not be stored as `org_admin`",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_operational_envelope_unbound",
+            "({tag}) #642-b: role divergence is an unbound column: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("role"),
+            "({tag}) #642-b: the refusal names `role`: {err}"
+        );
+    }
+
+    /// **#642-c — AN INFLATED `revision` IS REFUSED, AND THE LOCKOUT IS GONE.**
+    ///
+    /// `PartnerRecord` is the plane that was PARTIALLY clean: it really
+    /// does verify an M-of-N steward quorum. But the quorum verifies
+    /// `JCS(signed_envelope)`, and `revision` — the anti-rollback counter
+    /// and the first key of the `monotonic_quorum` comparator — was read
+    /// off the typed column.
+    ///
+    /// That made a permanent denial-of-service reachable WITHOUT ANY KEY:
+    /// replay a legitimately quorum-signed record with the column set to
+    /// `u64::MAX`. The quorum still verifies (the envelope is untouched),
+    /// `check_partner_revision_monotonic` accepts it (MAX exceeds
+    /// everything), and from then on EVERY legitimate revision is refused
+    /// as a rollback, forever, with no recovery path — the counter only
+    /// goes up.
+    ///
+    /// The last leg is the one that matters: it is not enough that the
+    /// attack write fails. A later legitimate write must still succeed, or
+    /// the fix merely relocated the lockout.
+    pub async fn exercise_revision_inflation_refused(
+        dir: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        let s1 = Identity::new(&format!("{tag}-s1"));
+        let s2 = Identity::new(&format!("{tag}-s2"));
+        for s in [&s1, &s2] {
+            w642_register_steward(dir, s).await;
+        }
+        let license = format!("{tag}-lic");
+        let now = w642_now();
+        let stewards: Vec<&Identity> = vec![&s1, &s2];
+
+        // (a) A legitimate 2-of-2 record at revision 1.
+        let r1 = signed_partner_record(
+            &format!("{tag}-p1"),
+            &license,
+            1,
+            "active",
+            now,
+            &stewards,
+            2,
+            false,
+        );
+        dir.put_partner_record(r1.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #642-c: the quorum-signed revision 1 admits: {e}"));
+
+        // (b) THE LOCKOUT ATTEMPT. The attacker holds no steward key. They
+        //     take the record above — whose quorum signatures remain
+        //     entirely valid — and raise only the unsigned column.
+        let mut inflated = r1.clone();
+        inflated.partner_record.attestation_id = format!("{tag}-p-inflated");
+        inflated.partner_record.revision = u64::MAX;
+        assert_eq!(
+            inflated.steward_signatures, r1.steward_signatures,
+            "({tag}) #642-c: the steward quorum is REPLAYED VERBATIM — no forgery anywhere"
+        );
+        let err = dir.put_partner_record(inflated).await.expect_err(
+            "({tag}) #642-c: an inflated `revision` the quorum never signed is REFUSED",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_operational_envelope_unbound",
+            "({tag}) #642-c: refused as an unbound column, NOT as a rollback: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("revision"),
+            "({tag}) #642-c: the refusal names `revision`: {err}"
+        );
+
+        // (c) THE LOCKOUT IS GONE. A legitimate revision 2 still admits.
+        //     Had the inflated row landed, this write — and every write
+        //     after it, forever — would fail PartnerRecordRollback.
+        let r2 = signed_partner_record(
+            &format!("{tag}-p2"),
+            &license,
+            2,
+            "active",
+            now + Duration::seconds(1),
+            &stewards,
+            2,
+            false,
+        );
+        dir.put_partner_record(r2).await.unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #642-c: THE LOCKOUT SURVIVED. A legitimate revision 2 was refused \
+                 after the inflation attempt, which means the attack still denies service \
+                 even though its own write failed: {e}"
+            )
+        });
+
+        // (d) …and the merge resolves to it, on a counter every steward
+        //     actually attested to.
+        let rows = dir
+            .list_partner_records_for(&license)
+            .await
+            .expect("list partner records");
+        let winner = resolve_monotonic_quorum(&rows).expect("a winner exists");
+        assert_eq!(
+            winner.revision, 2,
+            "({tag}) #642-c: the monotonic_quorum winner is the legitimate revision 2"
+        );
+        assert!(
+            rows.iter().all(|r| r.revision <= 2),
+            "({tag}) #642-c: no inflated revision was ever stored"
+        );
     }
 }
 

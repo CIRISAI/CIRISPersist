@@ -7325,6 +7325,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        // v30.13.0 (#642) — bind the typed projection to the signed
+        // envelope, then hybrid-Strict verify the row's OWN signature
+        // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
+        // DB work; nothing below it may assume an unverified column.
+        operational::verify_organization_admission(self, &row).await?;
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
@@ -7395,6 +7400,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        // v30.13.0 (#642) — bind the typed projection to the signed
+        // envelope, then hybrid-Strict verify the row's OWN signature
+        // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
+        // DB work; nothing below it may assume an unverified column.
+        operational::verify_org_membership_admission(self, &row).await?;
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
@@ -22591,6 +22601,13 @@ mod tests {
         let stranger = op::Identity::new("stranger");
         let _dir = [stranger.member()];
         let _roots = ["steward-1".to_string()]; // stranger is not rooted
+                                                // v30.13.0 (CIRISPersist#642) — register the stranger as a plain
+                                                // agent so its signature VERIFIES. Otherwise the new authorship gate
+                                                // refuses first (unregistered attester) and this test would no longer
+                                                // reach the authority gate it exists to pin. Registered-but-unrooted
+                                                // is the case that actually exercises fail-closed authority.
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&backend, "stranger")
+            .await;
 
         let org = op::signed_organization("o1", "org-x", &stranger, "active", op_now());
         let err = backend.put_organization(org).await.unwrap_err();
@@ -39756,6 +39773,43 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
             &backend, "sq598a",
+        )
+        .await;
+    }
+
+    /// #642-a — an org row whose own signature does not verify is REFUSED,
+    /// on sqlite. Before this cut NOTHING in the crate ever verified those
+    /// columns, on any backend.
+    #[tokio::test]
+    async fn org_bogus_signature_refused_sqlite_642() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
+            &backend, "sq642a",
+        )
+        .await;
+    }
+
+    /// #642-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// that the signature does not cover is REFUSED, on sqlite.
+    #[tokio::test]
+    async fn unsigned_tombstone_refused_sqlite_642() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
+            &backend, "sq642b",
+        )
+        .await;
+    }
+
+    /// #642-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// legitimate later revision still admits, on sqlite.
+    #[tokio::test]
+    async fn revision_inflation_refused_sqlite_642() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_revision_inflation_refused(
+            &backend, "sq642c",
         )
         .await;
     }
