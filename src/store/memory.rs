@@ -907,7 +907,12 @@ impl MemoryBackend {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let attesting_key_id = input.attesting_key_id.clone();
-        let now = chrono::Utc::now();
+        // v30.13.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+        // envelope when it carries one (see `admission::local_row_instant`), so
+        // a `consent:state:*` row staged at the local tier can still satisfy
+        // the instant binding at the promote door.
+        let now =
+            crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
         let mut row = match transit {
             Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
                 attestation_id.clone(),
@@ -918,6 +923,15 @@ impl MemoryBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v30.13.0 (CIRISPersist#598) — the same binding the federation door
+        // asks, asked at the local door too: a `consent:state:*` row that
+        // cannot state its own signed instant is refused where it is written,
+        // not where it is promoted.
+        crate::federation::admission::check_consent_state_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // v18.0.0 (#473) — replay idempotence for caller-supplied DETERMINISTIC
@@ -2249,6 +2263,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
+
+        // v30.13.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+        // `consent:state:*` row is refused unless its signed envelope carries
+        // an `asserted_at` (and `expires_at`) equal to the row column the
+        // consent fold orders on. `asserted_at` is stored VERBATIM from the
+        // caller here and no signature covers it, so without this a replay of
+        // a subject's own byte-identical, still-valid grant with a bumped
+        // column flipped a revocation back to Granted — and re-opened
+        // `check_capacity_consent_admission`, a gate inside persist. Pure
+        // function of (row, now) ⇒ AV-76 TIER 1, and a REFUSAL, so an early
+        // position is safe. Backend-symmetric across memory / sqlite /
+        // postgres, and asked again at the promote door
+        // (`check_promotion_admission`) so the local tier is not a way around
+        // it (B8).
+        crate::federation::admission::check_consent_state_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
@@ -7720,6 +7753,41 @@ mod accord_tests {
         .await;
     }
 
+    /// #598 B10-a — a REPLAYED consent grant whose `asserted_at` column
+    /// diverges from its own signed envelope is refused, on the memory backend. Shares
+    /// the assertion body with the other two backends: the pre-#598 fold
+    /// coverage was sqlite-only and single-writer, which is the "test shape"
+    /// gap the defect lived in.
+    #[tokio::test]
+    async fn consent_replay_refused_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
+            &backend, "mem598a",
+        )
+        .await;
+    }
+
+    /// #598 B10-b — two directories fed the SAME signed envelopes with the two
+    /// `asserted_at` columns swapped fold to the SAME verdict, on the memory backend.
+    #[tokio::test]
+    async fn consent_divergent_order_agrees_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_divergent_order(
+            &backend, "mem598b",
+        )
+        .await;
+    }
+
+    /// #598 B10-c — a sub-microsecond consent instant is refused and a true
+    /// tie resolves RESTRICTIVE, in both insertion orders, on the memory backend.
+    #[tokio::test]
+    async fn consent_tie_resolves_restrictive_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_tie_restriction_wins(
+            &backend, "mem598c"
+        )
+        .await;
+    }
     /// #543 AV-77 — de-admission stops an abuser and is revocable, on memory.
     ///
     /// The memory arm of the `{gate} × {backend}` matrix; the SAME shared
@@ -14103,9 +14171,13 @@ mod tests {
     async fn bare_subject_side_revocation_via_put_attestation_gated() {
         let backend = consent_backend().await;
         let mut row = fix_attestation("bare-rev", "subject-key", "registry-steward", "subject-key");
+        // v30.13.0 (CIRISPersist#598) — the signed instant must equal the column.
+        row.asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(row.asserted_at);
         row.attestation_envelope = serde_json::json!({
             "id": "bare-rev", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT: row.asserted_at.to_rfc3339(),
         });
         row.subject_key_ids = vec!["subject-key".into()];
         row.tier = crate::federation::types::attestation_tier::LOCAL.into();
@@ -15052,9 +15124,14 @@ mod tests {
 
         // A subject-side `consent:state:revoked` envelope, hybrid-signed by the
         // subject (Ed25519 + ML-DSA-65 bound) over the CEG canonical form.
+        // v30.13.0 (CIRISPersist#598) — the signed instant; the local door
+        // stamps the column from it.
         let env = serde_json::json!({
             "id": "rev-c", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT:
+                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                    .to_rfc3339(),
         });
         let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
 
@@ -15240,9 +15317,14 @@ mod tests {
         // A crypto-valid subject-side revocation, admitted as a TRANSIT
         // local-tier write (same real-admission fixture as the SLA loop
         // test above).
+        // v30.13.0 (CIRISPersist#598) — the signed instant; the local door
+        // stamps the column from it.
         let env = serde_json::json!({
             "id": "rev-r", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT:
+                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                    .to_rfc3339(),
         });
         let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
         let att_id = backend

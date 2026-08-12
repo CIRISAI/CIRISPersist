@@ -2209,6 +2209,15 @@ pub async fn check_promotion_admission(
     // is precisely the sentence this arm turns into a check.
     check_promotion_cohort_standing(row)?;
 
+    // v30.13.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
+    // promote door for the B8 reason: a row must not escape a put-gate by
+    // entering at the local tier and being PROMOTED. Only federation-tier rows
+    // reach the consent folds (`list_attestations_for` filters on tier), so
+    // promotion is the OTHER way a `consent:state:*` row arrives there — and
+    // the local door mints `asserted_at` from this node's own clock, which is
+    // exactly the bumped ordering key the replay wants. Pure, so it leads.
+    check_consent_state_instant_binding(row, chrono::Utc::now(), DEFAULT_MAX_TOUCH_SKEW)?;
+
     // AV-77 — a de-admitted author's rows are refused before any walk runs, so
     // a sanctioned peer also sheds the amplification cost (same posture as
     // `put_attestation`'s tier-4 placement).
@@ -3540,6 +3549,267 @@ pub fn verify_touch_claim_admission(
             "signed touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
              tolerance — a lying clock cannot jump the freshness floor into the future",
             claim.fresh_as_of.to_rfc3339(),
+            skew.num_seconds(),
+            now.to_rfc3339(),
+            max_skew.num_seconds(),
+        )));
+    }
+    Ok(())
+}
+
+/// v30.13.0 (CIRISPersist#598) — **the substrate's instant RESOLUTION**: one
+/// microsecond, expressed as the nanosecond quantum every bound consent
+/// instant must be a whole multiple of.
+///
+/// The three backends do not agree about sub-microsecond time and cannot be
+/// made to. sqlite stores RFC-3339 TEXT and memory holds a `chrono`
+/// `DateTime` — both keep the full nanosecond — while postgres `TIMESTAMPTZ`
+/// is microsecond precision and TRUNCATES. So a grant and a revoke 500ns
+/// apart are a strict order on two backends and a TIE on the third, and the
+/// tie was resolved by whatever row order the backend happened to present.
+/// That is a fold whose verdict depends on which database you asked, on the
+/// plane where the wrong answer is "processing may proceed".
+///
+/// The decision is to **REFUSE, not truncate**. Truncating at the write
+/// chokepoint is the other honest option and was rejected because the
+/// instant is now BOUND to a signature: silently rewriting `asserted_at` to
+/// a coarser value would leave the stored column no longer equal to the
+/// signed envelope it was admitted for, so the row would fail its own
+/// binding on re-check — trading a cross-backend divergence for a
+/// self-inconsistent row. Refusing keeps the property total: **the stored
+/// column, the signed envelope, and every backend's round-trip of it are the
+/// same instant, byte for byte.**
+///
+/// The cost lands on producers, and persist pays it first:
+/// [`crate::federation::attestation_emit::stamp_and_canonicalize`] truncates
+/// `Utc::now()` before it stamps, so nothing this node mints can trip the
+/// rule. Same fix, same reason, as `1f93785` one plane over on the Key wire
+/// index.
+pub const CONSENT_INSTANT_RESOLUTION_NANOS: u32 = 1_000;
+
+/// v30.13.0 (CIRISPersist#598) — truncate an instant to the substrate's
+/// [`CONSENT_INSTANT_RESOLUTION_NANOS`] floor, i.e. to what postgres
+/// `TIMESTAMPTZ` can actually hold. Every persist-minted instant that will be
+/// bound to a signature goes through here.
+#[must_use]
+pub fn truncate_to_substrate_resolution(
+    t: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike as _;
+    let nanos = t.nanosecond();
+    // `nanosecond()` reports ≥ 1_000_000_000 inside a leap second; `with_nanosecond`
+    // then refuses the truncated value, so fall back to the input unchanged
+    // rather than silently mangling it (the caller's binding check still runs).
+    t.with_nanosecond(nanos / CONSENT_INSTANT_RESOLUTION_NANOS * CONSENT_INSTANT_RESOLUTION_NANOS)
+        .unwrap_or(t)
+}
+
+/// v30.13.0 (CIRISPersist#598) — the instant a LOCAL-tier write stamps on
+/// its row: the envelope's own signed `asserted_at` when it carries one, else
+/// this node's clock truncated to the substrate resolution.
+///
+/// The local door mints `asserted_at` itself, which is fine while the row
+/// stays local (`list_attestations_for` filters to `tier = 'federation'`, so a
+/// local row reaches no consent fold) and NOT fine at promotion, where
+/// [`check_promotion_admission`] asks for the binding. A subject-side
+/// `consent:state:revoked` transiting the local tier (§10.1.3) must therefore
+/// be able to state its own instant, or the consent-SLA watcher could never
+/// promote it and every revocation would strand at local tier — fail-closed in
+/// the direction that loses the revocation.
+///
+/// Deriving the column from the signed envelope is also the same answer
+/// [`crate::federation::attestation_emit::assemble`] gives on the emit path:
+/// one instant, sampled once, carried by the object.
+pub fn local_row_instant(
+    envelope: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+    match envelope.get(crate::federation::envelope::paths::ASSERTED_AT) {
+        None | Some(serde_json::Value::Null) => Ok(truncate_to_substrate_resolution(now)),
+        Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "local attestation envelope `asserted_at` is not RFC-3339: {e} \
+                     (CIRISPersist#598)"
+                ))
+            }),
+        Some(_) => Err(Error::InvalidArgument(
+            "local attestation envelope `asserted_at` must be an RFC-3339 string or absent \
+             (CIRISPersist#598)"
+                .into(),
+        )),
+    }
+}
+
+/// v30.13.0 (CIRISPersist#598) — **THE CONSENT INSTANT BINDING GATE.**
+///
+/// # What was open
+///
+/// `federation_attestations.asserted_at` is a ROW COLUMN, stored VERBATIM
+/// from the caller on all three backends (`sqlite.rs` / `postgres.rs` /
+/// `memory.rs` `put_attestation`), and it is NOT covered by any signature:
+/// `verify_row_hybrid_signature` canonicalizes `attestation_envelope`, checks
+/// `SHA-256(canonical) == original_content_hash` and hybrid-verifies — the
+/// column never enters the preimage. `persist_row_hash` does cover it, but is
+/// recomputed locally at write, so it binds nothing across nodes.
+///
+/// Both consent folds order on that column. So the attack needed no forgery
+/// and no broken signature — it is a **REPLAY**:
+///
+/// 1. subject `S` grants `analyze` at `t1`, then revokes at `t2 > t1`; the
+///    fold reads `Revoked`.
+/// 2. anyone resubmits `S`'s **byte-identical, still-validly-signed** `t1`
+///    grant with a fresh `attestation_id` and `asserted_at = t3 > t2`.
+/// 3. nothing refused it — `attestation_id` is the only PK, there is no
+///    UNIQUE on the envelope or the content hash, the §6.1 dedup
+///    ([`crate::federation::precedence`]) covers only the four structural
+///    composers and returns `false` for a `scores` row, and the future-skew
+///    guards that exist (`fresh_as_of`, trace `signed_at`) do not reach this
+///    field.
+/// 4. the fold reads `Granted` again — and
+///    [`check_capacity_consent_admission`], a gate INSIDE persist, re-opens
+///    third-party `capacity:*` scoring about `S`.
+///
+/// # What this refuses
+///
+/// A `consent:state:*` row is admitted only when, all fail-closed:
+///
+/// 1. its signed envelope carries `asserted_at` as an RFC-3339 string, and
+///    that instant EQUALS the row column;
+/// 2. its `expires_at` agrees in BOTH directions — envelope absent ⇔ column
+///    `None`, envelope present ⇔ column present and equal (an unsigned
+///    `expires_at` is an unsigned mute button: the fold drops an expired
+///    row, so a writer who can set it alone can silence a revocation);
+/// 3. both bound instants sit on the substrate resolution floor
+///    ([`CONSENT_INSTANT_RESOLUTION_NANOS`] — see there for why REFUSE and
+///    not truncate);
+/// 4. `asserted_at` is not more than `max_skew` in the future — the
+///    anti-rollback dual, reusing [`DEFAULT_MAX_TOUCH_SKEW`] rather than
+///    minting a second tolerance constant. Without it the replay above still
+///    works with a signed instant, just one the attacker's clock invented.
+///
+/// **No grandfathering.** A `consent:state:*` row whose envelope lacks the
+/// instant is refused, not tolerated and not flagged (operator decision on
+/// #598: "we need to break NOW … consent needs to be the final shape").
+/// There is no legacy regime and no compatibility flag to find later.
+///
+/// # Why a gate and not a re-keyed fold
+///
+/// See [`crate::federation::consent::fold_ordering_key`]. Ordering stays on
+/// the column; this gate is what makes the column trustworthy. Security comes
+/// from the gate, not from the ordering.
+///
+/// # Shape
+///
+/// This is the [`verify_signed_transport_destination`] discipline one plane
+/// over — that gate already refuses exactly this divergence for the transport
+/// route table ("typed {what} diverges from the signed envelope") — minus the
+/// signature verification, which the surrounding write path already performs
+/// on the same envelope bytes. Pure function of `(row, now)`: no directory
+/// read, no crypto, no lock ⇒ AV-76 TIER 1 on every door.
+pub fn check_consent_state_instant_binding(
+    row: &super::Attestation,
+    now: chrono::DateTime<chrono::Utc>,
+    max_skew: chrono::Duration,
+) -> Result<(), Error> {
+    use crate::federation::envelope::paths;
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(crate::federation::consent::consent_dimension::STATE_PREFIX) {
+        return Ok(());
+    }
+    let env = &row.attestation_envelope;
+
+    let parse = |key: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "consent:state row {}: signed envelope `{key}` is not RFC-3339: {e} \
+                     (CIRISPersist#598)",
+                    row.attestation_id
+                ))
+            })
+    };
+    let on_resolution = |key: &str, t: chrono::DateTime<chrono::Utc>| -> Result<(), Error> {
+        use chrono::Timelike as _;
+        if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS == 0 {
+            return Ok(());
+        }
+        Err(Error::InvalidArgument(format!(
+            "consent:state row {}: `{key}` = {} carries sub-microsecond precision, which \
+             postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
+             on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
+             (CIRISPersist#598)",
+            row.attestation_id,
+            t.to_rfc3339(),
+        )))
+    };
+
+    // (1) asserted_at — REQUIRED, and the row column must equal it.
+    let Some(serde_json::Value::String(env_asserted)) = env.get(paths::ASSERTED_AT) else {
+        return Err(Error::InvalidArgument(format!(
+            "consent:state row {} carries no signed `{}` string in its envelope. The consent \
+             fold orders on the `asserted_at` COLUMN, which no signature covers — an unbound \
+             row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
+             CIRISPersist#598)",
+            row.attestation_id,
+            paths::ASSERTED_AT,
+        )));
+    };
+    let env_asserted = parse(paths::ASSERTED_AT, env_asserted)?;
+    if env_asserted != row.asserted_at {
+        return Err(Error::InvalidArgument(format!(
+            "consent:state row {}: typed `asserted_at` {} diverges from the signed envelope's \
+             {} (rejected — the column decides which consent claim wins, so it may not differ \
+             from the signed instant; CIRISPersist#598)",
+            row.attestation_id,
+            row.asserted_at.to_rfc3339(),
+            env_asserted.to_rfc3339(),
+        )));
+    }
+    on_resolution(paths::ASSERTED_AT, row.asserted_at)?;
+
+    // (2) expires_at — bound in BOTH directions (absent ⇔ None).
+    let env_expires = match env.get(paths::EXPIRES_AT) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(parse(paths::EXPIRES_AT, s)?),
+        Some(_) => {
+            return Err(Error::InvalidArgument(format!(
+                "consent:state row {}: signed envelope `{}` must be an RFC-3339 string or absent \
+                 (CIRISPersist#598)",
+                row.attestation_id,
+                paths::EXPIRES_AT,
+            )))
+        }
+    };
+    if env_expires != row.expires_at {
+        return Err(Error::InvalidArgument(format!(
+            "consent:state row {}: typed `expires_at` {:?} diverges from the signed envelope's \
+             {:?} (rejected — the fold DROPS an expired row, so an unsigned expiry is an \
+             unsigned mute button on a revocation; CIRISPersist#598)",
+            row.attestation_id,
+            row.expires_at.map(|t| t.to_rfc3339()),
+            env_expires.map(|t| t.to_rfc3339()),
+        )));
+    }
+    if let Some(exp) = row.expires_at {
+        on_resolution(paths::EXPIRES_AT, exp)?;
+    }
+
+    // (3) the future-skew dual. Binding alone stops a REPLAY of someone
+    // else's instant; it does not stop the claimant's own clock asserting a
+    // grant far enough forward that no later revocation can ever out-sort it.
+    let skew = row.asserted_at - now;
+    if skew > max_skew {
+        return Err(Error::InvalidArgument(format!(
+            "consent:state row {}: asserted_at {} is {}s ahead of now ({}), beyond the {}s skew \
+             tolerance — a lying clock cannot mint a consent claim no later revocation can \
+             out-sort (CIRISPersist#598)",
+            row.attestation_id,
+            row.asserted_at.to_rfc3339(),
             skew.num_seconds(),
             now.to_rfc3339(),
             max_skew.num_seconds(),

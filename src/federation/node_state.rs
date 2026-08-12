@@ -1038,11 +1038,16 @@ pub mod parity_test_support {
                 .await
                 .expect("register");
         }
+        // v30.13.0 (CIRISPersist#598) — the signed instant; the local write
+        // door stamps the `asserted_at` column FROM it.
         let env = serde_json::json!({
             "id": format!("{tag}-ns-rev"),
             "dimension": "consent:state:revoked:v1",
             "score": 1.0,
             "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT:
+                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                    .to_rfc3339(),
         });
         let (_h, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
         dir.attestation_upsert_local(LocalAttestationInput {

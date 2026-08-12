@@ -3803,7 +3803,7 @@ impl Engine {
     pub async fn emit_attestation(
         &self,
         signer: &crate::signing::LocalSigner,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
         // Derive the registered federation key_id from the signer itself
         // (#247 floor) — never a caller-supplied alias.
@@ -3813,7 +3813,10 @@ impl Engine {
         // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
         // cannot emit a conformant federation-tier attestation — surface
         // honestly with the same message the self-emit path uses.
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input)?;
         let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
@@ -3850,7 +3853,7 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn emit_attestation_self(
         &self,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
         // #247-correct derived federation key_id of the engine's own
         // composed signer (works for software + hardware-hybrid alike).
@@ -3858,7 +3861,10 @@ impl Engine {
             crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
         })?;
 
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input)?;
         // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
         // so a hardware-hybrid engine can emit here.
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
@@ -3899,14 +3905,17 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn assemble_attestation_self(
         &self,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<crate::federation::SignedAttestation, crate::federation::Error> {
         let key_id = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "assemble_attestation_self derive key_id: {e}"
             ))
         })?;
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input)?;
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "assemble_attestation_self sign_hybrid: {e} — a conformant federation-tier row \
@@ -3925,13 +3934,19 @@ impl Engine {
     /// content.
     ///
     /// v25.1.0 (CIRISPersist#582) — delegates to
-    /// [`attestation_emit::canonicalize`](crate::federation::attestation_emit::canonicalize),
+    /// [`attestation_emit::stamp_and_canonicalize`](crate::federation::attestation_emit::stamp_and_canonicalize),
     /// the backend-generic half of the recipe.
+    ///
+    /// v30.13.0 (CIRISPersist#598) — takes `&mut input` rather than a bare
+    /// envelope `Value`: the row instants are stamped into the envelope HERE,
+    /// before the bytes exist, so the signature covers them and
+    /// [`assemble`](crate::federation::attestation_emit::assemble) can read
+    /// them back out instead of sampling its own clock afterwards.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn emit_canonicalize(
-        envelope: &serde_json::Value,
+        input: &mut crate::federation::EmitAttestationInput,
     ) -> Result<Vec<u8>, crate::federation::Error> {
-        crate::federation::attestation_emit::canonicalize(envelope)
+        crate::federation::attestation_emit::stamp_and_canonicalize(input, chrono::Utc::now())
     }
 
     /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
