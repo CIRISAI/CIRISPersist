@@ -20298,6 +20298,29 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, &tag).await;
     }
 
+    /// v30.13.0 (CIRISPersist#612) — the `content_class:*` flag plane on
+    /// POSTGRES. Shares its body with the memory and sqlite twins: the fold is
+    /// a default trait method, but "latest by `asserted_at`" is a property of
+    /// what the STORE returns, and postgres is the leg that stores timestamps
+    /// at microsecond precision (#634).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn content_class_flag_plane_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = uuid_like();
+        let node = format!("cc-node-{tag}");
+        backend.set_node_key_id(node.clone());
+        crate::federation::content_class::parity_test_support::assert_content_class_flag_plane(
+            &backend, &node, &tag,
+        )
+        .await;
+    }
+
     /// CIRISServer#356 — the operator read surface on POSTGRES:
     /// unknown-not-green, the distinguished zeroes, and the read-only overdue
     /// query's zero-write proof. Shares its body with the memory and sqlite

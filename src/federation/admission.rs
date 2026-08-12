@@ -831,11 +831,16 @@ pub const MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN: &[(&str, &str, &str)] = &[
         "CC 3.3.12 — open vocabulary, producer-declared; and CC 3.4.14 R1 makes \
          the `generated`/`generated_modified` marking mandatory for EVERY \
          attester, which a `substrate_persist` gate refuses outright",
-        "CC 3.4.14 R2 (an agent's marking must ride an `agent`-typed key, which \
-         is a property of the signed envelope, not an admission rule) and R5 \
-         (a false or stripped marking is a false attestation adjudicated by WA \
-         quorum on the `hard_case:*` evidence floor — the substrate observes, \
-         it does not adjudicate)",
+        "the READ door (v30.13.0, CIRISPersist#612): \
+         `FederationDirectory::resolve_content_class_flag` folds the flag plane \
+         with a deliberate asymmetry — any emitter may RAISE (withholding is the \
+         safe error), but a withdrawal clears a flag its emitter did not raise \
+         only when a root THIS NODE trusts has conferred \
+         `infra:classify_content`. Plus CC 3.4.14 R2 (an agent's marking must \
+         ride an `agent`-typed key, which is a property of the signed envelope, \
+         not an admission rule) and R5 (a false or stripped marking is a false \
+         attestation adjudicated by WA quorum on the `hard_case:*` evidence \
+         floor — the substrate observes, it does not adjudicate)",
     ),
     (
         "cw_class:",

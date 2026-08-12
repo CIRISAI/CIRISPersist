@@ -489,6 +489,26 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          door is the shape CC describes, not a gap.",
     ),
     (
+        "content_class:",
+        "a READ-side filter, not an admission rule — the same shape as \
+         `content_rating:` above, arrived at the same way. Persist gated this \
+         family to `substrate_persist` from v3.0.0 under CEG 0.3 §5.6.8.3 until \
+         CC catalogued it; CC 3.3.12 declares it OPEN VOCABULARY and CC 3.4.14 R1 \
+         makes the `generated`/`generated_modified` marking universal — EVERY \
+         attester — so the write gate was refusing the very row CC makes \
+         mandatory, and CIRISPersist#571 removed it. The literal is now \
+         `content_class::FAMILY_STEM`, whose only use is the READ door \
+         `FederationDirectory::resolve_content_class_flag` (v30.13.0, \
+         CIRISPersist#612). That door admits nothing and refuses nothing: it \
+         FOLDS rows already stored, honouring a withdrawal that clears another \
+         emitter's flag only from a key a root this node trusts has conferred \
+         `infra:classify_content` on. An open write door with a \
+         conferral-filtered read door is the shape CC describes — see \
+         `admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`. It becomes \
+         persist-RULED only if a gate ever refuses a `content_class:` row at \
+         write time, at which point this line must go.",
+    ),
+    (
         "admin_action:",
         "a `hard_case` event-KIND token (`hard_case::kind::ADMIN_ACTION_PREFIX`), carried in the \
          `kind` column of an observed admin action — not a scored dimension",

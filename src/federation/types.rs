@@ -805,6 +805,61 @@ pub mod delegation_scope {
     /// declare a third party's age band.
     pub const INFRA_PUBLISH_RATING: &str = "infra:publish_rating";
 
+    /// v30.13.0 (CIRISPersist#612) — `infra:classify_content` — speak
+    /// **about a third party's content class**: the standing a
+    /// `content_class:*` emitter must hold before this node will honour a
+    /// WITHDRAWAL that clears a flag the emitter did not raise.
+    ///
+    /// The scope
+    /// [`resolve_content_class_flag`](crate::federation::FederationDirectory::resolve_content_class_flag)
+    /// resolves at USE, through
+    /// [`capability_roots_to_trusted_root`](crate::federation::trust_root::capability_roots_to_trusted_root),
+    /// against a root **the asking node itself trusts**.
+    ///
+    /// Like [`INFRA_PUBLISH_RATING`] it governs a **READ** door, not a write
+    /// door, and for the same constitutional reason: CC 3.3.12 leaves
+    /// `content_class:` open vocabulary, and CC 3.4.14 R1 makes the
+    /// `generated` / `generated_modified` marking universal — *every* attester
+    /// — so CIRISPersist#571 removed persist's CEG-sourced emitter rule as
+    /// stricter than the Constitution. An open write door and a
+    /// conferral-filtered read door is the shape CC describes; this token is
+    /// what makes the read side able to discriminate at all.
+    ///
+    /// # Why a CAPABILITY scope and NOT a rung on the moderation ladder
+    ///
+    /// [`MODERATION`] is authority to ACT ABOUT another party — emit a
+    /// moderation event, take content down, force a review, slash. A
+    /// content-class marking is an EPISTEMIC statement about content. Fusing
+    /// the two is the #532 axis-fusion class, so the test is mechanical:
+    ///
+    /// 1. **The intended holder is a NODE.** CIRISServer#363's emitter is a
+    ///    peer's own `substrate_persist` flag signer. A `node`-role delegate
+    ///    may carry ONLY `infra:*` —
+    ///    [`scopes_are_infra_only`](crate::federation::admission::scopes_are_infra_only)
+    ///    refuses every unprefixed duty token on a node key — so a ladder rung
+    ///    would be a scope the party that needs it structurally cannot hold.
+    /// 2. **A different resolver answers it.** Ladder rungs are resolved by the
+    ///    §11.10 duty walk over a roster the delegator governs
+    ///    (`check_moderation_admission` / `duty_holders_for_federation`). This
+    ///    is resolved on the CAPABILITY plane, against the ASKING node's trust
+    ///    root — which is precisely what #612 asked for, and what a duty walk
+    ///    cannot express (a peer classifier sits on no roster of ours).
+    /// 3. **Classification is not adjudication.** CC 3.4.14 R5 puts a false or
+    ///    stripped marking in front of a WA quorum on the `hard_case:*`
+    ///    evidence floor. "This is an infohazard" is the input; `takedown` /
+    ///    `slash` are sanctions a body may impose after one. One token for both
+    ///    would let a classifier's key slash, or a moderator's key silently
+    ///    re-classify.
+    ///
+    /// A fifth `infra:*` name rather than reuse of [`INFRA_DETECT`],
+    /// [`INFRA_PUBLISH_RATING`], [`INFRA_ATTEST_ASSURANCE`] or
+    /// [`INFRA_RECORD_HARD_CASE`], for the reason every one of them gives:
+    /// reusing `infra:detect` would let any adversarial-detection key clear a
+    /// CC 4.5.13 child-safety flag, and a key blessed to publish MPA-style
+    /// ratings has not thereby been blessed to declare content an infohazard.
+    /// One name, two authorities is the fusion class this repo keeps closing.
+    pub const INFRA_CLASSIFY_CONTENT: &str = "infra:classify_content";
+
     /// v30.2.0 (CIRISPersist#607) — `infra:detect` — emit on the adversarial
     /// detection plane (`detection:*`) about other parties.
     ///
@@ -954,6 +1009,7 @@ pub mod delegation_scope {
         INFRA_DETECT,
         INFRA_RECORD_HARD_CASE,
         INFRA_PUBLISH_RATING,
+        INFRA_CLASSIFY_CONTENT,
         // agency:* — what an agent may do on someone's behalf.
         AGENCY_ACT_ON_BEHALF,
         AGENCY_MESSAGE_IO,
@@ -989,6 +1045,7 @@ pub mod delegation_scope {
         INFRA_DETECT,
         INFRA_RECORD_HARD_CASE,
         INFRA_PUBLISH_RATING,
+        INFRA_CLASSIFY_CONTENT,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `agency:*` axis: what a key may do ON
@@ -1029,6 +1086,18 @@ pub mod delegation_scope {
     /// and re-exported here so the inventory and the minting site cannot
     /// disagree. Two arrays over one vocabulary would be the defect both #636
     /// and #637 exist to remove.
+    ///
+    /// # Still FIVE at v30.13.0 — a considered NO, not an omission
+    ///
+    /// CIRISPersist#612 minted [`INFRA_CLASSIFY_CONTENT`] and it is deliberately
+    /// **not** a sixth rung. "Asserts about another party" is not the ladder's
+    /// discriminator — [`INFRA_ATTEST_ASSURANCE`], [`INFRA_RECORD_HARD_CASE`],
+    /// [`INFRA_DETECT`] and [`INFRA_PUBLISH_RATING`] all do that and all sit on
+    /// [`INFRA`]. What makes a rung a rung is that it authorises an ACT the
+    /// §11.10 duty walk admits on a roster the delegator governs; a
+    /// content-class marking is an epistemic statement resolved on the
+    /// CAPABILITY plane against the asking node's own trust root. See
+    /// [`INFRA_CLASSIFY_CONTENT`] for the three-part axis test.
     pub const MODERATION: &[&str] = crate::federation::admission::DELEGATED_DUTY_SCOPES;
 
     /// v30.11.0 (CIRISPersist#636) — the recovery / succession axis: standing
