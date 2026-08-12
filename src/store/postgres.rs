@@ -10968,36 +10968,23 @@ impl crate::federation::BlobStorage for PostgresBackend {
         //    + envelope shape are centralized in
         //    crate::federation::blobs so list_holders can recompose
         //    the same prefix string.
+        // v31.0.0 (CIRISPersist#652) — through the ONE builder, which stamps
+        // the #598 instants and the #643 mirror into the envelope. Persist
+        // REBUILDS the caller's bytes here rather than storing bytes it was
+        // handed, so the builder is what makes "the caller signed the row we
+        // are storing" a checkable statement instead of an assumption.
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let attestation_envelope = crate::federation::holds_bytes_attestation_envelope(sha256);
-        let attestation_row = crate::federation::Attestation {
-            attestation_id: attestation.attestation_id.clone(),
-            attesting_key_id: attestation.attesting_key_id.clone(),
-            // A holder attestation attests the *holder itself* — the
-            // attester says "I (key_id=X) hold the bytes." No second
-            // key is involved.
-            attested_key_id: attestation.attesting_key_id.clone(),
-            attestation_type: attestation_type.clone(),
-            weight: None,
-            asserted_at: attestation.scrub_timestamp,
-            expires_at: None,
-            attestation_envelope,
-            original_content_hash: attestation.original_content_hash_hex.clone(),
-            scrub_signature_classical: attestation.scrub_signature_classical.clone(),
-            scrub_signature_pqc: attestation.scrub_signature_pqc.clone(),
-            scrub_key_id: attestation.scrub_key_id.clone(),
-            scrub_timestamp: attestation.scrub_timestamp,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
-            // self-attestation; subject-side authority does not apply.
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_string(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
+        let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
+            sha256,
+            &attestation.attesting_key_id,
+            &attestation.attestation_id,
+            attestation.asserted_at,
+        );
+        attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
+        attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
+        attestation_row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
+        attestation_row.scrub_key_id = attestation.scrub_key_id.clone();
+        attestation_row.scrub_timestamp = attestation.scrub_timestamp;
         // v31.0.0 (#644) — attestation_envelope is TEXT since V122. (Name kept
         // at the bind site below; the container is what changed.)
         let attestation_envelope_jsonb =
@@ -11059,14 +11046,19 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                 asserted_at, expires_at, attestation_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             &[
                 &attestation.attestation_id,
                 &attestation.attesting_key_id,
                 &attestation.attesting_key_id,
                 &attestation_type,
-                &attestation.scrub_timestamp,
+                // v31.0.0 (CIRISPersist#652) — from the ROW, which carries the
+                // TRUNCATED instant the builder also mirrored into the signed
+                // envelope, and which is `asserted_at` rather than
+                // `scrub_timestamp`: when the CLAIM was asserted, not when the
+                // signature was made.
+                &attestation_row.asserted_at,
                 &expires_at_null,
                 &attestation_envelope_jsonb,
                 &original_content_hash,
@@ -11076,6 +11068,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 &attestation.scrub_timestamp,
                 &pqc_completed_at_null,
                 &persist_row_hash,
+                // v31.0.0 (CIRISPersist#652) — STATED. It was omitted from the
+                // column list, so it took the schema default `'federation'` —
+                // and `list_attestations_since` filters on exactly that tier.
+                // The tier nobody chose is the tier that replicates.
+                &attestation_row.tier,
             ],
         )
         .await
@@ -27921,6 +27918,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         }
     }
 
@@ -30867,6 +30865,9 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp,
+            // This fixture's whole subject is the holder's INSTANT (it drives
+            // the TTL arms), and as of #652 that is `asserted_at`.
+            asserted_at: scrub_timestamp,
         }
     }
 
@@ -31126,6 +31127,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: steward.clone(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         };
         backend
             .put_blob(
@@ -31219,6 +31221,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: steward.clone(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         };
         backend
             .put_blob(

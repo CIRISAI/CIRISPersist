@@ -29100,6 +29100,17 @@ struct PutBlobAttestationWire {
     scrub_signature_pqc: Option<String>,
     scrub_key_id: String,
     scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    /// v31.0.0 (CIRISPersist#652) — when the HOLDER CLAIM is asserted, which
+    /// is not the same fact as when the signature was made.
+    ///
+    /// `#[serde(default)]` and NOT required: a caller that omits it keeps the
+    /// pre-#652 behaviour of the two instants coinciding, which is correct for
+    /// the common "announce what I just stored" case and is what every
+    /// existing Python caller means. The field exists so a holder announcing
+    /// bytes it has held for a week can say so — that is a claim about the
+    /// week, not about the moment it reached for its key.
+    #[serde(default)]
+    asserted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -29136,6 +29147,10 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
         scrub_signature_pqc: wire.attestation.scrub_signature_pqc,
         scrub_key_id: wire.attestation.scrub_key_id,
         scrub_timestamp: wire.attestation.scrub_timestamp,
+        asserted_at: wire
+            .attestation
+            .asserted_at
+            .unwrap_or(wire.attestation.scrub_timestamp),
     };
     Ok(PutBlobPayload {
         sha256: sha,

@@ -10209,35 +10209,26 @@ impl crate::federation::BlobStorage for SqliteBackend {
             }
         };
 
-        // 2. Compose the holder attestation envelope.
+        // 2. Compose the holder attestation row.
+        //
+        // v31.0.0 (CIRISPersist#652) — through the ONE builder, which stamps
+        // the #598 instants and the #643 mirror into the envelope. Persist
+        // REBUILDS the caller's bytes here rather than storing bytes it was
+        // handed, so the builder is what makes "the caller signed the row we
+        // are storing" a checkable statement instead of an assumption.
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let attestation_envelope_value =
-            crate::federation::holds_bytes_attestation_envelope(sha256);
-        let attestation_row = crate::federation::Attestation {
-            attestation_id: attestation.attestation_id.clone(),
-            attesting_key_id: attestation.attesting_key_id.clone(),
-            attested_key_id: attestation.attesting_key_id.clone(),
-            attestation_type: attestation_type.clone(),
-            weight: None,
-            asserted_at: attestation.scrub_timestamp,
-            expires_at: None,
-            attestation_envelope: attestation_envelope_value.clone(),
-            original_content_hash: attestation.original_content_hash_hex.clone(),
-            scrub_signature_classical: attestation.scrub_signature_classical.clone(),
-            scrub_signature_pqc: attestation.scrub_signature_pqc.clone(),
-            scrub_key_id: attestation.scrub_key_id.clone(),
-            scrub_timestamp: attestation.scrub_timestamp,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
-            // self-attestation; subject-side authority does not apply.
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_string(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
+        let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
+            sha256,
+            &attestation.attesting_key_id,
+            &attestation.attestation_id,
+            attestation.asserted_at,
+        );
+        attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
+        attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
+        attestation_row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
+        attestation_row.scrub_key_id = attestation.scrub_key_id.clone();
+        attestation_row.scrub_timestamp = attestation.scrub_timestamp;
+        let attestation_envelope_value = attestation_row.attestation_envelope.clone();
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
         let attestation_envelope_text = serde_json::to_string(&attestation_envelope_value)
@@ -10247,8 +10238,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
         let sha_vec = sha256.to_vec();
         let conn = self.conn.clone();
-        let asserted_at_str = attestation.scrub_timestamp.to_rfc3339();
+        // v31.0.0 (CIRISPersist#652) — from the ROW, which carries the
+        // TRUNCATED instant the builder also mirrored into the signed
+        // envelope. Reading `attestation.asserted_at` here instead would write
+        // an untruncated column beside a truncated twin — the #598 divergence,
+        // minted by the door that is supposed to prevent it.
+        let asserted_at_str = attestation_row.asserted_at.to_rfc3339();
         let scrub_timestamp_str = attestation.scrub_timestamp.to_rfc3339();
+        let tier_owned = attestation_row.tier.clone();
         let attestation_id_owned = attestation.attestation_id.clone();
         let attesting_key_id_owned = attestation.attesting_key_id.clone();
         let scrub_signature_classical_owned = attestation.scrub_signature_classical.clone();
@@ -10282,12 +10279,16 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 ],
             )?;
             tx.execute(
+                // v31.0.0 (CIRISPersist#652) — `tier` is LISTED. It was omitted
+                // entirely, so it took the schema default `'federation'` — and
+                // `list_attestations_since` filters on exactly that tier. The
+                // tier nobody chose is the tier that replicates.
                 "INSERT INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     attestation_id_owned,
                     attesting_key_id_owned,
@@ -10304,6 +10305,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     scrub_timestamp_str,
                     Option::<String>::None,
                     persist_row_hash,
+                    tier_owned,
                 ],
             )?;
             tx.commit()?;
@@ -21142,7 +21144,12 @@ mod tests {
         let tid = format!("hb-{}", uuid::Uuid::new_v4());
         let mut t = fed_attestation(&tid, &holder, &holder, &holder);
         t.attestation_type = holds_type.clone();
-        t.attestation_envelope = crate::federation::blobs::holds_bytes_attestation_envelope(&sha);
+        t.attestation_envelope = crate::federation::blobs::holds_bytes_attestation_envelope(
+            &sha,
+            &t.attesting_key_id.clone(),
+            &t.attestation_id.clone(),
+            t.asserted_at,
+        );
         resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: t })
@@ -30292,6 +30299,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         }
     }
 
@@ -30793,6 +30801,11 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp,
+            // This fixture's whole subject is the holder's INSTANT (it drives
+            // the TTL arms), and as of #652 that is `asserted_at`. The
+            // parameter keeps its name because every call site names the TTL
+            // it is testing, but the two are one value here.
+            asserted_at: scrub_timestamp,
         }
     }
 
@@ -34232,6 +34245,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: "rs".into(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         };
         backend
             .put_blob(
@@ -34326,6 +34340,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: "rs".into(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         };
         backend
             .put_blob(
@@ -34419,6 +34434,7 @@ mod tests {
             scrub_signature_pqc: None,
             scrub_key_id: "rs".into(),
             scrub_timestamp: chrono::Utc::now(),
+            asserted_at: chrono::Utc::now(),
         };
         backend
             .put_blob(
