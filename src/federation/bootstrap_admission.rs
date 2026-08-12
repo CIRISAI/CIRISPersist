@@ -1181,7 +1181,11 @@ pub mod test_support {
     /// # What it pins, on every backend
     ///
     /// (a) the LOCAL door stamps the mirror, so a row is self-describing from
-    /// the moment it is written and not first bound at republication; (b) the
+    /// the moment it is written and not first bound at republication; (a2/a3,
+    /// CIRISPersist#598) it stamps and TRUNCATES `expires_at` too, and clears
+    /// the key when the column is `None` — the two halves of the only binding
+    /// no other test in the tree reaches, because nothing else performs a
+    /// durable local write carrying an expiry; (b) the
     /// promoted row's SIGNED envelope names its POST-promotion scope; (c) THE
     /// WITNESS — a different directory's `put_attestation` ADMITS it; (d) the
     /// pre-#649 shape (promoted columns, envelope signed before the scope
@@ -1255,6 +1259,126 @@ pub mod test_support {
                  unstamped local row is one this substrate's own put door would refuse: {e}"
             )
         });
+
+        // ── (a2) THE LOCAL DOOR STAMPS `expires_at`, AND TRUNCATES IT. ─
+        //
+        // v31.0.0 (CIRISPersist#598). This arm exists because BOTH halves of
+        // the `expires_at` binding were unwitnessed on the durable local path:
+        // dropping the truncation, and never stamping the twin at all, each
+        // left the entire 1878-test corpus byte-identically green. The reason
+        // is narrow and worth stating — `local_row_instant` already truncates
+        // `asserted_at`, so the `asserted_at` half is load-bearing elsewhere and
+        // covered by accident, while `LocalAttestationInput::into_local_row`
+        // copies `input.expires_at` into the COLUMN verbatim and NO test in the
+        // tree performed a durable local write with an `expires_at` at all.
+        //
+        // So the input is deliberately the shape nothing else produces: a
+        // NANOSECOND-precision expiry in the typed field, and an envelope that
+        // does NOT carry it. That makes the two legs separately fatal —
+        //
+        //   - drop the TRUNCATION and the write is REFUSED for sub-microsecond
+        //     precision, because postgres TIMESTAMPTZ cannot store it;
+        //   - drop the TWIN stamp and the write is REFUSED for divergence,
+        //     because the column says `Some` while the envelope says nothing.
+        //
+        // — and it proves the twin is MINTED from the column rather than copied
+        // from a caller who happened to supply both.
+        let ns_expiry = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() + chrono::Duration::days(30),
+        ) + chrono::Duration::nanoseconds(500);
+        let expiring_id = {
+            let mut input = local_input("trust:demo:v1");
+            input.expires_at = Some(ns_expiry);
+            origin
+                .attestation_insert_local(input)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "({tag}) #598 (a2): a durable local write carrying a nanosecond-precision \
+                         `expires_at` must be ADMITTED — the door TRUNCATES to the substrate \
+                         resolution where it mints the signed twin, exactly as it does for \
+                         `asserted_at`. A refusal here means the truncation is gone and every \
+                         producer using `Utc::now()` is now writing rows this substrate rejects: \
+                         {e}"
+                    )
+                })
+        };
+        let expiring = origin
+            .get_attestation(&expiring_id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #598 (a2): the expiring local row exists");
+        let want = crate::federation::admission::truncate_to_substrate_resolution(ns_expiry);
+        assert_eq!(
+            expiring.expires_at,
+            Some(want),
+            "({tag}) #598 (a2): the stored `expires_at` COLUMN must be truncated to the \
+             substrate resolution, not stored verbatim"
+        );
+        assert_eq!(
+            expiring
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::EXPIRES_AT)
+                .and_then(|v| v.as_str()),
+            Some(want.to_rfc3339().as_str()),
+            "({tag}) #598 (a2): and the SIGNED envelope must carry the same instant. The fold \
+             DROPS an expired row, so an `expires_at` no signature covers is an unsigned mute \
+             button on whatever that row retracts"
+        );
+        // The gate itself, over the row as STORED — the same question a peer
+        // asks. Asserting the two fields above proves the stamp; running the
+        // gate proves the stamp is the one the gate accepts.
+        crate::federation::admission::check_instant_binding(
+            &expiring,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #598 (a2): a locally-minted row must already satisfy the instant \
+                 binding — the put door is TIER-BLIND, so a local row that does not is one \
+                 this substrate's own gate would refuse: {e}"
+            )
+        });
+
+        // ── (a3) `None` CLEARS THE KEY — the binding is BOTH directions.
+        // A caller whose envelope still carries a stale `expires_at` while the
+        // typed field is `None`. The door must REMOVE the key, not leave it:
+        // envelope-present / column-`None` is a refusal, and the two fields
+        // have independent sources (`EnvelopeCore` vs `LocalAttestationInput`),
+        // so they can disagree without anybody lying.
+        let cleared_id = {
+            let mut input = local_input("trust:demo:v1");
+            input.attestation_envelope.expires_at =
+                Some("2031-01-01T00:00:00.000000+00:00".to_owned());
+            input.expires_at = None;
+            origin
+                .attestation_insert_local(input)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "({tag}) #598 (a3): a local write whose envelope carries a stale \
+                         `expires_at` and whose column is `None` must be ADMITTED, with the \
+                         stale key CLEARED: {e}"
+                    )
+                })
+        };
+        let cleared = origin
+            .get_attestation(&cleared_id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #598 (a3): the row exists");
+        assert_eq!(cleared.expires_at, None);
+        assert!(
+            cleared
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::EXPIRES_AT)
+                .is_none(),
+            "({tag}) #598 (a3): the signed envelope must not keep an expiry the column does not \
+             have — a row that once carried an expiry and lost it would otherwise be refused \
+             for an expiry it no longer has. Stored envelope: {}",
+            cleared.attestation_envelope
+        );
 
         // ── (b) THE PROMOTION RE-STAMPS WHAT IT RE-SIGNS. ─────────────
         let reseal = ts::reseal_for_scope(&producer, &local, cohort_scope::FEDERATION);
@@ -2272,7 +2396,15 @@ pub mod test_support {
                 let signed =
                     crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
                 row.attestation_envelope = env;
-                crate::federation::tier_ingest::test_support::reseal(&mut row);
+                // Deliberately NOT `reseal`: the seal TRUNCATES to the
+                // substrate resolution, which is the very skew this arm exists
+                // to have refused. Re-sealing here truncated the 500ns away and
+                // re-signed, and then the hand-computed signature below was
+                // written back over the re-sealed envelope — so the row was
+                // refused for a FAILED ED25519 VERIFY while the assertion
+                // demanded the resolution rule. The comment above already
+                // forbade this ("build the sub-microsecond row by hand"); the
+                // call contradicted it.
                 signed
             };
             row.original_content_hash = och;
