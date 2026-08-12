@@ -3638,6 +3638,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST, first thing: the
+        // registration envelope is replaced by its JCS form, so the bytes
+        // bound into `federation_keys.registration_envelope` are the bytes
+        // `verify_key_registration` hashes and the producer signed.
+        // Idempotent, therefore signature-transparent; ahead of the role
+        // lift so every reader below sees one shape.
+        crate::federation::canonical_at_rest::canonicalize_in_place(
+            &mut row.registration_envelope,
+        )?;
         // v19.0.0 (#486) — lift envelope-attested roles into the claim
         // surface BEFORE the role write-gates (lift-then-gate).
         crate::federation::admission::lift_envelope_attested_roles(&mut row);
@@ -4216,6 +4225,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // This tier is IDENTICAL to the SQLite backend's, gate for gate
         // and order for order.
         crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST. The envelope is
+        // replaced by its JCS form HERE, immediately behind the size gate
+        // that BOUNDS the canonicalization it pays for, so every gate below
+        // and every bind site downstream sees exactly the bytes the
+        // producer's signature and `original_content_hash` were taken over.
+        // An operator can then `sha256sum` the stored column and compare it
+        // to `original_content_hash` with no JCS implementation in hand.
+        //
+        // Signature-transparent: canonicalization is IDEMPOTENT (proven in
+        // `federation::canonical_at_rest`), so the hash cross-check and the
+        // hybrid verify further down see byte-identical input to what they
+        // would have seen without this line.
+        //
+        // This tier is IDENTICAL across memory / sqlite / postgres.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
         // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
@@ -5159,6 +5183,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
+        // envelope is stored as the JCS bytes its scrub signature and
+        // `original_content_hash` cover, so the stored column sha256sums to
+        // the declared hash. Idempotent, therefore signature-transparent.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
 
         // v3.4.0 (CIRISPersist#123) — trust gate first.
         if !row.revoking_key_id.is_empty() {

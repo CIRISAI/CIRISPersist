@@ -26,6 +26,22 @@
 //! and JSONB does not preserve the producer's serialization" — and V112
 //! followed it. V122 retrofits the eleven planes that predate it.
 //!
+//! # v31.0.0 (CIRISPersist#647) — the claimed property moved
+//!
+//! The witnesses below no longer claim byte-identity with the PRODUCER. They
+//! claim byte-identity with `ceg_produce_canonicalize(submitted)`, because
+//! [`crate::federation::canonical_at_rest::canonicalize_in_place`] replaces
+//! the envelope with its JCS form at every `put_*` chokepoint.
+//!
+//! Nothing here is weakened. V105's requirement was always byte-exactness
+//! **through our storage**, not byte-identity **with the producer** — and it
+//! is still V122's TEXT column that delivers it: `jsonb` would rewrite even
+//! canonical bytes (`1e+21` renders as `1000000000000000000000` through
+//! `numeric`). What the change adds is the operator-facing property #647
+//! exists for, asserted here on all three backends:
+//! `sha256sum(column) == original_content_hash`
+//! ([`test_support::assert_column_sha256_is_original_content_hash`]).
+//!
 //! # Why the shared body exists
 //!
 //! The bug was **exactly** a backend divergence: the SQLite leg was correct all
@@ -75,17 +91,30 @@ pub(crate) fn awkward_envelope(extra: &[(&str, serde_json::Value)]) -> serde_jso
     v
 }
 
-// Gated on the SQL backends, not just `test`: the two callers are the sqlite
-// and postgres suites, and a DEFAULT-feature `cargo check --all-targets`
-// compiles neither. Without this the body is dead code on the default leg —
-// the same leg that has already cost one red certification.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+// v31.0.0 (#647) — gate widened to plain `#[cfg(test)]`. It used to be gated
+// on the SQL backends because the only two callers were the sqlite and
+// postgres suites, so a DEFAULT-feature `cargo check --all-targets` compiled
+// dead code. #647's canonicalization hook is backend-AGNOSTIC — it runs in
+// each backend's `put_*` — so the memory backend now runs the same body and
+// the parity claim covers all three. The default leg therefore has a live
+// caller and the dead-code hazard the old gate guarded against is gone.
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::awkward_envelope;
     use crate::federation::FederationDirectory;
 
-    /// Assert two envelopes serialize to the identical bytes, naming the column
-    /// so a red says which plane regressed.
+    /// Assert the reloaded envelope's bytes are the CANONICAL form of what
+    /// was submitted, naming the column so a red says which plane regressed.
+    ///
+    /// **v31.0.0 (#647) changed the claimed property.** It used to be
+    /// byte-identity with the producer; it is now byte-identity with
+    /// `ceg_produce_canonicalize(submitted)`, because the ingest chokepoints
+    /// replace the envelope with its canonical form
+    /// ([`crate::federation::canonical_at_rest::canonicalize_in_place`]). The
+    /// V122 requirement is unchanged and still satisfied — *more* robustly:
+    /// what must survive storage is a byte sequence, and a `jsonb` column
+    /// would still rewrite it (canonical `1e+21` renders as
+    /// `1000000000000000000000` through `numeric`). TEXT stays.
     ///
     /// Compares `to_string` output rather than `Value == Value`, because
     /// `Value`'s `PartialEq` under `arbitrary_precision` compares the number
@@ -97,14 +126,50 @@ pub(crate) mod test_support {
         submitted: &serde_json::Value,
         reloaded: &serde_json::Value,
     ) {
-        let a = serde_json::to_string(submitted).expect("submitted serializes");
-        let b = serde_json::to_string(reloaded).expect("reloaded serializes");
+        let expected = String::from_utf8(
+            crate::federation::canonical_at_rest::canonical_bytes(submitted)
+                .expect("the submitted envelope canonicalizes"),
+        )
+        .expect("JCS output is UTF-8");
+        let got = serde_json::to_string(reloaded).expect("reloaded serializes");
         assert_eq!(
-            a, b,
-            "{column} did not round-trip byte-exact. A JSONB column rewrote the \
-             producer's bytes (numbers are the usual axis: 1e+2 -> 100), which moves \
+            expected, got,
+            "{column} did not round-trip as CANONICAL bytes. Either the ingest \
+             chokepoint stopped canonicalizing (#647) or the column stopped \
+             preserving bytes — a JSONB column rewrites them (numbers are the usual \
+             axis: 1e+21 -> 1000000000000000000000), which moves \
              wire_index::content_hash_of and breaks fetch-by-content-hash. The column \
              must be TEXT on BOTH backends — see V122."
+        );
+        // The invariant the operator actually cashes in: the bytes in the
+        // column are the bytes a signature was taken over.
+        crate::federation::canonical_at_rest::check_canonical_at_rest(reloaded)
+            .unwrap_or_else(|e| panic!("{column} is not canonical at rest: {e}"));
+    }
+
+    /// v31.0.0 (#647) — **the operator's own check, run as a test.**
+    ///
+    /// `sha256sum` of the bytes sitting in the column must equal the row's
+    /// `original_content_hash`. That is the whole point of canonical-at-rest:
+    /// an artifact is decipherable by hand, with no JCS implementation
+    /// required to check it.
+    ///
+    /// `reloaded` is the envelope as read back through the REAL read path, so
+    /// `serde_json::to_string(reloaded)` is exactly the byte sequence the
+    /// backend bound into the TEXT column (V122) — asserting here is
+    /// asserting on the column.
+    pub(crate) fn assert_column_sha256_is_original_content_hash(
+        column: &str,
+        reloaded: &serde_json::Value,
+        original_content_hash: &str,
+    ) {
+        use sha2::{Digest as _, Sha256};
+        let stored = serde_json::to_string(reloaded).expect("reloaded serializes");
+        let digest = hex::encode(Sha256::digest(stored.as_bytes()));
+        assert_eq!(
+            digest, original_content_hash,
+            "sha256sum of {column} is not the row's original_content_hash — the \
+             artifact is NOT decipherable by hand at rest.\n  stored: {stored}"
         );
     }
 
@@ -187,6 +252,15 @@ pub(crate) mod test_support {
         // postgres: bf61b57c… on the way in, a6b819b3… on the way out.
         let mut expected = key.clone();
         expected.persist_row_hash = got.persist_row_hash.clone();
+        // v31.0.0 (#647) — the ingest chokepoint canonicalizes, so the
+        // submitted-side record must be canonicalized too before its wire
+        // content hash is comparable. This is NOT weakening the assertion: it
+        // is the whole claim of #647, that the hash is now a function of the
+        // record's LOGICAL content and not of the producer's serializer.
+        crate::federation::canonical_at_rest::canonicalize_in_place(
+            &mut expected.registration_envelope,
+        )
+        .expect("the fixture envelope canonicalizes");
         assert_eq!(
             crate::federation::wire_index::content_hash_of(&expected)
                 .expect("hash the submitted key record"),
@@ -247,6 +321,14 @@ pub(crate) mod test_support {
             "federation_attestations.attestation_envelope",
             &att_envelope,
             &reloaded_att.attestation_envelope,
+        );
+        // v31.0.0 (#647) — hand-verifiability. `original_content_hash` was
+        // computed by the SIGNER, before the row ever reached storage; the
+        // column must sha256sum to it.
+        assert_column_sha256_is_original_content_hash(
+            "federation_attestations.attestation_envelope",
+            &reloaded_att.attestation_envelope,
+            &reloaded_att.original_content_hash,
         );
 
         // ── 3. federation_revocations.revocation_envelope ───────────
@@ -323,6 +405,71 @@ pub(crate) mod test_support {
             "federation_revocations.revocation_envelope",
             &rev_envelope,
             &reloaded_rev.revocation_envelope,
+        );
+        assert_column_sha256_is_original_content_hash(
+            "federation_revocations.revocation_envelope",
+            &reloaded_rev.revocation_envelope,
+            &reloaded_rev.original_content_hash,
+        );
+
+        // ── 4. the PRETTY-PRINTED submission ────────────────────────
+        // The producer-facing half of #647: an envelope submitted with
+        // whitespace, unsorted keys and exponent tokens is stored canonical,
+        // and its `original_content_hash` — computed by the signer over the
+        // canonical form, before storage — still verifies against the column.
+        let pretty_kid = format!("k-647-pretty-{suffix}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &pretty_kid).await;
+        let pretty_src = "{\n  \"zz\": \"last\",\n  \"exp\": 1E+2,\n  \
+                          \"dimension\": \"envelope_bytes:pretty:v1\",\n  \
+                          \"aa\": \"first\"\n}";
+        let pretty_envelope: serde_json::Value =
+            serde_json::from_str(pretty_src).expect("the pretty fixture is legal JSON");
+        let (p_och, p_ed, p_pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &pretty_kid,
+            &pretty_envelope,
+        );
+        let pretty_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: crate::federation::Attestation {
+                attestation_id: pretty_id.clone(),
+                attesting_key_id: pretty_kid.clone(),
+                attested_key_id: pretty_kid.clone(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: pretty_envelope.clone(),
+                original_content_hash: p_och.clone(),
+                scrub_signature_classical: p_ed,
+                scrub_signature_pqc: p_pqc,
+                scrub_key_id: pretty_kid.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![pretty_kid.clone()],
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("a pretty-printed envelope is admitted (and its signature still verifies)");
+        let reloaded_pretty = dir
+            .get_attestation(&pretty_id)
+            .await
+            .expect("get_attestation")
+            .expect("the pretty attestation is there");
+        assert_eq!(
+            serde_json::to_string(&reloaded_pretty.attestation_envelope).expect("serializes"),
+            r#"{"aa":"first","dimension":"envelope_bytes:pretty:v1","exp":100,"zz":"last"}"#,
+            "a pretty-printed submission was not stored canonical"
+        );
+        assert_column_sha256_is_original_content_hash(
+            "federation_attestations.attestation_envelope (pretty submission)",
+            &reloaded_pretty.attestation_envelope,
+            &p_och,
         );
     }
 }

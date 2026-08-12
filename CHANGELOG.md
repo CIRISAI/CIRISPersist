@@ -32,6 +32,81 @@ column on postgres have already lost the producer's numeric literals
 release, and no migration recovers it — re-publish is the only remedy.
 
 
+### Changed — BREAKING — persist stores the CANONICAL envelope now, not the producer's bytes (#647)
+
+Every signature and every `original_content_hash` in this fabric is taken over
+`ceg_produce_canonicalize(envelope)` — the JCS (RFC 8785) bytes. The producer's
+original byte sequence therefore verifies **nothing**. We stored it anyway;
+#644/#645 moved eleven columns to TEXT specifically to preserve it.
+
+v31 stores the canonical form instead. Every `put_attestation`,
+`put_public_key` and `put_revocation`, on all three backends, replaces the
+envelope with its JCS form at ingest
+(`federation::canonical_at_rest::canonicalize_in_place`).
+
+**Why, in the operator's words:** *"the actual artifacts need to be decipherable
+by hand at rest."* With canonical bytes stored, that is now literally true:
+
+```text
+$ sha256sum <(psql -At -c "select attestation_envelope from federation_attestations where attestation_id='…'")
+```
+
+equals the row's `original_content_hash`. With producer bytes stored, an
+operator first had to obtain and run a JCS implementation. The equality is
+asserted as a test on memory, sqlite and postgres
+(`envelope_bytes::test_support::assert_column_sha256_is_original_content_hash`).
+
+It also kills the #644 class at the root: there is no producer token left to
+diverge, so no backend and no column type can disagree about one.
+
+**PROVEN FIRST, implemented second.** The whole design rests on
+`canonicalize(parse(canonicalize(v))) == canonicalize(v)`, and there was no test
+for it anywhere in the crate. There is now
+(`federation::canonical_at_rest::tests`): property tests over arbitrary
+`serde_json::Value`s, over arbitrary number *tokens* (the `arbitrary_precision`
+danger zone — the feature that made #644 live), and over arbitrary JSON *text*,
+plus a mutant guard proving the harness can fail. **Idempotence holds** — 3
+million generated cases plus the hand-picked table, and no counterexample. Had
+it failed, canonical-at-rest would have been unsafe and this would have closed
+WONTFIX.
+
+**What canonicalization is not: lossless.** JCS §3.2.2.3 serializes numbers
+through the ECMAScript `Number::toString` algorithm — i.e. through an IEEE-754
+double. `1E+2` → `100`, `1.000` → `1`, `9007199254740993` →
+`9007199254740992`, `12345678901234567890123` → `1.2345678901234568e+22`,
+`1e-400` → `0`, and `1e400` is a hard refusal. This is not new loss: the hash
+and the signature already went through it, so that precision was never covered
+by any signature. What changes is that it is no longer *retained*. A producer
+needing an exact integer beyond 2^53 must ship it as a string — which was
+already true of anything it wanted a signature to cover.
+
+**One shape is newly refused.** `serde_json`'s writer orders object keys by
+UTF-8 bytes; JCS orders them by UTF-16 code units. They differ only for an
+object holding both a supplementary-plane key (U+10000+) and a key in
+U+E000..=U+FFFF. Such an envelope is refused at ingest rather than stored,
+because its column would not `sha256sum` to its hash. Federation envelope member
+names are ASCII identifiers; nothing in the fabric is affected.
+
+**V122 stands.** TEXT is still required and the migration stays: `jsonb` would
+rewrite even canonical bytes (`1e+21` renders as `1000000000000000000000`
+through `numeric`).
+
+**Canon versioning, stated rather than discovered.** `ceg_produce_canonicalize`
+is versioned (`CanonVersion`, `V2Jcs` since v4.15.0), so stored canonical bytes
+are pinned to the canon version that admitted them. That is not a new exposure —
+a row's *signature* was already pinned to its canon version, which is what
+`canonicalizer_for` reads a per-row signed epoch to resolve. A future canon bump
+faces the same re-publish migration as v31, with or without this change. The
+stored bytes deliberately carry **no** canon-version tag: the version is already
+recoverable from the row's signed epoch, and a second unsigned copy of it in the
+payload would be a forgeable downgrade discriminator.
+
+**No mixed corpus, by operator decision.** Local-tier rows — the ones persist
+authored and can re-sign — are re-minted; federation-tier rows are dropped and
+re-fetched from peers through the replication plane, already in v31 shape. The
+ingest hook is therefore unconditional: no legacy sniff, no dual-read path, no
+tolerance for producer-byte rows.
+
 ### Fixed — JSONB is not a byte-preserving container, and eleven signed envelopes were stored in one (#644)
 
 Eleven columns holding **producer-signed envelope bytes** were `JSONB` on

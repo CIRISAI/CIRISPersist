@@ -44,6 +44,7 @@ pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
 pub mod bootstrap_admission;
+pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
 pub mod community_dek;

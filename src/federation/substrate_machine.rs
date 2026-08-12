@@ -3389,13 +3389,20 @@ mod proptests {
                  Accepting it is worse than refusing: the write is shadowed by the first row, \
                  so the writer believes it landed and never retries"
             ));
+            // v31.0.0 (#647) — the stored envelope is the CANONICAL form of
+            // what was submitted (`put_*` canonicalizes at ingest), so the
+            // "intact" comparison is against that. The claim is unchanged:
+            // the refused second write must not have overwritten the first.
+            let mut expected_first = first.attestation_envelope.clone();
+            crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_first)
+                .expect("the fixture envelope canonicalizes");
             assert_eq!(
                 dir.get_attestation(ID)
                     .await
                     .expect("get")
                     .expect("row")
                     .attestation_envelope,
-                first.attestation_envelope,
+                expected_first,
                 "({name}) the original row is intact"
             );
             assert_eq!(
