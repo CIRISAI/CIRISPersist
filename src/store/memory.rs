@@ -10686,8 +10686,13 @@ mod tests {
         );
         let mut w2 = w1.clone();
         w2.attestation_id = "w-2".into();
-        crate::federation::tier_ingest::test_support::reseal(&mut w2);
+        // v31.0.0 (CIRISPersist#598) — the LATER instant is what makes this a
+        // replay rather than a byte-identical resend, so it is part of what the
+        // seal must cover: set it BEFORE re-sealing, not after. Re-sealing
+        // afterwards left the column at 05-02 and the signed twin at 05-01,
+        // which is the exact divergence the instant-binding gate refuses.
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         backend
             .put_attestation(SignedAttestation { attestation: w1 })
             .await
@@ -13254,6 +13259,13 @@ mod tests {
             &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         );
         d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap()); // past
+                                                                      // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
+                                                                      // now (envelope absent ⇔ column None), so setting the column is a
+                                                                      // re-sign trigger. That is the property under test here, from the other
+                                                                      // side: an expiry a writer could set ALONE would be an unsigned mute
+                                                                      // button, and this fixture's whole premise is that the expiry is what
+                                                                      // kills the delegation's liveness.
+        resign_fix(&mut d);
         backend
             .put_attestation(SignedAttestation { attestation: d })
             .await
@@ -15825,10 +15837,16 @@ mod tests {
         seed_ob_keys(&backend).await;
         seed_second_owner(&backend, "ob-owner2").await;
 
-        // An already-expired incumbent binding (expires_at is a row field, not
-        // in the signed envelope, so the ingest signature is unaffected).
+        // An already-expired incumbent binding. v31.0.0 (CIRISPersist#598) —
+        // this comment used to read "expires_at is a row field, not in the
+        // signed envelope, so the ingest signature is unaffected". That
+        // sentence WAS the vulnerability: an expiry only the column carried was
+        // an unsigned mute button, since every consent fold DROPS an expired
+        // row. `expires_at` is now bound in both directions, so moving it is a
+        // re-sign trigger exactly like moving the envelope.
         let mut expired = fix_owner_binding("ob-b1", "ob-owner", "ob-node");
         expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        resign_fix(&mut expired);
         backend
             .put_attestation(SignedAttestation {
                 attestation: expired,
