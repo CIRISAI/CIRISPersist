@@ -31,6 +31,12 @@ pub use bundle::{
     GenesisAuthorization, GenesisBakeReport, GenesisBundle,
 };
 
+pub mod posture;
+pub use posture::{
+    constitutional_seat, genesis_posture, require_constitutional_root, GenesisFault, GenesisLeg,
+    GenesisPosture, ROOT_REQUIRING_GATES,
+};
+
 use super::SignedKeyRecord;
 
 /// The baked HUMANITY_ACCORD holder records (A1/B1/C1) — the #268 ceremony's
@@ -224,10 +230,16 @@ pub fn effective_accord_holder_records() -> std::borrow::Cow<'static, [SignedKey
 /// [`accord_holder_bootstrap_anchor`](ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor)
 /// pubkey is live as a seeded self-signed `accord_holder` row, and that the
 /// seeded set is *exactly* the anchor (no missing holder, no divergent pubkey
-/// squatting a holder `key_id`). Run at boot right after the seed; `Err` is a
-/// constitutional-safety fault the caller surfaces as
-/// [`EngineError::GenesisSeed`](crate::engine::EngineError::GenesisSeed).
-pub async fn verify_anchor_seeded<D>(dir: &D) -> Result<(), String>
+/// squatting a holder `key_id`). Run at boot right after the seed.
+///
+/// v31.0.0 (CIRISPersist#648) — the `Err` arm is now a typed [`GenesisFault`]
+/// rather than a `String`, because the two things it fused have opposite
+/// consequences: a holder row that was never seeded is a node before its
+/// ceremony ([`GenesisFault::Absent`] — boot proceeds, the gates refuse), while
+/// a holder `key_id` present with somebody else's pubkey is anchor SQUATTING
+/// ([`GenesisFault::Divergent`] — boot still refuses). Fusing them is why the
+/// seed had to be unconditional.
+pub async fn verify_anchor_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
@@ -247,40 +259,58 @@ where
             .collect();
     let mut present: HashSet<[u8; 32]> = HashSet::new();
 
+    const LEG: GenesisLeg = GenesisLeg::Anchor;
     let records = effective_accord_holder_records();
     for sr in records.iter() {
         let r = &sr.record;
         let row = dir
             .lookup_public_key(&r.key_id)
             .await
-            .map_err(|e| format!("lookup {}: {e}", r.key_id))?
-            .ok_or_else(|| format!("accord holder {} not seeded", r.key_id))?;
+            // The backend refused the question — honestly unknown, never
+            // guessed, and never `Absent` (which would let a node whose
+            // directory is unreadable boot as if it were merely young).
+            .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup {}: {e}", r.key_id)))?
+            // NOT seeded — the pre-genesis arm. Boot proceeds; every gate in
+            // `ROOT_REQUIRING_GATES` refuses (CIRISPersist#648).
+            .ok_or_else(|| {
+                GenesisFault::absent(LEG, format!("accord holder {} not seeded", r.key_id))
+            })?;
         // A conflicting pre-existing row (same key_id, different pubkey) must
-        // fail — `ON CONFLICT DO NOTHING` would have skipped our insert.
+        // fail — `ON CONFLICT DO NOTHING` would have skipped our insert. This
+        // is SQUATTING, not absence: somebody's key already answers to a
+        // constitutional holder's name, and #648 does not make that survivable.
         if row.pubkey_ed25519_base64 != r.pubkey_ed25519_base64 {
-            return Err(format!(
-                "accord holder {} present with a divergent pubkey (anchor squatting)",
-                r.key_id
+            return Err(GenesisFault::divergent(
+                LEG,
+                format!(
+                    "accord holder {} present with a divergent pubkey (anchor squatting)",
+                    r.key_id
+                ),
             ));
         }
         let ed: [u8; 32] = B64
             .decode(&row.pubkey_ed25519_base64)
-            .map_err(|e| format!("{} pubkey b64: {e}", r.key_id))?
+            .map_err(|e| GenesisFault::divergent(LEG, format!("{} pubkey b64: {e}", r.key_id)))?
             .try_into()
-            .map_err(|_| format!("{} pubkey not 32 bytes", r.key_id))?;
+            .map_err(|_| {
+                GenesisFault::divergent(LEG, format!("{} pubkey not 32 bytes", r.key_id))
+            })?;
         if !anchor.contains(&ed) {
-            return Err(format!(
-                "seeded holder {} is not a pinned anchor key",
-                r.key_id
+            return Err(GenesisFault::divergent(
+                LEG,
+                format!("seeded holder {} is not a pinned anchor key", r.key_id),
             ));
         }
         present.insert(ed);
     }
     if present != anchor {
-        return Err(format!(
-            "seeded anchor set (n={}) does not equal accord_holder_bootstrap_anchor() (n={})",
-            present.len(),
-            anchor.len()
+        return Err(GenesisFault::divergent(
+            LEG,
+            format!(
+                "seeded anchor set (n={}) does not equal accord_holder_bootstrap_anchor() (n={})",
+                present.len(),
+                anchor.len()
+            ),
         ));
     }
     Ok(())
@@ -337,15 +367,23 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
 ///
 /// Idempotent: skips when the row is already present (reboot), inserts on first
 /// boot. Same bake-what-exists trust model as the holder seed.
-pub async fn seed_accord_family<D>(dir: &D) -> Result<(), String>
+pub async fn seed_accord_family<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
+    const LEG: GenesisLeg = GenesisLeg::Family;
     let family = accord_family_genesis_record();
+    // v31.0.0 (CIRISPersist#648) — THE property that keeps a second assemble
+    // from becoming a replacement. An already-entrenched family is a no-op and
+    // has been since #386; making the pre-genesis state reachable must not make
+    // OVERWRITING an established root reachable, so this early return is
+    // load-bearing rather than an optimisation. A new ceremony ADDS a root
+    // (roots co-exist and are addressed per-`root_ref`); nothing here mutates
+    // one that already stands.
     if dir
         .lookup_family(&family.family_key_id)
         .await
-        .map_err(|e| format!("lookup_family: {e}"))?
+        .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
         .is_some()
     {
         return Ok(()); // already entrenched (reboot) — idempotent no-op.
@@ -355,9 +393,12 @@ where
     // bake-what-exists declaration with no private key to sign with
     // (`family_key_id` is keyless by design, see `put_family_local`'s doc).
     // Use the trusted-local bypass, exactly as this boot path always has.
-    dir.put_family_local(family)
-        .await
-        .map_err(|e| format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"))
+    dir.put_family_local(family).await.map_err(|e| {
+        GenesisFault::absent(
+            LEG,
+            format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"),
+        )
+    })
 }
 
 /// Fail-secure presence check (CIRISPersist#386): the baked HUMANITY_ACCORD
@@ -365,30 +406,42 @@ where
 /// A1/B1/C1 founder seat set. Run at boot right after [`seed_accord_family`];
 /// `Err` is surfaced as
 /// [`EngineError::GenesisSeed`](crate::engine::EngineError::GenesisSeed).
-pub async fn verify_family_seeded<D>(dir: &D) -> Result<(), String>
+pub async fn verify_family_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
+    const LEG: GenesisLeg = GenesisLeg::Family;
     let expected = accord_family_genesis_record();
     let row = dir
         .lookup_family(&expected.family_key_id)
         .await
-        .map_err(|e| format!("lookup_family: {e}"))?
-        .ok_or_else(|| format!("accord family {} not seeded", expected.family_key_id))?;
+        .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
+        .ok_or_else(|| {
+            GenesisFault::absent(
+                LEG,
+                format!("accord family {} not seeded", expected.family_key_id),
+            )
+        })?;
+    // Present-and-WRONG on either axis is divergence, not youth: the threshold
+    // and the seats are exactly what an accord m-of-n is measured by, and a
+    // mutated one is an altered root wearing the constitutional name.
     if row.consensus_protocol != expected.consensus_protocol || !row.consensus_protocol_entrenched {
-        return Err(format!(
+        return Err(GenesisFault::divergent(LEG, format!(
             "seeded accord family {} has non-entrenched / divergent protocol (got {:?}, entrenched={})",
             expected.family_key_id, row.consensus_protocol, row.consensus_protocol_entrenched
-        ));
+        )));
     }
     let seats: std::collections::BTreeSet<&str> =
         row.members.iter().map(|m| m.key_id.as_str()).collect();
     let want: std::collections::BTreeSet<&str> =
         expected.members.iter().map(|m| m.key_id.as_str()).collect();
     if seats != want {
-        return Err(format!(
-            "seeded accord family {} seats {seats:?} != the founder set {want:?}",
-            expected.family_key_id
+        return Err(GenesisFault::divergent(
+            LEG,
+            format!(
+                "seeded accord family {} seats {seats:?} != the founder set {want:?}",
+                expected.family_key_id
+            ),
         ));
     }
     Ok(())
@@ -467,10 +520,11 @@ pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
 /// present is a `put_public_key` no-op; a `key_id` collision with different
 /// content surfaces as an `Err` (never a silent overwrite — the same
 /// trust-root-takeover invariant as the family bake).
-pub async fn seed_canonical_servers<D>(dir: &D) -> Result<(), String>
+pub async fn seed_canonical_servers<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
+    const LEG: GenesisLeg = GenesisLeg::Canonical;
     for sr in &canonical_genesis_bundle().serve_nodes {
         let kid = &sr.record.key_id;
         // Branch on the EXISTING row's shape (CIRISPersist#394 + #410):
@@ -492,7 +546,7 @@ where
         let existing = dir
             .lookup_public_key(kid)
             .await
-            .map_err(|e| format!("lookup canonical {kid}: {e}"))?;
+            .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup canonical {kid}: {e}")))?;
         let res: Result<(), crate::federation::Error> = match existing {
             None => dir.put_public_key(sr.clone()).await,
             Some(row) if row.scrub_key_id == row.key_id => {
@@ -523,8 +577,19 @@ where
                 }
             }
         };
+        // v31.0.0 (CIRISPersist#648) — a refused canonical bake is `Absent`,
+        // never `Divergent`: the byte-exact-else-`Err` discipline above already
+        // makes a genuine takeover attempt impossible to install, and the state
+        // 31.0.0 actually ships in is precisely this one — a baked bundle whose
+        // pre-#643 attestations no longer bind, so the canonical leg does not
+        // land. That is a node awaiting its ceremony, and it boots.
         res.map_err(|e| {
-            format!("seed canonical server {kid}: {e} (are A1/B1 holders + accord family seeded first?)")
+            GenesisFault::absent(
+                LEG,
+                format!(
+                "seed canonical server {kid}: {e} (are A1/B1 holders + accord family seeded first?)"
+            ),
+            )
         })?;
     }
     Ok(())
@@ -534,30 +599,70 @@ where
 /// is live with matching pubkey and the `canonical` role still conferred. Run
 /// at boot right after [`seed_canonical_servers`]; `Err` surfaces as
 /// [`EngineError::GenesisSeed`](crate::engine::EngineError::GenesisSeed).
-pub async fn verify_canonical_seeded<D>(dir: &D) -> Result<(), String>
+pub async fn verify_canonical_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
     use crate::federation::types::identity_type;
+    const LEG: GenesisLeg = GenesisLeg::Canonical;
     for sr in &canonical_genesis_bundle().serve_nodes {
         let r = &sr.record;
         let row = dir
             .lookup_public_key(&r.key_id)
             .await
-            .map_err(|e| format!("lookup {}: {e}", r.key_id))?
-            .ok_or_else(|| format!("canonical server {} not seeded", r.key_id))?;
+            .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup {}: {e}", r.key_id)))?
+            .ok_or_else(|| {
+                GenesisFault::absent(LEG, format!("canonical server {} not seeded", r.key_id))
+            })?;
         if row.pubkey_ed25519_base64 != r.pubkey_ed25519_base64 {
-            return Err(format!(
-                "canonical server {} present with a divergent pubkey (squatting)",
-                r.key_id
+            return Err(GenesisFault::divergent(
+                LEG,
+                format!(
+                    "canonical server {} present with a divergent pubkey (squatting)",
+                    r.key_id
+                ),
             ));
         }
         if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
-            return Err(format!(
-                "seeded canonical server {} lost its `canonical` role (identity_type={:?})",
-                r.key_id, row.identity_type
+            return Err(GenesisFault::divergent(
+                LEG,
+                format!(
+                    "seeded canonical server {} lost its `canonical` role (identity_type={:?})",
+                    r.key_id, row.identity_type
+                ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#648) — **is this bundle's delegation plane bound to
+/// its typed columns (CIRISPersist#643), i.e. is it a v31-shaped bundle?**
+///
+/// `Ok(())` when every attestation the bundle carries passes
+/// [`check_row_column_binding`](crate::federation::admission::check_row_column_binding);
+/// `Err` naming the first that does not.
+///
+/// # Why a predicate and not a version flag
+///
+/// The baked `canonical_seed.json` was signed before the #643 row mirror
+/// existed, so its `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle`
+/// rows are refused at every `put_attestation` — correctly, and that gate must
+/// not be weakened to bake a stale artifact (it closes the verb-substitution
+/// and authority-injection attacks; a genesis-shaped carve-out would be a
+/// permanent hole in exactly the rows that grant everything).
+///
+/// The four genesis tests that fail on that refusal are made honest by asking
+/// this question rather than by being skipped: they assert the REFUSAL while
+/// the baked bundle is pre-v31, and assert INSTALLATION once it is re-signed.
+/// The assertion inverts on the artifact, not on a hand-edited expectation, so
+/// 31.1.0's re-bake turns the seed-install witnesses back on by itself and
+/// nobody has to remember to.
+#[must_use = "the caller branches on which regime the baked bundle is in"]
+pub fn bundle_delegation_plane_row_bound(bundle: &GenesisBundle) -> Result<(), String> {
+    for att in &bundle.attestations {
+        crate::federation::admission::check_row_column_binding(&att.attestation)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -583,6 +688,26 @@ where
 ///
 /// Run against the pre-V121 Postgres schema this fails with
 /// `attestation_id is not a valid UUID`, which is the dye test.
+///
+/// # v31.0.0 (CIRISPersist#648) — the delegation-plane half is regime-branched
+///
+/// The KEY plane assertions below are unchanged and still run on every backend:
+/// they are the #622 witness and nothing about #648 touches them.
+///
+/// The ATTESTATION half cannot pass while the baked bundle predates #643 — its
+/// rows carry no signed `row` mirror, so `put_attestation` refuses them at
+/// every backend, deliberately and correctly. This witness is therefore
+/// branched on [`bundle_delegation_plane_row_bound`] rather than skipped:
+///
+/// - **pre-v31 bundle** — assert the rows are REFUSED, with the #643 reason,
+///   and that NOTHING was written. That is a real property of a real build and
+///   it is the state 31.0.0 ships in; asserting it is not a carve-out, it is
+///   the honest form of the same test.
+/// - **re-signed bundle (31.1.0)** — assert the original: installs on every
+///   backend, byte-exact id round-trip.
+///
+/// The branch is taken from the ARTIFACT, so 31.1.0's re-bake flips this back
+/// to the install assertions without anyone editing the test.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDirectory) {
     // NOTE: each leg seeds the accord holders BEFORE calling this, via the
@@ -610,29 +735,55 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
     // `attestation_id` was `UUID`, and it is why a witness that only seeds keys
     // passes on the broken schema and proves nothing. (It did: the first version
     // of this body was green on unfixed Postgres.)
-    for att in &canonical_genesis_bundle().attestations {
-        dir.put_attestation(att.clone()).await.unwrap_or_else(|e| {
-            panic!(
-                "genesis attestation {:?} must install on EVERY backend: {e}",
-                att.attestation.attestation_id
-            )
-        });
-        let back = dir
-            .get_attestation(&att.attestation.attestation_id)
-            .await
-            .expect("read back")
-            .unwrap_or_else(|| {
-                panic!(
-                    "genesis attestation {:?} vanished after write",
-                    att.attestation.attestation_id
-                )
-            });
-        // Byte-exact: a backend that rewrote the id (to a UUID, say) would break
-        // every signature over the envelope that names it.
-        assert_eq!(
-            back.attestation_id, att.attestation.attestation_id,
-            "the id the ceremony SIGNED must round-trip unchanged"
-        );
+    let bundle = canonical_genesis_bundle();
+    let row_bound = bundle_delegation_plane_row_bound(bundle);
+    for att in &bundle.attestations {
+        let id = &att.attestation.attestation_id;
+        match &row_bound {
+            // ── 31.1.0 and after: the re-signed bundle installs, as it always
+            //    should have. This arm is the original #622 assertion verbatim.
+            Ok(()) => {
+                dir.put_attestation(att.clone()).await.unwrap_or_else(|e| {
+                    panic!("genesis attestation {id:?} must install on EVERY backend: {e}")
+                });
+                let back = dir
+                    .get_attestation(id)
+                    .await
+                    .expect("read back")
+                    .unwrap_or_else(|| panic!("genesis attestation {id:?} vanished after write"));
+                // Byte-exact: a backend that rewrote the id (to a UUID, say)
+                // would break every signature over the envelope that names it.
+                assert_eq!(
+                    back.attestation_id, *id,
+                    "the id the ceremony SIGNED must round-trip unchanged"
+                );
+            }
+            // ── 31.0.0: the baked bundle predates #643. The rows are refused,
+            //    on EVERY backend, for the SAME reason — which is itself the
+            //    three-backend property #622 exists to hold, just with the
+            //    outcome the current artifact actually earns. A backend that
+            //    ADMITTED one of these would be a backend with a hole in the
+            //    binding gate, and this reds on it.
+            Err(_) => {
+                let err = dir.put_attestation(att.clone()).await.expect_err(
+                    "a pre-v31 genesis attestation must be REFUSED by the #643 row-binding \
+                     gate on EVERY backend",
+                );
+                assert_eq!(
+                    err.kind(),
+                    "federation_invalid_argument",
+                    "the refusal is the #643 row-binding gate, not a backend accident"
+                );
+                assert!(
+                    err.to_string().contains("CIRISPersist#643"),
+                    "the refusal names the gate that refused: {err}"
+                );
+                assert!(
+                    dir.get_attestation(id).await.expect("read back").is_none(),
+                    "a refused genesis row writes NOTHING — verify-before-mutation"
+                );
+            }
+        }
     }
 }
 
@@ -654,7 +805,7 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
 /// [`FederationDirectory`] (pg/sqlite-symmetric); `seed_canonical_servers`
 /// verifies the 2-of-3 against the just-seeded A1/B1 anchor, so ordering is
 /// load-bearing and fail-secure.
-pub async fn seed_family_and_canonical<D>(dir: &D) -> Result<(), String>
+pub async fn seed_family_and_canonical<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
@@ -741,6 +892,43 @@ mod tests {
             sq.put_public_key(rec.clone())
                 .await
                 .expect("serve node admits");
+        }
+        // v31.0.0 (CIRISPersist#648) — the dry run's FIRST finding is whether
+        // the candidate is even in the right regime. A bundle whose delegation
+        // plane predates #643 carries no signed `row` mirror, so every
+        // `put_attestation` refuses it; that is the gate closing the
+        // verb-substitution and authority-injection attacks and it is not to be
+        // weakened to bake a stale artifact.
+        //
+        // So the dry run REPORTS that verdict instead of asserting through it.
+        // For a pre-v31 candidate the honest ceremony finding is "re-sign under
+        // the #643 envelope shape and run this again" — which is precisely the
+        // operator's 31.0.0 → 31.1.0 plan — and the refusal is asserted rather
+        // than skipped. For a re-signed candidate the full trust-root walk runs
+        // as before, on the artifact, with nobody editing the test.
+        if let Err(why) = bundle_delegation_plane_row_bound(&b) {
+            eprintln!("DRYRUN: candidate is PRE-v31 (delegation plane not row-bound): {why}");
+            for att in &b.attestations {
+                let err = sq
+                    .put_attestation(SignedAttestation {
+                        attestation: att.attestation.clone(),
+                    })
+                    .await
+                    .expect_err("a pre-#643 candidate attestation must be REFUSED, not baked");
+                assert!(
+                    err.to_string().contains("CIRISPersist#643"),
+                    "the refusal names the binding gate: {err}"
+                );
+            }
+            eprintln!(
+                "DRYRUN: PASS (pre-v31 regime) — quorum verified over {n} authorizations, keys \
+                 admitted, and all {} delegation rows correctly REFUSED by the #643 gate. \
+                 FINDING: this candidate must be re-signed under the #643 envelope shape \
+                 before it can serve as a trust root. The trust-root walk below returns with \
+                 the re-baked bundle in 31.1.0.",
+                b.attestations.len()
+            );
+            return;
         }
         for att in &b.attestations {
             sq.put_attestation(SignedAttestation {

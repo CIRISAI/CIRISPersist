@@ -6599,6 +6599,17 @@ pub async fn check_canonical_role_admission_over_roster(
         return Ok(());
     }
 
+    // (1b) v31.0.0 (CIRISPersist#648) — AFTER the fast path, never before: a
+    // pre-genesis node must still be able to register the ordinary identities
+    // that RUN its ceremony, and only the gated claim is refused. The
+    // enumerated fail-closed chokepoint; see `genesis::posture`.
+    super::genesis::posture::require_seated_accord_roster(
+        directory,
+        super::genesis::posture::CANONICAL_ROLE_ADMISSION,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
     // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
     // successor whose tombstone names THIS key_id is exempt (rotate-in).
@@ -7073,6 +7084,15 @@ pub async fn check_infra_attest_role_admission_over_roster(
         return Ok(());
     }
 
+    // (1b) v31.0.0 (CIRISPersist#648) — the enumerated fail-closed chokepoint,
+    // after the fast path. See `check_canonical_role_admission_over_roster`.
+    super::genesis::posture::require_seated_accord_roster(
+        directory,
+        super::genesis::posture::INFRA_ATTEST_ROLE_ADMISSION,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#424, the #377 rule generalized): a quorum-withdrawn
     // key stays refused EVEN with a valid co-scrub set — the ADD gate is
     // monotonic and anti-entropy re-runs it, so without this consult a peer
@@ -7362,6 +7382,15 @@ pub async fn check_accord_role_admission_over_roster(
     if !row.claims_role(role) {
         return Ok(());
     }
+
+    // (1b) v31.0.0 (CIRISPersist#648) — the enumerated fail-closed chokepoint,
+    // after the fast path. See `check_canonical_role_admission_over_roster`.
+    super::genesis::posture::require_seated_accord_roster(
+        directory,
+        super::genesis::posture::ACCORD_ROLE_ADMISSION,
+        roster_key_ids,
+    )
+    .await?;
 
     // (2) Revocation-wins (#377/#424): a quorum-withdrawn (role, key_id) stays
     // refused EVEN with a valid co-scrub set; a SUPERSEDE successor whose
@@ -7724,6 +7753,18 @@ async fn verify_canonical_authority_over_roster(
         key_id: target_key_id.to_owned(),
         reason,
     };
+
+    // (0) v31.0.0 (CIRISPersist#648) — the enumerated fail-closed chokepoint.
+    // The step-(5) threshold below already refuses an empty roster (`m` floors
+    // at 1 while `n` is 0), but INCIDENTALLY: that refusal survives only while
+    // nobody changes the floor or seeds a partial roster. A destructive
+    // constitutional op on a node with no constitution says so.
+    super::genesis::posture::require_seated_accord_roster(
+        directory,
+        super::genesis::posture::CANONICAL_WITHDRAW_AUTHORITY,
+        roster_key_ids,
+    )
+    .await?;
 
     // (1) The proposal MUST be stored (a caller cannot invent one).
     let stored = directory
@@ -12520,7 +12561,7 @@ mod tests {
 /// connection (they cannot execute inside the pool's transactioned session);
 /// `DROP … WITH (FORCE)` terminates any lingering pool session.
 #[cfg(all(test, feature = "postgres"))]
-async fn run_in_isolated_pg_db<F, Fut>(base_dsn: &str, body: F)
+pub(crate) async fn run_in_isolated_pg_db<F, Fut>(base_dsn: &str, body: F)
 where
     F: FnOnce(crate::store::postgres::PostgresBackend) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -13617,6 +13658,24 @@ mod canonical_gate_tests {
     /// backend): every constitutional role self-claim is refused with the
     /// SAME error kind regardless of which role surface carries it.
     async fn run_set_path_parity(dir: &dyn FederationDirectory, tag: &str) {
+        // v31.0.0 (CIRISPersist#648) — seat the accord roster first.
+        //
+        // This harness ran on a bare backend, which meant every refusal below
+        // came from the EMPTY-ROSTER accident (`m` floors at 1 while `n` is 0,
+        // so `m > n` refuses) and not one of them reached the conferral gate
+        // this test is named after. Now that the empty roster is refused
+        // explicitly — `federation_no_constitutional_root_yet`, the #648
+        // anti-fail-open chokepoint — the accident is visible, so the fixture
+        // seats a roster and the assertions below judge what they claim to.
+        //
+        // Plain `node` rows under the roster key_ids: they RESOLVE (so the
+        // roster is non-empty and the conferral gate runs), and their pubkeys
+        // are nobody's accord holder (so no scrub in this test can ever verify
+        // against them). The conferral gate is what refuses, on the merits.
+        for kid in accord_holder_roster_key_ids() {
+            let _ = put(dir, record(&kid, identity_type::NODE, &kid)).await;
+        }
+
         // (a) `canonical` in the roles VECTOR — the #441 probe case.
         let kid = format!("sp-canon-roles-{tag}");
         let mut rec = record(&kid, identity_type::NODE, &kid);

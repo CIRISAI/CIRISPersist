@@ -21448,6 +21448,32 @@ mod tests {
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
     }
 
+    /// v31.0.0 (CIRISPersist#648) — the POSTGRES leg of the **anti-fail-open**
+    /// witness (see the memory + sqlite legs): a node with no accord roster
+    /// refuses every root-requiring gate with the typed
+    /// `federation_no_constitutional_root_yet`.
+    ///
+    /// Runs in an ISOLATED throwaway database rather than the shared test db:
+    /// the witness needs a directory with genuinely no accord roster, and the
+    /// shared db carries whatever a concurrent Engine-constructing test seeded.
+    /// A witness that silently ran against a seeded directory would assert
+    /// nothing, which is why the harness opens by refusing to proceed on one.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn seedless_gate_refusals_parity_postgres_648() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            crate::federation::genesis::posture::exercise_seedless_gate_refusals(
+                &backend, "postgres",
+            )
+            .await;
+        })
+        .await;
+    }
+
     /// v30.3.0 (CIRISPersist#611) — the POSTGRES leg of the shared
     /// publisher-vouch-conferral witness (see the memory + sqlite legs).
     #[tokio::test]

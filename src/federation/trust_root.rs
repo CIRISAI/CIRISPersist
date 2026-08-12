@@ -1736,6 +1736,42 @@ where
     // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
     // item 2 — see the type-level doc.
     let Some(family) = resolve_family_root(directory, &row.attested_key_id).await? else {
+        // v31.0.0 (CIRISPersist#648) — EXCEPT when the subject is the
+        // constitutional accord family itself.
+        //
+        // This early return is the #632 inversion in miniature: the quorum
+        // check is skipped because the family row cannot be found, so on a
+        // PRE-GENESIS node — the state 31.0.0 ships in — a
+        // `delegates_to(anyone → "humanity-accord")` labelled
+        // `trust:charter:v1` was admitted with no quorum and no pre-rotation
+        // commitment at all. The row is inert at read time (the family arm of
+        // `trust_root_valid` re-derives the quorum), but "the write gate is
+        // off" is not a thing to leave true because a later read happens to
+        // catch it. Absence of the family is not absence of the rule ABOUT the
+        // family.
+        //
+        // The degrade-to-no-op contract is otherwise unchanged: for any OTHER
+        // subject an unanswerable family question still writes the row and
+        // leaves the walk to refuse it.
+        //
+        // The refusal is raised HERE rather than delegated to
+        // `require_constitutional_root`, because the missing leg is the FAMILY
+        // and that chokepoint deliberately gates on the roster alone (a
+        // ceremony seats the roster, then confers; demanding the family row
+        // would refuse the ceremony). This gate's authority genuinely IS the
+        // family row, so its absence is its own refusal.
+        if row.attested_key_id == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID {
+            return Err(Error::NoConstitutionalRootYet {
+                operation: super::genesis::posture::FAMILY_CHARTER_ADMISSION,
+                leg: super::genesis::GenesisLeg::Family,
+                fault_kind: "absent",
+                detail: format!(
+                    "a `{TRUST_CHARTER_DIMENSION}` naming {} cannot be judged: this node holds \
+                     no such family, so the quorum it must carry cannot be re-derived",
+                    row.attested_key_id
+                ),
+            });
+        }
         return Ok(());
     };
 

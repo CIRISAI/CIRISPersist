@@ -83,15 +83,22 @@ peer-replicate = []
 # CI's pytest job is the only consumer.
 test-panic = []
 
-# v13.3.1 (CIRISPersist#387) — TEST-ONLY seam: exposes
-# `Engine::with_signer_no_genesis_seed`, which connects + migrates but
-# SKIPS the unconditional HUMANITY_ACCORD holder + family genesis seed.
-# Prod builds MUST NOT enable this (a node with no baked trust root is
-# broken); default-off so it is absent from release builds. Downstream
-# integration tests (e.g. CIRISServer) enable it in `[dev-dependencies]`
-# to assemble a controllable custom-holder family without the baked
-# A1/B1/C1 + family blocking them. Same test-only pattern as `test-panic`.
-test-genesis-seam = []
+# v31.0.0 (CIRISPersist#648) — `test-genesis-seam` is REMOVED, SUBSUMED by the
+# supported `Engine::with_signer_pre_genesis`.
+#
+# It existed (v13.3.1, #387) to expose `with_signer_no_genesis_seed` to
+# downstream integration tests only, on the reasoning that "a node with no
+# baked trust root is broken". 31.0.0 is the release that disproves that: it is
+# the binary that runs the genesis ceremony which produces the root a later cut
+# bakes, so booting without one is a supported production state, not a test
+# seam. Keeping the fence would have meant two names for one boot mode, with
+# the release builds carrying the one that cannot reach it.
+#
+# Callers that enabled `test-genesis-seam` in `[dev-dependencies]` drop the
+# feature and call `Engine::with_signer_pre_genesis` on a default build. The
+# state is not a relaxation: every gate in
+# `federation::genesis::ROOT_REQUIRING_GATES` refuses with
+# `federation_no_constitutional_root_yet` until a ceremony completes.
 
 # v0.6.0 (CIRISPersist#19) — post-ingest filter pipeline features.
 # Match FSD §2.4 shape. Lens-side scrub + extract code lift in
