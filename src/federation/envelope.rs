@@ -354,6 +354,20 @@ impl RowMirror {
         mirror.insert_into(envelope, &row.attestation_id)
     }
 
+    /// [`Self::stamp_into`] for a producer that owns the whole row — it stamps
+    /// the row's mirror into the row's OWN envelope.
+    ///
+    /// Exists because `stamp_into(&mut row.attestation_envelope, &row)` cannot
+    /// borrow-check: the projection is read from the same value it writes back
+    /// into. Taking `&mut Attestation` and sequencing the two internally is the
+    /// only spelling that compiles, so it is the only one every whole-row
+    /// producer should use.
+    pub fn stamp_row(row: &mut super::Attestation) -> Result<(), super::Error> {
+        let mirror = Self::of(row)?;
+        let attestation_id = row.attestation_id.clone();
+        mirror.insert_into(&mut row.attestation_envelope, &attestation_id)
+    }
+
     /// The ONE write of [`paths::ROW`] — every stamping entry point funnels
     /// here so there is one placement as well as one projection.
     fn insert_into(
@@ -457,6 +471,16 @@ impl RowMirror {
     /// check; it is checked where the signature is (`put_attestation`, and the
     /// promote door the SLA watcher drives it through), not silently written
     /// here.
+    ///
+    /// # The instants ride the same rule (v31.0.0, CIRISPersist#598)
+    ///
+    /// [`crate::federation::admission::check_instant_binding`] covers EVERY
+    /// dimension as of this cut, so consequence 1 above is now true one field
+    /// over: a local row whose envelope carries no signed `asserted_at` is a
+    /// row this substrate's own put door refuses. The stamp therefore places
+    /// the instants as well as the mirror — through
+    /// [`stamp_signed_instants`], the one placement — and the transit
+    /// exclusion below governs both for exactly the same reason.
     pub fn stamp_local_row(
         row: &mut super::Attestation,
         caller_signed: bool,
@@ -464,10 +488,72 @@ impl RowMirror {
         if caller_signed {
             return Ok(());
         }
-        let mirror = Self::of(row)?;
-        let attestation_id = row.attestation_id.clone();
-        mirror.insert_into(&mut row.attestation_envelope, &attestation_id)
+        stamp_signed_instants(row)?;
+        Self::stamp_row(row)
     }
+}
+
+/// v31.0.0 (CIRISPersist#598) — **the ONE placement of the signed instants**,
+/// the [`RowMirror::stamp_into`] discipline for the two fields the mirror does
+/// not carry.
+///
+/// [`crate::federation::admission::check_instant_binding`] binds
+/// `asserted_at` and `expires_at` to their signed twins on every row of every
+/// dimension. Three producers must satisfy it, and each one MINTS the bytes it
+/// is about to sign: the emit path
+/// ([`crate::federation::attestation_emit::stamp_and_canonicalize`], which
+/// stamps from its typed input before a row exists), the local-tier write
+/// ([`RowMirror::stamp_local_row`]), and the fixture seal
+/// (`tier_ingest::test_support::seal_row_in_place`). The latter two have a row
+/// in hand and share this function, because a copied projection is a second
+/// definition of the binding and this substrate has a recorded defect class
+/// for exactly that.
+///
+/// Both columns are truncated to the substrate resolution FIRST, then written
+/// to the envelope from the truncated columns — the same order
+/// `stamp_and_canonicalize` uses. The gate REFUSES sub-microsecond precision
+/// rather than rounding it (see
+/// [`crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS`]), and
+/// `chrono::Utc::now()` is nanosecond-precise, so truncating where the signed
+/// twin is minted keeps column and twin equal BY CONSTRUCTION rather than by
+/// the caller remembering.
+///
+/// `expires_at` is bound in BOTH directions, so `None` REMOVES the key rather
+/// than leaving it: a row that once carried an expiry and lost it would
+/// otherwise be refused for an expiry it no longer has.
+///
+/// **Not for a row whose bytes someone else signed.** This rewrites the
+/// envelope, which invalidates any signature and any hash already derived from
+/// it — see the transit exclusion on [`RowMirror::stamp_local_row`]. A
+/// receiver CHECKS these; it does not stamp them.
+pub fn stamp_signed_instants(row: &mut super::Attestation) -> Result<(), super::Error> {
+    use crate::federation::admission::truncate_to_substrate_resolution as trunc;
+    row.asserted_at = trunc(row.asserted_at);
+    row.expires_at = row.expires_at.map(trunc);
+    let asserted = row.asserted_at.to_rfc3339();
+    let expires = row.expires_at.map(|t| t.to_rfc3339());
+    let obj = row.attestation_envelope.as_object_mut().ok_or_else(|| {
+        super::Error::InvalidArgument(format!(
+            "attestation {}: attestation_envelope must be a JSON object to carry the signed \
+             `{}` / `{}` instants (CIRISPersist#598)",
+            row.attestation_id,
+            paths::ASSERTED_AT,
+            paths::EXPIRES_AT,
+        ))
+    })?;
+    obj.insert(
+        paths::ASSERTED_AT.to_owned(),
+        serde_json::Value::String(asserted),
+    );
+    match expires {
+        None => {
+            obj.remove(paths::EXPIRES_AT);
+        }
+        Some(t) => {
+            obj.insert(paths::EXPIRES_AT.to_owned(), serde_json::Value::String(t));
+        }
+    }
+    Ok(())
 }
 
 impl EnvelopeCore {
