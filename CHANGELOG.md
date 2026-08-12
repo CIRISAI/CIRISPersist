@@ -200,6 +200,67 @@ BREAKING: `Error` gains `OperationalEnvelopeUnbound`; the three operational
 `test_support` builders now stamp `asserted_at` (and the partner builder
 `issued_at`/`expires_at`) into the envelope before signing.
 
+### Fixed — BREAKING — promotion re-signed a row and changed `cohort_scope` without re-stamping the mirror, so every promoted row was refused by every peer (#649)
+
+`#643` bound seven typed columns into the signed envelope and made
+`check_row_column_binding` refuse, at every `put_attestation`, any row whose
+columns diverge from that mirror. `Engine::attestation_promote` and
+`promote_attestation_with_transforms` **re-sign the row and change
+`cohort_scope`** — one of the seven — and they were re-signing the
+*pre-promotion* envelope. So a promoted row carried a signed mirror asserting
+its old scope beside a column saying otherwise: **the promoting node's own
+output was refused by every peer's `put_attestation`.** Promotion is the
+local→federation path, so this broke the thing promotion exists to do.
+
+`set_attestation_cohort_scope` — the #530 repair sweep's door — had the same
+shape, and its own doc still claimed *"`cohort_scope` is a row attribute outside
+the signed envelope, so the scrub signature stays valid"*, a sentence #643 had
+made false.
+
+**Nothing caught it because every promotion witness asserted `Ok`.** Promotion
+returned `Ok` throughout; the defect lives entirely in what a *different*
+directory does with the result, and nothing ever asked. `Ok` is not a
+replication property.
+
+- **A placement-touching write is a RE-SIGN.** `promote_attestation` and
+  `set_attestation_cohort_scope` now take an `AttestationReseal` — the
+  re-stamped envelope, its digest, its signature, the scrub key and the
+  timestamp — and write the envelope in the SAME statement as the placement.
+  `RowMirror::restamp_for_scope` builds it from `RowMirror::of`, the same
+  projection the gate compares against; there is no second spelling.
+- **`promote_attestation_transformed` is GONE**, absorbed into
+  `promote_attestation`. The #510 variant existed only because it also wrote
+  `attestation_envelope` back; now that every promotion must, the two were one
+  method under two names with two copies of one gate stack — the "door beside
+  the door" this repo keeps re-finding. A restriction pipeline is just a
+  different `base` handed to `restamp_for_scope`.
+- **`check_promotion_admission` now runs `check_row_column_binding`.** #643 could
+  not put it there — promotion signed the pre-promotion envelope, so the gate
+  would have refused every promotion rather than fixing any. Making the rule
+  satisfiable is what makes it enforceable, exactly the #598 sequence. A caller
+  that skips the re-stamp is refused at the primitive.
+- **The LOCAL write door now stamps the mirror.** `write_local_attestation`
+  assigns `attestation_id` and defaults `attested_key_id`, so four of the seven
+  bound columns are persist's own values and no producer can bind them in
+  advance — persist mints the bytes, so persist stamps. Without it, a locally
+  minted row was one this substrate's own (tier-blind) put door would refuse.
+  **Excluded: the transit revocation**, whose envelope the caller signed and
+  `verify_local_transit_revocation` already verified — stamping there would
+  rewrite the signed bytes and leave the stored hash covering an envelope that
+  no longer exists, i.e. this very defect one door over. The rule is the emit
+  path's: *the party that mints the bytes stamps; the party that receives them
+  checks.*
+- **Witness `exercise_promoted_row_crosses_to_a_peer`**, memory + sqlite +
+  postgres, ends at a **second directory's `put_attestation`**: local write →
+  promote → **peer admits**. Negative arm feeds that same peer the pre-#649 row
+  itself (promoted columns, envelope signed before the scope changed) and
+  requires a refusal naming `cohort_scope`. Mutating the re-stamp away turns it
+  red at the primitive; mutating the re-stamp *and* the new gate away turns it
+  red at the peer, with the peer's own refusal quoted.
+- Fixture debt from #643 cleared: `nanosecond_wire_refs_resolve_every_kind_*`
+  (#646) and `envelope_bytes_round_trip_sqlite_644` hand-signed rows without the
+  mirror and were red on arrival; both now seal through `seal_row_in_place`.
+
 ### Fixed — BREAKING — the attestation signature covered the envelope ONLY (#643)
 
 `verify_federation_tier_ingest` verifies the hybrid signature over

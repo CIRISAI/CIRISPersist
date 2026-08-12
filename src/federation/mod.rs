@@ -386,10 +386,10 @@ pub use topology::{
 };
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
-    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
-    EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
-    IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow,
-    PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
+    Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
+    EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
+    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
     SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
     SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, TrustClass, TrustFilter,
@@ -1022,23 +1022,41 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
-    /// an EXISTING attestation row: the promote-on-consent write-back
-    /// ([`crate::Engine::promote_consented_backlog`] flips a
-    /// freshly-promoted row's `cohort_scope` to
-    /// [`types::cohort_scope::FEDERATION`] right after
-    /// [`crate::Engine::attestation_promote`] has hybrid-signed it).
-    /// `cohort_scope` MUST be one of the closed-set values
+    /// an EXISTING attestation row: the second placement door, driven by
+    /// [`crate::Engine::repair_stranded_scope_backlog`] (CIRISPersist#530),
+    /// which re-scopes an ALREADY-federation row to a covering grant's
+    /// audience. `cohort_scope` MUST be one of the closed-set values
     /// ([`types::cohort_scope::is_valid`]) — implementations validate
     /// before writing and reject an out-of-set value with
     /// `InvalidArgument`. Also `InvalidArgument` if `attestation_id`
     /// does not exist. Default `Unsupported`; sqlite/postgres/memory
     /// override.
+    ///
+    /// # v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN
+    ///
+    /// This method's own doc used to end *"`cohort_scope` is a row attribute
+    /// outside the signed envelope, so the scrub signature stays valid"*.
+    /// CIRISPersist#643 made that sentence false: `cohort_scope` is one of the
+    /// seven columns bound into `envelope.row`, and
+    /// [`admission::check_row_column_binding`] refuses any row whose column
+    /// diverges from that mirror. Rewriting the column in place therefore
+    /// produced a row asserting its OLD scope — refused by every peer's
+    /// `put_attestation`, and by this node's own.
+    ///
+    /// So the caller re-stamps the mirror
+    /// ([`envelope::RowMirror::restamp_for_scope`]), re-signs the result, and
+    /// hands both over as `reseal`; the envelope, its digest, its signature
+    /// and the new placement land in ONE statement. Implementations re-run
+    /// [`admission::check_row_column_binding`] over the row as it will be
+    /// stored, so a caller that skips the re-stamp is REFUSED rather than
+    /// silently minting an unreplicable row.
     async fn set_attestation_cohort_scope(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
+        reseal: &AttestationReseal,
     ) -> Result<(), Error> {
-        let _ = (attestation_id, cohort_scope);
+        let _ = (attestation_id, cohort_scope, reseal);
         Err(Error::Unsupported {
             method: "set_attestation_cohort_scope",
         })
@@ -3340,72 +3358,44 @@ pub trait FederationDirectory: Send + Sync {
     /// placement is #519's own "a promotion is placement-touching, so the
     /// primitive must carry it" argument applied one layer further down: an
     /// incomplete OR a partially-applied promotion is no longer expressible.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # v31.0.0 (CIRISPersist#649) — the primitive carries its ENVELOPE
+    ///
+    /// The same argument, one layer further still. CIRISPersist#643 bound
+    /// `cohort_scope` into `envelope.row`; promotion CHANGES `cohort_scope`
+    /// and RE-SIGNS the row, and it was re-signing the PRE-promotion envelope
+    /// — so the promoted row's signed mirror asserted its old scope while its
+    /// column said otherwise, and every peer's `put_attestation` refused it.
+    /// The promoting node's own output was unreplicable, and promotion
+    /// returned `Ok` throughout, which is what hid it.
+    ///
+    /// [`AttestationReseal`] now carries the RE-STAMPED envelope
+    /// ([`envelope::RowMirror::restamp_for_scope`]) alongside the digest and
+    /// signature computed over exactly those bytes, and the implementation
+    /// writes the envelope in the SAME statement as the placement and the tier
+    /// flip. Implementations re-run [`admission::check_row_column_binding`]
+    /// over the row as it will be stored (via
+    /// [`admission::check_promotion_admission`]), so a caller that skips the
+    /// re-stamp is REFUSED at the primitive.
+    ///
+    /// # This absorbed `promote_attestation_transformed`
+    ///
+    /// v21.3.0's #510 strip-then-promote variant existed for exactly one
+    /// reason: it additionally wrote back `attestation_envelope`. Once THIS
+    /// method must write the envelope back too, the two were the same method
+    /// under two names with two copies of one gate stack — the "door beside
+    /// the door" this repo keeps re-discovering. There is one promotion
+    /// primitive; a #510 restriction pipeline is just a different `base` handed
+    /// to [`envelope::RowMirror::restamp_for_scope`]
+    /// (see [`crate::Engine::promote_consented_backlog`]). The row's full
+    /// PRE-transform form remains queryable via the `trace_events` projection,
+    /// exactly as before.
     async fn promote_attestation(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &AttestationReseal,
     ) -> Result<bool, Error>;
-
-    /// v21.3.0 (CIRISPersist#510 P1) — the STRIP-then-promote write-back:
-    /// same contract as [`Self::promote_attestation`] (local→federation,
-    /// idempotent, `Err` if absent), except the caller has ALREADY applied
-    /// a covering grant's `StripField` restriction(s) to a CLONE of the
-    /// row's envelope and hybrid-signed THAT stripped canonical — so this
-    /// method additionally overwrites the `attestation_envelope` column
-    /// with `envelope_json` (the stripped shape) in the SAME write as the
-    /// tier flip. `original_content_hash_hex` is the hash of the STRIPPED
-    /// canonical (it is the content actually signed/shipped), not the
-    /// original.
-    ///
-    /// [`crate::Engine::promote_consented_backlog`] calls this INSTEAD of
-    /// [`Self::promote_attestation`] only when the restriction union for a
-    /// row contains at least one `StripField`; with no `StripField`
-    /// restrictions the byte-identical-wire property is preserved by
-    /// continuing to use `promote_attestation` unchanged. The row's full
-    /// PRE-strip form remains queryable via the `trace_events` projection
-    /// (decomposed at ingest/emit time, before any strip is applied), so a
-    /// downstream strip never destroys the substrate's own copy of the
-    /// original content — only the federation-tier envelope this method
-    /// writes back is narrowed.
-    ///
-    /// Default `Unsupported` (the same posture as the #509 FLOOR's three
-    /// new directory methods — this is an engine-internal primitive, not
-    /// wired into the FFI directory capsule); sqlite/postgres/memory
-    /// override.
-    /// v26.0.0 (CIRISPersist#589 / AV-83) — carries `cohort_scope` for the same
-    /// reason [`Self::promote_attestation`] does; see that method.
-    #[allow(clippy::too_many_arguments)]
-    async fn promote_attestation_transformed(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        envelope_json: &serde_json::Value,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, Error> {
-        let _ = (
-            attestation_id,
-            cohort_scope,
-            envelope_json,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            original_content_hash_hex,
-            scrub_key_id,
-            scrub_timestamp,
-        );
-        Err(Error::Unsupported {
-            method: "promote_attestation_transformed",
-        })
-    }
 
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //

@@ -5050,6 +5050,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<(), crate::federation::Error> {
         if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -5062,6 +5063,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
         row.cohort_scope = cohort_scope.to_owned();
+        // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN; see the sqlite
+        // twin. The re-stamped envelope and the scrub that covers it land in
+        // the SAME statement as the placement.
+        row.attestation_envelope = reseal.attestation_envelope.clone();
+        row.original_content_hash = reseal.original_content_hash.clone();
+        row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
+        row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
+        row.scrub_key_id = reseal.scrub_key_id.clone();
+        row.scrub_timestamp = reseal.scrub_timestamp;
+        row.pqc_completed_at = reseal
+            .scrub_signature_pqc
+            .as_ref()
+            .map(|_| reseal.scrub_timestamp);
         // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
         // `repair_stranded_scope_backlog` re-scopes an already-federation row
         // to a covering grant's audience through here, which can be
@@ -5071,9 +5085,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // motion uses another). Verify-before-mutation (AV-9): `row` is a
         // loaded copy and nothing has been written yet.
         crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        // v31.0.0 (CIRISPersist#649) — and the typed-column binding at the same
+        // door, for the same "one rule, both doors" reason.
+        crate::federation::admission::check_row_column_binding(&row)?;
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+        let attestation_envelope_text =
+            pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
+        let och: Vec<u8> = hex::decode(&reseal.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let pqc_owned = reseal.scrub_signature_pqc.clone();
+        let pqc_completed = row.pqc_completed_at;
+        let scrub_signature_classical = reseal.scrub_signature_classical.clone();
+        let scrub_key_id = reseal.scrub_key_id.clone();
+        let scrub_timestamp = reseal.scrub_timestamp;
         // get_attestation already succeeded above → attestation_id parses.
         // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
         // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
@@ -5089,8 +5117,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let n = client
             .execute(
                 "UPDATE cirislens.federation_attestations \
-                 SET cohort_scope = $1, persist_row_hash = $2 WHERE attestation_id = $3",
-                &[&cohort_scope, &new_hash, &attestation_id],
+                 SET cohort_scope = $1, persist_row_hash = $2, attestation_envelope = $4, \
+                     original_content_hash = $5, scrub_signature_classical = $6, \
+                     scrub_signature_pqc = $7, scrub_key_id = $8, scrub_timestamp = $9, \
+                     pqc_completed_at = $10 \
+                 WHERE attestation_id = $3",
+                &[
+                    &cohort_scope,
+                    &new_hash,
+                    &attestation_id,
+                    &attestation_envelope_text,
+                    &och,
+                    &scrub_signature_classical,
+                    &pqc_owned,
+                    &scrub_key_id,
+                    &scrub_timestamp,
+                    &pqc_completed,
+                ],
             )
             .await
             .map_err(|e| {
@@ -9050,13 +9093,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
+        // v31.0.0 (CIRISPersist#649) — this method absorbed
+        // `promote_attestation_transformed`. EVERY promotion re-signs the row
+        // and changes `cohort_scope`, which #643 bound into the signed
+        // envelope, so every promotion must store the envelope it signed —
+        // which is all the #510 variant ever did differently. A restriction
+        // pipeline is now just a different `base` handed to
+        // `RowMirror::restamp_for_scope`.
         let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
                 "federation_attestations row {attestation_id} does not exist"
@@ -9065,146 +9111,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         if row.tier == attestation_tier::FEDERATION {
             return Ok(false); // idempotent
         }
-        let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
-        // See `src/store/sqlite.rs` promote_attestation for the rationale.
-        // Gated on the POST-promotion shape; verify-before-mutation.
-        {
-            let mut as_promoted = row.clone();
-            as_promoted.tier = attestation_tier::FEDERATION.to_string();
-            as_promoted.cohort_scope = cohort_scope.to_owned();
-            crate::federation::admission::check_promotion_admission(
-                self,
-                &as_promoted,
-                self.self_key_id().as_deref(),
-            )
-            .await?;
-        }
-        let now = scrub_timestamp;
-        let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
-        row.cohort_scope = cohort_scope.to_owned();
-        row.original_content_hash = original_content_hash_hex.to_owned();
-        row.scrub_signature_classical = scrub_signature_classical.to_owned();
-        row.scrub_signature_pqc = pqc_owned.clone();
-        row.scrub_key_id = scrub_key_id.to_owned();
-        row.scrub_timestamp = now;
-        row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
-        row.tier = attestation_tier::FEDERATION.to_string();
-        row.promoted_at = Some(now);
-        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
-        // A local-tier row defers its signature, so any `additional_scrubs` it
-        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
-        // the row with this node's key and moves it into the federation plane,
-        // where the ingest verifier DOES check every scrub — so carrying the
-        // unverified set across would either launder it into the signed plane or
-        // (once corrupt) make the promoted row unverifiable at every peer with
-        // no error at the promote site. That is the #541 shape: the preserve set
-        // must equal the verified set. Co-signatures are earned at the ceremony
-        // that mints a federation-tier row, never inherited by a promotion.
-        row.additional_scrubs.clear();
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        let pqc_completed = row.pqc_completed_at;
-        // get_attestation already succeeded above → attestation_id parses.
-        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
-        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
-        // the column can hold the ids the genesis ceremony SIGNED
-        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
-        // column alone was NOT enough — this Rust-side parse produced the identical
-        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_attestations \
-                 SET original_content_hash = $1, scrub_signature_classical = $2, \
-                     scrub_signature_pqc = $3, scrub_key_id = $4, scrub_timestamp = $5, \
-                     pqc_completed_at = $6, persist_row_hash = $7, tier = 'federation', \
-                     promoted_at = $5, additional_scrubs = '[]', cohort_scope = $9 \
-                 WHERE attestation_id = $8 AND tier = 'local'",
-                &[
-                    &och,
-                    &scrub_signature_classical,
-                    &pqc_owned,
-                    &scrub_key_id,
-                    &now,
-                    &pqc_completed,
-                    &new_hash,
-                    &attestation_id,
-                    &cohort_scope,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("promote_attestation: {e}")))?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} was concurrently promoted"
-            )));
-        }
-        // v21.1.0 (CIRISPersist#507b) — the promoted row is now
-        // federation-tier and therefore wire-servable; index it under the
-        // SAME post-promotion shape `list_attestations_since` will read back
-        // (`persist_row_hash` = the newly-stamped `new_hash`).
-        // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
-        client
-            .execute(
-                "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
-                 WHERE attestation_id = $1",
-                &[&attestation_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
-            })?;
-        drop(client);
-        // v31.0.0 (CIRISPersist#646) — THE confirmed live instance. `engine.rs`
-        // mints `chrono::Utc::now()` for `scrub_timestamp` at nanosecond
-        // precision and hands it straight in; it lands in `scrub_timestamp`,
-        // `promoted_at` and `pqc_completed_at`, all `TIMESTAMPTZ`. Hashing the
-        // in-memory `row` here indexed nanoseconds against a row stored at
-        // microseconds — on EVERY promotion on postgres.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
-    async fn promote_attestation_transformed(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        envelope_json: &serde_json::Value,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, crate::federation::Error> {
-        use crate::federation::types::attestation_tier;
-        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_attestations row {attestation_id} does not exist"
-            ))
-        })?;
-        if row.tier == attestation_tier::FEDERATION {
-            return Ok(false); // idempotent
-        }
-        let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
+        let och: Vec<u8> = hex::decode(&reseal.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
         // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
-        // over the TRANSFORMED envelope (the bytes this row will federate as).
+        // over the envelope this row will actually federate as (a #510
+        // transform changes those bytes; #649's re-stamped mirror lives in
+        // them).
         {
             let mut as_promoted = row.clone();
-            as_promoted.attestation_envelope = envelope_json.clone();
+            as_promoted.attestation_envelope = reseal.attestation_envelope.clone();
             as_promoted.tier = attestation_tier::FEDERATION.to_string();
             as_promoted.cohort_scope = cohort_scope.to_owned();
             crate::federation::admission::check_promotion_admission(
@@ -9214,14 +9130,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await?;
         }
-        let now = scrub_timestamp;
-        let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
+        let now = reseal.scrub_timestamp;
+        let pqc_owned = reseal.scrub_signature_pqc.clone();
+        let scrub_signature_classical = reseal.scrub_signature_classical.clone();
+        let scrub_key_id = reseal.scrub_key_id.clone();
         row.cohort_scope = cohort_scope.to_owned();
-        row.attestation_envelope = envelope_json.clone();
-        row.original_content_hash = original_content_hash_hex.to_owned();
-        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.attestation_envelope = reseal.attestation_envelope.clone();
+        row.original_content_hash = reseal.original_content_hash.clone();
+        row.scrub_signature_classical = scrub_signature_classical.clone();
         row.scrub_signature_pqc = pqc_owned.clone();
-        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_key_id = scrub_key_id.clone();
         row.scrub_timestamp = now;
         row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
@@ -9278,9 +9196,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("promote_attestation_transformed: {e}"))
-            })?;
+            .map_err(|e| crate::federation::Error::Backend(format!("promote_attestation: {e}")))?;
         if n == 0 {
             return Err(crate::federation::Error::Conflict(format!(
                 "federation_attestations row {attestation_id} was concurrently promoted"
@@ -9295,15 +9211,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "promote_attestation_transformed projection: {e}"
-                ))
+                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
             })?;
-        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
-        // served bytes (stripped envelope + new sigs + new persist_row_hash),
-        // so the wire index must be refreshed under the NEW content hash —
-        // same hook as `promote_attestation`. The stale pre-transform hash
-        // entry (if any) self-heals via the defensive re-hash on read.
+        // v21.1.0 (#507b) × v21.2.0 (#507 × #510) — a promotion CHANGES the
+        // served bytes (re-stamped/stripped envelope + new sigs + new
+        // persist_row_hash), so the wire index must be refreshed under the NEW
+        // content hash. The stale pre-promotion hash entry (if any) self-heals
+        // via the defensive re-hash on read.
+        //
+        // v31.0.0 (CIRISPersist#646) — the hash is taken from the row as
+        // STORED, never from an in-memory `chrono::Utc::now()` at nanosecond
+        // precision, which postgres truncates to microseconds on write.
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
         drop(client);
@@ -14428,6 +14346,7 @@ impl PostgresBackend {
         // A durable row defers its signature (empty-sentinel scrub envelope);
         // a TRANSIT revocation carries the caller's verified bound-hybrid
         // signature + computed hash (§10.1.3 transit-not-rest).
+        let is_transit = transit.is_some();
         let mut row = match transit {
             Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
                 attestation_id.clone(),
@@ -14438,6 +14357,10 @@ impl PostgresBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
+        // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
+        // decision and the transit exclusion. One helper, all three backends.
+        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, is_transit)?;
         // v31.0.0 (CIRISPersist#598) — the same binding the federation door
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
@@ -21019,6 +20942,37 @@ mod tests {
         backend.set_self_key_id(Some(me.clone()));
         crate::federation::bootstrap_admission::test_support::exercise_promotion_admission_gate(
             &backend, &me, &tag,
+        )
+        .await;
+    }
+
+    /// #649 B11 — a PROMOTED row is accepted by a DIFFERENT directory's
+    /// `put_attestation`, on postgres. Shared exercise body with memory +
+    /// sqlite; the tag is unique per run because this database persists across
+    /// tests.
+    ///
+    /// **The peer is a `MemoryBackend`, deliberately.** Every postgres test in
+    /// this crate connects to ONE shared database, so a second
+    /// `PostgresBackend` would be a second handle on the SAME corpus and the
+    /// peer put would hit the primary key rather than the gate stack — a
+    /// witness that fails for a reason it does not name. What this arm is here
+    /// to exercise is POSTGRES'S OWN `promote_attestation`: its envelope
+    /// write-back, its TEXT round-trip (V122), and the re-stamped mirror
+    /// surviving both. The receiving stack is backend-symmetric by construction
+    /// and has its own parity witnesses.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn promoted_row_crosses_to_a_peer_postgres_649() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let origin = PostgresBackend::connect(&dsn).await.expect("connect");
+        origin.run_migrations().await.expect("migrations run");
+        let peer = crate::store::memory::MemoryBackend::new();
+        let tag = format!("pg649{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
+            &origin, &peer, &tag,
         )
         .await;
     }

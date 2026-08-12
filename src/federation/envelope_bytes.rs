@@ -209,10 +209,8 @@ pub(crate) mod test_support {
             "dimension",
             serde_json::Value::String("envelope_bytes:round_trip:v1".to_owned()),
         )]);
-        let (och, ed_sig, pqc_sig) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&node, &att_envelope);
         let att_id = uuid::Uuid::new_v4().to_string();
-        let attestation = crate::federation::Attestation {
+        let mut attestation = crate::federation::Attestation {
             attestation_id: att_id.clone(),
             attesting_key_id: node.clone(),
             attested_key_id: node.clone(),
@@ -220,10 +218,10 @@ pub(crate) mod test_support {
             weight: None,
             asserted_at: now,
             expires_at: None,
-            attestation_envelope: att_envelope.clone(),
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            attestation_envelope: att_envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: node.clone(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -235,6 +233,12 @@ pub(crate) mod test_support {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
+        // v31.0.0 (CIRISPersist#643) — SEAL, don't hand-sign: `put_attestation`
+        // refuses a row that does not carry its typed-column mirror inside the
+        // signed bytes. The mirror joins the awkward envelope BEFORE it is
+        // signed, so the bytes under test are the bytes that were written.
+        crate::federation::tier_ingest::test_support::seal_row_in_place(&node, &mut attestation);
+        let att_envelope = attestation.attestation_envelope.clone();
         dir.put_attestation(crate::federation::SignedAttestation { attestation })
             .await
             .expect("put_attestation admits the awkward envelope");

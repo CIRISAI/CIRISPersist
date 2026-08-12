@@ -3263,11 +3263,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "promote_attestation",

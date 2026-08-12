@@ -691,6 +691,70 @@ pub(crate) mod test_support {
         seal_row_in_place(&signer, row);
     }
 
+    /// v31.0.0 (CIRISPersist#649) — **the fixture twin of
+    /// `Engine::reseal_for_scope`**: re-stamp `row`'s typed-column mirror for
+    /// the placement it is about to land at, then hybrid-sign the result with
+    /// `signing_key_id`'s deterministic keys.
+    ///
+    /// Both placement-touching directory primitives
+    /// ([`crate::federation::FederationDirectory::promote_attestation`] and
+    /// [`crate::federation::FederationDirectory::set_attestation_cohort_scope`])
+    /// take this bundle, because `cohort_scope` lives INSIDE the signed bytes
+    /// and a placement change is therefore a re-sign. Fixtures use this rather
+    /// than hand-rolling the recipe: a hand-rolled copy that forgets the
+    /// re-stamp is the #649 defect wearing a test's clothes.
+    ///
+    /// `scrub_timestamp` is truncated to the substrate resolution so the
+    /// postgres arm (microseconds) and the in-memory row agree — the #646
+    /// nanosecond skew, avoided rather than re-measured.
+    pub fn reseal_for_scope(
+        signing_key_id: &str,
+        row: &Attestation,
+        cohort_scope: &str,
+    ) -> crate::federation::AttestationReseal {
+        let attestation_envelope = crate::federation::envelope::RowMirror::restamp_for_scope(
+            &row.attestation_envelope,
+            row,
+            cohort_scope,
+        )
+        .expect("finite weight");
+        reseal_over(signing_key_id, attestation_envelope)
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the PRE-#649 shape, on purpose**: sign
+    /// the row's CURRENT envelope, whose mirror still asserts the row's OLD
+    /// `cohort_scope`, and hand it to a placement-touching primitive.
+    ///
+    /// This is what promotion did for the whole of #643's life, and the reason
+    /// a promoted row was refused by every peer. It exists so the witness can
+    /// exercise the defect itself rather than a description of it: a test that
+    /// only ever passes the CORRECT bundle cannot tell whether the re-stamp is
+    /// load-bearing.
+    pub fn reseal_without_restamp(
+        signing_key_id: &str,
+        row: &Attestation,
+    ) -> crate::federation::AttestationReseal {
+        reseal_over(signing_key_id, row.attestation_envelope.clone())
+    }
+
+    fn reseal_over(
+        signing_key_id: &str,
+        attestation_envelope: serde_json::Value,
+    ) -> crate::federation::AttestationReseal {
+        let (original_content_hash, scrub_signature_classical, scrub_signature_pqc) =
+            sign_envelope(signing_key_id, &attestation_envelope);
+        crate::federation::AttestationReseal {
+            attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            scrub_key_id: signing_key_id.to_owned(),
+            scrub_timestamp: crate::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
+        }
+    }
+
     /// v31.0.0 (CIRISPersist#643) — stamp the mirror and **do not sign**.
     ///
     /// For the witnesses whose whole point is a row that reaches a LATER gate:

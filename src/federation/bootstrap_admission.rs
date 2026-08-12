@@ -861,7 +861,8 @@ pub mod test_support {
     /// # The hole this closes
     ///
     /// `Engine::attestation_promote` and the backends' `promote_attestation` /
-    /// `promote_attestation_transformed` re-signed a row and flipped `tier`
+    /// `promote_attestation_transformed` (folded into `promote_attestation` by
+    /// CIRISPersist#649) re-signed a row and flipped `tier`
     /// local→federation while running **no** put-gate whatsoever. Every gate
     /// that no-ops at the local tier had therefore never been asked about a
     /// promoted row, and promotion is the moment those rows become
@@ -966,10 +967,13 @@ pub mod test_support {
         // ── (c) NOT A LOCKDOWN — an ordinary local row admits AND promotes.
         let ok_id = uuid::Uuid::new_v4().to_string();
         let ok_row = local_row(&ok_id, "trust:demo:v1", None);
-        let (ok_och, ok_sc, ok_sp) = (
-            ok_row.original_content_hash.clone(),
-            ok_row.scrub_signature_classical.clone(),
-            ok_row.scrub_signature_pqc.clone(),
+        // v31.0.0 (CIRISPersist#649) — a promotion RE-STAMPS the mirror it
+        // re-signs, because it changes `cohort_scope`. `reseal_for_scope` is
+        // the fixture twin of `Engine::reseal_for_scope`.
+        let ok_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &attester,
+            &ok_row,
+            cohort_scope::FEDERATION,
         );
         dir.put_attestation(SignedAttestation {
             attestation: ok_row,
@@ -977,17 +981,9 @@ pub mod test_support {
         .await
         .expect("({tag}) B8: an ordinary local row still admits");
         assert!(
-            dir.promote_attestation(
-                &ok_id,
-                cohort_scope::FEDERATION,
-                &ok_sc,
-                ok_sp.as_deref(),
-                &ok_och,
-                &attester,
-                chrono::Utc::now(),
-            )
-            .await
-            .expect("({tag}) B8: an ordinary promotion still succeeds"),
+            dir.promote_attestation(&ok_id, cohort_scope::FEDERATION, &ok_reseal)
+                .await
+                .expect("({tag}) B8: an ordinary promotion still succeeds"),
             "({tag}) B8: and it flips the tier"
         );
 
@@ -1003,10 +999,10 @@ pub mod test_support {
         self_row.tier = attestation_tier::LOCAL.to_owned();
         self_row.cohort_scope = cohort_scope::SELF.to_owned();
         crate::federation::tier_ingest::test_support::reseal(&mut self_row);
-        let (s_och, s_sc, s_sp) = (
-            self_row.original_content_hash.clone(),
-            self_row.scrub_signature_classical.clone(),
-            self_row.scrub_signature_pqc.clone(),
+        let self_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &bystander,
+            &self_row,
+            cohort_scope::SELF,
         );
         dir.put_attestation(SignedAttestation {
             attestation: self_row,
@@ -1022,10 +1018,10 @@ pub mod test_support {
         // capacity arm would have left this exactly as it was.
         let doomed_id = uuid::Uuid::new_v4().to_string();
         let doomed = local_row(&doomed_id, "trust:demo:v1", None);
-        let (d_och, d_sc, d_sp) = (
-            doomed.original_content_hash.clone(),
-            doomed.scrub_signature_classical.clone(),
-            doomed.scrub_signature_pqc.clone(),
+        let doomed_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &attester,
+            &doomed,
+            cohort_scope::FEDERATION,
         );
         dir.put_attestation(SignedAttestation {
             attestation: doomed,
@@ -1050,15 +1046,7 @@ pub mod test_support {
         .expect("({tag}) B8: a node may always author its own de-admission");
 
         let err = dir
-            .promote_attestation(
-                &doomed_id,
-                cohort_scope::FEDERATION,
-                &d_sc,
-                d_sp.as_deref(),
-                &d_och,
-                &attester,
-                chrono::Utc::now(),
-            )
+            .promote_attestation(&doomed_id, cohort_scope::FEDERATION, &doomed_reseal)
             .await
             .expect_err(
                 "({tag}) B8: promoting a DE-ADMITTED author's row must be refused — AV-77 \
@@ -1098,15 +1086,7 @@ pub mod test_support {
         // good standing, so the ONLY reason this promotion can be refused is
         // the placement itself.
         let err = dir
-            .promote_attestation(
-                &self_id,
-                cohort_scope::SELF,
-                &s_sc,
-                s_sp.as_deref(),
-                &s_och,
-                &bystander,
-                chrono::Utc::now(),
-            )
+            .promote_attestation(&self_id, cohort_scope::SELF, &self_reseal)
             .await
             .expect_err("({tag}) B8: (federation, self) is refused by the primitive itself");
         assert!(
@@ -1170,6 +1150,236 @@ pub mod test_support {
         crate::federation::admission::check_promotion_admission(dir, &legacy, None)
             .await
             .expect("({tag}) B8: with a live analyze grant the same promotion is admitted");
+    }
+
+    /// **B11 (CIRISPersist#649) — A PROMOTED ROW IS ACCEPTED BY A PEER.**
+    ///
+    /// # The hole this closes
+    ///
+    /// CIRISPersist#643 bound seven typed columns into the signed envelope
+    /// (`envelope.row`) and made `check_row_column_binding` refuse, at every
+    /// `put_attestation`, any row whose columns diverge from that mirror.
+    /// Promotion **re-signs the row and changes `cohort_scope`** — one of the
+    /// seven — and it was signing the PRE-promotion envelope. So every promoted
+    /// row carried a signed mirror asserting its old scope while its column said
+    /// otherwise: **the promoting node's own output was refused by every peer.**
+    /// Promotion is the local→federation path, so this broke the thing promotion
+    /// exists to do.
+    ///
+    /// # Why nothing caught it
+    ///
+    /// Every existing promotion witness asserted that promotion returned `Ok`
+    /// and that the row's own columns flipped. Both stayed true throughout —
+    /// the defect is entirely in what a DIFFERENT directory does with the
+    /// result, and nothing ever asked. `Ok` is not a replication property.
+    ///
+    /// So this witness ends at a **second directory's put door**, and the
+    /// negative arm is the pre-#649 row itself rather than a description of it:
+    /// a test that only ever feeds the peer the CORRECT bundle cannot tell
+    /// whether the re-stamp is load-bearing.
+    ///
+    /// # What it pins, on every backend
+    ///
+    /// (a) the LOCAL door stamps the mirror, so a row is self-describing from
+    /// the moment it is written and not first bound at republication; (b) the
+    /// promoted row's SIGNED envelope names its POST-promotion scope; (c) THE
+    /// WITNESS — a different directory's `put_attestation` ADMITS it; (d) the
+    /// pre-#649 shape (promoted columns, envelope signed before the scope
+    /// changed) is REFUSED by that same peer, and the refusal names
+    /// `cohort_scope`; (e) the promoting PRIMITIVE refuses to mint that shape at
+    /// all, so a caller that skips the re-stamp cannot ship one; and (f) that
+    /// refusal leaves the row byte-identical (AV-9).
+    ///
+    /// `origin` promotes; `peer` receives. They must be independent corpora —
+    /// see each backend's arm for how it gets a second directory.
+    pub async fn exercise_promoted_row_crosses_to_a_peer(
+        origin: &dyn FederationDirectory,
+        peer: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, cohort_scope, LocalAttestationInput};
+
+        // Invocation-unique — the postgres arm shares a long-lived database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let producer = format!("{tag}-p649-{run}");
+        ts::register_hybrid_key(origin, &producer).await;
+        // The peer must be able to resolve the author's pubkeys — that is what
+        // a real mesh peer has, and what the tier-3 hybrid verify needs.
+        ts::register_hybrid_key(peer, &producer).await;
+
+        let local_input = |dimension: &str| {
+            let mut envelope = crate::federation::envelope::EnvelopeCore {
+                dimension: Some(dimension.to_owned()),
+                ..Default::default()
+            };
+            envelope
+                .extra
+                .insert("score".into(), serde_json::json!(1.0));
+            envelope
+                .extra
+                .insert("confidence".into(), serde_json::json!(0.9));
+            LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: producer.clone(),
+                attested_key_id: None,
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: Some(1.0),
+                expires_at: None,
+                attestation_envelope: envelope,
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            }
+        };
+
+        // ── (a) THE LOCAL DOOR STAMPS. ────────────────────────────────
+        // Through the REAL local-write door (`attestation_insert_local`), not a
+        // hand-built row: the decision under witness is that persist stamps the
+        // mirror where it MINTS the bytes, and a fixture that stamped for it
+        // would be testing the fixture.
+        let id = origin
+            .attestation_insert_local(local_input("trust:demo:v1"))
+            .await
+            .expect("({tag}) #649: the local write admits");
+        let local = origin
+            .get_attestation(&id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #649: the local row exists");
+        crate::federation::admission::check_row_column_binding(&local).unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #649 (a): a locally-minted row must already carry its own signed \
+                 typed-column mirror — `put_attestation`'s binding gate is TIER-BLIND, so an \
+                 unstamped local row is one this substrate's own put door would refuse: {e}"
+            )
+        });
+
+        // ── (b) THE PROMOTION RE-STAMPS WHAT IT RE-SIGNS. ─────────────
+        let reseal = ts::reseal_for_scope(&producer, &local, cohort_scope::FEDERATION);
+        assert!(
+            origin
+                .promote_attestation(&id, cohort_scope::FEDERATION, &reseal)
+                .await
+                .expect("({tag}) #649: the promotion succeeds"),
+            "({tag}) #649: and it flips the tier"
+        );
+        let promoted = origin
+            .get_attestation(&id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #649: the promoted row exists");
+        assert_eq!(promoted.tier, attestation_tier::FEDERATION);
+        assert_eq!(promoted.cohort_scope, cohort_scope::FEDERATION);
+        assert_eq!(
+            promoted
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::ROW)
+                .and_then(|r| r.get(crate::federation::envelope::row_paths::COHORT_SCOPE))
+                .and_then(|v| v.as_str()),
+            Some(cohort_scope::FEDERATION),
+            "({tag}) #649 (b): the STORED signed envelope must name the POST-promotion scope — \
+             the promoting node signs the row it is about to become, not the one it was"
+        );
+
+        // ── (c) THE WITNESS: A DIFFERENT DIRECTORY ADMITS IT. ─────────
+        peer.put_attestation(SignedAttestation {
+            attestation: promoted.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #649 (c): a PROMOTED row must be admissible at a PEER — promotion is \
+                 the local→federation path, so a promoted row every peer refuses is a promotion \
+                 that did nothing. This is the assertion whose absence hid the defect: \
+                 promotion returned Ok the whole time. Refusal: {e}"
+            )
+        });
+        let at_peer = peer
+            .get_attestation(&id)
+            .await
+            .expect("read back at the peer")
+            .expect("({tag}) #649 (c): the peer stored the row");
+        assert_eq!(at_peer.tier, attestation_tier::FEDERATION);
+        assert_eq!(at_peer.cohort_scope, cohort_scope::FEDERATION);
+
+        // ── (d) THE PRE-#649 SHAPE IS REFUSED BY THAT SAME PEER. ──────
+        // Built exactly as the old code left it: promoted COLUMNS, and an
+        // envelope whose signature covers the mirror as it stood BEFORE the
+        // scope changed. Constructed at the row level rather than by asking the
+        // primitive, so this arm holds even if a future caller finds another
+        // way to mint the shape.
+        let stale_id = origin
+            .attestation_insert_local(local_input("trust:demo:v1"))
+            .await
+            .expect("({tag}) #649: the second local write admits");
+        let stale_local = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        let stale_reseal = ts::reseal_without_restamp(&producer, &stale_local);
+        let mut as_if_pre_649 = stale_local.clone();
+        as_if_pre_649.tier = attestation_tier::FEDERATION.to_owned();
+        as_if_pre_649.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        as_if_pre_649.promoted_at = Some(stale_reseal.scrub_timestamp);
+        as_if_pre_649.attestation_envelope = stale_reseal.attestation_envelope.clone();
+        as_if_pre_649.original_content_hash = stale_reseal.original_content_hash.clone();
+        as_if_pre_649.scrub_signature_classical = stale_reseal.scrub_signature_classical.clone();
+        as_if_pre_649.scrub_signature_pqc = stale_reseal.scrub_signature_pqc.clone();
+        as_if_pre_649.scrub_key_id = stale_reseal.scrub_key_id.clone();
+        as_if_pre_649.scrub_timestamp = stale_reseal.scrub_timestamp;
+        let err = peer
+            .put_attestation(SignedAttestation {
+                attestation: as_if_pre_649,
+            })
+            .await
+            .expect_err(
+                "({tag}) #649 (d): the PRE-#649 promoted shape must be REFUSED by the peer — a \
+                 witness that passes with and WITHOUT the re-stamp is not a witness",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(crate::federation::envelope::row_paths::COHORT_SCOPE),
+            "({tag}) #649 (d): and the refusal names the column that diverged: {msg}"
+        );
+
+        // ── (e) THE PRIMITIVE WILL NOT MINT IT. ───────────────────────
+        // Defence in depth: the peer refusing is the property, but a node that
+        // can still CREATE an unreplicable row will create one and never know.
+        let before = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        let err = origin
+            .promote_attestation(&stale_id, cohort_scope::FEDERATION, &stale_reseal)
+            .await
+            .expect_err(
+                "({tag}) #649 (e): promoting WITHOUT re-stamping the mirror must be refused at \
+                 the primitive, not silently stored",
+            );
+        assert!(
+            format!("{err}").contains(crate::federation::envelope::row_paths::COHORT_SCOPE),
+            "({tag}) #649 (e): the refusal names the diverging column: {err}"
+        );
+
+        // ── (f) AND THE REFUSAL MUTATES NOTHING (AV-9). ───────────────
+        let after = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        assert_eq!(
+            after.tier,
+            attestation_tier::LOCAL,
+            "({tag}) #649 (f): a refused promotion leaves the row at its original tier"
+        );
+        assert_eq!(
+            after.persist_row_hash, before.persist_row_hash,
+            "({tag}) #649 (f): byte-identical"
+        );
     }
 
     /// **B9 (CIRISPersist#592 / AV-84) — a TARGETED-COHORT placement is a
@@ -1248,37 +1458,31 @@ pub mod test_support {
             row
         };
 
-        let store = |row: Attestation| async {
-            let (id, och, sc, sp) = (
-                row.attestation_id.clone(),
-                row.original_content_hash.clone(),
-                row.scrub_signature_classical.clone(),
-                row.scrub_signature_pqc.clone(),
+        // v31.0.0 (CIRISPersist#649) — store the local row and hand back the
+        // RESEAL for the placement it will be promoted to: a promotion changes
+        // `cohort_scope`, which lives inside the signed bytes, so the mirror is
+        // re-stamped and the row re-signed before it is offered to the door.
+        let store = |row: Attestation, scope: &'static str| async {
+            let id = row.attestation_id.clone();
+            let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer, &row, scope,
             );
             dir.put_attestation(SignedAttestation { attestation: row })
                 .await
                 .expect("B9: the local write itself is admissible");
-            (id, och, sc, sp)
+            (id, reseal)
         };
 
         // ── (a) + (b) THE HOLE: a stranger's row into a cohort plane. ──
         for scope in [cohort_scope::COMMUNITY, cohort_scope::FAMILY] {
-            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(third_party(&uuid::Uuid::new_v4().to_string()), scope).await;
             let before = dir
                 .get_attestation(&id)
                 .await
                 .expect("read back")
                 .expect("row");
             let err = dir
-                .promote_attestation(
-                    &id,
-                    scope,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
+                .promote_attestation(&id, scope, &reseal)
                 .await
                 .expect_err(
                     "({tag}) B9: promoting a row that names a THIRD PARTY into a targeted \
@@ -1324,19 +1528,15 @@ pub mod test_support {
         // ban on promoting third-party rows — that would be a different gate,
         // silently widened under this one's name.
         {
-            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(
+                third_party(&uuid::Uuid::new_v4().to_string()),
+                cohort_scope::FEDERATION,
+            )
+            .await;
             assert!(
-                dir.promote_attestation(
-                    &id,
-                    cohort_scope::FEDERATION,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
-                .await
-                .expect("({tag}) B9: a broad-tier promotion of the same row still succeeds"),
+                dir.promote_attestation(&id, cohort_scope::FEDERATION, &reseal)
+                    .await
+                    .expect("({tag}) B9: a broad-tier promotion of the same row still succeeds"),
                 "({tag}) B9: and it flips the tier"
             );
         }
@@ -1345,22 +1545,18 @@ pub mod test_support {
         // The #519/#510 motion this gate must not amputate: a producer's own
         // row, promoted to the audience its own signed grant named.
         {
-            let (id, och, sc, sp) = store(own(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(
+                own(&uuid::Uuid::new_v4().to_string()),
+                cohort_scope::COMMUNITY,
+            )
+            .await;
             assert!(
-                dir.promote_attestation(
-                    &id,
-                    cohort_scope::COMMUNITY,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
-                .await
-                .expect(
-                    "({tag}) B9: a producer's OWN row still reaches the community plane — \
+                dir.promote_attestation(&id, cohort_scope::COMMUNITY, &reseal)
+                    .await
+                    .expect(
+                        "({tag}) B9: a producer's OWN row still reaches the community plane — \
                      the #510 audience plane is intact"
-                ),
+                    ),
                 "({tag}) B9: and it flips the tier"
             );
             let after = dir
@@ -1382,8 +1578,14 @@ pub mod test_support {
         // and both leave a refused row byte-identical.
         {
             let stranded_id = uuid::Uuid::new_v4().to_string();
+            let stranded_row = scores_row(&stranded_id, &producer, &stranger, "trust:demo:v1");
+            let stranded_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer,
+                &stranded_row,
+                cohort_scope::COMMUNITY,
+            );
             dir.put_attestation(SignedAttestation {
-                attestation: scores_row(&stranded_id, &producer, &stranger, "trust:demo:v1"),
+                attestation: stranded_row,
             })
             .await
             .expect("({tag}) B9: the federation-tier third-party row admits");
@@ -1393,7 +1595,11 @@ pub mod test_support {
                 .expect("read back")
                 .expect("row");
             let err = dir
-                .set_attestation_cohort_scope(&stranded_id, cohort_scope::COMMUNITY)
+                .set_attestation_cohort_scope(
+                    &stranded_id,
+                    cohort_scope::COMMUNITY,
+                    &stranded_reseal,
+                )
                 .await
                 .expect_err(
                     "({tag}) B9: re-scoping a third-party row into a cohort plane must be \
@@ -1421,12 +1627,18 @@ pub mod test_support {
             // And the producer's own row still re-scopes: the repair motion is
             // narrowed, not disabled.
             let own_id = uuid::Uuid::new_v4().to_string();
+            let own_row = scores_row(&own_id, &producer, &producer, "trust:demo:v1");
+            let own_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer,
+                &own_row,
+                cohort_scope::COMMUNITY,
+            );
             dir.put_attestation(SignedAttestation {
-                attestation: scores_row(&own_id, &producer, &producer, "trust:demo:v1"),
+                attestation: own_row,
             })
             .await
             .expect("({tag}) B9: the federation-tier own row admits");
-            dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY)
+            dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY, &own_reseal)
                 .await
                 .expect("({tag}) B9: the #530 repair motion still works on a producer's own row");
         }
