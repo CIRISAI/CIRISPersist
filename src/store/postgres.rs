@@ -4200,6 +4200,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )?;
 
+        // v30.13.0 (CIRISPersist#643) — THE TYPED-COLUMN BINDING. The
+        // signature covers `attestation_envelope` and NOTHING ELSE, so
+        // `attestation_type` (the VERB), `subject_key_ids` (which grants
+        // revocation authority), `attested_key_id`, `cohort_scope` and
+        // `weight` were unsigned columns a relay could rewrite with the
+        // producer's own signature still verifying — flip `withdraws` to
+        // `scores` and a retraction becomes a claim while the thing it
+        // retracted stays live. Refused on ABSENCE or DIVERGENCE, no legacy
+        // regime. Pure function of the row => AV-76 TIER 1, tier-blind (a
+        // tier-scoped binding would be skippable by writing `tier = "local"`
+        // and promoting), and backend-symmetric across memory / sqlite /
+        // postgres.
+        crate::federation::admission::check_row_column_binding(&row)?;
+
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
         // (notably `global`, a §8.1.8 feed-name, never a wire value)
@@ -20691,6 +20705,28 @@ mod tests {
     ///
     /// Runs the SAME shared exercise body as the sqlite and memory arms — the
     /// matrix is a parity proof only when all three drive one body.
+    /// v30.13.0 (CIRISPersist#643) — the typed-column binding, postgres arm.
+    /// The backend that most needs it: `attestation_envelope` is JSONB here, so
+    /// this is where a token-normalizing round-trip would turn the binding into
+    /// a false refusal if `weight` were compared by token instead of by value
+    /// (see `check_row_column_binding`).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn row_column_binding_postgres_643() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        // Unique per run: this database persists across tests.
+        let tag = format!("pg643{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_row_column_binding(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn bootstrap_peer_deadmission_postgres_543() {
@@ -28112,6 +28148,7 @@ mod tests {
     ) -> crate::federation::Attestation {
         let mut a = pg_scores_attestation(granter, grantee, granter, "x");
         a.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
         a.attestation_envelope = serde_json::json!({
             "references_attestation_id": a.attestation_id,
             "scope": scope,
@@ -28732,7 +28769,9 @@ mod tests {
         // owner withdraws the edge (issuer-against-recipient: attested = node_wd).
         let mut w = pg_scores_attestation(&owner, &node_wd, &owner, "x");
         w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut w);
         w.attestation_envelope = serde_json::json!({"references_attestation_id": d_wd_id});
+        crate::federation::tier_ingest::test_support::reseal(&mut w);
         pg_resign(&mut w);
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: w })
@@ -28855,6 +28894,7 @@ mod tests {
         let report = |signer: &str, subjects: &[&str], community: Option<&str>| {
             let mut a = pg_scores_attestation(signer, signer, signer, dim);
             a.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             if let Some(c) = community {
                 a.attestation_envelope["community_id"] = serde_json::Value::String(c.to_owned());
                 pg_resign(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
@@ -29006,11 +29046,14 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let mut row = pg_scores_attestation(attester, attester, attester, dimension);
         row.attestation_id = id.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         // `weight` is the confidence column the fold uses (score × confidence);
         // full confidence, the varying signal is `score` in the envelope.
         row.weight = Some(1.0);
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row.asserted_at = base + chrono::Duration::minutes(mins);
         row.subject_key_ids = vec![subject.to_string()];
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row.attestation_envelope = serde_json::json!({
             "dimension": dimension, "score": score, "confidence": 1.0,
         });
@@ -29040,8 +29083,10 @@ mod tests {
         row.attestation_id = uuid::Uuid::new_v4().to_string();
         row.attestation_type = atype.to_string();
         row.weight = None;
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row.asserted_at = base + chrono::Duration::minutes(mins);
         row.attestation_envelope = serde_json::json!({ "references_attestation_id": references });
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         pg_resign(&mut row);
         be.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
@@ -29416,6 +29461,7 @@ mod tests {
         // Target T with two independent subjects.
         let mut t = pg_scores_attestation(&prod, &prod, &prod, "identity_binding:v1");
         t.subject_key_ids = vec![s1.clone(), s2.clone()];
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         let tid = t.attestation_id.clone();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: t })
@@ -29425,6 +29471,7 @@ mod tests {
         let mk_withdraws = |issuer: &str| {
             let mut w = pg_scores_attestation(issuer, issuer, issuer, "identity_binding:v1");
             w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut w);
             w.attestation_envelope = serde_json::json!({
                 "references_attestation_id": tid,
                 "withdrawal_reason": "test",
@@ -29611,6 +29658,7 @@ mod tests {
             a.tier = tier.to_string();
             if tier == crate::federation::types::attestation_tier::LOCAL {
                 a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+                crate::federation::tier_ingest::test_support::reseal(&mut a);
             }
             a
         };
@@ -29699,6 +29747,7 @@ mod tests {
         // Target T names the canonical hash H in subject_key_ids (no FK).
         let mut t = pg_scores_attestation(&prod, &prod, &prod, "identity_binding:v1");
         t.subject_key_ids = vec![canon.clone()];
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         let tid = t.attestation_id.clone();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: t })
@@ -29708,6 +29757,7 @@ mod tests {
         let mk_withdraws = || {
             let mut w = pg_scores_attestation(&k, &k, &k, "identity_binding:v1");
             w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut w);
             w.attestation_envelope = serde_json::json!({
                 "references_attestation_id": tid,
                 "withdrawal_reason": "test",
@@ -29981,6 +30031,7 @@ mod tests {
             .unwrap();
         let mut att = pg_scores_attestation(&steward, &agent_k, &steward, "identity_binding:v1");
         att.cohort_scope = "global".to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
@@ -30036,6 +30087,7 @@ mod tests {
             .unwrap();
         let mut att = pg_scores_attestation(&steward, &agent_k, &steward, "identity_binding:v1");
         att.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
@@ -30289,6 +30341,7 @@ mod tests {
             "delegates_to:correlated_action_v2:from:emergent_deception_v1",
         );
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
@@ -30367,6 +30420,7 @@ mod tests {
         let w1_id = w1.attestation_id.clone();
         let mut w2 = w1.clone();
         w2.attestation_id = uuid::Uuid::new_v4().to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.asserted_at += chrono::Duration::seconds(60);
         w2.scrub_timestamp = w2.asserted_at;
         backend
@@ -34401,6 +34455,7 @@ mod tests {
         withdraws.attestation_type =
             crate::federation::types::attestation_type::WITHDRAWS.to_owned();
         withdraws.weight = None;
+        crate::federation::tier_ingest::test_support::reseal(&mut withdraws);
         withdraws.attestation_envelope = serde_json::json!({
             "kind": "withdraws",
             "references_attestation_id": holds_bytes.attestation_id,
@@ -34938,6 +34993,7 @@ mod tests {
             let mut a = pg_scores_attestation(&emit_a, attested, &emit_a, "identity_binding:v1");
             a.asserted_at = at;
             a.cohort_scope = scope.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             crate::federation::SignedAttestation { attestation: a }
         };
         let t = |d: u32| chrono::Utc.with_ymd_and_hms(2026, 5, d, 0, 0, 0).unwrap();

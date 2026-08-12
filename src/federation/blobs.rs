@@ -1799,10 +1799,32 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     // attests it itself no longer holds the bytes (a self-revocation).
     let signer_key_id = signer.derived_key_id();
 
-    let envelope = crate::federation::withdraws_attestation_envelope(
+    let mut envelope = crate::federation::withdraws_attestation_envelope(
         &prior.attestation_id,
         &prior.attestation_type,
     );
+    // v30.13.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, stamped BEFORE the
+    // bytes are signed. This helper hand-rolls the emit recipe (it predates
+    // `attestation_emit`), so it also has to hand-roll the stamp — and the row
+    // id has to be minted HERE rather than at the struct literal below, because
+    // it is now signed material. Without this, persist's own eviction sweeper
+    // emits rows its own put-gate refuses.
+    let attestation_id = uuid::Uuid::new_v4().to_string();
+    envelope
+        .as_object_mut()
+        .expect("withdraws_attestation_envelope builds an object")
+        .insert(
+            crate::federation::envelope::paths::ROW.to_owned(),
+            serde_json::json!({
+                "attestation_id": attestation_id,
+                "attesting_key_id": signer_key_id,
+                "attested_key_id": signer_key_id,
+                "attestation_type": crate::federation::types::attestation_type::WITHDRAWS,
+                "subject_key_ids": [],
+                "cohort_scope": crate::federation::types::cohort_scope::FEDERATION,
+            }),
+        );
+    let envelope = envelope;
     // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
     // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
     // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
@@ -1826,7 +1848,7 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     let scrub_signature_pqc = B64.encode(&sig.pqc.signature);
 
     let row = crate::federation::Attestation {
-        attestation_id: uuid::Uuid::new_v4().to_string(),
+        attestation_id,
         attesting_key_id: signer_key_id.to_owned(),
         // The withdraws row's FK target is `signer_key_id`: the host
         // attests it itself no longer holds the bytes. Matches the

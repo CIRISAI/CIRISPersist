@@ -1471,29 +1471,32 @@ pub mod test_support {
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(signing_key_id, &envelope);
         let now = chrono::Utc::now();
-        crate::federation::Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: attester.to_owned(),
-            attested_key_id: attested.to_owned(),
-            attestation_type: attestation_type.to_owned(),
-            weight: Some(1.0),
-            asserted_at: now,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
-            scrub_key_id: attester.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        }
+        crate::federation::tier_ingest::test_support::seal_row(
+            signing_key_id,
+            crate::federation::Attestation {
+                attestation_id: id.to_owned(),
+                attesting_key_id: attester.to_owned(),
+                attested_key_id: attested.to_owned(),
+                attestation_type: attestation_type.to_owned(),
+                weight: Some(1.0),
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: attester.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        )
     }
 
     /// v21.15.0 (CIRISPersist#536) — the ONE scope-granting edge: a live
@@ -2220,6 +2223,11 @@ pub mod test_support {
     ) -> crate::federation::Attestation {
         let mut row =
             signed_trust_attestation(id, attester, attested, attestation_type, envelope.clone());
+        // v30.13.0 (CIRISPersist#643) — the co-signers sign the SEALED envelope,
+        // i.e. the one `signed_trust_attestation` just stamped the typed-column
+        // mirror into. Every scrub is over the SAME preimage (#556), and the
+        // mirror is part of that preimage now.
+        let envelope = row.attestation_envelope.clone();
         row.additional_scrubs = cosigners
             .iter()
             .map(|k| {

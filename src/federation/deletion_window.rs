@@ -655,7 +655,7 @@ pub(crate) mod watch_witness {
         at: DateTime<Utc>,
     ) -> Attestation {
         let (hash, classical, pqc) = ts::sign_envelope(attesting, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: row_id(tag, label),
             attesting_key_id: attesting.to_owned(),
             attested_key_id: subject_key(tag),
@@ -677,7 +677,13 @@ pub(crate) mod watch_witness {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(
+            attesting,
+            &mut sealed_row_,
+        );
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     async fn publish(dir: &dyn FederationDirectory, row: Attestation) {

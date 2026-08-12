@@ -305,29 +305,32 @@ pub(crate) mod parity_test_support {
         };
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(emitter, &envelope);
-        let att = crate::federation::Attestation {
-            attestation_id: id,
-            attesting_key_id: emitter.to_owned(),
-            attested_key_id: subject.to_owned(),
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-            weight: Some(1.0),
-            asserted_at: at,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
-            scrub_key_id: emitter.to_owned(),
-            scrub_timestamp: at,
-            pqc_completed_at: Some(at),
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
+        let att = crate::federation::tier_ingest::test_support::seal_row(
+            emitter,
+            crate::federation::Attestation {
+                attestation_id: id,
+                attesting_key_id: emitter.to_owned(),
+                attested_key_id: subject.to_owned(),
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: Some(1.0),
+                asserted_at: at,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: emitter.to_owned(),
+                scrub_timestamp: at,
+                pqc_completed_at: Some(at),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        );
         dir.put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .expect("an open-vocabulary content_class row admits from any emitter (#571)");

@@ -1096,7 +1096,7 @@ mod ingest_gate_proof {
     fn row(attester: &str, envelope: serde_json::Value) -> Attestation {
         let (och, classical, pqc) = sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             // `::uuid`-cast on the PG write path — a real UUID, per the
             // uuid_like() fixture lesson.
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -1120,7 +1120,10 @@ mod ingest_gate_proof {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// **ERASABLE: total erasure changes nothing the wire looks at.** Mint,

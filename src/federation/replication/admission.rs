@@ -1966,7 +1966,11 @@ pub mod gate_order_test_support {
     /// A federation-tier row whose scrub signature is garbage — it can
     /// never clear the tier-3 hybrid verify.
     fn unverifiable_row(key_id: &str, tier: &str, cohort_scope: &str) -> Attestation {
-        Attestation {
+        // v30.13.0 (CIRISPersist#643) — the mirror is STAMPED but the row is
+        // deliberately NOT re-signed: this witness needs a row that clears the
+        // pure tier-1 gates and dies at the tier-3 hybrid verify, so sealing it
+        // with a valid signature would move what the test measures.
+        let mut row = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: key_id.into(),
             attested_key_id: key_id.into(),
@@ -1988,7 +1992,9 @@ pub mod gate_order_test_support {
             tier: tier.into(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::stamp_mirror(&mut row);
+        row
     }
 
     /// **The headline AV-76 assertion.** A federation-tier row that fails
@@ -2083,6 +2089,7 @@ pub mod gate_order_test_support {
             "self",
         );
         row.attestation_envelope = oversized;
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
 
         let err = dir
             .put_attestation(SignedAttestation { attestation: row })
@@ -2156,6 +2163,10 @@ pub mod gate_order_test_support {
             reserved.attestation_envelope = serde_json::json!({
                 "dimension": format!("{prefix}reserved_probe:v1"),
             });
+            // v30.13.0 (CIRISPersist#643) — swapping the envelope drops the
+            // mirror; re-stamp (still unsigned, see `unverifiable_row`) so this
+            // arm keeps measuring the quota class and not the binding.
+            crate::federation::tier_ingest::test_support::stamp_mirror(&mut reserved);
             let err = dir
                 .put_attestation(SignedAttestation {
                     attestation: reserved,
@@ -2220,6 +2231,7 @@ pub mod gate_order_test_support {
         for _ in 0..super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
             let mut row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
             row.attestation_envelope = big.clone();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             let err = dir
                 .put_attestation(SignedAttestation { attestation: row })
                 .await
@@ -2825,6 +2837,7 @@ mod tests {
         }
         let mut no_dimension = row_with("x");
         no_dimension.attestation_envelope = serde_json::json!({});
+        crate::federation::tier_ingest::test_support::reseal(&mut no_dimension);
         assert_eq!(
             PeerWriteQuota::classify(&no_dimension),
             WriteAdmissionClass::Ordinary

@@ -1474,18 +1474,7 @@ pub(crate) mod test_support {
         asserted_at: DateTime<Utc>,
     ) -> Attestation {
         let (och, classical, pqc) = ts::sign_envelope(signer, &envelope);
-        let additional_scrubs = cosigners
-            .iter()
-            .map(|c| {
-                let (_h, cl, pq) = ts::sign_envelope(c, &envelope);
-                crate::federation::types::ScrubSig {
-                    scrub_key_id: (*c).to_owned(),
-                    scrub_signature_classical: cl,
-                    scrub_signature_pqc: pq,
-                }
-            })
-            .collect();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: attested.to_owned(),
@@ -1506,8 +1495,24 @@ pub(crate) mod test_support {
             cohort_scope: cohort_scope::FEDERATION.to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
-            additional_scrubs,
-        }
+            additional_scrubs: Vec::new(),
+        };
+        // v30.13.0 (CIRISPersist#643) — seal FIRST, then co-sign the SEALED
+        // envelope: every scrub is over the same preimage (#556), and the
+        // typed-column mirror is part of that preimage now.
+        crate::federation::tier_ingest::test_support::seal_row_in_place(signer, &mut sealed_row_);
+        sealed_row_.additional_scrubs = cosigners
+            .iter()
+            .map(|c| {
+                let (_h, cl, pq) = ts::sign_envelope(c, &sealed_row_.attestation_envelope);
+                crate::federation::types::ScrubSig {
+                    scrub_key_id: (*c).to_owned(),
+                    scrub_signature_classical: cl,
+                    scrub_signature_pqc: pq,
+                }
+            })
+            .collect();
+        sealed_row_
     }
 
     async fn store(dir: &dyn FederationDirectory, row: &Attestation) -> Result<(), Error> {
@@ -2151,6 +2156,7 @@ pub(crate) mod test_support {
         let b3_id = uuid::Uuid::new_v4().to_string();
         let mut b3 = ts::owner_binding_attestation(&b3_id, &owner3, &node3);
         b3.subject_key_ids = vec![node3.clone()];
+        crate::federation::tier_ingest::test_support::reseal(&mut b3);
         store(dir, &b3)
             .await
             .expect("conformant binding names K as subject");

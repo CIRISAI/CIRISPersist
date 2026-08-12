@@ -3007,7 +3007,7 @@ mod tests {
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
         let now = Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: from.to_owned(),
             attested_key_id: to.to_owned(),
@@ -3029,7 +3029,10 @@ mod tests {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(from, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// A really-hybrid-signed mesh-config row, ready for the real door.
@@ -3057,7 +3060,7 @@ mod tests {
         );
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(author, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             // UUID, not a slug: postgres types `attestation_id` as `uuid` and
             // rejects anything else at the driver.
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -3081,7 +3084,10 @@ mod tests {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// **The whole plane, driven through the REAL doors, on one backend.**
@@ -3394,6 +3400,7 @@ mod tests {
             "att-deleg",
         );
         misfiled.attested_key_id = node.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut misfiled);
         assert_eq!(
             door!(misfiled),
             MeshConfigOutcome::Refused {

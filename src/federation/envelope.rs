@@ -71,6 +71,143 @@ pub mod paths {
     /// treatment: the consent fold drops a row whose `expires_at` has passed,
     /// so an unsigned column is an unsigned mute button.
     pub const EXPIRES_AT: &str = "expires_at";
+    /// v30.13.0 (CIRISPersist#643) — **the TYPED-COLUMN MIRROR.** One object,
+    /// not five sibling keys: the five `federation_attestations` columns that
+    /// decide what a row MEANS and no signature covered
+    /// ([`super::RowMirror`] — `attestation_type`, `attested_key_id`,
+    /// `subject_key_ids`, `cohort_scope`, `weight`).
+    ///
+    /// `original_content_hash` covers `attestation_envelope` and nothing else,
+    /// so before this key a relay could flip `withdraws` → `scores` (the
+    /// retraction becomes an ordinary claim and the thing it retracted stays
+    /// live — note the TARGET, `references_attestation_id`, was already
+    /// signed) or append a canonical binding hash to `subject_key_ids` (which
+    /// grants that key rule-2 revocation standing at
+    /// [`crate::federation::admission::withdraws_admission_rule_for`]), and
+    /// the row still verified.
+    ///
+    /// Stamped by
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`] BEFORE
+    /// the bytes are signed; enforced at every `put_attestation` by
+    /// [`crate::federation::admission::check_row_column_binding`].
+    pub const ROW: &str = "row";
+}
+
+/// v30.13.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
+/// object with a CLOSED member set (see [`RowMirror`]'s
+/// `deny_unknown_fields`), so "the mirror" is one vocabulary entry rather than
+/// five top-level keys accreted over five releases.
+pub mod row_paths {
+    /// The row's IDENTITY. Binding it makes a replay of a still-valid signed
+    /// envelope under a fresh `attestation_id` structurally impossible: same
+    /// bytes ⇒ same id ⇒ the PK dedup absorbs it as an idempotent no-op.
+    pub const ATTESTATION_ID: &str = "attestation_id";
+    /// WHO made the claim. Emergently bound already (the ingest verifier
+    /// resolves this key's registered pubkeys and the producer's signature
+    /// verifies under no other), but bound EXPLICITLY here so the property
+    /// holds on the local tier too, where signature verification is deferred.
+    pub const ATTESTING_KEY_ID: &str = "attesting_key_id";
+    /// The VERB — `scores` / `withdraws` / `supersedes` / `recants` /
+    /// `delegates_to`.
+    pub const ATTESTATION_TYPE: &str = "attestation_type";
+    /// Who the claim is ABOUT.
+    pub const ATTESTED_KEY_ID: &str = "attested_key_id";
+    /// §4.2.6 subjects — the field that GRANTS revocation authority.
+    pub const SUBJECT_KEY_IDS: &str = "subject_key_ids";
+    /// Who may SEE it.
+    pub const COHORT_SCOPE: &str = "cohort_scope";
+    /// How much it COUNTS.
+    pub const WEIGHT: &str = "weight";
+}
+
+/// v30.13.0 (CIRISPersist#643) — the signed twin of the five typed
+/// `federation_attestations` columns the envelope never covered. Rides the
+/// envelope under [`paths::ROW`] as ONE object.
+///
+/// # Why an object and not five sibling keys
+///
+/// Five top-level keys would be five independent vocabulary additions, each
+/// individually optional-looking, and a producer that stamped four of five
+/// would look conformant. One object is one presence check: the mirror is
+/// there in full or the row is refused.
+///
+/// # Closed member set
+///
+/// `deny_unknown_fields` — an unexpected member inside `row` is a refusal, not
+/// a shrug. The mirror is not an extension point: anything that wants to ride
+/// the envelope rides the envelope's own `extra`, where the vocabulary hash
+/// covers it. A SIXTH column joining the mirror is a deliberate re-pin of
+/// [`ENVELOPE_VOCABULARY_SHA256`], exactly as this one was.
+///
+/// # `subject_key_ids` is ORDER-SENSITIVE
+///
+/// The mirror carries the list AS A LIST and
+/// [`crate::federation::admission::check_row_column_binding`] compares it
+/// element-by-element. Every *semantic* consumer is a membership test
+/// (`iter().any`, `HashSet::contains`, `for subj in …` — the rule-2/3/4 arms,
+/// the V106 subject projection, the trace self-emission polarity check), so
+/// nothing reads position. But
+/// [`crate::federation::types::compute_persist_row_hash`] and
+/// [`crate::federation::wire_index::content_hash_of`] both serialize the field
+/// as an ORDERED JSON array, so a set-wise comparison here would let a relay
+/// permute the list, change the row's content hash and its wire-index address,
+/// and still satisfy the binding — a divergence traded one plane over rather
+/// than closed. Order round-trips verbatim on all three backends (sqlite
+/// `TEXT` JSON array, postgres JSONB array, memory `Vec`), so the strict
+/// comparison is exactly reproducible and is never a false refusal.
+/// # What is deliberately NOT in the mirror
+///
+/// Binding a field that the receiving node RE-DERIVES from its own verified
+/// state would be worse than leaving it unbound — it would make a peer's
+/// signed opinion about our placement decisions into something we have to
+/// honour. So:
+///
+/// - `tier`, `promoted_at` — this node's own placement of the row. Re-gated at
+///   every door ([`check_local_tier_eligibility`], [`check_promotion_admission`]).
+/// - `withdraws_admission_rule` — audit metadata RE-DERIVED at admission by
+///   [`resolve_withdraws_admission_rule`]; a signed claim to a rule would be a
+///   producer asserting its own authority.
+/// - `persist_row_hash` — locally computed, over the row including this
+///   envelope; binding it would be circular.
+/// - `original_content_hash`, `scrub_signature_*` — the signature and its
+///   digest cannot live inside the bytes they cover.
+/// - `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at` — signature
+///   metadata, legitimately REWRITTEN when a promoting node re-scrubs the row.
+///   No authority gate reads them (the ingest verifier resolves
+///   `attesting_key_id`); `additional_scrubs` are each verified individually
+///   over the same preimage (#556), which is a stronger property than binding.
+/// - `asserted_at`, `expires_at` — bound, but as TOP-LEVEL envelope keys by
+///   CIRISPersist#598 in this same break window, not inside `row`. They are
+///   assertion-native (the validity interval of a claim, which any CEG reader
+///   expects at the envelope root) rather than persist projections, and
+///   [`check_consent_state_instant_binding`] reads them there.
+///
+/// [`check_local_tier_eligibility`]: crate::federation::admission::check_local_tier_eligibility
+/// [`check_promotion_admission`]: crate::federation::admission::check_promotion_admission
+/// [`resolve_withdraws_admission_rule`]: crate::federation::admission::resolve_withdraws_admission_rule
+/// [`check_consent_state_instant_binding`]: crate::federation::admission::check_consent_state_instant_binding
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowMirror {
+    /// [`row_paths::ATTESTATION_ID`].
+    pub attestation_id: String,
+    /// [`row_paths::ATTESTING_KEY_ID`].
+    pub attesting_key_id: String,
+    /// [`row_paths::ATTESTATION_TYPE`].
+    pub attestation_type: String,
+    /// [`row_paths::ATTESTED_KEY_ID`].
+    pub attested_key_id: String,
+    /// [`row_paths::SUBJECT_KEY_IDS`] — order-sensitive (see the type doc).
+    #[serde(default)]
+    pub subject_key_ids: Vec<String>,
+    /// [`row_paths::COHORT_SCOPE`].
+    pub cohort_scope: String,
+    /// [`row_paths::WEIGHT`] — absent ⇔ the row column is `None`. Held as a
+    /// [`serde_json::Number`] rather than an `f64` so [`EnvelopeCore`] keeps
+    /// its `Eq` (and so a non-finite weight, which JSON cannot represent at
+    /// all, is refused at the stamp instead of silently becoming `null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<serde_json::Number>,
 }
 
 /// A delegation `scope` in either established wire shape.
@@ -145,10 +282,51 @@ pub struct EnvelopeCore {
     /// binding gate refuses any other pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// [`paths::ROW`] — v30.13.0 (#643). The signed twin of the five typed
+    /// columns (see [`RowMirror`]). `None` on an envelope that has not been
+    /// through
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`];
+    /// `put_attestation` REFUSES such a row on every backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<RowMirror>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RowMirror {
+    /// v30.13.0 (CIRISPersist#643) — **the ONE definition of "the mirror this
+    /// row implies"**, shared by the stamp side
+    /// ([`crate::federation::attestation_emit::stamp_and_canonicalize`] builds
+    /// the same shape from the emit input) and the check side
+    /// ([`crate::federation::admission::check_row_column_binding`] compares
+    /// against this). Two definitions of the projection would be two
+    /// definitions of the binding, and this substrate has a recorded defect
+    /// class for exactly that.
+    ///
+    /// Fails only on a non-finite `weight`, which JSON cannot represent at all
+    /// — refused rather than silently serialized as `null`.
+    pub fn of(row: &super::Attestation) -> Result<Self, super::Error> {
+        Ok(Self {
+            attestation_id: row.attestation_id.clone(),
+            attesting_key_id: row.attesting_key_id.clone(),
+            attestation_type: row.attestation_type.clone(),
+            attested_key_id: row.attested_key_id.clone(),
+            subject_key_ids: row.subject_key_ids.clone(),
+            cohort_scope: row.cohort_scope.clone(),
+            weight: match row.weight {
+                None => None,
+                Some(w) => Some(serde_json::Number::from_f64(w).ok_or_else(|| {
+                    super::Error::InvalidArgument(format!(
+                        "attestation {}: `weight` {w} is not finite and cannot be bound into the \
+                         signed envelope (CIRISPersist#643)",
+                        row.attestation_id
+                    ))
+                })?),
+            },
+        })
+    }
 }
 
 impl EnvelopeCore {
@@ -194,6 +372,15 @@ mod tests {
             deletion_window: Some("2027-01-01T00:00:00Z".into()),
             asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
             expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
+            row: Some(RowMirror {
+                attestation_id: "att-1".into(),
+                attesting_key_id: "k-auth".into(),
+                attestation_type: "scores".into(),
+                attested_key_id: "k-att".into(),
+                subject_key_ids: vec!["k-subj".into()],
+                cohort_scope: "federation".into(),
+                weight: serde_json::Number::from_f64(1.0),
+            }),
             extra: serde_json::Map::new(),
         };
         let v = core.to_value();
@@ -209,6 +396,7 @@ mod tests {
             (paths::DELETION_WINDOW, true),
             (paths::ASSERTED_AT, true),
             (paths::EXPIRES_AT, true),
+            (paths::ROW, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -216,6 +404,35 @@ mod tests {
                 "paths::{path} does not bind an EnvelopeCore serde field"
             );
         }
+        // v30.13.0 (CIRISPersist#643) — the same binding one level down: every
+        // `row_paths` constant must name a real [`RowMirror`] serde field, or
+        // the gate would compare a member the wire never carries.
+        let row_v = v.get(paths::ROW).expect("row mirror serialized");
+        for path in [
+            row_paths::ATTESTATION_ID,
+            row_paths::ATTESTING_KEY_ID,
+            row_paths::ATTESTATION_TYPE,
+            row_paths::ATTESTED_KEY_ID,
+            row_paths::SUBJECT_KEY_IDS,
+            row_paths::COHORT_SCOPE,
+            row_paths::WEIGHT,
+        ] {
+            assert!(
+                row_v.get(path).is_some(),
+                "row_paths::{path} does not bind a RowMirror serde field"
+            );
+        }
+        // The member set is CLOSED: an unknown member is refused, not ignored.
+        let mut junk = row_v.clone();
+        junk.as_object_mut()
+            .unwrap()
+            .insert("smuggled".into(), serde_json::json!(1));
+        let mut env_junk = v.clone();
+        env_junk[paths::ROW] = junk;
+        assert!(
+            EnvelopeCore::from_value(env_junk).is_err(),
+            "an unknown member inside `row` must be REFUSED (the mirror is a closed vocabulary)"
+        );
         // Round-trip losslessness incl. extras.
         let mut with_extra = core.clone();
         with_extra
@@ -304,6 +521,26 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // choose.
             paths::ASSERTED_AT,
             paths::EXPIRES_AT,
+            // v30.13.0 (CIRISPersist#643) — the typed-column mirror. Added
+            // DELIBERATELY (re-pinning `ENVELOPE_VOCABULARY_SHA256` a second
+            // time in this cut): the VERB of an attestation, and the field
+            // that grants revocation authority over it, must be part of the
+            // vocabulary both sides agree on rather than unsigned columns a
+            // relay can rewrite.
+            paths::ROW,
+        ],
+        // v30.13.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
+        // alongside the universal paths so a consumer can validate the mirror
+        // it must now stamp, and so adding a sixth column is a visible
+        // vocabulary change rather than a quiet one.
+        "row_members": [
+            row_paths::ATTESTATION_ID,
+            row_paths::ATTESTING_KEY_ID,
+            row_paths::ATTESTATION_TYPE,
+            row_paths::ATTESTED_KEY_ID,
+            row_paths::SUBJECT_KEY_IDS,
+            row_paths::COHORT_SCOPE,
+            row_paths::WEIGHT,
         ],
         "consent_dimension_prefixes": [
             cd::STATE_GRANTED_PREFIX,
@@ -329,8 +566,12 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// wins is now part of the vocabulary both sides agree on. Consumers
 /// asserting the old hash BREAK, deliberately and loudly (operator decision
 /// on #598 — no grandfathering).
+/// v30.13.0 (CIRISPersist#643) — RE-PINNED AGAIN, same window, same decision.
+/// `row` joined `universal_paths` and its closed member set joined the
+/// document as `row_members`: the VERB of an attestation, and the field that
+/// grants revocation authority over it, are now signed material.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "2bb46f15f911ce245571f7f88451badf46e948258976e728f0b7025a296394ba";
+    "0a6f72817eb39d4205ea024ce4a0056112a0614d5a023b8c2c7c88dcfb7264f5";
 
 #[cfg(test)]
 mod vocab_tests {

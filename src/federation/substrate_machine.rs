@@ -1242,6 +1242,27 @@ pub mod test_support {
                     .expect("harness envelopes are objects")
                     .insert("references_attestation_id".into(), target.into());
             }
+            // v30.13.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, stamped
+            // into the envelope BEFORE it is signed. Built here for the same
+            // reason everything else is: this is the ONE row builder, so the
+            // mirror the harness signs is the mirror of the row the harness
+            // submits — a mirror assembled anywhere else would drift from the
+            // row and the differential would measure the drift, not the gate.
+            envelope
+                .as_object_mut()
+                .expect("harness envelopes are objects")
+                .insert(
+                    crate::federation::envelope::paths::ROW.into(),
+                    serde_json::json!({
+                        "attestation_id": id,
+                        "attesting_key_id": self.kid(attester),
+                        "attested_key_id": self.kid(op.subject),
+                        "attestation_type": structural
+                            .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
+                        "subject_key_ids": [self.kid(op.subject)],
+                        "cohort_scope": op.cohort_scope.as_str(),
+                    }),
+                );
             let (hash, classical, pqc) =
                 signature_for_key(op.signature, &self.kid(attester), &envelope);
             // v24.0.0 (CIRISPersist#556) — the co-signature set, over the SAME
@@ -2252,6 +2273,7 @@ pub mod test_support {
                     match narrowing {
                         Narrowing::UnregisteredAttester => {
                             row.attesting_key_id = UNREGISTERED_KEY_ID.to_owned();
+                            crate::federation::tier_ingest::test_support::reseal(&mut row);
                             row.scrub_key_id = UNREGISTERED_KEY_ID.to_owned();
                         }
                         Narrowing::CorruptSignature => {
@@ -3093,6 +3115,21 @@ mod proptests {
                 .expect("harness envelopes are objects")
                 .insert("references_attestation_id".into(), r.into());
         }
+        // v30.13.0 (CIRISPersist#643) — the mirror rides the SIGNED bytes.
+        envelope
+            .as_object_mut()
+            .expect("harness envelopes are objects")
+            .insert(
+                crate::federation::envelope::paths::ROW.into(),
+                serde_json::json!({
+                    "attestation_id": id,
+                    "attesting_key_id": Principal::A.key_id_in(tag),
+                    "attested_key_id": Principal::A.key_id_in(tag),
+                    "attestation_type": att_type,
+                    "subject_key_ids": [],
+                    "cohort_scope": cohort,
+                }),
+            );
         let (original_content_hash, classical, pqc) =
             signature_for_key(sig, &Principal::A.key_id_in(tag), &envelope);
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
