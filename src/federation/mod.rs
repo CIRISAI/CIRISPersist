@@ -5422,7 +5422,7 @@ pub enum Error {
     #[error("operational-data authority not established: {0}")]
     OperationalAuthority(String),
 
-    /// v30.13.0 (CIRISPersist#642, CEG 1.0-RC2 §5.6.8.13) — an
+    /// v30.13.0 (CIRISPersist#644, CEG 1.0-RC2 §5.6.8.13) — an
     /// `organization` / `org_membership` / `partner_record` row carried a
     /// typed column that its signature does not cover and that disagrees
     /// with the signed envelope it claims to project.
@@ -5447,7 +5447,7 @@ pub enum Error {
         "{plane} row {attestation_id:?}: typed column `{field}` is not bound to the \
          signed envelope — {detail}. The signature covers `signed_envelope` only, so an \
          unbound column is authored by whoever wrote the row, not by whoever signed it \
-         (CIRISPersist#642)"
+         (CIRISPersist#644)"
     )]
     OperationalEnvelopeUnbound {
         /// `organization` | `org_membership` | `partner_record`.

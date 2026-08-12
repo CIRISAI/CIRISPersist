@@ -8092,7 +8092,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#642) — bind the typed projection to the signed
+        // v30.13.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -8161,7 +8161,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#642) — bind the typed projection to the signed
+        // v30.13.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -20650,13 +20650,13 @@ mod tests {
         .await;
     }
 
-    /// #642-a — an org row whose own signature does not verify is REFUSED,
+    /// #644-a — an org row whose own signature does not verify is REFUSED,
     /// on postgres. Shares the assertion body with the other two backends:
     /// the gate was missing from the SHARED admission code, so a
     /// single-backend witness would repeat the test shape that hid it.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn org_bogus_signature_refused_postgres_642() {
+    async fn org_bogus_signature_refused_postgres_644() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -20666,43 +20666,43 @@ mod tests {
         // Short + unique: this database persists across tests, and the
         // exercise derives distinct identities from the tag — they must
         // differ inside the 32-byte `Identity::new` seed window.
-        let tag = format!("p642a{}", &uuid_like()[..6]);
+        let tag = format!("p644a{}", &uuid_like()[..6]);
         crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
             &backend, &tag,
         )
         .await;
     }
 
-    /// #642-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// #644-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
     /// that the signature does not cover is REFUSED, on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn unsigned_tombstone_refused_postgres_642() {
+    async fn unsigned_tombstone_refused_postgres_644() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
-        let tag = format!("p642b{}", &uuid_like()[..6]);
+        let tag = format!("p644b{}", &uuid_like()[..6]);
         crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
             &backend, &tag,
         )
         .await;
     }
 
-    /// #642-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
     /// legitimate later revision still admits, on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn revision_inflation_refused_postgres_642() {
+    async fn revision_inflation_refused_postgres_644() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
-        let tag = format!("p642c{}", &uuid_like()[..6]);
+        let tag = format!("p644c{}", &uuid_like()[..6]);
         crate::federation::operational::test_support::exercise_revision_inflation_refused(
             &backend, &tag,
         )
@@ -36309,7 +36309,7 @@ mod tests {
             .unwrap();
 
         // fail-closed: a stranger cannot write.
-        // v30.13.0 (CIRISPersist#642) — the stranger is REGISTERED (as a
+        // v30.13.0 (CIRISPersist#644) — the stranger is REGISTERED (as a
         // plain agent) so its signature verifies and this leg still reaches
         // the authority gate it exists to pin. Registered-but-unrooted is
         // the case that actually exercises fail-closed authority; an

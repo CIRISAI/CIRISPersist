@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
-### Fixed — BREAKING — the operational planes stored signatures nobody verified, beside columns nobody bound (#642)
+### Fixed — BREAKING — the operational planes stored signatures nobody verified, beside columns nobody bound (#644)
 
 `Organization` and `OrgMembership` carry `ed25519_signature_base64` /
 `mldsa65_signature_base64`. **Nothing in the crate ever verified them.** The
@@ -90,7 +90,7 @@ agent release). Fixtures that broke ARE the break.
   truncated, and then fail its own binding when a replicating peer read it back
   and re-submitted it.
 
-Witnesses `#642-a/b/c` live in `operational::test_support` and run on **all
+Witnesses `#644-a/b/c` live in `operational::test_support` and run on **all
 three backends** — the gate was missing from the SHARED admission code, so a
 single-backend witness would have repeated the exact test shape that hid it.
 The `-c` witness asserts the lockout is GONE, not merely that the attack write

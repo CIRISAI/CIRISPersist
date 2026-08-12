@@ -33,7 +33,7 @@
 //!
 //! Every `put_*` runs, in order:
 //!
-//! 0. **Authorship + envelope binding** (v30.13.0, CIRISPersist#642) —
+//! 0. **Authorship + envelope binding** (v30.13.0, CIRISPersist#644) —
 //!    [`verify_organization_admission`] /
 //!    [`verify_org_membership_admission`] hybrid-Strict verify the row's
 //!    OWN signature against `attesting_key_id`'s REGISTERED pubkeys, and
@@ -520,7 +520,7 @@ pub fn check_partner_set_and_quorum(
     signed: &SignedPartnerRecord,
     steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
 ) -> Result<(), Error> {
-    // v30.13.0 (CIRISPersist#642) — bind the typed projection FIRST. The
+    // v30.13.0 (CIRISPersist#644) — bind the typed projection FIRST. The
     // quorum below proves M stewards signed `signed_envelope`; it proves
     // nothing about the columns beside it, and `revision` — the anti-
     // rollback counter and the first key of the `monotonic_quorum`
@@ -566,9 +566,9 @@ pub fn check_partner_revision_monotonic(
     Ok(())
 }
 
-// ── Admission check 0: authorship + envelope binding (#642) ─────────
+// ── Admission check 0: authorship + envelope binding (#644) ─────────
 //
-// v30.13.0 (CIRISPersist#642). Two holes, one root cause: the signature
+// v30.13.0 (CIRISPersist#644). Two holes, one root cause: the signature
 // covers `signed_envelope` and NOTHING ELSE, but every decision the
 // substrate makes reads a TYPED COLUMN beside it.
 //
@@ -609,7 +609,7 @@ pub fn check_partner_revision_monotonic(
 // Shaped on `check_consent_state_instant_binding` (#598), which refuses
 // exactly this divergence one plane over, in this same release.
 
-/// v30.13.0 (CIRISPersist#642) — build the typed refusal for a projection
+/// v30.13.0 (CIRISPersist#644) — build the typed refusal for a projection
 /// column that disagrees with the signed envelope it claims to project.
 fn unbound(plane: &'static str, id: &str, field: &'static str, detail: String) -> Error {
     Error::OperationalEnvelopeUnbound {
@@ -851,7 +851,7 @@ fn bind_opt_instant(
     ))
 }
 
-/// v30.13.0 (CIRISPersist#642) — refuse an [`Organization`] whose typed
+/// v30.13.0 (CIRISPersist#644) — refuse an [`Organization`] whose typed
 /// projection disagrees with the envelope its signature covers.
 ///
 /// # Errors
@@ -878,7 +878,7 @@ pub fn check_organization_binding(row: &Organization) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#642) — refuse an [`OrgMembership`] whose typed
+/// v30.13.0 (CIRISPersist#644) — refuse an [`OrgMembership`] whose typed
 /// projection disagrees with the envelope its signature covers.
 ///
 /// `role` and `status` are the two the role-chain resolver reads out of the
@@ -902,7 +902,7 @@ pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#642) — refuse a [`PartnerRecord`] whose typed
+/// v30.13.0 (CIRISPersist#644) — refuse a [`PartnerRecord`] whose typed
 /// projection disagrees with the envelope the M-of-N steward quorum signed.
 ///
 /// **This is what binds `revision`.** The counter is the anti-rollback
@@ -957,7 +957,7 @@ pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#642) — the `organization` admission gate nobody
+/// v30.13.0 (CIRISPersist#644) — the `organization` admission gate nobody
 /// was running: bind the projection, then hybrid-Strict verify the row's
 /// OWN signature over `JCS(signed_envelope)` against `attesting_key_id`'s
 /// **REGISTERED** pubkeys, resolved from persist's own directory.
@@ -991,7 +991,7 @@ where
     .map(|_| ())
 }
 
-/// v30.13.0 (CIRISPersist#642) — the `org_membership` counterpart of
+/// v30.13.0 (CIRISPersist#644) — the `org_membership` counterpart of
 /// [`verify_organization_admission`]. See there for the contract.
 ///
 /// # Errors
@@ -1340,7 +1340,7 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrgMembership {
-        // v30.13.0 (#642) — the envelope now carries EVERY column the
+        // v30.13.0 (#644) — the envelope now carries EVERY column the
         // binding gate checks, and the instant is truncated to the
         // substrate resolution before it is signed so the row cannot fail
         // its own binding after a postgres round-trip.
@@ -1384,7 +1384,7 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrganization {
-        // v30.13.0 (#642) — see `signed_membership`.
+        // v30.13.0 (#644) — see `signed_membership`.
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = json!({
@@ -1438,7 +1438,7 @@ pub mod test_support {
         } else {
             json!(["billing.read", "identity.read"])
         };
-        // v30.13.0 (#642) — `revision` was already in the envelope and the
+        // v30.13.0 (#644) — `revision` was already in the envelope and the
         // COLUMN was still the one the anti-rollback gate read; the three
         // instants join it so every column the comparator touches is
         // quorum-attested. Truncated before signing (see
@@ -3962,7 +3962,7 @@ pub mod test_support {
         Ok(())
     }
 
-    // ── #642 witnesses — authorship + envelope binding ──────────────
+    // ── #644 witnesses — authorship + envelope binding ──────────────
     //
     // One body, driven from memory + sqlite + postgres. The defect was
     // uniform across all three backends because the gate was missing from
@@ -3989,7 +3989,7 @@ pub mod test_support {
         .ok();
     }
 
-    /// **#642-a — AN ORG ROW WITH A BOGUS SIGNATURE IS REFUSED.**
+    /// **#644-a — AN ORG ROW WITH A BOGUS SIGNATURE IS REFUSED.**
     ///
     /// The reported defect at its simplest. `Organization` and
     /// `OrgMembership` carry `ed25519_signature_base64` /
@@ -4016,7 +4016,7 @@ pub mod test_support {
         let good = signed_organization(&format!("{tag}-o-ok"), &org_id, &steward, "active", now);
         dir.put_organization(good.clone())
             .await
-            .unwrap_or_else(|e| panic!("({tag}) #642-a: the genuinely signed org row admits: {e}"));
+            .unwrap_or_else(|e| panic!("({tag}) #644-a: the genuinely signed org row admits: {e}"));
 
         // (b) The SAME row with only the Ed25519 half replaced. Everything
         //     else — envelope, attesting_key_id, every typed column — is
@@ -4027,17 +4027,17 @@ pub mod test_support {
             base64::engine::general_purpose::STANDARD.encode([0x41u8; 64]);
         assert_eq!(
             forged.organization.signed_envelope, good.organization.signed_envelope,
-            "({tag}) #642-a: the forgery must differ ONLY in the signature — otherwise the \
+            "({tag}) #644-a: the forgery must differ ONLY in the signature — otherwise the \
              witness could pass for the wrong reason"
         );
         let err = dir
             .put_organization(forged)
             .await
-            .expect_err("({tag}) #642-a: an org row whose signature does not verify is REFUSED");
+            .expect_err("({tag}) #644-a: an org row whose signature does not verify is REFUSED");
         assert_eq!(
             err.kind(),
             "federation_federation_tier_unverified",
-            "({tag}) #642-a: and it is refused as an unverified signature, not incidentally \
+            "({tag}) #644-a: and it is refused as an unverified signature, not incidentally \
              by some other gate: {err:?}"
         );
 
@@ -4054,16 +4054,16 @@ pub mod test_support {
         forged_m.org_membership.ed25519_signature_base64 =
             base64::engine::general_purpose::STANDARD.encode([0x42u8; 64]);
         let err = dir.put_org_membership(forged_m).await.expect_err(
-            "({tag}) #642-a: an org_membership row whose signature does not verify is REFUSED",
+            "({tag}) #644-a: an org_membership row whose signature does not verify is REFUSED",
         );
         assert_eq!(
             err.kind(),
             "federation_federation_tier_unverified",
-            "({tag}) #642-a: org_membership refuses for the same reason: {err:?}"
+            "({tag}) #644-a: org_membership refuses for the same reason: {err:?}"
         );
     }
 
-    /// **#642-b — A TOMBSTONE SET BY A KEY THAT DID NOT SIGN IT IS REFUSED.**
+    /// **#644-b — A TOMBSTONE SET BY A KEY THAT DID NOT SIGN IT IS REFUSED.**
     ///
     /// Verifying the signature is necessary and NOT sufficient. The
     /// signature covers `signed_envelope`; `withdrawn_at` is a column
@@ -4089,7 +4089,7 @@ pub mod test_support {
         let good = signed_organization(&format!("{tag}-o-live"), &org_id, &steward, "active", now);
         dir.put_organization(good.clone())
             .await
-            .unwrap_or_else(|e| panic!("({tag}) #642-b: the in-force org row admits: {e}"));
+            .unwrap_or_else(|e| panic!("({tag}) #644-b: the in-force org row admits: {e}"));
 
         // (a) The tombstone. Signature untouched and still valid; only the
         //     unsigned column moves.
@@ -4099,19 +4099,19 @@ pub mod test_support {
         assert_eq!(
             tombstoned.organization.ed25519_signature_base64,
             good.organization.ed25519_signature_base64,
-            "({tag}) #642-b: the attacker forges NOTHING — that is the point of the witness"
+            "({tag}) #644-b: the attacker forges NOTHING — that is the point of the witness"
         );
         let err = dir.put_organization(tombstoned).await.expect_err(
-            "({tag}) #642-b: a withdrawn_at tombstone the signature does not cover is REFUSED",
+            "({tag}) #644-b: a withdrawn_at tombstone the signature does not cover is REFUSED",
         );
         assert_eq!(
             err.kind(),
             "federation_operational_envelope_unbound",
-            "({tag}) #642-b: refused as an unbound column: {err:?}"
+            "({tag}) #644-b: refused as an unbound column: {err:?}"
         );
         assert!(
             format!("{err}").contains("withdrawn_at"),
-            "({tag}) #642-b: the refusal must name the column it is about: {err}"
+            "({tag}) #644-b: the refusal must name the column it is about: {err}"
         );
 
         // (b) The org is still in force — the failed write changed nothing.
@@ -4121,7 +4121,7 @@ pub mod test_support {
             .expect("list organizations");
         assert!(
             rows.iter().all(|r| r.withdrawn_at.is_none()),
-            "({tag}) #642-b: the refused tombstone must not have landed"
+            "({tag}) #644-b: the refused tombstone must not have landed"
         );
 
         // (c) `status` is bound too — the other half of the same column.
@@ -4131,7 +4131,7 @@ pub mod test_support {
         let err = dir
             .put_organization(restatused)
             .await
-            .expect_err("({tag}) #642-b: an unsigned `status` flip is REFUSED");
+            .expect_err("({tag}) #644-b: an unsigned `status` flip is REFUSED");
         assert_eq!(err.kind(), "federation_operational_envelope_unbound");
 
         // (d) …and `role` on the membership plane — the escalation surface.
@@ -4146,20 +4146,20 @@ pub mod test_support {
         );
         escalated.org_membership.role = "org_admin".into();
         let err = dir.put_org_membership(escalated).await.expect_err(
-            "({tag}) #642-b: a membership signed as `viewer` may not be stored as `org_admin`",
+            "({tag}) #644-b: a membership signed as `viewer` may not be stored as `org_admin`",
         );
         assert_eq!(
             err.kind(),
             "federation_operational_envelope_unbound",
-            "({tag}) #642-b: role divergence is an unbound column: {err:?}"
+            "({tag}) #644-b: role divergence is an unbound column: {err:?}"
         );
         assert!(
             format!("{err}").contains("role"),
-            "({tag}) #642-b: the refusal names `role`: {err}"
+            "({tag}) #644-b: the refusal names `role`: {err}"
         );
     }
 
-    /// **#642-c — AN INFLATED `revision` IS REFUSED, AND THE LOCKOUT IS GONE.**
+    /// **#644-c — AN INFLATED `revision` IS REFUSED, AND THE LOCKOUT IS GONE.**
     ///
     /// `PartnerRecord` is the plane that was PARTIALLY clean: it really
     /// does verify an M-of-N steward quorum. But the quorum verifies
@@ -4204,7 +4204,7 @@ pub mod test_support {
         );
         dir.put_partner_record(r1.clone())
             .await
-            .unwrap_or_else(|e| panic!("({tag}) #642-c: the quorum-signed revision 1 admits: {e}"));
+            .unwrap_or_else(|e| panic!("({tag}) #644-c: the quorum-signed revision 1 admits: {e}"));
 
         // (b) THE LOCKOUT ATTEMPT. The attacker holds no steward key. They
         //     take the record above — whose quorum signatures remain
@@ -4214,19 +4214,19 @@ pub mod test_support {
         inflated.partner_record.revision = u64::MAX;
         assert_eq!(
             inflated.steward_signatures, r1.steward_signatures,
-            "({tag}) #642-c: the steward quorum is REPLAYED VERBATIM — no forgery anywhere"
+            "({tag}) #644-c: the steward quorum is REPLAYED VERBATIM — no forgery anywhere"
         );
         let err = dir.put_partner_record(inflated).await.expect_err(
-            "({tag}) #642-c: an inflated `revision` the quorum never signed is REFUSED",
+            "({tag}) #644-c: an inflated `revision` the quorum never signed is REFUSED",
         );
         assert_eq!(
             err.kind(),
             "federation_operational_envelope_unbound",
-            "({tag}) #642-c: refused as an unbound column, NOT as a rollback: {err:?}"
+            "({tag}) #644-c: refused as an unbound column, NOT as a rollback: {err:?}"
         );
         assert!(
             format!("{err}").contains("revision"),
-            "({tag}) #642-c: the refusal names `revision`: {err}"
+            "({tag}) #644-c: the refusal names `revision`: {err}"
         );
 
         // (c) THE LOCKOUT IS GONE. A legitimate revision 2 still admits.
@@ -4244,7 +4244,7 @@ pub mod test_support {
         );
         dir.put_partner_record(r2).await.unwrap_or_else(|e| {
             panic!(
-                "({tag}) #642-c: THE LOCKOUT SURVIVED. A legitimate revision 2 was refused \
+                "({tag}) #644-c: THE LOCKOUT SURVIVED. A legitimate revision 2 was refused \
                  after the inflation attempt, which means the attack still denies service \
                  even though its own write failed: {e}"
             )
@@ -4259,11 +4259,11 @@ pub mod test_support {
         let winner = resolve_monotonic_quorum(&rows).expect("a winner exists");
         assert_eq!(
             winner.revision, 2,
-            "({tag}) #642-c: the monotonic_quorum winner is the legitimate revision 2"
+            "({tag}) #644-c: the monotonic_quorum winner is the legitimate revision 2"
         );
         assert!(
             rows.iter().all(|r| r.revision <= 2),
-            "({tag}) #642-c: no inflated revision was ever stored"
+            "({tag}) #644-c: no inflated revision was ever stored"
         );
     }
 }

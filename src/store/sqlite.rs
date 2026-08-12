@@ -7325,7 +7325,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#642) — bind the typed projection to the signed
+        // v30.13.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -7400,7 +7400,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#642) — bind the typed projection to the signed
+        // v30.13.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -22601,7 +22601,7 @@ mod tests {
         let stranger = op::Identity::new("stranger");
         let _dir = [stranger.member()];
         let _roots = ["steward-1".to_string()]; // stranger is not rooted
-                                                // v30.13.0 (CIRISPersist#642) — register the stranger as a plain
+                                                // v30.13.0 (CIRISPersist#644) — register the stranger as a plain
                                                 // agent so its signature VERIFIES. Otherwise the new authorship gate
                                                 // refuses first (unregistered attester) and this test would no longer
                                                 // reach the authority gate it exists to pin. Registered-but-unrooted
@@ -39777,39 +39777,39 @@ mod tests {
         .await;
     }
 
-    /// #642-a — an org row whose own signature does not verify is REFUSED,
+    /// #644-a — an org row whose own signature does not verify is REFUSED,
     /// on sqlite. Before this cut NOTHING in the crate ever verified those
     /// columns, on any backend.
     #[tokio::test]
-    async fn org_bogus_signature_refused_sqlite_642() {
+    async fn org_bogus_signature_refused_sqlite_644() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
-            &backend, "sq642a",
+            &backend, "sq644a",
         )
         .await;
     }
 
-    /// #642-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// #644-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
     /// that the signature does not cover is REFUSED, on sqlite.
     #[tokio::test]
-    async fn unsigned_tombstone_refused_sqlite_642() {
+    async fn unsigned_tombstone_refused_sqlite_644() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
-            &backend, "sq642b",
+            &backend, "sq644b",
         )
         .await;
     }
 
-    /// #642-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
     /// legitimate later revision still admits, on sqlite.
     #[tokio::test]
-    async fn revision_inflation_refused_sqlite_642() {
+    async fn revision_inflation_refused_sqlite_644() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::operational::test_support::exercise_revision_inflation_refused(
-            &backend, "sq642c",
+            &backend, "sq644c",
         )
         .await;
     }

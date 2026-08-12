@@ -5164,7 +5164,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.organization;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v30.13.0 (#642) — bind the projection + hybrid-Strict verify the
+        // v30.13.0 (#644) — bind the projection + hybrid-Strict verify the
         // row's OWN signature. Before the state lock: the verify resolves
         // the attester's registered pubkeys, which locks the directory.
         operational::verify_organization_admission(self, &row).await?;
@@ -5214,7 +5214,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v30.13.0 (#642) — bind the projection + hybrid-Strict verify the
+        // v30.13.0 (#644) — bind the projection + hybrid-Strict verify the
         // row's OWN signature, before the lock (see `put_organization`).
         operational::verify_org_membership_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
@@ -7774,35 +7774,35 @@ mod accord_tests {
         .await;
     }
 
-    /// #642-a — an org row whose own signature does not verify is REFUSED,
+    /// #644-a — an org row whose own signature does not verify is REFUSED,
     /// on the memory backend.
     #[tokio::test]
-    async fn org_bogus_signature_refused_memory_642() {
+    async fn org_bogus_signature_refused_memory_644() {
         let backend = MemoryBackend::new();
         crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
-            &backend, "mem642a",
+            &backend, "mem644a",
         )
         .await;
     }
 
-    /// #642-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// #644-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
     /// that the signature does not cover is REFUSED, on the memory backend.
     #[tokio::test]
-    async fn unsigned_tombstone_refused_memory_642() {
+    async fn unsigned_tombstone_refused_memory_644() {
         let backend = MemoryBackend::new();
         crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
-            &backend, "mem642b",
+            &backend, "mem644b",
         )
         .await;
     }
 
-    /// #642-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
     /// legitimate later revision still admits, on the memory backend.
     #[tokio::test]
-    async fn revision_inflation_refused_memory_642() {
+    async fn revision_inflation_refused_memory_644() {
         let backend = MemoryBackend::new();
         crate::federation::operational::test_support::exercise_revision_inflation_refused(
-            &backend, "mem642c",
+            &backend, "mem644c",
         )
         .await;
     }
@@ -11425,9 +11425,9 @@ mod tests {
         let steward = op::Identity::new("e9-steward");
         let admin = op::Identity::new("e9-admin");
 
-        // v30.13.0 (CIRISPersist#642) — the outsider is now REGISTERED (as a
+        // v30.13.0 (CIRISPersist#644) — the outsider is now REGISTERED (as a
         // plain agent), which sharpens this test rather than weakening it.
-        // Before #642 the first leg refused a key the directory had never
+        // Before #644 the first leg refused a key the directory had never
         // heard of, so "not a steward" and "not registered at all" were
         // indistinguishable — and the row's own signature was never checked,
         // so the leg could not have told them apart. Now the outsider's
