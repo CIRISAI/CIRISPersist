@@ -309,6 +309,14 @@ pub(crate) mod test_support {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
+        // #643: the binding gate refuses an unsealed row. Sealing signs OVER
+        // the awkward number tokens, so the at-rest canonicalization this test
+        // is about still happens.
+        let attestation = crate::federation::tier_ingest::test_support::seal_row(
+            &attestation.attesting_key_id.clone(),
+            attestation,
+        );
+        let att_envelope = attestation.attestation_envelope.clone();
         dir.put_attestation(crate::federation::SignedAttestation { attestation })
             .await
             .expect("put_attestation admits the awkward envelope");
@@ -429,7 +437,7 @@ pub(crate) mod test_support {
             &pretty_envelope,
         );
         let pretty_id = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(crate::federation::SignedAttestation {
+        let pretty_att = crate::federation::SignedAttestation {
             attestation: crate::federation::Attestation {
                 attestation_id: pretty_id.clone(),
                 attesting_key_id: pretty_kid.clone(),
@@ -453,18 +461,37 @@ pub(crate) mod test_support {
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             },
-        })
-        .await
-        .expect("a pretty-printed envelope is admitted (and its signature still verifies)");
+        };
+        // #643: seal the mirror before the put, same as the awkward leg.
+        // Sealing signs over the PRETTY bytes, so what this leg measures —
+        // that a pretty submission is stored CANONICAL — is unchanged.
+        let pretty_att = crate::federation::SignedAttestation {
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &pretty_kid.clone(),
+                pretty_att.attestation,
+            ),
+        };
+        // seal_row RECOMPUTES original_content_hash over the sealed bytes,
+        // so the pre-seal `p_och` is stale — take both the reference envelope
+        // and the hash from the sealed row.
+        let pretty_sealed_env = pretty_att.attestation.attestation_envelope.clone();
+        let p_och = pretty_att.attestation.original_content_hash.clone();
+        dir.put_attestation(pretty_att)
+            .await
+            .expect("a pretty-printed envelope is admitted (and its signature still verifies)");
         let reloaded_pretty = dir
             .get_attestation(&pretty_id)
             .await
             .expect("get_attestation")
             .expect("the pretty attestation is there");
-        assert_eq!(
-            serde_json::to_string(&reloaded_pretty.attestation_envelope).expect("serializes"),
-            r#"{"aa":"first","dimension":"envelope_bytes:pretty:v1","exp":100,"zz":"last"}"#,
-            "a pretty-printed submission was not stored canonical"
+        // Compared against the SEALED envelope's canonical form rather than a
+        // literal: the #643 mirror carries a per-run uuid and key id, so a
+        // hard-coded expectation cannot express it. Same helper as the awkward
+        // leg, so both legs assert the identical property.
+        assert_envelope_bytes_eq(
+            "federation_attestations.attestation_envelope (pretty submission)",
+            &pretty_sealed_env,
+            &reloaded_pretty.attestation_envelope,
         );
         assert_column_sha256_is_original_content_hash(
             "federation_attestations.attestation_envelope (pretty submission)",
