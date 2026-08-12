@@ -38,11 +38,97 @@ VERSION_RE = re.compile(r"(?<![\w.])v(\d+)\.(\d+)\.(\d+)\b")
 # A comment line -- doc (`///`, `//!`) or plain (`//`). Version strings inside
 # string literals are code, not documentation, and are not this gate's business.
 COMMENT_RE = re.compile(r"^\s*(///|//!|//)")
-# Another project's version, qualified by its name somewhere earlier on the line.
+# Another project's version, qualified by its name immediately before the token.
+#
+# v30.13.0 (CIRISPersist#599) — the alternation was missing most of the mesh.
+# CIRISEdge, CIRISServer, CIRISConformance, CIRISRegistry, CIRISLens and the
+# FSD-NNN specs all name versions in these comments, and every one of them was
+# being reported as a phantom persist release. Fifteen of the seventeen entries
+# still on the burndown list were THIS false positive, not doc debt — the gate
+# was manufacturing its own backlog.
+#
+# NOT end-anchored, and that is the fix. The old pattern required the name to sit
+# immediately before the token, so every real citation shaped
+# `CIRISVerify#219 / v10.6.2` or `CIRISEdge#65 v2.1.0` — name, issue ref, version
+# — was reported as a phantom persist release.
+#
+# Un-anchoring alone would over-suppress: a line reading
+# `CIRISVerify v10.0.0 ... and persist v99.99.99` would silence the SECOND token
+# too, trading a false positive for a false NEGATIVE. So the qualifier is
+# POSITIONAL, applied at the call site: a name qualifies a version only when it
+# is NEARER to it than any other version token is. See `_qualified_by_name`.
 NAMED_CRATE = re.compile(
-    r"(ciris[-_](verify|crypto|keyring)|CIRISVerify|pyo3|CEG|agent|verify)\s*[@ ]?\s*v?$",
+    r"(ciris[-_](verify|crypto|keyring|persist)|CIRIS[A-Z][A-Za-z]*|FSD-\d+"
+    r"|pyo3|CEG|agent|verify)",
     re.IGNORECASE,
 )
+# The WRAP case: the project name ended the previous comment line and the
+# version opens this one —
+#
+#     //! ... the shape that matches CIRISAgent
+#     //! v2.8.13's wa_cert bundle ...
+#
+# `NAMED_CRATE` reads only the text before the token ON THIS LINE, so a wrapped
+# citation looked unqualified and every one was reported as a phantom.
+#
+# Deliberately NOT a general look-back over the whole comment block. A paragraph
+# that mentions CIRISVerify three lines up must NOT silence a genuine persist
+# reference below it — that would trade a false positive for a false NEGATIVE,
+# and a gate that misses a real phantom is worse than one that over-reports.
+# So: previous line must END with the project name, and the version must be at
+# the START of this line's comment body. Nothing else is suppressed.
+WRAPPED_NAME = re.compile(
+    r"(ciris[-_](verify|crypto|keyring|persist)|CIRIS[A-Z][A-Za-z]*|FSD-\d+"
+    r"|pyo3|CEG|agent|verify)\s*$",
+    re.IGNORECASE,
+)
+COMMENT_BODY = re.compile(r"^\s*(?:///|//!|//)\s*")
+
+
+def _qualified_by_name(prefix: str) -> bool:
+    """Does another project's name qualify the version that follows `prefix`?
+
+    True only when the NEAREST preceding project name is nearer than the
+    NEAREST preceding version token. That is what lets
+
+        v21.4.0 (CIRISVerify#219 / v10.6.2)
+
+    resolve correctly in both directions on ONE line: `v21.4.0` has no name
+    before it and is checked as persist's; `v10.6.2` has `CIRISVerify` nearer
+    than `v21.4.0` and is skipped. A blanket "name appears somewhere in the
+    prefix" would have silenced BOTH, which is how a guard stops guarding.
+    """
+    # A RANGE or LIST shares one qualifier:
+    #
+    #     shipped CIRISVerify v10.9.0-v10.11.0
+    #     four earlier instances of exactly this (v3.0.1, v5.0.0, ...
+    #
+    # For the second and later tokens the nearest preceding VERSION is nearer
+    # than the name, so the positional rule alone would call them unqualified.
+    # Peel any trailing run of `version + separator` off the prefix first, so the
+    # question asked is the one that matters: what qualifies the SERIES.
+    #
+    # Only separators are peeled — a dash, comma, slash, or the word "and"/"to".
+    # Prose between two versions ends the series, which is what keeps
+    # `CIRISVerify v10.0.0 ... and persist v99.99.99` correctly unqualified.
+    peeled = prefix
+    while True:
+        vs = list(VERSION_RE.finditer(peeled))
+        if not vs:
+            break
+        tail = peeled[vs[-1].end() :]
+        if tail.strip(" \t*–—-,;/&") in ("", "and", "to", "through"):
+            peeled = peeled[: vs[-1].start()]
+            continue
+        break
+
+    names = list(NAMED_CRATE.finditer(peeled))
+    if not names:
+        return False
+    versions = list(VERSION_RE.finditer(peeled))
+    if not versions:
+        return True
+    return names[-1].start() > versions[-1].start()
 
 
 def released_versions() -> set[str]:
@@ -118,15 +204,42 @@ def main() -> int:
     bad: list[tuple[str, int, str, str]] = []
     scanned = 0
     for path in sorted((ROOT / "src").rglob("*.rs")):
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+        lines = path.read_text(encoding="utf-8").split("\n")
+        for lineno, line in enumerate(lines, 1):
             if not COMMENT_RE.match(line):
                 continue
             for m in VERSION_RE.finditer(line):
                 scanned += 1
                 ver = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
                 prefix = line[: m.start()]
-                if NAMED_CRATE.search(prefix):
+                if _qualified_by_name(prefix):
                     continue
+                # THE WRAP CASE. A doc comment is a block, and a citation can
+                # break across lines:
+                #
+                #     /// ... (CIRISAgent FSD/TRACE_WIRE_FORMAT.md
+                #     /// @v2.7.9-stable §5.10). When present, ...
+                #
+                # When the version OPENS this line's comment body (allowing
+                # leading reference punctuation like `@`), the previous comment
+                # line is the rest of its sentence — so run the SAME positional
+                # rule over the two joined. Reusing the rule rather than adding
+                # a second one is deliberate: two rules drift, and the whole
+                # reason this gate needed fixing is that its qualifier and its
+                # reality had drifted apart.
+                #
+                # Bounded to the immediately-preceding line, and only when the
+                # version opens this one. A general block-wide look-back would
+                # let a paragraph mentioning another project silence a genuine
+                # persist reference several lines below — a false NEGATIVE,
+                # which is the failure this gate exists to prevent.
+                body_start = COMMENT_BODY.match(line)
+                if body_start and lineno >= 2:
+                    lead = line[body_start.end() : m.start()]
+                    if lead.strip(" @([/-") == "":
+                        prev = lines[lineno - 2]
+                        if COMMENT_RE.match(prev) and _qualified_by_name(prev + lead):
+                            continue
                 if ver not in known and ver not in grandfathered:
                     bad.append(
                         (str(path.relative_to(ROOT)), lineno, ver, line.strip()[:100])

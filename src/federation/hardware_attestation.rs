@@ -11,7 +11,7 @@
 //! consumer (persist) authors the policy. Persist's
 //! [`HardwareAttestationPolicy`] is that policy.
 //!
-//! (The citation used to name **v3.0.1**, nine majors behind the pinned cut,
+//! (The citation used to name CIRISVerify **v3.0.1**, nine majors behind the pinned
 //! and the flag by a spelling verify never used — CIRISPersist#568. Re-read
 //! against the pinned verify: the claim holds verbatim, so the version pin is
 //! dropped rather than bumped. A doctrine that has been stable across nine
@@ -60,17 +60,17 @@
 //!
 //! Recorded here (CIRISPersist#568) so a reader deciding whether a gap is
 //! real does not need a round trip to another repo. Verify posted this
-//! against the v12.1.0 release; persist pins v12.1.0.
+//! against the CIRISVerify v12.1.0 release; persist pins CIRISVerify v12.1.0.
 //!
 //! | Capability | Status | Entry point |
 //! |---|---|---|
 //! | YubiKey PIV custody | shipped, hardware-validated | `verify_accord_custody_attestation` / `verify_yubikey_piv_attestation` |
-//! | Android Key Attestation | shipped **v10.8.0** | `device_attestation::verify_android_key_attestation{,_with_store}` |
-//! | Apple App Attest | shipped **v11.0.0** | `device_attestation::verify_apple_app_attest{,_with_store}` |
+//! | Android Key Attestation | shipped CIRISVerify **v10.8.0** | `device_attestation::verify_android_key_attestation{,_with_store}` |
+//! | Apple App Attest | shipped CIRISVerify **v11.0.0** | `device_attestation::verify_apple_app_attest{,_with_store}` |
 //! | **TPM EK (local chain walk)** | **STILL DEFERRED** | — the last open leg of **CIRISVerify#199** |
 //! | Pinned vendor roots | verify now bakes them | `trust_anchor_store::baked` — Yubico, Google ×2, Apple |
-//! | Constrained anchor store | shipped v10.9.0–v10.11.0 | `TrustAnchorStore::resolve(purpose, environment)` |
-//! | Presenter binding (build) | shipped v10.7.0 | `verify_build_attestation_bundle` (CIRISPersist#567) |
+//! | Constrained anchor store | shipped CIRISVerify v10.9.0–v10.11.0 | `TrustAnchorStore::resolve(purpose, environment)` |
+//! | Presenter binding (build) | shipped CIRISVerify v10.7.0 | `verify_build_attestation_bundle` (CIRISPersist#567) |
 //!
 //! So the old note here — *"CIRISVerify#32 Ask 5's local-chain-validation
 //! surface, which Verify v3.0.1 has NOT shipped"* — was stale twice over:

@@ -7,6 +7,47 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
+### Fixed — the doc-version gate was manufacturing its own backlog (#599)
+
+223 phantom references → **2**. Ten baseline rows (170 references) were retired
+by mapping each to the release that actually shipped the cited ISSUE, read out
+of the CHANGELOG rather than guessed from adjacency. `v12.7.0` alone was 93
+references, all citing #365–#372, all shipped in v13.0.0.
+
+Then the more interesting half: **15 of the 17 survivors were false positives of
+the gate's own heuristic, not doc debt.** `NAMED_CRATE` read only the text
+before the version ON THE SAME LINE and ended its match there, so every real
+citation shaped `CIRISVerify#219 / v10.6.2` or `CIRISEdge#65 v2.1.0` — name,
+issue ref, version — was reported as a phantom persist release, as was any
+citation whose project name wrapped to the previous line, as was any project
+missing from its alternation (CIRISEdge, CIRISServer, CIRISConformance, FSD-NNN).
+
+The qualifier is now POSITIONAL: a project name qualifies a version only when it
+is NEARER than any other version token. That resolves both directions of
+`v21.4.0 (CIRISVerify#219 / v10.6.2)` on one line — the first is checked as
+persist's, the second is skipped — where a blanket "name appears somewhere in
+the prefix" would have silenced both, which is how a guard stops guarding.
+Ranges and lists (`v10.9.0–v10.11.0`, `(v3.0.1, v5.0.0, …)`) inherit one
+qualifier by peeling separator-joined runs; prose between two versions ends the
+series. The wrap case reuses the same rule over the joined pair rather than
+adding a second rule, bounded to the immediately-preceding line.
+
+**A false NEGATIVE found while fixing the false positives.** The
+`hardware_attestation.rs` capability table listed CIRISVerify versions with no
+project qualifier. Rows naming v10.8.0 and v10.11.0 were reported as phantoms —
+but the rows naming **v11.0.0 and v10.7.0 PASSED**, because persist happens to
+have real releases with those numbers. The same ambiguity was quietly accepting
+another project's versions as our own. Those rows now name CIRISVerify
+explicitly, which a reader of a bare table row could not have inferred anyway.
+
+Mutation-tested, because a widened guard is a guard that might no longer guard:
+a genuine persist phantom still fails; a phantom AFTER another project's name on
+the same line still fails; the wrap rule does not leak to an unrelated next line.
+
+The two remaining baseline rows are named debts, not noise: `2.0.5` is a real
+tagged release missing its CHANGELOG entry, and `0.6.2` names capability that is
+still a stub on both backends — no real version would make that sentence true.
+
 ### Fixed — the sanction did not cover the sanctioning dimension (#608)
 
 `check_peer_deadmission` opened with a DISJUNCTION:

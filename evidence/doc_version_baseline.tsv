@@ -34,25 +34,10 @@
 # version	refs	note
 #
 # ── FALSE POSITIVE: CIRISVerify ────────────────────────────────────────────────
-10.6.2	1	CIRISVerify -- `admission.rs` "v21.4.0 (CIRISVerify#219 / v10.6.2)": the guard sees "#219 / " before the version, not the project name
-10.6.3	1	CIRISVerify -- same shape as 10.6.2 ("CIRISVerify#221 / v10.6.3")
-10.8.0	1	CIRISVerify -- `hardware_attestation.rs` capability table; the project name is in the module header, not the row
-10.9.0	1	CIRISVerify -- capability-table row "shipped v10.9.0-v10.11.0"
-10.10.0	1	CIRISVerify -- `trust_anchor_store::baked` citation
-10.11.0	1	CIRISVerify -- capability-table row "shipped v10.9.0-v10.11.0"
-3.0.1	2	CIRISVerify -- a HISTORICAL citation, twice: the pin `hardware_attestation.rs` used to name, and one of the four earlier verify re-pin burns `supersets.rs` lists
 #
 # ── FALSE POSITIVE: CIRISAgent ─────────────────────────────────────────────────
-2.7.9	4	CIRISAgent -- `FSD/TRACE_WIRE_FORMAT.md @ v2.7.9-stable`; the guard cannot match across "TRACE_WIRE_FORMAT.md @ "
-2.8.13	1	CIRISAgent -- `wa_cert/types.rs` "24 columns matching CIRISAgent / v2.8.13's `wa_cert` verbatim"; the name wrapped to the previous line
 #
 # ── FALSE POSITIVE: other CIRIS projects ───────────────────────────────────────
-0.13.0	3	CIRISEdge -- the `PEER_MUTATION_FOLLOWUP` UniFFI stubs this surface unblocks
-0.13.1	1	CIRISEdge -- `ReticulumTransport` link establish
-0.15.0	1	CIRISEdge -- `ReticulumTransport`
-2.1.0	1	CIRISEdge -- "CIRISPersist#199, CIRISEdge#65 v2.1.0". NOT persist's own v2.1.0 tag: the version belongs to CIRISEdge#65
-0.10.0	1	CIRISConformance -- the cross-wheel deployment failure its suite catches
-1.4.3	1	FSD-002 -- a specification document version (§3.2.1.2), not a crate release
 #
 # ── TAG-ONLY: real release, CHANGELOG entry missing ────────────────────────────
 2.0.5	5	TAG EXISTS, no CHANGELOG entry -- iOS Secure-Enclave signer backoff + boot-time audit-chain self-verification, all in `ffi/pyo3.rs`. Backfill the entry, then delete this row
