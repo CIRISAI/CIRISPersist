@@ -1966,10 +1966,12 @@ pub mod gate_order_test_support {
     /// A federation-tier row whose scrub signature is garbage — it can
     /// never clear the tier-3 hybrid verify.
     fn unverifiable_row(key_id: &str, tier: &str, cohort_scope: &str) -> Attestation {
-        // v31.0.0 (CIRISPersist#643) — the mirror is STAMPED but the row is
-        // deliberately NOT re-signed: this witness needs a row that clears the
-        // pure tier-1 gates and dies at the tier-3 hybrid verify, so sealing it
-        // with a valid signature would move what the test measures.
+        // v31.0.0 (CIRISPersist#643/#598) — the tier-1 bindings (the #643
+        // mirror and the #598 instants) are STAMPED but the row is deliberately
+        // NOT re-signed: this witness needs a row that clears the pure tier-1
+        // gates and dies at the tier-3 hybrid verify, so sealing it with a
+        // valid signature would move what the test measures — and leaving a
+        // tier-1 binding off moves it just as far in the other direction.
         let mut row = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: key_id.into(),
@@ -2109,39 +2111,91 @@ pub mod gate_order_test_support {
     /// Every write here is refused by the pure tier-1 `check_cohort_scope`
     /// (`global` is a §8.1.8 feed-name, never a wire value) — so the rows
     /// never reach the DB, and what the assertion isolates is that the
-    /// quota is charged AHEAD of that, on the very first gate: the
-    /// N+1th write from one peer inside one window comes back
+    /// quota is charged AHEAD of that, on the very first gate: a peer that
+    /// floods inside one window eventually comes back
     /// `federation_rate_limited`, the typed error that this cut gave its
     /// first construction site.
+    ///
+    /// # Why it DRAINS rather than asserting on write N+1
+    ///
+    /// v31.0.0 (CIRISPersist#598) — it used to assert that the very next write
+    /// after exactly `N` was rate-limited, and that was a **wall-clock
+    /// assumption wearing an exact number**. The bucket refills CONTINUOUSLY at
+    /// `PER_PEER_ATTESTATION_WRITES_PER_WINDOW / PER_PEER_ATTESTATION_WRITE_WINDOW`
+    /// = 10 tokens/second, so "write N+1 is refused" only holds if all `N`
+    /// writes complete within ~100 ms. Alone they took ~50 ms and it passed; in
+    /// a full parallel run they took ~250 ms, two tokens accrued mid-flood, and
+    /// write N+1 was legitimately back inside quota. A green run on an idle box
+    /// and a red one on a loaded box, measuring machine speed.
+    ///
+    /// This is the same class as
+    /// `substrate_machine::every_row_the_harness_writes_is_live_at_wall_clock`:
+    /// a fixed expectation next to a gate that reads a real clock. The property
+    /// was never "N+1 exactly" — it is *the bucket is FINITE and charged before
+    /// the cohort gate*. So: flood until rate-limited, capped. If the quota
+    /// were not charged on the first gate the cap is never reached and this
+    /// fails, which is precisely the regression it exists to catch.
     pub async fn assert_per_peer_write_quota_is_wired<F>(dir: &F, tag: &str)
     where
         F: FederationDirectory + ?Sized,
     {
         let key_id = format!("av76q{tag}");
         let n = super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW;
-        for i in 0..n {
+        let started = std::time::Instant::now();
+        // The cap is `2n`: draining `n` empties a full bucket, and the second
+        // `n` is headroom for tokens that accrue while the first `n` are in
+        // flight. Reaching it means `2n` consecutive writes were all admitted
+        // past the quota — that is not slowness, that is an uncharged bucket.
+        let mut rate_limited = None;
+        for i in 0..(2 * n) {
             let row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
             let err = dir
                 .put_attestation(SignedAttestation { attestation: row })
                 .await
                 .expect_err("the `global` cohort_scope is never a wire value");
-            assert_eq!(
-                err.kind(),
-                "federation_cohort_scope_rejected",
-                "write {i} of {n} must be inside quota and fail on the \
-                 closed-set value instead — got {err:?}"
-            );
+            match err.kind() {
+                "federation_rate_limited" => {
+                    rate_limited = Some(i);
+                    break;
+                }
+                // Still inside quota: the write fell through to the closed-set
+                // cohort_scope gate, which is the ONLY other verdict these rows
+                // may draw. Anything else means a gate moved.
+                k => assert_eq!(
+                    k,
+                    "federation_cohort_scope_rejected",
+                    "write {i} of at most {cap} must be either inside quota (and so fail on \
+                     the closed-set `cohort_scope`) or rate-limited — got {err:?}",
+                    cap = 2 * n,
+                ),
+            }
         }
-        let row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect_err("the N+1th write in the window must be refused");
-        assert_eq!(
-            err.kind(),
-            "federation_rate_limited",
-            "AV-76: the per-peer quota must be charged on the first gate — \
-             got {err:?}"
+        let at = rate_limited.unwrap_or_else(|| {
+            panic!(
+                "AV-76: the per-peer quota must be charged on the FIRST gate — {cap} \
+                 consecutive writes from one peer inside one window were ALL admitted past it. \
+                 The bucket refills at only {n} per {window:?}, so no amount of slowness \
+                 explains this: the quota is not wired into `put_attestation` at all, or it is \
+                 charged after the gate that refuses these rows.",
+                cap = 2 * n,
+                window = super::PER_PEER_ATTESTATION_WRITE_WINDOW,
+            )
+        });
+        // And it must have happened because the bucket EMPTIED, not because the
+        // window elapsed and something else fired. A drain that takes longer
+        // than the window is not measuring capacity.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < super::PER_PEER_ATTESTATION_WRITE_WINDOW,
+            "AV-76: the drain took {elapsed:?}, which is at least one full refill window \
+             ({window:?}) — this run measured the clock, not the bucket",
+            window = super::PER_PEER_ATTESTATION_WRITE_WINDOW,
+        );
+        assert!(
+            at >= n,
+            "AV-76: the quota bit after only {at} writes, but the bucket's capacity is {n} — a \
+             peer's first honest burst must fit, or the cap is a censorship primitive against \
+             ordinary traffic rather than a flood brake"
         );
 
         // v24.3.0 (CIRISPersist#575) — the RESERVED ADMISSION CLASS, proven

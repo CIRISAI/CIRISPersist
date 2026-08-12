@@ -804,16 +804,27 @@ pub(crate) mod test_support {
         }
     }
 
-    /// v31.0.0 (CIRISPersist#643) — stamp the mirror and **do not sign**.
+    /// v31.0.0 (CIRISPersist#643) — stamp **every tier-1 binding** and **do not
+    /// sign**.
     ///
     /// For the witnesses whose whole point is a row that reaches a LATER gate:
-    /// `unverifiable_row` must clear the tier-1 binding and then be refused by
+    /// `unverifiable_row` must clear the tier-1 bindings and then be refused by
     /// the tier-3 hybrid verify, so sealing it with a valid signature would
     /// silently relocate what the test measures.
+    ///
+    /// v31.0.0 (CIRISPersist#598) — that means the INSTANTS as well as the
+    /// mirror. `check_instant_binding` became a tier-1 gate on every dimension,
+    /// so a row carrying only the mirror now dies at tier 1 — and a gate-ORDER
+    /// witness that dies at the wrong tier is not measuring the order. Stamping
+    /// them here rather than at the call sites keeps "clears tier 1, dies at
+    /// tier 3" a property of ONE helper, so the next tier-1 gate is added in
+    /// one place instead of silently disarming these witnesses.
+    ///
+    /// Still does not sign, which is the whole distinction from
+    /// [`seal_row_in_place`].
     pub fn stamp_mirror(row: &mut Attestation) {
-        let mirror = crate::federation::envelope::RowMirror::of(row).expect("finite weight");
-        row.attestation_envelope[crate::federation::envelope::paths::ROW] =
-            serde_json::to_value(&mirror).expect("RowMirror serializes");
+        crate::federation::envelope::stamp_signed_instants(row).expect("envelope is an object");
+        crate::federation::envelope::RowMirror::stamp_row(row).expect("finite weight");
     }
 
     /// v21.0.0 (CIRISPersist#502 E4) — sign a [`Family`](crate::federation::types::Family)
