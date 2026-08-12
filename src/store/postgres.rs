@@ -4258,7 +4258,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // postgres, and asked again at the promote door
         // (`check_promotion_admission`) so the local tier is not a way around
         // it (B8).
-        crate::federation::admission::check_consent_state_instant_binding(
+        crate::federation::admission::check_instant_binding(
             &row,
             chrono::Utc::now(),
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
@@ -14471,7 +14471,7 @@ impl PostgresBackend {
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
         // not where it is promoted.
-        crate::federation::admission::check_consent_state_instant_binding(
+        crate::federation::admission::check_instant_binding(
             &row,
             chrono::Utc::now(),
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,

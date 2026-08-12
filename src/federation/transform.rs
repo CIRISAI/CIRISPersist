@@ -757,7 +757,7 @@ fn in_range_value(input: &Value, lo: f64, hi: f64) -> Result<Value, TransformErr
 /// field that grants revocation authority). A family transform that stripped
 /// any of them would produce an envelope that no longer states what the row it
 /// travels with says — the exact divergence
-/// [`crate::federation::admission::check_consent_state_instant_binding`] and
+/// [`crate::federation::admission::check_instant_binding`] and
 /// [`crate::federation::admission::check_row_column_binding`] refuse, arriving
 /// via a sanctioned door instead of a hostile relay.
 ///

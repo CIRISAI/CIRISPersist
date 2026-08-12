@@ -188,7 +188,7 @@ pub mod test_support {
     ///
     /// `asserted_at` is EXPLICIT because the fold is latest-wins on it, and it
     /// is stamped INTO the signed envelope as well as onto the row column —
-    /// [`crate::federation::admission::check_consent_state_instant_binding`]
+    /// [`crate::federation::admission::check_instant_binding`]
     /// refuses the row if the two disagree (v31.0.0, CIRISPersist#598).
     /// Truncated to the substrate resolution so the fixture measures ordering
     /// rather than the precision difference between postgres `TIMESTAMPTZ` and

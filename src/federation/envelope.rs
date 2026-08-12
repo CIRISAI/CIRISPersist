@@ -63,7 +63,7 @@ pub mod paths {
     /// else). The consent fold orders on that column, so a replay of a
     /// subject's own still-valid grant with a bumped column flipped a
     /// revocation back to Granted. This key is the column's signed twin:
-    /// [`crate::federation::admission::check_consent_state_instant_binding`]
+    /// [`crate::federation::admission::check_instant_binding`]
     /// refuses a `consent:state:*` row whose column and envelope disagree.
     pub const ASSERTED_AT: &str = "asserted_at";
     /// v31.0.0 (CIRISPersist#598) — the SIGNED expiry instant, the twin of
@@ -180,12 +180,12 @@ pub mod row_paths {
 ///   CIRISPersist#598 in this same break window, not inside `row`. They are
 ///   assertion-native (the validity interval of a claim, which any CEG reader
 ///   expects at the envelope root) rather than persist projections, and
-///   [`check_consent_state_instant_binding`] reads them there.
+///   [`check_instant_binding`] reads them there.
 ///
 /// [`check_local_tier_eligibility`]: crate::federation::admission::check_local_tier_eligibility
 /// [`check_promotion_admission`]: crate::federation::admission::check_promotion_admission
 /// [`resolve_withdraws_admission_rule`]: crate::federation::admission::resolve_withdraws_admission_rule
-/// [`check_consent_state_instant_binding`]: crate::federation::admission::check_consent_state_instant_binding
+/// [`check_instant_binding`]: crate::federation::admission::check_instant_binding
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RowMirror {

@@ -56,7 +56,7 @@ pub fn canonicalize(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
 /// The recipe used to be `canonicalize → hash → sign → assemble`, and
 /// `assemble` sampled its OWN `chrono::Utc::now()` for `asserted_at` **after**
 /// the bytes were already signed. That made envelope/column equality — the
-/// property [`crate::federation::admission::check_consent_state_instant_binding`]
+/// property [`crate::federation::admission::check_instant_binding`]
 /// demands — structurally impossible to satisfy at the mint: the two values
 /// came from two different clock reads, in that order, by construction. Not a
 /// missing check; a missing possibility.
@@ -208,7 +208,7 @@ pub fn assemble(
     // read, taken after `canonical` was already hashed and signed, so the row
     // column and the signed bytes disagreed by construction and no producer
     // could have made them agree. Reading it back out is what makes
-    // `check_consent_state_instant_binding` satisfiable at all — see
+    // `check_instant_binding` satisfiable at all — see
     // [`stamp_and_canonicalize`], which every emit entry point goes through.
     let envelope_value = input.attestation_envelope.to_value();
     let now = {

@@ -606,7 +606,7 @@ pub fn check_partner_revision_monotonic(
 // other one: verify the producer's signature, then REFUSE any row whose
 // projection disagrees with the bytes that were signed.
 //
-// Shaped on `check_consent_state_instant_binding` (#598), which refuses
+// Shaped on `check_instant_binding` (#598), which refuses
 // exactly this divergence one plane over, in this same release.
 
 /// v31.0.0 (CIRISPersist#644) — build the typed refusal for a projection

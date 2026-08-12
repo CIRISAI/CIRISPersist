@@ -2216,7 +2216,7 @@ pub async fn check_promotion_admission(
     // promotion is the OTHER way a `consent:state:*` row arrives there — and
     // the local door mints `asserted_at` from this node's own clock, which is
     // exactly the bumped ordering key the replay wants. Pure, so it leads.
-    check_consent_state_instant_binding(row, chrono::Utc::now(), DEFAULT_MAX_TOUCH_SKEW)?;
+    check_instant_binding(row, chrono::Utc::now(), DEFAULT_MAX_TOUCH_SKEW)?;
 
     // AV-77 — a de-admitted author's rows are refused before any walk runs, so
     // a sanctioned peer also sheds the amplification cost (same posture as
@@ -3642,7 +3642,7 @@ pub fn local_row_instant(
     }
 }
 
-/// v31.0.0 (CIRISPersist#598) — **THE CONSENT INSTANT BINDING GATE.**
+/// v31.0.0 (CIRISPersist#598) — **THE INSTANT BINDING GATE.**
 ///
 /// # What was open
 ///
@@ -3673,7 +3673,8 @@ pub fn local_row_instant(
 ///
 /// # What this refuses
 ///
-/// A `consent:state:*` row is admitted only when, all fail-closed:
+/// **Every** attestation, of every dimension, is admitted only when, all
+/// fail-closed:
 ///
 /// 1. its signed envelope carries `asserted_at` as an RFC-3339 string, and
 ///    that instant EQUALS the row column;
@@ -3689,10 +3690,34 @@ pub fn local_row_instant(
 ///    minting a second tolerance constant. Without it the replay above still
 ///    works with a signed instant, just one the attacker's clock invented.
 ///
-/// **No grandfathering.** A `consent:state:*` row whose envelope lacks the
-/// instant is refused, not tolerated and not flagged (operator decision on
-/// #598: "we need to break NOW … consent needs to be the final shape").
-/// There is no legacy regime and no compatibility flag to find later.
+/// **No grandfathering.** A row whose envelope lacks the instant is refused,
+/// not tolerated and not flagged (operator decision on #598: "we need to
+/// break NOW … consent needs to be the final shape"). There is no legacy
+/// regime and no compatibility flag to find later.
+///
+/// # Why EVERY dimension and not just `consent:state:*`
+///
+/// The gate shipped consent-only because consent is where the replay was
+/// FOUND — not because consent is where it works. `asserted_at` is a bare,
+/// unsigned, verbatim-stored column on EVERY row, and the property the replay
+/// exploits is "a fold picks a winner by that column", which is not a
+/// consent-specific property. The fold sites that have it:
+/// [`crate::federation::scores`] (latest-`asserted_at` per attester),
+/// [`crate::federation::content_class`] (latest-wins on a flag),
+/// [`crate::federation::mesh_config`], [`crate::federation::age`] (reads the
+/// head of an `asserted_at DESC` list), the withdraw/supersede precedence
+/// walks, and every `ORDER BY asserted_at` read the three backends serve.
+/// Same replay, aimed at whichever of those the attacker prefers.
+///
+/// Restricting the gate BY DIMENSION also made it evadable BY DIMENSION. The
+/// dimension is in the envelope and therefore signed, so this is not forgery
+/// — it is worse: the producer picks its own gate. A check a writer selects
+/// is not a check.
+///
+/// Universality costs nothing at the mint, because
+/// [`crate::federation::attestation_emit::stamp_and_canonicalize`] never
+/// filtered by dimension — it has always stamped both instants into every
+/// envelope it seals. Only the CHECK was narrow.
 ///
 /// # Why a gate and not a re-keyed fold
 ///
@@ -3708,18 +3733,14 @@ pub fn local_row_instant(
 /// signature verification, which the surrounding write path already performs
 /// on the same envelope bytes. Pure function of `(row, now)`: no directory
 /// read, no crypto, no lock ⇒ AV-76 TIER 1 on every door.
-pub fn check_consent_state_instant_binding(
+pub fn check_instant_binding(
     row: &super::Attestation,
     now: chrono::DateTime<chrono::Utc>,
     max_skew: chrono::Duration,
 ) -> Result<(), Error> {
     use crate::federation::envelope::paths;
-    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
-        return Ok(());
-    };
-    if !dimension.starts_with(crate::federation::consent::consent_dimension::STATE_PREFIX) {
-        return Ok(());
-    }
+    // NO dimension filter, deliberately. See "Why EVERY dimension" above: a
+    // check the producer selects by choosing a dimension is not a check.
     let env = &row.attestation_envelope;
 
     let parse = |key: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
@@ -3727,7 +3748,7 @@ pub fn check_consent_state_instant_binding(
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
                 Error::InvalidArgument(format!(
-                    "consent:state row {}: signed envelope `{key}` is not RFC-3339: {e} \
+                    "attestation {}: signed envelope `{key}` is not RFC-3339: {e} \
                      (CIRISPersist#598)",
                     row.attestation_id
                 ))
@@ -3739,7 +3760,7 @@ pub fn check_consent_state_instant_binding(
             return Ok(());
         }
         Err(Error::InvalidArgument(format!(
-            "consent:state row {}: `{key}` = {} carries sub-microsecond precision, which \
+            "attestation {}: `{key}` = {} carries sub-microsecond precision, which \
              postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
              on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
              (CIRISPersist#598)",
@@ -3751,8 +3772,8 @@ pub fn check_consent_state_instant_binding(
     // (1) asserted_at — REQUIRED, and the row column must equal it.
     let Some(serde_json::Value::String(env_asserted)) = env.get(paths::ASSERTED_AT) else {
         return Err(Error::InvalidArgument(format!(
-            "consent:state row {} carries no signed `{}` string in its envelope. The consent \
-             fold orders on the `asserted_at` COLUMN, which no signature covers — an unbound \
+            "attestation {} carries no signed `{}` string in its envelope. Folds pick a \
+             winner by the `asserted_at` COLUMN, which no signature covers — an unbound \
              row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
              CIRISPersist#598)",
             row.attestation_id,
@@ -3762,8 +3783,8 @@ pub fn check_consent_state_instant_binding(
     let env_asserted = parse(paths::ASSERTED_AT, env_asserted)?;
     if env_asserted != row.asserted_at {
         return Err(Error::InvalidArgument(format!(
-            "consent:state row {}: typed `asserted_at` {} diverges from the signed envelope's \
-             {} (rejected — the column decides which consent claim wins, so it may not differ \
+            "attestation {}: typed `asserted_at` {} diverges from the signed envelope's \
+             {} (rejected — the column decides which claim wins, so it may not differ \
              from the signed instant; CIRISPersist#598)",
             row.attestation_id,
             row.asserted_at.to_rfc3339(),
@@ -3778,7 +3799,7 @@ pub fn check_consent_state_instant_binding(
         Some(serde_json::Value::String(s)) => Some(parse(paths::EXPIRES_AT, s)?),
         Some(_) => {
             return Err(Error::InvalidArgument(format!(
-                "consent:state row {}: signed envelope `{}` must be an RFC-3339 string or absent \
+                "attestation {}: signed envelope `{}` must be an RFC-3339 string or absent \
                  (CIRISPersist#598)",
                 row.attestation_id,
                 paths::EXPIRES_AT,
@@ -3787,9 +3808,9 @@ pub fn check_consent_state_instant_binding(
     };
     if env_expires != row.expires_at {
         return Err(Error::InvalidArgument(format!(
-            "consent:state row {}: typed `expires_at` {:?} diverges from the signed envelope's \
-             {:?} (rejected — the fold DROPS an expired row, so an unsigned expiry is an \
-             unsigned mute button on a revocation; CIRISPersist#598)",
+            "attestation {}: typed `expires_at` {:?} diverges from the signed envelope's \
+             {:?} (rejected — folds DROP an expired row, so an unsigned expiry is an \
+             unsigned mute button on whatever the row retracts; CIRISPersist#598)",
             row.attestation_id,
             row.expires_at.map(|t| t.to_rfc3339()),
             env_expires.map(|t| t.to_rfc3339()),
@@ -3805,9 +3826,8 @@ pub fn check_consent_state_instant_binding(
     let skew = row.asserted_at - now;
     if skew > max_skew {
         return Err(Error::InvalidArgument(format!(
-            "consent:state row {}: asserted_at {} is {}s ahead of now ({}), beyond the {}s skew \
-             tolerance — a lying clock cannot mint a consent claim no later revocation can \
-             out-sort (CIRISPersist#598)",
+            "attestation {}: asserted_at {} is {}s ahead of now ({}), beyond the {}s skew \
+             tolerance — a lying clock cannot mint a claim no later row can out-sort (CIRISPersist#598)",
             row.attestation_id,
             row.asserted_at.to_rfc3339(),
             skew.num_seconds(),
@@ -3879,7 +3899,7 @@ pub fn check_consent_state_instant_binding(
 /// **Tier-blind, deliberately.** `tier` is a caller-supplied string, so a
 /// tier-scoped binding would be skippable by writing `tier = "local"` — and a
 /// local row can be PROMOTED into the federation plane. Same posture as
-/// [`check_consent_state_instant_binding`].
+/// [`check_instant_binding`].
 ///
 /// [`paths::ROW`]: crate::federation::envelope::paths::ROW
 /// [`RowMirror`]: crate::federation::envelope::RowMirror

@@ -153,7 +153,7 @@ pub fn restriction_rank(state: super::hard_case::ConsentState) -> u8 {
 ///   longer code path.
 ///
 /// So the ordering stays on the column and the SECURITY comes from the gate:
-/// [`crate::federation::admission::check_consent_state_instant_binding`]
+/// [`crate::federation::admission::check_instant_binding`]
 /// refuses a `consent:state:*` row at every write door unless the column and
 /// the signed envelope carry the SAME instant. Once every stored row is
 /// bound, ordering on the column IS ordering on the signed instant — and the
