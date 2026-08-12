@@ -451,6 +451,26 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "slashing:",
+        "a RETENTION rule, not an admission rule — and the distinction is the whole \
+         entry. v31.0.0 (CIRISPersist#650) names this stem in \
+         `federation::migration::is_exclusion_bearing`, which decides what the v31 \
+         in-place migration may DELETE. It never decides what may be WRITTEN: \
+         persist still gates nothing on `slashing:` at admission (the module note \
+         above, and `tests::slashing_is_not_a_persist_ruled_family`, both hold \
+         unchanged — the only other `slashing` surface in the crate remains \
+         CIRISNode's `cirisnode_slashing_attestations`, a different plane). \
+         Naming it here is the same move `moderation:` / `quarantine:` / \
+         `reconsideration:` get from their inventory rows: a slashing outcome is \
+         one of the classes whose deletion would silently RE-ADMIT the key it \
+         excluded, because exclusion in this substrate is not structural — no \
+         fresh trust root removes an old key, and `federation_revocations` has no \
+         replication cursor to refill it from. So the migration refuses to purge \
+         it. Purge polarity is not a dimension-family rule and must not be \
+         derived into `persist_ruled_prefixes()`; if persist ever gates \
+         `slashing:` at a WRITE door, this entry must go.",
+    ),
+    (
         "regime:",
         "NOT persist-ruled, and still deliberately so (CIRISPersist#571) — but the \
          REASON changed at the rc3 re-vendor and the old one is dead. It used to \

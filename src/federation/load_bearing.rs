@@ -770,6 +770,383 @@ async fn key_record_load_bearing(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// v31.0.0 (CIRISPersist#650) — the RECURSIVE variant.
+//
+// `is_load_bearing` answers about ONE object. The v31 migration needs the
+// TRANSITIVE CLOSURE from the node's own anchor — "every node starts with an
+// owner claim, and then you walk the load-bearing current state" — because a
+// row is re-stampable only if this node can still reach it through the
+// delegation/authorship graph that gives it meaning.
+//
+// Three properties this walk is built around, in order of how badly getting
+// them wrong would hurt:
+//
+// 1. **`Unknown` is IN the closure.** The closure is the KEEP set, and its
+//    complement is what a caller may consider purging. So the fail-secure
+//    polarity of [`LoadBearing::treated_as_load_bearing`] — `Yes` and
+//    `Unknown` both count — is preserved verbatim here: only a proven `No`
+//    is outside. Inverting it would delete user data on an inconclusive
+//    predicate.
+// 2. **It terminates, and a cycle drops nothing.** The graph has cycles (A
+//    attests B, B attests A; a delegation chain that loops). Membership is a
+//    SET and [`is_load_bearing`] is a pure function of (object, corpus) — not
+//    of the path taken to reach it — so expanding each object at most once
+//    loses no information. Re-encountering a visited object is counted, never
+//    an error, and never a dropped subtree.
+// 3. **Truncation is LOUD.** A budget that silently stopped early would hand
+//    a caller a short KEEP set whose complement is a long PURGE set — the
+//    worst possible failure. [`ClosureCompleteness::Truncated`] is therefore
+//    part of the returned value, and #650's migration refuses to purge on
+//    anything but [`ClosureCompleteness::Complete`].
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The default expansion budget for [`load_bearing_closure`]: the maximum
+/// number of objects the walk will EXPAND (not the number it may report as
+/// members — a single expansion can add many members).
+///
+/// Sized to be larger than any single node's own key/authorship graph while
+/// still bounding boot on a corpus that has grown pathologically. Termination
+/// does not depend on it (the `visited` set already bounds the walk by the
+/// corpus size); the budget bounds the WALL CLOCK, which is what a boot-time
+/// caller needs.
+pub const DEFAULT_CLOSURE_BUDGET: usize = 50_000;
+
+/// One member of a [`LoadBearingClosure`]: what it is, what the per-object
+/// predicate said about it, and how the walk got there.
+///
+/// The verdict is carried rather than collapsed to a bool for the same reason
+/// [`LoadBearing`] is never a bare bool: a consumer deciding what to do with
+/// the complement of this set must be able to read WHY each member is in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureMember {
+    /// The object.
+    pub object: ObjectRef,
+    /// The per-object verdict at the time of the walk.
+    pub verdict: LoadBearing,
+    /// Hops from the nearest root. `0` for a root itself.
+    pub depth: usize,
+    /// The object this one was reached FROM (`None` for a root), as
+    /// `"{class}:{id}"` — a derivation trace, not an index key.
+    pub reached_from: Option<String>,
+}
+
+/// Whether the walk saw the whole graph. **Not a detail** — see the module
+/// note: a caller that purges the complement of a TRUNCATED closure deletes
+/// live data, so this is returned rather than logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosureCompleteness {
+    /// The frontier emptied. Every object reachable from the roots was
+    /// expanded, so the complement of the member set is genuinely unreachable.
+    Complete,
+    /// The budget ran out with work still queued. The member set is a SUBSET
+    /// of the true closure, so its complement is a SUPERSET of the true
+    /// unreachable set and **must not be treated as a purge candidate list**.
+    Truncated {
+        /// The budget that was hit.
+        budget: usize,
+        /// How many objects were still queued when it was hit.
+        frontier_remaining: usize,
+    },
+}
+
+impl ClosureCompleteness {
+    /// `true` only for [`Self::Complete`]. The single place a caller that
+    /// intends to act on the COMPLEMENT of a closure should branch — named for
+    /// what it licenses, so `!matches!(.., Truncated{..})` never gets written
+    /// somewhere it can drift.
+    #[must_use]
+    pub const fn complement_is_trustworthy(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// The transitive closure of load-bearing objects reachable from a set of
+/// roots — [`is_load_bearing`] lifted from one object to a graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBearingClosure {
+    /// Where the walk started.
+    pub roots: Vec<ObjectRef>,
+    /// Every object in the closure, in discovery (breadth-first) order.
+    pub members: Vec<ClosureMember>,
+    /// The `attestation_id`s of the [`ObjectRef::Attestation`] members — the
+    /// projection #650's migration keys its KEEP set on, precomputed so a
+    /// caller does not re-derive it (and get the `Unknown` polarity wrong).
+    pub attestation_ids: std::collections::BTreeSet<String>,
+    /// The `key_id`s of the [`ObjectRef::KeyRecord`] members.
+    pub key_ids: std::collections::BTreeSet<String>,
+    /// Objects that were reached again after being expanded — the cycles and
+    /// diamonds. Reported so "the graph had cycles and we handled them" is an
+    /// observation rather than a claim.
+    pub revisits: usize,
+    /// Objects that resolved [`LoadBearing::No`] and were therefore NOT added.
+    pub excluded_proven_not_load_bearing: usize,
+    /// Whether the walk saw the whole graph.
+    pub completeness: ClosureCompleteness,
+}
+
+impl LoadBearingClosure {
+    /// Is `attestation_id` in the closure?
+    #[must_use]
+    pub fn contains_attestation(&self, attestation_id: &str) -> bool {
+        self.attestation_ids.contains(attestation_id)
+    }
+}
+
+/// The visited-set key: a class token plus the object's full (possibly
+/// composite) identity. [`ObjectRef::id`] alone is NOT unique — the two
+/// composite-keyed classes would collide on their leading key.
+fn visit_key(object: &ObjectRef) -> String {
+    match object {
+        ObjectRef::TransportDestination {
+            occurrence_key_id,
+            transport_kind,
+        } => format!("transport_destination:{occurrence_key_id}\u{1f}{transport_kind}"),
+        ObjectRef::FountainContent {
+            content_id,
+            corpus_kind,
+        } => format!("fountain_content:{content_id}\u{1f}{corpus_kind}"),
+        other => format!("{}:{}", other.class().as_str(), other.id()),
+    }
+}
+
+/// v31.0.0 (CIRISPersist#650) — **the recursive load-bearing walk**: start at
+/// `roots` and compute the transitive closure of everything load-bearing that
+/// is reachable from them in the corpus AS IT STANDS NOW.
+///
+/// # The roots are the OWNER CLAIM
+///
+/// #650: *"load-bearing needs to have a recursive variant that finds the root
+/// (for us every node starts with an owner claim) and then walks the load
+/// bearing current state"*. This function does not decide what the root IS —
+/// [`super::migration::owner_roots`] resolves it from the owner-binding
+/// delegation ([`super::admission::owner_of`]) so that the policy question
+/// ("what anchors this node?") and the graph question ("what hangs off it?")
+/// stay separable and separately testable.
+///
+/// # The edges
+///
+/// - [`ObjectRef::KeyRecord`] → every attestation naming it as ATTESTER
+///   (`list_attestations_by`) or as SUBJECT (`list_attestations_for`), plus
+///   every inbound delegation (`delegations_to`). The last is not redundant
+///   with the second on every backend — the default `delegations_to` filters
+///   `list_attestations_for`, but a backend MAY override it, and #650 asks for
+///   delegations to be RE-WALKED by name.
+/// - [`ObjectRef::Attestation`] → every key it names (`attesting_key_id`,
+///   `attested_key_id`, each `subject_key_ids` member, `scrub_key_id`, each
+///   `additional_scrubs` co-scrubber) and the attestation it points at
+///   (`references_attestation_id`). The key edges are exactly the #643 mirror
+///   members plus the scrub identities, which is what makes the walk track the
+///   binding the migration must re-stamp.
+/// - The three classes that resolve [`LoadBearing::Unknown`] structurally
+///   ([`ObjectClass::TransportDestination`] is the exception — it can prove
+///   `No`) are LEAVES: they are in the closure when reached, and they have no
+///   enumerable outbound edges on this trait surface.
+///
+/// # `No` is the only thing left out
+///
+/// A neighbour whose verdict is [`LoadBearing::No`] is not added and not
+/// expanded — that is the whole point of a reference-counted closure. `Yes`
+/// and `Unknown` are both added and both expanded, preserving
+/// [`LoadBearing::treated_as_load_bearing`] verbatim. **If you find yourself
+/// making `Unknown` behave like `No` here, you are deleting user data on an
+/// inconclusive predicate.**
+///
+/// # Termination
+///
+/// Each object is inserted into `visited` BEFORE it is queued, so it is
+/// expanded at most once; the object universe is finite (the corpus), so the
+/// frontier drains. `budget` additionally bounds the number of expansions so
+/// boot cannot be held hostage by corpus size. Hitting it yields
+/// [`ClosureCompleteness::Truncated`] — never a silent short answer.
+pub async fn load_bearing_closure(
+    directory: &dyn FederationDirectory,
+    roots: Vec<ObjectRef>,
+    budget: usize,
+) -> Result<LoadBearingClosure, Error> {
+    use std::collections::{BTreeSet, HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: VecDeque<(ObjectRef, usize, Option<String>)> = VecDeque::new();
+    let mut members: Vec<ClosureMember> = Vec::new();
+    let mut attestation_ids: BTreeSet<String> = BTreeSet::new();
+    let mut key_ids: BTreeSet<String> = BTreeSet::new();
+    let mut revisits = 0usize;
+    let mut excluded = 0usize;
+    let mut expansions = 0usize;
+
+    for root in &roots {
+        if visited.insert(visit_key(root)) {
+            frontier.push_back((root.clone(), 0, None));
+        } else {
+            revisits += 1;
+        }
+    }
+
+    let mut completeness = ClosureCompleteness::Complete;
+
+    while let Some((object, depth, reached_from)) = frontier.pop_front() {
+        if expansions >= budget {
+            // LOUD, and BEFORE anything else: put the object back so the
+            // remaining count is honest.
+            frontier.push_front((object, depth, reached_from));
+            completeness = ClosureCompleteness::Truncated {
+                budget,
+                frontier_remaining: frontier.len(),
+            };
+            break;
+        }
+        expansions += 1;
+
+        let verdict = is_load_bearing(directory, object.clone()).await?;
+        if matches!(verdict, LoadBearing::No) {
+            // Provably nothing here depends on it. NOT a member, and not
+            // expanded — a dead branch does not keep its children alive.
+            // Roots are subject to the same rule: an unowned node's owner
+            // claim resolving `No` must not silently pull the whole corpus in.
+            excluded += 1;
+            continue;
+        }
+
+        match &object {
+            ObjectRef::Attestation { attestation_id } => {
+                attestation_ids.insert(attestation_id.clone());
+            }
+            ObjectRef::KeyRecord { key_id } => {
+                key_ids.insert(key_id.clone());
+            }
+            _ => {}
+        }
+        members.push(ClosureMember {
+            object: object.clone(),
+            verdict,
+            depth,
+            reached_from,
+        });
+
+        let here = visit_key(&object);
+        let push = |next: ObjectRef,
+                    frontier: &mut VecDeque<(ObjectRef, usize, Option<String>)>,
+                    visited: &mut HashSet<String>,
+                    revisits: &mut usize| {
+            if visited.insert(visit_key(&next)) {
+                frontier.push_back((next, depth + 1, Some(here.clone())));
+            } else {
+                // A CYCLE or a diamond. The object is already in (or already
+                // provably out of) the closure, and the verdict does not
+                // depend on the path — so skipping the re-expansion drops
+                // nothing. Counted so the property is observable.
+                *revisits += 1;
+            }
+        };
+
+        match object {
+            ObjectRef::KeyRecord { ref key_id } => {
+                for row in directory.list_attestations_by(key_id).await? {
+                    push(
+                        ObjectRef::Attestation {
+                            attestation_id: row.attestation_id,
+                        },
+                        &mut frontier,
+                        &mut visited,
+                        &mut revisits,
+                    );
+                }
+                for row in directory.list_attestations_for(key_id).await? {
+                    push(
+                        ObjectRef::Attestation {
+                            attestation_id: row.attestation_id,
+                        },
+                        &mut frontier,
+                        &mut visited,
+                        &mut revisits,
+                    );
+                }
+                // RE-WALK DELEGATIONS by name (#650). The default impl derives
+                // these from `list_attestations_for`, but a backend may
+                // override it, and the delegation plane is the one whose state
+                // decides which rows still matter.
+                for row in directory.delegations_to(key_id).await? {
+                    push(
+                        ObjectRef::Attestation {
+                            attestation_id: row.attestation_id,
+                        },
+                        &mut frontier,
+                        &mut visited,
+                        &mut revisits,
+                    );
+                }
+            }
+            ObjectRef::Attestation {
+                ref attestation_id, ..
+            } => {
+                let Some(row) = directory.get_attestation(attestation_id).await? else {
+                    // Reached by name from a neighbour but absent here. Not an
+                    // error (the verdict above already said `No` for a missing
+                    // row, so this is unreachable in practice); nothing to
+                    // expand.
+                    continue;
+                };
+                let mut named: Vec<String> = vec![
+                    row.attesting_key_id.clone(),
+                    row.attested_key_id.clone(),
+                    row.scrub_key_id.clone(),
+                ];
+                named.extend(row.subject_key_ids.iter().cloned());
+                named.extend(row.additional_scrubs.iter().map(|s| s.scrub_key_id.clone()));
+                for key_id in named {
+                    if key_id.is_empty() {
+                        continue;
+                    }
+                    push(
+                        ObjectRef::KeyRecord { key_id },
+                        &mut frontier,
+                        &mut visited,
+                        &mut revisits,
+                    );
+                }
+                // CC 4.5.1.1 — the pointer is read WITH ITS DISCRIMINATOR,
+                // because the two readings pull in opposite directions here. On
+                // a STRUCTURAL COMPOSER the target is the row this one KILLED,
+                // and dragging a retracted row into a *load-bearing* closure
+                // would be a category error — the fold has already ruled on it.
+                // On any other verb the pointer is a CITATION (#579: a
+                // reference, conferring no subject authority), and the cited
+                // row is genuinely reachable from this one.
+                if !super::precedence::is_structural_composer(&row.attestation_type) {
+                    if let Some(target) = super::precedence::references_attestation_id_from_envelope(
+                        &row.attestation_envelope,
+                    ) {
+                        push(
+                            ObjectRef::Attestation {
+                                attestation_id: target.to_owned(),
+                            },
+                            &mut frontier,
+                            &mut visited,
+                            &mut revisits,
+                        );
+                    }
+                }
+            }
+            // Leaves on this trait surface — see the fn doc.
+            ObjectRef::TransportDestination { .. }
+            | ObjectRef::FountainContent { .. }
+            | ObjectRef::HardCaseEvent { .. } => {}
+        }
+    }
+
+    Ok(LoadBearingClosure {
+        roots,
+        members,
+        attestation_ids,
+        key_ids,
+        revisits,
+        excluded_proven_not_load_bearing: excluded,
+        completeness,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // CIRISPersist#564 stage 2 — `may_release_copy`, and the ANTI-ENTROPY
 // CONJUNCT that is the whole point of it.
 //
@@ -1413,6 +1790,98 @@ pub(crate) mod test_support {
             MayRelease::Yes => panic!("the un-trust lever must never be releasable"),
         }
     }
+
+    /// v31.0.0 (CIRISPersist#650) — the RECURSIVE variant, on a corpus that
+    /// CONTAINS A CYCLE.
+    ///
+    /// Two keys attest each other and each attests itself, so a walk that
+    /// re-expanded a visited object would not terminate. Three properties, in
+    /// the order they matter:
+    ///
+    /// 1. **It terminates**, and the cycle is COUNTED rather than being an
+    ///    error — a graph like this one is normal, not exceptional.
+    /// 2. **No subtree is dropped.** Every row in the cycle is a member, and so
+    ///    is a row reachable only through the far side of it — which is the
+    ///    thing a "skip on revisit" implementation gets wrong if it skips the
+    ///    object instead of the re-expansion.
+    /// 3. **A tiny budget TRUNCATES loudly.** The member set is then a subset
+    ///    of the truth, so the complement is a superset of the unreachable set,
+    ///    and `complement_is_trustworthy()` refuses to license acting on it.
+    pub(crate) async fn exercise_load_bearing_closure(dir: &dyn FederationDirectory, suffix: &str) {
+        use super::{load_bearing_closure, ClosureCompleteness, DEFAULT_CLOSURE_BUDGET};
+
+        let a = format!("lbc-a-{suffix}");
+        let b = format!("lbc-b-{suffix}");
+        let c = format!("lbc-c-{suffix}");
+        for k in [&a, &b, &c] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        // THE CYCLE: a→b and b→a. Plus b→c, which is reachable from `a` ONLY
+        // through the cycle.
+        let edges = [
+            (format!("lbc-ab-{suffix}"), a.clone(), b.clone()),
+            (format!("lbc-ba-{suffix}"), b.clone(), a.clone()),
+            (format!("lbc-bc-{suffix}"), b.clone(), c.clone()),
+        ];
+        for (id, author, subject) in &edges {
+            dir.put_attestation(SignedAttestation {
+                attestation: row(
+                    id,
+                    author,
+                    subject,
+                    attestation_type::SCORES,
+                    "trust:accepts:v1",
+                    vec![subject.clone()],
+                    serde_json::json!({}),
+                ),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("closure fixture {id}: {e}"));
+        }
+
+        let closure = load_bearing_closure(
+            dir,
+            vec![ObjectRef::KeyRecord { key_id: a.clone() }],
+            DEFAULT_CLOSURE_BUDGET,
+        )
+        .await
+        .expect("the walk terminates on a cyclic graph");
+
+        assert_eq!(
+            closure.completeness,
+            ClosureCompleteness::Complete,
+            "a small cyclic corpus must be walked to completion"
+        );
+        assert!(
+            closure.revisits > 0,
+            "the fixture contains a cycle, so the walk must have re-encountered a visited \
+             object — if it did not, this witness is not exercising the cycle path"
+        );
+        for (id, _, _) in &edges {
+            assert!(
+                closure.contains_attestation(id),
+                "{id} is reachable from the root and must be IN the closure — a cycle must not \
+                 drop a subtree; closure = {:?}",
+                closure.attestation_ids
+            );
+        }
+        // `c` is reachable from `a` only THROUGH the cycle.
+        assert!(
+            closure.key_ids.contains(&c),
+            "the far side of a cycle must still be reached"
+        );
+
+        // A budget of ONE expansion cannot see the graph, and says so.
+        let truncated =
+            load_bearing_closure(dir, vec![ObjectRef::KeyRecord { key_id: a.clone() }], 1)
+                .await
+                .expect("the walk still returns");
+        assert!(
+            !truncated.completeness.complement_is_trustworthy(),
+            "a truncated closure must NOT license acting on its complement — that complement \
+             is a superset of the truly unreachable set, and purging it deletes live data"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1746,5 +2215,47 @@ mod tests {
         }
         .treated_as_load_bearing());
         assert!(!LoadBearing::No.treated_as_load_bearing());
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the closure's completeness flag is a
+    /// LICENCE, and only `Complete` grants it. A caller acting on the
+    /// COMPLEMENT of a truncated closure deletes live data.
+    #[test]
+    fn only_a_complete_closure_licenses_acting_on_its_complement() {
+        assert!(ClosureCompleteness::Complete.complement_is_trustworthy());
+        assert!(!ClosureCompleteness::Truncated {
+            budget: 1,
+            frontier_remaining: 7,
+        }
+        .complement_is_trustworthy());
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the visited key must DISAMBIGUATE the
+    /// composite-keyed classes. `ObjectRef::id` reports only the leading key,
+    /// so keying the walk on it would collapse two different routes into one
+    /// and silently drop a subtree.
+    #[test]
+    fn the_visit_key_disambiguates_composite_keyed_classes() {
+        let a = ObjectRef::TransportDestination {
+            occurrence_key_id: "occ".into(),
+            transport_kind: "reticulum".into(),
+        };
+        let b = ObjectRef::TransportDestination {
+            occurrence_key_id: "occ".into(),
+            transport_kind: "websocket".into(),
+        };
+        assert_eq!(a.id(), b.id(), "the fixture must share a leading key");
+        assert_ne!(
+            super::visit_key(&a),
+            super::visit_key(&b),
+            "two distinct routes must not collapse into one visited entry"
+        );
+        // And a KeyRecord never collides with an Attestation of the same id.
+        assert_ne!(
+            super::visit_key(&ObjectRef::KeyRecord { key_id: "x".into() }),
+            super::visit_key(&ObjectRef::Attestation {
+                attestation_id: "x".into()
+            }),
+        );
     }
 }

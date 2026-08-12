@@ -872,6 +872,12 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
+        // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
+        // `Backend` has no signer; this is the first point at which the backend
+        // and the signing key exist together. Idempotent, resumable, and never
+        // boot-fatal — see `federation::migration`.
+        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -946,6 +952,13 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
+        // pre-genesis node usually has nothing to migrate (no identity ⇒ no
+        // authorship), and the routine returns early in that case; but a node
+        // that HAS an identity and no trust root still owns rows, and
+        // withholding the migration from this constructor would make the
+        // corpus's shape depend on which constructor the host happened to use.
+        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 

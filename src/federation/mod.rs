@@ -77,6 +77,9 @@ pub mod identity_aggregate;
 // consumer-owned.
 pub mod invariant;
 pub mod location;
+/// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
+/// folded CEG state from the owner root, then purge what is provably dead.
+pub mod migration;
 pub mod namespace;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /
@@ -1019,6 +1022,106 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (after_attestation_id, limit);
         Err(Error::Unsupported {
             method: "list_stranded_federation_attestations",
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **the ONLY unfiltered attestation
+    /// enumerator**: every row, every tier, every `cohort_scope`, keyset-paged
+    /// `attestation_id > after ORDER BY attestation_id ASC LIMIT limit`.
+    ///
+    /// Every other list method on this trait is tier-partitioned
+    /// (`list_attestations_for` / `_by` / `_since` / `list_attestation_log` all
+    /// pin `tier = 'federation'`; [`Self::list_local_tier_attestations`] pins
+    /// `'local'`), which is right for every CONSUMER read — a local-tier row
+    /// must never reach the serve wire. The v31 migration is not a consumer
+    /// read: it must FOLD, and a fold over a partition is a fold that can
+    /// resurrect the half it could not see. That is why this exists, and why it
+    /// is named for the one caller that may use it rather than being offered as
+    /// a general `list_attestations`.
+    ///
+    /// The keyset shape is [`Self::list_local_tier_attestations`]'s verbatim —
+    /// a stable resumption point rather than a chronological one, so a run
+    /// interrupted mid-corpus resumes without skipping or repeating. Default
+    /// `Unsupported`; sqlite/postgres/memory override.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_attestation_id, limit);
+        Err(Error::Unsupported {
+            method: "list_attestations_for_migration",
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **re-seal an EXISTING row in place**, under
+    /// its existing `attestation_id`.
+    ///
+    /// `resealed` is the row **as it will be stored**: the same row, with the
+    /// #598 signed instants and the #643 typed-column mirror stamped and the
+    /// seal recomputed over exactly those bytes. Implementations:
+    ///
+    /// 1. load the stored row; `Ok(false)` if it is gone (a concurrent purge is
+    ///    not an error);
+    /// 2. **REFUSE any divergence in an IMMUTABLE field** —
+    ///    `attesting_key_id`, `attested_key_id`, `attestation_type`,
+    ///    `subject_key_ids`, `cohort_scope`, `weight`, `tier`. A "re-seal" that
+    ///    could move a row between tiers or scopes would be a placement door
+    ///    beside [`Self::promote_attestation`] and
+    ///    [`Self::set_attestation_cohort_scope`], with none of their gates;
+    /// 3. run [`admission::check_instant_binding`] and
+    ///    [`admission::check_row_column_binding`] over `resealed`, so a caller
+    ///    that hands over a still-legacy row is REFUSED rather than silently
+    ///    writing one no peer will take (the CIRISPersist#649 rule);
+    /// 4. write `attestation_envelope`, `original_content_hash`,
+    ///    `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id`,
+    ///    `scrub_timestamp`, `additional_scrubs`, `asserted_at`, `expires_at`
+    ///    and the recomputed `persist_row_hash` in ONE statement.
+    ///
+    /// `asserted_at` / `expires_at` are mutable here precisely because #598
+    /// binds them: a legacy row minted with nanosecond precision cannot satisfy
+    /// the gate until the COLUMN is truncated to the substrate resolution
+    /// alongside its signed twin, and doing one without the other is the
+    /// divergence the gate exists to catch.
+    ///
+    /// **This is not a general re-sign door.** It exists for the migration and
+    /// refuses everything else by refusing the legacy shape it is handed. Any
+    /// other caller wanting to re-sign a row is changing its placement and
+    /// belongs at one of the two doors that gate that. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    ///
+    /// [`admission::check_instant_binding`]: admission::check_instant_binding
+    /// [`admission::check_row_column_binding`]: admission::check_row_column_binding
+    async fn reseal_attestation_v31(&self, resealed: &Attestation) -> Result<bool, Error> {
+        let _ = resealed;
+        Err(Error::Unsupported {
+            method: "reseal_attestation_v31",
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **hard-delete ONE attestation row** by id.
+    /// `Ok(true)` if a row was removed, `Ok(false)` if it was already gone (so
+    /// a re-run of an interrupted migration is a no-op, not an error).
+    ///
+    /// The row's `attestation_subjects` projection goes with it (`ON DELETE
+    /// CASCADE` on the SQL backends; explicitly on memory). The V111 signed
+    /// wire index is NOT touched per row — the migration calls
+    /// [`Self::rebuild_signed_wire_index`] once at the end, which is the
+    /// sanctioned repair for exactly this and already exists on all three
+    /// backends.
+    ///
+    /// # This deletes user data
+    ///
+    /// It is reachable only from
+    /// [`migration::run_v31_migration`](migration::run_v31_migration), whose
+    /// [`classify`](migration::classify) is the one place the decision is made
+    /// and which purges only on a PROOF — a live tombstone from the row's own
+    /// attester, or a foreign legacy row whose author is its source. Default
+    /// `Unsupported`; sqlite/postgres/memory override.
+    async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_attestation_v31",
         })
     }
 

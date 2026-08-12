@@ -5066,6 +5066,182 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
+    /// v31.0.0 (CIRISPersist#650) — the unfiltered corpus enumerator.
+    /// Structural twin of `list_local_tier_attestations` with the tier
+    /// predicate REMOVED: a fold that runs over a tier partition is a fold that
+    /// can resurrect the half it could not see.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, scrub_signature_classical, \
+                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                    tier, promoted_at, additional_scrubs \
+                 FROM cirislens.federation_attestations \
+                 WHERE ($1::text IS NULL OR attestation_id::text > $1) \
+                 ORDER BY attestation_id ASC LIMIT $2",
+                &[&after_attestation_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_for_migration: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — re-seal in place. Gate stack is
+    /// [`crate::federation::migration::check_reseal_admission`], shared with
+    /// memory and sqlite; verify-before-mutation over a LOADED COPY.
+    async fn reseal_attestation_v31(
+        &self,
+        resealed: &crate::federation::Attestation,
+    ) -> Result<bool, crate::federation::Error> {
+        let Some(stored) = self.get_attestation(&resealed.attestation_id).await? else {
+            return Ok(false);
+        };
+        crate::federation::migration::check_reseal_admission(
+            &stored,
+            resealed,
+            chrono::Utc::now(),
+        )?;
+
+        let mut row = stored.clone();
+        row.attestation_envelope = resealed.attestation_envelope.clone();
+        row.original_content_hash = resealed.original_content_hash.clone();
+        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
+        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
+        row.scrub_key_id = resealed.scrub_key_id.clone();
+        row.scrub_timestamp = resealed.scrub_timestamp;
+        row.additional_scrubs = resealed.additional_scrubs.clone();
+        row.asserted_at = resealed.asserted_at;
+        row.expires_at = resealed.expires_at;
+        row.pqc_completed_at = resealed
+            .scrub_signature_pqc
+            .as_ref()
+            .map(|_| resealed.scrub_timestamp);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+        let envelope_text = pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
+        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
+        let id = resealed.attestation_id.as_str();
+        let classical = row.scrub_signature_classical.clone();
+        let pqc = row.scrub_signature_pqc.clone();
+        let scrub_key = row.scrub_key_id.clone();
+        let scrub_ts = row.scrub_timestamp;
+        let pqc_completed = row.pqc_completed_at;
+        let asserted = row.asserted_at;
+        let expires = row.expires_at;
+        let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let n = tx
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET attestation_envelope = $2, original_content_hash = $3, \
+                     scrub_signature_classical = $4, scrub_signature_pqc = $5, \
+                     scrub_key_id = $6, scrub_timestamp = $7, pqc_completed_at = $8, \
+                     additional_scrubs = $9, asserted_at = $10, expires_at = $11, \
+                     persist_row_hash = $12 \
+                 WHERE attestation_id = $1",
+                &[
+                    &id,
+                    &envelope_text,
+                    &och,
+                    &classical,
+                    &pqc,
+                    &scrub_key,
+                    &scrub_ts,
+                    &pqc_completed,
+                    &scrubs_json,
+                    &asserted,
+                    &expires,
+                    &new_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}"))
+            })?;
+        // The V106 projection carries `asserted_at`, which the instant
+        // truncation may have moved. Same transaction.
+        tx.execute(
+            "UPDATE cirislens.attestation_subjects SET asserted_at = $2 WHERE attestation_id = $1",
+            &[&id, &asserted],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("reseal_attestation_v31 subjects: {e}"))
+        })?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("reseal_attestation_v31 commit: {e}"))
+        })?;
+        drop(client);
+        if n == 0 {
+            return Ok(false);
+        }
+        // The wire index moves WITH the row (#610).
+        if federation_tier {
+            self.index_stored_record(
+                "Attestation",
+                &crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &resealed.attestation_id,
+                )]),
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
+    /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106), and
+    /// `identity_canonical_binding.binding_attestation_id` via `ON DELETE SET
+    /// NULL` (V121).
+    async fn purge_attestation_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_attestation_v31: {e}"))
+            })?;
+        Ok(n > 0)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back. Structural mirror of the sqlite impl: validate against
     /// the closed cohort_scope set, then `UPDATE` + recompute
@@ -21031,6 +21207,76 @@ mod tests {
         let tag = format!("pg649{}", uuid_like());
         crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
             &origin, &peer, &tag,
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+    /// the STORED envelope. No production door can do this (both v31 gates
+    /// refuse the shape), so the seam reaches the pool directly.
+    #[async_trait::async_trait]
+    impl crate::federation::migration::test_support::LegacyRowInstaller for PostgresBackend {
+        async fn downgrade_to_v30(&self, attestation_id: &str) {
+            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
+                .await
+                .expect("read")
+                .expect("downgrade_to_v30: row must exist");
+            // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+            let envelope = pg_envelope_text(
+                &crate::federation::migration::test_support::v30_envelope(
+                    &row.attestation_envelope,
+                ),
+                "attestation_envelope",
+            )
+            .expect("serialize");
+            let client = self.get_client().await.expect("client");
+            client
+                .execute(
+                    "UPDATE cirislens.federation_attestations SET attestation_envelope = $2 \
+                     WHERE attestation_id = $1",
+                    &[&attestation_id, &envelope],
+                )
+                .await
+                .expect("downgrade_to_v30 update");
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
+    /// CYCLIC graph, postgres arm. Shared exercise body with memory + sqlite.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn load_bearing_closure_postgres_650() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg650c{}", uuid_like());
+        crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, postgres arm.
+    /// Shared exercise body with memory + sqlite; the peer is a `MemoryBackend`
+    /// (one postgres database per test process, so a second postgres corpus is
+    /// not available — and the receiving stack is backend-symmetric by
+    /// construction, with its own parity witnesses).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v31_migration_postgres_650() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let origin = PostgresBackend::connect(&dsn).await.expect("connect");
+        origin.run_migrations().await.expect("migrations run");
+        let peer = crate::store::memory::MemoryBackend::new();
+        let tag = format!("pg650{}", uuid_like());
+        crate::federation::migration::test_support::exercise_v31_migration(
+            &origin, &origin, &peer, &tag,
         )
         .await;
     }

@@ -4262,6 +4262,163 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    /// v31.0.0 (CIRISPersist#650) — the unfiltered corpus enumerator.
+    /// Structural twin of `list_local_tier_attestations` with the tier
+    /// predicate REMOVED: a fold that runs over a tier partition is a fold that
+    /// can resurrect the half it could not see.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let after = after_attestation_id.map(str::to_owned);
+        let limit = i64::from(limit);
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                 FROM federation_attestations \
+                 WHERE (?1 IS NULL OR attestation_id > ?1) \
+                 ORDER BY attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_for_migration: {e}"))
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — re-seal in place. Gate stack is
+    /// [`crate::federation::migration::check_reseal_admission`], shared with
+    /// memory and postgres; verify-before-mutation over a LOADED COPY, so a
+    /// refused re-seal leaves no trace.
+    async fn reseal_attestation_v31(
+        &self,
+        resealed: &crate::federation::Attestation,
+    ) -> Result<bool, crate::federation::Error> {
+        let Some(stored) = self.get_attestation(&resealed.attestation_id).await? else {
+            return Ok(false);
+        };
+        crate::federation::migration::check_reseal_admission(
+            &stored,
+            resealed,
+            chrono::Utc::now(),
+        )?;
+
+        let mut row = stored.clone();
+        row.attestation_envelope = resealed.attestation_envelope.clone();
+        row.original_content_hash = resealed.original_content_hash.clone();
+        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
+        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
+        row.scrub_key_id = resealed.scrub_key_id.clone();
+        row.scrub_timestamp = resealed.scrub_timestamp;
+        row.additional_scrubs = resealed.additional_scrubs.clone();
+        row.asserted_at = resealed.asserted_at;
+        row.expires_at = resealed.expires_at;
+        row.pqc_completed_at = resealed
+            .scrub_signature_pqc
+            .as_ref()
+            .map(|_| resealed.scrub_timestamp);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
+        let wire_index_key = crate::federation::wire_index::record_key(&[(
+            "attestation_id",
+            &resealed.attestation_id,
+        )]);
+        let conn = self.conn.clone();
+        let id = resealed.attestation_id.clone();
+        let classical = row.scrub_signature_classical.clone();
+        let pqc = row.scrub_signature_pqc.clone();
+        let scrub_key = row.scrub_key_id.clone();
+        let ts = row.scrub_timestamp.to_rfc3339();
+        let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
+        let asserted = row.asserted_at.to_rfc3339();
+        let expires = row.expires_at.map(|t| t.to_rfc3339());
+        let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let n = tx.execute(
+                "UPDATE federation_attestations \
+                 SET attestation_envelope = ?2, original_content_hash = ?3, \
+                     scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                     scrub_key_id = ?6, scrub_timestamp = ?7, pqc_completed_at = ?8, \
+                     additional_scrubs = ?9, asserted_at = ?10, expires_at = ?11, \
+                     persist_row_hash = ?12 \
+                 WHERE attestation_id = ?1",
+                rusqlite::params![
+                    id,
+                    envelope_text,
+                    och,
+                    classical,
+                    pqc,
+                    scrub_key,
+                    ts,
+                    pqc_completed,
+                    scrubs_json,
+                    asserted,
+                    expires,
+                    new_hash,
+                ],
+            )?;
+            // The V106 projection carries `asserted_at`, which the instant
+            // truncation may have moved. Same statement, same transaction.
+            tx.execute(
+                "UPDATE attestation_subjects SET asserted_at = ?2 WHERE attestation_id = ?1",
+                rusqlite::params![id, asserted],
+            )?;
+            tx.commit()?;
+            Ok(n)
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}")))?;
+        if n == 0 {
+            return Ok(false);
+        }
+        // The wire index moves WITH the row (#610): the re-seal recomputes
+        // `persist_row_hash`, so without re-indexing the row advertises a hash
+        // the index does not hold.
+        if federation_tier {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
+    /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106).
+    async fn purge_attestation_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                rusqlite::params![id],
+            )
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_attestation_v31: {e}")))?;
+        Ok(n > 0)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back: stamp a new `cohort_scope` onto an existing row
     /// (validated against the closed set) and recompute
@@ -39980,6 +40137,62 @@ mod tests {
         peer.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
             &origin, &peer, "sq649",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+    /// the STORED envelope. No production door can do this (both v31 gates
+    /// refuse the shape), so the seam reaches the connection directly.
+    #[async_trait::async_trait]
+    impl crate::federation::migration::test_support::LegacyRowInstaller for SqliteBackend {
+        async fn downgrade_to_v30(&self, attestation_id: &str) {
+            let row = crate::federation::FederationDirectory::get_attestation(self, attestation_id)
+                .await
+                .expect("read")
+                .expect("downgrade_to_v30: row must exist");
+            let envelope =
+                serde_json::to_string(&crate::federation::migration::test_support::v30_envelope(
+                    &row.attestation_envelope,
+                ))
+                .expect("serialize");
+            let conn = self.conn.clone();
+            let id = attestation_id.to_owned();
+            (move || -> Result<usize, rusqlite::Error> {
+                let conn = conn.lock();
+                conn.execute(
+                    "UPDATE federation_attestations SET attestation_envelope = ?2 \
+                     WHERE attestation_id = ?1",
+                    rusqlite::params![id, envelope],
+                )
+            })()
+            .expect("downgrade_to_v30 update");
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
+    /// CYCLIC graph, sqlite arm. Shared exercise body with memory + postgres.
+    #[tokio::test]
+    async fn load_bearing_closure_sqlite_650() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
+            &backend, "sq650c",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, sqlite arm.
+    /// Shared exercise body with memory + postgres; two independent in-memory
+    /// databases are two genuinely separate corpora.
+    #[tokio::test]
+    async fn v31_migration_sqlite_650() {
+        let origin = SqliteBackend::open_in_memory().await.unwrap();
+        origin.run_migrations().await.unwrap();
+        let peer = SqliteBackend::open_in_memory().await.unwrap();
+        peer.run_migrations().await.unwrap();
+        crate::federation::migration::test_support::exercise_v31_migration(
+            &origin, &origin, &peer, "sq650",
         )
         .await;
     }
