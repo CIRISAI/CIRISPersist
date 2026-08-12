@@ -2779,6 +2779,14 @@ pub trait FederationDirectory: Send + Sync {
     /// version. [`Error::InvalidArgument`] if the group does not exist or the
     /// cohort is `self`. Prefer the typed [`Self::supersede_family`] /
     /// [`Self::supersede_community`] wrappers.
+    /// v31.0.0 (CIRISPersist#651) — `new_snapshot` is the **SIGNED WRAPPER**
+    /// ([`types::SignedFamily`] / [`types::SignedCommunity`]), not the bare
+    /// record. Implementations decode the wrapper and MUST write
+    /// `authority_key_id` + `scrub_signature_{classical,pqc}` alongside the
+    /// record columns they update — the signature covers `members`,
+    /// `family_name`, `founded_at` and `consensus_protocol`, so a supersede
+    /// that rewrites those and leaves the old signature in place stores a row
+    /// that cannot verify against its own contents.
     async fn supersede_group_row(
         &self,
         cohort: cohort::Cohort,
@@ -2808,7 +2816,24 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.family.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.family)
+        // v31.0.0 (CIRISPersist#651) — THE AUTHORSHIP GATE. `put_family` has
+        // run this since v21.0.0 (#502 E4); supersede ran NOTHING, so
+        // `federation_families` had a SECOND write door that admitted a
+        // re-baselined roster, a new `consensus_protocol` and a new
+        // `family_name` on FK-existence alone. Superseding is not a lesser act
+        // than creating — it is the act that REPLACES what creation
+        // established — so it is gated identically, and before any write.
+        crate::federation::verify_family_admission(self, &new).await?;
+        // The snapshot is the SIGNED WRAPPER, not the bare record. Serializing
+        // `.family` alone is what dropped the caller's freshly-minted
+        // signature on the floor: `signing_envelope()` covers `members`,
+        // `family_name`, `founded_at` and `consensus_protocol`, so a supersede
+        // that carries the record without its signature leaves the stored
+        // `authority_key_id` / `scrub_signature_*` describing a roster that is
+        // no longer there. Same discipline as #649's `AttestationReseal`: the
+        // record and the signature that authorizes it travel together, because
+        // the way they go stale is by being able to move apart.
+        let snapshot = serde_json::to_value(&new)
             .map_err(|e| Error::Backend(format!("supersede_family snapshot serialize: {e}")))?;
         self.supersede_group_row(cohort::Cohort::Family, snapshot, authorization)
             .await
@@ -2822,7 +2847,10 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.community)
+        // v31.0.0 (CIRISPersist#651) — the authorship gate + the signed
+        // wrapper as the snapshot. See [`Self::supersede_family`] for why both.
+        crate::federation::verify_community_admission(self, &new).await?;
+        let snapshot = serde_json::to_value(&new)
             .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
         self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
             .await
@@ -2839,7 +2867,15 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.community).map_err(|e| {
+        // v31.0.0 (CIRISPersist#651) — gated and signature-carrying for the
+        // same reason as its two siblings. #651 named the family and community
+        // arms; this THIRD arm shares `SignedCommunity` and the
+        // `federation_communities` storage with the community arm, so fixing
+        // the two named doors and leaving this one open would have left the
+        // identical hole reachable under a different discriminator — which is
+        // exactly the by-name evadability #598 refused for the instant gate.
+        crate::federation::verify_community_admission(self, &new).await?;
+        let snapshot = serde_json::to_value(&new).map_err(|e| {
             Error::Backend(format!("supersede_affiliations snapshot serialize: {e}"))
         })?;
         self.supersede_group_row(cohort::Cohort::Affiliations, snapshot, authorization)

@@ -5057,8 +5057,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
         let new_version = match cohort {
             Cohort::Family => {
-                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
-                    .map_err(|e| {
+                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                // wrapper. Decoding the bare record here is what silently
+                // stranded the caller's signature: the UPDATE below rewrites
+                // every field `signing_envelope()` covers.
+                let crate::federation::SignedFamily {
+                    family: mut new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 new_fam.persist_row_hash =
@@ -5106,7 +5114,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         "UPDATE federation_families SET \
                             family_name = ?2, members = ?3, founded_at = ?4, \
                             consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
-                            persist_row_hash = ?7, version = ?8 \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -5117,6 +5127,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             new_fam.consensus_protocol_entrenched as i64,
                             new_fam.persist_row_hash,
                             next,
+                            // v31.0.0 (CIRISPersist#651) — the signature moves
+                            // with the record it authorizes. Updated in the
+                            // SAME statement, so a future edit cannot rewrite
+                            // the roster and forget the authorship.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
                         ],
                     )?;
                     tx.commit()?;
@@ -5124,10 +5141,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 })()
             }
             Cohort::Community | Cohort::Affiliations => {
-                let mut new_comm: crate::federation::Community =
-                    serde_json::from_value(new_snapshot).map_err(|e| {
-                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                    })?;
+                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                // family arm above.
+                let crate::federation::SignedCommunity {
+                    community: mut new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
+                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                })?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let members_json = serde_json::to_string(&new_comm.members)
@@ -5180,7 +5203,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         "UPDATE federation_communities SET \
                             community_name = ?2, members = ?3, founded_at = ?4, \
                             consensus_protocol = ?5, policy_blob = ?6, \
-                            persist_row_hash = ?7, version = ?8 \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11 \
                          WHERE community_key_id = ?1",
                         rusqlite::params![
                             new_comm.community_key_id,
@@ -5191,6 +5216,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             policy_json,
                             new_comm.persist_row_hash,
                             next,
+                            // v31.0.0 (CIRISPersist#651) — see the family arm.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
                         ],
                     )?;
                     tx.commit()?;
@@ -40149,6 +40178,132 @@ mod tests {
         assert!(
             err.is_err(),
             "duplicate (occ, kind) must violate the new PK"
+        );
+    }
+
+    /// v31.0.0 (CIRISPersist#651) — **THE SUPERSEDE PEER-ACCEPTANCE WITNESS.**
+    ///
+    /// `Family::signing_envelope()` is the whole record minus
+    /// `persist_row_hash`, so `members`, `family_name`, `founded_at` and
+    /// `consensus_protocol` are ALL in the signed preimage. `supersede_family`
+    /// rewrites every one of them. Before this cut it serialized only
+    /// `.family`, dropping the caller's freshly-minted signature on the floor,
+    /// and `supersede_group_row` left `authority_key_id` /
+    /// `scrub_signature_*` at whatever `put_family` had written for the
+    /// PREVIOUS roster. The stored row then advertised an authorship it could
+    /// not prove: the signature verified against a roster that was no longer
+    /// there.
+    ///
+    /// A round-trip assertion inside one directory cannot see that — the
+    /// origin never re-verifies its own row. So this witness does what a mesh
+    /// does: it takes the `SignedFamily` the origin SERVES from
+    /// `list_signed_families_since` and feeds it to a SECOND directory's
+    /// `put_family`, whose `verify_family_admission` is the same gate every
+    /// real peer runs. Same discipline as
+    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a `MemoryBackend`
+    /// because the property is backend-independent and the point is that the
+    /// two corpora are genuinely separate.
+    #[tokio::test]
+    async fn superseded_family_crosses_to_a_peer_sqlite_651() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{Family, FamilyMember};
+        use crate::federation::FederationDirectory;
+
+        let origin = SqliteBackend::open_in_memory().await.unwrap();
+        origin.run_migrations().await.unwrap();
+        let peer = crate::store::memory::MemoryBackend::new();
+
+        let authority = "fam651-authority";
+        let fam_key = "fam651-key";
+        let m1 = "fam651-m1";
+        let m2 = "fam651-m2";
+        // Both directories must resolve the authority's pubkeys — that is what
+        // a real peer has, and what the admission gate needs. Members must be
+        // registered keys on each side (`validate_family_members`).
+        for dir in [
+            &origin as &dyn FederationDirectory,
+            &peer as &dyn FederationDirectory,
+        ] {
+            for k in [authority, fam_key, m1, m2] {
+                ts::register_hybrid_key(dir, k).await;
+            }
+        }
+
+        let joined = "2026-05-01T00:00:00Z".parse().unwrap();
+        let mk = |members: Vec<&str>, protocol: &str| Family {
+            family_key_id: fam_key.to_owned(),
+            family_name: "acme".into(),
+            members: members
+                .into_iter()
+                .map(|k| FamilyMember {
+                    key_id: k.to_owned(),
+                    joined_at: joined,
+                    role: None,
+                })
+                .collect(),
+            founded_at: joined,
+            consensus_protocol: protocol.to_owned(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+
+        // v1: one member, admitted through the signed door.
+        origin
+            .put_family(ts::sign_family(authority, mk(vec![m1], "founder_only")))
+            .await
+            .expect("651: the signed put admits");
+
+        // SUPERSEDE to a DIFFERENT roster and a DIFFERENT protocol — both
+        // inside the signing preimage, so both are re-signed.
+        let v2 = ts::sign_family(authority, mk(vec![m1, m2], "unanimous"));
+        let version = origin
+            .supersede_family(v2, Some(serde_json::json!({"membership_change": "add m2"})))
+            .await
+            .expect("651: the signed supersede admits");
+        assert_eq!(version, 2, "supersede bumps the version");
+
+        // THE WITNESS: what the origin now SERVES must be admissible by a peer.
+        let served = origin
+            .list_signed_families_since(None, 100)
+            .await
+            .expect("list_signed_families_since")
+            .into_iter()
+            .find(|f| f.family.family_key_id == fam_key)
+            .expect("651: the superseded family is served");
+        assert_eq!(
+            served.family.members.len(),
+            2,
+            "651: the served record must be the POST-supersede roster"
+        );
+        assert_eq!(
+            served.family.consensus_protocol, "unanimous",
+            "651: and the post-supersede protocol"
+        );
+        assert_eq!(
+            served.authority_key_id, authority,
+            "651: the served record must carry an authorship claim at all"
+        );
+        peer.put_family(served)
+            .await
+            .expect("651: a PEER's admission gate must accept the superseded row");
+
+        // The counter-witness: the PRE-supersede signature over the POST-
+        // supersede record is what the defect stored, and it must NOT verify —
+        // otherwise this test would pass with the signature check disabled.
+        let stale = crate::federation::SignedFamily {
+            family: mk(vec![m1, m2], "unanimous"),
+            ..ts::sign_family(authority, mk(vec![m1], "founder_only"))
+        };
+        let err = peer
+            .put_family(stale)
+            .await
+            .expect_err("651: a signature over the OLD roster must not admit the NEW one");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "651: the refusal must be the authorship gate, got {err:?}"
         );
     }
 }
