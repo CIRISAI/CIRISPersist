@@ -110,6 +110,15 @@ moving into persist. `seq` is not returned: the index has no seq column.
 Mutation-tested: hashing the `to_value`-normalised form — the exact skew #634
 names — fails both the memory and sqlite legs.
 
+**The witness caught real skew on its first postgres run**, which is the argument
+for running it on three backends rather than on memory. The Key-plane ref
+resolved on memory and sqlite and NOT on postgres: the index is hashed from the
+in-memory row at put time, while the read re-serializes the row reloaded from
+postgres, and `TIMESTAMPTZ` is microsecond precision where `Utc::now()` is
+nanosecond. `register_hybrid_key` now truncates, the same fix the #610 rescope
+witness applies for the same reason. The **local-mint** path is not obviously
+fixture-only and is filed as #640 rather than papered over here.
+
 ## [30.11.0] - 2026-08-11
 
 ### Added — a canonical array over the duty scopes (#637)

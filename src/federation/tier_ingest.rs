@@ -530,7 +530,23 @@ pub(crate) mod test_support {
         pubkey_source_key_id: &str,
     ) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
-        let now = chrono::Utc::now();
+        // v30.12.0 (CIRISPersist#634) — TRUNCATED TO MICROSECONDS. Postgres
+        // `TIMESTAMPTZ` is microsecond precision while `Utc::now()` carries
+        // nanoseconds, so a nanosecond-bearing fixture does not survive the
+        // round-trip: the wire index is written from the IN-MEMORY row at put
+        // time, and `list_signed_key_records_since` re-serializes the RELOADED
+        // (truncated) row, so the two hash differently and the advertised ref
+        // point-reads to `None`. The same trap the #610 rescope witness
+        // documents, and it is a property of the FIXTURE — rows arriving over
+        // the wire carry RFC-3339 instants that already round-trip losslessly.
+        // Truncating here keeps every postgres test measuring what it is for
+        // rather than clock precision.
+        let now = {
+            use chrono::Timelike as _;
+            chrono::Utc::now()
+                .with_nanosecond(chrono::Utc::now().nanosecond() / 1_000 * 1_000)
+                .unwrap_or_else(chrono::Utc::now)
+        };
         let rec = crate::federation::KeyRecord {
             key_id: key_id.to_owned(),
             pubkey_ed25519_base64: ed_pk,
