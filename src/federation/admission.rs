@@ -9617,6 +9617,44 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
 /// be admitted. Measures the REAL canonical bytes (the same JCS the producer
 /// signed, via [`crate::verify::canonical::ceg_produce_canonicalize`]) — the
 /// signed thing is the sized thing (CC#38's proposed rule).
+///
+/// # v31.0.0 (CIRISPersist#653) — and at the local doors it runs TWICE,
+/// because persist writes bytes of its own
+///
+/// The sentence above was true while the envelope that arrived was the
+/// envelope that got stored. CIRISPersist#643 and CIRISPersist#598 ended that
+/// at the LOCAL tier: a durable local row carries the deferred empty-sentinel
+/// scrub envelope, so the local write door stamps the typed-column mirror
+/// ([`crate::federation::envelope::RowMirror::stamp_local_row`]) and the bound
+/// instants into the bytes before they land — the last moment they are
+/// persist's to write.
+///
+/// So at a local door the early call measures the PRODUCER's envelope and the
+/// stored one is ~250 bytes larger (the exact growth depends on the key_id
+/// lengths inside the mirror). A row landing in that window was ADMITTED here
+/// and then refused by this same function at the federation door on promotion
+/// or replication — locally Ok, globally unreplicable, the recurring class of
+/// this release (CIRISPersist#649 / #651 / #652).
+///
+/// Both calls are kept rather than moving the one, because they are two
+/// different jobs:
+///
+/// - the EARLY call is a cheap pre-filter that bounds the work spent on
+///   hostile input — it must stay ahead of `check_trace_dimension_admission`
+///   and `check_trust_charter_admission`, which do directory reads;
+/// - the call after the stamp is the AUTHORITATIVE one, and it is the one
+///   that makes the doc sentence true again: what is measured is what is
+///   stored.
+///
+/// The federation door needs only one call: a row arriving there is already
+/// fully stamped, so its envelope IS the stored envelope.
+///
+/// Deliberately NOT fixed by having producers reserve headroom. The two
+/// in-tree producers that choose an inline-vs-manifest envelope shape by
+/// measuring themselves — `crate::ingest::IngestPipeline::build_trace_attestation_input`
+/// and [`crate::Engine::backfill_trace_attestations`] — would each have to
+/// model this door's stamp to do that, and a second spelling of a projection
+/// that drifts is precisely how #643 and #598 each acquired their defect.
 pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
         .map_err(|e| Error::InvalidArgument(format!("envelope canonicalize: {e}")))?;
@@ -14760,14 +14798,151 @@ mod canonical_withdrawal_tests {
 
 // ─────────────────────────────────────────────────────────────────────
 // v17.9.0 (CIRISConstitution#38 interim) — envelope size cap witnesses.
-// The check is SINGLE-SOURCED (`check_envelope_size_admission`) and called
-// identically at all six write chokepoints, so the boundary is unit-pinned
-// here and one backend integration (memory, below in store tests) proves the
-// wiring; per-backend duplication would re-test the same fn.
+// The check is SINGLE-SOURCED (`check_envelope_size_admission`) and called at
+// every write chokepoint, so the BOUNDARY is unit-pinned here and one backend
+// integration (memory, below in store tests) proves the wiring; per-backend
+// duplication would re-test the same fn.
+//
+// v31.0.0 (CIRISPersist#653) — that reasoning covers the boundary but NOT which
+// bytes get measured, and the two answers stopped agreeing. The local doors
+// now call the check twice — once on the producer's envelope as a pre-filter,
+// once on the row as it will be STORED, after the #643 mirror and #598
+// instants are stamped into it. `stored_row_is_within_the_cap_on_every_backend`
+// below pins the second call, because a unit test of the predicate cannot see
+// a door that measures the wrong object.
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod envelope_size_tests {
     use super::{check_envelope_size_admission, MAX_ATTESTATION_ENVELOPE_BYTES};
+
+    /// v31.0.0 (CIRISPersist#653) — **what this door STORES is within the cap.**
+    ///
+    /// The invariant stated positively, because the negative form ("an
+    /// oversize envelope is refused") was already true and was not the defect.
+    /// The defect was that a local door measured the PRODUCER's envelope and
+    /// then stored a LARGER one: persist stamps the typed-column mirror
+    /// (CIRISPersist#643) and the bound instants (CIRISPersist#598) into a
+    /// durable local row's bytes at that door, growing them by ~250. A row
+    /// landing in that window was admitted here and refused by the SAME
+    /// function at the federation door on promotion or replication — locally
+    /// Ok, globally unreplicable, this release's recurring class.
+    ///
+    /// The fixture sits the PRODUCER's envelope exactly AT the cap, which the
+    /// unit witness above proves is admissible, so the only thing that can
+    /// refuse it is the stamp pushing it over — and the only thing that can
+    /// let it through is a door measuring the wrong object.
+    ///
+    /// Backend-symmetric: the check is one line in each of the three local
+    /// write funnels and the failure mode is someone deleting one of them, so
+    /// asking one backend would not detect it.
+    async fn exercise_stored_row_within_cap<D>(dir: &D)
+    where
+        D: crate::federation::FederationDirectory + Sync + ?Sized,
+    {
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, "cap-probe").await;
+
+        let build = |pad: usize| crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: "cap-probe".into(),
+            attested_key_id: None,
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "dimension": "identity_binding:v1",
+                    "id": "cap-1",
+                    "pad": "x".repeat(pad),
+                }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+
+        // Tune `pad` so the PRODUCER's canonical bytes land exactly at the cap.
+        let mut pad = MAX_ATTESTATION_ENVELOPE_BYTES;
+        for _ in 0..64 {
+            let n = crate::verify::canonical::ceg_produce_canonicalize(
+                &build(pad).attestation_envelope.to_value(),
+            )
+            .unwrap()
+            .len();
+            if n == MAX_ATTESTATION_ENVELOPE_BYTES {
+                break;
+            }
+            pad = (pad + MAX_ATTESTATION_ENVELOPE_BYTES).saturating_sub(n);
+        }
+        let at_cap = build(pad);
+        assert_eq!(
+            crate::verify::canonical::ceg_produce_canonicalize(
+                &at_cap.attestation_envelope.to_value()
+            )
+            .unwrap()
+            .len(),
+            MAX_ATTESTATION_ENVELOPE_BYTES,
+            "fixture sanity: the PRODUCER's envelope must sit exactly at the cap, or this \
+             witness measures nothing"
+        );
+
+        let err = dir
+            .attestation_upsert_local(at_cap)
+            .await
+            .expect_err("a producer envelope AT the cap cannot fit once the door stamps it");
+        // Pinned to the TYPED variant and to this row's own numbers, not to an
+        // issue number: a neighbouring gate that legitimately refused first
+        // would satisfy a looser assertion and this witness would pass while
+        // measuring nothing. The positive half below is what earns the right to
+        // be this specific — it drives the SAME key, dimension and door with
+        // only the size changed, so every other gate is proven to admit.
+        match err {
+            super::Error::EnvelopeTooLarge { bytes, cap } => {
+                assert_eq!(cap, MAX_ATTESTATION_ENVELOPE_BYTES, "the cap it names");
+                assert!(
+                    bytes > cap,
+                    "the refusal must be about THIS row's stored size ({bytes}) exceeding the \
+                     cap ({cap}), which is only true after the stamp"
+                );
+            }
+            other => panic!(
+                "it must be refused for its SIZE, naming the bytes and the cap — not by some \
+                 other gate that happens to also dislike it: {other:?}"
+            ),
+        }
+
+        // And the positive half: a row that DOES admit is within the cap as
+        // STORED, not merely as submitted. Same key, same dimension, same
+        // door — only the size differs.
+        let id = dir
+            .attestation_upsert_local(build(16))
+            .await
+            .expect("an ordinary local row still admits");
+        let stored = dir
+            .get_attestation(&id)
+            .await
+            .expect("get_attestation")
+            .expect("the row landed");
+        check_envelope_size_admission(&stored.attestation_envelope)
+            .expect("every row this door stores must pass the cap it was admitted under");
+    }
+
+    #[tokio::test]
+    async fn stored_row_is_within_the_cap_on_memory() {
+        exercise_stored_row_within_cap(&crate::store::memory::MemoryBackend::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn stored_row_is_within_the_cap_on_sqlite() {
+        use crate::store::backend::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        exercise_stored_row_within_cap(&b).await;
+    }
 
     /// Build an envelope whose CANONICAL bytes are exactly `n` long:
     /// `{"d":"<pad>"}` canonicalizes to 8 framing bytes + pad.

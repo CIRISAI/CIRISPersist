@@ -13742,6 +13742,17 @@ impl SqliteBackend {
         // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
         // decision and the transit exclusion. One helper, all three backends.
         crate::federation::envelope::RowMirror::stamp_local_row(&mut row, is_transit)?;
+        // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
+        // measured the PRODUCER's envelope; this one measures the bytes that
+        // actually land, which the #643 mirror and the #598 instants just grew
+        // by ~250. Without it a row in that window is admitted here and refused
+        // by the SAME function at the federation door on promotion or
+        // replication — locally Ok, globally unreplicable. Both calls stay: the
+        // early one is the cheap pre-filter that keeps hostile input away from
+        // the directory reads below it, this one is authoritative. See
+        // `check_envelope_size_admission` for why producers do not reserve
+        // headroom instead.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
         // v31.0.0 (CIRISPersist#598) — the same binding the federation door
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
