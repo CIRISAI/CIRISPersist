@@ -106,6 +106,82 @@ authored and can re-sign — are re-minted; federation-tier rows are dropped and
 re-fetched from peers through the replication plane, already in v31 shape. The
 ingest hook is therefore unconditional: no legacy sniff, no dual-read path, no
 tolerance for producer-byte rows.
+
+### Added — the v31 corpus migrates ITSELF at boot, and it migrates the FINAL folded state (#650)
+
+Every row written under v30 is refused by this substrate's own put doors: no
+#643 typed-column mirror, no #598 signed instants. `federation::migration` makes
+that self-healing — *"100% automatable inside persist, consumers should never
+know."* It runs from `Engine::with_signer` / `with_signer_pre_genesis`, which is
+the first point at which the backend and the SIGNING KEY exist together (a
+re-stamp is a re-sign, so `Backend::run_migrations` — where the other idempotent
+data sweeps live — cannot host it).
+
+**It re-stamps the FINAL folded state, never the interim states.** Replaying
+history would re-mint rows that were already superseded, withdrawn or recanted
+— **resurrecting retracted claims**, which is the worst outcome a migration can
+have; a withdrawn `consent:replication:v1` grant coming back to life
+re-authorizes a peer the subject revoked. `fold_retractions` applies the SAME
+rule every backend's `LifecycleView::Live` read applies, over the whole corpus
+instead of one page, and the routine acts on the result. Retracted rows are
+purged; the TOMBSTONE that killed them is retained unconditionally, because
+purging a tombstone is the other way a dead row comes back — one round of
+anti-entropy later. The identity is preserved through the re-stamp
+(`attestation_id` is one of the seven members #643 binds), so a re-mint under a
+fresh id — the second resurrection vector — is not expressible.
+
+**Fail-secure, in the direction a purge needs.** `LoadBearing::Unknown` is
+treated as load-bearing: *do not delete what you cannot prove is dead.* Every
+arm of `migration::classify` states which side it falls on. The only licence to
+delete a row of ours that nobody retracted is four conjuncts wide — proven
+`LoadBearing::No`, federation tier, outside the owner closure, and the closure
+COMPLETE — and a truncated walk disables it entirely.
+
+**`load_bearing::load_bearing_closure`** is the recursive variant #650 asks for:
+it starts at the OWNER CLAIM (`admission::owner_of`'s owner-binding delegation
+plus the node's own key record) and computes the transitive closure over the
+current state, re-walking delegations by name. It terminates on cyclic graphs
+(each object is expanded at most once; the verdict is a function of the object
+and the corpus, not of the path), counts the revisits rather than erroring on
+them, and reports `ClosureCompleteness::Truncated` when a budget bites — because
+a caller acting on the COMPLEMENT of a short closure deletes live data.
+
+**Exclusion is NOT structural, so preserving it is an explicit step.** A fresh
+trust root does not exclude an old key: `put_public_key` proves key custody and
+consults no revocation, quarantine or de-admission state, and the trust root is
+consulted only for privileged ROLE claims. Worse, `federation_revocations` has
+no replication serve cursor at all, so a purge of it could never be refilled.
+This routine touches exactly one table (`federation_attestations`), and inside
+it `migration::is_exclusion_bearing` names — by constant, not by shape — the
+classes it will never purge: structural composers, peer de-admission
+(`revocation:peer_admission:v1`), quarantine markers, moderation /
+reconsideration / slashing / objection reports, and the whole `delegates_to`
+plane that authorizes them. Ones we can re-author are re-stamped; ones we cannot
+are `RetainInert` — v30-shaped and unusable on the wire, but still read by the
+folds that enforce them. **An exclusion that cannot be refreshed still excludes;
+one that was deleted excludes nothing.**
+
+**Idempotent and interruptible by construction**, with no completion marker: a
+row's disposition is a function of its current shape and the current fold, so a
+second run reports zero work and a half-migrated corpus is exactly the input the
+next run completes. The fold is stable under partial application because purging
+removes targets and never composers.
+
+New `FederationDirectory` methods (all three backends):
+`list_attestations_for_migration` (the ONLY unfiltered attestation enumerator —
+a fold over a tier partition can resurrect the half it could not see),
+`reseal_attestation_v31` (re-seal in place; refuses any divergence in an
+immutable field, then re-runs both v31 gates), and `purge_attestation_v31`.
+
+Witnessed on memory, sqlite and postgres through one shared body: the withdrawn
+grant does not come back, the tombstone survives in v31 shape, an
+`Unknown`-verdict row is kept, a previously-excluded row is still excluded, the
+re-stamped row is **accepted by a peer's `put_attestation`** (local success is
+not acceptance — the #649 lesson), a half-migrated corpus is completed, and a
+second run changes nothing. Mutating the fold to replay the interim states turns
+the withdrawn grant from `Purge` into `Restamp` and reds the resurrection
+witness.
+
 ### Added — BREAKING — 31.0.0 is the binary that RUNS the ceremony, so it had to boot without the thing the ceremony produces (#648)
 
 The release plan is: cut 31.0.0 with no valid seed → roll it onto a new server →

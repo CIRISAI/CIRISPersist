@@ -3273,6 +3273,110 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v31.0.0 (CIRISPersist#650) — the unfiltered corpus enumerator: every
+    /// row, every tier. Twin of `list_local_tier_attestations` MINUS the tier
+    /// predicate; see the trait doc for why a fold may not run over a
+    /// partition.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| match after_attestation_id {
+                Some(after) => a.attestation_id.as_str() > after,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — re-seal in place. The gate stack is
+    /// [`crate::federation::migration::check_reseal_admission`], shared with
+    /// sqlite and postgres, run on a CANDIDATE before `row` is touched: this
+    /// backend holds `&mut` into live state, so gating after stamping would
+    /// leave a REFUSED re-seal having already mutated the row — the AV-9
+    /// violation the SQL backends are structurally protected from by working on
+    /// a loaded copy.
+    async fn reseal_attestation_v31(
+        &self,
+        resealed: &crate::federation::Attestation,
+    ) -> Result<bool, crate::federation::Error> {
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let Some(row) = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == resealed.attestation_id)
+            else {
+                return Ok(false);
+            };
+            crate::federation::migration::check_reseal_admission(
+                row,
+                resealed,
+                chrono::Utc::now(),
+            )?;
+            row.attestation_envelope = resealed.attestation_envelope.clone();
+            row.original_content_hash = resealed.original_content_hash.clone();
+            row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
+            row.scrub_key_id = resealed.scrub_key_id.clone();
+            row.scrub_timestamp = resealed.scrub_timestamp;
+            row.additional_scrubs = resealed.additional_scrubs.clone();
+            row.asserted_at = resealed.asserted_at;
+            row.expires_at = resealed.expires_at;
+            row.pqc_completed_at = resealed
+                .scrub_signature_pqc
+                .as_ref()
+                .map(|_| resealed.scrub_timestamp);
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            // The wire index moves WITH the row (#610): the re-seal recomputes
+            // `persist_row_hash`, so without re-indexing the row advertises a
+            // hash the index does not hold.
+            (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )])
+            })
+        };
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row, and the
+    /// V106 subject projection with it (the SQL backends get that from `ON
+    /// DELETE CASCADE`; memory has to say it).
+    async fn purge_attestation_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.federation_attestations.len();
+        state
+            .federation_attestations
+            .retain(|a| a.attestation_id != attestation_id);
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
     /// validate against the closed cohort_scope set, stamp it alongside the
     /// re-signed envelope, and recompute `persist_row_hash`.
@@ -8076,6 +8180,68 @@ mod accord_tests {
             &origin, &peer, "mem649",
         )
         .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+    /// the STORED envelope: strip the #598 instants and the #643 mirror, exactly
+    /// as a v30 writer would have left it.
+    ///
+    /// No production door can do this (both v31 gates refuse the shape), so the
+    /// seam has to reach the storage directly — which is why it lives here,
+    /// beside the private `State`, rather than on the trait.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[async_trait::async_trait]
+    impl crate::federation::migration::test_support::LegacyRowInstaller for MemoryBackend {
+        async fn downgrade_to_v30(&self, attestation_id: &str) {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .expect("downgrade_to_v30: row must exist");
+            row.attestation_envelope =
+                crate::federation::migration::test_support::v30_envelope(&row.attestation_envelope);
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, memory arm.
+    /// Shared exercise body with sqlite + postgres; the peer is a second
+    /// `MemoryBackend`, i.e. a genuinely separate corpus.
+    ///
+    /// Feature-gated because the shared body seals rows through
+    /// `tier_ingest::test_support`, which is itself gated — the same shape as
+    /// `load_bearing_predicate_parity_memory_564`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn v31_migration_memory_650() {
+        let origin = MemoryBackend::new();
+        let peer = MemoryBackend::new();
+        crate::federation::migration::test_support::exercise_v31_migration(
+            &origin, &origin, &peer, "mem650",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
+    /// CYCLIC graph, memory arm. Shared exercise body with sqlite + postgres.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn load_bearing_closure_memory_650() {
+        let backend = MemoryBackend::new();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
+            &backend, "mem650c",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE MUTATION. Pure, so it runs on every
+    /// backend leg: disable the fold (replay the interim states) and the
+    /// withdrawn grant flips from `Purge` to `Restamp` — i.e. it is re-minted
+    /// as a valid, freshly-signed, peer-admissible v31 row.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn the_v31_fold_is_load_bearing_650() {
+        crate::federation::migration::test_support::assert_the_fold_is_load_bearing();
     }
 
     /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
