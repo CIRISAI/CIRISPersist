@@ -1157,8 +1157,17 @@ mod ingest_gate_proof {
             .await
             .expect("get")
             .expect("row present");
+        // v31.0.0 (#647) — compared against the CANONICAL form of what was
+        // submitted, because `put_attestation` now stores canonical bytes.
+        // The claim under test is unchanged and unweakened: erasure must not
+        // move the stored envelope. Canonicalization is a property of INGEST,
+        // it happened once before this row was ever erased, and it is
+        // idempotent — so any drift observed here is still erasure's doing.
+        let mut expected_envelope = att.attestation_envelope.clone();
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the sealed envelope canonicalizes");
         assert_eq!(
-            stored.attestation_envelope, att.attestation_envelope,
+            stored.attestation_envelope, expected_envelope,
             "erasure must not have moved the stored envelope"
         );
         assert_eq!(
