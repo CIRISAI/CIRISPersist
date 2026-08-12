@@ -2994,6 +2994,9 @@ impl PostgresBackend {
                 row.consent_role.as_deref(),
             )
             .to_owned();
+            // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+            let registration_envelope_text =
+                pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
             client
                 .execute(
                     "INSERT INTO cirislens.federation_keys (\
@@ -3013,7 +3016,7 @@ impl PostgresBackend {
                         &row.identity_ref,
                         &row.valid_from,
                         &row.valid_until,
-                        &row.registration_envelope,
+                        &registration_envelope_text,
                         &original_content_hash,
                         &row.scrub_signature_classical,
                         &row.scrub_signature_pqc,
@@ -3131,6 +3134,9 @@ impl PostgresBackend {
         // marker (its OQ-1 overwrite surface is `set_consent_role`), not
         // registration content; an anchor-scrub upgrade must not clobber
         // an assigned role.
+        // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         let n = client
             .execute(
                 "UPDATE cirislens.federation_keys SET \
@@ -3149,7 +3155,7 @@ impl PostgresBackend {
                     &row.identity_ref,
                     &row.valid_from,
                     &row.valid_until,
-                    &row.registration_envelope,
+                    &registration_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -3271,6 +3277,9 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // Atomic swap guarded on the planned-against version's persist_row_hash;
         // `consent_role` stays out of the SET (operational marker).
+        // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         let n = client
             .execute(
                 "UPDATE cirislens.federation_keys SET \
@@ -3290,7 +3299,7 @@ impl PostgresBackend {
                     &row.identity_ref,
                     &row.valid_from,
                     &row.valid_until,
-                    &row.registration_envelope,
+                    &registration_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -3549,6 +3558,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| Error::Backend(e.to_string()))?;
         // No `scrub_key_id = key_id` WHERE condition — this path replaces an
         // ANCHORED row under the bundle-quorum authority verified above.
+        // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         let n = client
             .execute(
                 "UPDATE cirislens.federation_keys SET \
@@ -3567,7 +3579,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.identity_ref,
                     &row.valid_from,
                     &row.valid_until,
-                    &row.registration_envelope,
+                    &registration_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -3699,6 +3711,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             serde_json::to_string(&row.additional_scrubs).map_err(|e| {
                 crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
             })?;
+        // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -3718,7 +3733,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.identity_ref,
                     &row.valid_from,
                     &row.valid_until,
-                    &row.registration_envelope,
+                    &registration_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -4462,7 +4477,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                             "SELECT 1 AS one FROM cirislens.federation_attestations \
                              WHERE attestation_type = $1 \
                                AND attesting_key_id = $2 \
-                               AND attestation_envelope->>'{}' = $3 \
+                               AND attestation_envelope::jsonb->>'{}' = $3 \
                              LIMIT 1",
                             crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
                         ),
@@ -4654,6 +4669,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 .collect(),
         );
         let withdraws_admission_rule: Option<i16> = row.withdraws_admission_rule.map(|v| v as i16);
+        // v30.13.0 (#644) — attestation_envelope is TEXT since V122
+        // (subject_key_ids stays JSONB: a persist-built projection, not signed
+        // producer bytes).
+        let attestation_envelope_text =
+            pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
         client
             .execute(
                 "INSERT INTO cirislens.federation_attestations (\
@@ -4672,7 +4692,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.weight,
                     &row.asserted_at,
                     &row.expires_at,
-                    &row.attestation_envelope,
+                    &attestation_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -5078,7 +5098,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE attestation_type = 'scores' AND tier = 'federation' \
-                    AND attestation_envelope -> 'evidence_refs' @> $1 \
+                    AND attestation_envelope::jsonb -> 'evidence_refs' @> $1 \
                  ORDER BY asserted_at DESC",
                 &[&needle],
             )
@@ -5149,6 +5169,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
 
+        // v30.13.0 (#644) — revocation_envelope is TEXT since V122.
+        let revocation_envelope_text =
+            pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
         client
             .execute(
                 "INSERT INTO cirislens.federation_revocations (\
@@ -5165,7 +5188,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.reason,
                     &row.revoked_at,
                     &row.effective_at,
-                    &row.revocation_envelope,
+                    &revocation_envelope_text,
                     &original_content_hash,
                     &row.scrub_signature_classical,
                     &row.scrub_signature_pqc,
@@ -5242,10 +5265,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ),
             None => (None, None),
         };
-        let signature_json = serde_json::to_value(&signature)
+        // v30.13.0 (#644) — the V102 trio is TEXT since V122: serialize here,
+        // exactly as the SQLite leg does, so both backends store the same bytes.
+        let signed_envelope_text = pg_envelope_text(&signed_envelope, "signed_envelope")?;
+        let signature_json = serde_json::to_string(&signature)
             .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
         let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_value(tb).map_err(|e| {
+            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
                 crate::federation::Error::Backend(format!("transport_binding: {e}"))
             })?),
             None => None,
@@ -5288,7 +5314,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &enc_x25519,
                     &enc_ml_kem,
                     &attesting_key_id,
-                    &signed_envelope,
+                    &signed_envelope_text,
                     &signature_json,
                     &transport_binding_json,
                 ],
@@ -5363,8 +5389,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ),
             None => (None, None),
         };
+        // v30.13.0 (#644) — transport_binding is TEXT since V122.
         let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_value(tb).map_err(|e| {
+            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
                 crate::federation::Error::Backend(format!("transport_binding: {e}"))
             })?),
             None => None,
@@ -6564,7 +6591,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } = revocation;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::json!(row.witness_set);
-        let signature_value = serde_json::to_value(&signature)
+        // v30.13.0 (#644) — the V103 pair is TEXT since V122 (witness_set stays
+        // JSONB: it is a persist-derived projection, not producer bytes).
+        let signed_envelope_text = pg_envelope_text(&signed_envelope, "signed_envelope")?;
+        let signature_value = serde_json::to_string(&signature)
             .map_err(|e| crate::federation::Error::Backend(format!("signature encode: {e}")))?;
         let client = self
             .get_client()
@@ -6586,7 +6616,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &witness,
                     &row.persist_row_hash,
                     &attesting_key_id,
-                    &signed_envelope,
+                    &signed_envelope_text,
                     &signature_value,
                 ],
             )
@@ -8013,7 +8043,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // constants (drift meant list_consent_revocations silently empty).
         let pred = format!(
             "((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
-                    OR (attestation_envelope->>'{dim}') LIKE '{rev}%')",
+                    OR (attestation_envelope::jsonb->>'{dim}') LIKE '{rev}%')",
             dim = crate::federation::envelope::paths::DIMENSION,
             rev = crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
         );
@@ -8107,6 +8137,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v30.13.0 (#644) — V071's signed_envelope is TEXT since V122.
+        let signed_envelope_text = pg_envelope_text(&row.signed_envelope, "signed_envelope")?;
         let client = self
             .get_client()
             .await
@@ -8131,7 +8163,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.asserted_at,
                     &row.valid_until,
                     &row.attesting_key_id,
-                    &row.signed_envelope,
+                    &signed_envelope_text,
                     &row.ed25519_signature_base64,
                     &row.mldsa65_signature_base64,
                     &row.withdrawn_at,
@@ -8176,6 +8208,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v30.13.0 (#644) — V071's signed_envelope is TEXT since V122.
+        let signed_envelope_text = pg_envelope_text(&row.signed_envelope, "signed_envelope")?;
         let client = self
             .get_client()
             .await
@@ -8198,7 +8232,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.asserted_at,
                     &row.valid_until,
                     &row.attesting_key_id,
-                    &row.signed_envelope,
+                    &signed_envelope_text,
                     &row.ed25519_signature_base64,
                     &row.mldsa65_signature_base64,
                     &row.withdrawn_at,
@@ -8256,6 +8290,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let threshold = signed.threshold as i32;
         let mut row = signed.partner_record;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v30.13.0 (#644) — V071's signed_envelope is TEXT since V122
+        // (steward_signatures stays JSONB: persist-serialized, not producer bytes).
+        let signed_envelope_text = pg_envelope_text(&row.signed_envelope, "signed_envelope")?;
         let revision = row.revision as i64;
         let deployment_limit = i64::from(row.deployment_limit);
         let offline_grace_hours = i64::from(row.offline_grace_hours);
@@ -8288,7 +8325,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.issued_at,
                     &row.expires_at,
                     &row.asserted_at,
-                    &row.signed_envelope,
+                    &signed_envelope_text,
                     &row.withdrawn_at,
                     &row.persist_row_hash,
                     &steward_sigs_value,
@@ -9226,6 +9263,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         let pqc_completed = row.pqc_completed_at;
+        // v30.13.0 (#644) — attestation_envelope is TEXT since V122.
+        let attestation_envelope_text =
+            pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
         // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
         // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
         // the column can hold the ids the genesis ceremony SIGNED
@@ -9247,7 +9287,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      additional_scrubs = '[]', cohort_scope = $10 \
                  WHERE attestation_id = $9 AND tier = 'local'",
                 &[
-                    &row.attestation_envelope,
+                    &attestation_envelope_text,
                     &och,
                     &scrub_signature_classical,
                     &pqc_owned,
@@ -9336,7 +9376,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
                    WHERE c.attesting_key_id = fa.attesting_key_id \
                      AND c.attestation_type IN ({}) \
-                     AND c.attestation_envelope->>'{}' = fa.attestation_id::text)",
+                     AND c.attestation_envelope::jsonb->>'{}' = fa.attestation_id::text)",
                 ph.join(","),
                 crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
             ));
@@ -9755,7 +9795,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let mk_err = crate::federation::Error::Backend;
                 Ok(crate::federation::HybridPendingRow {
                     id: row.safe_get_with("key_id", mk_err)?,
-                    envelope: row.safe_get_with("registration_envelope", mk_err)?,
+                    // v30.13.0 (#644) — TEXT since V122.
+                    envelope: pg_envelope_value(
+                        &row.safe_get_with::<String, _, _, _>("registration_envelope", mk_err)?,
+                        "registration_envelope",
+                    )?,
                     classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
                 })
             })
@@ -9789,7 +9833,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let mk_err = crate::federation::Error::Backend;
                 Ok(crate::federation::HybridPendingRow {
                     id: row.safe_get_with("attestation_id", mk_err)?,
-                    envelope: row.safe_get_with("attestation_envelope", mk_err)?,
+                    // v30.13.0 (#644) — TEXT since V122.
+                    envelope: pg_envelope_value(
+                        &row.safe_get_with::<String, _, _, _>("attestation_envelope", mk_err)?,
+                        "attestation_envelope",
+                    )?,
                     classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
                 })
             })
@@ -9823,7 +9871,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let mk_err = crate::federation::Error::Backend;
                 Ok(crate::federation::HybridPendingRow {
                     id: row.safe_get_with("revocation_id", mk_err)?,
-                    envelope: row.safe_get_with("revocation_envelope", mk_err)?,
+                    // v30.13.0 (#644) — TEXT since V122.
+                    envelope: pg_envelope_value(
+                        &row.safe_get_with::<String, _, _, _>("revocation_envelope", mk_err)?,
+                        "revocation_envelope",
+                    )?,
                     classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
                 })
             })
@@ -10309,6 +10361,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let consent_role_stored =
             crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
                 .to_owned();
+        // v30.13.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
         tx.execute(
             "INSERT INTO cirislens.federation_keys (\
                 key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -10327,7 +10382,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &key.identity_ref,
                 &key.valid_from,
                 &key.valid_until,
-                &key.registration_envelope,
+                &registration_envelope_text,
                 &original_content_hash,
                 &key.scrub_signature_classical,
                 &key.scrub_signature_pqc,
@@ -11018,7 +11073,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        let attestation_envelope_jsonb = attestation_row.attestation_envelope.clone();
+        // v30.13.0 (#644) — attestation_envelope is TEXT since V122. (Name kept
+        // at the bind site below; the container is what changed.)
+        let attestation_envelope_jsonb =
+            serde_json::to_string(&attestation_row.attestation_envelope).map_err(|e| {
+                crate::federation::BlobError::Backend(format!("attestation_envelope encode: {e}"))
+            })?;
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
 
@@ -12754,7 +12814,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                  WHERE w.attestation_type = $2 \
                    AND w.attesting_key_id = \
                        cirislens.federation_attestations.attesting_key_id \
-                   AND w.attestation_envelope->>'references_attestation_id' = \
+                   AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
                        cirislens.federation_attestations.attestation_id::text \
                )"
         } else {
@@ -12767,7 +12827,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                  WHERE w.attestation_type = $2 \
                    AND w.attesting_key_id = \
                        cirislens.federation_attestations.attesting_key_id \
-                   AND w.attestation_envelope->>'references_attestation_id' = \
+                   AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
                        cirislens.federation_attestations.attestation_id::text \
                )"
         };
@@ -12786,10 +12846,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let mut holders: Vec<String> = Vec::with_capacity(rows.len());
         let mut seen = std::collections::HashSet::new();
         for row in rows {
-            let envelope: serde_json::Value = row.safe_get_with(
+            // v30.13.0 (#644) — TEXT since V122.
+            let envelope_text: String = row.safe_get_with(
                 "attestation_envelope",
                 crate::federation::BlobError::Backend,
             )?;
+            let envelope: serde_json::Value =
+                serde_json::from_str(&envelope_text).map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "attestation_envelope decode: {e}"
+                    ))
+                })?;
             let matches = envelope
                 .get("evidence_refs")
                 .and_then(|v| v.as_array())
@@ -12853,7 +12920,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                      WHERE w.attestation_type = $2 \
                        AND w.attesting_key_id = \
                            cirislens.federation_attestations.attesting_key_id \
-                       AND w.attestation_envelope->>'references_attestation_id' = \
+                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
                            cirislens.federation_attestations.attestation_id::text \
                    )",
                 &[
@@ -12869,10 +12936,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let mut holders: Vec<String> = Vec::with_capacity(rows.len());
         let mut seen = std::collections::HashSet::new();
         for row in rows {
-            let envelope: serde_json::Value = row.safe_get_with(
+            // v30.13.0 (#644) — TEXT since V122.
+            let envelope_text: String = row.safe_get_with(
                 "attestation_envelope",
                 crate::federation::BlobError::Backend,
             )?;
+            let envelope: serde_json::Value =
+                serde_json::from_str(&envelope_text).map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "attestation_envelope decode: {e}"
+                    ))
+                })?;
             let matches = envelope
                 .get("evidence_refs")
                 .and_then(|v| v.as_array())
@@ -12925,7 +12999,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                      SELECT 1 FROM cirislens.federation_attestations w \
                      WHERE w.attestation_type = $4 \
                        AND w.attesting_key_id = $1 \
-                       AND w.attestation_envelope->>'references_attestation_id' = \
+                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
                            cirislens.federation_attestations.attestation_id::text \
                    )",
                 &[
@@ -12943,10 +13017,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let mut out: Vec<[u8; 32]> = Vec::with_capacity(rows.len());
         let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for row in rows {
-            let envelope: serde_json::Value = row.safe_get_with(
+            // v30.13.0 (#644) — TEXT since V122.
+            let envelope_text: String = row.safe_get_with(
                 "attestation_envelope",
                 crate::federation::BlobError::Backend,
             )?;
+            let envelope: serde_json::Value =
+                serde_json::from_str(&envelope_text).map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "attestation_envelope decode: {e}"
+                    ))
+                })?;
             let sha_hex = envelope
                 .get("evidence_refs")
                 .and_then(|v| v.as_array())
@@ -14134,6 +14215,38 @@ where
     Ok(())
 }
 
+/// v30.13.0 (CIRISPersist#645) — serialize a signature-covered envelope for a
+/// **TEXT** column, byte-identically to the SQLite leg.
+///
+/// V122 turned every one of these columns from JSONB into TEXT. Binding a
+/// `serde_json::Value` straight at a JSONB column is what let Postgres reparse
+/// the envelope into `numeric` and hand back `100` where the producer wrote
+/// `1e+2` — measured, and it moved `wire_index::content_hash_of`. Going through
+/// `to_string` here is the whole fix on the write side: the bytes stored are
+/// the bytes `serde_json` produces, which is exactly what SQLite has always
+/// stored, so identical input yields identical rows on both backends.
+fn pg_envelope_text(
+    value: &serde_json::Value,
+    column: &str,
+) -> Result<String, crate::federation::Error> {
+    serde_json::to_string(value)
+        .map_err(|e| crate::federation::Error::Backend(format!("{column} encode: {e}")))
+}
+
+/// The read half of [`pg_envelope_text`] — parse a TEXT envelope column back
+/// into the `Value` the read surface returns. Tolerates the pre-V122 rendering
+/// (`jsonb::text` spacing and key order): the parse normalizes both, so a
+/// legacy row and a freshly written one yield the identical `Value` and hence
+/// the identical content hash. What it cannot restore is a number token the
+/// old JSONB column already rewrote — see V122.
+fn pg_envelope_value(
+    text: &str,
+    column: &str,
+) -> Result<serde_json::Value, crate::federation::Error> {
+    serde_json::from_str(text)
+        .map_err(|e| crate::federation::Error::Backend(format!("{column} decode: {e}")))
+}
+
 // v0.5.4 (CIRISPersist#28) — three federation directory row decoders
 // were infallible; bumped to Result<_, federation::Error> so a NULL in
 // any column surfaces as a typed Backend error instead of a panic.
@@ -14198,7 +14311,11 @@ fn pg_row_to_key_record(
         identity_ref: row.safe_get_with("identity_ref", mk_err)?,
         valid_from: row.safe_get_with("valid_from", mk_err)?,
         valid_until: row.safe_get_with("valid_until", mk_err)?,
-        registration_envelope: row.safe_get_with("registration_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122, decoded through the shared parser.
+        registration_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("registration_envelope", mk_err)?,
+            "registration_envelope",
+        )?,
         original_content_hash: hex::encode(&original_content_hash),
         scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
         scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
@@ -14365,6 +14482,9 @@ impl PostgresBackend {
         // the id binds as itself. This site had a different `map_err` shape than
         // its eight siblings, which is exactly how one survives a sweep.
 
+        // v30.13.0 (#644) — attestation_envelope is TEXT since V122.
+        let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
         let tx = client
             .transaction()
             .await
@@ -14373,7 +14493,7 @@ impl PostgresBackend {
             tx.execute(
                 "DELETE FROM cirislens.federation_attestations \
                   WHERE attesting_key_id = $1 AND tier = 'local' \
-                    AND attestation_envelope->>'dimension' = $2",
+                    AND attestation_envelope::jsonb->>'dimension' = $2",
                 &[&attesting_key_id, &dimension],
             )
             .await
@@ -14398,7 +14518,7 @@ impl PostgresBackend {
                 &row.weight,
                 &row.asserted_at,
                 &row.expires_at,
-                &row.attestation_envelope,
+                &attestation_envelope_text,
                 &original_content_hash,
                 &row.scrub_signature_classical,
                 &row.scrub_signature_pqc,
@@ -14712,7 +14832,11 @@ fn pg_row_to_attestation(
         weight: row.safe_get_with("weight", mk_err)?,
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
         expires_at: row.safe_get_with("expires_at", mk_err)?,
-        attestation_envelope: row.safe_get_with("attestation_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122, decoded through the shared parser.
+        attestation_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("attestation_envelope", mk_err)?,
+            "attestation_envelope",
+        )?,
         original_content_hash: hex::encode(&original_content_hash),
         scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
         scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
@@ -14743,7 +14867,11 @@ fn pg_row_to_revocation(
         reason: row.safe_get_with("reason", mk_err)?,
         revoked_at: row.safe_get_with("revoked_at", mk_err)?,
         effective_at: row.safe_get_with("effective_at", mk_err)?,
-        revocation_envelope: row.safe_get_with("revocation_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122, decoded through the shared parser.
+        revocation_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("revocation_envelope", mk_err)?,
+            "revocation_envelope",
+        )?,
         original_content_hash: hex::encode(&original_content_hash),
         scrub_signature_classical: row.safe_get_with("scrub_signature_classical", mk_err)?,
         scrub_signature_pqc: row.safe_get_with("scrub_signature_pqc", mk_err)?,
@@ -14782,12 +14910,15 @@ fn pg_row_to_identity_occurrence(
             }
             _ => None,
         },
-        // #418 — nullable JSONB (grandfathered rows are NULL).
+        // #418 — nullable (grandfathered rows are NULL). v30.13.0 (#644): TEXT
+        // since V122, so this parses rather than reparsing a JSONB round-trip.
         transport_binding: {
-            let tb: Option<serde_json::Value> = row.safe_get_with("transport_binding", mk_err)?;
-            tb.map(serde_json::from_value).transpose().map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding decode: {e}"))
-            })?
+            let tb: Option<String> = row.safe_get_with("transport_binding", mk_err)?;
+            tb.map(|t| serde_json::from_str(&t))
+                .transpose()
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("transport_binding decode: {e}"))
+                })?
         },
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
@@ -14804,9 +14935,13 @@ fn pg_row_to_signed_identity_occurrence(
 ) -> Result<crate::federation::SignedIdentityOccurrence, crate::federation::Error> {
     let mk_err = crate::federation::Error::Backend;
     let attesting_key_id: String = row.safe_get_with("attesting_key_id", mk_err)?;
-    let signed_envelope: serde_json::Value = row.safe_get_with("signed_envelope", mk_err)?;
-    let signature_value: serde_json::Value = row.safe_get_with("signature", mk_err)?;
-    let signature = serde_json::from_value(signature_value)
+    // v30.13.0 (#644) — the V102 trio is TEXT since V122.
+    let signed_envelope = pg_envelope_value(
+        &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+        "signed_envelope",
+    )?;
+    let signature_text: String = row.safe_get_with("signature", mk_err)?;
+    let signature = serde_json::from_str(&signature_text)
         .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?;
     let identity_occurrence = pg_row_to_identity_occurrence(row)?;
     Ok(crate::federation::SignedIdentityOccurrence {
@@ -15045,9 +15180,13 @@ fn pg_row_to_signed_identity_occurrence_revocation(
 ) -> Result<crate::federation::SignedIdentityOccurrenceRevocation, crate::federation::Error> {
     let mk_err = crate::federation::Error::Backend;
     let attesting_key_id: String = row.safe_get_with("attesting_key_id", mk_err)?;
-    let signed_envelope: serde_json::Value = row.safe_get_with("signed_envelope", mk_err)?;
-    let signature_value: serde_json::Value = row.safe_get_with("signature", mk_err)?;
-    let signature = serde_json::from_value(signature_value)
+    // v30.13.0 (#644) — the V103 pair is TEXT since V122.
+    let signed_envelope = pg_envelope_value(
+        &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+        "signed_envelope",
+    )?;
+    let signature_text: String = row.safe_get_with("signature", mk_err)?;
+    let signature = serde_json::from_str(&signature_text)
         .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?;
     let identity_occurrence_revocation = pg_row_to_identity_occurrence_revocation(row)?;
     Ok(crate::federation::SignedIdentityOccurrenceRevocation {
@@ -15151,7 +15290,11 @@ fn pg_row_to_organization(
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
         valid_until: row.safe_get_with("valid_until", mk_err)?,
         attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
-        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122.
+        signed_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+            "signed_envelope",
+        )?,
         ed25519_signature_base64: row.safe_get_with("ed25519_signature_base64", mk_err)?,
         mldsa65_signature_base64: row.safe_get_with("mldsa65_signature_base64", mk_err)?,
         withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
@@ -15173,7 +15316,11 @@ fn pg_row_to_org_membership(
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
         valid_until: row.safe_get_with("valid_until", mk_err)?,
         attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
-        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122.
+        signed_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+            "signed_envelope",
+        )?,
         ed25519_signature_base64: row.safe_get_with("ed25519_signature_base64", mk_err)?,
         mldsa65_signature_base64: row.safe_get_with("mldsa65_signature_base64", mk_err)?,
         withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
@@ -15204,7 +15351,11 @@ fn pg_row_to_partner_record(
         issued_at: row.safe_get_with("issued_at", mk_err)?,
         expires_at: row.safe_get_with("expires_at", mk_err)?,
         asserted_at: row.safe_get_with("asserted_at", mk_err)?,
-        signed_envelope: row.safe_get_with("signed_envelope", mk_err)?,
+        // v30.13.0 (#644) — TEXT since V122.
+        signed_envelope: pg_envelope_value(
+            &row.safe_get_with::<String, _, _, _>("signed_envelope", mk_err)?,
+            "signed_envelope",
+        )?,
         withdrawn_at: row.safe_get_with("withdrawn_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
@@ -17402,7 +17553,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     .replace('_', "\\_");
                 params.push(Box::new(format!("{esc}%")));
                 ors.push(format!(
-                    "attestation_envelope->>'dimension' LIKE ${}",
+                    "attestation_envelope::jsonb->>'dimension' LIKE ${}",
                     params.len()
                 ));
             }
@@ -17416,7 +17567,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         if let Some(d) = &filter.dimension_exact {
             params.push(Box::new(d.clone()));
             where_parts.push(format!(
-                "attestation_envelope->>'dimension' = ${}",
+                "attestation_envelope::jsonb->>'dimension' = ${}",
                 params.len()
             ));
         }
@@ -35462,7 +35613,13 @@ mod tests {
             let backend = &backend;
             async move {
                 let client = backend.get_client().await.unwrap();
-                let env = serde_json::json!({"id": id.to_string(), "dimension": dim, "score": 1.0});
+                // v30.13.0 (#644) — attestation_envelope is TEXT since V122, so
+                // this raw-SQL fixture binds the serialized form like the real
+                // write path does.
+                let env = serde_json::to_string(
+                    &serde_json::json!({"id": id.to_string(), "dimension": dim, "score": 1.0}),
+                )
+                .unwrap();
                 let empty: Vec<u8> = Vec::new();
                 let asserted = "2026-05-01T00:00:00Z"
                     .parse::<chrono::DateTime<chrono::Utc>>()
@@ -37188,7 +37345,8 @@ mod tests {
                         &owner2,
                         &node,
                         &ts_stamp,
-                        &anomaly.attestation_envelope,
+                        // v30.13.0 (#644) — TEXT since V122.
+                        &serde_json::to_string(&anomaly.attestation_envelope).unwrap(),
                         &hash_bytes,
                     ],
                 )
@@ -38453,5 +38611,100 @@ mod tests {
             .unwrap()
             .expect("rebuild_signed_wire_index must reindex the row");
         assert_eq!(rehit, expected_bytes);
+    }
+
+    /// v30.13.0 (CIRISPersist#645) — the postgres leg of the shared
+    /// envelope byte-exactness witness (see
+    /// `sqlite::tests::envelope_bytes_round_trip_sqlite_644`). Both legs call
+    /// the SAME
+    /// `envelope_bytes::test_support::exercise_envelope_byte_exactness` body.
+    ///
+    /// This is THE leg that reds on the defect: before V122 these columns were
+    /// JSONB here and TEXT on SQLite, so the SQLite leg passed while Postgres
+    /// silently rewrote the producer's number tokens and moved
+    /// `wire_index::content_hash_of`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn envelope_bytes_round_trip_postgres_644() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::envelope_bytes::test_support::exercise_envelope_byte_exactness(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#645) — **every column V122 converted is `text`.**
+    ///
+    /// The round-trip witness above covers three of the eleven planes end to
+    /// end; the other eight (the operational trio, the V102 occurrence trio,
+    /// the V103 revocation pair) need multi-party ceremonies to reach through a
+    /// real put path. This gate covers ALL eleven by asking Postgres what the
+    /// column type actually is — which is precisely the condition that broke:
+    /// `jsonb` reds here, `text` passes.
+    ///
+    /// Exhaustive by construction: the list below IS the migration's scope, so
+    /// a column dropped from V122 without being dropped here fails loudly
+    /// rather than quietly narrowing the guarantee.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn every_v122_envelope_column_is_text_postgres_644() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let client = backend.get_client().await.expect("client");
+
+        const COLUMNS: &[(&str, &str)] = &[
+            ("federation_keys", "registration_envelope"),
+            ("federation_attestations", "attestation_envelope"),
+            ("federation_revocations", "revocation_envelope"),
+            ("federation_organizations", "signed_envelope"),
+            ("federation_org_memberships", "signed_envelope"),
+            ("federation_partner_records", "signed_envelope"),
+            ("federation_identity_occurrences", "signed_envelope"),
+            ("federation_identity_occurrences", "signature"),
+            ("federation_identity_occurrences", "transport_binding"),
+            (
+                "federation_identity_occurrence_revocations",
+                "signed_envelope",
+            ),
+            ("federation_identity_occurrence_revocations", "signature"),
+        ];
+
+        let mut offenders = Vec::new();
+        for (table, column) in COLUMNS {
+            let row = client
+                .query_opt(
+                    "SELECT data_type FROM information_schema.columns \
+                     WHERE table_schema = 'cirislens' AND table_name = $1 AND column_name = $2",
+                    &[table, column],
+                )
+                .await
+                .expect("information_schema query")
+                .unwrap_or_else(|| panic!("cirislens.{table}.{column} does not exist"));
+            let data_type: String = row
+                .safe_get_with("data_type", crate::federation::Error::Backend)
+                .expect("information_schema.data_type decodes");
+            if data_type != "text" {
+                offenders.push(format!("  cirislens.{table}.{column} is {data_type}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a signature-covered envelope column is not TEXT (CIRISPersist#645 / V122). JSONB \
+             reparses numbers into `numeric` and drops exponent notation (1e+2 -> 100), which \
+             rewrites the bytes `wire_index::content_hash_of` hashes — measured, and it moved \
+             the hash. SQLite stores all of these as TEXT; a JSONB column here is a backend \
+             divergence in the bytes we re-publish:\n{}",
+            offenders.join("\n")
+        );
     }
 }
