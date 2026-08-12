@@ -3413,6 +3413,16 @@ mod tests {
         //       admits; a second from the SAME holder whose window opens before
         //       the first closes does not. "The emergency path must not become
         //       the government."
+        // v31.0.0 (CIRISPersist#598) — this window CLOSES two minutes from
+        // `now`, not 24 hours from it, and that is forced rather than
+        // stylistic. `em3` below has to open AFTER it closes while still being
+        // a row the write door will accept, and the door now refuses any
+        // `asserted_at` more than `DEFAULT_MAX_TOUCH_SKEW` (5 minutes) into the
+        // future. The whole em1/em2/em3 chronology therefore lives inside that
+        // tolerance. Nothing about what the three rows PROVE changed: the
+        // back-to-back rule is a purely relative comparison
+        // (`prior.valid_until > row.asserted_at`), so compressing the scale
+        // leaves it measuring exactly what it did.
         let em1 = signed_config_row(
             &root_a,
             &root_a,
@@ -3420,7 +3430,7 @@ mod tests {
             50,
             MeshConfigForm::Emergency,
             now - Duration::hours(2),
-            Some(now + Duration::hours(24)),
+            Some(now + Duration::minutes(2)),
             None,
             "att-deleg",
         );
@@ -3449,13 +3459,22 @@ mod tests {
         );
         // The same holder CAN act again once the first window has closed —
         // the ban is on CHAINING, not on ever acting twice.
+        //
+        // Still FUTURE-DATED relative to the fold's `now`, which is the second
+        // job this row does (see the `AntientropyPageLimit` assertion at the
+        // end): it must be admitted and then NOT counted as live. Four minutes
+        // rather than 25 hours because #598's skew guard is the outer bound on
+        // how far ahead any row may be dated at all — and note which direction
+        // elapsed test time pushes this: wall-clock advances TOWARD the
+        // instant, so a slow run makes the write door happier, never less so,
+        // while the fold compares against the captured `now` and is unaffected.
         let em3 = signed_config_row(
             &root_a,
             &root_a,
             K::AntientropyPageLimit,
             40,
             MeshConfigForm::Emergency,
-            now + Duration::hours(25),
+            now + Duration::minutes(4),
             Some(now + Duration::hours(48)),
             None,
             "att-deleg",
@@ -3535,9 +3554,13 @@ mod tests {
             50,
             "[{tag}] the live rows for this key are the emergency at 50 and the durable that \
              ratified it, also 50. The tighter emergency at 40 was admitted with an \
-             `asserted_at` 25 hours in the FUTURE, so it has not started — answering 40 means a \
-             future-dated row is being counted as live, which would let an author pre-schedule \
-             the mesh's configuration"
+             `asserted_at` FOUR MINUTES in the future, so it has not started — answering 40 \
+             means a future-dated row is being counted as live, which would let an author \
+             pre-schedule the mesh's configuration. Four minutes and not 25 hours because \
+             CIRISPersist#598's skew guard now caps how far ahead the write door will accept \
+             any row; the unbounded version of this claim is pinned on the pure fold by \
+             `ttl_expired_rows_drop_at_read_time_and_future_rows_have_not_started`, which no \
+             write door constrains"
         );
         // Nothing the stranger root said reaches this node.
         assert!(

@@ -1607,6 +1607,15 @@ pub(crate) mod test_support {
         let binding_id = uuid::Uuid::new_v4().to_string();
         let mut binding = ts::owner_binding_attestation(&binding_id, &owner, &node);
         binding.asserted_at = now - Duration::days(400);
+        // v31.0.0 (CIRISPersist#598) — RE-SEAL. `owner_binding_attestation`
+        // hands back a sealed row and this fixture then back-dates it by 400
+        // days, which is the "construct signed bytes, then mutate the row"
+        // shape the binding gate exists to refuse. The back-dating is the
+        // point of the fixture (rc3 needs the binding OUTSIDE the abandonment
+        // window), so the instant has to move — and moving it means re-signing,
+        // not writing past the signature. `scrub_timestamp` is copied AFTER,
+        // because the seal truncates `asserted_at` to the substrate resolution.
+        crate::federation::tier_ingest::test_support::reseal(&mut binding);
         binding.scrub_timestamp = binding.asserted_at;
         store(dir, &binding).await.expect("incumbent binding");
         let stored_binding = dir

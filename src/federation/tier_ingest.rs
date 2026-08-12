@@ -661,9 +661,15 @@ pub(crate) mod test_support {
     /// projection the gate compares against), envelope canonicalized, hash and
     /// both signature halves filled in.
     ///
-    /// Deliberately does NOT touch `asserted_at` / `expires_at`: the #598
-    /// instant binding is a separate property with its own witnesses, and a
-    /// helper that silently satisfied it would disarm them.
+    /// v31.0.0 (CIRISPersist#598) — **also stamps `asserted_at` /
+    /// `expires_at`.** It did not, when the #598 gate ran on `consent:state:*`
+    /// only and the instants were one dimension's property; the gate now binds
+    /// them on EVERY row, so a seal that left them out would produce a row
+    /// this substrate's own put door refuses — a fixture corpus certifying a
+    /// placement no host can write. The witnesses that measure the binding
+    /// itself are therefore NOT fixtures that forgot to seal (that failure
+    /// mode is indistinguishable from a stale fixture); they build the
+    /// divergence deliberately, AFTER sealing.
     pub fn seal_row(signing_key_id: &str, mut row: Attestation) -> Attestation {
         seal_row_in_place(signing_key_id, &mut row);
         row
@@ -681,34 +687,12 @@ pub(crate) mod test_support {
         // on every dimension, so a row sealed without them is one this
         // substrate's own put door refuses.
         //
-        // Truncating the columns first mirrors `stamp_and_canonicalize`, which
-        // truncates before it stamps: fixtures build instants from
-        // `Utc::now()`, whose nanoseconds postgres TIMESTAMPTZ cannot store,
-        // and the gate REFUSES sub-microsecond rather than rounding (see
-        // CONSENT_INSTANT_RESOLUTION_NANOS for why). Truncating here — where
-        // the signed twin is minted — keeps the column and its twin equal by
-        // construction instead of by the caller remembering.
-        row.asserted_at =
-            crate::federation::admission::truncate_to_substrate_resolution(row.asserted_at);
-        row.expires_at = row
-            .expires_at
-            .map(crate::federation::admission::truncate_to_substrate_resolution);
-        row.attestation_envelope[paths::ASSERTED_AT] =
-            serde_json::Value::String(row.asserted_at.to_rfc3339());
-        match row.expires_at {
-            // Bound in BOTH directions: envelope absent <=> column None. A
-            // stale `expires_at` left behind by a mutation would be refused,
-            // which is correct but unhelpful, so the seal clears it.
-            None => {
-                if let Some(obj) = row.attestation_envelope.as_object_mut() {
-                    obj.remove(paths::EXPIRES_AT);
-                }
-            }
-            Some(t) => {
-                row.attestation_envelope[paths::EXPIRES_AT] =
-                    serde_json::Value::String(t.to_rfc3339());
-            }
-        }
+        // Through `envelope::stamp_signed_instants` — the SAME function the
+        // production local-write door stamps with — so the fixture corpus
+        // cannot certify a placement no host writes. It truncates the columns
+        // before mirroring them and clears `expires_at` in both directions;
+        // see its doc for why each of those is load-bearing.
+        crate::federation::envelope::stamp_signed_instants(row).expect("envelope is an object");
         let mirror = crate::federation::envelope::RowMirror::of(row).expect("finite weight");
         row.attestation_envelope[paths::ROW] =
             serde_json::to_value(&mirror).expect("RowMirror serializes");

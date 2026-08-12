@@ -1799,55 +1799,21 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     // attests it itself no longer holds the bytes (a self-revocation).
     let signer_key_id = signer.derived_key_id();
 
-    let mut envelope = crate::federation::withdraws_attestation_envelope(
+    let envelope = crate::federation::withdraws_attestation_envelope(
         &prior.attestation_id,
         &prior.attestation_type,
     );
-    // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, stamped BEFORE the
-    // bytes are signed. This helper hand-rolls the emit recipe (it predates
-    // `attestation_emit`), so it also has to hand-roll the stamp — and the row
-    // id has to be minted HERE rather than at the struct literal below, because
-    // it is now signed material. Without this, persist's own eviction sweeper
-    // emits rows its own put-gate refuses.
+    // v31.0.0 (#643/#598) — the row is ASSEMBLED FIRST, then stamped, then
+    // signed. This helper hand-rolls the emit recipe (it predates
+    // `attestation_emit`), and the two bindings are both over material the
+    // signature covers, so the order is forced: build → stamp → canonicalize →
+    // sign. Without it persist's own eviction sweeper emits rows its own
+    // put-gate refuses.
+    //
+    // `attestation_id` is minted here rather than at the literal because it is
+    // signed material — the mirror carries it.
     let attestation_id = uuid::Uuid::new_v4().to_string();
-    envelope
-        .as_object_mut()
-        .expect("withdraws_attestation_envelope builds an object")
-        .insert(
-            crate::federation::envelope::paths::ROW.to_owned(),
-            serde_json::json!({
-                "attestation_id": attestation_id,
-                "attesting_key_id": signer_key_id,
-                "attested_key_id": signer_key_id,
-                "attestation_type": crate::federation::types::attestation_type::WITHDRAWS,
-                "subject_key_ids": [],
-                "cohort_scope": crate::federation::types::cohort_scope::FEDERATION,
-            }),
-        );
-    let envelope = envelope;
-    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
-    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
-    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
-    // which the gate's ceg_produce_canonicalize would not match).
-    let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-        .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
-    let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
-    // federation-tier withdraws carries the PQC half the ingest gate
-    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
-    // CANNOT emit a conformant federation-tier withdraws — surface that
-    // honestly (no classical-only fallback / silent skip / local
-    // downgrade).
-    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
-        BlobError::Backend(format!(
-            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
-             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-        ))
-    })?;
-    let scrub_signature_classical = B64.encode(&sig.classical.signature);
-    let scrub_signature_pqc = B64.encode(&sig.pqc.signature);
-
-    let row = crate::federation::Attestation {
+    let mut row = crate::federation::Attestation {
         attestation_id,
         attesting_key_id: signer_key_id.to_owned(),
         // The withdraws row's FK target is `signer_key_id`: the host
@@ -1859,9 +1825,10 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         asserted_at: now,
         expires_at: None,
         attestation_envelope: envelope,
-        original_content_hash,
-        scrub_signature_classical,
-        scrub_signature_pqc: Some(scrub_signature_pqc),
+        // Filled in below, once there are bytes to sign.
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
         scrub_key_id: signer_key_id.to_owned(),
         scrub_timestamp: now,
         pqc_completed_at: Some(now),
@@ -1876,6 +1843,52 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         promoted_at: None,
         additional_scrubs: Vec::new(),
     };
+
+    // v31.0.0 (CIRISPersist#598) — THE SIGNED INSTANTS, before the signature.
+    // Through the shared placement rather than a fourth hand-rolled copy; it
+    // also TRUNCATES `asserted_at` to the substrate resolution, which is why
+    // the two derived timestamps are re-read from the row afterwards instead of
+    // from `now` — a row whose three instants differ in their last nanoseconds
+    // is one the postgres arm stores differently from the sqlite arm.
+    crate::federation::envelope::stamp_signed_instants(&mut row)
+        .map_err(|e| BlobError::Backend(format!("withdraws instant stamp: {e}")))?;
+    row.scrub_timestamp = row.asserted_at;
+    row.pqc_completed_at = Some(row.asserted_at);
+    // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, from
+    // `RowMirror::of` and NOT a hand-written `json!` literal.
+    //
+    // The literal that stood here was correct only by coincidence.
+    // [`RowMirror`] is `deny_unknown_fields` over a CLOSED member set, so the
+    // next column bound into it would have left this one site silently
+    // stamping a mirror missing that field — #643 re-opened at exactly one
+    // door, and the door persist's own eviction sweeper writes through.
+    // `RowMirror::of` is the one projection the GATE compares against, so
+    // there is now nothing here that can drift from it.
+    crate::federation::envelope::RowMirror::stamp_row(&mut row)
+        .map_err(|e| BlobError::Backend(format!("withdraws row mirror stamp: {e}")))?;
+
+    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
+    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
+    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
+    // which the gate's ceg_produce_canonicalize would not match).
+    let canonical_bytes =
+        crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+            .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
+    row.original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
+    // federation-tier withdraws carries the PQC half the ingest gate
+    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
+    // CANNOT emit a conformant federation-tier withdraws — surface that
+    // honestly (no classical-only fallback / silent skip / local
+    // downgrade).
+    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
+        BlobError::Backend(format!(
+            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
+             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+        ))
+    })?;
+    row.scrub_signature_classical = B64.encode(&sig.classical.signature);
+    row.scrub_signature_pqc = Some(B64.encode(&sig.pqc.signature));
 
     directory
         .put_attestation(crate::federation::SignedAttestation { attestation: row })

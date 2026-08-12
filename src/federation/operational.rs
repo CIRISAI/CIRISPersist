@@ -3390,6 +3390,12 @@ pub mod test_support {
             }),
         );
         edge.expires_at = expires_at;
+        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH
+        // directions, so setting the COLUMN after the seal is exactly the
+        // divergence the gate refuses. Re-seal: this helper's whole subject is
+        // the TTL min-fold, and an edge whose expiry the signature does not
+        // cover is an unsigned mute button on the bound it is testing.
+        crate::federation::tier_ingest::test_support::reseal(&mut edge);
         directory
             .put_attestation(crate::federation::SignedAttestation { attestation: edge })
             .await?;
