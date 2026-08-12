@@ -675,8 +675,42 @@ pub(crate) mod test_support {
     /// helpers delegate here, so "re-sign after mutating" and "re-stamp the
     /// mirror after mutating" are ONE step that cannot be half-done.
     pub fn seal_row_in_place(signing_key_id: &str, row: &mut Attestation) {
+        use crate::federation::envelope::paths;
+        // v31.0.0 (CIRISPersist#598) — the INSTANTS are part of the seal, not a
+        // separate step a fixture can forget. `check_instant_binding` now runs
+        // on every dimension, so a row sealed without them is one this
+        // substrate's own put door refuses.
+        //
+        // Truncating the columns first mirrors `stamp_and_canonicalize`, which
+        // truncates before it stamps: fixtures build instants from
+        // `Utc::now()`, whose nanoseconds postgres TIMESTAMPTZ cannot store,
+        // and the gate REFUSES sub-microsecond rather than rounding (see
+        // CONSENT_INSTANT_RESOLUTION_NANOS for why). Truncating here — where
+        // the signed twin is minted — keeps the column and its twin equal by
+        // construction instead of by the caller remembering.
+        row.asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(row.asserted_at);
+        row.expires_at = row
+            .expires_at
+            .map(crate::federation::admission::truncate_to_substrate_resolution);
+        row.attestation_envelope[paths::ASSERTED_AT] =
+            serde_json::Value::String(row.asserted_at.to_rfc3339());
+        match row.expires_at {
+            // Bound in BOTH directions: envelope absent <=> column None. A
+            // stale `expires_at` left behind by a mutation would be refused,
+            // which is correct but unhelpful, so the seal clears it.
+            None => {
+                if let Some(obj) = row.attestation_envelope.as_object_mut() {
+                    obj.remove(paths::EXPIRES_AT);
+                }
+            }
+            Some(t) => {
+                row.attestation_envelope[paths::EXPIRES_AT] =
+                    serde_json::Value::String(t.to_rfc3339());
+            }
+        }
         let mirror = crate::federation::envelope::RowMirror::of(row).expect("finite weight");
-        row.attestation_envelope[crate::federation::envelope::paths::ROW] =
+        row.attestation_envelope[paths::ROW] =
             serde_json::to_value(&mirror).expect("RowMirror serializes");
         let (och, sc, sp) = sign_envelope(signing_key_id, &row.attestation_envelope);
         row.original_content_hash = och;
