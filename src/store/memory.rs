@@ -15961,6 +15961,20 @@ mod tests {
         .await;
     }
 
+    /// v30.12.0 (CIRISPersist#634) — the MEMORY leg: every wire ref a
+    /// subject read returns must resolve through the content-hash fetch path.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn wire_refs_for_subject_resolve_memory_634() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
+            &backend,
+            "memory-634",
+        )
+        .await;
+    }
+
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the MEMORY leg of the shared
     /// namespace-registration witness. Memory tolerates what sqlite/postgres
     /// reject, which is exactly why it gets its own leg: an R2 refusal that

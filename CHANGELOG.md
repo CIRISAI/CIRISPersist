@@ -5,6 +5,111 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.12.0] - 2026-08-12
+
+### Fixed — Bench had not succeeded in 100 runs, and a timeout reports as "cancelled" (#639)
+
+Zero successes in the last 100 `Bench` runs (88 `cancelled`, 11 `failure`) back
+to 2026-07-26. Invisible because GitHub reports a `timeout-minutes` kill as
+**`cancelled`**, which reads as benign beside a red X.
+
+The 45-minute budget went: **10m44s** setup, **19m07s** release compiling,
+15m27s left for twelve benches. **Six distinct feature sets meant six full
+release rebuilds** — and calibration ran on a seventh (default). The workflow's
+own comment said *"Observed ~14 min locally; headroom for the runner"*; that
+counted bench RUNTIME and never counted compiling the crate six times cold.
+
+`ciriscache` cost **8m27s** and could not help: it restores the **dev/test**
+profile `target/`, benches build the **bench** profile, and cargo keys artifacts
+by profile. Its comment claimed it prevented cold-compiling the crypto graph. It
+never did.
+
+- one feature set, built once with `--no-run`, then per-bench invocations that
+  are cache hits (failure attribution preserved). Verified locally: clean build,
+  all 13 bench targets produced.
+- `ciriscache` step removed
+- `pull_request` trigger removed — the job books a ~45-minute slot on the
+  org-wide pool that CI queues against, for trend data that is a
+  per-release-point concern. cron + push-to-main + `workflow_dispatch` remain.
+
+~30 minutes of overhead becomes ~6. Checked rather than assumed:
+`sequence_contention`'s `#[cfg(feature = "postgres")]` arms, not compiled
+before, self-skip on `CIRIS_PERSIST_TEST_PG_URL` being unset — which its own doc
+names as "the case on bench.yml's runner".
+
+Collateral: the gh-pages trend chart the README advertises "per commit" has been
+frozen at 2026-07-24, because `Publish to gh-pages trend chart` is skipped on
+every timeout.
+
+### Added — `is_subject_retainable(dimension)` (#635)
+
+May the DATA-SUBJECT of a row carrying this dimension retain a copy on its own
+node? `true` only where the subject is NECESSARILY the author.
+
+Serving a peer-authored score *about* a subject onto the node where that subject
+is the **sole writer** conflates read-copy with write-authority — the shape that
+produced the **G2 self-revocation hole**. CIRISEdge carved it out with a local
+prefix denylist (`capacity:` / `capacity_assurance:` / `moderation:`), which
+re-opens G2 the moment a scoring family lands persist-side and not edge-side.
+The taxonomy is persist's, so the predicate is persist's.
+
+**An allowlist, not a denylist.** A denylist defaults a NEW family to
+retainable — the same drift, relocated into persist. Unclassified family,
+renamed family and unknown dimension all read `false`, matching
+`LoadBearing::treated_as_load_bearing`: only a proven `No` is a `No`.
+
+**The manifest is the alarm, not the authority.** `emit_authority` records
+authorship as PROSE — *"self-emission MANDATORY (attesting_key_id in
+subject_key_ids)"*, *"scored-by-canonical (reserved: attesting_key_id !=
+attested)"*. Deriving a security predicate by string-matching English is
+inference dressed as a rule, so the prose is read by a TEST that fails the build
+when the manifest gains a self-emission family the list does not name. That test
+can only ever ask for an addition; it can never silently make something
+retainable.
+
+It earned itself immediately: on its first run it caught three CC 3.4.3
+`substrate-self-report` families (`audit_chain:hash_continuity`,
+`corpus_health:n_eff_measurable`, `federation_directory:replication_lag`) that
+would have shipped missing.
+
+Not "is it a score" — `polarity` is present on 94 of 104 families, because in
+this taxonomy nearly everything is a score. The G2 hazard is authorship.
+
+### Added — `wire_index::wire_refs_for_subject` (#634)
+
+Every `(kind_token, content_hash, record_key)` the signed-wire index holds for a
+subject, computed from the same reads and the same `content_hash_of` the index
+write hooks use.
+
+Edge could not use `list_signed_records(kind, subject)`: it returns
+`serde_json::to_value(row)`, and with no `serde_json/preserve_order` in the
+workspace `to_value` SORTS keys, so its hash is not the wire-index hash. Edge
+therefore composed the per-kind subject reads and hashed the structs itself —
+correct only while each backend's `_for` read serializes byte-identically to
+what its `_since` read hashed. That held; it was edge asserting a property about
+persist's serialization. Now persist asserts it, in one place, gated on all
+three backends.
+
+**Not a trait method.** #634 proposed one; `all_kind_hash_keys` is already
+written once against `&dyn FederationDirectory` precisely so "which kinds, which
+`record_key` shape" lives in one place, so this is its sibling — same guarantee,
+no 79th method across three backends.
+
+**The token is `EnvelopeKind`, not `ReplicatedKind`.** `ReplicatedKind::as_str`
+is `"key_record"`; `signed_wire_index.kind` and the `kind` argument of
+`lookup_signed_record_by_content_hash` are `"Key"`. Two vocabularies name these
+planes, and returning the one that does NOT key the index would leave every
+caller writing the same mapping, each free to get it wrong.
+
+Cost, honestly: four planes have a subject-scoped read; the Key plane has none,
+so it is filtered from the bulk read the index itself is built from. #634 hoped
+this would be cheaper than compose-and-rehash — for four planes it is the same
+work and for Key it is more. What is delivered is the byte-exactness guarantee
+moving into persist. `seq` is not returned: the index has no seq column.
+
+Mutation-tested: hashing the `to_value`-normalised form — the exact skew #634
+names — fails both the memory and sqlite legs.
+
 ## [30.11.0] - 2026-08-11
 
 ### Added — a canonical array over the duty scopes (#637)

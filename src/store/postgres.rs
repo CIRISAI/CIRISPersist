@@ -20946,6 +20946,24 @@ mod tests {
         .await;
     }
 
+    /// v30.12.0 (CIRISPersist#634) — the POSTGRES leg: every wire ref a subject
+    /// read returns must resolve through the content-hash fetch path.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn wire_refs_for_subject_resolve_postgres_634() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
+            &be,
+            &format!("pg-634-{}", uuid_like()),
+        )
+        .await;
+    }
+
     /// v30.8.0 (CIRISPersist#596 item 1) — give `revoker` the `slash` authority
     /// that revoking SOMEONE ELSE'S key now requires. These fixtures test
     /// revocation MECHANICS, not who may revoke, so they get the authority they

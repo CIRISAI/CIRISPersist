@@ -22,16 +22,13 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
-    paths:
-      - 'src/ingest.rs'
-      - 'src/queue.rs'
-      - 'src/store/**'
-      - 'src/verify/**'
-      - 'src/scrub/**'
-      - 'benches/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+  # v30.12.0 (CIRISPersist#639) — the `pull_request` trigger is GONE.
+  # This job books a runner for the better part of an hour, and the org's
+  # slot pool is shared with every sibling repo; a persist PR that touched
+  # `Cargo.toml` took a slot away from the CI matrix that actually gates
+  # the merge. Trend data is a per-release-point concern, so push-to-main
+  # plus the weekly cron is the right cadence. `workflow_dispatch` covers
+  # the "I want to see this PR's numbers" case on demand.
 
 permissions:
   # benchmark-action needs `contents: write` to push to the
@@ -86,25 +83,22 @@ jobs:
           # miss the restore. Bump in lockstep with the toolchain file.
           toolchain: "1.97.0"
 
-      # CIRISCache (#316) — warm the substrate registry/target from the
-      # verify→persist layers so the bench build doesn't cold-compile the
-      # ML-DSA / ML-KEM / keyring / tokio-postgres graph every run. ubuntu ⇒
-      # PLAT=linux-x86_64. Restore-only (anonymous GHCR pull, no save). Runs
-      # BEFORE the criterion actions/cache below, which keeps the per-bench
-      # baseline + the bench's own incremental (wins on overlap).
-      - uses: ./.github/actions/ciriscache
-        with:
-          plat: linux-x86_64
+      # v30.12.0 (CIRISPersist#639) — the `ciriscache` restore is GONE, and its
+      # absence is the point. It cost **8m27s** per run and could not help:
+      # it restores the DEV/TEST-profile `target/` saved by ci.yml, while
+      # benches build the BENCH profile. Cargo keys artifacts by profile, so
+      # nothing in that blob was ever reusable here — the step's own comment
+      # claimed it stopped the bench "cold-compiling the ML-DSA / ML-KEM /
+      # keyring / tokio-postgres graph every run", and it never did.
+      # Registry and git are cached by the `actions/cache` step below, which
+      # is what actually made the downloads cheap.
 
       - name: Cache criterion baseline
         uses: actions/cache@v5
         with:
           # CIRISPersist#335 — cache ONLY the criterion baseline, NOT the
-          # full compiled `target/`. The heavy dep artifacts (ML-DSA /
-          # ML-KEM / keyring / tokio-postgres graph) are already warmed by
-          # the GHCR `ciriscache` restore above (which lives OUTSIDE the
-          # 10 GB GitHub-cache budget), so caching all of `target/` here
-          # was ~3 GB of pure redundancy — and its two branch-scoped copies
+          # full compiled `target/`. Caching all of `target/` here was ~3 GB
+          # of redundancy — its two branch-scoped copies
           # pushed the repo cache to 13.9 GB / 10 GB, LRU-evicting the small
           # vcpkg-OpenSSL (28 MB) + wheel `target/` blobs and forcing a
           # 382 s OpenSSL rebuild + cold wheel compiles every run. Scoping
@@ -162,8 +156,18 @@ jobs:
           # failure is the step's status (not `tee`'s) — see the attribution
           # note on the bench loop below.
           set -o pipefail
+          # ── ONE FEATURE SET, ONE BUILD (CIRISPersist#639) ────────────────
+          # Declared before calibration so the ENTIRE bench suite — anchor
+          # included — is one cargo fingerprint and therefore one release
+          # build. Running calibration on default features while the rest ran
+          # on five other sets made it a seventh distinct build.
+          BENCH_FEATURES="postgres,sqlite,secrets,cirislens_sequence,cirislens_occurrence"
+          echo "::group::build all benches once (features: ${BENCH_FEATURES})"
+          cargo bench --features "$BENCH_FEATURES" --no-run
+          echo "::endgroup::"
           echo "::group::bench calibration"
-          cargo bench --bench calibration -- --output-format bencher | tee calibration-output.txt
+          cargo bench --features "$BENCH_FEATURES" --bench calibration -- --output-format bencher \
+            | tee calibration-output.txt
           echo "::endgroup::"
           # v3.3.1 (CIRISPersist#122) — TWO calibration anchors now:
           # `splitmix64_10m` (CPU-bound) + `dram_random_walk_500k`
@@ -225,33 +229,57 @@ jobs:
           set -o pipefail
           : > bench-output-raw.txt
           failed_benches=""
+          # ── ONE FEATURE SET, ONE BUILD (CIRISPersist#639) ────────────────
+          # This loop used to pass a DIFFERENT `--features` per bench:
+          # postgres / default / sqlite / sqlite,cirislens_sequence /
+          # sqlite,cirislens_occurrence / secrets. Cargo fingerprints
+          # artifacts by feature set, so six distinct sets meant SIX full
+          # release rebuilds of the crate — measured at 17m29s of a 45-minute
+          # budget, on top of 10m44s of setup, leaving 15m27s for twelve
+          # benches. The job hit `timeout-minutes` and was killed. GitHub
+          # reports a timeout as `cancelled`, which reads as benign, so this
+          # went unnoticed for **100 consecutive runs** (88 timeouts, 11
+          # failures, zero successes, back to 2026-07-26) while the gh-pages
+          # trend chart the README advertises "per commit" sat frozen at
+          # 2026-07-24.
+          #
+          # The union is safe, and each exclusion was checked rather than
+          # assumed:
+          #   * `sequence_contention` has `#[cfg(feature = "postgres")]` arms
+          #     that were NOT compiled before. They are now — and they
+          #     self-skip on `CIRIS_PERSIST_TEST_PG_URL` being unset, which
+          #     its own doc comment already names as "the case on bench.yml's
+          #     runner (no Postgres service)".
+          #   * features are additive here; nothing declares a conflict, and
+          #     ci.yml's `core`/`lint` legs already compile wider unions.
+          #
+          # Built ONCE with `--no-run`, then each bench is invoked separately
+          # so a failure still names the bench that failed. Those invocations
+          # are cache hits on the same feature set, not rebuilds.
           run_bench() {
-            local features="$1" bench="$2"
-            echo "::group::bench ${bench} (features: ${features:-default})"
+            local bench="$1"
+            echo "::group::bench ${bench}"
             local rc=0
-            if [ -n "$features" ]; then
-              cargo bench --features "$features" --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
-            else
-              cargo bench --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
-            fi
+            cargo bench --features "$BENCH_FEATURES" --bench "$bench" -- --output-format bencher \
+              | tee -a bench-output-raw.txt || rc=$?
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
-              echo "::error title=bench failed::${bench} (features: ${features:-default}) failed to build or run (exit ${rc}) — see the '::group:: bench ${bench}' log above"
+              echo "::error title=bench failed::${bench} failed to build or run (exit ${rc}) — see the '::group:: bench ${bench}' log above"
               failed_benches="${failed_benches} ${bench}"
             fi
           }
-          run_bench "postgres" ingest_pipeline
-          run_bench "" canonicalize
-          run_bench "" sign
-          run_bench "" dedup_key
-          run_bench "postgres" queue
-          run_bench "sqlite,cirislens_sequence" sequence_contention
-          run_bench "sqlite" engine_cold_start
-          run_bench "sqlite" read_engine_analytics
-          run_bench "sqlite" scores_read
-          run_bench "secrets" secrets_crypto
-          run_bench "sqlite,cirislens_occurrence" occurrence_registry
-          run_bench "sqlite,cirislens_sequence" storage_floor
+          run_bench ingest_pipeline
+          run_bench canonicalize
+          run_bench sign
+          run_bench dedup_key
+          run_bench queue
+          run_bench sequence_contention
+          run_bench engine_cold_start
+          run_bench read_engine_analytics
+          run_bench scores_read
+          run_bench secrets_crypto
+          run_bench occurrence_registry
+          run_bench storage_floor
           if [ -n "${failed_benches}" ]; then
             echo "::error title=bench job failed::broken benches:${failed_benches}"
             exit 1

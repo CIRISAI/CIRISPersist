@@ -14665,6 +14665,103 @@ pub(crate) mod r2_test_support {
         }
     }
 
+    /// v30.12.0 (CIRISPersist#634) — every ref
+    /// [`wire_refs_for_subject`](crate::federation::wire_index::wire_refs_for_subject)
+    /// returns for a subject MUST resolve through
+    /// `lookup_signed_record_by_content_hash`.
+    ///
+    /// That is the whole guarantee edge is buying. Edge previously composed the
+    /// per-kind subject reads and hashed the structs itself, which held only
+    /// while each backend's `_for` read serialized byte-identically to what its
+    /// `_since` read hashed into the index. **That is a per-backend property**,
+    /// which is why this runs on all three rather than on memory alone — memory
+    /// reserializes from the same in-process struct and would agree with itself
+    /// no matter what sqlite and postgres did.
+    ///
+    /// A ref that does not resolve is the #634 skew, caught here instead of as
+    /// a `None` on a peer's fetch.
+    pub(crate) async fn exercise_wire_refs_for_subject_resolve(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use chrono::Timelike as _;
+
+        let subject = format!("wireref-subject-{tag}");
+        let author = format!("wireref-author-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &subject).await;
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &author).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id, "dimension": "trust:wireref:v1", "score": 1.0, "confidence": 0.9,
+        });
+        let (och, sc, sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&author, &envelope);
+        // Microsecond truncation for the same reason the rescope witness does
+        // it: postgres TIMESTAMPTZ drops nanoseconds, so a nanosecond-bearing
+        // fixture re-serializes to a different hash than the one indexed at
+        // write — a property of the FIXTURE, not the backend.
+        let now = chrono::Utc::now().with_nanosecond(0).expect("truncate");
+
+        let att = crate::federation::types::SignedAttestation {
+            attestation: crate::federation::Attestation {
+                attestation_id: id.clone(),
+                attesting_key_id: author.clone(),
+                attested_key_id: subject.clone(),
+                attestation_type: "scores".to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: author.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        };
+        dir.put_attestation(att)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] seed attestation must admit: {e}"));
+
+        let refs = crate::federation::wire_index::wire_refs_for_subject(dir, &subject)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] wire_refs_for_subject: {e}"));
+
+        // NON-VACUITY FIRST. An empty result resolves every ref it returns, so
+        // without this the assertion below passes on a function that does
+        // nothing — the exact shape of a check that cannot fail.
+        assert!(
+            refs.iter().any(|(k, _, _)| *k == "Attestation"),
+            "[{tag}] no Attestation ref for the seeded subject; got {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|(k, _, _)| *k == "Key"),
+            "[{tag}] no Key ref for the subject's own key record; got {refs:?}"
+        );
+
+        for (kind, content_hash, record_key) in &refs {
+            let served = dir
+                .lookup_signed_record_by_content_hash(kind, content_hash)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] lookup {kind}/{content_hash}: {e}"));
+            assert!(
+                served.is_some(),
+                "[{tag}] ref ({kind}, {content_hash}) does not resolve — the subject read and \
+                 the wire index disagree about this row's bytes (record_key {record_key}). \
+                 That is the #634 skew, and a peer asking for this exact ref would get None."
+            );
+        }
+    }
+
     pub(crate) async fn exercise_rescope_keeps_row_servable(
         dir: &dyn FederationDirectory,
         tag: &str,
