@@ -3039,7 +3039,7 @@ impl Engine {
             // CC#38 size discipline — oversize reassemblies take the
             // manifest form, same as the live mint.
             //
-            // v31.0.0 — and it inherits the live mint's stated residue with
+            // v31.0.0 (CIRISPersist#653) — and it inherits the live mint's caveat with
             // it: these are the PRODUCER's bytes, not the stored ones, which
             // also carry persist's own #643 mirror and #598 instants stamped
             // at the local write door. See
@@ -15074,16 +15074,28 @@ mod tests {
         .expect("genesis put_family");
 
         // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
-        // #502 E4 note: `supersede_family` writes via `supersede_group_row`, NOT
-        // the newly-gated `put_family` — the wrapper's authority fields are
-        // unused on this path (out of scope; the quorum authorization below is
-        // this path's OWN real authority check), so empty placeholders satisfy
-        // the type only.
+        //
+        // v31.0.0 (CIRISPersist#651) — this comment used to say that because
+        // `supersede_family` writes via `supersede_group_row` and not the
+        // gated `put_family`, "the wrapper's authority fields are unused on
+        // this path", so empty placeholders satisfied the type. That sentence
+        // WAS the hole, written down and accepted as intentional: supersede
+        // was a SECOND, ungated write door into `federation_families`,
+        // admitting a re-baselined roster, a new `consensus_protocol` and a
+        // new `family_name` on FK-existence alone.
+        //
+        // The `authorization` below never substituted for authorship. It is
+        // the membership-change JUSTIFICATION recorded on the superseded prior
+        // version — a note about why the change was made, not a proof of who
+        // made it. `supersede_family` now hybrid-verifies the wrapper exactly
+        // as `put_family` does, so the fixture seals it through the same
+        // helper the genesis write above uses.
         let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
         let new_version = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(5),
@@ -15092,10 +15104,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 Some(auth.clone()),
             )
             .await
@@ -15133,10 +15142,19 @@ mod tests {
         assert!(d.group_at(Cohort::Family, &fam, 9).await.unwrap().is_none());
 
         // supersede on an unknown group is rejected.
+        //
+        // v31.0.0 (CIRISPersist#651) — SIGNED, deliberately, even though the
+        // row is meant to be refused. This assertion is about the UNKNOWN-GROUP
+        // rule, and `supersede_family` now hybrid-verifies authorship first, so
+        // an unsigned wrapper would be refused for having no registered
+        // attester and this test would silently start measuring the authorship
+        // gate instead of the rule it was written for. Sealing it with a
+        // registered key keeps the refusal under test the intended one.
         let err = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -15145,10 +15163,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 None,
             )
             .await
