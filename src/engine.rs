@@ -9888,12 +9888,19 @@ mod tests {
         // stable across the flip — and asserting via the gate (not a
         // pinned canonicalizer) keeps the test honest to whatever the
         // produce epoch is.
-        let envelope = holds_bytes_attestation_envelope(&sha);
+        // v31.0.0 (CIRISPersist#652) — the identity is minted FIRST, because
+        // the envelope now binds it. `now` is truncated to the substrate
+        // resolution because the builder truncates before it stamps, and this
+        // test recomputes the expected hash from the same inputs the engine
+        // will use — an untruncated `now` here would hash a different instant
+        // than the one that gets signed.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let attestation_id = uuid::Uuid::new_v4();
+        let envelope =
+            holds_bytes_attestation_envelope(&sha, &signer_alias, &attestation_id.to_string(), now);
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
-
-        let now = chrono::Utc::now();
-        let attestation_id = uuid::Uuid::new_v4();
         engine
             .put_blob_signing(
                 &sha,
@@ -10336,12 +10343,17 @@ mod tests {
             media_type: Some("application/octet-stream".into()),
         };
 
-        let envelope = holds_bytes_attestation_envelope(&sha);
+        // v31.0.0 (CIRISPersist#652) — identity and instant are minted FIRST,
+        // because the envelope now binds them; `now` is truncated because the
+        // builder truncates before it stamps, so an untruncated value here
+        // would hash a different instant than the one that gets signed.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let attestation_id = uuid::Uuid::new_v4();
+        let envelope =
+            holds_bytes_attestation_envelope(&sha, &key_id, &attestation_id.to_string(), now);
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
-
-        let now = chrono::Utc::now();
-        let attestation_id = uuid::Uuid::new_v4();
         engine
             .put_blob_signing(
                 &sha,
@@ -10688,6 +10700,7 @@ mod tests {
                     scrub_signature_pqc: None,
                     scrub_key_id: peer_key.to_string(),
                     scrub_timestamp: chrono::Utc::now(),
+                    asserted_at: chrono::Utc::now(),
                 },
             )
             .await
