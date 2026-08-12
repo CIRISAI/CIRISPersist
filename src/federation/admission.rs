@@ -831,7 +831,7 @@ pub const MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN: &[(&str, &str, &str)] = &[
         "CC 3.3.12 — open vocabulary, producer-declared; and CC 3.4.14 R1 makes \
          the `generated`/`generated_modified` marking mandatory for EVERY \
          attester, which a `substrate_persist` gate refuses outright",
-        "the READ door (v30.13.0, CIRISPersist#612): \
+        "the READ door (v31.0.0, CIRISPersist#612): \
          `FederationDirectory::resolve_content_class_flag` folds the flag plane \
          with a deliberate asymmetry — any emitter may RAISE (withholding is the \
          safe error), but a withdrawal clears a flag its emitter did not raise \
@@ -2209,7 +2209,7 @@ pub async fn check_promotion_admission(
     // is precisely the sentence this arm turns into a check.
     check_promotion_cohort_standing(row)?;
 
-    // v30.13.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
+    // v31.0.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
     // promote door for the B8 reason: a row must not escape a put-gate by
     // entering at the local tier and being PROMOTED. Only federation-tier rows
     // reach the consent folds (`list_attestations_for` filters on tier), so
@@ -3557,7 +3557,7 @@ pub fn verify_touch_claim_admission(
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#598) — **the substrate's instant RESOLUTION**: one
+/// v31.0.0 (CIRISPersist#598) — **the substrate's instant RESOLUTION**: one
 /// microsecond, expressed as the nanosecond quantum every bound consent
 /// instant must be a whole multiple of.
 ///
@@ -3587,7 +3587,7 @@ pub fn verify_touch_claim_admission(
 /// index.
 pub const CONSENT_INSTANT_RESOLUTION_NANOS: u32 = 1_000;
 
-/// v30.13.0 (CIRISPersist#598) — truncate an instant to the substrate's
+/// v31.0.0 (CIRISPersist#598) — truncate an instant to the substrate's
 /// [`CONSENT_INSTANT_RESOLUTION_NANOS`] floor, i.e. to what postgres
 /// `TIMESTAMPTZ` can actually hold. Every persist-minted instant that will be
 /// bound to a signature goes through here.
@@ -3604,7 +3604,7 @@ pub fn truncate_to_substrate_resolution(
         .unwrap_or(t)
 }
 
-/// v30.13.0 (CIRISPersist#598) — the instant a LOCAL-tier write stamps on
+/// v31.0.0 (CIRISPersist#598) — the instant a LOCAL-tier write stamps on
 /// its row: the envelope's own signed `asserted_at` when it carries one, else
 /// this node's clock truncated to the substrate resolution.
 ///
@@ -3642,7 +3642,7 @@ pub fn local_row_instant(
     }
 }
 
-/// v30.13.0 (CIRISPersist#598) — **THE CONSENT INSTANT BINDING GATE.**
+/// v31.0.0 (CIRISPersist#598) — **THE CONSENT INSTANT BINDING GATE.**
 ///
 /// # What was open
 ///
@@ -6939,7 +6939,7 @@ pub async fn check_peer_deadmission(
 ) -> Result<(), Error> {
     // A node never de-admits itself.
     //
-    // v30.13.0 (CIRISPersist#608) — this used to be a DISJUNCTION, exempting
+    // v31.0.0 (CIRISPersist#608) — this used to be a DISJUNCTION, exempting
     // any row carrying `PEER_DEADMISSION_DIMENSION` regardless of who wrote it.
     // A peer this node had already de-admitted could therefore keep authoring
     // de-admission rows ABOUT THIRD PARTIES: the sanction did not cover the
@@ -15062,7 +15062,7 @@ pub(crate) mod r2_test_support {
         }
     }
 
-    /// v30.13.0 (CIRISPersist#640) — a key whose timestamps carry
+    /// v31.0.0 (CIRISPersist#640) — a key whose timestamps carry
     /// SUB-MICROSECOND precision, and a `consent_role` submitted in its STORED
     /// form, must still resolve through the ref this node advertises for it.
     ///
@@ -15172,7 +15172,7 @@ pub(crate) mod r2_test_support {
         }
     }
 
-    /// v30.13.0 (CIRISPersist#646) — a DETERMINISTIC sub-microsecond tail on
+    /// v31.0.0 (CIRISPersist#646) — a DETERMINISTIC sub-microsecond tail on
     /// every seeded row of four MORE kinds, each written through a different
     /// put chokepoint, all of which must still resolve through the ref this
     /// node advertises for them.
@@ -15397,7 +15397,7 @@ pub(crate) mod r2_test_support {
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(&author, &envelope);
-        // v30.13.0 (CIRISPersist#646) — NANOSECOND-BEARING, deliberately.
+        // v31.0.0 (CIRISPersist#646) — NANOSECOND-BEARING, deliberately.
         //
         // This fixture used to truncate to microseconds, with a comment calling
         // the skew "a property of the FIXTURE, not of the backend". That was

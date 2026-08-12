@@ -186,12 +186,12 @@ pub mod test_support {
     /// `asserted_at` is EXPLICIT because the fold is latest-wins on it, and it
     /// is stamped INTO the signed envelope as well as onto the row column —
     /// [`crate::federation::admission::check_consent_state_instant_binding`]
-    /// refuses the row if the two disagree (v30.13.0, CIRISPersist#598).
+    /// refuses the row if the two disagree (v31.0.0, CIRISPersist#598).
     /// Truncated to the substrate resolution so the fixture measures ordering
     /// rather than the precision difference between postgres `TIMESTAMPTZ` and
     /// `Utc::now()`.
     ///
-    /// v30.13.0 — the note that used to live here ("a grant and a revoke
+    /// v31.0.0 — the note that used to live here ("a grant and a revoke
     /// minted at the same `Utc::now()` tie, and `max_by_key` on a tie is
     /// unspecified — the sequence must advance") DOCUMENTED the missing
     /// tie-break instead of fixing it. The fold now carries a deterministic
@@ -798,7 +798,7 @@ pub mod test_support {
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
 
-        // (e) v30.13.0 (CIRISPersist#608) — **THE SANCTION COVERS THE
+        // (e) v31.0.0 (CIRISPersist#608) — **THE SANCTION COVERS THE
         // SANCTIONING DIMENSION.**
         //
         // The gate used to exempt any row carrying `PEER_DEADMISSION_DIMENSION`

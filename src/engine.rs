@@ -3813,7 +3813,7 @@ impl Engine {
         // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
         // cannot emit a conformant federation-tier attestation — surface
         // honestly with the same message the self-emit path uses.
-        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
         let canonical = Self::emit_canonicalize(&mut input)?;
@@ -3861,7 +3861,7 @@ impl Engine {
             crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
         })?;
 
-        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
         let canonical = Self::emit_canonicalize(&mut input)?;
@@ -3912,7 +3912,7 @@ impl Engine {
                 "assemble_attestation_self derive key_id: {e}"
             ))
         })?;
-        // v30.13.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
         let canonical = Self::emit_canonicalize(&mut input)?;
@@ -3937,7 +3937,7 @@ impl Engine {
     /// [`attestation_emit::stamp_and_canonicalize`](crate::federation::attestation_emit::stamp_and_canonicalize),
     /// the backend-generic half of the recipe.
     ///
-    /// v30.13.0 (CIRISPersist#598) — takes `&mut input` rather than a bare
+    /// v31.0.0 (CIRISPersist#598) — takes `&mut input` rather than a bare
     /// envelope `Value`: the row instants are stamped into the envelope HERE,
     /// before the bytes exist, so the signature covers them and
     /// [`assemble`](crate::federation::attestation_emit::assemble) can read

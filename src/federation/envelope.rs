@@ -56,7 +56,7 @@ pub mod paths {
     /// consented payload must be deleted (persist-owned lifecycle
     /// processor — the breach signal). Hoisted from `extra`, byte-invariant.
     pub const DELETION_WINDOW: &str = "deletion_window";
-    /// v30.13.0 (CIRISPersist#598) — **the SIGNED assertion instant.** The
+    /// v31.0.0 (CIRISPersist#598) — **the SIGNED assertion instant.** The
     /// `federation_attestations.asserted_at` COLUMN is stored verbatim from
     /// the caller on all three backends and is not covered by any signature
     /// (`original_content_hash` covers `attestation_envelope` and nothing
@@ -66,7 +66,7 @@ pub mod paths {
     /// [`crate::federation::admission::check_consent_state_instant_binding`]
     /// refuses a `consent:state:*` row whose column and envelope disagree.
     pub const ASSERTED_AT: &str = "asserted_at";
-    /// v30.13.0 (CIRISPersist#598) — the SIGNED expiry instant, the twin of
+    /// v31.0.0 (CIRISPersist#598) — the SIGNED expiry instant, the twin of
     /// `federation_attestations.expires_at`. Same unsigned row column, same
     /// treatment: the consent fold drops a row whose `expires_at` has passed,
     /// so an unsigned column is an unsigned mute button.
@@ -131,7 +131,7 @@ pub struct EnvelopeCore {
     /// breach signal — see [`super::deletion_window`]). Byte-invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_window: Option<String>,
-    /// [`paths::ASSERTED_AT`] — v30.13.0 (#598). RFC-3339. The signed twin
+    /// [`paths::ASSERTED_AT`] — v31.0.0 (#598). RFC-3339. The signed twin
     /// of the `asserted_at` ROW COLUMN the consent fold orders on. Stamped
     /// by [`crate::federation::attestation_emit::stamp_and_canonicalize`]
     /// BEFORE the bytes are signed, and read back out by
@@ -140,7 +140,7 @@ pub struct EnvelopeCore {
     /// disagree at the mint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asserted_at: Option<String>,
-    /// [`paths::EXPIRES_AT`] — v30.13.0 (#598). RFC-3339. The signed twin of
+    /// [`paths::EXPIRES_AT`] — v31.0.0 (#598). RFC-3339. The signed twin of
     /// the `expires_at` ROW COLUMN. `None` ⇔ the row column is `None`; the
     /// binding gate refuses any other pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,7 +296,7 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             paths::RECOVERS,
             paths::SUCCESSOR_KEYS,
             paths::WITHDRAWAL_REASON,
-            // v30.13.0 (CIRISPersist#598) — the two signed instants. Added to
+            // v31.0.0 (CIRISPersist#598) — the two signed instants. Added to
             // the vocabulary DELIBERATELY (this re-pins
             // `ENVELOPE_VOCABULARY_SHA256` and every consumer asserting it):
             // an ordering key that decides consent must be part of the
@@ -324,7 +324,7 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// The PINNED envelope-vocabulary hash (see
 /// `envelope_vocabulary_hash_is_pinned` — computed == pinned is a gating
 /// witness; changing the vocabulary without a deliberate re-pin fails CI).
-/// v30.13.0 (CIRISPersist#598) — RE-PINNED. `asserted_at` and `expires_at`
+/// v31.0.0 (CIRISPersist#598) — RE-PINNED. `asserted_at` and `expires_at`
 /// joined `universal_paths`: the instant that decides which consent claim
 /// wins is now part of the vocabulary both sides agree on. Consumers
 /// asserting the old hash BREAK, deliberately and loudly (operator decision

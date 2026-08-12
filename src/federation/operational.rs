@@ -33,7 +33,7 @@
 //!
 //! Every `put_*` runs, in order:
 //!
-//! 0. **Authorship + envelope binding** (v30.13.0, CIRISPersist#644) —
+//! 0. **Authorship + envelope binding** (v31.0.0, CIRISPersist#644) —
 //!    [`verify_organization_admission`] /
 //!    [`verify_org_membership_admission`] hybrid-Strict verify the row's
 //!    OWN signature against `attesting_key_id`'s REGISTERED pubkeys, and
@@ -520,7 +520,7 @@ pub fn check_partner_set_and_quorum(
     signed: &SignedPartnerRecord,
     steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
 ) -> Result<(), Error> {
-    // v30.13.0 (CIRISPersist#644) — bind the typed projection FIRST. The
+    // v31.0.0 (CIRISPersist#644) — bind the typed projection FIRST. The
     // quorum below proves M stewards signed `signed_envelope`; it proves
     // nothing about the columns beside it, and `revision` — the anti-
     // rollback counter and the first key of the `monotonic_quorum`
@@ -568,7 +568,7 @@ pub fn check_partner_revision_monotonic(
 
 // ── Admission check 0: authorship + envelope binding (#644) ─────────
 //
-// v30.13.0 (CIRISPersist#644). Two holes, one root cause: the signature
+// v31.0.0 (CIRISPersist#644). Two holes, one root cause: the signature
 // covers `signed_envelope` and NOTHING ELSE, but every decision the
 // substrate makes reads a TYPED COLUMN beside it.
 //
@@ -609,7 +609,7 @@ pub fn check_partner_revision_monotonic(
 // Shaped on `check_consent_state_instant_binding` (#598), which refuses
 // exactly this divergence one plane over, in this same release.
 
-/// v30.13.0 (CIRISPersist#644) — build the typed refusal for a projection
+/// v31.0.0 (CIRISPersist#644) — build the typed refusal for a projection
 /// column that disagrees with the signed envelope it claims to project.
 fn unbound(plane: &'static str, id: &str, field: &'static str, detail: String) -> Error {
     Error::OperationalEnvelopeUnbound {
@@ -851,7 +851,7 @@ fn bind_opt_instant(
     ))
 }
 
-/// v30.13.0 (CIRISPersist#644) — refuse an [`Organization`] whose typed
+/// v31.0.0 (CIRISPersist#644) — refuse an [`Organization`] whose typed
 /// projection disagrees with the envelope its signature covers.
 ///
 /// # Errors
@@ -878,7 +878,7 @@ pub fn check_organization_binding(row: &Organization) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#644) — refuse an [`OrgMembership`] whose typed
+/// v31.0.0 (CIRISPersist#644) — refuse an [`OrgMembership`] whose typed
 /// projection disagrees with the envelope its signature covers.
 ///
 /// `role` and `status` are the two the role-chain resolver reads out of the
@@ -902,7 +902,7 @@ pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#644) — refuse a [`PartnerRecord`] whose typed
+/// v31.0.0 (CIRISPersist#644) — refuse a [`PartnerRecord`] whose typed
 /// projection disagrees with the envelope the M-of-N steward quorum signed.
 ///
 /// **This is what binds `revision`.** The counter is the anti-rollback
@@ -957,7 +957,7 @@ pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
     Ok(())
 }
 
-/// v30.13.0 (CIRISPersist#644) — the `organization` admission gate nobody
+/// v31.0.0 (CIRISPersist#644) — the `organization` admission gate nobody
 /// was running: bind the projection, then hybrid-Strict verify the row's
 /// OWN signature over `JCS(signed_envelope)` against `attesting_key_id`'s
 /// **REGISTERED** pubkeys, resolved from persist's own directory.
@@ -991,7 +991,7 @@ where
     .map(|_| ())
 }
 
-/// v30.13.0 (CIRISPersist#644) — the `org_membership` counterpart of
+/// v31.0.0 (CIRISPersist#644) — the `org_membership` counterpart of
 /// [`verify_organization_admission`]. See there for the contract.
 ///
 /// # Errors
@@ -1340,7 +1340,7 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrgMembership {
-        // v30.13.0 (#644) — the envelope now carries EVERY column the
+        // v31.0.0 (#644) — the envelope now carries EVERY column the
         // binding gate checks, and the instant is truncated to the
         // substrate resolution before it is signed so the row cannot fail
         // its own binding after a postgres round-trip.
@@ -1384,7 +1384,7 @@ pub mod test_support {
         status: &str,
         asserted_at: DateTime<Utc>,
     ) -> SignedOrganization {
-        // v30.13.0 (#644) — see `signed_membership`.
+        // v31.0.0 (#644) — see `signed_membership`.
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = json!({
@@ -1438,7 +1438,7 @@ pub mod test_support {
         } else {
             json!(["billing.read", "identity.read"])
         };
-        // v30.13.0 (#644) — `revision` was already in the envelope and the
+        // v31.0.0 (#644) — `revision` was already in the envelope and the
         // COLUMN was still the one the anti-rollback gate read; the three
         // instants join it so every column the comparator touches is
         // quorum-attested. Truncated before signing (see

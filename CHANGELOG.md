@@ -5,7 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [30.13.0] - 2026-08-12
+## [31.0.0] - 2026-08-12
+
+### BREAKING — this release requires a FRESH GENESIS. The baked seed will not load.
+
+**Read this first.** `canonical_seed.json` holds `SignedAttestation`s signed
+before the envelope carried its typed-column mirror. The new binding gate
+refuses them, by construction and on purpose. There is no compatibility flag,
+no legacy regime, and no carve-out for genesis rows — a carve-out would be a
+permanent hole in exactly the gate that closes the attacks below.
+
+The operator's call, taken deliberately before the first agent release ships on
+the mesh: *"a fresh genesis is totally fine, we need to do this Right, with
+everything inside the signed envelope that should be."* Every wire-shape break
+this substrate is going to need lands HERE, in one window, rather than
+piecemeal against a live federation.
+
+**What every producer must change:** the signed envelope now carries the fields
+that decide things. Anything minting attestations, organizations, org
+memberships or partner records must re-mint them; anything holding rows signed
+under v30 must re-publish from the producer.
+
+**Why the number tokens matter:** rows whose envelopes passed through a JSONB
+column on postgres have already lost the producer's numeric literals
+(`1e-5` reads back `0.00001`). That happened on the way IN, before this
+release, and no migration recovers it — re-publish is the only remedy.
+
 
 ### Fixed — JSONB is not a byte-preserving container, and eleven signed envelopes were stored in one (#644)
 

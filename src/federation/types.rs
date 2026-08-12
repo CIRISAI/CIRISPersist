@@ -805,7 +805,7 @@ pub mod delegation_scope {
     /// declare a third party's age band.
     pub const INFRA_PUBLISH_RATING: &str = "infra:publish_rating";
 
-    /// v30.13.0 (CIRISPersist#612) — `infra:classify_content` — speak
+    /// v31.0.0 (CIRISPersist#612) — `infra:classify_content` — speak
     /// **about a third party's content class**: the standing a
     /// `content_class:*` emitter must hold before this node will honour a
     /// WITHDRAWAL that clears a flag the emitter did not raise.
@@ -1087,7 +1087,7 @@ pub mod delegation_scope {
     /// disagree. Two arrays over one vocabulary would be the defect both #636
     /// and #637 exist to remove.
     ///
-    /// # Still FIVE at v30.13.0 — a considered NO, not an omission
+    /// # Still FIVE at v31.0.0 — a considered NO, not an omission
     ///
     /// CIRISPersist#612 minted [`INFRA_CLASSIFY_CONTENT`] and it is deliberately
     /// **not** a sixth rung. "Asserts about another party" is not the ladder's
@@ -3702,7 +3702,7 @@ pub struct AnnouncedPeer {
     pub announce_count: i64,
 }
 
-/// v30.13.0 (CIRISPersist#646) — truncate one RFC-3339 timestamp string to
+/// v31.0.0 (CIRISPersist#646) — truncate one RFC-3339 timestamp string to
 /// microsecond precision, or return `None` when the string is not an RFC-3339
 /// instant carrying a sub-microsecond tail.
 ///
@@ -3727,7 +3727,7 @@ fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
     Some(out)
 }
 
-/// v30.13.0 (CIRISPersist#646) — rewrite every RFC-3339 instant in `value` to
+/// v31.0.0 (CIRISPersist#646) — rewrite every RFC-3339 instant in `value` to
 /// microsecond precision, recursively.
 ///
 /// # Why `persist_row_hash` must not see nanoseconds
@@ -3812,7 +3812,7 @@ fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
 ///
 /// Returns the hex-encoded SHA-256 string.
 ///
-/// v30.13.0 (CIRISPersist#646) — every instant in the hashed value is first
+/// v31.0.0 (CIRISPersist#646) — every instant in the hashed value is first
 /// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
@@ -3836,7 +3836,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
         obj.remove("persist_row_hash");
         obj.remove("consent_role");
     }
-    // v30.13.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
+    // v31.0.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
     // BEFORE HASHING. See `truncate_instants_to_microseconds`.
     truncate_instants_to_microseconds(&mut value);
     let bytes = PythonJsonDumpsCanonicalizer
@@ -3850,7 +3850,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 mod tests {
     use super::*;
 
-    /// v30.13.0 (CIRISPersist#646) — `persist_row_hash` does not depend on a
+    /// v31.0.0 (CIRISPersist#646) — `persist_row_hash` does not depend on a
     /// precision no participant can reproduce.
     ///
     /// The row identity has to be a function of the RECORD, not of who stored

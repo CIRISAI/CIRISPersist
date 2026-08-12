@@ -2119,7 +2119,7 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
 //   - UUID columns are TEXT — rusqlite passes UUID strings as TEXT.
 
 impl SqliteBackend {
-    /// v30.13.0 (CIRISPersist#640) — re-read `key_id` and upsert the Key-plane
+    /// v31.0.0 (CIRISPersist#640) — re-read `key_id` and upsert the Key-plane
     /// `signed_wire_index` entry for the row **as this backend stores it**.
     ///
     /// SQLite twin of `PostgresBackend::index_stored_key_row`. Every
@@ -2143,7 +2143,7 @@ impl SqliteBackend {
         .await
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
+    /// v31.0.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
     /// row through the read path's own dispatcher and index the bytes it
     /// returns. See
     /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored)
@@ -2397,7 +2397,7 @@ impl SqliteBackend {
         // follow this UPDATE. Without it a scrub-upgraded node advertises its
         // new content hash while the index still carries the pre-adopt one,
         // and the ref it just advertised point-reads to `None`.
-        // v30.13.0 (CIRISPersist#640) — the entry is no longer computed from
+        // v31.0.0 (CIRISPersist#640) — the entry is no longer computed from
         // `row` before the write; it is read BACK afterwards, below. See
         // `SqliteBackend::index_stored_key_row`.
         let n = (move || -> Result<usize, rusqlite::Error> {
@@ -2573,7 +2573,7 @@ impl SqliteBackend {
         // v24.1.0 (CIRISPersist#547) — the successor must be indexed; a
         // canonical rotation that skipped this advertised the rotated record
         // and could not serve it.
-        // v30.13.0 (CIRISPersist#640) — indexed from the stored row, after the
+        // v31.0.0 (CIRISPersist#640) — indexed from the stored row, after the
         // swap; see `SqliteBackend::index_stored_key_row`.
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
@@ -2857,7 +2857,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
         // v24.1.0 (CIRISPersist#547) — the re-anchored row must be indexed.
-        // v30.13.0 (CIRISPersist#640) — from the stored row, after the UPDATE;
+        // v31.0.0 (CIRISPersist#640) — from the stored row, after the UPDATE;
         // see `SqliteBackend::index_stored_key_row`.
         let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
@@ -3050,7 +3050,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
         // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
         // path and the four mutators cannot compute the entry differently.
-        // v30.13.0 (CIRISPersist#640) — and that derivation reads the row
+        // v31.0.0 (CIRISPersist#640) — and that derivation reads the row
         // BACK. Hashing `row` here indexed the CALLER's struct, which is not
         // what `lookup_public_key` returns whenever the storage boundary
         // normalizes anything — `consent_role` (wire `None` ⇔ stored
@@ -3211,7 +3211,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "set_consent_role: no federation_keys row for {key_id}"
             )));
         }
-        // v30.13.0 (CIRISPersist#640) — index AFTER the write, from the row as
+        // v31.0.0 (CIRISPersist#640) — index AFTER the write, from the row as
         // stored. This used to reload BEFORE the UPDATE and hand-patch
         // `consent_role` onto the result — a model of what the write was about
         // to produce, which is the same guess `key_entry(&row)` was making
@@ -3468,7 +3468,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
 
-        // v30.13.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+        // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
         // an `asserted_at` (and `expires_at`) equal to the row column the
         // consent fold orders on. `asserted_at` is stored VERBATIM from the
@@ -3918,7 +3918,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // `Attestation` IS its own signed wrapper (carries the scrub
         // signature inline), so this hashes the exact `list_attestations_since`
         // read-surface value.
-        // v30.13.0 (CIRISPersist#646) — only the LOCATOR is derived here; the
+        // v31.0.0 (CIRISPersist#646) — only the LOCATOR is derived here; the
         // hash comes from the stored row, after the write. See
         // `index_stored_record`.
         let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
@@ -4801,7 +4801,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        // v30.13.0 (CIRISPersist#646) — that reload is now the SHARED one. This
+        // v31.0.0 (CIRISPersist#646) — that reload is now the SHARED one. This
         // site had the right instinct and its own implementation of it; the
         // instinct is now the rule and the implementation is one function.
         self.index_stored_record(
@@ -6073,7 +6073,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            // v30.13.0 (CIRISPersist#646) — the index entry LEFT this
+            // v31.0.0 (CIRISPersist#646) — the index entry LEFT this
             // transaction. Deriving the hash from the row as stored means
             // reading the row back, and this closure holds the only
             // connection: reading inside the tx would see state a rollback
@@ -6244,7 +6244,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // moves everything.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("subject_key_id", &row.subject_key_id),
-            // v30.13.0 (CIRISPersist#646) — the microsecond-floor spelling; see
+            // v31.0.0 (CIRISPersist#646) — the microsecond-floor spelling; see
             // `wire_index::locator_instant`.
             (
                 "asserted_at",
@@ -7270,7 +7270,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#644) — bind the typed projection to the signed
+        // v31.0.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -7345,7 +7345,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
-        // v30.13.0 (#644) — bind the typed projection to the signed
+        // v31.0.0 (#644) — bind the typed projection to the signed
         // envelope, then hybrid-Strict verify the row's OWN signature
         // against `attesting_key_id`'s REGISTERED pubkeys. Runs before any
         // DB work; nothing below it may assume an unverified column.
@@ -8062,7 +8062,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // The postgres twin failed exactly that way before this re-read landed.
         // Re-reading makes the index agree with the read surface by
         // construction, on any backend, whatever it rounds.
-        // v30.13.0 (CIRISPersist#640) — through the shared helper; this site's
+        // v31.0.0 (CIRISPersist#640) — through the shared helper; this site's
         // remedy is now every site's remedy.
         self.index_stored_key_row(&key_id).await?;
         Ok(())
@@ -13769,7 +13769,7 @@ impl SqliteBackend {
             .attestation_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // v30.13.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+        // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
         // envelope when it carries one (see `admission::local_row_instant`), so
         // a `consent:state:*` row staged at the local tier can still satisfy
         // the instant binding at the promote door.
@@ -13786,7 +13786,7 @@ impl SqliteBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
-        // v30.13.0 (CIRISPersist#598) — the same binding the federation door
+        // v31.0.0 (CIRISPersist#598) — the same binding the federation door
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
         // not where it is promoted.
@@ -19491,7 +19491,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#640) — the SQLITE leg. SQLite round-trips the
+    /// v31.0.0 (CIRISPersist#640) — the SQLITE leg. SQLite round-trips the
     /// nanoseconds (RFC-3339 TEXT) so the timestamp half cannot bite here, but
     /// the `consent_role` wire ⇔ stored normalization DOES: before the fix this
     /// backend indexed `Some("unregistered")` while its read surface returns
@@ -19506,7 +19506,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the SQLITE leg of the every-kind witness.
+    /// v31.0.0 (CIRISPersist#646) — the SQLITE leg of the every-kind witness.
     /// SQLite round-trips nanoseconds, so the timestamp half cannot bite here;
     /// it runs anyway because a rule only the failing backend follows is a rule
     /// the next writer will not know about, and because the LOCATOR floor on
@@ -20357,7 +20357,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#645) — the sqlite leg of the shared envelope
+    /// v31.0.0 (CIRISPersist#645) — the sqlite leg of the shared envelope
     /// byte-exactness witness (see
     /// `postgres::tests::envelope_bytes_round_trip_postgres_644`). Both legs
     /// call the SAME
@@ -20378,7 +20378,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#645) — the sqlite twin of
+    /// v31.0.0 (CIRISPersist#645) — the sqlite twin of
     /// `postgres::tests::every_v122_envelope_column_is_text_postgres_644`:
     /// every signature-covered envelope column is declared `TEXT`.
     ///
@@ -21491,7 +21491,7 @@ mod tests {
             .unwrap();
         let mk = |id: &str, dim: &str, at: &str| {
             let mut a = fed_attestation(id, "subject-1", "target-1", "subject-1");
-            // v30.13.0 (CIRISPersist#598) — the instant rides the SIGNED
+            // v31.0.0 (CIRISPersist#598) — the instant rides the SIGNED
             // envelope as well as the row column; the two must agree or the
             // row is refused. Assigning `asserted_at` by hand — which is what
             // this fixture does, and exactly what the defect permitted — is
@@ -21582,7 +21582,7 @@ mod tests {
         }
         let mk = |id: &str, dim: &str, at: &str, extras: serde_json::Value| {
             let mut a = fed_attestation(id, "subject-2", "target-2", "subject-2");
-            // v30.13.0 (CIRISPersist#598) — see the twin in
+            // v31.0.0 (CIRISPersist#598) — see the twin in
             // `resolve_consent_state_latest_revoked_overrides_granted`.
             let mut env = serde_json::json!({
                 "id": id,
@@ -21761,7 +21761,7 @@ mod tests {
         //     not re-open over the (5) scoped revoke.
         let mut expired_grant =
             fed_attestation("sc-expired-grant", "subject-2", "target-2", "subject-2");
-        // v30.13.0 (CIRISPersist#598) — `expires_at` is bound the same way
+        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound the same way
         // `asserted_at` is, and for the same reason: the fold DROPS an expired
         // row, so an unsigned expiry is an unsigned mute button. Truncated to
         // the substrate resolution because the bound instants must be storable
@@ -21920,7 +21920,7 @@ mod tests {
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let mk = |id: &str, attester: &str, dim: &str, at: chrono::DateTime<chrono::Utc>| {
             let mut a = fed_attestation(id, attester, "target-1", attester);
-            // v30.13.0 (CIRISPersist#598) — the signed instant. Harmless on the
+            // v31.0.0 (CIRISPersist#598) — the signed instant. Harmless on the
             // `consent:deletion_sla:*` row (the binding is keyed to
             // `consent:state:*`) and REQUIRED on the revocation.
             a.attestation_envelope = serde_json::json!({
@@ -22032,7 +22032,7 @@ mod tests {
         // (transit-not-rest), so this simulates the #171 promote-surface
         // staging the watcher must drive out.
         let mut rev = fed_attestation("rev-p", "subject-p", "target-p", "subject-p");
-        // v30.13.0 (CIRISPersist#598) — the signed instant rides the envelope.
+        // v31.0.0 (CIRISPersist#598) — the signed instant rides the envelope.
         rev.attestation_envelope = serde_json::json!({
             "id": "rev-p", "dimension": "consent:state:revoked:v1",
             crate::federation::envelope::paths::ASSERTED_AT: revoked_at.to_rfc3339(),
@@ -22150,7 +22150,7 @@ mod tests {
             ("rev-new", revoked_at + chrono::Duration::hours(12)),
         ] {
             let mut rev = fed_attestation(id, "subject-r", "target-r", "subject-r");
-            // v30.13.0 (CIRISPersist#598) — the signed instant rides the envelope.
+            // v31.0.0 (CIRISPersist#598) — the signed instant rides the envelope.
             rev.attestation_envelope = serde_json::json!({
                 "id": id, "dimension": "consent:state:revoked:v1",
                 crate::federation::envelope::paths::ASSERTED_AT: at.to_rfc3339(),
@@ -22618,7 +22618,7 @@ mod tests {
         let stranger = op::Identity::new("stranger");
         let _dir = [stranger.member()];
         let _roots = ["steward-1".to_string()]; // stranger is not rooted
-                                                // v30.13.0 (CIRISPersist#644) — register the stranger as a plain
+                                                // v31.0.0 (CIRISPersist#644) — register the stranger as a plain
                                                 // agent so its signature VERIFIES. Otherwise the new authorship gate
                                                 // refuses first (unregistered attester) and this test would no longer
                                                 // reach the authority gate it exists to pin. Registered-but-unrooted
@@ -28549,7 +28549,7 @@ mod tests {
             .await
             .unwrap();
 
-        // v30.13.0 (CIRISPersist#598) — a `consent:state:*` row states its own
+        // v31.0.0 (CIRISPersist#598) — a `consent:state:*` row states its own
         // instant in the SIGNED envelope; the local write door stamps the column
         // FROM it (`admission::local_row_instant`), so the two agree by
         // construction and the row survives the binding gate at promotion.
@@ -38385,7 +38385,7 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "sq").await;
     }
 
-    /// v30.13.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
+    /// v31.0.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
     /// sqlite backend. Shares its body with the memory and postgres twins.
     #[tokio::test]
     async fn content_class_flag_plane_sqlite() {

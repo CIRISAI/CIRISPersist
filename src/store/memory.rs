@@ -481,7 +481,7 @@ impl MemoryBackend {
         Self::default()
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the memory twin of
+    /// v31.0.0 (CIRISPersist#646) — the memory twin of
     /// `PostgresBackend`/`SqliteBackend::index_stored_record`: reload the row
     /// through the read path's own dispatcher and index the bytes it returns.
     /// See
@@ -513,7 +513,7 @@ impl MemoryBackend {
         Ok(())
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the Key-plane shorthand for
+    /// v31.0.0 (CIRISPersist#646) — the Key-plane shorthand for
     /// [`index_stored_record`](Self::index_stored_record).
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
         self.index_stored_record(
@@ -918,7 +918,7 @@ impl MemoryBackend {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let attesting_key_id = input.attesting_key_id.clone();
-        // v30.13.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+        // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
         // envelope when it carries one (see `admission::local_row_instant`), so
         // a `consent:state:*` row staged at the local tier can still satisfy
         // the instant binding at the promote door.
@@ -934,7 +934,7 @@ impl MemoryBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
-        // v30.13.0 (CIRISPersist#598) — the same binding the federation door
+        // v31.0.0 (CIRISPersist#598) — the same binding the federation door
         // asks, asked at the local door too: a `consent:state:*` row that
         // cannot state its own signed instant is refused where it is written,
         // not where it is promoted.
@@ -1968,7 +1968,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
             // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
             // path and the mutators cannot compute the entry differently.
-            // v30.13.0 (CIRISPersist#640/#646) — indexed from the STORED row, after
+            // v31.0.0 (CIRISPersist#640/#646) — indexed from the STORED row, after
             // the insert AND after the guard is released; see
             // `MemoryBackend::index_stored_record`.
             let key_id = row.key_id.clone();
@@ -2036,7 +2036,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
             // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
             // row through EVERY mutator, not only `put_public_key`.
-            // v30.13.0 (CIRISPersist#640/#646) — from the STORED row; see
+            // v31.0.0 (CIRISPersist#640/#646) — from the STORED row; see
             // `MemoryBackend::index_stored_record`.
             let key_id = row.key_id.clone();
             state.federation_keys.insert(key_id.clone(), row);
@@ -2111,7 +2111,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
             // `persist_row_hash` but IS in the bytes the read surface returns, so
             // the WIRE content hash moves here. Re-index.
-            // v30.13.0 (CIRISPersist#640/#646) — through the shared stored-row
+            // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
             // helper, after the guard is released.
         }
         self.index_stored_key_row(key_id).await?;
@@ -2283,7 +2283,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
 
-        // v30.13.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+        // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
         // an `asserted_at` (and `expires_at`) equal to the row column the
         // consent fold orders on. `asserted_at` is stored VERBATIM from the
@@ -2645,7 +2645,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
-        // v30.13.0 (CIRISPersist#646) — carried OUT of the guard scope: the
+        // v31.0.0 (CIRISPersist#646) — carried OUT of the guard scope: the
         // reload the index derivation needs takes the same lock.
         let wire_index_key: Option<String>;
 
@@ -2736,7 +2736,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // tier only, the E5 invariant). `Attestation` IS its own signed
             // wrapper (inline scrub signature). Computed before the push
             // moves `row`.
-            // v30.13.0 (CIRISPersist#646) — indexed after the guard is
+            // v31.0.0 (CIRISPersist#646) — indexed after the guard is
             // released, from the STORED row; see `index_stored_record`.
             wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
                 .then(|| {
@@ -3387,7 +3387,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #446 — the projection is computed inside the lock scope but applied
         // after it (put_transport_destination takes the lock itself), ONLY
         // when the occurrence write applied.
-        // v30.13.0 (CIRISPersist#646) — same for the wire-index derivation: it
+        // v31.0.0 (CIRISPersist#646) — same for the wire-index derivation: it
         // reloads through the read surface, which takes this lock.
         let mut indexed: Option<String> = None;
         let projected_route = {
@@ -5148,7 +5148,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.organization;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v30.13.0 (#644) — bind the projection + hybrid-Strict verify the
+        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
         // row's OWN signature. Before the state lock: the verify resolves
         // the attester's registered pubkeys, which locks the directory.
         operational::verify_organization_admission(self, &row).await?;
@@ -5200,7 +5200,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v30.13.0 (#644) — bind the projection + hybrid-Strict verify the
+        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
         // row's OWN signature, before the lock (see `put_organization`).
         operational::verify_org_membership_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
@@ -5920,7 +5920,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
             // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
             // the wire content hash moved with them.
-            // v30.13.0 (CIRISPersist#640/#646) — through the shared stored-row
+            // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
             // helper, after the guard is released.
         }
         self.index_stored_key_row(key_id).await?;
@@ -9698,7 +9698,7 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "mem").await;
     }
 
-    /// v30.13.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
+    /// v31.0.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
     /// memory backend. Shares its body with the sqlite and postgres twins.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
@@ -11408,7 +11408,7 @@ mod tests {
         let steward = op::Identity::new("e9-steward");
         let admin = op::Identity::new("e9-admin");
 
-        // v30.13.0 (CIRISPersist#644) — the outsider is now REGISTERED (as a
+        // v31.0.0 (CIRISPersist#644) — the outsider is now REGISTERED (as a
         // plain agent), which sharpens this test rather than weakening it.
         // Before #644 the first leg refused a key the directory had never
         // heard of, so "not a steward" and "not registered at all" were
@@ -14206,7 +14206,7 @@ mod tests {
     async fn bare_subject_side_revocation_via_put_attestation_gated() {
         let backend = consent_backend().await;
         let mut row = fix_attestation("bare-rev", "subject-key", "registry-steward", "subject-key");
-        // v30.13.0 (CIRISPersist#598) — the signed instant must equal the column.
+        // v31.0.0 (CIRISPersist#598) — the signed instant must equal the column.
         row.asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(row.asserted_at);
         row.attestation_envelope = serde_json::json!({
@@ -15159,7 +15159,7 @@ mod tests {
 
         // A subject-side `consent:state:revoked` envelope, hybrid-signed by the
         // subject (Ed25519 + ML-DSA-65 bound) over the CEG canonical form.
-        // v30.13.0 (CIRISPersist#598) — the signed instant; the local door
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
         // stamps the column from it.
         let env = serde_json::json!({
             "id": "rev-c", "dimension": "consent:state:revoked:v1",
@@ -15352,7 +15352,7 @@ mod tests {
         // A crypto-valid subject-side revocation, admitted as a TRANSIT
         // local-tier write (same real-admission fixture as the SLA loop
         // test above).
-        // v30.13.0 (CIRISPersist#598) — the signed instant; the local door
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
         // stamps the column from it.
         let env = serde_json::json!({
             "id": "rev-r", "dimension": "consent:state:revoked:v1",
@@ -16132,7 +16132,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#640) — the MEMORY leg (the CONTROL: memory
+    /// v31.0.0 (CIRISPersist#640) — the MEMORY leg (the CONTROL: memory
     /// neither rounds timestamps nor normalizes `consent_role`, so it must be
     /// green before and after the fix; a red here means the shared derivation
     /// broke, not that the skew was caught).
@@ -16148,7 +16148,7 @@ mod tests {
         .await;
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the MEMORY leg of the every-kind witness.
+    /// v31.0.0 (CIRISPersist#646) — the MEMORY leg of the every-kind witness.
     /// The CONTROL: memory rounds nothing, so this must be green before AND
     /// after the fix. A red here means the shared derivation broke, not that
     /// the skew was caught.

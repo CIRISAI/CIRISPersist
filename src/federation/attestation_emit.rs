@@ -46,7 +46,7 @@ pub fn canonicalize(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::Backend(format!("emit_attestation canonicalize: {e}")))
 }
 
-/// v30.13.0 (CIRISPersist#598) — **stamp the row instants INTO the envelope,
+/// v31.0.0 (CIRISPersist#598) — **stamp the row instants INTO the envelope,
 /// then canonicalize it.** Every emit entry point calls THIS, not
 /// [`canonicalize`], so there is no longer a canonicalize step that can be
 /// reached with an unstamped envelope.
@@ -157,7 +157,7 @@ pub fn assemble(
     super::validate_subject_key_ids(&input.subject_key_ids)?;
 
     let original_content_hash = hex::encode(Sha256::digest(canonical));
-    // v30.13.0 (CIRISPersist#598) — THE INSTANT COMES OUT OF THE SIGNED
+    // v31.0.0 (CIRISPersist#598) — THE INSTANT COMES OUT OF THE SIGNED
     // ENVELOPE. This line used to be `chrono::Utc::now()`: a SECOND clock
     // read, taken after `canonical` was already hashed and signed, so the row
     // column and the signed bytes disagreed by construction and no producer
@@ -269,7 +269,7 @@ where
     D: FederationDirectory + Sync + ?Sized,
 {
     let key_id = signer.derived_key_id();
-    // v30.13.0 (CIRISPersist#598) — stamp BEFORE signing (see
+    // v31.0.0 (CIRISPersist#598) — stamp BEFORE signing (see
     // [`stamp_and_canonicalize`]); `assemble` then reads the instant back out.
     let canonical = stamp_and_canonicalize(&mut input, chrono::Utc::now())?;
     let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {

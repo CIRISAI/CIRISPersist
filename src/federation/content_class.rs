@@ -1,4 +1,4 @@
-//! v30.13.0 (CIRISPersist#612, CC 4.5.13 / CC 3.3.12 / CC 3.4.14) — the
+//! v31.0.0 (CIRISPersist#612, CC 4.5.13 / CC 3.3.12 / CC 3.4.14) — the
 //! **`content_class:*` flag-plane read predicate**, and the conferral that
 //! makes its clearing arm safe to federate.
 //!
@@ -86,7 +86,7 @@ pub const FAMILY_STEM: &str = "content_class:";
 /// retraction must not reveal.
 pub const WITHDRAWN_FIELD: &str = "withdrawn";
 
-/// v30.13.0 (CIRISPersist#612) — the folded state of one
+/// v31.0.0 (CIRISPersist#612) — the folded state of one
 /// `content_class:{class}` plane for one subject, as **this node** is entitled
 /// to read it.
 ///
@@ -135,7 +135,7 @@ pub fn is_withdrawal(att: &Attestation) -> bool {
         .unwrap_or(false)
 }
 
-/// v30.13.0 (CIRISPersist#612) — fold the `content_class` flag plane named by
+/// v31.0.0 (CIRISPersist#612) — fold the `content_class` flag plane named by
 /// `dimension` for `subject_key_id`, honouring a cross-emitter clear only from a
 /// key holding
 /// [`INFRA_CLASSIFY_CONTENT`](super::types::delegation_scope::INFRA_CLASSIFY_CONTENT)
@@ -261,7 +261,7 @@ where
     })
 }
 
-/// v30.13.0 (CIRISPersist#612) — the ONE #612 witness body, run against every
+/// v31.0.0 (CIRISPersist#612) — the ONE #612 witness body, run against every
 /// backend rather than copied per backend.
 ///
 /// The door is a default trait method composed from trait-required reads, so

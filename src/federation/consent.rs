@@ -47,7 +47,7 @@
 /// active → replication kept flowing to a peer that revoked. Versioned
 /// dimensions extend the prefix (`consent:state:revoked:v1`).
 pub mod consent_dimension {
-    /// v30.13.0 (CIRISPersist#598) — the prefix of EVERY consent-STATE
+    /// v31.0.0 (CIRISPersist#598) — the prefix of EVERY consent-STATE
     /// dimension, i.e. the exact axis both consent folds and the #598
     /// instant-binding gate key on. It was spelled as a bare `"consent:state:"`
     /// literal in three places (both folds and the gate that had to agree with
@@ -113,7 +113,7 @@ pub fn consent_state_of(dimension: Option<&str>) -> super::hard_case::ConsentSta
     }
 }
 
-/// v30.13.0 (CIRISPersist#598) — the **restriction rank** of a consent
+/// v31.0.0 (CIRISPersist#598) — the **restriction rank** of a consent
 /// stance: how much a stance CLOSES, ordered so that a larger number is a
 /// more restrictive reading.
 ///
@@ -132,7 +132,7 @@ pub fn restriction_rank(state: super::hard_case::ConsentState) -> u8 {
     }
 }
 
-/// v30.13.0 (CIRISPersist#598) — **THE consent-fold ordering key**, shared by
+/// v31.0.0 (CIRISPersist#598) — **THE consent-fold ordering key**, shared by
 /// [`resolve_consent_state`](super::FederationDirectory::resolve_consent_state)
 /// and [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
 /// so the two folds cannot disagree about which claim wins.

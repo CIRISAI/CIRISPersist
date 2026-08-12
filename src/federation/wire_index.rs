@@ -89,7 +89,7 @@ pub fn content_hash_of_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// v30.13.0 (CIRISPersist#646) — the microsecond-truncated RFC-3339 spelling
+/// v31.0.0 (CIRISPersist#646) — the microsecond-truncated RFC-3339 spelling
 /// used for the ONE `record_key` field that is not a byte-transparent TEXT id:
 /// `LocationProof.asserted_at`.
 ///
@@ -123,7 +123,7 @@ pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
         .to_rfc3339()
 }
 
-/// v30.13.0 (CIRISPersist#646) — THE index entry for any kind, derived from
+/// v31.0.0 (CIRISPersist#646) — THE index entry for any kind, derived from
 /// the row **as stored**: reload through [`reload_record_bytes`] — the exact
 /// function the point-read resolves with — and hash those bytes.
 ///
@@ -133,7 +133,7 @@ pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
 /// federation_keys` paths — `adopt_scrub_upgrade`, `supersede_canonical_record`,
 /// `adopt_genesis_reanchor` — mutated the row and left the index holding the
 /// PRE-mutation hash, so a node scrub-upgraded while running advertised the
-/// hash of its NEW row and could not serve it. v30.13.0 (CIRISPersist#640)
+/// hash of its NEW row and could not serve it. v31.0.0 (CIRISPersist#640)
 /// then fixed the index-hash DERIVATION, on ONE plane (`Key`), by reloading
 /// and hashing what the read returns. Both remedies were applied to the site
 /// that had failed and nowhere else, which is how the same defect arrived a
@@ -320,7 +320,7 @@ pub async fn reload_record_bytes(
             let rows = dir
                 .list_signed_location_proofs_since(None, u32::MAX)
                 .await?;
-            // v30.13.0 (CIRISPersist#646) — compared through
+            // v31.0.0 (CIRISPersist#646) — compared through
             // `locator_instant`, the microsecond-floor spelling the put path
             // and `all_kind_hash_keys` both write. A raw `to_rfc3339()`
             // comparison could not match on postgres, whose `TIMESTAMPTZ`
@@ -685,7 +685,7 @@ mod tests {
         assert!(record_key_field(&rk, "nope").is_err());
     }
 
-    /// v30.13.0 (CIRISPersist#646) — the locator floor. A `LocationProof`
+    /// v31.0.0 (CIRISPersist#646) — the locator floor. A `LocationProof`
     /// written with a nanosecond `asserted_at` must produce the SAME record_key
     /// as the same row reloaded from a backend that rounded it, or the
     /// point-read cannot find the row its own index points at.

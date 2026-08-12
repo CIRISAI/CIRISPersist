@@ -344,7 +344,7 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     PersistFamilyRule {
         prefix: "revocation:peer_admission:",
         rule: "self-authored, asked at BOTH ends — a de-admission is honoured on this node only \
-               if THIS node authored it (consumption), and since v30.13.0 (#608) a de-admitted \
+               if THIS node authored it (consumption), and since v31.0.0 (#608) a de-admitted \
                peer cannot AUTHOR one either. The admission exemption used to key on the \
                dimension, so the sanction did not cover the sanctioning dimension (AV-77)",
         enforced_at: &["federation::admission::check_peer_deadmission"],
@@ -500,7 +500,7 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          attester — so the write gate was refusing the very row CC makes \
          mandatory, and CIRISPersist#571 removed it. The literal is now \
          `content_class::FAMILY_STEM`, whose only use is the READ door \
-         `FederationDirectory::resolve_content_class_flag` (v30.13.0, \
+         `FederationDirectory::resolve_content_class_flag` (v31.0.0, \
          CIRISPersist#612). That door admits nothing and refuses nothing: it \
          FOLDS rows already stored, honouring a withdrawal that clears another \
          emitter's flag only from a key a root this node trusts has conferred \

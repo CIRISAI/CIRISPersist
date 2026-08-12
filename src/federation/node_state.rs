@@ -1038,7 +1038,7 @@ pub mod parity_test_support {
                 .await
                 .expect("register");
         }
-        // v30.13.0 (CIRISPersist#598) — the signed instant; the local write
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local write
         // door stamps the `asserted_at` column FROM it.
         let env = serde_json::json!({
             "id": format!("{tag}-ns-rev"),

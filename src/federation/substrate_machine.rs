@@ -1961,7 +1961,7 @@ pub mod test_support {
             1,
             true,
             "a node may ALWAYS author its own de-admission, so it cannot lock itself out of \
-             lifting one. v30.13.0 (#608): the exemption is AUTHORSHIP (attester == self), not \
+             lifting one. v31.0.0 (#608): the exemption is AUTHORSHIP (attester == self), not \
              the dimension — the dimension arm let a de-admitted peer keep writing the sanction \
              dimension about third parties",
         );

@@ -535,7 +535,7 @@ pub(crate) mod test_support {
         // nanoseconds, so timestamps minted here do not survive the round-trip
         // byte-for-byte on that backend.
         //
-        // v30.13.0 (CIRISPersist#640) — this is NO LONGER what keeps the wire
+        // v31.0.0 (CIRISPersist#640) — this is NO LONGER what keeps the wire
         // index honest. #634 read the skew as a fixture property; it was not —
         // the write paths hashed the in-memory row while every read
         // re-serializes the reloaded one, so the same divergence was reachable

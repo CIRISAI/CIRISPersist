@@ -1,4 +1,4 @@
-//! v30.13.0 (CIRISPersist#645) — **the signature-covered envelope columns must
+//! v31.0.0 (CIRISPersist#645) — **the signature-covered envelope columns must
 //! round-trip byte-exact, on every backend.**
 //!
 //! # What went wrong
@@ -357,7 +357,7 @@ mod tests {
         );
     }
 
-    /// v30.13.0 (#644) — **does the JCS canonicalization the SIGNATURE is taken
+    /// v31.0.0 (#644) — **does the JCS canonicalization the SIGNATURE is taken
     /// over absorb what JSONB does to numbers?**
     ///
     /// The audit that raised #644 believed it did, but recorded the belief as

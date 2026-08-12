@@ -109,7 +109,7 @@ pub mod read;
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
 pub mod envelope;
-/// v30.13.0 (CIRISPersist#645) — the byte-exactness witness for the V122
+/// v31.0.0 (CIRISPersist#645) — the byte-exactness witness for the V122
 /// signature-covered envelope columns.
 pub mod envelope_bytes;
 // v21.6.0 (CIRISPersist#519 item 2a-iii) — the signed `fresh_as_of`
@@ -4298,7 +4298,7 @@ pub trait FederationDirectory: Send + Sync {
     /// chain (§8.1.11.1 `attesting_key_id ∈ delegates_to(s).proxies`) is
     /// a follow-up — a delegate-emitted stance is not yet folded in.
     ///
-    /// v30.13.0 (CIRISPersist#598) — the winner is picked through
+    /// v31.0.0 (CIRISPersist#598) — the winner is picked through
     /// [`consent::fold_ordering_key`]: still latest-wins on the `asserted_at`
     /// COLUMN (which every admitted `consent:state:*` row now proves equals
     /// its own signed envelope instant), with a deterministic
@@ -4374,7 +4374,7 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// v30.13.0 (CIRISPersist#612, CC 4.5.13) — the **other half** of the
+    /// v31.0.0 (CIRISPersist#612, CC 4.5.13) — the **other half** of the
     /// infohazard reveal gate: fold the `content_class:{class}` flag plane for
     /// `subject_key_id`, honouring a cross-emitter CLEAR only from a key holding
     /// [`INFRA_CLASSIFY_CONTENT`](types::delegation_scope::INFRA_CLASSIFY_CONTENT)
@@ -5425,7 +5425,7 @@ pub enum Error {
     #[error("operational-data authority not established: {0}")]
     OperationalAuthority(String),
 
-    /// v30.13.0 (CIRISPersist#644, CEG 1.0-RC2 §5.6.8.13) — an
+    /// v31.0.0 (CIRISPersist#644, CEG 1.0-RC2 §5.6.8.13) — an
     /// `organization` / `org_membership` / `partner_record` row carried a
     /// typed column that its signature does not cover and that disagrees
     /// with the signed envelope it claims to project.
