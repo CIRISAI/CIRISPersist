@@ -29931,8 +29931,16 @@ mod tests {
         );
         let mut w2 = w1.clone();
         w2.attestation_id = "w-2".into();
-        crate::federation::tier_ingest::test_support::reseal(&mut w2);
+        // v31.0.0 (CIRISPersist#598) — the LATER instant is what makes this a
+        // replay rather than a byte-identical resend, so it is part of what the
+        // seal must cover: set it BEFORE re-sealing, not after. Re-sealing
+        // afterwards left the column at 05-02 and the signed twin at 05-01,
+        // which is the exact divergence the instant-binding gate refuses. The
+        // §6.1 dedup key is the triple, not the envelope bytes
+        // ([`crate::federation::precedence::is_dedup_match`]), so re-sealing
+        // does not soften what this witness measures.
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         backend
             .put_attestation(SignedAttestation { attestation: w1 })
             .await
@@ -35906,6 +35914,12 @@ mod tests {
             &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         );
         d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
+        // now (envelope absent ⇔ column None), so setting the column is a
+        // re-sign trigger. That is this fixture's own premise from the other
+        // side: the expiry is what kills the delegation's liveness, and an
+        // expiry a writer could set ALONE would be an unsigned mute button.
+        resign_fed(&mut d);
         backend
             .put_attestation(SignedAttestation { attestation: d })
             .await

@@ -28294,20 +28294,33 @@ mod tests {
         k
     }
 
-    /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)sign a federation-tier PG test
-    /// attestation's envelope with its `attesting_key_id`'s deterministic
-    /// hybrid key so the mandatory federation-tier ingest gate verifies
-    /// it. Call AFTER any post-construction mutation of
-    /// `attestation_envelope` / `attesting_key_id`. Matching pubkeys are
-    /// registered via [`fix_section_i_key`] / [`pg_admission_key`].
+    /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)SEAL a federation-tier PG test
+    /// attestation with its `attesting_key_id`'s deterministic hybrid key so
+    /// the mandatory federation-tier ingest gate verifies it. Call AFTER any
+    /// post-construction mutation of `attestation_envelope` /
+    /// `attesting_key_id` / `asserted_at` / `expires_at` / any of the five
+    /// typed columns. Matching pubkeys are registered via
+    /// [`fix_section_i_key`] / [`pg_admission_key`].
+    ///
+    /// v31.0.0 (CIRISPersist#598) — this helper is the postgres twin of
+    /// `memory.rs::resign_fix` and `sqlite.rs::resign_fed`, and it was the ONLY
+    /// one of the three still hand-rolling `sign_envelope`. Both siblings had
+    /// already been redirected through
+    /// [`tier_ingest::test_support::reseal`](crate::federation::tier_ingest::test_support::reseal);
+    /// this one had not, so every postgres attestation fixture in this file
+    /// descended from `pg_scores_attestation` was signed WITHOUT its
+    /// `asserted_at` / `expires_at` twins and — wherever the envelope was
+    /// replaced wholesale after construction — without its #643 typed-column
+    /// mirror either. Forty-odd postgres tests were certifying a row shape no
+    /// host can write, and none of them could see it, because the sqlite and
+    /// memory arms of the same witnesses were sealed correctly.
+    ///
+    /// The three re-sign helpers now differ in NAME only. That is the point:
+    /// `feedback_test_every_backend_not_just_memory` is this exact class, and
+    /// the way a backend arm drifts is by keeping its own copy of a step the
+    /// other arms centralized.
     fn pg_resign(row: &mut crate::federation::Attestation) {
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &row.attesting_key_id,
-            &row.attestation_envelope,
-        );
-        row.original_content_hash = och;
-        row.scrub_signature_classical = classical;
-        row.scrub_signature_pqc = pqc;
+        crate::federation::tier_ingest::test_support::reseal(row);
     }
 
     fn pg_scores_attestation(
@@ -29014,6 +29027,12 @@ mod tests {
             false,
         );
         d_exp.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
+        // now (envelope absent ⇔ column None), so setting the column is a
+        // re-sign trigger. That is this leg's own premise from the other side:
+        // the expiry is what kills the delegation's liveness, and an expiry a
+        // writer could set ALONE would be an unsigned mute button.
+        crate::federation::tier_ingest::test_support::reseal(&mut d_exp);
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: d_exp })
             .await
@@ -30635,8 +30654,17 @@ mod tests {
         let w1_id = w1.attestation_id.clone();
         let mut w2 = w1.clone();
         w2.attestation_id = uuid::Uuid::new_v4().to_string();
-        crate::federation::tier_ingest::test_support::reseal(&mut w2);
+        // v31.0.0 (CIRISPersist#598) — the LATER instant is what makes this a
+        // replay rather than a byte-identical resend, so it is part of what the
+        // seal must cover: move it BEFORE re-sealing, not after. `reseal` also
+        // truncates to the substrate resolution, so copying `scrub_timestamp`
+        // from it afterwards keeps the two columns equal on the postgres arm
+        // (TIMESTAMPTZ has no nanoseconds). `scrub_timestamp` is not signed
+        // material, so setting it after the seal is not a divergence. The §6.1
+        // dedup key is the triple, not the envelope bytes, so re-sealing does
+        // not soften what this witness measures.
         w2.asserted_at += chrono::Duration::seconds(60);
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.scrub_timestamp = w2.asserted_at;
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
@@ -30689,7 +30717,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let now = chrono::Utc::now();
+        // v31.0.0 (CIRISPersist#598) — the base is deliberately TWO HOURS BACK
+        // rather than `Utc::now()`. What this witness needs is that the
+        // `withdraws` is STRICTLY LATER than the `recants` and still loses;
+        // what it does not need — and must not smuggle in — is an instant in
+        // the FUTURE, which the instant-binding gate's anti-rollback leg
+        // refuses beyond a 300s tolerance. Both rows now sit in the past, the
+        // one-hour gap that gives the test its teeth is unchanged, and the
+        // ordering the assertion overrules is still a real ordering.
+        let now = chrono::Utc::now() - chrono::Duration::hours(2);
         let recants = pg_structural_composer(
             &steward,
             crate::federation::types::attestation_type::RECANTS,
