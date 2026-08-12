@@ -6662,11 +6662,36 @@ pub async fn check_peer_deadmission(
     row: &super::Attestation,
     self_key_id: &str,
 ) -> Result<(), Error> {
-    // A node never de-admits itself, and a de-admission row itself must always
-    // be admissible (else a node could not lift its own denial).
-    if row.attesting_key_id == self_key_id
-        || envelope_dimension(&row.attestation_envelope) == Some(PEER_DEADMISSION_DIMENSION)
-    {
+    // A node never de-admits itself.
+    //
+    // v30.13.0 (CIRISPersist#608) — this used to be a DISJUNCTION, exempting
+    // any row carrying `PEER_DEADMISSION_DIMENSION` regardless of who wrote it.
+    // A peer this node had already de-admitted could therefore keep authoring
+    // de-admission rows ABOUT THIRD PARTIES: the sanction did not cover the
+    // sanctioning dimension itself. Live since v22.0.0, on all three backends,
+    // at both chokepoints that call this (`put_attestation` and
+    // `check_promotion_admission`).
+    //
+    // The reason the dimension arm cannot be repaired — only removed — is that
+    // **the exemption must mirror the consumption fold.** The fold below asks
+    // `list_attestations_by(self_key_id)`: WHO AUTHORED. The old second arm
+    // asked WHAT DIMENSION. Any exemption wider than the fold admits rows the
+    // fold will never read, which is the "accepted but not projected" class
+    // (v17.0.0's route table) wearing a different hat.
+    //
+    // The stated worry — "a node could not lift its own denial" — is answered
+    // by the FIRST arm, not the second: every lift path forces the attester to
+    // this node (`OpKind::Deadmit` and `OpKind::Withdraw` both pin
+    // `SELF_PRINCIPAL`), so self-authored rows are already exempt. The second
+    // arm only ever extended that to OTHER people's de-admission rows.
+    //
+    // Deliberately NOT widened to delegates: `is_steward_bound` /
+    // `can_accept_for_itself` / the delegation walk answer custody about a
+    // SUBJECT, not authorship of THIS ROW. Wiring one in here would re-open the
+    // same gap one layer up, because the fold would still ignore the delegate.
+    // Delegated de-admission means changing the FOLD first, and that is a
+    // capability grant subject to the accord-ops m-of-n invariant.
+    if row.attesting_key_id == self_key_id {
         return Ok(());
     }
     // Live de-admissions THIS node authored about the row's author. The

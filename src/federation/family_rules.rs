@@ -343,8 +343,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "revocation:peer_admission:",
-        rule: "self-authored only AT CONSUMPTION — a de-admission is honoured on this node only \
-               if THIS node authored it, so a peer cannot de-admit a third party here (AV-77)",
+        rule: "self-authored, asked at BOTH ends — a de-admission is honoured on this node only \
+               if THIS node authored it (consumption), and since v30.13.0 (#608) a de-admitted \
+               peer cannot AUTHOR one either. The admission exemption used to key on the \
+               dimension, so the sanction did not cover the sanctioning dimension (AV-77)",
         enforced_at: &["federation::admission::check_peer_deadmission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,

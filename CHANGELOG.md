@@ -5,6 +5,46 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.13.0] - 2026-08-12
+
+### Fixed — the sanction did not cover the sanctioning dimension (#608)
+
+`check_peer_deadmission` opened with a DISJUNCTION:
+
+```rust
+if row.attesting_key_id == self_key_id
+    || envelope_dimension(&row.attestation_envelope) == Some(PEER_DEADMISSION_DIMENSION)
+```
+
+The second arm exempted **any** row carrying the de-admission dimension
+regardless of who wrote it. So a peer this node had already de-admitted could
+keep authoring de-admission rows **about third parties** — the one dimension a
+sanctioned peer most wants, because it is how this node decides who else to
+refuse. Live since v22.0.0, on all three backends, at both chokepoints that
+call the gate (`put_attestation` and `check_promotion_admission`).
+
+The arm could not be repaired, only removed, because **the exemption must mirror
+the consumption fold.** The fold asks `list_attestations_by(self_key_id)` — who
+authored. The arm asked what dimension. Any exemption wider than the fold admits
+rows the fold will never read: the "accepted but not projected" class in
+different clothing. The worry the arm existed for ("a node could not lift its
+own denial") is answered by the *first* arm, since every lift path pins the
+attester to this node.
+
+Not widened to delegates: `is_steward_bound` / `can_accept_for_itself` / the
+delegation walk answer custody about a SUBJECT, not authorship of THIS ROW.
+Delegated de-admission means changing the fold first, which is a capability
+grant under the accord-ops m-of-n invariant.
+
+New leg (e) in the shared `exercise_peer_deadmission` body, so all three
+backends get it by construction. It also asserts the refused row was not
+STORED — "refused" and "refused after storing" are different outcomes and
+indistinguishable from the error alone. Mutation: restoring the disjunct kills
+it on memory and sqlite.
+
+Two doc sites that asserted the old semantics moved in the same cut, or the next
+reader restores the arm.
+
 ## [30.12.0] - 2026-08-12
 
 ### Fixed — Bench had not succeeded in 100 runs, and a timeout reports as "cancelled" (#639)

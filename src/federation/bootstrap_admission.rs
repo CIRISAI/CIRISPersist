@@ -781,6 +781,47 @@ pub mod test_support {
         })
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
+
+        // (e) v30.13.0 (CIRISPersist#608) — **THE SANCTION COVERS THE
+        // SANCTIONING DIMENSION.**
+        //
+        // The gate used to exempt any row carrying `PEER_DEADMISSION_DIMENSION`
+        // regardless of author, so the de-admitted abuser could keep writing
+        // de-admission rows ABOUT THIRD PARTIES — the one dimension a sanctioned
+        // peer most wants, since it is how this node decides who else to refuse.
+        // Legs (a)-(d) all passed over that hole for eight majors: (c) refuses
+        // the abuser on `trust:demo:v1`, and nothing asked what happened on the
+        // sanction dimension itself.
+        let smuggled = scores_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &abuser,   // ATTESTER — already de-admitted at (b)
+            &innocent, // about a THIRD PARTY, not itself
+            PEER_DEADMISSION_DIMENSION,
+        );
+        let smuggled_id = smuggled.attestation_id.clone();
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: smuggled,
+            })
+            .await
+            .expect_err(
+                "({tag}) #608: a de-admitted peer must not author the de-admission dimension",
+            );
+        assert!(
+            format!("{err}").contains("de-admitted"),
+            "({tag}) #608: the refusal names the de-admission: {err}"
+        );
+
+        // REFUSED, not refused-after-storing. AV-9 wants the former, and the two
+        // are indistinguishable from the error alone.
+        let by_abuser = dir
+            .list_attestations_by(&abuser)
+            .await
+            .expect("({tag}) #608: list_attestations_by");
+        assert!(
+            !by_abuser.iter().any(|a| a.attestation_id == smuggled_id),
+            "({tag}) #608: the refused row was STORED anyway — refusal must leave no trace"
+        );
     }
 
     /// **B8 (CIRISPersist#589 / AV-83) — a PROMOTION faces the tier-4 stack,
