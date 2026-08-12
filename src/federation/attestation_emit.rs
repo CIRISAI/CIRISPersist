@@ -75,8 +75,27 @@ pub fn canonicalize(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
 ///
 /// [`assemble`] then READS both back out of the signed envelope. Signature,
 /// hash and row column are three views of one instant.
+///
+/// # v31.0.0 (CIRISPersist#643) — and the five typed COLUMNS
+///
+/// The same treatment, for the same reason, applied to the columns that decide
+/// what the row MEANS: `attestation_type` (the verb), `subject_key_ids` (which
+/// grants revocation authority), `attested_key_id`, `cohort_scope` and
+/// `weight`. They are stamped into
+/// [`envelope.row`](crate::federation::envelope::RowMirror) here, before the
+/// bytes exist, so
+/// [`check_row_column_binding`](crate::federation::admission::check_row_column_binding)
+/// is satisfiable at the mint rather than being a rule no producer could obey.
+///
+/// `attesting_key_id` is the signer's DERIVED federation key_id and is passed
+/// in because the mirror must carry the EFFECTIVE `attested_key_id` — the
+/// value [`assemble`] will place on the row, which for a self-attestation
+/// (`input.attested_key_id == None`) is the signer's own id. Stamping the
+/// caller's `Option` instead would bind a mirror that diverges from the row it
+/// mints.
 pub fn stamp_and_canonicalize(
     input: &mut EmitAttestationInput,
+    attesting_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<u8>, Error> {
     use crate::federation::admission::truncate_to_substrate_resolution as trunc;
@@ -85,6 +104,33 @@ pub fn stamp_and_canonicalize(
     }
     input.expires_at = input.expires_at.map(trunc);
     input.attestation_envelope.expires_at = input.expires_at.map(|t| t.to_rfc3339());
+    input.attestation_envelope.row = Some(crate::federation::envelope::RowMirror {
+        // v31.0.0 (#643) — THE ROW ID IS MINTED HERE, before the bytes exist,
+        // and [`assemble`] reads it back out. It used to be a fresh
+        // `Uuid::new_v4()` sampled AFTER the signature — the same
+        // sample-after-signing shape #598 found on `asserted_at`, and for the
+        // same reason unbindable by construction. Minting it into the signed
+        // bytes is also what makes a replay structurally impossible rather
+        // than merely refused: the same envelope can only ever name one row.
+        attestation_id: uuid::Uuid::new_v4().to_string(),
+        attesting_key_id: attesting_key_id.to_owned(),
+        attestation_type: input.attestation_type.clone(),
+        attested_key_id: input
+            .attested_key_id
+            .clone()
+            .unwrap_or_else(|| attesting_key_id.to_owned()),
+        subject_key_ids: input.subject_key_ids.clone(),
+        cohort_scope: input.cohort_scope.clone(),
+        weight: match input.weight {
+            None => None,
+            Some(w) => Some(serde_json::Number::from_f64(w).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "emit_attestation: `weight` {w} is not finite and cannot be bound into the \
+                     signed envelope (CIRISPersist#643)"
+                ))
+            })?),
+        },
+    });
     canonicalize(&input.attestation_envelope.to_value())
 }
 
@@ -218,8 +264,25 @@ pub fn assemble(
     super::admission::check_cohort_scope(&input.cohort_scope)?;
     let cohort_scope = input.cohort_scope;
 
+    // v31.0.0 (CIRISPersist#643) — the row id comes OUT of the signed
+    // envelope's mirror (see `stamp_and_canonicalize`), not from a fresh v4
+    // minted after the signature existed.
+    let attestation_id = input
+        .attestation_envelope
+        .row
+        .as_ref()
+        .map(|m| m.attestation_id.clone())
+        .ok_or_else(|| {
+            Error::InvalidArgument(
+                "emit_attestation: the envelope carries no `row` mirror — assemble reads the row \
+                 identity and the five typed columns OUT of the signed envelope. Build the \
+                 canonical bytes through `attestation_emit::stamp_and_canonicalize` \
+                 (CIRISPersist#643)"
+                    .into(),
+            )
+        })?;
     let row = Attestation {
-        attestation_id: uuid::Uuid::new_v4().to_string(),
+        attestation_id,
         attesting_key_id: key_id.clone(),
         attested_key_id,
         attestation_type: input.attestation_type,
@@ -241,6 +304,14 @@ pub fn assemble(
         promoted_at: None,
         additional_scrubs: Vec::new(),
     };
+    // v31.0.0 (CIRISPersist#643) — the typed-column binding, asked at the
+    // MINT. `put_attestation` asks it again at every door (that is where it
+    // defends), but a row assembled here and put later — the co-signed
+    // `mesh_config` / quarantine-marker paths `assemble`-without-put exists for
+    // — should fail where it was built, naming the column, rather than at a
+    // store call one layer away. Also catches an `input` whose envelope was
+    // stamped for a DIFFERENT signer than the `key_id` assembling it.
+    super::admission::check_row_column_binding(&row)?;
     let emitted = EmittedAttestation {
         attestation_id: row.attestation_id.clone(),
         attesting_key_id: key_id,
@@ -269,9 +340,11 @@ where
     D: FederationDirectory + Sync + ?Sized,
 {
     let key_id = signer.derived_key_id();
-    // v31.0.0 (CIRISPersist#598) — stamp BEFORE signing (see
-    // [`stamp_and_canonicalize`]); `assemble` then reads the instant back out.
-    let canonical = stamp_and_canonicalize(&mut input, chrono::Utc::now())?;
+    // v31.0.0 (CIRISPersist#598/#643) — stamp BEFORE signing (see
+    // [`stamp_and_canonicalize`]); `assemble` then reads the instants back out
+    // and `check_row_column_binding` re-checks the typed-column mirror at the
+    // door.
+    let canonical = stamp_and_canonicalize(&mut input, &key_id, chrono::Utc::now())?;
     let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
         Error::Backend(format!(
             "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \

@@ -268,7 +268,7 @@ pub use admission::{
     check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
     check_cohort_scope, check_consensus_protocol_form, check_device_class,
     check_encryption_pubkeys, check_infra_attest_role_admission,
-    check_infra_attest_role_admission_over_roster, check_observed_region,
+    check_infra_attest_role_admission_over_roster, check_observed_region, check_row_column_binding,
     has_accord_conferred_role, has_accord_conferred_role_over_roster, is_canonical,
     is_canonical_effective, is_infra_attest, is_infra_attest_effective, op_withdraw_role,
     supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,

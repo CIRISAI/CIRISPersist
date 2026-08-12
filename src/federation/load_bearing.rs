@@ -972,7 +972,7 @@ pub(crate) mod test_support {
         let (och, ed_sig, pqc_sig) =
             crate::federation::tier_ingest::test_support::sign_envelope(author, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: author.to_owned(),
             attested_key_id: subject.to_owned(),
@@ -994,7 +994,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     async fn verdict(dir: &dyn FederationDirectory, attestation_id: &str) -> LoadBearing {

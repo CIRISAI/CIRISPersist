@@ -1724,6 +1724,10 @@ mod tests {
         replicated.scrub_signature_classical = sig_c;
         replicated.scrub_signature_pqc = sig_p;
         replicated.scrub_key_id = key_id.clone();
+        // v31.0.0 (CIRISPersist#643) — the local mint stamped its mirror at the
+        // LOCAL tier; flipping `tier` does not change any bound column, but the
+        // re-seal is what keeps this fixture honest if it ever edits one.
+        crate::federation::tier_ingest::test_support::reseal(&mut replicated);
         node_b
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: replicated,

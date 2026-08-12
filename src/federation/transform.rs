@@ -750,7 +750,31 @@ fn in_range_value(input: &Value, lo: f64, hi: f64) -> Result<Value, TransformErr
 /// to recognize what's left. Moved here verbatim from
 /// `consent_grammar::PROTECTED_ROOT_MEMBERS` (CIRISPersist#519 item 2a-ii —
 /// ONE strip implementation).
-const PROTECTED_ROOT_MEMBERS: &[&str] = &["dimension", "trace_id"];
+///
+/// v31.0.0 (CIRISPersist#598/#643) — the three SIGNED-TWIN members join the
+/// list: `asserted_at` / `expires_at` (the instants the consent fold orders and
+/// filters on) and `row` (the typed-column mirror carrying the verb and the
+/// field that grants revocation authority). A family transform that stripped
+/// any of them would produce an envelope that no longer states what the row it
+/// travels with says — the exact divergence
+/// [`crate::federation::admission::check_consent_state_instant_binding`] and
+/// [`crate::federation::admission::check_row_column_binding`] refuse, arriving
+/// via a sanctioned door instead of a hostile relay.
+///
+/// **Known residue, stated rather than discovered later:** this protection
+/// covers SINGLE-SEGMENT root paths only, so `strip_field("row/attestation_type")`
+/// still resolves and removes a mirror member. That is not a hole in the
+/// binding — a mirror missing a member fails
+/// [`crate::federation::envelope::RowMirror`] deserialization and the row is
+/// REFUSED at the next door. The protection is here so the loud failure is a
+/// warn at the transform rather than a puzzling refusal one hop later.
+const PROTECTED_ROOT_MEMBERS: &[&str] = &[
+    "dimension",
+    "trace_id",
+    crate::federation::envelope::paths::ASSERTED_AT,
+    crate::federation::envelope::paths::EXPIRES_AT,
+    crate::federation::envelope::paths::ROW,
+];
 
 /// Apply one `strip_field` `path` to `envelope` IN PLACE. `path` is a
 /// `/`-separated JSON pointer (a leading `/` is optional and stripped); a

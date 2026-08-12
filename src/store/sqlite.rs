@@ -3487,6 +3487,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )?;
 
+        // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN BINDING. The
+        // signature covers `attestation_envelope` and NOTHING ELSE, so
+        // `attestation_type` (the VERB), `subject_key_ids` (which grants
+        // revocation authority), `attested_key_id`, `cohort_scope` and
+        // `weight` were unsigned columns a relay could rewrite with the
+        // producer's own signature still verifying — flip `withdraws` to
+        // `scores` and a retraction becomes a claim while the thing it
+        // retracted stays live. Refused on ABSENCE or DIVERGENCE, no legacy
+        // regime. Pure function of the row => AV-76 TIER 1, tier-blind (a
+        // tier-scoped binding would be skippable by writing `tier = "local"`
+        // and promoting), and backend-symmetric across memory / sqlite /
+        // postgres.
+        crate::federation::admission::check_row_column_binding(&row)?;
+
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
         // (notably `global`, a §8.1.8 feed-name, never a wire value)
@@ -20151,14 +20165,14 @@ mod tests {
     /// for local-tier rows is unnecessary — signing them is harmless and
     /// the gate skips them. The matching pubkeys are registered via
     /// [`fed_key`] (same deterministic seed per key_id).
+    /// v31.0.0 (CIRISPersist#643) — delegates to
+    /// [`tier_ingest::test_support::reseal`](crate::federation::tier_ingest::test_support::reseal),
+    /// which ALSO re-stamps the typed-column mirror from the row's own five
+    /// columns before signing. A mutation to `attestation_type` /
+    /// `subject_key_ids` / `attested_key_id` / `cohort_scope` / `weight` is now
+    /// exactly as much a re-sign trigger as a mutation to the envelope.
     fn resign_fed(row: &mut Attestation) {
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &row.attesting_key_id,
-            &row.attestation_envelope,
-        );
-        row.original_content_hash = och;
-        row.scrub_signature_classical = classical;
-        row.scrub_signature_pqc = pqc;
+        crate::federation::tier_ingest::test_support::reseal(row);
     }
 
     fn fed_attestation(
@@ -20229,6 +20243,7 @@ mod tests {
         let canonical_hash = format!("sha256:{}", "0".repeat(64));
         let mut row = fed_attestation("att-ceg06", "host-a", "host-a", "host-a");
         row.subject_key_ids = vec!["subject-1".into(), canonical_hash.clone()];
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row.withdraws_admission_rule = None; // scores row; rule only set on withdraws
 
         backend
@@ -20777,6 +20792,7 @@ mod tests {
         ensure_key(backend, producer).await;
         let mut t = fed_attestation(id, producer, producer, producer);
         t.subject_key_ids = subjects.iter().map(|s| s.to_string()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         backend
             .put_attestation(SignedAttestation { attestation: t })
             .await
@@ -20878,6 +20894,7 @@ mod tests {
         // envelope is mutated, so re-sign for the federation-tier ingest gate.
         let mut t = fed_attestation(&tid, &scorer, &agent, &scorer);
         t.subject_key_ids = vec![agent.clone()];
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         t.attestation_envelope = serde_json::json!({
             "id": tid,
             "dimension": "capacity:sustained_coherence:v1",
@@ -21348,6 +21365,7 @@ mod tests {
             a.tier = tier.to_string();
             if tier == crate::federation::types::attestation_tier::LOCAL {
                 a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+                crate::federation::tier_ingest::test_support::reseal(&mut a);
             }
             a
         };
@@ -28279,6 +28297,7 @@ mod tests {
             .unwrap();
         let mut att = fed_attestation("att-cs-bad", "registry-steward", "k-a", "registry-steward");
         att.cohort_scope = "global".to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -28319,6 +28338,7 @@ mod tests {
             .unwrap();
         let mut att = fed_attestation("att-cs-self", "registry-steward", "k-a", "registry-steward");
         att.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -28955,6 +28975,7 @@ mod tests {
         let mut a = signed_attestation_fixture(attester, attester, attester, SCORES);
         a.attestation_id = id.into();
         a.weight = Some(weight);
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
         a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
         a.attestation_envelope = serde_json::json!({
             "dimension": dimension, "score": score, "confidence": weight,
@@ -28989,6 +29010,7 @@ mod tests {
         let mut a = signed_attestation_fixture(attester, attester, attester, ty);
         a.attestation_id = id.into();
         a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
         a.attestation_envelope = serde_json::json!({
             "references_attestation_id": references, "reason": "t",
         });
@@ -29871,6 +29893,7 @@ mod tests {
             "delegates_to:correlated_action_v2:from:emergent_deception_v1",
         );
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -29949,6 +29972,7 @@ mod tests {
         );
         let mut w2 = w1.clone();
         w2.attestation_id = "w-2".into();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
         backend
             .put_attestation(SignedAttestation { attestation: w1 })
@@ -32655,6 +32679,7 @@ mod tests {
             let mut a = fed_attestation(id, attesting, attested, "emit-a");
             a.asserted_at = at.parse().unwrap();
             a.cohort_scope = scope.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             SignedAttestation { attestation: a }
         };
 
@@ -35509,6 +35534,7 @@ mod tests {
         let mut local = fed_attestation("nm-a3", "nm-prim", "nm-no", "nm-prim");
         local.tier = crate::federation::types::attestation_tier::LOCAL.into();
         local.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut local);
         backend
             .put_attestation(SignedAttestation { attestation: local })
             .await
@@ -39855,6 +39881,17 @@ mod tests {
         .await;
     }
     /// #543 AV-77 — de-admission stops an abuser and is revocable, on sqlite.
+    /// v31.0.0 (CIRISPersist#643) — the typed-column binding, sqlite arm.
+    #[tokio::test]
+    async fn row_column_binding_sqlite_643() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_row_column_binding(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn bootstrap_peer_deadmission_sqlite_543() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

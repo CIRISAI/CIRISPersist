@@ -200,6 +200,73 @@ BREAKING: `Error` gains `OperationalEnvelopeUnbound`; the three operational
 `test_support` builders now stamp `asserted_at` (and the partner builder
 `issued_at`/`expires_at`) into the envelope before signing.
 
+### Fixed — BREAKING — the attestation signature covered the envelope ONLY (#643)
+
+`verify_federation_tier_ingest` verifies the hybrid signature over
+`attestation_envelope` and cross-checks `original_content_hash` against that
+envelope's canonical SHA-256. **That was the entire coverage.** Every typed
+`federation_attestations` column — the ones that decide what a row MEANS — had
+no envelope twin and no gate, so a relay could rewrite one and re-use the
+producer's own untouched signature. Two attacks, both signature-preserving:
+
+1. **Verb substitution.** `references_attestation_id` — the TARGET of a
+   retraction — was inside the signed envelope; `attestation_type` — *whether
+   this is a retraction at all* — was not. Flip `withdraws` → `scores` and the
+   retraction becomes an ordinary claim while the thing it retracted stays live.
+2. **Authority injection.** `resolve_withdraws_admission_rule` returns rule-2
+   revocation standing when a canonical binding hash of the issuer appears in
+   `subject_key_ids`. Appending one in transit handed that key revocation
+   authority over the row.
+
+**BREAK NOW, no grandfathering** — same operator decision as #598, same window,
+before the first agent release on the mesh.
+
+- **`envelope.row`** — ONE object, not N sibling keys, carrying the columns as
+  signed material: `attestation_id`, `attesting_key_id`, `attestation_type`,
+  `attested_key_id`, `subject_key_ids`, `cohort_scope`, `weight`. Closed member
+  set (`deny_unknown_fields`): the mirror is not an extension point.
+  `RowMirror::of` is the ONE definition of the projection, shared by the stamp
+  side and the check side.
+- **`attestation_id` is now signed**, and minted inside
+  `stamp_and_canonicalize` rather than after the signature existed. The same
+  signed bytes can only ever name one row, so the #598 replay (byte-identical
+  envelope, fresh id) is closed structurally rather than only refused.
+- **`check_row_column_binding`** (`admission.rs`) — refuses on ABSENCE or
+  DIVERGENCE, naming the column. AV-76 tier 1 on all three backends, gate for
+  gate and order for order; tier-blind, because `tier` is a caller-supplied
+  string and a local row can be promoted.
+- `subject_key_ids` is compared **ORDER-SENSITIVELY**: no semantic consumer
+  reads position (all are membership tests), but `compute_persist_row_hash` and
+  `wire_index::content_hash_of` serialize it as an ordered array, so a set
+  comparison would let a permutation change the row's content hash and its
+  wire-index address while still satisfying the binding.
+- `weight` is compared **NUMERICALLY, never by token** — `serde_json` is built
+  with `arbitrary_precision`, so `Number == Number` is a string comparison and a
+  postgres JSONB round-trip rewrites the producer's token (#645). The gate is
+  therefore independent of whether V122 has landed.
+- `transform::PROTECTED_ROOT_MEMBERS` gains `row`, `asserted_at`, `expires_at`:
+  a family transform must not strip a signed twin.
+- `ENVELOPE_VOCABULARY_SHA256` **re-pinned** to
+  `0a6f72817eb39d4205ea024ce4a0056112a0614d5a023b8c2c7c88dcfb7264f5`
+  (`row` joined `universal_paths`; its closed member set joined the document as
+  `row_members`). Consumers asserting the old hash break, deliberately.
+- `blobs::emit_withdraws_attestation_helper` (the eviction sweeper's hand-rolled
+  emit recipe) stamps the mirror — without it, persist emitted rows its own
+  put-gate refused.
+- Witness `exercise_row_column_binding`, driven from memory + sqlite + postgres:
+  a control that admits, verb substitution, authority injection, one arm per
+  remaining column, absence, a malformed partial mirror, and a non-vacuity
+  control at the end. Both gate mutations (delete the equality checks; delete
+  only the absence check) turn it red.
+- **Known break, deliberately left failing:** the baked genesis seed
+  (`genesis/canonical_seed.json`) was signed before the mirror existed, so its
+  rows are refused. `genesis_seed_installs_parity_{memory,sqlite}_622`,
+  `bake_real_genesis_v2_artifact_490` and
+  `genesis_candidate_bundle_roots_to_the_family_under_quorum_557` fail until the
+  seed is re-baked with the real ceremony material. A carve-out for baked rows
+  would be a permanent hole in exactly the gate that closes the two attacks
+  above.
+
 ### Fixed — BREAKING — the consent fold ordered on a column no signature covered (#598)
 
 `asserted_at` is a ROW COLUMN, stored **verbatim** from the caller by all three

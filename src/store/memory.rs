@@ -2302,6 +2302,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )?;
 
+        // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN BINDING. The
+        // signature covers `attestation_envelope` and NOTHING ELSE, so
+        // `attestation_type` (the VERB), `subject_key_ids` (which grants
+        // revocation authority), `attested_key_id`, `cohort_scope` and
+        // `weight` were unsigned columns a relay could rewrite with the
+        // producer's own signature still verifying — flip `withdraws` to
+        // `scores` and a retraction becomes a claim while the thing it
+        // retracted stays live. Refused on ABSENCE or DIVERGENCE, no legacy
+        // regime. Pure function of the row => AV-76 TIER 1, tier-blind (a
+        // tier-scoped binding would be skippable by writing `tier = "local"`
+        // and promoting), and backend-symmetric across memory / sqlite /
+        // postgres.
+        crate::federation::admission::check_row_column_binding(&row)?;
+
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
         // (notably `global`, a §8.1.8 feed-name, never a wire value) BEFORE
@@ -7817,6 +7831,18 @@ mod accord_tests {
     /// exercise body the sqlite (`bootstrap_peer_deadmission_sqlite_543`) and
     /// postgres arms run, which is what makes it a parity proof rather than
     /// three tests that happen to agree today.
+    /// v31.0.0 (CIRISPersist#643) — the typed-column binding, memory arm.
+    /// Same shared body as the sqlite + postgres arms: a parity proof, not
+    /// three tests that happen to agree today.
+    #[tokio::test]
+    async fn row_column_binding_memory_643() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_row_column_binding(
+            &backend, "memory",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn bootstrap_peer_deadmission_memory_543() {
         let backend = MemoryBackend::new();
@@ -8465,14 +8491,17 @@ mod tests {
     /// it. Call AFTER any post-construction mutation of
     /// `attestation_envelope` / `attesting_key_id`. Matching pubkeys are
     /// registered via [`fix_key`].
+    ///
+    /// v31.0.0 (CIRISPersist#643) — delegates to
+    /// [`tier_ingest::test_support::reseal`](crate::federation::tier_ingest::test_support::reseal),
+    /// which ALSO re-stamps the typed-column mirror from the row's own five
+    /// columns before signing. A mutation to `attestation_type` /
+    /// `subject_key_ids` / `attested_key_id` / `cohort_scope` / `weight` is now
+    /// exactly as much a re-sign trigger as a mutation to the envelope, and
+    /// keeping both in one helper is what stops a fixture from re-signing half
+    /// the change.
     fn resign_fix(row: &mut Attestation) {
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &row.attesting_key_id,
-            &row.attestation_envelope,
-        );
-        row.original_content_hash = och;
-        row.scrub_signature_classical = classical;
-        row.scrub_signature_pqc = pqc;
+        crate::federation::tier_ingest::test_support::reseal(row);
     }
 
     fn fix_attestation(
@@ -8832,6 +8861,7 @@ mod tests {
     ) -> Attestation {
         let mut att = fix_attestation(id, attesting, attested, scrub_key_id);
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
@@ -9628,6 +9658,7 @@ mod tests {
         // federation} — never a wire value.
         let mut att = fix_attestation("cs-global", "cs-attester", "cs-attested", "cs-attester");
         att.cohort_scope = "global".to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -9649,6 +9680,7 @@ mod tests {
         // Empty string — same closed-set refusal, same kind.
         let mut att = fix_attestation("cs-empty", "cs-attester", "cs-attested", "cs-attester");
         att.cohort_scope = String::new();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -9672,6 +9704,7 @@ mod tests {
                 "cs-attester",
             );
             att.cohort_scope = scope.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut att);
             backend
                 .put_attestation(SignedAttestation { attestation: att })
                 .await
@@ -9911,6 +9944,7 @@ mod tests {
         });
         resign_fix(&mut est); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         est.subject_key_ids = vec!["subj-1".into(), "subj-2".into()];
+        resign_fix(&mut est); // #643 — a typed-column edit is a re-seal trigger
         backend
             .put_attestation(SignedAttestation { attestation: est })
             .await
@@ -10643,6 +10677,7 @@ mod tests {
         );
         let mut w2 = w1.clone();
         w2.attestation_id = "w-2".into();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
         backend
             .put_attestation(SignedAttestation { attestation: w1 })
@@ -12188,6 +12223,7 @@ mod tests {
             crate::federation::trust_root::pre_rotation_commitment(&successors).unwrap();
         let mut d = fix_attestation(id, root, root, root);
         d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut d);
         d.attestation_envelope = serde_json::json!({
             "references_attestation_id": id,
             "scope": scope,
@@ -12211,6 +12247,7 @@ mod tests {
         // Target T: producer `prod`, subjects {s1, s2, canon}.
         let mut t = fix_attestation("t-1", "prod", "prod", "prod");
         t.subject_key_ids = vec!["s1".into(), "s2".into(), "canon".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         backend
             .put_attestation(SignedAttestation { attestation: t })
             .await
@@ -12299,6 +12336,7 @@ mod tests {
         a.attestation_envelope = env;
         resign_fix(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a.subject_key_ids = subject_key_ids.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
         a
     }
 
@@ -14078,6 +14116,7 @@ mod tests {
         // federation rows keep the fixture default.
         if tier == crate::federation::types::attestation_tier::LOCAL {
             a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
         }
         a
     }
@@ -14226,6 +14265,7 @@ mod tests {
 
         // Forged signature → rejected (no put_attestation bypass of the gate).
         forged.attestation_id = "bare-rev-forged".into();
+        crate::federation::tier_ingest::test_support::reseal(&mut forged);
         forged.scrub_signature_classical = "AAAA".into();
         let err = backend
             .put_attestation(SignedAttestation {
@@ -14301,6 +14341,7 @@ mod tests {
         // no FK.)
         let mut target = fix_attestation("T-1", "producer", "producer", "registry-steward");
         target.subject_key_ids = vec![canonical_h.to_string()];
+        crate::federation::tier_ingest::test_support::reseal(&mut target);
         backend
             .put_attestation(SignedAttestation {
                 attestation: target.clone(),
@@ -15029,6 +15070,7 @@ mod tests {
         let bare_env = serde_json::json!({ "id": "bk-1", "dimension": "identity_binding:v1" });
         let mut row = fix_attestation("bk-1", "bk-prim", "bk-no", "bk-prim");
         row.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         refused(
             check_no_moderator_federate_apply(&b, &row)
                 .await
@@ -15038,6 +15080,7 @@ mod tests {
         // Same shape onto the MODERATORED community → ADMIT.
         let mut ok_row = fix_attestation("bk-2", "bk-user", "bk-ok", "bk-user");
         ok_row.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut ok_row);
         check_no_moderator_federate_apply(&b, &ok_row)
             .await
             .expect("membership-shaped row onto a moderatored community is admitted");
@@ -15051,6 +15094,7 @@ mod tests {
         // (2) EMITTED-BY-C shape — attesting_key_id = the community → REJECT.
         let mut by_c = fix_attestation("bk-3", "bk-no", "bk-prim", "bk-no");
         by_c.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut by_c);
         refused(
             check_no_moderator_federate_apply(&b, &by_c)
                 .await
@@ -15062,6 +15106,7 @@ mod tests {
         let mut subj = fix_attestation("bk-4", "bk-prim", "bk-prim", "bk-prim");
         subj.attestation_envelope = bare_env.clone();
         subj.subject_key_ids = vec!["not-a-community".into(), "bk-no".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut subj);
         refused(
             check_no_moderator_federate_apply(&b, &subj)
                 .await
@@ -15070,6 +15115,7 @@ mod tests {
         );
         let mut subj_ok = subj.clone();
         subj_ok.subject_key_ids = vec!["not-a-community".into(), "bk-ok".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut subj_ok);
         check_no_moderator_federate_apply(&b, &subj_ok)
             .await
             .expect("subject-keyed row onto a moderatored community is admitted");
@@ -15595,6 +15641,7 @@ mod tests {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut att = fix_attestation(id, owner, node, owner);
         att.attestation_type = attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
@@ -15676,6 +15723,7 @@ mod tests {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut att = fix_attestation(id, owner, node, owner);
         att.attestation_type = attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         // CC 2.4.1.2 marker ONLY (no `dimension`). Carries the infra scopes so
         // it clears the node-agency gate and actually reaches the single-owner
         // gate under test (the marker recognition is the thing being proven).
@@ -15934,6 +15982,7 @@ mod tests {
         let delegate = |id: &str, granter: &str, grantee: &str, sub: bool| {
             let mut d = fix_attestation(id, granter, grantee, granter);
             d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut d);
             d.attestation_envelope = serde_json::json!({
                 "references_attestation_id": id,
                 "scope": [DELEGATION_SCOPE_MODERATE],
@@ -16332,6 +16381,7 @@ mod tests {
         let delegate = |id: &str, granter: &str, grantee: &str| {
             let mut d = fix_attestation(id, granter, grantee, granter);
             d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut d);
             d.attestation_envelope = serde_json::json!({
                 "references_attestation_id": id,
                 "scope": [DELEGATION_SCOPE_MODERATE],
@@ -16481,6 +16531,7 @@ mod tests {
         let row = |attn: &str, attesting: &str, attested: &str| {
             let mut a = fix_attestation("rp-att", attesting, attested, attesting);
             a.attestation_type = attn.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             a
         };
 
@@ -16613,6 +16664,7 @@ mod tests {
         // Federation put: refused before signature/directory work.
         let mut row = fix_attestation("cap-fed", "cap-k", "cap-k", "cap-k");
         row.attestation_envelope = oversize.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         let err = backend
             .put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
@@ -16909,6 +16961,7 @@ mod tests {
             a.scrub_signature_classical = sc_sig;
             a.scrub_signature_pqc = sp_sig;
             a.scrub_key_id = from.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             match backend
                 .put_attestation(crate::federation::SignedAttestation { attestation: a })
                 .await
@@ -17400,6 +17453,7 @@ mod tests {
     ) -> Attestation {
         let mut att = fix_attestation(id, steward, ward, steward);
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let mut env = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),

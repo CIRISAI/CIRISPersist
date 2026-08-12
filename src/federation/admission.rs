@@ -3818,6 +3818,212 @@ pub fn check_consent_state_instant_binding(
     Ok(())
 }
 
+/// v31.0.0 (CIRISPersist#643) — **THE TYPED-COLUMN BINDING GATE.**
+///
+/// # What was open
+///
+/// [`crate::federation::tier_ingest::verify_federation_tier_ingest`] verifies
+/// the hybrid signature over `attestation_envelope` and cross-checks
+/// `original_content_hash` against that envelope's canonical SHA-256. **That
+/// is the entire coverage.** Five typed `federation_attestations` columns —
+/// the ones that decide what a row MEANS — had no envelope twin and no gate:
+///
+/// | column | what it decides |
+/// |---|---|
+/// | `attestation_type` | **the VERB** (`scores` / `withdraws` / `supersedes` / `recants` / `delegates_to`) |
+/// | `subject_key_ids` | **grants revocation authority** ([`resolve_withdraws_admission_rule`] rules 2/3/4) |
+/// | `attested_key_id` | who the claim is ABOUT |
+/// | `cohort_scope` | who may SEE it |
+/// | `weight` | how much it COUNTS |
+///
+/// Two attacks, both **signature-preserving** — the relay changes a column,
+/// re-uses the producer's own untouched signature, and the row verifies:
+///
+/// 1. **Verb substitution.** `references_attestation_id` — the TARGET of a
+///    retraction — is inside the signed envelope; `attestation_type` —
+///    *whether this is a retraction at all* — was not. Flip `withdraws` →
+///    `scores` and the retraction becomes an ordinary claim while the thing it
+///    retracted stays live. The reverse holds too.
+/// 2. **Authority injection.** [`withdraws_admission_rule_for`] returns rule 2
+///    standing (see [`resolve_withdraws_admission_rule`]) when a canonical
+///    binding hash of the issuer appears in
+///    `T.subject_key_ids`. APPENDING such a hash in transit therefore hands
+///    that key revocation authority over the row, with the producer's
+///    signature still valid because the field was never in the signed bytes.
+///
+/// # What this refuses
+///
+/// Every row at every `put_attestation`, all fail-closed:
+///
+/// 1. **ABSENCE** — the envelope carries no [`paths::ROW`] object. Refused, not
+///    tolerated: a row nobody bound is a row anybody can rewrite, and the
+///    operator's standing decision on this break window (#598, #640, #643) is
+///    to break NOW, before the first agent release on the mesh. There is no
+///    grandfathering regime and no compatibility flag to find later.
+/// 2. **DIVERGENCE** of any of the five, each named individually so the
+///    refusal says which column was rewritten.
+///
+/// `subject_key_ids` is compared **ORDER-SENSITIVELY** — see [`RowMirror`] for
+/// why the list is pinned rather than set-compared.
+///
+/// # Shape and placement
+///
+/// This is [`verify_signed_transport_destination`]'s discipline generalized —
+/// that gate already refuses exactly this divergence for the route plane
+/// ("typed {what} diverges from the signed envelope") — minus the signature
+/// verification, which the surrounding write path already performs over the
+/// same envelope bytes. Pure function of `row`: no directory read, no crypto,
+/// no lock ⇒ AV-76 TIER 1 on all three backends, gate for gate and order for
+/// order, immediately after the #598 instant binding it generalizes.
+///
+/// **Tier-blind, deliberately.** `tier` is a caller-supplied string, so a
+/// tier-scoped binding would be skippable by writing `tier = "local"` — and a
+/// local row can be PROMOTED into the federation plane. Same posture as
+/// [`check_consent_state_instant_binding`].
+///
+/// [`paths::ROW`]: crate::federation::envelope::paths::ROW
+/// [`RowMirror`]: crate::federation::envelope::RowMirror
+pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::envelope::{paths, row_paths, RowMirror};
+
+    let Some(raw) = row.attestation_envelope.get(paths::ROW) else {
+        return Err(Error::InvalidArgument(format!(
+            "attestation {} carries no signed `{}` object in its envelope. The signature covers \
+             `attestation_envelope` and NOTHING ELSE, so `attestation_type` (the verb), \
+             `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
+             `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
+             signature still verified. An unbound row is REFUSED (no legacy regime; \
+             CIRISPersist#643)",
+            row.attestation_id,
+            paths::ROW,
+        )));
+    };
+    let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
+        Error::InvalidArgument(format!(
+            "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
+             (members are exactly {:?}; CIRISPersist#643)",
+            row.attestation_id,
+            paths::ROW,
+            [
+                row_paths::ATTESTATION_TYPE,
+                row_paths::ATTESTED_KEY_ID,
+                row_paths::SUBJECT_KEY_IDS,
+                row_paths::COHORT_SCOPE,
+                row_paths::WEIGHT,
+            ],
+        ))
+    })?;
+
+    // THE typed projection — ONE definition, shared with the stamp side.
+    let expected = RowMirror::of(row)?;
+
+    let diverges = |member: &str, typed: String, signed: String| {
+        Error::InvalidArgument(format!(
+            "attestation {}: typed `{member}` {typed} diverges from the signed envelope's \
+             {signed} (rejected — CIRISPersist#643)",
+            row.attestation_id,
+        ))
+    };
+
+    // THE ROW'S IDENTITY. First, because it is what makes a REPLAY of an
+    // otherwise-valid signed envelope structurally impossible: same bytes ⇒
+    // same id ⇒ the PK dedup absorbs the resubmission.
+    if mirror.attestation_id != expected.attestation_id {
+        return Err(diverges(
+            row_paths::ATTESTATION_ID,
+            format!("{:?}", expected.attestation_id),
+            format!("{:?}", mirror.attestation_id),
+        ));
+    }
+    if mirror.attesting_key_id != expected.attesting_key_id {
+        return Err(diverges(
+            row_paths::ATTESTING_KEY_ID,
+            format!("{:?}", expected.attesting_key_id),
+            format!("{:?}", mirror.attesting_key_id),
+        ));
+    }
+    // THE VERB. Verb substitution is the attack that turns a retraction into
+    // an ordinary claim.
+    if mirror.attestation_type != expected.attestation_type {
+        return Err(diverges(
+            row_paths::ATTESTATION_TYPE,
+            format!("{:?}", expected.attestation_type),
+            format!("{:?}", mirror.attestation_type),
+        ));
+    }
+    // THE AUTHORITY. Order-sensitive (see `RowMirror`): a permutation changes
+    // `persist_row_hash` and the wire-index address, so a set comparison would
+    // move the divergence rather than close it.
+    if mirror.subject_key_ids != expected.subject_key_ids {
+        return Err(diverges(
+            row_paths::SUBJECT_KEY_IDS,
+            format!("{:?}", expected.subject_key_ids),
+            format!("{:?}", mirror.subject_key_ids),
+        ));
+    }
+    if mirror.attested_key_id != expected.attested_key_id {
+        return Err(diverges(
+            row_paths::ATTESTED_KEY_ID,
+            format!("{:?}", expected.attested_key_id),
+            format!("{:?}", mirror.attested_key_id),
+        ));
+    }
+    if mirror.cohort_scope != expected.cohort_scope {
+        return Err(diverges(
+            row_paths::COHORT_SCOPE,
+            format!("{:?}", expected.cohort_scope),
+            format!("{:?}", mirror.cohort_scope),
+        ));
+    }
+    // `weight` is bound in BOTH directions (absent ⇔ column `None`) for the
+    // same reason `expires_at` is: an unsigned weight is an unsigned volume
+    // knob on a signed claim (`trust_scoring` / `topology` fold
+    // `weight.unwrap_or(1.0)`).
+    //
+    // **Compared NUMERICALLY, never by token** (v31.0.0, CIRISPersist#643 ×
+    // #645). `serde_json` is built here with `arbitrary_precision`, so a
+    // `Number` carries the producer's literal token and `Number == Number` is a
+    // STRING comparison: `1e+2` and `100` are the same weight and different
+    // tokens. Postgres makes that concrete — a JSONB round-trip rewrites the
+    // producer's token (#645 measured `1e+2` → `100` through the real write/read
+    // path on PG16), so a token comparison would refuse a replicated row for a
+    // reason that has nothing to do with an attacker, and would do it only on
+    // one backend. Going through `as_f64` makes this gate independent of
+    // whether V122 (envelope columns JSONB→TEXT) has landed.
+    let mirror_weight = match &mirror.weight {
+        None => None,
+        Some(n) => Some(n.as_f64().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "attestation {}: signed envelope `{}.{}` {n} is not a finite JSON number \
+                 (CIRISPersist#643)",
+                row.attestation_id,
+                paths::ROW,
+                row_paths::WEIGHT,
+            ))
+        })?),
+    };
+    if mirror_weight != row.weight {
+        return Err(diverges(
+            row_paths::WEIGHT,
+            format!("{:?}", row.weight),
+            format!("{mirror_weight:?}"),
+        ));
+    }
+    // Belt and braces: the compared members ARE the whole mirror (the struct is
+    // `deny_unknown_fields`), so a residual inequality here would mean a member
+    // was added to `RowMirror` without a comparison arm. `weight` is normalized
+    // out first because it is the one member compared by value rather than by
+    // token — see above.
+    debug_assert_eq!(
+        RowMirror {
+            weight: expected.weight.clone(),
+            ..mirror
+        },
+        expected
+    );
+    Ok(())
+}
+
 /// v21.6.0 (CIRISPersist#519 item 2a-iii) — the SIGNED touch-claim
 /// admission gate: the freshness-floor mirror of
 /// [`verify_signed_transport_destination`], closing the same class of hole
@@ -14797,29 +15003,32 @@ pub(crate) mod r2_test_support {
         let envelope = serde_json::json!({ "dimension": dimension, "score": 0.5 });
         let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
         SignedAttestation {
-            attestation: Attestation {
-                attestation_id: id.to_owned(),
-                attesting_key_id: author.to_owned(),
-                attested_key_id: author.to_owned(),
-                attestation_type: attestation_type::SCORES.to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: ed_sig,
-                scrub_signature_pqc: pqc_sig,
-                scrub_key_id: author.to_owned(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-                tier: attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                author,
+                Attestation {
+                    attestation_id: id.to_owned(),
+                    attesting_key_id: author.to_owned(),
+                    attested_key_id: author.to_owned(),
+                    attestation_type: attestation_type::SCORES.to_owned(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: ed_sig,
+                    scrub_signature_pqc: pqc_sig,
+                    scrub_key_id: author.to_owned(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                    tier: attestation_tier::FEDERATION.to_owned(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            ),
         }
     }
 
@@ -14927,7 +15136,7 @@ pub(crate) mod r2_test_support {
         for (id, from, to, _dim, envelope) in rows {
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
-            let att = Attestation {
+            let mut att = Attestation {
                 attestation_id: id,
                 attesting_key_id: from.to_owned(),
                 attested_key_id: to.to_owned(),
@@ -14951,6 +15160,7 @@ pub(crate) mod r2_test_support {
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             };
+            crate::federation::tier_ingest::test_support::seal_row_in_place(from, &mut att);
             match dir
                 .put_attestation(crate::federation::SignedAttestation { attestation: att })
                 .await
@@ -15004,29 +15214,32 @@ pub(crate) mod r2_test_support {
         let now = chrono::Utc::now().with_nanosecond(0).expect("truncate");
 
         let att = crate::federation::types::SignedAttestation {
-            attestation: crate::federation::Attestation {
-                attestation_id: id.clone(),
-                attesting_key_id: author.clone(),
-                attested_key_id: subject.clone(),
-                attestation_type: "scores".to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: author.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: Some(now),
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &author,
+                crate::federation::Attestation {
+                    attestation_id: id.clone(),
+                    attesting_key_id: author.clone(),
+                    attested_key_id: subject.clone(),
+                    attestation_type: "scores".to_owned(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: sc,
+                    scrub_signature_pqc: sp,
+                    scrub_key_id: author.clone(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: Some(now),
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                    tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            ),
         };
         dir.put_attestation(att)
             .await
@@ -15424,29 +15637,32 @@ pub(crate) mod r2_test_support {
              or this witness cannot fail"
         );
         let att = crate::federation::SignedAttestation {
-            attestation: crate::federation::Attestation {
-                attestation_id: id.clone(),
-                attesting_key_id: author.clone(),
-                attested_key_id: author.clone(),
-                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: author.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: Some(now),
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &author,
+                crate::federation::Attestation {
+                    attestation_id: id.clone(),
+                    attesting_key_id: author.clone(),
+                    attested_key_id: author.clone(),
+                    attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: sc,
+                    scrub_signature_pqc: sp,
+                    scrub_key_id: author.clone(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: Some(now),
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                    tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            ),
         };
         dir.put_attestation(att)
             .await
@@ -15569,29 +15785,32 @@ pub(crate) mod r2_test_support {
         });
         let (och, ed_sig, pqc_sig) = sign_envelope(&publisher, &envelope);
         dir.put_attestation(SignedAttestation {
-            attestation: Attestation {
-                attestation_id: rating_id.clone(),
-                attesting_key_id: publisher.clone(),
-                attested_key_id: publisher.clone(),
-                attestation_type: attestation_type::SCORES.to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: ed_sig,
-                scrub_signature_pqc: pqc_sig,
-                scrub_key_id: publisher.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-                tier: attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &publisher,
+                Attestation {
+                    attestation_id: rating_id.clone(),
+                    attesting_key_id: publisher.clone(),
+                    attested_key_id: publisher.clone(),
+                    attestation_type: attestation_type::SCORES.to_owned(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: ed_sig,
+                    scrub_signature_pqc: pqc_sig,
+                    scrub_key_id: publisher.clone(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                    tier: attestation_tier::FEDERATION.to_owned(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            ),
         })
         .await
         .expect(
@@ -15698,29 +15917,32 @@ pub(crate) mod r2_test_support {
             let envelope = serde_json::json!({ "dimension": dimension });
             let (och, ed_sig, pqc_sig) = sign_envelope(&author, &envelope);
             SignedAttestation {
-                attestation: Attestation {
-                    attestation_id: id.to_owned(),
-                    attesting_key_id: author.clone(),
-                    attested_key_id: about.to_owned(),
-                    attestation_type: dimension.to_owned(),
-                    weight: None,
-                    asserted_at: now,
-                    expires_at: None,
-                    attestation_envelope: envelope,
-                    original_content_hash: och,
-                    scrub_signature_classical: ed_sig,
-                    scrub_signature_pqc: pqc_sig,
-                    scrub_key_id: author.clone(),
-                    scrub_timestamp: now,
-                    pqc_completed_at: None,
-                    persist_row_hash: String::new(),
-                    subject_key_ids: Vec::new(),
-                    withdraws_admission_rule: None,
-                    cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-                    tier: attestation_tier::FEDERATION.to_owned(),
-                    promoted_at: None,
-                    additional_scrubs: Vec::new(),
-                },
+                attestation: crate::federation::tier_ingest::test_support::seal_row(
+                    &author,
+                    Attestation {
+                        attestation_id: id.to_owned(),
+                        attesting_key_id: author.clone(),
+                        attested_key_id: about.to_owned(),
+                        attestation_type: dimension.to_owned(),
+                        weight: None,
+                        asserted_at: now,
+                        expires_at: None,
+                        attestation_envelope: envelope,
+                        original_content_hash: och,
+                        scrub_signature_classical: ed_sig,
+                        scrub_signature_pqc: pqc_sig,
+                        scrub_key_id: author.clone(),
+                        scrub_timestamp: now,
+                        pqc_completed_at: None,
+                        persist_row_hash: String::new(),
+                        subject_key_ids: Vec::new(),
+                        withdraws_admission_rule: None,
+                        cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                        tier: attestation_tier::FEDERATION.to_owned(),
+                        promoted_at: None,
+                        additional_scrubs: Vec::new(),
+                    },
+                ),
             }
         };
 
@@ -15927,7 +16149,7 @@ pub(crate) mod steward_liveness_test_support {
     ) -> Attestation {
         let (och, classical, pqc) = sign_envelope(signer, &envelope);
         let ts = Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: signer.to_owned(),
             attested_key_id: attested.to_owned(),
@@ -15949,7 +16171,10 @@ pub(crate) mod steward_liveness_test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(signer, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// A `delegates_to(granter → recipient)`. `subjects` fills
@@ -15973,6 +16198,7 @@ pub(crate) mod steward_liveness_test_support {
             }),
         );
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row
     }
 
@@ -16456,6 +16682,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             }),
         );
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row
     }
 
@@ -17235,6 +17462,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             }),
         );
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         row
     }
 
@@ -17472,7 +17700,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         for (id, by, about, dim, env) in rows {
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(by, &env);
-            let att = Attestation {
+            let mut att = Attestation {
                 attestation_id: id,
                 attesting_key_id: by.to_owned(),
                 attested_key_id: about.to_owned(),
@@ -17496,6 +17724,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             };
+            crate::federation::tier_ingest::test_support::seal_row_in_place(by, &mut att);
             dir.put_attestation(crate::federation::SignedAttestation { attestation: att })
                 .await
                 .unwrap_or_else(|e| panic!("{dim} row must admit: {e}"));

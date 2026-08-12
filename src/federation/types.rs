@@ -1150,6 +1150,12 @@ pub mod delegation_scope {
             "the envelope FIELD NAME (\"scope\"), not a value that field may hold",
         ),
         (
+            "envelope::COHORT_SCOPE",
+            "v31.0.0 (CIRISPersist#643) — a MEMBER NAME inside the signed typed-column mirror \
+             (`envelope::row_paths::COHORT_SCOPE` = \"cohort_scope\"), not a delegates_to scope \
+             value. Its own closed inventory is types::cohort_scope",
+        ),
+        (
             "admission::ANALYZE_CONSENT_SCOPE",
             "CC 3.3.1's `analyze` CONSENT-GRAMMAR kind, pinned to \
              consent_grammar::TransmissionPrinciple::Analyze — a different vocabulary from \

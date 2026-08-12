@@ -490,6 +490,7 @@ mod tests {
         let (id, attester, mut row) = build_row(dir, suffix, dimension).await;
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         dir.put_attestation(SignedAttestation { attestation: row })
             .await?;
         Ok((id, attester))

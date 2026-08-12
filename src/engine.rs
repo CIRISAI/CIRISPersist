@@ -405,29 +405,32 @@ pub mod teardown {
                 &envelope,
             );
             let now = chrono::Utc::now();
-            let att = crate::federation::Attestation {
-                attestation_id: uuid::Uuid::new_v4().to_string(),
-                attesting_key_id: "probe-stranger".into(),
-                attested_key_id: "probe-victim".into(),
-                attestation_type: "age_assurance:government:adult:v1".into(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: "probe-stranger".into(),
-                scrub_timestamp: now,
-                pqc_completed_at: Some(now),
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: "federation".into(),
-                tier: "federation".into(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            };
+            let att = crate::federation::tier_ingest::test_support::seal_row(
+                "probe-stranger",
+                crate::federation::Attestation {
+                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    attesting_key_id: "probe-stranger".into(),
+                    attested_key_id: "probe-victim".into(),
+                    attestation_type: "age_assurance:government:adult:v1".into(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: sc,
+                    scrub_signature_pqc: sp,
+                    scrub_key_id: "probe-stranger".into(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: Some(now),
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: "federation".into(),
+                    tier: "federation".into(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            );
             let err = crate::federation::FederationDirectory::put_attestation(
                 sq.as_ref(),
                 crate::federation::SignedAttestation { attestation: att },
@@ -3816,7 +3819,7 @@ impl Engine {
         // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input)?;
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
@@ -3864,7 +3867,7 @@ impl Engine {
         // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input)?;
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
         // so a hardware-hybrid engine can emit here.
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
@@ -3915,7 +3918,7 @@ impl Engine {
         // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
         // envelope before the bytes are signed; `assemble` reads them back out
         // instead of sampling a second clock after the signature exists.
-        let canonical = Self::emit_canonicalize(&mut input)?;
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "assemble_attestation_self sign_hybrid: {e} — a conformant federation-tier row \
@@ -3942,11 +3945,20 @@ impl Engine {
     /// before the bytes exist, so the signature covers them and
     /// [`assemble`](crate::federation::attestation_emit::assemble) can read
     /// them back out instead of sampling its own clock afterwards.
+    ///
+    /// v31.0.0 (CIRISPersist#643) — takes the signer's DERIVED `key_id` too:
+    /// the typed-column mirror stamped here must carry the EFFECTIVE
+    /// `attested_key_id`, which for a self-attestation is that key_id.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn emit_canonicalize(
         input: &mut crate::federation::EmitAttestationInput,
+        attesting_key_id: &str,
     ) -> Result<Vec<u8>, crate::federation::Error> {
-        crate::federation::attestation_emit::stamp_and_canonicalize(input, chrono::Utc::now())
+        crate::federation::attestation_emit::stamp_and_canonicalize(
+            input,
+            attesting_key_id,
+            chrono::Utc::now(),
+        )
     }
 
     /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
@@ -11510,6 +11522,7 @@ mod tests {
             );
             row.tier = attestation_tier::LOCAL.to_owned();
             row.cohort_scope = cohort_scope::SELF.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             row
         };
 
@@ -11553,6 +11566,7 @@ mod tests {
         );
         ok_row.tier = attestation_tier::LOCAL.to_owned();
         ok_row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut ok_row);
         sq.put_attestation(SignedAttestation {
             attestation: ok_row,
         })
@@ -11632,6 +11646,7 @@ mod tests {
         );
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         sq.put_attestation(SignedAttestation { attestation: row })
             .await
             .expect("#589: the local row admits while its author is in good standing");
