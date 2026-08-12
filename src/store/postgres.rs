@@ -2244,7 +2244,7 @@ impl Backend for PostgresBackend {
         Ok(out)
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
 
     async fn put_installed_storage_budget(
         &self,
@@ -2960,7 +2960,7 @@ impl PostgresBackend {
             } else {
                 Some(&row.capability_roles)
             };
-            // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — wire None ⇔ the
+            // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — wire None ⇔ the
             // stored V020 'unregistered' default (column is NOT NULL).
             crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
             let consent_role_stored = crate::federation::types::consent_role::stored_from_wire(
@@ -3039,7 +3039,7 @@ impl PostgresBackend {
                 row.algorithm
             )));
         }
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
         // self-signed → anchor-scrubbed UPDATE that CAN change identity_type,
         // so it is a second path a `canonical` role could otherwise enter on.
         // Re-run the accord-conferred gate: `canonical` is admitted here only
@@ -3099,7 +3099,7 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // WHERE re-asserts the guards atomically: self-signed + same pubkey.
         //
-        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
         // deliberately NOT in the SET list — it is an operational role
         // marker (its OQ-1 overwrite surface is `set_consent_role`), not
         // registration content; an anchor-scrub upgrade must not clobber
@@ -3290,7 +3290,7 @@ impl PostgresBackend {
         Ok(ReplicatedKeyOutcome::Superseded)
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply** — Postgres twin of
     /// [`SqliteBackend::apply_replicated_key_record`](crate::store::sqlite::SqliteBackend::apply_replicated_key_record).
     /// All policy lives in the shared, backend-agnostic
@@ -3359,7 +3359,7 @@ impl PostgresBackend {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: `federation_keys` rows whose
     /// `identity_type` **set** contains
     /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
@@ -3592,7 +3592,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )?;
         }
 
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
         // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
         // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
         // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
@@ -3647,7 +3647,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } else {
             Some(&row.capability_roles)
         };
-        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
         // token (Rust-level, so PG's V020 CHECK and CHECK-less SQLite
         // behave identically), then map wire None ⇔ the stored V020
         // 'unregistered' default (the column is NOT NULL).
@@ -3810,7 +3810,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_key_record).collect()
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
     /// consent_role. Flat UPDATE of the single V020 column; `None` resets
     /// to the stored `'unregistered'` default (revoke). No chain — a
     /// subsequent call overwrites. Excluded from `persist_row_hash`, so
@@ -4456,7 +4456,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate (parity with the sqlite + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
         // recipient (`attested_key_id`) resolves to a node-ONLY identity it
@@ -7189,7 +7189,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // payload — and GUARDED monotonic on (epoch, asserted_at)
         // lexicographic. A stale assertion is a silent no-op.
         //
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
         // unsigned writer never demotes a signed row (signature columns
         // preserved unconditionally; a content-CHANGING unsigned write
         // against a signed row is a silent no-op). See the sqlite twin's
@@ -7309,7 +7309,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?
             .map(|row| pg_row_to_transport_destination(&row))
             .transpose()?;
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
         // monotonic-clock refusal applies only against a stored row that is
         // itself SIGNED; a signed write always reclaims an unsigned row
         // (occurrence-projection / announce state) regardless of clocks.
@@ -10248,7 +10248,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
         let roles_param: Option<&Vec<String>> = None;
-        // v12.7.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
+        // v13.0.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
         let consent_role_stored =
             crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
                 .to_owned();
@@ -13076,7 +13076,7 @@ impl PostgresBackend {
                 // the signer's holds_bytes index (no attesting_key_id
                 // column on federation_blobs).
                 attesting_key_id: None,
-                // v12.7.0 (§Q B5, #370): the corpus-class token the
+                // v13.0.0 (§Q B5, #370): the corpus-class token the
                 // Engine matches against the installed pinned_class set.
                 media_type,
             });
@@ -13084,7 +13084,7 @@ impl PostgresBackend {
         Ok(out)
     }
 
-    /// v12.7.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
+    /// v13.0.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
     /// blobs whose `media_type` is one of `media_types` (the installed
     /// `pinned_class` set). This is the §Q "consumption accounting is
     /// edge-internal — recomputed from held content" number the sweep uses
@@ -14106,7 +14106,7 @@ fn pg_row_to_key_record(
         .try_get::<_, Option<serde_json::Value>>("attestation_evidence")
         .ok()
         .flatten();
-    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
+    // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
     // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
     // (matching roles/attestation_evidence above) — a SELECT that didn't
     // pull the column maps to None, and the stored 'unregistered'
@@ -20318,7 +20318,7 @@ mod tests {
         .await;
     }
 
-    /// v24.4.0 (CIRISPersist#583) on POSTGRES: the quota's BYTE dimension is
+    /// v25.1.0 (CIRISPersist#583) on POSTGRES: the quota's BYTE dimension is
     /// charged from the real envelope, through the real host API. Every write
     /// in the body is refused by the pure tier-1 `check_cohort_scope`, so
     /// this costs the test DB nothing.
@@ -21696,7 +21696,7 @@ mod tests {
         assert_eq!(got.conformity_variant, ConformityVariant::Numeric);
     }
 
-    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure on PG: hard-
+    /// v7.0.0 (CIRISPersist#222) — full Art. 17 erasure on PG: hard-
     /// delete the agent's trace_events + trace_llm_calls across all keys,
     /// TOMBSTONE the derived detection_events (PII NULLed, erased_at set,
     /// row retained), emit the audit row, idempotent. Self-isolating:
@@ -23990,7 +23990,7 @@ mod tests {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
     /// through put/lookup, OQ-1 overwrite-on-revoke via set_consent_role,
     /// and the consent_role_of resolver — on the Postgres twin. Gated on a
     /// live test PG (skips when `CIRIS_PERSIST_TEST_PG_URL` is unset).
@@ -28098,7 +28098,7 @@ mod tests {
         );
     }
 
-    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
     /// on-node-key gate, PG backend (3-backend parity with memory +
     /// sqlite). Covers (a) infra-only → ADMITTED, (b) agency:* → REJECTED
     /// + not stored, (b') legacy unprefixed agency → REJECTED, (c) empty
@@ -36849,7 +36849,7 @@ mod tests {
         assert!(granters.contains(dt_g1.as_str()) && granters.contains(dt_g2.as_str()));
     }
 
-    /// v12.7.0 (#371) — postgres twin of
+    /// v13.0.0 (#371) — postgres twin of
     /// `store::sqlite::tests::apply_replicated_key_record_ambiguous_owner_refused_sqlite`:
     /// a node carrying TWO live owner-bindings (the second a PRE-GATE
     /// anomaly, raw-SQL-inserted past the v12.6.0 single-owner admission

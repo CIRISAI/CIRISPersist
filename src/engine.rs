@@ -1614,7 +1614,7 @@ impl Engine {
             }
         };
 
-        // v12.7.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
+        // v13.0.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
         // StorageBudgetV1 state (V092; written only after the PQC-mandatory
         // verify + B3 anti-rollback in `install_storage_budget_v1`) into
         // this cycle's pin classification:
@@ -1888,7 +1888,7 @@ impl Engine {
         }
     }
 
-    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys).
     ///
@@ -2121,9 +2121,9 @@ impl Engine {
         }
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
 
-    /// v12.7.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
+    /// v13.0.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
     /// signed `StorageBudgetV1` so it GOVERNS this node's capacity
     /// eviction (#356 shipped build/verify as wire-negotiation only).
     /// Three gates, in order:
@@ -3775,7 +3775,7 @@ impl Engine {
     /// `attested_key_id` defaults to the derived key_id (self-attestation)
     /// when [`EmitAttestationInput::attested_key_id`] is `None`.
     ///
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
     /// [`EmitAttestationInput::attested_key_id`] names the row's **SUBJECT**
     /// (the natural CEG cross-subject edge target, exactly how
     /// [`Self::grant_delegation`] keys a `delegates_to` by its recipient).
@@ -4044,7 +4044,7 @@ impl Engine {
     /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
     ///
-    /// v12.7.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
+    /// v13.0.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
     /// governed by the user-target steward-binding gate
     /// ([`check_user_target_steward_binding_admission`](crate::federation::admission::check_user_target_steward_binding_admission)):
     /// the ONLY admissible user-target shapes are **minor-guardianship**
@@ -5920,7 +5920,7 @@ impl Engine {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**: the anti-entropy apply the edge replication bridge routes
     /// `apply_key` to instead of raw
     /// [`put_public_key`](crate::federation::FederationDirectory::put_public_key)
@@ -5965,7 +5965,7 @@ impl Engine {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? True iff its `federation_keys` row's
     /// `identity_type` set contains `canonical`. Because the admission gate
     /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
@@ -5983,7 +5983,7 @@ impl Engine {
         crate::federation::is_canonical_effective(directory.as_ref(), key_id).await
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: all `federation_keys` rows whose
     /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.
     /// Every returned row is (by the admission gate) anchor-scrub-conferred —
@@ -10369,7 +10369,7 @@ mod tests {
         );
     }
 
-    // ─── v12.7.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
+    // ─── v13.0.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
 
     /// §Q signer for the budget wires: a deterministic-enough hybrid pair
     /// (fresh per test; the pubkeys ride along). Built + used SYNCHRONOUSLY
@@ -13745,7 +13745,7 @@ mod tests {
         );
     }
 
-    // ── v12.7.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
+    // ── v13.0.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
     // Witness-targets-subject age graduation over the REAL emit path, and
     // the minor-guardianship admit + steward-less-minor fail-secure driven
     // end-to-end over `emit_attestation` / `grant_delegation` /

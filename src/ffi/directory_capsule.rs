@@ -2498,7 +2498,7 @@ impl FederationDirectory for OpsDirectory {
         _key_id: &str,
         _consent_role: Option<&str>,
     ) -> Result<(), Error> {
-        // v12.7.0 (CIRISPersist#365) — no DirectoryOp in the capsule
+        // v13.0.0 (CIRISPersist#365) — no DirectoryOp in the capsule
         // protocol carries consent_role mutation; not routable here.
         Err(Error::Unsupported {
             method: "set_consent_role",

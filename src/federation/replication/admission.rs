@@ -154,7 +154,7 @@ impl AdmissionGate {
 
 // ─────────────────────── QUOTA CONSTANTS — BEGIN ───────────────────────
 //
-// v24.4.0 (CIRISPersist#583) — everything between this marker and the END
+// v25.1.0 (CIRISPersist#583) — everything between this marker and the END
 // marker is **derivation-gated**. `tests::every_quota_constant_is_derived`
 // scans this block out of the source at test time and fails if a constant
 // here lacks a `**Bounds:**` line (what it bounds), a `**Derived:**` line
@@ -189,7 +189,7 @@ impl AdmissionGate {
 /// [`PER_PEER_SUSTAINED_WRITES_PER_WINDOW`], a second bucket charged by the
 /// same write.
 ///
-/// v24.4.0 (CIRISPersist#583) — and it is now explicitly the **many-small**
+/// v25.1.0 (CIRISPersist#583) — and it is now explicitly the **many-small**
 /// half of a two-dimensional control. A row count bounds the part of a
 /// write's cost that does not vary with its payload (two signatures, the
 /// hashes, the ids, the index entries); it is blind to the part that does,
@@ -255,7 +255,7 @@ pub const PER_PEER_ATTESTATION_WRITE_WINDOW: Duration = Duration::from_secs(60);
 /// dimension alongside the count — was the next thing this control needed.
 /// A row count is a proxy for storage, and a poor one.
 ///
-/// v24.4.0 (CIRISPersist#583) — **that dimension now exists**
+/// v25.1.0 (CIRISPersist#583) — **that dimension now exists**
 /// ([`PER_PEER_SUSTAINED_BYTES_PER_WINDOW`]), and the 14 GiB/day worst case
 /// is 211 MiB/day. This constant is unchanged and its job narrowed: it
 /// bounds *rows*, and rows are the many-small attack.
@@ -293,7 +293,7 @@ pub const PER_PEER_SUSTAINED_WRITES_PER_WINDOW: u32 = 14_400;
 /// dimensions ([`QuotaDimension`]).
 pub const PER_PEER_SUSTAINED_WRITE_WINDOW: Duration = Duration::from_secs(86_400);
 
-/// v24.4.0 (CIRISPersist#583) — the size of a **typical federation-tier
+/// v25.1.0 (CIRISPersist#583) — the size of a **typical federation-tier
 /// attestation envelope**, and the floor every write is charged on the byte
 /// dimension.
 ///
@@ -321,7 +321,7 @@ pub const PER_PEER_SUSTAINED_WRITE_WINDOW: Duration = Duration::from_secs(86_400
 /// (and relied on) by the v24.3.0 sustained-rows derivation.
 pub const TYPICAL_ATTESTATION_ENVELOPE_BYTES: u64 = 1_536;
 
-/// v24.4.0 (CIRISPersist#583) — how many times a typical row's size a peer's
+/// v25.1.0 (CIRISPersist#583) — how many times a typical row's size a peer's
 /// **mean** row may reach before the byte dimension binds instead of the row
 /// dimension.
 ///
@@ -349,7 +349,7 @@ pub const TYPICAL_ATTESTATION_ENVELOPE_BYTES: u64 = 1_536;
 /// so the rows this control does bind on are the *few huge* ones.
 pub const QUOTA_BYTE_HEADROOM_MULTIPLE: u64 = 10;
 
-/// v24.4.0 (CIRISPersist#583) — the row size the byte dimension is
+/// v25.1.0 (CIRISPersist#583) — the row size the byte dimension is
 /// calibrated against: `TYPICAL × HEADROOM` = 15 KiB.
 ///
 /// Both byte constants below are this number times the corresponding row
@@ -362,7 +362,7 @@ pub const QUOTA_BYTE_HEADROOM_MULTIPLE: u64 = 10;
 /// QUOTA_BYTE_HEADROOM_MULTIPLE` = 1 536 × 10 = 15 360.
 pub const QUOTA_CALIBRATION_ROW_BYTES: u64 = 15_360;
 
-/// v24.4.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
+/// v25.1.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
 /// [`PER_PEER_ATTESTATION_WRITE_WINDOW`]: the burst allowance on the second
 /// metered dimension, and the *few-huge* half of the control.
 ///
@@ -394,7 +394,7 @@ pub const QUOTA_CALIBRATION_ROW_BYTES: u64 = 15_360;
 /// ≈150 KiB/s). Asserted as an identity by the derivation gate.
 pub const PER_PEER_ATTESTATION_BYTES_PER_WINDOW: u64 = 9_216_000;
 
-/// v24.4.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
+/// v25.1.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
 /// [`PER_PEER_SUSTAINED_WRITE_WINDOW`]: the sustained storage ceiling.
 ///
 /// # What it is worth
@@ -443,7 +443,7 @@ pub const PER_PEER_SUSTAINED_BYTES_PER_WINDOW: u64 = 221_184_000;
 ///    `cap × 600` precisely because defect 1 meant the cap did not bind.
 ///    Rotation now buys nothing: see [`UNTRACKED_TAIL_BUDGET_MULTIPLE`].
 ///
-/// # v24.4.0 (CIRISPersist#583) — 4096 → 8192, and WHY a size is the fix
+/// # v25.1.0 (CIRISPersist#583) — 4096 → 8192, and WHY a size is the fix
 ///
 /// #583's second finding is the residue of that hard bound: *"once the table
 /// saturates with live-spending peers, no new bucket is created and an
@@ -582,7 +582,7 @@ pub const UNTRACKED_TAIL_BUDGET_MULTIPLE: u32 = 1;
 /// information surface and is accepted for that reason.
 ///
 /// **Bounds:** what the whole `put_attestation` federation-ingest plane may
-/// cost this node — 6 000 rows/min and 144 000 rows/day, and (v24.4.0,
+/// cost this node — 6 000 rows/min and 144 000 rows/day, and (v25.1.0,
 /// CIRISPersist#583) 87.9 MiB/min and 2.06 GiB/day of payload.
 /// **Derived:** ten peers writing at their individual ceiling,
 /// simultaneously, forever. A judgement, and the residual is on the record:
@@ -667,7 +667,7 @@ pub const RESERVED_CLASS_DIMENSION_PREFIXES: &[&str] = &["accord:", "objection:"
 
 // ──────────────────────── QUOTA CONSTANTS — END ────────────────────────
 
-/// v24.4.0 (CIRISPersist#583) — **what the quota meters.** Closed, and the
+/// v25.1.0 (CIRISPersist#583) — **what the quota meters.** Closed, and the
 /// set is load-bearing: the implementation indexes its budgets and its
 /// per-write costs BY this enum, so a variant added here is a compile error
 /// everywhere a dimension must be priced, sized and refused — and
@@ -698,7 +698,7 @@ pub enum QuotaDimension {
     Rows,
     /// The row's storage cost in bytes:
     /// `max(envelope_bytes, TYPICAL_ATTESTATION_ENVELOPE_BYTES)`.
-    /// v24.4.0 (CIRISPersist#583).
+    /// v25.1.0 (CIRISPersist#583).
     Bytes,
 }
 
@@ -732,7 +732,7 @@ impl QuotaDimension {
     }
 }
 
-/// v24.4.0 (CIRISPersist#583) — **which budget** a write is charged against.
+/// v25.1.0 (CIRISPersist#583) — **which budget** a write is charged against.
 /// Closed; the four #575 shipped, named so the refusal taxonomy can be
 /// generated from `budget × dimension × horizon` instead of hand-listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -754,7 +754,7 @@ impl QuotaBudget {
     pub const ALL: &'static [Self] = &[Self::Peer, Self::UntrackedTail, Self::Node, Self::Reserved];
 }
 
-/// v24.4.0 (CIRISPersist#583) — **which horizon** a refusal came from. Every
+/// v25.1.0 (CIRISPersist#583) — **which horizon** a refusal came from. Every
 /// budget meters every dimension on both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuotaHorizon {
@@ -786,7 +786,7 @@ impl QuotaHorizon {
 /// is the downstream contract and this mapping is **APPEND-ONLY**: add
 /// variants, never re-spell one.
 ///
-/// # v24.4.0 (CIRISPersist#583) — the set is now a PRODUCT
+/// # v25.1.0 (CIRISPersist#583) — the set is now a PRODUCT
 ///
 /// It is exactly `QuotaBudget × QuotaDimension × QuotaHorizon` (4 × 2 × 2 =
 /// 16), generated by [`Self::of`] and asserted complete by
@@ -835,7 +835,7 @@ pub enum PeerQuotaRefusal {
     /// The **reserved class**'s sustained ROW budget is spent. As
     /// [`Self::ReservedBurst`], on the day horizon.
     ReservedSustained,
-    /// v24.4.0 (CIRISPersist#583) — this peer's own **burst** BYTE budget is
+    /// v25.1.0 (CIRISPersist#583) — this peer's own **burst** BYTE budget is
     /// spent: more than [`PER_PEER_ATTESTATION_BYTES_PER_WINDOW`] of payload
     /// inside [`PER_PEER_ATTESTATION_WRITE_WINDOW`]. A **storage** flood,
     /// not a row flood — the peer is well inside its row allowance and is
@@ -843,31 +843,31 @@ pub enum PeerQuotaRefusal {
     /// [`Self::PeerBurst`] precisely so an operator does not tune the wrong
     /// number.
     PeerBytesBurst,
-    /// v24.4.0 (CIRISPersist#583) — this peer's own **sustained** BYTE
+    /// v25.1.0 (CIRISPersist#583) — this peer's own **sustained** BYTE
     /// budget is spent ([`PER_PEER_SUSTAINED_BYTES_PER_WINDOW`] in a day).
     /// The one #583 exists to make possible: the day's *storage*, not the
     /// day's rows.
     PeerBytesSustained,
-    /// v24.4.0 (CIRISPersist#583) — the shared **untracked tail**'s burst
+    /// v25.1.0 (CIRISPersist#583) — the shared **untracked tail**'s burst
     /// BYTE budget is spent. Identities this node has never seen have,
     /// together, sent too much payload too fast; rotating does not help.
     UntrackedTailBytesBurst,
-    /// v24.4.0 (CIRISPersist#583) — the shared **untracked tail**'s
+    /// v25.1.0 (CIRISPersist#583) — the shared **untracked tail**'s
     /// sustained BYTE budget is spent. As
     /// [`Self::UntrackedTailBytesBurst`], on the day horizon.
     UntrackedTailBytesSustained,
-    /// v24.4.0 (CIRISPersist#583) — the **node-wide** burst BYTE budget is
+    /// v25.1.0 (CIRISPersist#583) — the **node-wide** burst BYTE budget is
     /// spent. The node's federation-ingest write bandwidth is full; not
     /// about this peer.
     NodeBytesBurst,
-    /// v24.4.0 (CIRISPersist#583) — the **node-wide** sustained BYTE budget
+    /// v25.1.0 (CIRISPersist#583) — the **node-wide** sustained BYTE budget
     /// is spent: this node has taken its day's federation-ingest storage.
     NodeBytesSustained,
-    /// v24.4.0 (CIRISPersist#583) — the **reserved class**'s burst BYTE
+    /// v25.1.0 (CIRISPersist#583) — the **reserved class**'s burst BYTE
     /// budget is spent. Only accord/objection-class rows can reach it, so
     /// this means accord-class traffic itself is a storage flood.
     ReservedBytesBurst,
-    /// v24.4.0 (CIRISPersist#583) — the **reserved class**'s sustained BYTE
+    /// v25.1.0 (CIRISPersist#583) — the **reserved class**'s sustained BYTE
     /// budget is spent. As [`Self::ReservedBytesBurst`], on the day horizon.
     ReservedBytesSustained,
 }
@@ -898,7 +898,7 @@ impl PeerQuotaRefusal {
         }
     }
 
-    /// v24.4.0 (CIRISPersist#583) — **the taxonomy as a function**, not a
+    /// v25.1.0 (CIRISPersist#583) — **the taxonomy as a function**, not a
     /// list. The refusal for one `(budget, dimension, horizon)` triple.
     ///
     /// This is the single place the product is spelled, so the enum cannot
@@ -951,7 +951,7 @@ impl PeerQuotaRefusal {
     }
 
     /// Which dimension this refusal came from — a **row** flood or a
-    /// **storage** flood. v24.4.0 (CIRISPersist#583); the distinction is the
+    /// **storage** flood. v25.1.0 (CIRISPersist#583); the distinction is the
     /// whole reason the byte tokens are separate names.
     #[must_use]
     pub const fn dimension(&self) -> QuotaDimension {
@@ -975,7 +975,7 @@ impl PeerQuotaRefusal {
         }
     }
 
-    /// Which budget refused. v24.4.0 (CIRISPersist#583).
+    /// Which budget refused. v25.1.0 (CIRISPersist#583).
     #[must_use]
     pub const fn budget(&self) -> QuotaBudget {
         match self {
@@ -998,7 +998,7 @@ impl PeerQuotaRefusal {
         }
     }
 
-    /// Which horizon refused — seconds or a day. v24.4.0 (CIRISPersist#583).
+    /// Which horizon refused — seconds or a day. v25.1.0 (CIRISPersist#583).
     #[must_use]
     pub const fn horizon(&self) -> QuotaHorizon {
         match self {
@@ -1136,7 +1136,7 @@ impl DimensionSpec {
 /// [`Self::for_multiple`]; there are no free-floating numbers below this
 /// line.
 ///
-/// v24.4.0 (CIRISPersist#583) — indexed by [`QuotaDimension`]. The array is
+/// v25.1.0 (CIRISPersist#583) — indexed by [`QuotaDimension`]. The array is
 /// `[_; QuotaDimension::COUNT]` and `for_multiple` matches exhaustively on
 /// the enum, so **a dimension cannot be added without being sized**: the
 /// compiler asks for its capacities before the code builds.
@@ -1184,7 +1184,7 @@ impl BudgetSpec {
     }
 }
 
-/// v24.4.0 (CIRISPersist#583) — what ONE write costs, per metered dimension.
+/// v25.1.0 (CIRISPersist#583) — what ONE write costs, per metered dimension.
 ///
 /// Also indexed by [`QuotaDimension`] and built by an exhaustive match, so a
 /// new dimension must be *priced* as well as sized before anything compiles.
@@ -1365,7 +1365,7 @@ fn retry_after(deficit: f64, per_second: f64) -> u64 {
     (deficit / per_second).ceil().max(1.0) as u64
 }
 
-/// v24.4.0 (CIRISPersist#583) — the byte size of an attestation envelope, as
+/// v25.1.0 (CIRISPersist#583) — the byte size of an attestation envelope, as
 /// the quota charges it.
 ///
 /// Measured with a counting sink rather than by canonicalizing: the quota is
@@ -1525,7 +1525,7 @@ struct QuotaState {
     tail: PeerBucket,
     /// The reserved class's own budget ([`RESERVED_CLASS_BUDGET_MULTIPLE`]).
     reserved: PeerBucket,
-    /// v24.4.0 (CIRISPersist#583) — how many admitted writes were denied an
+    /// v25.1.0 (CIRISPersist#583) — how many admitted writes were denied an
     /// individual bucket because the table was saturated with non-full
     /// peers: the **tail-squeeze counter**.
     ///
@@ -1661,7 +1661,7 @@ impl PeerWriteQuota {
     /// Charge one ordinary-class write against `key_id`.
     ///
     /// Retained as the shape this method has had since v22.0.0 for callers
-    /// that hold a key and no row. v24.4.0 (CIRISPersist#583): such a caller
+    /// that hold a key and no row. v25.1.0 (CIRISPersist#583): such a caller
     /// is charged [`WriteCost::floor`] on the byte dimension — one typical
     /// row — because a size-free entry point into a size-metered control is
     /// a door around the dimension, and the completeness gate exists to stop
@@ -1700,7 +1700,7 @@ impl PeerWriteQuota {
     /// admissible *before* anything is spent — a check that debited the node
     /// and then refused on the peer would leak the node's budget to refused
     /// traffic, which is precisely the amplification this control exists to
-    /// close. v24.4.0 (CIRISPersist#583) extends the same rule across
+    /// close. v25.1.0 (CIRISPersist#583) extends the same rule across
     /// dimensions: a write that clears rows and fails bytes debits neither.
     ///
     /// # Refusal precedence
@@ -1818,7 +1818,7 @@ impl PeerWriteQuota {
             .len()
     }
 
-    /// v24.4.0 (CIRISPersist#583) — whether `key_id` currently has an
+    /// v25.1.0 (CIRISPersist#583) — whether `key_id` currently has an
     /// individual budget rather than sharing the untracked tail.
     ///
     /// The observable form of #583's honest-newcomer property: a peer with
@@ -1832,7 +1832,7 @@ impl PeerWriteQuota {
             .contains_key(key_id)
     }
 
-    /// v24.4.0 (CIRISPersist#583) — how many admitted writes were denied an
+    /// v25.1.0 (CIRISPersist#583) — how many admitted writes were denied an
     /// individual bucket because the tracked table was saturated with
     /// non-full peers.
     ///
@@ -2191,7 +2191,7 @@ pub mod gate_order_test_support {
         );
     }
 
-    /// v24.4.0 (CIRISPersist#583) — the **BYTE dimension**, proven wired into
+    /// v25.1.0 (CIRISPersist#583) — the **BYTE dimension**, proven wired into
     /// `put_attestation` on every backend.
     ///
     /// #583, quoting CIRISServer: *"600 rows of 100 B and 600 rows of 10 MB
@@ -2484,7 +2484,7 @@ mod tests {
     /// `min over cells of (capacity + rate × elapsed) / cost`. Rounded up by
     /// one so the assertion cannot flake on the last fractional token.
     ///
-    /// v24.4.0 (CIRISPersist#583) — the minimum now ranges over dimensions
+    /// v25.1.0 (CIRISPersist#583) — the minimum now ranges over dimensions
     /// as well as horizons, so a ceiling assertion cannot go stale by
     /// ignoring a dimension the control has started metering.
     fn ceiling_for(spec: &BudgetSpec, elapsed: Duration, cost: &WriteCost) -> u64 {
@@ -3058,7 +3058,7 @@ mod tests {
         );
     }
 
-    // ── v24.4.0 (CIRISPersist#583) — the byte dimension, the tail-squeeze,
+    // ── v25.1.0 (CIRISPersist#583) — the byte dimension, the tail-squeeze,
     //    and the three gates that outlive both fixes ────────────────────────
 
     /// A federation-tier row whose envelope is exactly `envelope`.

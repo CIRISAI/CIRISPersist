@@ -362,7 +362,7 @@ pub struct DeleteSummary {
     pub deleted_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// v6.9.0 (CIRISPersist#222) — Result of
+/// v7.0.0 (CIRISPersist#222) — Result of
 /// [`Engine::delete_traces_for_agent_id_hash`](crate::Engine::delete_traces_for_agent_id_hash)
 /// — the GDPR Art. 17 / DSAR full-erasure primitive.
 ///

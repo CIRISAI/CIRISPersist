@@ -1292,7 +1292,7 @@ impl Backend for SqliteBackend {
         .map_err(|e| Error::Backend(format!("list_held_fountain_content: {e}")))
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
 
     async fn put_installed_storage_budget(
         &self,
@@ -2144,7 +2144,7 @@ impl SqliteBackend {
                 )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // v12.7.0 (CIRISPersist#365) — same consent_role admission
+            // v13.0.0 (CIRISPersist#365) — same consent_role admission
             // gate as put_public_key (backend-symmetric with PG's twin).
             crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
             let envelope_text = serde_json::to_string(&row.registration_envelope)
@@ -2198,7 +2198,7 @@ impl SqliteBackend {
                         row.persist_row_hash,
                         roles_text,
                         attestation_text,
-                        // v12.7.0 (CIRISPersist#365) — wire None ⇔ the
+                        // v13.0.0 (CIRISPersist#365) — wire None ⇔ the
                         // stored V020 'unregistered' default (NOT NULL).
                         crate::federation::types::consent_role::stored_from_wire(
                             row.consent_role.as_deref(),
@@ -2256,7 +2256,7 @@ impl SqliteBackend {
                 row.algorithm
             )));
         }
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
         // self-signed → anchor-scrubbed UPDATE that CAN change identity_type,
         // so it is a second path a `canonical` role could otherwise enter on.
         // Re-run the accord-conferred gate: `canonical` is admitted here only
@@ -2354,7 +2354,7 @@ impl SqliteBackend {
             // The WHERE re-asserts the guards atomically: self-signed + same
             // pubkey. The Ed25519 pubkey is the guard, so it is NOT updated.
             //
-            // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
+            // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
             // deliberately NOT in the SET list — it is an operational role
             // marker (its OQ-1 overwrite surface is `set_consent_role`),
             // not registration content; an anchor-scrub upgrade must not
@@ -2579,7 +2579,7 @@ impl SqliteBackend {
         Ok(ReplicatedKeyOutcome::Superseded)
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**. The anti-entropy apply the edge replication bridge routes
     /// `apply_key` to, replacing its raw `put_public_key` call (which stays
     /// unchanged for direct registration): a fresh `key_id` inserts as today,
@@ -2655,7 +2655,7 @@ impl SqliteBackend {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: `federation_keys` rows whose
     /// `identity_type` **set** contains
     /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
@@ -2900,7 +2900,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
         }
 
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
         // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
         // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
         // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
@@ -2986,7 +2986,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     crate::federation::Error::Backend(format!("roles serialize: {e}"))
                 })?)
             };
-        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
         // token (Rust-level; SQLite's V020 ALTER could not add the PG
         // CHECK, this keeps the backends symmetric), then map wire None
         // ⇔ the stored V020 'unregistered' default (NOT NULL column).
@@ -3125,7 +3125,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
     /// consent_role. Flat UPDATE of the single V020 column; `None` resets
     /// to the stored `'unregistered'` default (revoke). No chain — a
     /// subsequent call overwrites. Excluded from `persist_row_hash`, so
@@ -3740,7 +3740,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate (parity with the postgres + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
         // recipient (`attested_key_id`) resolves to a node-ONLY identity it
@@ -6486,7 +6486,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // asserted_at TEXT comparison is chronological for our uniform
             // RFC-3339 UTC encoding (to_rfc3339, "+00:00").
             //
-            // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY. An
+            // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY. An
             // unsigned writer (the occurrence projection / edge announce)
             // carries no signature to offer, so it can NEVER demote a
             // signed row:
@@ -6639,7 +6639,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )
                 .optional()?;
             if let Some(ex) = existing {
-                // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY:
+                // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY:
                 // the monotonic-clock refusal applies only against a stored
                 // row that is itself SIGNED. A signed write always reclaims
                 // an unsigned row (occurrence-projection / announce state),
@@ -9629,7 +9629,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         key_hash,
                         Option::<String>::None,
                         Option::<String>::None,
-                        // v12.7.0 (CIRISPersist#365) — the V020 column is
+                        // v13.0.0 (CIRISPersist#365) — the V020 column is
                         // NOT NULL; peer rows carry the 'unregistered'
                         // default (wire None).
                         crate::federation::types::consent_role::UNREGISTERED,
@@ -12474,7 +12474,7 @@ impl SqliteBackend {
                     // from the signer's holds_bytes index, not the blob
                     // table (which has no attesting_key_id column).
                     attesting_key_id: None,
-                    // v12.7.0 (§Q B5, #370): the corpus-class token the
+                    // v13.0.0 (§Q B5, #370): the corpus-class token the
                     // Engine matches against the installed pinned_class
                     // set.
                     media_type,
@@ -12485,7 +12485,7 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("sweep_candidates: {e}")))
     }
 
-    /// v12.7.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
+    /// v13.0.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
     /// blobs whose `media_type` is one of `media_types` (the installed
     /// `pinned_class` set). §Q consumption accounting is edge-internal —
     /// recomputed from held content, never taken from the wire. Empty set
@@ -13653,7 +13653,7 @@ fn sqlite_row_to_key_record(
         .as_deref()
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok());
-    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
+    // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
     // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
     // (matching roles/attestation_evidence) — an absent column maps to
     // None, and the stored 'unregistered' default maps to wire None
@@ -19962,7 +19962,7 @@ mod tests {
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
     }
 
-    /// v12.7.0 (#371) — `apply_replicated_key_record` owner-gate fail-closed
+    /// v13.0.0 (#371) — `apply_replicated_key_record` owner-gate fail-closed
     /// rows that need a **pre-gate anomaly** (raw SQL, since the v12.6.0
     /// single-owner admission gate refuses a second live owner going
     /// forward): a node with TWO live owner-bindings resolves
@@ -27382,7 +27382,7 @@ mod tests {
             "an identical-content unsigned re-assertion must not strip the signature"
         );
 
-        // (2) v21.3.1 (#515) — CHANGED content, newer clock, UNSIGNED
+        // (2) v21.4.0 (#515) — CHANGED content, newer clock, UNSIGNED
         // writer against a SIGNED row: a silent NO-OP. The signed content
         // is authoritative; an unsigned writer never demotes it (the
         // v21.3.0 ELSE-NULL demotion was exactly the live canonical's
@@ -27412,7 +27412,7 @@ mod tests {
             "the signed row's content is authoritative — the divergent unsigned write no-ops"
         );
 
-        // (3) v21.3.1 (#515) — a SIGNED write reclaims an UNSIGNED row
+        // (3) v21.4.0 (#515) — a SIGNED write reclaims an UNSIGNED row
         // regardless of clocks. Fresh key: unsigned row lands first with a
         // NEWER clock than the signed write that follows; the signed write
         // must still win.
@@ -27479,7 +27479,7 @@ mod tests {
         );
     }
 
-    /// v21.3.1 (CIRISPersist#515) — the ADMIT-THEN-PROJECT race, the exact
+    /// v21.4.0 (CIRISPersist#515) — the ADMIT-THEN-PROJECT race, the exact
     /// class the suites kept missing (they covered the signed-producer path
     /// only, never projection-after-signed): a SIGNED route is admitted,
     /// then a signed identity-occurrence for the SAME occurrence arrives
@@ -31403,7 +31403,7 @@ mod tests {
             .contains(&"cirislens_secrets_reader".to_owned()));
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
     /// through put_public_key → lookup_public_key, and
     /// persist_row_hash is INDEPENDENT of the role (OQ-1: excluded from
     /// the signed-registration hash).
@@ -31463,7 +31463,7 @@ mod tests {
         );
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — set_consent_role is
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — set_consent_role is
     /// non-recursive overwrite-on-revoke, and consent_role_of resolves the
     /// current value. Absent role and revoked-to-None both resolve to None.
     #[tokio::test]
@@ -33767,7 +33767,7 @@ mod tests {
         }
     }
 
-    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure: hard-delete the
+    /// v7.0.0 (CIRISPersist#222) — full Art. 17 erasure: hard-delete the
     /// agent's trace_events + trace_llm_calls, TOMBSTONE (not delete) the
     /// derived detection_events for those traces, audit, idempotent.
     #[tokio::test]
@@ -38267,7 +38267,7 @@ mod tests {
         .await;
     }
 
-    /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
+    /// v25.1.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
     /// the real envelope, on this backend, through the real host API.
     #[tokio::test]
     async fn quota_byte_dimension_is_wired_sqlite() {

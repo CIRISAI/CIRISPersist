@@ -733,7 +733,7 @@ pub trait FederationDirectory: Send + Sync {
         identity_type: &str,
     ) -> Result<Vec<KeyRecord>, Error>;
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
     /// or **overwrite** the Counter-RII [`consent_role`](types::consent_role)
     /// of `key_id`.
     ///
@@ -5044,7 +5044,7 @@ pub enum Error {
         attestation_type: String,
     },
 
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
     /// attestation was self-emitted (`attesting_key_id ==
     /// attested_key_id`). The witness rung is an attestation ABOUT a
     /// subject: CC 3.4.11 — "A subject MUST NOT emit on `age_assurance:`;
@@ -5468,7 +5468,7 @@ pub enum Error {
         scope: String,
     },
 
-    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
+    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
     /// was REFUSED because its `attested_key_id` resolves to a `node`-only
     /// [`crate::federation::types::identity_type::NODE`] identity but the
     /// delegation carries a scope that is NOT `infra:*` — i.e. an
@@ -5567,7 +5567,7 @@ pub enum Error {
         detail: String,
     },
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
     /// `federation_keys` row carrying the [`types::identity_type::CANONICAL`]
     /// role was REJECTED at admission because it is **not accord-conferred**.
     /// The `canonical` (founding bootstrap server) role is accord-CONFERRED,

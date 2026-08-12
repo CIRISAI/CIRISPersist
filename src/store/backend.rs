@@ -182,7 +182,7 @@ pub trait Backend: Send + Sync {
         include_federation_key: bool,
     ) -> impl Future<Output = Result<DeleteSummary, Error>> + Send;
 
-    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure** of
+    /// v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure** of
     /// an agent's trace corpus, keyed on `agent_id_hash` ALONE (across all
     /// signing keys — contrast [`delete_traces_for_agent`](Self::delete_traces_for_agent),
     /// which scopes to one signing key for the per-key DSAR).
@@ -452,7 +452,7 @@ pub trait Backend: Send + Sync {
         publisher_key_id: &str,
     ) -> impl Future<Output = Result<Vec<crate::fountain::FountainHeldMeta>, Error>> + Send;
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
     //
     // The durable half of the storage-contention shapes (#356 shipped
     // build/verify as wire-negotiation only). One row per owner node_id in

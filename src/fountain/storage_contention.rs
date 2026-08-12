@@ -12,7 +12,7 @@
 //!
 //! `CorpusWantV1` remains **verified-at-ingest, not stored** (CC 6.1.3
 //! store-path): a consumer builds one to advertise / verifies one it received.
-//! `StorageBudgetV1` gained a pin-INSTALL surface in #370 (v12.7.0):
+//! `StorageBudgetV1` gained a pin-INSTALL surface in #370 (v13.0.0):
 //! [`Engine::install_storage_budget_v1`](crate::Engine::install_storage_budget_v1)
 //! verifies the bound-hybrid signature (PQC-mandatory — verify at the gate,
 //! BEFORE persistence) and upserts an [`InstalledStorageBudget`] row (V093,
