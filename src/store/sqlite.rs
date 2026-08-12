@@ -4406,6 +4406,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#650) — the door's own gate, over a LOADED
+        // COPY, before any statement runs (AV-9).
+        if let Some(row) = self.get_attestation(attestation_id).await? {
+            crate::federation::migration::check_purge_admission(&row)?;
+        }
         let conn = self.conn.clone();
         let id = attestation_id.to_owned();
         let n = (move || -> Result<usize, rusqlite::Error> {
@@ -40205,6 +40210,19 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
             &backend, "sq650c",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+    /// land after the migration, through the transit-revocation door. Sqlite
+    /// arm; shared body with memory + postgres.
+    #[tokio::test]
+    async fn a_v30_row_can_still_land_after_migration_sqlite_650() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
+            &backend, "sq650g",
         )
         .await;
     }

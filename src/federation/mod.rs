@@ -1110,14 +1110,19 @@ pub trait FederationDirectory: Send + Sync {
     /// sanctioned repair for exactly this and already exists on all three
     /// backends.
     ///
-    /// # This deletes user data
+    /// # This deletes user data, so the door carries the invariant
     ///
-    /// It is reachable only from
-    /// [`migration::run_v31_migration`](migration::run_v31_migration), whose
-    /// [`classify`](migration::classify) is the one place the decision is made
-    /// and which purges only on a PROOF — a live tombstone from the row's own
-    /// attester, or a foreign legacy row whose author is its source. Default
-    /// `Unsupported`; sqlite/postgres/memory override.
+    /// The disposition is decided by
+    /// [`migration::classify`](migration::classify), which purges only on a
+    /// proof — a live tombstone from the row's own attester — or on the
+    /// operator's explicit recoverability licence. But *"the caller is careful"*
+    /// is the shape CIRISPersist#652 was: a door whose safety lives entirely in
+    /// its callers. So implementations re-ask the one question whose wrong
+    /// answer is unrecoverable, via
+    /// [`migration::check_purge_admission`](migration::check_purge_admission):
+    /// **an exclusion-bearing row is refused here**, tombstones included,
+    /// whatever the caller believes. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
     async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
         let _ = attestation_id;
         Err(Error::Unsupported {
