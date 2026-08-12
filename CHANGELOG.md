@@ -7,6 +7,77 @@ threat-model citations because this crate's audit story is the point.
 
 ## [30.13.0] - 2026-08-12
 
+### Fixed — the wire index hashed the row the writer held, not the row the backend stored (#640)
+
+Every Key-plane `signed_wire_index` writer computed its content hash from the
+in-memory `KeyRecord` at put time:
+
+```rust
+let (wire_index_hash, wire_index_key) = wire_index::key_entry(&row)?;
+```
+
+while `list_signed_key_records_since` — the read the offer path advertises from,
+and the read `lookup_signed_record_by_content_hash` resolves through —
+re-serializes the row the backend RELOADED. Those are the same bytes only if
+storage is byte-transparent. It is not, in **two** independent ways:
+
+- **Postgres `TIMESTAMPTZ` is microsecond precision.** Any sub-microsecond
+  instant reaching `federation_keys` is rounded on the way in, so the index
+  carried a hash the read surface could never reproduce and the node advertised
+  a `(Key, content_hash)` that point-read to `None`.
+- **`consent_role` is normalized at the storage boundary** (wire `None` ⇔
+  stored `'unregistered'`). A registration submitting the stored token indexed
+  `Some("unregistered")` while both SQL backends read back `None`. Nothing to do
+  with clocks — and live on **sqlite** as well as postgres, which is why
+  truncating timestamps would not have closed this.
+
+#640 filed the local-mint path as unconfirmed. It is confirmed, and it is not
+`register_self_federation_key` (that has truncated to microseconds since
+v10.0.1). It is:
+
+- `attach_key_pqc_signature` mints `pqc_completed_at` from `Utc::now()` at
+  nanosecond precision — the cold-path PQC fill, a first-class production
+  surface. #547 already patched that ONE site by re-reading the stored row, and
+  the comment there names this exact mechanism.
+- SQLite stores `to_rfc3339()` TEXT and round-trips nanoseconds, so a
+  sqlite-backed node SERVES nanosecond instants. A postgres peer ingesting them
+  through `put_public_key` / `apply_replicated_key_record` rounds them and
+  advertises an unresolvable ref. Cross-backend replication reaches this with no
+  local mint at all.
+
+**The fix is option 1 of the issue — hash what the read returns.** Every
+`federation_keys` writer now indexes the row AS STORED, via one shared
+derivation (`wire_index::key_entry_as_stored`, and its
+`{Postgres,Sqlite}Backend::index_stored_key_row` /
+`memory_index_stored_key_row` call sites): `put_public_key`,
+`adopt_scrub_upgrade`, `supersede_canonical_record`, `adopt_genesis_reanchor`,
+`set_consent_role`, `attach_key_pqc_signature` — on all three backends. The
+memory twin reads its own map value under the lock it already holds, which is
+literally what its `lookup_public_key` clones.
+
+Truncating at the write chokepoint (option 2) was rejected: it models ONE
+normalization, leaves the `consent_role` instance live, and the next column that
+normalizes reopens the hole silently. Option 3 was rejected on the evidence
+above. This is the same reasoning as #541 (PRESERVE SET MUST EQUAL VERIFIED SET)
+and the second time #547's advertise-vs-reload divergence has needed fixing —
+which is what makes it a class rather than an instance.
+
+### Testing
+
+`exercise_nanosecond_key_wire_ref_resolves` +
+`nanosecond_key_wire_ref_resolves_{memory,sqlite,postgres}_640`: registers a key
+carrying a **deterministic** 789ns sub-microsecond tail and a stored-form
+`consent_role`, then asserts every ref `wire_refs_for_subject` returns resolves.
+Deliberately NOT routed through `register_hybrid_key` — that fixture truncates
+to microseconds, and a witness that only fails when the fixture cooperates is a
+report. Mutation-checked: with the pre-#640 derivation restored at
+`put_public_key`, the postgres leg reds on the timestamp and the sqlite leg reds
+on `consent_role`, while memory (which normalizes nothing) stays green as the
+control.
+
+#634's `wire_refs_for_subject_resolve_postgres_634` also passes with the
+fixture truncation REMOVED, which it did not before this cut.
+
 ### Added — the flag plane could be cleared by anyone, and there was no name for the authority to clear it (#612)
 
 CIRISServer#363 drove the fail-open **end to end through the real

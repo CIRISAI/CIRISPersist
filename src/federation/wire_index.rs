@@ -124,6 +124,64 @@ pub(crate) fn key_entry(row: &crate::federation::KeyRecord) -> Result<(String, S
     Ok((content_hash, record_key(&[("key_id", &row.key_id)])))
 }
 
+/// v30.13.0 (CIRISPersist#640) — the Key-plane index entry for the row **as
+/// stored**: reload through `lookup_public_key` — the SAME read
+/// [`reload_record_bytes`] resolves the point-read with — and hash THAT.
+///
+/// # Why the in-memory row is the wrong thing to hash
+///
+/// [`key_entry`] closed #547's *coverage* gap (writers that mutated the row
+/// and never touched the index). It did not close the *derivation* gap: it
+/// hashes the struct the WRITER holds, while every read the offer path
+/// advertises from — `list_signed_key_records_since`, `lookup_public_key` —
+/// re-serializes the row the BACKEND reloaded. Those are equal only if
+/// storage is byte-transparent, and it is not:
+///
+/// * **Postgres `TIMESTAMPTZ` is microsecond precision** while `Utc::now()`
+///   and RFC-3339 both carry nanoseconds, so any sub-microsecond instant that
+///   reaches a `federation_keys` write is rounded on the way in. Locally this
+///   is reachable through `attach_key_pqc_signature` (which mints
+///   `pqc_completed_at` at nanosecond precision) and over the wire through
+///   replication FROM a sqlite/memory node (sqlite stores `to_rfc3339()`
+///   TEXT, so it round-trips the nanoseconds and serves them). That was
+///   CIRISPersist#640, caught by `wire_refs_for_subject_resolve_postgres_634`.
+/// * **`consent_role` is normalized at the storage boundary** — wire `None`
+///   ⇔ stored `'unregistered'` — so a registration submitting the STORED
+///   token reads back as `None` on both SQL backends while the in-memory row
+///   still says `Some("unregistered")`.
+///
+/// Neither is a timestamp problem in general; they are the same problem —
+/// hashing a value the read surface never returns. So the remedy is not to
+/// model each normalization (which is a new guess per backend per column,
+/// and the next one silently reopens the hole) but to stop guessing: hash
+/// what the read returns. `attach_key_pqc_signature` already did exactly
+/// this, for exactly this reason, on all three backends; this is that fix
+/// promoted from one write site to every write site, behind one name.
+///
+/// Same reasoning as #541's PRESERVE SET MUST EQUAL VERIFIED SET: two lists
+/// that must agree, so derive both from ONE source — and here the source has
+/// to be the one the reader can actually see.
+///
+/// Returns `None` when the row is gone (a concurrent delete, or a write whose
+/// `WHERE` matched nothing); the caller then writes no index entry, which is
+/// the correct outcome — an entry pointing at a row that does not exist is
+/// precisely the dangling ref this closes.
+///
+/// # Cost
+///
+/// One extra point-read per `federation_keys` write. Key registration and the
+/// anchor mutators are cold paths (registration, scrub-upgrade, supersede,
+/// re-anchor, PQC completion), not per-request work.
+pub(crate) async fn key_entry_as_stored(
+    dir: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<Option<(String, String)>, Error> {
+    match dir.lookup_public_key(key_id).await? {
+        Some(row) => Ok(Some(key_entry(&row)?)),
+        None => Ok(None),
+    }
+}
+
 /// v21.1.0 (CIRISPersist#507b) — the shared per-kind reload dispatcher every
 /// backend's `lookup_signed_record_by_content_hash` calls after its own
 /// `SELECT record_key FROM signed_wire_index WHERE (kind, content_hash) = ...`

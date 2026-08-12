@@ -532,20 +532,31 @@ pub(crate) mod test_support {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
         // v30.12.0 (CIRISPersist#634) — TRUNCATED TO MICROSECONDS. Postgres
         // `TIMESTAMPTZ` is microsecond precision while `Utc::now()` carries
-        // nanoseconds, so a nanosecond-bearing fixture does not survive the
-        // round-trip: the wire index is written from the IN-MEMORY row at put
-        // time, and `list_signed_key_records_since` re-serializes the RELOADED
-        // (truncated) row, so the two hash differently and the advertised ref
-        // point-reads to `None`. The same trap the #610 rescope witness
-        // documents, and it is a property of the FIXTURE — rows arriving over
-        // the wire carry RFC-3339 instants that already round-trip losslessly.
-        // Truncating here keeps every postgres test measuring what it is for
-        // rather than clock precision.
+        // nanoseconds, so timestamps minted here do not survive the round-trip
+        // byte-for-byte on that backend.
+        //
+        // v30.13.0 (CIRISPersist#640) — this is NO LONGER what keeps the wire
+        // index honest. #634 read the skew as a fixture property; it was not —
+        // the write paths hashed the in-memory row while every read
+        // re-serializes the reloaded one, so the same divergence was reachable
+        // in production (`attach_key_pqc_signature` mints `pqc_completed_at` at
+        // nanosecond precision; replication from a sqlite origin carries
+        // nanosecond RFC-3339 over the wire). That is fixed at the source now:
+        // every `federation_keys` writer indexes the row AS STORED. See
+        // `wire_index::key_entry_as_stored`.
+        //
+        // The truncation stays because this fixture seeds hundreds of tests
+        // that are about something else, and a microsecond-clean row keeps
+        // them measuring what they are for. The #640 regression net is a
+        // DEDICATED nanosecond-bearing witness
+        // (`exercise_nanosecond_key_wire_ref_resolves`) — deliberately not
+        // this shared helper, so the net cannot be silently disarmed by a
+        // future fixture tidy-up.
         let now = {
             use chrono::Timelike as _;
-            chrono::Utc::now()
-                .with_nanosecond(chrono::Utc::now().nanosecond() / 1_000 * 1_000)
-                .unwrap_or_else(chrono::Utc::now)
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
+                .unwrap_or(dt)
         };
         let rec = crate::federation::KeyRecord {
             key_id: key_id.to_owned(),

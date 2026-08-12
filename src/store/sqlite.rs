@@ -2119,6 +2119,37 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
 //   - UUID columns are TEXT — rusqlite passes UUID strings as TEXT.
 
 impl SqliteBackend {
+    /// v30.13.0 (CIRISPersist#640) — re-read `key_id` and upsert the Key-plane
+    /// `signed_wire_index` entry for the row **as this backend stores it**.
+    ///
+    /// SQLite twin of `PostgresBackend::index_stored_key_row`. Every
+    /// `federation_keys` writer calls this AFTER its primary write instead of
+    /// hashing the struct it happened to hold; see
+    /// [`wire_index::key_entry_as_stored`](crate::federation::wire_index::key_entry_as_stored)
+    /// for why the two differ.
+    ///
+    /// SQLite is not the backend that ROUNDS anything (it stores
+    /// `to_rfc3339()` TEXT and round-trips nanoseconds), which is exactly why
+    /// it must run the same derivation: a rule only the failing backend
+    /// follows is a rule the next writer will not know about. It also fixes a
+    /// divergence SQLite DOES have — `consent_role` is normalized wire ⇔
+    /// stored at this boundary, so a registration submitting the stored token
+    /// used to index bytes `lookup_public_key` never returns.
+    async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
+        if let Some((wire_index_hash, wire_index_key)) =
+            crate::federation::wire_index::key_entry_as_stored(self, key_id).await?
+        {
+            let conn = self.conn.clone();
+            (move || {
+                sqlite_upsert_wire_index(&conn.lock(), "Key", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("signed_wire_index upsert: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Genesis-trusted seed of the HUMANITY_ACCORD holder rooting-anchor rows
     /// (CIRISPersist#347). Admits each baked `accord_holder` `SignedKeyRecord`
     /// into `federation_keys`, idempotent (`ON CONFLICT (key_id) DO NOTHING`).
@@ -2342,13 +2373,13 @@ impl SqliteBackend {
         })?;
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the Key-plane wire-index entry for the row
-        // this UPDATE is about to store, computed BEFORE `row` moves into the
-        // closure (the shape `put_public_key` already used) and upserted under the
-        // SAME connection lock as the write. Without it a scrub-upgraded node
-        // advertises its new content hash while the index still carries the
-        // pre-adopt one, and the ref it just advertised point-reads to `None`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        // v24.1.0 (CIRISPersist#547) — the Key-plane wire-index entry must
+        // follow this UPDATE. Without it a scrub-upgraded node advertises its
+        // new content hash while the index still carries the pre-adopt one,
+        // and the ref it just advertised point-reads to `None`.
+        // v30.13.0 (CIRISPersist#640) — the entry is no longer computed from
+        // `row` before the write; it is read BACK afterwards, below. See
+        // `SqliteBackend::index_stored_key_row`.
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // The WHERE re-asserts the guards atomically: self-signed + same
@@ -2389,9 +2420,6 @@ impl SqliteBackend {
                     row.pubkey_ed25519_base64,
                 ],
             )?;
-            if n > 0 {
-                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
-            }
             Ok(n)
         })()
         .map_err(|e| {
@@ -2404,6 +2432,7 @@ impl SqliteBackend {
                 "adopt_scrub_upgrade {kid}: row changed concurrently"
             )));
         }
+        self.index_stored_key_row(&kid).await?;
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
@@ -2521,10 +2550,11 @@ impl SqliteBackend {
         let expected_prior_hash = existing.persist_row_hash.clone();
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the successor's wire-index entry; see
-        // `wire_index::key_entry`. A canonical rotation that skipped this
-        // advertised the rotated record and could not serve it.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        // v24.1.0 (CIRISPersist#547) — the successor must be indexed; a
+        // canonical rotation that skipped this advertised the rotated record
+        // and could not serve it.
+        // v30.13.0 (CIRISPersist#640) — indexed from the stored row, after the
+        // swap; see `SqliteBackend::index_stored_key_row`.
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // Atomic swap: replace the EXACT version the policy was verified
@@ -2563,9 +2593,6 @@ impl SqliteBackend {
                     expected_prior_hash,
                 ],
             )?;
-            if n > 0 {
-                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
-            }
             Ok(n)
         })()
         .map_err(|e| {
@@ -2576,6 +2603,7 @@ impl SqliteBackend {
                 "supersede_canonical_record {kid}: row changed concurrently"
             )));
         }
+        self.index_stored_key_row(&kid).await?;
         Ok(ReplicatedKeyOutcome::Superseded)
     }
 
@@ -2808,9 +2836,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the re-anchored row's wire-index entry;
-        // see `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        // v24.1.0 (CIRISPersist#547) — the re-anchored row must be indexed.
+        // v30.13.0 (CIRISPersist#640) — from the stored row, after the UPDATE;
+        // see `SqliteBackend::index_stored_key_row`.
         let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // WHERE re-asserts the identity guard atomically. Unlike
@@ -2847,9 +2875,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.pubkey_ed25519_base64,
                 ],
             )?;
-            if n > 0 {
-                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
-            }
             Ok(n)
         })
         .await
@@ -2860,6 +2885,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "reanchor {kid}: expected 1 row updated, got {n}"
             )));
         }
+        self.index_stored_key_row(&kid).await?;
         Ok(())
     }
 
@@ -3001,12 +3027,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             serde_json::to_string(&row.additional_scrubs).map_err(|e| {
                 crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
             })?;
-        // v21.1.0 (CIRISPersist#507b) — compute the wire-index entry from
-        // `row` BEFORE it moves into the INSERT closure below (`row` is the
-        // exact value `SignedKeyRecord` wraps for the read surface).
+        // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
         // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
         // path and the four mutators cannot compute the entry differently.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        // v30.13.0 (CIRISPersist#640) — and that derivation reads the row
+        // BACK. Hashing `row` here indexed the CALLER's struct, which is not
+        // what `lookup_public_key` returns whenever the storage boundary
+        // normalizes anything — `consent_role` (wire `None` ⇔ stored
+        // `'unregistered'`) diverges on this very statement, three lines up.
+        let key_id_for_index = row.key_id.clone();
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3041,10 +3070,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     additional_scrubs_text,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
+        self.index_stored_key_row(&key_id_for_index).await?;
         Ok(())
     }
 
@@ -3146,35 +3175,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::types::consent_role::check_admissible(consent_role)?;
         let stored =
             crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
-        // The post-write row, from this node's own state — never a guess about
-        // what the rest of the columns hold.
-        let indexed =
-            match <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
-                .await?
-            {
-                Some(mut r) => {
-                    r.consent_role =
-                        crate::federation::types::consent_role::wire_from_stored(&stored)
-                            .map(str::to_owned);
-                    Some(crate::federation::wire_index::key_entry(&r)?)
-                }
-                None => None,
-            };
         let conn = self.conn.clone();
         let key_id = key_id.to_owned();
         let key_id_for_exec = key_id.clone();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
-            let n = conn.execute(
+            conn.execute(
                 "UPDATE federation_keys SET consent_role = ?2 WHERE key_id = ?1",
                 rusqlite::params![key_id_for_exec, stored],
-            )?;
-            if n > 0 {
-                if let Some((hash, record_key)) = &indexed {
-                    sqlite_upsert_wire_index(&conn, "Key", hash, record_key)?;
-                }
-            }
-            Ok(n)
+            )
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("set_consent_role: {e}")))?;
         if n == 0 {
@@ -3182,6 +3191,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "set_consent_role: no federation_keys row for {key_id}"
             )));
         }
+        // v30.13.0 (CIRISPersist#640) — index AFTER the write, from the row as
+        // stored. This used to reload BEFORE the UPDATE and hand-patch
+        // `consent_role` onto the result — a model of what the write was about
+        // to produce, which is the same guess `key_entry(&row)` was making
+        // everywhere else. Reading it back removes the model.
+        self.index_stored_key_row(&key_id).await?;
         Ok(())
     }
 
@@ -8047,8 +8062,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         // v24.1.0 (CIRISPersist#547) — the hybrid-completion write changes FOUR
         // serialized columns, so it moves the record's content hash exactly like
-        // the anchor mutators do. `row` is already the post-write value bar the
-        // hash; stamp that and index the result. See `wire_index::key_entry`.
+        // the anchor mutators do; it is re-indexed after the UPDATE, below.
         let conn = self.conn.clone();
         let key_id = key_id.to_owned();
         let key_id_for_exec = key_id.clone();
@@ -8080,22 +8094,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // The postgres twin failed exactly that way before this re-read landed.
         // Re-reading makes the index agree with the read surface by
         // construction, on any backend, whatever it rounds.
-        if let Some(stored) =
-            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, &key_id)
-                .await?
-        {
-            let (wire_index_hash, wire_index_key) =
-                crate::federation::wire_index::key_entry(&stored)?;
-            let conn = self.conn.clone();
-            (move || {
-                sqlite_upsert_wire_index(&conn.lock(), "Key", &wire_index_hash, &wire_index_key)
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "attach_key_pqc_signature signed_wire_index: {e}"
-                ))
-            })?;
-        }
+        // v30.13.0 (CIRISPersist#640) — through the shared helper; this site's
+        // remedy is now every site's remedy.
+        self.index_stored_key_row(&key_id).await?;
         Ok(())
     }
 
@@ -19527,6 +19528,21 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &backend,
             "sqlite-634",
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#640) — the SQLITE leg. SQLite round-trips the
+    /// nanoseconds (RFC-3339 TEXT) so the timestamp half cannot bite here, but
+    /// the `consent_role` wire ⇔ stored normalization DOES: before the fix this
+    /// backend indexed `Some("unregistered")` while its read surface returns
+    /// `None`.
+    #[tokio::test]
+    async fn nanosecond_key_wire_ref_resolves_sqlite_640() {
+        let backend = fresh_backend_with_occurrence("occ-640").await;
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &backend,
+            "sqlite-640",
         )
         .await;
     }
