@@ -5,6 +5,92 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [30.13.0] - 2026-08-12
+
+### Fixed — BREAKING — the consent fold ordered on a column no signature covered (#598)
+
+`asserted_at` is a ROW COLUMN, stored **verbatim** from the caller by all three
+backends (`sqlite.rs`, `postgres.rs`, `memory.rs` `put_attestation`), and no
+signature covers it: `verify_row_hybrid_signature` canonicalizes
+`attestation_envelope`, checks `SHA-256(canonical) == original_content_hash` and
+hybrid-verifies — the column never enters the preimage. `persist_row_hash` does
+cover it but is recomputed locally at write, so it binds nothing across nodes.
+
+Both consent folds order on that column, so the attack needed **no forgery and
+no broken signature — it is a REPLAY**:
+
+1. subject `S` grants `analyze` at `t1`, revokes at `t2 > t1`; the fold reads
+   `Revoked`.
+2. anyone resubmits `S`'s **byte-identical, still-validly-signed** `t1` grant
+   with a fresh `attestation_id` and `asserted_at = t3 > t2`.
+3. nothing refused it: `attestation_id` is the only PK, no UNIQUE on the
+   envelope or content hash, the §6.1 dedup covers only the four structural
+   composers and returns `false` for a `scores` row, and the future-skew guards
+   that exist (`fresh_as_of`, trace `signed_at`) do not reach this field.
+4. the fold reads `Granted` again — re-opening `check_capacity_consent_admission`,
+   a gate **inside persist**.
+
+**BREAK NOW, no grandfathering** (operator decision on #598: *"every break must
+happen now, WAY harder later … consent needs to be the final shape"*). There is
+no compatibility flag and no legacy regime.
+
+- **`check_consent_state_instant_binding`** (`admission.rs`) — a
+  `consent:state:*` row is REFUSED unless its signed envelope carries an
+  `asserted_at` equal to the row column, and an `expires_at` that agrees in both
+  directions (absent ⇔ `None`). Shaped on `verify_signed_transport_destination`,
+  which already refuses this divergence one plane over. Pure function of
+  `(row, now)` ⇒ AV-76 TIER 1 on all three `put_attestation` doors, the local
+  write door, and `check_promotion_admission` (B8: a row must not escape a
+  put-gate by entering local and being promoted).
+- **The fold is NOT re-keyed** to the envelope instant, which is the tempting
+  fix and is wrong: historical rows return `None`, and `None`-sorts-low lets a
+  re-minted stale grant beat a recent revoke while `None`-falls-back-to-the-column
+  hands the attacker their own ordering key. Ordering stays on the column;
+  security comes from the gate that makes the column trustworthy.
+- **The emit path could not have satisfied it.** `assemble` sampled its own
+  `Utc::now()` *after* the bytes were signed, so column ≠ envelope by
+  construction — not a missing check, a missing possibility. New
+  `attestation_emit::stamp_and_canonicalize` stamps both instants into the
+  envelope BEFORE signing and `assemble` reads them back out; the bare
+  `canonicalize` step is no longer on any emit path.
+- **Future-skew guard** on the bound instant, reusing `DEFAULT_MAX_TOUCH_SKEW`
+  (no second tolerance constant).
+- **The fold had NO tie-break.** `consent::fold_ordering_key` adds a
+  deterministic RESTRICTION-WINS ordering — the discipline `quarantine.rs`,
+  `mesh_config.rs` and `precedence.rs` already implement — so a grant can never
+  out-sort a revoke it ties with, on any backend. The fixture comment in
+  `bootstrap_admission.rs` that *documented* this gap is deleted.
+- **Sub-microsecond spacing is REFUSED, not truncated.** postgres `TIMESTAMPTZ`
+  truncates to microseconds while sqlite TEXT and memory `chrono` keep
+  nanoseconds, so a 500ns-spaced pair was a strict order on two backends and a
+  tie on the third. Truncating at the write chokepoint was the other honest
+  option and was rejected: the instant is now bound to a signature, so silently
+  coarsening the column would leave the row failing its own binding. Refusing
+  keeps column, envelope and every backend's round-trip byte-equal. Persist's
+  own emit path truncates before stamping, so nothing it mints can trip it.
+
+**BREAKING for consumers:** `ENVELOPE_VOCABULARY_SHA256` is re-pinned to
+`2bb46f15…94ba` (`asserted_at` / `expires_at` joined `universal_paths`), and a
+`consent:state:*` envelope without a signed `asserted_at` is refused everywhere.
+`Engine::emit_attestation` / `emit_attestation_self` / `assemble_attestation_self`
+and `attestation_emit::emit_with_local_signer` now take their input by value and
+mutate it in place (stamping the instants), so the caller's envelope is no longer
+the byte-identical thing that gets signed — it gains the two instant keys.
+
+Witnessed by **B10-a/b/c** in `bootstrap_admission::test_support`, driven from
+**all three backends** (the pre-existing fold tests were sqlite-only,
+single-writer, and assigned `asserted_at` by hand — the exact operation the
+defect permitted): the replay is refused and the capacity gate stays shut; two
+directories fed the same signed envelopes with the columns swapped converge on
+one verdict; a 500ns pair is refused identically everywhere and a true tie
+resolves restrictive in BOTH insertion orders.
+
+Mutation-tested — every mutation killed: deleting the envelope/column equality
+check reds the replay AND divergent-order legs on both backends;
+`max_by_key`→`min_by_key` reds all six witnesses; removing the tie-break reds
+the tie leg on the `revoke-first` order (and only that order, which is why the
+witness drives both).
+
 ## [30.12.0] - 2026-08-12
 
 ### Fixed — Bench had not succeeded in 100 runs, and a timeout reports as "cancelled" (#639)

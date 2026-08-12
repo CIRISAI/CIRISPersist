@@ -46,6 +46,48 @@ pub fn canonicalize(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::Backend(format!("emit_attestation canonicalize: {e}")))
 }
 
+/// v30.13.0 (CIRISPersist#598) — **stamp the row instants INTO the envelope,
+/// then canonicalize it.** Every emit entry point calls THIS, not
+/// [`canonicalize`], so there is no longer a canonicalize step that can be
+/// reached with an unstamped envelope.
+///
+/// # The ordering defect this closes
+///
+/// The recipe used to be `canonicalize → hash → sign → assemble`, and
+/// `assemble` sampled its OWN `chrono::Utc::now()` for `asserted_at` **after**
+/// the bytes were already signed. That made envelope/column equality — the
+/// property [`crate::federation::admission::check_consent_state_instant_binding`]
+/// demands — structurally impossible to satisfy at the mint: the two values
+/// came from two different clock reads, in that order, by construction. Not a
+/// missing check; a missing possibility.
+///
+/// So the instant is sampled ONCE, here, before the bytes exist:
+///
+/// - `now` is truncated to the substrate resolution
+///   ([`crate::federation::admission::truncate_to_substrate_resolution`]) so a
+///   persist-minted row can never trip the sub-microsecond refusal that keeps
+///   postgres and sqlite from disagreeing about ordering;
+/// - it is written to `envelope.asserted_at` (a producer that set the field
+///   ITSELF is honoured, not overwritten — that is the co-signed / staged-row
+///   case, where the instant must survive being assembled later);
+/// - `input.expires_at` is truncated the same way and mirrored to
+///   `envelope.expires_at`, so the pair is bound in both directions.
+///
+/// [`assemble`] then READS both back out of the signed envelope. Signature,
+/// hash and row column are three views of one instant.
+pub fn stamp_and_canonicalize(
+    input: &mut EmitAttestationInput,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Error> {
+    use crate::federation::admission::truncate_to_substrate_resolution as trunc;
+    if input.attestation_envelope.asserted_at.is_none() {
+        input.attestation_envelope.asserted_at = Some(trunc(now).to_rfc3339());
+    }
+    input.expires_at = input.expires_at.map(trunc);
+    input.attestation_envelope.expires_at = input.expires_at.map(|t| t.to_rfc3339());
+    canonicalize(&input.attestation_envelope.to_value())
+}
+
 /// Assemble the 20-field [`Attestation`] from an already-derived `key_id`
 /// (the attester/scrub — the #247 derived federation key_id, NEVER a caller
 /// alias), the `canonical` bytes, the computed hybrid `sig`, and `input`;
@@ -115,7 +157,62 @@ pub fn assemble(
     super::validate_subject_key_ids(&input.subject_key_ids)?;
 
     let original_content_hash = hex::encode(Sha256::digest(canonical));
-    let now = chrono::Utc::now();
+    // v30.13.0 (CIRISPersist#598) — THE INSTANT COMES OUT OF THE SIGNED
+    // ENVELOPE. This line used to be `chrono::Utc::now()`: a SECOND clock
+    // read, taken after `canonical` was already hashed and signed, so the row
+    // column and the signed bytes disagreed by construction and no producer
+    // could have made them agree. Reading it back out is what makes
+    // `check_consent_state_instant_binding` satisfiable at all — see
+    // [`stamp_and_canonicalize`], which every emit entry point goes through.
+    let envelope_value = input.attestation_envelope.to_value();
+    let now = {
+        let raw = input
+            .attestation_envelope
+            .asserted_at
+            .as_deref()
+            .ok_or_else(|| {
+                Error::InvalidArgument(
+                    "emit_attestation: the envelope carries no `asserted_at` — assemble reads the \
+                 row instant OUT of the signed envelope and never samples its own clock. Build \
+                 the canonical bytes through `attestation_emit::stamp_and_canonicalize` \
+                 (CIRISPersist#598)"
+                        .into(),
+                )
+            })?;
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "emit_attestation: envelope `asserted_at` is not RFC-3339: {e} \
+                     (CIRISPersist#598)"
+                ))
+            })?
+    };
+    // The expiry column is derived from the SAME signed bytes, for the same
+    // reason. A typed `expires_at` that the envelope does not carry would be
+    // an unsigned expiry on a signed row — the exact divergence the binding
+    // gate refuses at ingest, so it is refused at the mint too.
+    let expires_at = match input.attestation_envelope.expires_at.as_deref() {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "emit_attestation: envelope `expires_at` is not RFC-3339: {e} \
+                         (CIRISPersist#598)"
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+    if expires_at != input.expires_at {
+        return Err(Error::InvalidArgument(format!(
+            "emit_attestation: typed `expires_at` {:?} diverges from the signed envelope's {:?} \
+             (CIRISPersist#598)",
+            input.expires_at.map(|t| t.to_rfc3339()),
+            expires_at.map(|t| t.to_rfc3339()),
+        )));
+    }
 
     let attested_key_id = input.attested_key_id.unwrap_or_else(|| key_id.clone());
     super::admission::check_cohort_scope(&input.cohort_scope)?;
@@ -128,8 +225,8 @@ pub fn assemble(
         attestation_type: input.attestation_type,
         weight: input.weight,
         asserted_at: now,
-        expires_at: input.expires_at,
-        attestation_envelope: input.attestation_envelope.to_value(),
+        expires_at,
+        attestation_envelope: envelope_value,
         original_content_hash,
         scrub_signature_classical: B64.encode(&sig.classical.signature),
         scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
@@ -166,13 +263,15 @@ pub fn assemble(
 pub async fn emit_with_local_signer<D>(
     dir: &D,
     signer: &crate::signing::LocalSigner,
-    input: EmitAttestationInput,
+    mut input: EmitAttestationInput,
 ) -> Result<EmittedAttestation, Error>
 where
     D: FederationDirectory + Sync + ?Sized,
 {
     let key_id = signer.derived_key_id();
-    let canonical = canonicalize(&input.attestation_envelope.to_value())?;
+    // v30.13.0 (CIRISPersist#598) — stamp BEFORE signing (see
+    // [`stamp_and_canonicalize`]); `assemble` then reads the instant back out.
+    let canonical = stamp_and_canonicalize(&mut input, chrono::Utc::now())?;
     let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
         Error::Backend(format!(
             "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \

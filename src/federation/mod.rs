@@ -4290,6 +4290,13 @@ pub trait FederationDirectory: Send + Sync {
     /// v1 resolves the **direct** subject only; the `delegates_to` proxy
     /// chain (§8.1.11.1 `attesting_key_id ∈ delegates_to(s).proxies`) is
     /// a follow-up — a delegate-emitted stance is not yet folded in.
+    ///
+    /// v30.13.0 (CIRISPersist#598) — the winner is picked through
+    /// [`consent::fold_ordering_key`]: still latest-wins on the `asserted_at`
+    /// COLUMN (which every admitted `consent:state:*` row now proves equals
+    /// its own signed envelope instant), with a deterministic
+    /// RESTRICTION-WINS tie-break. Read that function's doc for why re-keying
+    /// this fold to the envelope instant is the wrong fix.
     async fn resolve_consent_state(
         &self,
         target_key_id: &str,
@@ -4301,10 +4308,11 @@ pub trait FederationDirectory: Send + Sync {
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
             .filter(|a| {
-                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+                consent::envelope_dimension(a)
+                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
             })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
-            .max_by_key(|a| a.asserted_at);
+            .max_by_key(consent::fold_ordering_key);
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),
         ))
@@ -4348,11 +4356,12 @@ pub trait FederationDirectory: Send + Sync {
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
             .filter(|a| {
-                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+                consent::envelope_dimension(a)
+                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
             })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
             .filter(|a| consent::matches_scoped_query(a, scope, qualifier))
-            .max_by_key(|a| a.asserted_at);
+            .max_by_key(consent::fold_ordering_key);
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),
         ))

@@ -183,9 +183,22 @@ pub mod test_support {
     /// grants must name their scope exactly, a scope-less non-grant is
     /// blanket).
     ///
-    /// `asserted_at` is EXPLICIT because the fold is latest-wins on it: a
-    /// grant and a revoke minted at the same `Utc::now()` tie, and
-    /// `max_by_key` on a tie is unspecified — the sequence must advance.
+    /// `asserted_at` is EXPLICIT because the fold is latest-wins on it, and it
+    /// is stamped INTO the signed envelope as well as onto the row column —
+    /// [`crate::federation::admission::check_consent_state_instant_binding`]
+    /// refuses the row if the two disagree (v30.13.0, CIRISPersist#598).
+    /// Truncated to the substrate resolution so the fixture measures ordering
+    /// rather than the precision difference between postgres `TIMESTAMPTZ` and
+    /// `Utc::now()`.
+    ///
+    /// v30.13.0 — the note that used to live here ("a grant and a revoke
+    /// minted at the same `Utc::now()` tie, and `max_by_key` on a tie is
+    /// unspecified — the sequence must advance") DOCUMENTED the missing
+    /// tie-break instead of fixing it. The fold now carries a deterministic
+    /// restriction-wins tie-break ([`crate::federation::consent::fold_ordering_key`]),
+    /// so a tie resolves to the restrictive stance on all three backends and
+    /// the fixture no longer has to keep the sequence advancing to be
+    /// meaningful.
     pub fn consent_scope_row(
         id: &str,
         subject: &str,
@@ -194,9 +207,12 @@ pub mod test_support {
         scopes: &[&str],
         asserted_at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = serde_json::json!({
             "dimension": stance_dimension,
             "scope": scopes,
+            crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(subject, &envelope);
@@ -1351,6 +1367,435 @@ pub mod test_support {
             dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY)
                 .await
                 .expect("({tag}) B9: the #530 repair motion still works on a producer's own row");
+        }
+    }
+
+    // ── B10 (CIRISPersist#598) — THE CONSENT INSTANT BINDING ─────────────
+    //
+    // | # | Invariant | Threat it denies |
+    // |---|---|---|
+    // | B10 | A `consent:state:*` row's `asserted_at` / `expires_at` COLUMNS
+    //        equal the instants in its own SIGNED envelope, on the substrate's
+    //        microsecond resolution and not in the future | Replaying a
+    //        subject's still-valid grant with a bumped column to un-revoke
+    //        their consent — no forgery, no broken signature |
+    //
+    // The pre-existing fold coverage was `sqlite.rs` only, single-writer, and
+    // assigned `asserted_at` BY HAND — which is precisely the operation the
+    // defect permits. Three legs, three backends, one body.
+
+    /// The three consent instants a witness needs, all on the substrate
+    /// resolution and all safely in the past: `t1` (grant), `t2` (revoke,
+    /// later), `t3` (the replay's bumped column, later still).
+    fn replay_instants() -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        (
+            now - chrono::Duration::seconds(300),
+            now - chrono::Duration::seconds(120),
+            now - chrono::Duration::seconds(10),
+        )
+    }
+
+    /// A third-party `capacity:*` claim by `attester` about `subject` — the
+    /// gate INSIDE persist that the replay re-opens
+    /// ([`crate::federation::admission::check_capacity_consent_admission`]).
+    fn capacity_claim(attester: &str, subject: &str) -> Attestation {
+        scores_row(
+            &uuid::Uuid::new_v4().to_string(),
+            attester,
+            subject,
+            "capacity:core_identity:v1",
+        )
+    }
+
+    /// **B10-a — THE REPLAY IS REFUSED.**
+    ///
+    /// The reported defect, end to end. `asserted_at` is a row column stored
+    /// verbatim by every backend and covered by no signature, so an attacker
+    /// needs no key material at all:
+    ///
+    /// 1. subject `S` grants `analyze` covering `P` at `t1`, then revokes at
+    ///    `t2 > t1`. The fold reads `Revoked` and `P`'s `capacity:*` claim
+    ///    about `S` is refused.
+    /// 2. the replay resubmits `S`'s **byte-identical, still-validly-signed**
+    ///    `t1` grant — same envelope, same `original_content_hash`, same
+    ///    hybrid signature, same `attesting_key_id` — with a fresh
+    ///    `attestation_id` and `asserted_at = t3 > t2`.
+    ///
+    /// Persist's ingest door carries **no caller identity**, which is why
+    /// "a DIFFERENT key replays it" is indistinguishable at the door from `S`
+    /// re-sending — and therefore why the defence has to be a property of the
+    /// ROW rather than of the sender. The row is refused because its column
+    /// diverges from its own signed envelope.
+    ///
+    /// Asserts the put is refused, the fold is STILL `Revoked`, and
+    /// `check_capacity_consent_admission` still refuses the third-party
+    /// `capacity:*` row — the last one because the fold and the gate are two
+    /// surfaces and a witness on only the fold would not have caught #598
+    /// biting inside persist.
+    pub async fn exercise_consent_replay_refusal(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let subject = format!("{tag}-598-subject");
+        let attester = format!("{tag}-598-attester");
+        for k in [&subject, &attester] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        let (t1, t2, t3) = replay_instants();
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+
+        // (a) the grant at t1 — this row is the attacker's ammunition, so keep
+        // it: the replay is this exact row with two fields changed.
+        let grant = consent_scope_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &subject,
+            &attester,
+            &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
+            &[analyze],
+            t1,
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: grant.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own grant admits: {e}"));
+
+        // (b) the revocation at t2 > t1 — the fold closes.
+        dir.put_attestation(SignedAttestation {
+            attestation: consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
+                &[analyze],
+                t2,
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own revocation admits: {e}"));
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B10-a: after the revoke the fold must read Revoked"
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: capacity_claim(&attester, &subject),
+        })
+        .await
+        .expect_err("({tag}) B10-a: with consent revoked, a capacity:* claim about S is refused");
+
+        // (c) THE REPLAY. Byte-identical signed envelope (so the hybrid verify
+        // still passes and `original_content_hash` still matches), new
+        // `attestation_id` (the only PK — nothing dedups a `scores` row), and
+        // the ordering key bumped past the revocation.
+        let mut replay = grant.clone();
+        replay.attestation_id = uuid::Uuid::new_v4().to_string();
+        replay.asserted_at = t3;
+        assert_eq!(
+            replay.attestation_envelope, grant.attestation_envelope,
+            "({tag}) B10-a: the replay must be BYTE-IDENTICAL in the signed half — a witness \
+             that mutates the envelope is testing the signature, not the binding"
+        );
+        assert_eq!(
+            replay.scrub_signature_classical, grant.scrub_signature_classical,
+            "({tag}) B10-a: …and carries the subject's own still-valid signature"
+        );
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: replay,
+            })
+            .await
+            .expect_err(
+                "({tag}) B10-a: a replayed grant whose asserted_at COLUMN diverges from its \
+                 signed envelope must be REFUSED (CIRISPersist#598)",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("asserted_at") && msg.contains("598"),
+            "({tag}) B10-a: the refusal must name the field and the rule: {msg}"
+        );
+
+        // (d) …and nothing moved: the fold is still closed and the gate INSIDE
+        // persist still refuses.
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B10-a: the replay must not flip the fold back to Granted"
+        );
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: capacity_claim(&attester, &subject),
+            })
+            .await
+            .expect_err(
+                "({tag}) B10-a: check_capacity_consent_admission must STILL refuse a \
+                 third-party capacity:* row about S",
+            );
+        assert_eq!(
+            err.kind(),
+            "federation_consent_gate_refused",
+            "({tag}) B10-a: and it refuses at the consent gate, not incidentally: {err:?}"
+        );
+    }
+
+    /// **B10-b — TWO DIRECTORIES FED THE SAME ENVELOPES CANNOT DISAGREE.**
+    ///
+    /// The divergent-order leg. Replica A is fed the two signed envelopes with
+    /// their true instants. Replica B is fed **the same two signed envelopes**
+    /// with the two `asserted_at` COLUMNS SWAPPED — a relaying node (or a
+    /// skewed clock) reordering a subject's consent history without touching a
+    /// signature. Before #598 that made the two replicas fold to opposite
+    /// verdicts about the same signed facts, which is the property a mesh
+    /// cannot have on the consent plane.
+    ///
+    /// Both replicas live in ONE directory under disjoint key pairs: the fold
+    /// is keyed on `(target, subject)`, so two disjoint pairs are two
+    /// independent replicas of the same history — and using one directory is
+    /// what lets the same body run on all three backends.
+    ///
+    /// The property proved is that **the signed envelopes decide the verdict
+    /// and the columns cannot change it**: replica B's swapped feed is
+    /// REFUSED, B stays non-Granted while it holds only the swapped rows, and
+    /// when B is fed the same envelopes with the instants those envelopes
+    /// themselves state, it converges on A's verdict exactly. Ordering is no
+    /// longer an input a relay gets to choose.
+    pub async fn exercise_consent_divergent_order(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+        let (t1, t2, _t3) = replay_instants();
+        let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
+        let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
+
+        let mut verdicts = Vec::new();
+        for (replica, swap) in [("a", false), ("b", true)] {
+            let subject = format!("{tag}-598-div{replica}-subject");
+            let attester = format!("{tag}-598-div{replica}-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            // The SIGNED envelopes are identical on both replicas (same
+            // stance, same scope, same signed instant). Only the row COLUMNS
+            // differ — swapped on replica B.
+            let grant = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                t1,
+            );
+            let revoke = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                t2,
+            );
+            if swap {
+                let mut swapped_grant = grant.clone();
+                let mut swapped_revoke = revoke.clone();
+                std::mem::swap(
+                    &mut swapped_grant.asserted_at,
+                    &mut swapped_revoke.asserted_at,
+                );
+                for (row, what) in [(swapped_grant, "grant"), (swapped_revoke, "revoke")] {
+                    dir.put_attestation(SignedAttestation { attestation: row })
+                        .await
+                        .expect_err(&format!(
+                            "({tag}) B10-b: replica b's {what} carries a column its own signed \
+                             envelope does not agree with and must be REFUSED \
+                             (CIRISPersist#598)"
+                        ));
+                }
+                // While B holds ONLY the swapped feed it must not have been
+                // talked into a grant. Pre-#598 this read Granted while A read
+                // Revoked — the mesh split this leg exists to deny.
+                assert_ne!(
+                    dir.resolve_scoped_consent(
+                        &attester,
+                        &subject,
+                        analyze,
+                        None,
+                        chrono::Utc::now()
+                    )
+                    .await
+                    .expect("fold reads"),
+                    ConsentState::Granted,
+                    "({tag}) B10-b: a swapped ordering column must never buy a GRANT"
+                );
+            }
+            // Both replicas are now fed the envelopes with the instants those
+            // envelopes THEMSELVES state — for A that is the only feed it ever
+            // saw; for B it is the honest relay of the same signed bytes.
+            for (row, what) in [(grant, "grant"), (revoke, "revoke")] {
+                dir.put_attestation(SignedAttestation { attestation: row })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("({tag}) B10-b/{replica}: the bound {what} admits: {e}")
+                    });
+            }
+            verdicts.push(
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("fold reads"),
+            );
+        }
+        assert_eq!(
+            verdicts[0], verdicts[1],
+            "({tag}) B10-b: two directories fed the SAME signed envelopes must fold to the same \
+             verdict — a swapped ordering column must not buy a different answer"
+        );
+        assert_eq!(
+            verdicts[0],
+            ConsentState::Revoked,
+            "({tag}) B10-b: …and the verdict they converge on is the subject's actual latest \
+             stance, not a shared blank"
+        );
+    }
+
+    /// **B10-c — SUB-MICROSECOND SPACING IS REFUSED, AND A TRUE TIE RESOLVES
+    /// RESTRICTIVE.**
+    ///
+    /// Two properties the three backends previously disagreed about.
+    ///
+    /// **(1) resolution.** sqlite stores RFC-3339 TEXT and memory holds a
+    /// `chrono` `DateTime` — both keep the full nanosecond — while postgres
+    /// `TIMESTAMPTZ` truncates to microseconds. So a grant and a revoke 500ns
+    /// apart were a strict order on two backends and a TIE on the third: the
+    /// same op sequence, two verdicts, decided by which database you asked.
+    /// The substrate now REFUSES a bound instant finer than a microsecond
+    /// (see [`crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS`]
+    /// for why refuse and not truncate), identically on all three.
+    ///
+    /// **(2) the tie.** With the sub-microsecond pair gone, a genuine tie is
+    /// still reachable — two claims in the same microsecond — and the fold had
+    /// **no tie-break at all**, so `max_by_key` returned whichever row the
+    /// backend's iteration order presented last. It now resolves
+    /// RESTRICTION-WINS, deterministically. Driven in BOTH insertion orders on
+    /// purpose: a single order can pass by luck on the backend whose row order
+    /// happens to favour the revoke, which is exactly how the gap survived.
+    pub async fn exercise_consent_tie_restriction_wins(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+        let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
+        let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
+        let base =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                - chrono::Duration::seconds(60);
+
+        // (1) 500ns apart — refused on EVERY backend, so no backend can be the
+        // one that reads this pair as a strict order.
+        {
+            let subject = format!("{tag}-598-ns-subject");
+            let attester = format!("{tag}-598-ns-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            // `consent_scope_row` truncates, so build the sub-microsecond row
+            // by hand: bump BOTH the column and the signed envelope so the
+            // divergence arm cannot be what refuses it — this arm must fail on
+            // RESOLUTION or it is testing the wrong rule.
+            let mut row = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                base,
+            );
+            let skewed = base + chrono::Duration::nanoseconds(500);
+            row.asserted_at = skewed;
+            let (och, sc, sp) = {
+                let mut env = row.attestation_envelope.clone();
+                env[crate::federation::envelope::paths::ASSERTED_AT] =
+                    serde_json::Value::String(skewed.to_rfc3339());
+                let signed =
+                    crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
+                row.attestation_envelope = env;
+                signed
+            };
+            row.original_content_hash = och;
+            row.scrub_signature_classical = sc;
+            row.scrub_signature_pqc = sp;
+            let err = dir
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err(
+                    "({tag}) B10-c: a sub-microsecond consent instant must be REFUSED — \
+                     postgres TIMESTAMPTZ cannot store it, so admitting it makes the fold's \
+                     answer depend on the backend (CIRISPersist#598)",
+                );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("sub-microsecond"),
+                "({tag}) B10-c: the refusal must name the RESOLUTION rule, not the binding: \
+                 {msg}"
+            );
+        }
+
+        // (2) a TRUE tie, fed in both orders. Restriction wins, both times,
+        // on every backend.
+        for (order, first_is_grant) in [("grant-first", true), ("revoke-first", false)] {
+            let subject = format!("{tag}-598-tie-{order}-subject");
+            let attester = format!("{tag}-598-tie-{order}-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            let mk = |dimension: &str| {
+                consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    dimension,
+                    &[analyze],
+                    base,
+                )
+            };
+            let pair = if first_is_grant {
+                [mk(&granted), mk(&revoked)]
+            } else {
+                [mk(&revoked), mk(&granted)]
+            };
+            for row in pair {
+                dir.put_attestation(SignedAttestation { attestation: row })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("({tag}) B10-c/{order}: both tied stances admit: {e}")
+                    });
+            }
+            assert_eq!(
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("fold reads"),
+                ConsentState::Revoked,
+                "({tag}) B10-c/{order}: a grant and a revoke at the SAME instant must resolve \
+                 to the RESTRICTIVE stance, in either insertion order and on every backend \
+                 (CIRISPersist#598)"
+            );
+            // The gate inside persist must agree with the fold — the tie-break
+            // is only worth anything if it reaches the consumer.
+            dir.put_attestation(SignedAttestation {
+                attestation: capacity_claim(&attester, &subject),
+            })
+            .await
+            .expect_err(&format!(
+                "({tag}) B10-c/{order}: and the tied verdict CLOSES the capacity gate"
+            ));
         }
     }
 }

@@ -3433,6 +3433,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
 
+        // v30.13.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+        // `consent:state:*` row is refused unless its signed envelope carries
+        // an `asserted_at` (and `expires_at`) equal to the row column the
+        // consent fold orders on. `asserted_at` is stored VERBATIM from the
+        // caller here and no signature covers it, so without this a replay of
+        // a subject's own byte-identical, still-valid grant with a bumped
+        // column flipped a revocation back to Granted — and re-opened
+        // `check_capacity_consent_admission`, a gate inside persist. Pure
+        // function of (row, now) ⇒ AV-76 TIER 1, and a REFUSAL, so an early
+        // position is safe. Backend-symmetric across memory / sqlite /
+        // postgres, and asked again at the promote door
+        // (`check_promotion_admission`) so the local tier is not a way around
+        // it (B8).
+        crate::federation::admission::check_consent_state_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
         // (notably `global`, a §8.1.8 feed-name, never a wire value)
@@ -13823,7 +13842,12 @@ impl SqliteBackend {
             .attestation_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let now = chrono::Utc::now();
+        // v30.13.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+        // envelope when it carries one (see `admission::local_row_instant`), so
+        // a `consent:state:*` row staged at the local tier can still satisfy
+        // the instant binding at the promote door.
+        let now =
+            crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
         let attesting_key_id = input.attesting_key_id.clone();
         let mut row = match transit {
             Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
@@ -13835,6 +13859,15 @@ impl SqliteBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v30.13.0 (CIRISPersist#598) — the same binding the federation door
+        // asks, asked at the local door too: a `consent:state:*` row that
+        // cannot state its own signed instant is refused where it is written,
+        // not where it is promoted.
+        crate::federation::admission::check_consent_state_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let envelope_text = serde_json::to_string(&row.attestation_envelope)
@@ -21415,7 +21448,16 @@ mod tests {
             .unwrap();
         let mk = |id: &str, dim: &str, at: &str| {
             let mut a = fed_attestation(id, "subject-1", "target-1", "subject-1");
-            a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
+            // v30.13.0 (CIRISPersist#598) — the instant rides the SIGNED
+            // envelope as well as the row column; the two must agree or the
+            // row is refused. Assigning `asserted_at` by hand — which is what
+            // this fixture does, and exactly what the defect permitted — is
+            // now only expressible when the signed half says the same thing.
+            a.attestation_envelope = serde_json::json!({
+                "id": id,
+                "dimension": dim,
+                crate::federation::envelope::paths::ASSERTED_AT: at,
+            });
             a.asserted_at = at.parse().unwrap();
             resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             SignedAttestation { attestation: a }
@@ -21497,7 +21539,13 @@ mod tests {
         }
         let mk = |id: &str, dim: &str, at: &str, extras: serde_json::Value| {
             let mut a = fed_attestation(id, "subject-2", "target-2", "subject-2");
-            let mut env = serde_json::json!({ "id": id, "dimension": dim });
+            // v30.13.0 (CIRISPersist#598) — see the twin in
+            // `resolve_consent_state_latest_revoked_overrides_granted`.
+            let mut env = serde_json::json!({
+                "id": id,
+                "dimension": dim,
+                crate::federation::envelope::paths::ASSERTED_AT: at,
+            });
             if let (Some(obj), Some(extra)) = (env.as_object_mut(), extras.as_object()) {
                 for (k, v) in extra {
                     obj.insert(k.clone(), v.clone());
@@ -21670,12 +21718,25 @@ mod tests {
         //     not re-open over the (5) scoped revoke.
         let mut expired_grant =
             fed_attestation("sc-expired-grant", "subject-2", "target-2", "subject-2");
+        // v30.13.0 (CIRISPersist#598) — `expires_at` is bound the same way
+        // `asserted_at` is, and for the same reason: the fold DROPS an expired
+        // row, so an unsigned expiry is an unsigned mute button. Truncated to
+        // the substrate resolution because the bound instants must be storable
+        // by every backend, postgres included.
+        expired_grant.asserted_at = "2026-06-05T00:00:00Z".parse().unwrap();
+        expired_grant.expires_at = Some(
+            crate::federation::admission::truncate_to_substrate_resolution(
+                now - chrono::Duration::hours(1),
+            ),
+        );
         expired_grant.attestation_envelope = serde_json::json!({
             "id": "sc-expired-grant", "dimension": "consent:state:granted:v1",
             "scope": "view", "content_class": "medical",
+            crate::federation::envelope::paths::ASSERTED_AT:
+                expired_grant.asserted_at.to_rfc3339(),
+            crate::federation::envelope::paths::EXPIRES_AT:
+                expired_grant.expires_at.map(|t| t.to_rfc3339()),
         });
-        expired_grant.asserted_at = "2026-06-05T00:00:00Z".parse().unwrap();
-        expired_grant.expires_at = Some(now - chrono::Duration::hours(1));
         resign_fed(&mut expired_grant);
         backend
             .put_attestation(SignedAttestation {
@@ -21704,6 +21765,7 @@ mod tests {
         let mut s3_blanket = fed_attestation("sc-s3-blanket", "subject-3", "target-2", "subject-3");
         s3_blanket.attestation_envelope = serde_json::json!({
             "id": "sc-s3-blanket", "dimension": "consent:state:revoked:v1",
+            crate::federation::envelope::paths::ASSERTED_AT: "2026-06-06T00:00:00Z",
         });
         s3_blanket.asserted_at = "2026-06-06T00:00:00Z".parse().unwrap();
         resign_fed(&mut s3_blanket);
@@ -21811,10 +21873,17 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let now = chrono::Utc::now();
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let mk = |id: &str, attester: &str, dim: &str, at: chrono::DateTime<chrono::Utc>| {
             let mut a = fed_attestation(id, attester, "target-1", attester);
-            a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
+            // v30.13.0 (CIRISPersist#598) — the signed instant. Harmless on the
+            // `consent:deletion_sla:*` row (the binding is keyed to
+            // `consent:state:*`) and REQUIRED on the revocation.
+            a.attestation_envelope = serde_json::json!({
+                "id": id, "dimension": dim,
+                crate::federation::envelope::paths::ASSERTED_AT: at.to_rfc3339(),
+            });
             a.asserted_at = at;
             resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             SignedAttestation { attestation: a }
@@ -21920,8 +21989,11 @@ mod tests {
         // (transit-not-rest), so this simulates the #171 promote-surface
         // staging the watcher must drive out.
         let mut rev = fed_attestation("rev-p", "subject-p", "target-p", "subject-p");
-        rev.attestation_envelope =
-            serde_json::json!({ "id": "rev-p", "dimension": "consent:state:revoked:v1" });
+        // v30.13.0 (CIRISPersist#598) — the signed instant rides the envelope.
+        rev.attestation_envelope = serde_json::json!({
+            "id": "rev-p", "dimension": "consent:state:revoked:v1",
+            crate::federation::envelope::paths::ASSERTED_AT: revoked_at.to_rfc3339(),
+        });
         rev.asserted_at = revoked_at;
         rev.subject_key_ids = vec!["subject-p".into()];
         resign_fed(&mut rev);
@@ -22035,8 +22107,11 @@ mod tests {
             ("rev-new", revoked_at + chrono::Duration::hours(12)),
         ] {
             let mut rev = fed_attestation(id, "subject-r", "target-r", "subject-r");
-            rev.attestation_envelope =
-                serde_json::json!({ "id": id, "dimension": "consent:state:revoked:v1" });
+            // v30.13.0 (CIRISPersist#598) — the signed instant rides the envelope.
+            rev.attestation_envelope = serde_json::json!({
+                "id": id, "dimension": "consent:state:revoked:v1",
+                crate::federation::envelope::paths::ASSERTED_AT: at.to_rfc3339(),
+            });
             rev.asserted_at = at;
             rev.subject_key_ids = vec!["subject-r".into()];
             resign_fed(&mut rev);
@@ -28424,9 +28499,16 @@ mod tests {
             .await
             .unwrap();
 
+        // v30.13.0 (CIRISPersist#598) — a `consent:state:*` row states its own
+        // instant in the SIGNED envelope; the local write door stamps the column
+        // FROM it (`admission::local_row_instant`), so the two agree by
+        // construction and the row survives the binding gate at promotion.
         let env = serde_json::json!({
             "id": "rev-c", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT:
+                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                    .to_rfc3339(),
         });
         let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
 
@@ -39632,6 +39714,44 @@ mod tests {
         .await;
     }
 
+    /// #598 B10-a — a REPLAYED consent grant whose `asserted_at` column
+    /// diverges from its own signed envelope is refused, on sqlite. Shares
+    /// the assertion body with the other two backends: the pre-#598 fold
+    /// coverage was sqlite-only and single-writer, which is the "test shape"
+    /// gap the defect lived in.
+    #[tokio::test]
+    async fn consent_replay_refused_sqlite_598() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
+            &backend, "sq598a",
+        )
+        .await;
+    }
+
+    /// #598 B10-b — two directories fed the SAME signed envelopes with the two
+    /// `asserted_at` columns swapped fold to the SAME verdict, on sqlite.
+    #[tokio::test]
+    async fn consent_divergent_order_agrees_sqlite_598() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_divergent_order(
+            &backend, "sq598b",
+        )
+        .await;
+    }
+
+    /// #598 B10-c — a sub-microsecond consent instant is refused and a true
+    /// tie resolves RESTRICTIVE, in both insertion orders, on sqlite.
+    #[tokio::test]
+    async fn consent_tie_resolves_restrictive_sqlite_598() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_tie_restriction_wins(
+            &backend, "sq598c"
+        )
+        .await;
+    }
     /// #543 AV-77 — de-admission stops an abuser and is revocable, on sqlite.
     #[tokio::test]
     async fn bootstrap_peer_deadmission_sqlite_543() {
