@@ -2136,16 +2136,36 @@ impl SqliteBackend {
     /// stored at this boundary, so a registration submitting the stored token
     /// used to index bytes `lookup_public_key` never returns.
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
-        if let Some((wire_index_hash, wire_index_key)) =
-            crate::federation::wire_index::key_entry_as_stored(self, key_id).await?
+        self.index_stored_record(
+            "Key",
+            &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
+        )
+        .await
+    }
+
+    /// v30.13.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
+    /// row through the read path's own dispatcher and index the bytes it
+    /// returns. See
+    /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored)
+    /// for why the write path must not derive this itself.
+    ///
+    /// Callers must have RELEASED the connection lock before awaiting this —
+    /// the reload takes it, and `parking_lot::Mutex` is not reentrant — and
+    /// must have finished any transaction they opened, since a reload on the
+    /// same connection mid-transaction would see uncommitted state that a
+    /// rollback could then take away.
+    async fn index_stored_record(
+        &self,
+        kind: &str,
+        record_key_json: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(content_hash) =
+            crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
         {
             let conn = self.conn.clone();
-            (move || {
-                sqlite_upsert_wire_index(&conn.lock(), "Key", &wire_index_hash, &wire_index_key)
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("signed_wire_index upsert: {e}"))
-            })?;
+            sqlite_upsert_wire_index(&conn.lock(), kind, &content_hash, record_key_json).map_err(
+                |e| crate::federation::Error::Backend(format!("signed_wire_index upsert: {e}")),
+            )?;
         }
         Ok(())
     }
@@ -3898,17 +3918,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // `Attestation` IS its own signed wrapper (carries the scrub
         // signature inline), so this hashes the exact `list_attestations_since`
         // read-surface value.
-        let wire_index_entry = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
+        // v30.13.0 (CIRISPersist#646) — only the LOCATOR is derived here; the
+        // hash comes from the stored row, after the write. See
+        // `index_stored_record`.
+        let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
             .then(|| {
-                Ok::<_, crate::federation::Error>((
-                    crate::federation::wire_index::record_key(&[(
-                        "attestation_id",
-                        &row.attestation_id,
-                    )]),
-                    crate::federation::wire_index::content_hash_of(&row)?,
-                ))
-            })
-            .transpose()?;
+                crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )])
+            });
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3966,9 +3985,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
             sqlite_project_consent_peer_set(&conn, &row)?;
-            if let Some((wire_index_key, wire_index_hash)) = &wire_index_entry {
-                sqlite_upsert_wire_index(&conn, "Attestation", wire_index_hash, wire_index_key)?;
-            }
             Ok(())
         })()
         .map_err(|e| {
@@ -3981,6 +3997,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert attestation: {msg}"))
             }
         })?;
+        if let Some(wire_index_key) = &wire_index_key {
+            self.index_stored_record("Attestation", wire_index_key)
+                .await?;
+        }
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
         // rows (via the SAME decompose the ingest path uses), so a
@@ -4249,10 +4269,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // Key-plane mutators and the Attestation re-scope path was not in that
         // set. Same shape as #541 — a preserve set and a verified set that can
         // disagree.
-        row.persist_row_hash = new_hash.clone();
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
 
         let conn = self.conn.clone();
         let id = attestation_id.to_owned();
@@ -4264,9 +4282,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  WHERE attestation_id = ?3",
                 rusqlite::params![scope, new_hash, id],
             )?;
-            if n > 0 {
-                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)?;
-            }
             Ok(n)
         })()
         .map_err(|e| {
@@ -4277,6 +4292,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "federation_attestations row {attestation_id} does not exist"
             )));
         }
+        self.index_stored_record("Attestation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -4500,14 +4517,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("identity_key_id", &row.identity_key_id),
             ("occurrence_key_id", &row.occurrence_key_id),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: row.clone(),
-                attesting_key_id: attesting_key_id.clone(),
-                signed_envelope: signed_envelope.clone(),
-                signature: signature.clone(),
-            },
-        )?;
         let conn = self.conn.clone();
         let occurrence_applied = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
@@ -4567,21 +4576,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::FederationDirectory::put_transport_destination(self, route)
                     .await?;
             }
-            let conn = self.conn.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                sqlite_upsert_wire_index(
-                    &conn,
-                    "IdentityOccurrence",
-                    &wire_index_hash,
-                    &wire_index_key,
-                )
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "put_identity_occurrence wire index: {e}"
-                ))
-            })?;
+            self.index_stored_record("IdentityOccurrence", &wire_index_key)
+                .await?;
         }
         Ok(())
     }
@@ -4805,25 +4801,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        if let Some(reloaded) = self.lookup_family(&family_key_id).await? {
-            let wire_index_key =
-                crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]);
-            let wire_index_hash =
-                crate::federation::wire_index::content_hash_of(&crate::federation::SignedFamily {
-                    family: reloaded,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                })?;
-            let conn = self.conn.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                sqlite_upsert_wire_index(&conn, "Family", &wire_index_hash, &wire_index_key)
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_family wire index: {e}"))
-            })?;
-        }
+        // v30.13.0 (CIRISPersist#646) — that reload is now the SHARED one. This
+        // site had the right instinct and its own implementation of it; the
+        // instinct is now the rule and the implementation is one function.
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -5333,13 +5318,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             "community_key_id",
             &row.community_key_id,
         )]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedCommunity {
-                community: row.clone(),
-                authority_key_id: authority_key_id.clone(),
-                scrub_signature_classical: scrub_signature_classical.clone(),
-                scrub_signature_pqc: scrub_signature_pqc.clone(),
-            })?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -5362,7 +5340,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "Community", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(|e| {
@@ -5375,6 +5352,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert community: {msg}"))
             }
         })?;
+        self.index_stored_record("Community", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5868,14 +5847,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("identity_key_id", &row.identity_key_id),
             ("occurrence_key_id", &row.occurrence_key_id),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: row.clone(),
-                attesting_key_id: attesting_key_id.clone(),
-                signed_envelope: signed_envelope.clone(),
-                signature: signature.clone(),
-            },
-        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -5898,12 +5869,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signature_json,
                 ],
             )?;
-            sqlite_upsert_wire_index(
-                &conn,
-                "IdentityOccurrenceRevocation",
-                &wire_index_hash,
-                &wire_index_key,
-            )?;
             // #446 de-projection (the projection's inverse): retire the LOCAL
             // derived route materialized from this occurrence's binding — else
             // a revoked occurrence leaves a live routable peer. Narrow on
@@ -5922,6 +5887,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("identity_occurrence_revocation"))?;
+        self.index_stored_record("IdentityOccurrenceRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6005,14 +5972,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("family_key_id", &row.family_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedFamilyMembershipRevocation {
-                family_membership_revocation: row.clone(),
-                authority_key_id: authority_key_id.clone(),
-                scrub_signature_classical: scrub_signature_classical.clone(),
-                scrub_signature_pqc: scrub_signature_pqc.clone(),
-            },
-        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -6035,15 +5994,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            sqlite_upsert_wire_index(
-                &conn,
-                "FamilyMembershipRevocation",
-                &wire_index_hash,
-                &wire_index_key,
-            )?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("family_membership_revocation"))?;
+        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
+            .await?;
         self.record_hard_case(removal_event).await?;
         Ok(())
     }
@@ -6090,14 +6045,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("community_key_id", &row.community_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedCommunityMembershipRevocation {
-                community_membership_revocation: row.clone(),
-                authority_key_id: authority_key_id.clone(),
-                scrub_signature_classical: scrub_signature_classical.clone(),
-                scrub_signature_pqc: scrub_signature_pqc.clone(),
-            },
-        )?;
         let conn = self.conn.clone();
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
         // under a single lock acquisition: a bump failure after the INSERT
@@ -6126,12 +6073,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            sqlite_upsert_wire_index(
-                &tx,
-                "CommunityMembershipRevocation",
-                &wire_index_hash,
-                &wire_index_key,
-            )?;
+            // v30.13.0 (CIRISPersist#646) — the index entry LEFT this
+            // transaction. Deriving the hash from the row as stored means
+            // reading the row back, and this closure holds the only
+            // connection: reading inside the tx would see state a rollback
+            // could still take away. Written after commit instead — a crash in
+            // the gap leaves a row `rebuild_signed_wire_index` repairs, where
+            // an atomically-committed WRONG hash is permanent and silent.
             // Idempotent on the deterministic event_id.
             tx.execute(
                 "INSERT INTO hard_case_events \
@@ -6162,6 +6110,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             tx.commit()
         })()
         .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
+        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6294,16 +6244,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // moves everything.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("subject_key_id", &row.subject_key_id),
-            ("asserted_at", &row.asserted_at.to_rfc3339()),
+            // v30.13.0 (CIRISPersist#646) — the microsecond-floor spelling; see
+            // `wire_index::locator_instant`.
+            (
+                "asserted_at",
+                &crate::federation::wire_index::locator_instant(&row.asserted_at),
+            ),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedLocationProof {
-                location_proof: row.clone(),
-                authority_key_id: authority_key_id.clone(),
-                scrub_signature_classical: scrub_signature_classical.clone(),
-                scrub_signature_pqc: scrub_signature_pqc.clone(),
-            },
-        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -6327,10 +6274,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "LocationProof", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("location_proof"))?;
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6653,9 +6601,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("occurrence_key_id", &d.occurrence_key_id),
             ("transport_kind", &d.transport_kind),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(signed)?;
+
         let conn = self.conn.clone();
-        (move || -> Result<Outcome, rusqlite::Error> {
+        let outcome = (move || -> Result<Outcome, rusqlite::Error> {
             let conn = conn.lock();
             // Classify against the current row (retired rows INCLUDED — the
             // tombstone must keep winning), then write with the same guard in
@@ -6752,12 +6700,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signature_json,
                 ],
             )?;
-            sqlite_upsert_wire_index(
-                &conn,
-                "TransportDestination",
-                &wire_index_hash,
-                &wire_index_key,
-            )?;
             Ok(if inserted_fresh {
                 Outcome::Inserted
             } else {
@@ -6766,7 +6708,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-        })
+        })?;
+        self.index_stored_record("TransportDestination", &wire_index_key)
+            .await?;
+        Ok(outcome)
     }
 
     async fn list_transport_destinations_for(
@@ -7349,7 +7294,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // closure moves `row`.
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -7382,10 +7326,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "Organization", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("organization"))?;
+        self.index_stored_record("Organization", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -7422,7 +7367,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // wire-index comment.
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -7450,10 +7394,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "OrgMembership", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("org_membership"))?;
+        self.index_stored_record("OrgMembership", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -7500,13 +7445,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // (only `.partner_record` was moved out above — a partial move).
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedPartnerRecord {
-                partner_record: row.clone(),
-                steward_signatures: signed.steward_signatures.clone(),
-                threshold: signed.threshold,
-            },
-        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -7541,10 +7479,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     threshold,
                 ],
             )?;
-            sqlite_upsert_wire_index(&conn, "PartnerRecord", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("partner_record"))?;
+        self.index_stored_record("PartnerRecord", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -8327,22 +8266,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // SAME post-promotion shape `list_attestations_since` will read back
         // (`persist_row_hash` = the newly-stamped `new_hash`, not the
         // pre-promotion value still on `row`).
-        {
-            row.persist_row_hash = new_hash;
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-            let conn = self.conn.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("promote_attestation wire index: {e}"))
-            })?;
-        }
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]),
+        )
+        .await?;
         // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
         {
             let conn = self.conn.clone();
@@ -8502,23 +8430,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // same hook as `promote_attestation`. The stale pre-transform hash
         // entry (if any) self-heals via the defensive re-hash on read.
         // (`row.persist_row_hash` was stamped to the new hash above.)
-        {
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-            let conn = self.conn.clone();
-            (move || -> Result<(), rusqlite::Error> {
-                let conn = conn.lock();
-                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)
-            })()
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "promote_attestation_transformed wire index: {e}"
-                ))
-            })?;
-        }
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -19586,6 +19502,22 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
             &backend,
             "sqlite-640",
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#646) — the SQLITE leg of the every-kind witness.
+    /// SQLite round-trips nanoseconds, so the timestamp half cannot bite here;
+    /// it runs anyway because a rule only the failing backend follows is a rule
+    /// the next writer will not know about, and because the LOCATOR floor on
+    /// `LocationProof.asserted_at` must agree across backends or a rebuilt
+    /// index and an incrementally written one spell the same row two ways.
+    #[tokio::test]
+    async fn nanosecond_wire_refs_resolve_every_kind_sqlite_646() {
+        let backend = fresh_backend_with_occurrence("occ-646").await;
+        crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
+            &backend,
+            "sqlite-646",
         )
         .await;
     }

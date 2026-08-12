@@ -3702,6 +3702,104 @@ pub struct AnnouncedPeer {
     pub announce_count: i64,
 }
 
+/// v30.13.0 (CIRISPersist#646) — truncate one RFC-3339 timestamp string to
+/// microsecond precision, or return `None` when the string is not an RFC-3339
+/// instant carrying a sub-microsecond tail.
+///
+/// The `parse_from_rfc3339` guard is what makes this safe to run over an
+/// arbitrary JSON string: a base64 signature, a hex digest or a key_id cannot
+/// pass it, so nothing but an actual instant is ever rewritten.
+fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
+    let dot = s.find('.')?;
+    let frac_start = dot + 1;
+    let frac_len = s.as_bytes()[frac_start..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if frac_len <= 6 {
+        return None;
+    }
+    // Only rewrite something that really is an instant.
+    chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..frac_start + 6]);
+    out.push_str(&s[frac_start + frac_len..]);
+    Some(out)
+}
+
+/// v30.13.0 (CIRISPersist#646) — rewrite every RFC-3339 instant in `value` to
+/// microsecond precision, recursively.
+///
+/// # Why `persist_row_hash` must not see nanoseconds
+///
+/// `persist_row_hash` is a CROSS-NODE row identity: the write paths compare a
+/// freshly computed hash against the stored column to decide "same row or
+/// different row", and those comparisons **gate**. A mismatch is not a slow
+/// path — `put_public_key` returns `Error::Conflict("… already exists with
+/// different content")`, `put_goal` does the same, `adopt_scrub_upgrade`
+/// refuses as a downgrade/replace, and a miss on
+/// [`plan_replicated_key_apply`](super::register::plan_replicated_key_apply)'s
+/// idempotency fast path falls through to `plan_canonical_supersede`, which
+/// refuses a same-version re-apply as a re-scrub hijack. So an identity hash
+/// that disagrees with itself REFUSES legitimate writes.
+///
+/// And it did disagree, because the three backends store instants at three
+/// precisions:
+///
+/// * postgres `TIMESTAMPTZ` — **microseconds** (a sub-µs tail is rounded away
+///   on the way in);
+/// * sqlite — `to_rfc3339()` TEXT, **nanoseconds** preserved;
+/// * memory — the `DateTime<Utc>` itself, **nanoseconds** preserved.
+///
+/// The hash was computed over the struct the writer HELD, so a postgres node
+/// stored `H(nanoseconds)` beside a row holding microseconds. Serve that row
+/// and it is internally inconsistent — `record.persist_row_hash !=
+/// compute_persist_row_hash(record)` — and any peer that re-derives (which is
+/// exactly what the idempotency gates do) computes a different value and
+/// refuses.
+///
+/// # Why truncate rather than hash-as-stored
+///
+/// CIRISPersist#640's remedy for the WIRE INDEX is "hash the row as stored",
+/// and that is right there: the wire index hashes the exact bytes the read
+/// surface serves, whatever they are, and the normalization it has to survive
+/// is not only about clocks (`consent_role` is normalized too). It is the
+/// WRONG remedy here. Hashing as stored would make postgres compute
+/// `H(microseconds)` and sqlite `H(nanoseconds)` **for the same record**,
+/// which is precisely the disagreement a cross-node identity must not have.
+/// A row identity has to be a function of the record, not of who stored it.
+///
+/// Microseconds is the correct floor, not an arbitrary one: it is what
+/// postgres `TIMESTAMPTZ` holds, what Python's `datetime` (CIRISRegistry,
+/// CIRISAgent) can represent at all, and therefore the finest precision every
+/// participant in this mesh can reproduce. A nanosecond tail is a value no
+/// peer can round-trip, so no identity may depend on it.
+///
+/// Applied to the hash INPUT, not to the stored row: nothing here changes what
+/// a column holds or what a signature covers. The rows keep whatever precision
+/// their backend keeps; only the identity derived from them stops varying with
+/// it.
+fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(truncated) = truncate_rfc3339_to_microseconds(s) {
+                *s = truncated;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                truncate_instants_to_microseconds(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                truncate_instants_to_microseconds(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compute the canonical-bytes hash for a row used for
 /// `persist_row_hash`. Persist calls this server-side on every write
 /// path so consumers don't have to.
@@ -3713,6 +3811,9 @@ pub struct AnnouncedPeer {
 /// itself).
 ///
 /// Returns the hex-encoded SHA-256 string.
+///
+/// v30.13.0 (CIRISPersist#646) — every instant in the hashed value is first
+/// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use sha2::{Digest, Sha256};
@@ -3735,6 +3836,9 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
         obj.remove("persist_row_hash");
         obj.remove("consent_role");
     }
+    // v30.13.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
+    // BEFORE HASHING. See `truncate_instants_to_microseconds`.
+    truncate_instants_to_microseconds(&mut value);
     let bytes = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&value)
         .map_err(|e| super::Error::Backend(format!("canonicalize for hash: {e}")))?;
@@ -3745,6 +3849,112 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v30.13.0 (CIRISPersist#646) — `persist_row_hash` does not depend on a
+    /// precision no participant can reproduce.
+    ///
+    /// The row identity has to be a function of the RECORD, not of who stored
+    /// it, because the write paths compare a freshly computed hash against the
+    /// stored column to decide "same row or different row" and REFUSE on a
+    /// mismatch (`put_public_key` → `Error::Conflict`, `put_goal` likewise,
+    /// `adopt_scrub_upgrade` → downgrade/replace refused,
+    /// `plan_replicated_key_apply` → falls through to a supersede that refuses
+    /// a same-version re-apply). Postgres holds microseconds and sqlite/memory
+    /// hold nanoseconds, so before this cut the same record hashed two ways
+    /// depending on which backend had touched it, and a byte-identical
+    /// re-apply could be refused as "different content".
+    #[test]
+    fn persist_row_hash_is_microsecond_stable_646() {
+        use chrono::Timelike as _;
+        let with_ns: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456789Z".parse().unwrap();
+        let truncated = with_ns.with_nanosecond(123_456_000).unwrap();
+        // The fixture must really differ below a microsecond, or this cannot fail.
+        assert_ne!(
+            with_ns.nanosecond() % 1_000,
+            0,
+            "the nanosecond fixture must carry a sub-microsecond tail"
+        );
+        assert_ne!(
+            with_ns, truncated,
+            "the two fixtures must be distinct instants"
+        );
+
+        let row = |t: chrono::DateTime<Utc>| KeyRecord {
+            key_id: "k1".into(),
+            pubkey_ed25519_base64: "AAAA".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: "hybrid".into(),
+            identity_type: "node".into(),
+            identity_ref: "k1".into(),
+            valid_from: t,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": "k1" }),
+            original_content_hash: "de".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k1".into(),
+            scrub_timestamp: t,
+            pqc_completed_at: Some(t),
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        assert_eq!(
+            compute_persist_row_hash(&row(with_ns)).unwrap(),
+            compute_persist_row_hash(&row(truncated)).unwrap(),
+            "a nanosecond tail no backend can round-trip must not change the row identity"
+        );
+    }
+
+    /// The truncation is a MICROSECOND floor, not a blanket timestamp erasure:
+    /// two instants that differ AT microsecond resolution must still hash
+    /// differently, or the identity would stop distinguishing real versions.
+    #[test]
+    fn persist_row_hash_still_separates_distinct_microseconds_646() {
+        let a: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456Z".parse().unwrap();
+        let b: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123457Z".parse().unwrap();
+        let row = |t: chrono::DateTime<Utc>| serde_json::json!({ "asserted_at": t.to_rfc3339() });
+        assert_ne!(
+            compute_persist_row_hash(&row(a)).unwrap(),
+            compute_persist_row_hash(&row(b)).unwrap(),
+            "one microsecond apart is a real difference and must survive"
+        );
+    }
+
+    /// The `parse_from_rfc3339` guard is what makes the rewrite safe over an
+    /// arbitrary JSON string. A base64 signature, a hex digest, a version
+    /// string — none may be touched however many dots and digits they carry.
+    #[test]
+    fn instant_truncation_never_touches_a_non_timestamp_646() {
+        for s in [
+            "1.2345678901234567890",
+            "sha256.1234567890abcdef",
+            "v1.2.3456789012",
+            "not-a-time.9999999",
+            "2026-13-45T99:99:99.1234567Z",
+        ] {
+            assert!(
+                super::truncate_rfc3339_to_microseconds(s).is_none(),
+                "must not rewrite non-instant {s:?}"
+            );
+        }
+        // …and it DOES rewrite a real one, or the guard would be vacuous.
+        assert_eq!(
+            super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456789Z").as_deref(),
+            Some("2026-06-01T00:00:00.123456Z"),
+        );
+        // A microsecond-or-coarser instant is already at the floor: left alone.
+        assert!(super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456Z").is_none());
+        assert!(super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00Z").is_none());
+        // The offset suffix survives the splice.
+        assert_eq!(
+            super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456789+02:00")
+                .as_deref(),
+            Some("2026-06-01T00:00:00.123456+02:00"),
+        );
+    }
 
     /// v23.0.0 (CIRISPersist#551 item 6) — the Rust field is
     /// `capability_roles`; the WIRE name is still `roles`.

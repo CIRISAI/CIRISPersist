@@ -259,6 +259,137 @@ check reds the replay AND divergent-order legs on both backends;
 the tie leg on the `revoke-first` order (and only that order, which is why the
 witness drives both).
 
+### Fixed — the #640 remedy reached one kind of thirteen, and the row identity it left behind could refuse a legitimate write (#646)
+
+#547 fixed the wire index's KEY COVERAGE at three sites. #640 fixed its HASH
+DERIVATION — index the row **as stored**, not the struct the writer holds — at
+one plane, `Key`. Both remedies were applied where the failure had been
+observed and nowhere else. That is why the same defect arrived a third time:
+the other twelve kinds were still hashing the in-memory value, at **fifteen
+sites per backend, forty-five in all** — every one confirmed by inspection, none
+miscounted (`postgres.rs` 4713 / 5049 / 5326 / 5558 / 6115 / 6602 / 6735 / 6834
+/ 7060 / 7461 / 8143 / 8205 / 8298 / 9139 / 9282 and the exact twins in
+`sqlite.rs` and `memory.rs`: twelve kinds plus three extra `Attestation`
+mutators — `set_attestation_cohort_scope`, `promote_attestation`,
+`promote_attestation_transformed`).
+
+**ONE mechanism, not thirteen near-copies.** The write path now calls the READ
+path's own dispatcher: `wire_index::entry_as_stored` is
+`content_hash_of_bytes(reload_record_bytes(..))`, so the hash the index carries
+is *by construction* the value `lookup_signed_record_by_content_hash` recomputes
+when it self-checks. There is no second derivation left to drift. Every backend
+grows exactly one hook (`index_stored_record`) and every site becomes a call to
+it. A thirteen-way copy is how this became a class; the remedy had to stop being
+copyable.
+
+Cost, honestly: five kinds reload targeted (`Key`/`Attestation` by single-row
+getter; `IdentityOccurrence` / `IdentityOccurrenceRevocation` /
+`TransportDestination` scoped to their parent). The other eight have no
+subject-scoped signed read on the trait, so their put inherits
+`reload_record_bytes`'s `_since(None, u32::MAX)` scan — governance and
+operational writes whose point-read was already that scan. The scan is now the
+only thing left to make cheaper, and making it cheaper fixes both paths at once,
+which was never true while the write path had its own derivation.
+
+The confirmed live instance: `engine.rs` mints `chrono::Utc::now()` for
+`scrub_timestamp` at nanosecond precision and hands it to `promote_attestation`,
+where it lands in three `TIMESTAMPTZ` columns. **Every promotion on postgres**
+advertised a ref its own read surface could not reproduce.
+
+**A second defect, one level up.** `LocationProof` is the one kind whose
+`record_key` is not a byte-transparent TEXT id — it locates by
+`(subject_key_id, asserted_at)`. The put path wrote the writer's nanosecond
+`asserted_at` into the locator and the point-read then compared it against the
+value postgres handed back **rounded**. It never matched, so the ref resolved to
+`None` for a reason hashing the stored row cannot fix: the locator is what finds
+the stored row. A locator must be derivable *without* a read, so it is pinned
+instead to `wire_index::locator_instant` — the microsecond floor — spelled
+identically by the put path, by `all_kind_hash_keys`, and by the comparison in
+`reload_record_bytes`.
+
+**Atomicity, traded deliberately, at two sites.**
+`put_community_membership_revocation` upserted its index entry inside the same
+transaction as the INSERT on both SQL backends. It cannot stay there: reading
+the row back means reading on a connection that cannot see the open transaction
+(postgres) or inside the only connection the closure holds (sqlite). The entry
+is written after commit. The trade is not close — a crash in the gap leaves a
+row `rebuild_signed_wire_index` repairs, and #547's own postmortem shows that is
+repairable; an entry committed atomically with the WRONG hash is permanent and
+silent, because nothing downstream can tell a stale hash from a correct one.
+
+#### `persist_row_hash` gates. The audit said it did not.
+
+The audit filed this as interop-only: `register.rs:364` a benign fast-path miss,
+`genesis/bundle.rs:318` dedup. Verified, and **false**. `compute_persist_row_hash`
+covers every timestamp, postgres holds microseconds while sqlite and memory hold
+nanoseconds, so the same record hashed two ways depending on who stored it — and
+the comparisons that consume it REFUSE:
+
+- `put_public_key` (both SQL backends) — `existing_hash != row.persist_row_hash`
+  ⇒ `Error::Conflict("key_id … already exists with different content")`. Not a
+  slow path; the write is rejected.
+- `put_goal` — same shape, same `Conflict`.
+- `adopt_scrub_upgrade` — a differing hash on an already-anchored row is refused
+  as a downgrade/replace.
+- `plan_replicated_key_apply`'s idempotency fast path — a miss does not fall
+  through to a slower equivalent, it falls through to `plan_canonical_supersede`,
+  which refuses a same-version re-apply as a re-scrub hijack.
+
+So a byte-identical re-apply of a record that had round-tripped through a
+postgres node could be refused as different content. (The accord M2/M6 gates —
+`put_accord_participation`, `put_accord_decision` — DO gate on this hash but are
+**not** affected: they hash verify-core objects whose instants are strings, and
+compare stored column to stored column. `supersede_canonical_record`'s
+`WHERE persist_row_hash = $19` optimistic guard is likewise stored-vs-stored.)
+
+**Truncate at the door, not hash-as-stored** — deliberately the opposite choice
+from the wire index above, because the two hashes answer different questions.
+The wire index hashes the bytes a backend SERVES, whatever they are, and the
+normalization it must survive is not only about clocks (`consent_role` too), so
+it has to read the row. `persist_row_hash` is a CROSS-NODE row identity, and
+hash-as-stored would make postgres compute `H(µs)` and sqlite `H(ns)` *for the
+same record* — precisely the disagreement an identity must not have.
+`compute_persist_row_hash` now truncates every RFC-3339 instant in its input to
+microseconds before canonicalizing. Microseconds is the ecosystem floor, not an
+arbitrary one: it is what `TIMESTAMPTZ` holds and what Python's `datetime`
+(CIRISRegistry, CIRISAgent) can represent at all. Applied to the hash INPUT
+only — no column, no signature, and no stored row changes; a `parse_from_rfc3339`
+guard means nothing but an actual instant is ever rewritten.
+
+**Interop note:** `persist_row_hash` changes value for rows carrying
+sub-microsecond timestamps. Postgres-stored rows are already at the floor and
+are unaffected; sqlite/memory rows with nanosecond tails re-hash. Python-produced
+rows cannot have been affected.
+
+Witnesses — deterministic 789ns tails, never `Utc::now()`'s luck, each asserting
+the fixture really carries sub-microsecond precision so the check cannot become
+unfailable:
+
+- `nanosecond_wire_refs_resolve_every_kind_{memory,sqlite,postgres}_646` — one
+  row through each of four MORE chokepoints (`put_attestation`,
+  `put_location_proof`, `put_family`, `put_community`), then asserts that every
+  entry `all_kind_hash_keys` derives from the RELOADED rows already resolves
+  through the incrementally written index. Non-vacuity asserted per kind first.
+- `exercise_rescope_keeps_row_servable` — its microsecond truncation is REMOVED.
+  The comment called the skew "a property of the FIXTURE, not of the backend";
+  it was not, and deleting the truncation is what turns that test into a
+  regression net for `set_attestation_cohort_scope`.
+- `persist_row_hash_is_microsecond_stable_646`,
+  `persist_row_hash_still_separates_distinct_microseconds_646` (the floor is a
+  floor, not an erasure), `instant_truncation_never_touches_a_non_timestamp_646`,
+  `locator_instant_floors_at_microseconds_646`.
+
+Mutation-tested. Reverting the derivation at ONE site — `postgres.rs`
+`put_location_proof`, back to hashing the in-memory `SignedLocationProof` with a
+`to_rfc3339()` locator — reds the postgres leg with the dangling ref named, while
+memory and sqlite (the controls, which round nothing) stay green. Removing the
+`compute_persist_row_hash` truncation reds
+`persist_row_hash_is_microsecond_stable_646`.
+
+2156/2156 lib tests green on postgres+sqlite; 1813/1813 on sqlite+memory; clippy
+`-D warnings` clean on default, `sqlite`, and `postgres,sqlite` — including
+`--all-targets` with DEFAULT features, the leg #640 itself failed.
+
 ### Fixed — the wire index hashed the row the writer held, not the row the backend stored (#640)
 
 Every Key-plane `signed_wire_index` writer computed its content hash from the

@@ -15172,6 +15172,215 @@ pub(crate) mod r2_test_support {
         }
     }
 
+    /// v30.13.0 (CIRISPersist#646) — a DETERMINISTIC sub-microsecond tail on
+    /// every seeded row of four MORE kinds, each written through a different
+    /// put chokepoint, all of which must still resolve through the ref this
+    /// node advertises for them.
+    ///
+    /// # Why this exists beyond the #640 Key witness
+    ///
+    /// #640's witness covers the `Key` plane, which is where the defect was
+    /// FOUND. The derivation it fixed — index the row as stored, never the
+    /// struct the writer holds — was applied only there, while twelve other
+    /// kinds went on hashing the in-memory value at fifteen sites per backend.
+    /// A witness on the one plane that was fixed cannot tell you the rule
+    /// holds; it can only tell you the exception does.
+    ///
+    /// So this drives one row through each of four DIFFERENT chokepoints, with
+    /// the same 789ns tail postgres `TIMESTAMPTZ` rounds away:
+    ///
+    /// * `put_attestation` — `asserted_at` / `scrub_timestamp` /
+    ///   `pqc_completed_at`;
+    /// * `put_location_proof` — `asserted_at`, which is ALSO half the
+    ///   `record_key`, so this row exercises the locator floor
+    ///   ([`wire_index::locator_instant`](crate::federation::wire_index::locator_instant))
+    ///   as well as the hash. Before #646 a nanosecond-bearing location proof
+    ///   was unresolvable on postgres for two independent reasons;
+    /// * `put_family` and `put_community` — `founded_at`, and each member's
+    ///   `joined_at`.
+    ///
+    /// The check is the strongest available: for every entry
+    /// [`wire_index::all_kind_hash_keys`](crate::federation::wire_index::all_kind_hash_keys)
+    /// derives for these rows — the same list `rebuild_signed_wire_index`
+    /// writes, computed from the reloaded rows — the INCREMENTALLY written
+    /// index must already resolve it. A write path that indexed a different
+    /// hash leaves the correct one absent, and the point-read returns `None`
+    /// exactly as a peer's fetch would.
+    ///
+    /// Memory rounds nothing, so it is the CONTROL: it must pass before and
+    /// after, and a change that reds memory has broken the derivation rather
+    /// than caught the skew.
+    pub(crate) async fn exercise_nanosecond_wire_refs_resolve_every_kind(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use chrono::Timelike as _;
+
+        // A DETERMINISTIC sub-microsecond tail — 789ns — not `Utc::now()`'s
+        // luck. A probe that fires "usually" is a flake, not a gate.
+        let now = {
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000 + 789)
+                .expect("789ns tail is a valid nanosecond field")
+        };
+        assert_ne!(
+            now.nanosecond() % 1_000,
+            0,
+            "[{tag}] the fixture must actually carry sub-microsecond precision, \
+             or this witness cannot fail"
+        );
+
+        let author = format!("nskinds-author-{tag}");
+        let member = format!("nskinds-member-{tag}");
+        let fam = format!("nskinds-fam-{tag}");
+        let comm = format!("nskinds-comm-{tag}");
+        ts::register_hybrid_key(dir, &author).await;
+        // A `user`-role member: CC 3.2's steward-binding gate refuses a bare
+        // `node`/`agent` key into a non-infrastructure community, and that gate
+        // is not what this witness is about.
+        ts::register_identity_key(dir, &member, crate::federation::types::identity_type::USER)
+            .await;
+        ts::register_hybrid_key(dir, &fam).await;
+        ts::register_hybrid_key(dir, &comm).await;
+
+        // ── Attestation ───────────────────────────────────────────────
+        let att_id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": att_id, "dimension": "trust:nskinds:v1", "score": 1.0, "confidence": 0.9,
+        });
+        let (och, sc, sp) = ts::sign_envelope(&author, &envelope);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: crate::federation::Attestation {
+                attestation_id: att_id.clone(),
+                attesting_key_id: author.clone(),
+                attested_key_id: author.clone(),
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: author.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] nanosecond attestation must admit: {e}"));
+
+        // ── LocationProof (hash AND locator) ──────────────────────────
+        let cell = h3o::LatLng::new(37.0, -122.0)
+            .expect("valid latlng")
+            .to_cell(h3o::Resolution::Seven)
+            .to_string();
+        dir.put_location_proof(ts::sign_location_proof(
+            &author,
+            crate::federation::types::LocationProof {
+                subject_key_id: author.clone(),
+                cell_id: cell,
+                cell_resolution: 7,
+                asserted_at: now,
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] nanosecond location proof must admit: {e}"));
+
+        // ── Family ────────────────────────────────────────────────────
+        dir.put_family(ts::sign_family(
+            &author,
+            crate::federation::types::Family {
+                family_key_id: fam.clone(),
+                family_name: format!("nskinds-family-{tag}"),
+                members: vec![crate::federation::types::FamilyMember {
+                    key_id: member.clone(),
+                    joined_at: now,
+                    role: Some("founder".to_owned()),
+                }],
+                founded_at: now,
+                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] nanosecond family must admit: {e}"));
+
+        // ── Community ─────────────────────────────────────────────────
+        dir.put_community(ts::sign_community(
+            &author,
+            crate::federation::types::Community {
+                community_key_id: comm.clone(),
+                community_name: format!("nskinds-community-{tag}"),
+                members: vec![crate::federation::types::CommunityMember {
+                    key_id: member.clone(),
+                    joined_at: now,
+                    role: Some("founder".to_owned()),
+                }],
+                founded_at: now,
+                consensus_protocol: "founder_only".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] nanosecond community must admit: {e}"));
+
+        // The rebuild-side derivation, computed from the RELOADED rows. Scoped
+        // to this fixture's own ids so a shared/genesis-seeded directory cannot
+        // make the assertion about someone else's rows.
+        let all = crate::federation::wire_index::all_kind_hash_keys(dir)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] all_kind_hash_keys: {e}"));
+        let mine: Vec<_> = all
+            .into_iter()
+            .filter(|(_, _, rk)| {
+                rk.contains(&author)
+                    || rk.contains(&member)
+                    || rk.contains(&fam)
+                    || rk.contains(&comm)
+                    || rk.contains(&att_id)
+            })
+            .collect();
+
+        // NON-VACUITY FIRST. An empty set resolves every ref it contains, so
+        // without this the loop below passes on a fixture that seeded nothing.
+        for kind in ["Key", "Attestation", "LocationProof", "Family", "Community"] {
+            assert!(
+                mine.iter().any(|(k, _, _)| *k == kind),
+                "[{tag}] no {kind} ref for the seeded fixture; got {mine:?}"
+            );
+        }
+
+        for (kind, content_hash, record_key) in &mine {
+            let served = dir
+                .lookup_signed_record_by_content_hash(kind, content_hash)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] lookup {kind}/{content_hash}: {e}"));
+            assert!(
+                served.is_some(),
+                "[{tag}] ref ({kind}, {content_hash}) does not resolve (record_key \
+                 {record_key}). The {kind} write path indexed the row this node HELD, \
+                 not the row it STORED — CIRISPersist#646, the #640 defect at the \
+                 twelve kinds #640 did not reach. A peer asking for this exact ref \
+                 gets None."
+            );
+        }
+    }
+
     pub(crate) async fn exercise_rescope_keeps_row_servable(
         dir: &dyn FederationDirectory,
         tag: &str,
@@ -15188,16 +15397,32 @@ pub(crate) mod r2_test_support {
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(&author, &envelope);
-        // TRUNCATED TO MICROSECONDS. Postgres `TIMESTAMPTZ` is microsecond
-        // precision while `Utc::now()` carries nanoseconds, so a nanosecond-bearing
-        // fixture does not survive the round-trip and the reloaded row re-serializes
-        // to a different hash than the one indexed at write. That is a property of
-        // the FIXTURE, not of the backend: rows arriving over the wire carry
-        // RFC-3339 instants that already round-trip losslessly. Truncating here
-        // keeps this test measuring index coverage rather than clock precision.
-        let now = chrono::Utc::now()
-            .with_nanosecond(chrono::Utc::now().nanosecond() / 1_000 * 1_000)
-            .expect("microsecond truncation");
+        // v30.13.0 (CIRISPersist#646) — NANOSECOND-BEARING, deliberately.
+        //
+        // This fixture used to truncate to microseconds, with a comment calling
+        // the skew "a property of the FIXTURE, not of the backend". That was
+        // wrong in the same way #634's truncation was wrong: `postgres`
+        // `TIMESTAMPTZ` rounds a sub-microsecond instant on the way in, and the
+        // re-scope path then hashed the row it HELD while every read
+        // re-serializes the row it STORED. The truncation was not keeping the
+        // test honest, it was hiding the mechanism the test is named for.
+        //
+        // Now that `set_attestation_cohort_scope` indexes the stored row on all
+        // three backends, the tail can stay — and removing it is what makes
+        // this a regression net rather than a description. 789ns, deterministic:
+        // `Utc::now()` only *usually* carries a sub-microsecond tail, and a
+        // probe that fires usually is a flake.
+        let now = {
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000 + 789)
+                .expect("789ns tail is a valid nanosecond field")
+        };
+        assert_ne!(
+            now.nanosecond() % 1_000,
+            0,
+            "[{tag}] the fixture must actually carry sub-microsecond precision, \
+             or this witness cannot fail"
+        );
         let att = crate::federation::SignedAttestation {
             attestation: crate::federation::Attestation {
                 attestation_id: id.clone(),

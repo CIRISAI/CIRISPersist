@@ -830,14 +830,39 @@ impl PostgresBackend {
     /// reload takes its own, and nesting two checkouts can exhaust a small
     /// pool.
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
-        if let Some((wire_index_hash, wire_index_key)) =
-            crate::federation::wire_index::key_entry_as_stored(self, key_id).await?
+        self.index_stored_record(
+            "Key",
+            &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
+        )
+        .await
+    }
+
+    /// v30.13.0 (CIRISPersist#646) — the #640 remedy for EVERY kind: reload the
+    /// row through the read path's own dispatcher and index the bytes it
+    /// returns. See
+    /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored)
+    /// for why the write path must not derive this itself.
+    ///
+    /// Callers must RELEASE any pooled client they hold before calling — the
+    /// reload takes its own, and nesting two checkouts can exhaust a small
+    /// pool. That is also why the primary write must be COMMITTED first: the
+    /// reload runs on a different connection and would not see an open
+    /// transaction's rows. Every wire-indexed write chokepoint here is
+    /// autocommit (none opens a `tokio_postgres::Transaction`), so "after the
+    /// statement returns" is already "after commit".
+    async fn index_stored_record(
+        &self,
+        kind: &str,
+        record_key_json: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(content_hash) =
+            crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
         {
             let client = self
                 .get_client()
                 .await
                 .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
+            pg_upsert_wire_index(&**client, kind, &content_hash, record_key_json).await?;
         }
         Ok(())
     }
@@ -4725,15 +4750,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // only, the E5 invariant; `put_attestation` is the federation write
         // path so this always holds in practice). `Attestation` IS its own
         // signed wrapper (inline scrub signature).
-        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-            pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key)
-                .await?;
-        }
+        // v30.13.0 (CIRISPersist#646) — deferred to after the client is
+        // released and derived from the STORED row; see `index_stored_record`.
+        let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
+            .then(|| {
+                crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )])
+            });
         // v17.4.0 (V106) — maintain the subject projection (federation tier).
         pg_project_attestation_subjects(
             &**client,
@@ -4753,6 +4778,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
             })?;
+        drop(client);
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
         // rows (via the SAME decompose the ingest path uses), so a
@@ -4774,6 +4800,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         crate::federation::Error::Backend(format!("trace llm projection: {e}"))
                     })?;
             }
+        }
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
         }
         Ok(())
     }
@@ -5063,11 +5093,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // so the offer path offered it and the pack path could not serve it.
         // Missing the postgres twin of a fix is this repo's own recurring
         // class, so it is done in the same commit rather than followed up.
-        row.persist_row_hash = new_hash.clone();
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key).await?;
+        drop(client);
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -5349,21 +5380,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ("identity_key_id", &row.identity_key_id),
                 ("occurrence_key_id", &row.occurrence_key_id),
             ]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(
-                &crate::federation::SignedIdentityOccurrence {
-                    identity_occurrence: row.clone(),
-                    attesting_key_id: attesting_key_id.clone(),
-                    signed_envelope: signed_envelope.clone(),
-                    signature: signature.clone(),
-                },
-            )?;
-            pg_upsert_wire_index(
-                &**client,
-                "IdentityOccurrence",
-                &wire_index_hash,
-                &wire_index_key,
-            )
-            .await?;
+            drop(client);
+            self.index_stored_record("IdentityOccurrence", &wire_index_key)
+                .await?;
         }
         Ok(())
     }
@@ -5578,18 +5597,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        if let Some(reloaded) = self.lookup_family(&family_key_id).await? {
-            let wire_index_key =
-                crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]);
-            let wire_index_hash =
-                crate::federation::wire_index::content_hash_of(&crate::federation::SignedFamily {
-                    family: reloaded,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                })?;
-            pg_upsert_wire_index(&**client, "Family", &wire_index_hash, &wire_index_key).await?;
-        }
+        // v30.13.0 (CIRISPersist#646) — that reload is now the SHARED one. This
+        // site had the right instinct and its own implementation of it; the
+        // instinct is now the rule and the implementation is one function.
+        drop(client);
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -6138,14 +6154,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             "community_key_id",
             &row.community_key_id,
         )]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedCommunity {
-                community: row,
-                authority_key_id,
-                scrub_signature_classical,
-                scrub_signature_pqc,
-            })?;
-        pg_upsert_wire_index(&**client, "Community", &wire_index_hash, &wire_index_key).await?;
+        drop(client);
+        self.index_stored_record("Community", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6629,21 +6640,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ("identity_key_id", &row.identity_key_id),
             ("occurrence_key_id", &row.occurrence_key_id),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: row.clone(),
-                attesting_key_id: attesting_key_id.clone(),
-                signed_envelope: signed_envelope.clone(),
-                signature: signature.clone(),
-            },
-        )?;
-        pg_upsert_wire_index(
-            &**client,
-            "IdentityOccurrenceRevocation",
-            &wire_index_hash,
-            &wire_index_key,
-        )
-        .await?;
         // #446 de-projection (the projection's inverse): retire the LOCAL
         // derived route materialized from this occurrence's binding — else a
         // revoked occurrence leaves a live routable peer. Narrow on purpose:
@@ -6662,6 +6658,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        drop(client);
+        self.index_stored_record("IdentityOccurrenceRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6757,27 +6756,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(map_revocation_pg_err("family_membership_revocation"))?;
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
         // (`row` still owns its final `persist_row_hash`).
-        {
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("family_key_id", &row.family_key_id),
-                ("removed_identity_key_id", &row.removed_identity_key_id),
-            ]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(
-                &crate::federation::SignedFamilyMembershipRevocation {
-                    family_membership_revocation: row.clone(),
-                    authority_key_id: authority_key_id.clone(),
-                    scrub_signature_classical: scrub_signature_classical.clone(),
-                    scrub_signature_pqc: scrub_signature_pqc.clone(),
-                },
-            )?;
-            pg_upsert_wire_index(
-                &**client,
-                "FamilyMembershipRevocation",
-                &wire_index_hash,
-                &wire_index_key,
-            )
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("family_key_id", &row.family_key_id),
+            ("removed_identity_key_id", &row.removed_identity_key_id),
+        ]);
+        drop(client);
+        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
             .await?;
-        }
         // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
         // membership-change hard_case (`change_kind: "removed"`), keyed on
         // the re-key epoch. Idempotent on event_id (ON CONFLICT DO NOTHING).
@@ -6855,28 +6840,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         )
         .await
         .map_err(map_revocation_pg_err("community_membership_revocation"))?;
-        // v21.1.0 (CIRISPersist#507b) — same transaction as the INSERT above.
-        {
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &row.community_key_id),
-                ("removed_identity_key_id", &row.removed_identity_key_id),
-            ]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(
-                &crate::federation::SignedCommunityMembershipRevocation {
-                    community_membership_revocation: row.clone(),
-                    authority_key_id: authority_key_id.clone(),
-                    scrub_signature_classical: scrub_signature_classical.clone(),
-                    scrub_signature_pqc: scrub_signature_pqc.clone(),
-                },
-            )?;
-            pg_upsert_wire_index(
-                &*tx,
-                "CommunityMembershipRevocation",
-                &wire_index_hash,
-                &wire_index_key,
-            )
-            .await?;
-        }
+        // v21.1.0 (CIRISPersist#507b) — was upserted in the SAME transaction as
+        // the INSERT above.
+        // v30.13.0 (CIRISPersist#646) — it cannot stay there. Deriving the hash
+        // from the row AS STORED means READING the row back, and the reload
+        // runs on a pooled connection that cannot see this transaction's
+        // uncommitted rows: inside the tx it would find nothing and index
+        // nothing. So the entry is written after `commit()`, and the atomicity
+        // this site had is deliberately traded away. The trade is not close —
+        // a crash in the gap leaves a row with no index entry, which
+        // `rebuild_signed_wire_index` repairs and #547's own postmortem shows
+        // is repairable; an entry committed atomically with the WRONG hash is
+        // permanent and silent, because nothing downstream can tell a stale
+        // hash from a correct one.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("community_key_id", &row.community_key_id),
+            ("removed_identity_key_id", &row.removed_identity_key_id),
+        ]);
         // Idempotent on event_id.
         tx.execute(
             "INSERT INTO cirislens.hard_case_events \
@@ -6915,6 +6895,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        drop(client);
+        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -7085,23 +7068,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("subject_key_id", &row.subject_key_id),
-            ("asserted_at", &row.asserted_at.to_rfc3339()),
+            // v30.13.0 (CIRISPersist#646) — the microsecond-floor spelling.
+            // `to_rfc3339()` here wrote a locator postgres could never match
+            // back, because the reloaded `asserted_at` comes out rounded.
+            (
+                "asserted_at",
+                &crate::federation::wire_index::locator_instant(&row.asserted_at),
+            ),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedLocationProof {
-                location_proof: row,
-                authority_key_id,
-                scrub_signature_classical,
-                scrub_signature_pqc,
-            },
-        )?;
-        pg_upsert_wire_index(
-            &**client,
-            "LocationProof",
-            &wire_index_hash,
-            &wire_index_key,
-        )
-        .await?;
+        drop(client);
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -7481,21 +7458,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 reason: "superseded concurrently by a newer record".into(),
             });
         }
-        // v21.1.0 (CIRISPersist#507b) — the stored row is byte-identical to
-        // `signed`, so `signed` itself IS the exact value
+        // v21.1.0 (CIRISPersist#507b) — indexed under the shape
         // `list_signed_transport_destinations_since` re-serializes.
+        // v30.13.0 (CIRISPersist#646) — "the stored row is byte-identical to
+        // `signed`" was the assumption this whole class is made of. It is not
+        // this site's to make: read the row back and hash that.
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("occurrence_key_id", &d.occurrence_key_id),
             ("transport_kind", &d.transport_kind),
         ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(signed)?;
-        pg_upsert_wire_index(
-            &**client,
-            "TransportDestination",
-            &wire_index_hash,
-            &wire_index_key,
-        )
-        .await?;
+        drop(client);
+        self.index_stored_record("TransportDestination", &wire_index_key)
+            .await?;
         Ok(if fresh {
             Outcome::Inserted
         } else {
@@ -8177,8 +8151,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `list_organizations_since` re-serializes, no separate wrapper.
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        pg_upsert_wire_index(&**client, "Organization", &wire_index_hash, &wire_index_key).await?;
+        drop(client);
+        self.index_stored_record("Organization", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -8246,14 +8221,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // wire-index comment.
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        pg_upsert_wire_index(
-            &**client,
-            "OrgMembership",
-            &wire_index_hash,
-            &wire_index_key,
-        )
-        .await?;
+        drop(client);
+        self.index_stored_record("OrgMembership", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -8338,24 +8308,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // quorum is EXTERNAL to the row, so the read surface
         // (`list_signed_partner_records_since`) returns the
         // `SignedPartnerRecord` wrapper — hash that shape, not the bare row.
-        // `signed.steward_signatures`/`.threshold` are still valid here
-        // (only `.partner_record` was moved out above — a partial move).
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedPartnerRecord {
-                partner_record: row,
-                steward_signatures: signed.steward_signatures,
-                threshold: signed.threshold,
-            },
-        )?;
-        pg_upsert_wire_index(
-            &**client,
-            "PartnerRecord",
-            &wire_index_hash,
-            &wire_index_key,
-        )
-        .await?;
+        drop(client);
+        self.index_stored_record("PartnerRecord", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -9180,11 +9137,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // federation-tier and therefore wire-servable; index it under the
         // SAME post-promotion shape `list_attestations_since` will read back
         // (`persist_row_hash` = the newly-stamped `new_hash`).
-        row.persist_row_hash = new_hash;
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key).await?;
         // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
         client
             .execute(
@@ -9196,6 +9148,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
             })?;
+        drop(client);
+        // v30.13.0 (CIRISPersist#646) — THE confirmed live instance. `engine.rs`
+        // mints `chrono::Utc::now()` for `scrub_timestamp` at nanosecond
+        // precision and hands it straight in; it lands in `scrub_timestamp`,
+        // `promoted_at` and `pqc_completed_at`, all `TIMESTAMPTZ`. Hashing the
+        // in-memory `row` here indexed nanoseconds against a row stored at
+        // microseconds — on EVERY promotion on postgres.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -9326,11 +9290,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // so the wire index must be refreshed under the NEW content hash —
         // same hook as `promote_attestation`. The stale pre-transform hash
         // entry (if any) self-heals via the defensive re-hash on read.
-        row.persist_row_hash = new_hash;
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key).await?;
+        drop(client);
+        self.index_stored_record("Attestation", &wire_index_key)
+            .await?;
         Ok(true)
     }
 
@@ -21348,6 +21312,28 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
             &be,
             &format!("pg-640-{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// v30.13.0 (CIRISPersist#646) — the POSTGRES leg of the every-kind
+    /// witness, and the one that actually reddens without the fix.
+    /// `TIMESTAMPTZ` drops the fixture's 789ns tail, so an index written from
+    /// the in-memory row carries, for EVERY kind, a hash this backend's read
+    /// surface can never reproduce — and for `LocationProof` a record_key it
+    /// can never match either.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn nanosecond_wire_refs_resolve_every_kind_postgres_646() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
+            &be,
+            &format!("pg-646-{}", uuid_like()),
         )
         .await;
     }
