@@ -10469,6 +10469,7 @@ mod tests {
         let (row, mldsa_pk, pqc_sig) =
             crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
                 "k-pending",
+                crate::federation::types::identity_type::PRIMITIVE,
             );
         backend
             .put_public_key(SignedKeyRecord { record: row })
@@ -10519,6 +10520,7 @@ mod tests {
         let (row, mldsa_pk, pqc_sig) =
             crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
                 "k-double",
+                crate::federation::types::identity_type::PRIMITIVE,
             );
         backend
             .put_public_key(SignedKeyRecord { record: row })
@@ -10618,6 +10620,7 @@ mod tests {
         let (k_a, k_a_mldsa_pk, k_a_pqc_sig) =
             crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
                 "k-a",
+                crate::federation::types::identity_type::PRIMITIVE,
             );
         backend
             .put_public_key(SignedKeyRecord { record: k_a })

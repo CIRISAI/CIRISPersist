@@ -32,6 +32,135 @@ column on postgres have already lost the producer's numeric literals
 release, and no migration recovers it — re-publish is the only remedy.
 
 
+### Changed — BREAKING — SECURITY — CIRISVerify 13.1.0: standing was the one authority-bearing field the subject binding did NOT cover (#661)
+
+All seven `ciris-verify-*` pins move `v13.0.0` → `v13.1.0` together (they must —
+a split pin forks `ciris_crypto` into two graph versions and the types stop
+unifying). 13.1.0 is verify's own subject-binding cut, and adopting it closed
+one finding in our storage layer and re-sealed three producer planes.
+
+**The finding: privilege transfer.** `subject_binding` bound `key_id` and both
+hybrid pubkeys — WHICH KEY this is — but not `identity_type`, which is WHAT
+STANDING it carries. `is_canonical` decides canonical standing by reading
+`identity_type` off the ROW, and `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on
+it. Unbound, a relay could take a validly-signed, honestly-co-scrubbed record
+and relabel it on the OUTSIDE of the signed bytes: every hash matched, every
+signature verified, and the row arrived carrying a standing no signer ever
+named.
+
+It was **reachable, not theoretical.** `apply_replicated_key_record`'s `Insert`
+branch skips `verify_key_registration` for exactly the role-gated records
+(`sqlite.rs`, mirror in `postgres.rs`), which leaves the accord co-scrub as
+their only cryptographic proof — and the co-scrub bound `key_id` + pubkeys but
+not standing.
+
+`identity_type` is now the **second member** of the projection, so persist binds
+the same four `ciris_verify_core`'s `KeyRecord::check_subject_binding` binds:
+`key_id`, `identity_type`, `pubkey_ed25519_base64`, `pubkey_ml_dsa_65_base64`
+(the last via `require_optional`). Persist keeps a separate spelling ONLY
+because its `KeyRecord` is a distinct type with a declaration-order contract
+against CIRISRegistry; the semantics are verify's, and the code says so at the
+insert.
+
+**Preimage impact: none for conformant artifacts.** Checked rather than assumed
+— the baked genesis canonical (`identity_type = "canonical,node"`) and the
+A1/B1/C1 accord holders (`"accord_holder"`) already carry all four members in
+their `registration_envelope`, byte-equal to their columns. For a conformant
+ceremony this is a tightening.
+
+**Adopted with it: the CEG §0.9 omit-vs-materialize carve-out.** A legitimate
+JCS producer OMITS a member rather than materializing a `null`, and its signed
+bytes therefore differ. `verify_envelope_binds_subject` now satisfies an
+expected `null` with an ABSENT member — mirroring verify's `require_optional`,
+so the two implementations agree rather than diverge. It is exactly one row of a
+three-row table, and the other two are what keep it from being a hole:
+
+| envelope | row | verdict |
+| --- | --- | --- |
+| omits `pubkey_ml_dsa_65_base64` | claims no PQC key | **ADMITTED** — both say nothing, which is agreement |
+| omits it | CLAIMS a PQC key | REFUSED (`does not bind …`) |
+| declares a leg | claims none | REFUSED (mismatch) |
+
+`key_id`, `identity_type` and the classical leg are never `null`, so their
+absence stays a refusal. The carve-out cannot widen without a second nullable
+member, and a witness asserts there is none.
+
+**Three more producer planes re-sealed.** 13.1.0 applies the same projection
+beyond the key record, and each one was a place persist had a *second spelling*:
+
+- **provenance links** (`verify_provenance`) — the rooting conformance fixture
+  hand-wrote `{"key_id": …}`. It now goes through the one shared
+  `bind_subject_into_envelope`. Verify checks this binding FIRST, before the
+  hash, the signatures and any anchor resolution; unbound, an attacker could
+  wrap a victim's genuine validly-signed envelope in a link declaring their own
+  key_id and pubkeys, and the chain would root the ATTACKER's key.
+- **transport bindings** (`verify_transport_binding`) — the signed identity
+  occurrence's `attesting_key_id` lived OUTSIDE the signed bytes, so Mallory
+  could re-present a victim's genuine envelope under her own transport
+  destination: a traffic-redirect primitive built out of a perfectly valid
+  signature. The envelope now binds `attesting_key_id`, verify's own spelling.
+- **the cold-path PQC attach fixture** — `hybrid_pending_self_scrubbed` takes
+  `identity_type` as a parameter instead of hardcoding `primitive` and letting
+  callers assign the field afterwards. Post-hoc assignment is now a relabel; the
+  same correction `signed_canonical_record` took for pubkeys earlier in this
+  release.
+
+#### ACTION REQUIRED, CIRISServer harness — the test-anchor preimage MOVED
+
+`CIRIS_TEST_TRUST_ROOT_SCRUB[_PQC]` are signatures over a preimage two repos
+must agree on byte-for-byte, and that preimage changed. It was
+
+```json
+{"key_id": "test-accord-holder-{i}", "test_anchor": true}
+```
+
+and it now additionally binds `identity_type` (`accord_holder`) and both of the
+row's pubkeys, because verify's provenance-link check requires the full subject
+binding and refuses a link whose signed bytes omit it. **A harness still signing
+the old literal produces a terminus persist's `root_binding` will not confirm**
+— which is exactly how this surfaced: the `test-anchor` CI leg went red on
+`test_anchor_e2e_sw_root_blesses_node_and_roots` while `cargo check` under the
+same feature was clean.
+
+The contract is now a FUNCTION rather than a sentence:
+`federation::genesis::test_anchor_registration_envelope(key_id,
+pubkey_ed25519_base64, pubkey_ml_dsa_65_base64)`. **Call it; do not transcribe
+it.** The literal had been written out three times — the producer, persist's own
+#451 e2e, and the harness — so when the preimage moved, the producer and its own
+witness moved apart. Both in-repo copies now call the shared function, which is
+also what makes that e2e a real end-to-end rather than two copies of a string
+agreeing with each other.
+
+**A witness that was about to pass for the wrong reason.** `signer_acts_for`
+runs AFTER the transport-binding gate. Leg (4) of
+`signed_identity_occurrence_gate_admits_valid_rejects_forged` built its "wrong
+signer" case by rewriting `attesting_key_id` on the wrapper — which, once that
+field is bound, is refused as `SubjectMismatch` several gates earlier, with the
+same `federation_signature_invalid` kind the assertion checked. It would have
+stayed green while the authorization rule it is named for went untested. Mallory
+now signs a COHERENT envelope of her own — real registered key, real signature,
+binding intact — so `signer_acts_for` is the only thing left to refuse her, and
+the assertion pins its message.
+
+**Witnesses.** `coscrub_subject_binding_{memory,sqlite,postgres}_659` and
+`registration_subject_binding_{memory,sqlite,postgres}_659` each gained a
+relabel leg (`node` → `agent`, deliberately NOT `node` → `canonical`: that also
+wakes the #513 hardware-custody floor, which could legitimately refuse first,
+and an assertion pinned on #659 that a neighbouring gate is satisfying is a
+witness passing for the wrong reason). The co-scrub exerciser also carries the
+full three-row §0.9 table through the real `put_public_key` door, re-scrubbing
+the edited envelope so the admitted row's signatures are genuinely over the
+bytes it carries.
+
+**One edit, not two.** Every per-member loop now reads its list off
+`subject_binding` itself rather than restating it — the absence sweeps in both
+backend exercisers, the canonical-gate leg (e), and the load-bearing loop in
+`subject_binding_has_one_spelling_659`. Exactly one literal member list survives,
+in that test, and its job is the CROSS-REPO pin against verify; the doc comment
+says so. Adding a fifth member should be one edit in `subject_binding` plus that
+one deliberate line.
+
+
 ### Fixed — SECURITY — a peer could deny a node its boot with ONE ordinary attestation (#660)
 
 The baked genesis delegation ids — `genesis-charter`,

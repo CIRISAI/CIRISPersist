@@ -1634,7 +1634,8 @@ pub mod test_support {
     ///
     /// # v31.0.0 (CIRISPersist#659) — BREAKING: the subject is now BOUND
     ///
-    /// The helper stamps the subject's `key_id` and BOTH pubkeys into
+    /// The helper stamps the subject's `key_id`, `identity_type` and BOTH
+    /// pubkeys into
     /// `envelope` before canonicalizing and signing it, through the one shared
     /// [`crate::federation::admission::bind_subject_into_envelope`] — the same
     /// projection the co-scrub gate checks with, so a record this helper builds
@@ -1644,9 +1645,9 @@ pub mod test_support {
     /// Two changes, both deliberate:
     ///
     /// - a **preimage change** for any caller whose envelope did not already
-    ///   carry those three fields (the in-repo `{"key_id": k}` fixtures did
-    ///   not) — the signed bytes now differ, so records must be re-minted, not
-    ///   re-used;
+    ///   carry every [`crate::federation::admission::subject_binding`] member
+    ///   (the in-repo `{"key_id": k}` fixtures did not) — the signed bytes now
+    ///   differ, so records must be re-minted, not re-used;
     /// - a **signature change**: the subject's pubkeys are explicit parameters.
     ///   #659's second half is precisely that the accord signs for the
     ///   subject's KEYS and not merely its name, and a helper that hardcoded
@@ -1675,6 +1676,7 @@ pub mod test_support {
         crate::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             key_id,
+            identity_type,
             pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64,
         )
@@ -2007,11 +2009,14 @@ pub mod test_support {
         // v31.0.0 (CIRISPersist#659) — the SECOND producer of co-scrubbed
         // records, and therefore the second place the subject has to be bound.
         // It runs through the same `bind_subject_into_envelope` the gate checks
-        // with, off the record's OWN key_id and pubkeys, so a fixture cannot
-        // hand the accord family a preimage that names somebody else.
+        // with, off the record's OWN key_id, identity_type and pubkeys, so a
+        // fixture cannot hand the accord family a preimage that names somebody
+        // else — nor, since 13.1.0, one that names a DIFFERENT STANDING for the
+        // same key, which is the conferral this helper exists to simulate.
         crate::federation::admission::bind_subject_into_envelope(
             &mut record.registration_envelope,
             &record.key_id,
+            &record.identity_type,
             &record.pubkey_ed25519_base64,
             record.pubkey_ml_dsa_65_base64.as_deref(),
         )
@@ -2268,6 +2273,23 @@ pub mod test_support {
     /// substitution; (d) the PQC-leg substitution, because binding one leg of a
     /// hybrid identity leaves the other substitutable; (e) each bound field
     /// removed in turn, because an optional check is skippable by omission.
+    ///
+    /// # v31.0.0 (CIRISVerify 13.1.0) — the fourth member and the one carve-out
+    ///
+    /// (f) THE RELABEL: a record whose `identity_type` COLUMN disagrees with
+    /// its signed envelope is refused, naming the field. This is verify's third
+    /// 13.1.0 finding — privilege transfer — and it is reachable here rather
+    /// than theoretical, because `apply_replicated_key_record`'s Insert branch
+    /// skips `verify_key_registration` for exactly the role-gated records,
+    /// leaving the co-scrub as their only cryptographic proof.
+    ///
+    /// (g) CEG §0.9 OMIT-VS-MATERIALIZE, as a three-row table: (g1) envelope
+    /// omits the PQC member AND the row claims none ⇒ ADMITTED; (g2) envelope
+    /// omits but the row CLAIMS a key ⇒ REFUSED; (g3) envelope declares a leg
+    /// the row does not ⇒ REFUSED. The table IS the property — verify tolerates
+    /// exactly one absence and it is the "both say nothing" case, so (g1) alone
+    /// would read as "an omitted member is unchecked" and (g2)/(g3) are what
+    /// make it agreement rather than tolerance.
     pub async fn exercise_coscrub_subject_binding(
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
@@ -2394,15 +2416,146 @@ pub mod test_support {
         .await;
 
         // (e) ABSENCE IS A REFUSAL, per bound field.
-        for missing in ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"] {
+        //
+        // The member list is READ OFF `subject_binding` rather than restated,
+        // so a fifth member is witnessed here the moment it is added — the
+        // whole point of one-projection-one-spelling is that adding a member is
+        // ONE edit, and a hardcoded list here would quietly make it two. This
+        // subject carries BOTH hybrid legs, so every member is non-null and
+        // every absence is a refusal; the one tolerated absence needs a null
+        // expectation and gets its own table in (g).
+        let all_members: Vec<String> = crate::federation::admission::subject_binding(
+            &victim,
+            crate::federation::types::identity_type::NODE,
+            &v_ed,
+            v_pqc.as_deref(),
+        )
+        .keys()
+        .cloned()
+        .collect();
+        assert!(
+            all_members.iter().any(|m| m == "identity_type"),
+            "({tag}) 13.1.0: `identity_type` must be one of the bound members, or leg (f) below \
+             is witnessing a field nothing binds"
+        );
+        for missing in all_members {
             let mut partial = conferral(&victim, &v_ed, v_pqc.as_deref());
             partial
                 .registration_envelope
                 .as_object_mut()
                 .expect("the conferral envelope is an object")
-                .remove(missing);
+                .remove(&missing);
             refused(partial, "(e)", format!("does not bind {missing}")).await;
         }
+
+        // (f) THE RELABEL — CIRISVerify 13.1.0's third finding (privilege
+        //     transfer), at our write door. The envelope, the signatures and
+        //     BOTH pubkeys are the accord's real work for this very subject;
+        //     only the `identity_type` COLUMN is rewritten, on the outside.
+        //     `is_canonical` reads standing off that column and
+        //     `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it, so before the
+        //     fourth member this relabel was free.
+        //
+        //     The relabel is NODE → AGENT and not NODE → CANONICAL on purpose.
+        //     Both are the same defect, but `canonical` also wakes the #513
+        //     hardware-custody floor, which could legitimately refuse FIRST —
+        //     and an assertion pinned on #659 that is actually being satisfied
+        //     by a neighbouring gate is a witness that passes for the wrong
+        //     reason. `agent` confers no authority, so nothing but the subject
+        //     binding is left to refuse it, and the `infra:attest` role in the
+        //     envelope still drives the co-scrub gate either way.
+        let mut relabelled = conferral(&victim, &v_ed, v_pqc.as_deref());
+        relabelled.identity_type = crate::federation::types::identity_type::AGENT.to_owned();
+        refused(relabelled, "(f)", "identity_type".to_owned()).await;
+
+        // (g) CEG §0.9 OMIT-VS-MATERIALIZE — the three-case table. Verify
+        //     tolerates exactly ONE absence and it is the "both say nothing"
+        //     case; the other two rows are what keeps that from being a hole.
+        //     Re-scrubbing is required (not just editing the envelope) because
+        //     case 1 has to ADMIT, which means its signatures must be real over
+        //     the edited bytes — an unsigned edit would be refused by the
+        //     quorum and prove nothing about the carve-out.
+        let rescrub = |mut rec: crate::federation::types::KeyRecord| {
+            use crate::federation::types::ScrubSig;
+            use sha2::{Digest, Sha256};
+            let bytes =
+                crate::verify::canonical::ceg_produce_canonicalize(&rec.registration_envelope)
+                    .expect("canonicalize the edited envelope");
+            let sigs: Vec<ScrubSig> = scrubbers
+                .iter()
+                .map(|s| {
+                    let (ed, pqc) = s.sign_bytes(&bytes);
+                    ScrubSig {
+                        scrub_key_id: s.key_id.clone(),
+                        scrub_signature_classical: ed,
+                        scrub_signature_pqc: Some(pqc),
+                    }
+                })
+                .collect();
+            rec.original_content_hash = hex::encode(Sha256::digest(&bytes));
+            rec.scrub_key_id.clone_from(&sigs[0].scrub_key_id);
+            rec.scrub_signature_classical
+                .clone_from(&sigs[0].scrub_signature_classical);
+            rec.scrub_signature_pqc
+                .clone_from(&sigs[0].scrub_signature_pqc);
+            rec.additional_scrubs = sigs[1..].to_vec();
+            rec
+        };
+        let omit_pqc = |rec: &mut crate::federation::types::KeyRecord| {
+            rec.registration_envelope
+                .as_object_mut()
+                .expect("the conferral envelope is an object")
+                .remove("pubkey_ml_dsa_65_base64");
+        };
+
+        // (g1) BOTH SAY NOTHING ⇒ ADMITTED. The envelope omits the member and
+        //      the row claims no PQC leg. This is the row the carve-out exists
+        //      for, and it is the ONLY one that admits.
+        let g1 = format!("g1659-{tag}");
+        let (g1_ed, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(&g1);
+        let mut both_silent = conferral(&g1, &g1_ed, None);
+        omit_pqc(&mut both_silent);
+        directory
+            .put_public_key(SignedKeyRecord {
+                record: rescrub(both_silent),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({tag}) CEG §0.9(g1): an envelope that OMITS the PQC leg and a row that \
+                     claims none say the SAME thing — a JCS producer legitimately omits rather \
+                     than materializes a null, and refusing this would diverge from \
+                     CIRISVerify 13.1.0's `require_optional`: {e}"
+                )
+            });
+
+        // (g2) ENVELOPE SILENT, ROW CLAIMS A KEY ⇒ REFUSED. The carve-out keys
+        //      on the EXPECTATION being null, and here it is not — so this
+        //      lands on the plain absence arm. Without this row, the carve-out
+        //      would be "an omitted member is never checked", which is the
+        //      whole PQC-substitution attack back again.
+        let mut row_claims = conferral(&victim, &v_ed, v_pqc.as_deref());
+        omit_pqc(&mut row_claims);
+        refused(
+            rescrub(row_claims),
+            "(g2)",
+            "does not bind pubkey_ml_dsa_65_base64".to_owned(),
+        )
+        .await;
+
+        // (g3) ENVELOPE DECLARES A LEG THE ROW DOES NOT ⇒ REFUSED, on the
+        //      mismatch arm. A row asserting ABSENCE cannot inherit a co-scrub
+        //      that named a key.
+        let g3 = format!("g3659-{tag}");
+        let (g3_ed, g3_pqc) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(&g3);
+        let mut envelope_claims = conferral(&g3, &g3_ed, g3_pqc.as_deref());
+        envelope_claims.pubkey_ml_dsa_65_base64 = None;
+        refused(
+            envelope_claims,
+            "(g3)",
+            "pubkey_ml_dsa_65_base64".to_owned(),
+        )
+        .await;
 
         Ok(())
     }
@@ -4313,11 +4466,17 @@ pub mod test_support {
         // the PQC leg off a `replicated_key_record` no longer produces a row the
         // attach door will accept, and that is the point of #657 — an attached
         // PUBLIC KEY has to be one the envelope's signer named.
-        let (mut rec, pqc_pubkey, pqc_sig) =
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — the standing is passed IN rather than
+        // assigned onto the row afterwards. The fourth bound member makes a
+        // post-hoc `rec.identity_type = …` a relabel: the envelope would name
+        // one standing and the row carry another, and the attach door would
+        // (correctly) refuse a row this exerciser only meant to be a `node`.
+        let (rec, pqc_pubkey, pqc_sig) =
             crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
                 &pending,
+                identity_type::NODE,
             );
-        rec.identity_type = identity_type::NODE.into();
         directory
             .put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await?;
@@ -5020,22 +5179,66 @@ mod tests {
     /// directions: what the producer stamps is exactly what the checker
     /// demands. A drift here is the #643/#598/#652 defect shape, and it would
     /// be invisible to every gate test (both sides would simply agree on the
-    /// wrong thing) — so it is asserted against a LITERAL field set.
+    /// wrong thing).
+    ///
+    /// # One literal, and it is the CROSS-REPO pin (v31.0.0, CIRISVerify 13.1.0)
+    ///
+    /// The literal list below is deliberately the ONLY restatement of the
+    /// member set in the repo, and it is not here to describe persist — it is
+    /// here to pin persist against `ciris_verify_core`'s
+    /// `KeyRecord::check_subject_binding`, which binds `key_id`,
+    /// `identity_type`, `pubkey_ed25519_base64` and `pubkey_ml_dsa_65_base64`
+    /// (the last via `require_optional`). Persist keeps its own spelling only
+    /// because its `KeyRecord` is a distinct type with a declaration-order
+    /// contract against CIRISRegistry; the SEMANTICS are verify's, so silent
+    /// drift away from those four is the failure this literal exists to make
+    /// loud.
+    ///
+    /// The pin is on the SET, spelled in the order persist iterates it. Verify
+    /// carries its members in an insertion-ordered `Vec` while persist builds a
+    /// `serde_json::Map` (BTreeMap-backed — this crate does not enable
+    /// `preserve_order`), so the two orders are not comparable and only the set
+    /// is the contract. Lexicographic is the right spelling here regardless: it
+    /// is the order JCS emits, which is the order the co-scrubbers actually
+    /// signed over.
+    ///
+    /// Everything else derives from [`subject_binding`] itself — in particular
+    /// the per-member load-bearing loop, which witnesses a FIFTH member
+    /// automatically the day one is added. Adding a member should be one edit
+    /// in `subject_binding` plus this one deliberate cross-repo line.
     #[test]
     fn subject_binding_has_one_spelling_659() {
         use crate::federation::admission::{
             bind_subject_into_envelope, subject_binding, verify_envelope_binds_subject,
         };
-        let bound = subject_binding("k1", "ED", Some("PQC"));
+        let bound = subject_binding("k1", "node", "ED", Some("PQC"));
         assert_eq!(
             bound.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"],
-            "#659: the bound field set is the row's identity, and both sides read it from here"
+            [
+                "identity_type",
+                "key_id",
+                "pubkey_ed25519_base64",
+                "pubkey_ml_dsa_65_base64"
+            ],
+            "13.1.0: persist's projection must be the same four members \
+             `ciris_verify_core::federation_self_record::KeyRecord::check_subject_binding` binds — \
+             two implementations of one projection may not drift"
         );
         assert!(
-            subject_binding("k1", "ED", None)["pubkey_ml_dsa_65_base64"].is_null(),
+            subject_binding("k1", "node", "ED", None)["pubkey_ml_dsa_65_base64"].is_null(),
             "#659: an absent PQC leg binds `null` — an assertion of ABSENCE, not a missing field"
         );
+        // …and it is the ONLY member that may ever be null, which is what makes
+        // the CEG §0.9 carve-out narrow. Read off the projection, not restated.
+        for (member, value) in subject_binding("k1", "node", "ED", None) {
+            assert_eq!(
+                value.is_null(),
+                member == "pubkey_ml_dsa_65_base64",
+                "13.1.0: only the PQC leg may bind `null`, because `verify_envelope_binds_subject` \
+                 tolerates an OMITTED member exactly when the expectation is null — a second \
+                 nullable member would silently widen that carve-out to a second field"
+            );
+        }
 
         // Producer → checker, round trip, for a row with and without a PQC leg.
         for pqc in [Some("PQC".to_owned()), None] {
@@ -5054,7 +5257,29 @@ mod tests {
                 .expect("#659: what the producer stamps, the checker accepts");
             // …and the caller's own fields survive the stamping.
             assert_eq!(rec.registration_envelope["purpose"], json!("round trip"));
-            // Any divergence on any bound field is a refusal.
+
+            // EVERY bound member is load-bearing, and the list comes off the
+            // projection rather than a literal — so a fifth member is witnessed
+            // the day it is added instead of the day someone remembers. The
+            // envelope side is the one tampered with (not the row) because that
+            // is generic over members whose row-side spellings differ.
+            for member in subject_binding("k1", "node", "ED", pqc.as_deref()).keys() {
+                let mut tampered = rec.clone();
+                tampered.registration_envelope[member] = json!("a-value-nobody-signed-for");
+                let Err(why) = verify_envelope_binds_subject(&tampered) else {
+                    panic!(
+                        "#659: a divergence on {member} must be refused — an unchecked bound \
+                         member is a member that is not bound"
+                    )
+                };
+                assert!(
+                    why.contains(member) && why.contains("CIRISPersist#659"),
+                    "#659: the refusal must name {member}: {why}"
+                );
+            }
+
+            // Row-side divergence too, on the member whose row spelling is the
+            // record's own name.
             rec.key_id = "k2".into();
             let why = verify_envelope_binds_subject(&rec)
                 .expect_err("#659: a diverging subject is refused");
@@ -5073,12 +5298,18 @@ mod tests {
         // changed `insert` to `entry().or_insert` survived the whole suite.)
         let mut hostile = json!({
             "key_id": "somebody-else",
+            // 13.1.0 — the hostile envelope claims a PRIVILEGED standing, which
+            // is the fourth member's whole reason for existing: a producer that
+            // deferred to this value would let a caller carry `canonical` into
+            // the bytes the accord signs.
+            "identity_type": "canonical",
             "pubkey_ed25519_base64": "SOMEBODY-ELSES-KEY",
             "pubkey_ml_dsa_65_base64": "SOMEBODY-ELSES-PQC-KEY",
             "purpose": "kept",
         });
-        bind_subject_into_envelope(&mut hostile, "k1", "ED", None).expect("bind");
+        bind_subject_into_envelope(&mut hostile, "k1", "node", "ED", None).expect("bind");
         assert_eq!(hostile["key_id"], json!("k1"));
+        assert_eq!(hostile["identity_type"], json!("node"));
         assert_eq!(hostile["pubkey_ed25519_base64"], json!("ED"));
         assert!(hostile["pubkey_ml_dsa_65_base64"].is_null());
         assert_eq!(hostile["purpose"], json!("kept"));
@@ -5086,7 +5317,7 @@ mod tests {
         // The producer refuses a non-object envelope rather than dropping the
         // binding on the floor.
         let mut not_an_object = json!("just a string");
-        assert!(bind_subject_into_envelope(&mut not_an_object, "k1", "ED", None).is_err());
+        assert!(bind_subject_into_envelope(&mut not_an_object, "k1", "node", "ED", None).is_err());
     }
 
     /// v31.0.0 (CIRISPersist#659) — [`test_support::accord_conferred`] is the

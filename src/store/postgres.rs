@@ -39172,6 +39172,8 @@ mod tests {
             compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
         let asserted_at = chrono::Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap();
         let envelope = serde_json::json!({
+            // v31.0.0 (CIRISVerify 13.1.0) - bound; see `self_at_login`.
+            "attesting_key_id": id_key,
             "identity_key_id": id_key,
             "occurrence_key_id": occ_key,
             "transport_destination": {

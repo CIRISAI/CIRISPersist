@@ -25261,15 +25261,29 @@ mod tests {
             "x25519_base64": B64.encode(content_x),
             "ml_kem_768_base64": B64.encode(vec![0x11u8; 1184]),
         });
-        let envelope = serde_json::json!({
-            "identity_key_id": "alice",
-            "occurrence_key_id": "alice-phone",
-            "transport_destination": tb_env,
-            "encryption_pubkeys": enc_env,
-            "asserted_at": "2026-06-14T00:00:00.000Z",
-        });
+        // v31.0.0 (CIRISVerify 13.1.0) - `attesting_key_id` is BOUND into the
+        // signed bytes. It is a `SignedIdentityOccurrence` field living OUTSIDE
+        // them, so nothing tied the signer named on the wrapper to the signer
+        // the envelope is about: Mallory could re-present a victim's genuine
+        // envelope under her own transport destination and the signature still
+        // verified. Verify now refuses the pair as SubjectMismatch. Same
+        // spelling as verify's own fixture.
+        //
+        // A CLOSURE, not a literal, because leg (4) below needs a second
+        // envelope naming a different attester — and now that the field is
+        // bound, rewriting it on the wrapper alone no longer produces one.
+        let mk_envelope = |attesting: &str| {
+            serde_json::json!({
+                "attesting_key_id": attesting,
+                "identity_key_id": "alice",
+                "occurrence_key_id": "alice-phone",
+                "transport_destination": tb_env,
+                "encryption_pubkeys": enc_env,
+                "asserted_at": "2026-06-14T00:00:00.000Z",
+            })
+        };
         let (signed_envelope, signature) =
-            produce_signed_identity_occurrence(signer.as_ref(), envelope)
+            produce_signed_identity_occurrence(signer.as_ref(), mk_envelope("alice"))
                 .await
                 .unwrap();
 
@@ -25358,12 +25372,53 @@ mod tests {
 
         // (4) WRONG signer (not the identity, not an active occurrence of it) →
         // REJECTED by signer_acts_for.
-        let mut wrong = signed(typed(&content_x), signature.clone());
-        wrong.attesting_key_id = "alice-phone".to_string(); // registered, but not alice's identity key nor an occurrence
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — this leg used to be built by rewriting
+        // `attesting_key_id` on the WRAPPER alone. That field is bound into the
+        // signed bytes now, so the rewrite is refused as `SubjectMismatch` by
+        // the transport-binding gate — which runs BEFORE `signer_acts_for` and
+        // returns the same `federation_signature_invalid` kind. The assertion
+        // would still have passed while the authorization rule it is named for
+        // went untested.
+        //
+        // So Mallory signs a COHERENT envelope of her own: a real registered
+        // key, a real signature over bytes that bind her as the attester,
+        // key-separation intact. Every earlier gate is satisfied, and the only
+        // thing left to refuse her is `signer_acts_for` — which is the point.
+        let mallory = Box::new(HybridSigningIdentity::new(
+            "mallory",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let m_member = mallory.directory_member().unwrap();
+        let mut mallory_key = fed_key("mallory", "mallory", "mallory");
+        mallory_key.pubkey_ed25519_base64 = m_member.ed25519_public_key_base64.clone();
+        mallory_key.pubkey_ml_dsa_65_base64 = m_member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: mallory_key,
+            })
+            .await
+            .unwrap();
+        let (m_envelope, m_signature) =
+            produce_signed_identity_occurrence(mallory.as_ref(), mk_envelope("mallory"))
+                .await
+                .unwrap();
+        let wrong = crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: typed(&content_x),
+            attesting_key_id: "mallory".to_string(),
+            signed_envelope: m_envelope,
+            signature: m_signature,
+        };
         let err = backend.put_identity_occurrence(wrong).await.expect_err(
             "a signer who is neither the identity nor its active occurrence must be rejected",
         );
         assert_eq!(err.kind(), "federation_signature_invalid");
+        assert!(
+            format!("{err}").contains("neither identity"),
+            "(4) the refusal must be `signer_acts_for`'s, not a subject-binding or signature \
+             failure standing in for it: {err}"
+        );
     }
 
     /// v14.0.0 (CIRISPersist#418 ask 3) — `resolve_encryption_keys` (the SEALING
@@ -25738,6 +25793,8 @@ mod tests {
         let dest_hash =
             compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
         let envelope = serde_json::json!({
+            // v31.0.0 (CIRISVerify 13.1.0) - bound; see `self_at_login`.
+            "attesting_key_id": "alice",
             "identity_key_id": "alice",
             "occurrence_key_id": "alice-phone",
             "transport_destination": {
@@ -27849,6 +27906,8 @@ mod tests {
         let dest_hash =
             compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
         let envelope = serde_json::json!({
+            // v31.0.0 (CIRISVerify 13.1.0) - bound; see `self_at_login`.
+            "attesting_key_id": "io507-id",
             "identity_key_id": "io507-id",
             "occurrence_key_id": "io507-occ",
             "transport_destination": {
@@ -28242,6 +28301,8 @@ mod tests {
             });
             (
                 serde_json::json!({
+                    // v31.0.0 (CIRISVerify 13.1.0) - bound; see `self_at_login`.
+                    "attesting_key_id": "ap515",
                     "identity_key_id": "ap515",
                     "occurrence_key_id": "ap515",
                     "transport_destination": tb_env,

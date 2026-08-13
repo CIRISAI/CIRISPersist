@@ -1165,8 +1165,8 @@ pub(crate) mod test_support {
     ///
     /// # v31.0.0 (CIRISPersist#659) — the subject is BOUND
     ///
-    /// The envelope is stamped with `key_id` and BOTH of the subject's pubkeys
-    /// through the one shared
+    /// The envelope is stamped with `key_id`, `identity_type` and BOTH of the
+    /// subject's pubkeys through the one shared
     /// [`crate::federation::admission::bind_subject_into_envelope`] before it is
     /// canonicalized and signed, so every record this helper builds satisfies
     /// `verify_key_registration`'s subject-binding gate by construction. This
@@ -1189,6 +1189,7 @@ pub(crate) mod test_support {
         crate::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             key_id,
+            identity_type,
             &ed_pk,
             mldsa_pk.as_deref(),
         )

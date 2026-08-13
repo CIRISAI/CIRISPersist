@@ -704,7 +704,11 @@ pub fn record_is_role_gated(record: &KeyRecord) -> bool {
 /// # v31.0.0 (CIRISPersist#659) — BREAKING: the envelope must bind its subject
 ///
 /// Before any of the above, the record's `registration_envelope` must bind
-/// `key_id` and BOTH pubkeys equal to the record's own columns — checked
+/// every member of
+/// [`admission::subject_binding`](super::admission::subject_binding) —
+/// `key_id`, `identity_type` and BOTH pubkeys — equal to the record's own
+/// columns, with the single CEG §0.9 exception that an omitted PQC member
+/// agrees with a row that claims no PQC key. Checked
 /// through [`admission::verify_envelope_binds_subject`](super::admission::verify_envelope_binds_subject),
 /// the SAME function the accord co-scrub quorum core calls. Absence is a
 /// refusal; there is no legacy regime. See this module's header for the defect
@@ -1175,6 +1179,7 @@ pub mod test_support {
         crate::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             key_id,
+            identity_type,
             pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64,
         )
@@ -1225,7 +1230,18 @@ pub mod test_support {
     /// substitutable; (e) each bound field REMOVED in turn — an optional check
     /// is skippable by omission, which is the whole attack; (f) the
     /// self-attested sibling branch, whose signature is genuinely the
-    /// registrant's own and which was subject-blind in exactly the same way.
+    /// registrant's own and which was subject-blind in exactly the same way;
+    /// (g) v31.0.0 (CIRISVerify 13.1.0) THE RELABEL — the authority's honest
+    /// signature for this exact subject, with only the `identity_type` COLUMN
+    /// rewritten outside the signed bytes. That is verify's third 13.1.0
+    /// finding (privilege transfer), and it is reachable rather than
+    /// theoretical because `apply_replicated_key_record`'s Insert branch skips
+    /// this very gate for exactly the role-gated records.
+    ///
+    /// Leg (e)'s field list is read off
+    /// [`crate::federation::admission::subject_binding`] rather than restated,
+    /// so a member added to the projection is witnessed here the day it is
+    /// added instead of the day somebody remembers to update a literal.
     pub async fn exercise_registration_subject_binding(
         directory: &dyn FederationDirectory,
         tag: &str,
@@ -1364,7 +1380,20 @@ pub mod test_support {
         //     so the cross-check still passes. These also PIN THE ORDERING: the
         //     signature no longer covers the mutated envelope, yet the refusal
         //     is the binding's, because the binding is checked first.
-        for field in ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"] {
+        //     The field list is READ OFF the projection rather than restated, so
+        //     a member added to `subject_binding` is witnessed here the day it
+        //     is added — one edit, not two.
+        let bound_members: Vec<String> = crate::federation::admission::subject_binding(
+            &attacker,
+            identity_type::NODE,
+            &a_ed,
+            a_pqc.as_deref(),
+        )
+        .keys()
+        .cloned()
+        .collect();
+        for field in bound_members {
+            let field = field.as_str();
             let mut blind = authority_signed_record(
                 &attacker,
                 identity_type::NODE,
@@ -1412,9 +1441,18 @@ pub mod test_support {
             &attacker,
         );
         let mut foreign = serde_json::json!({ "purpose": "federation-peering" });
+        // The foreign envelope binds the victim's NAME and KEYS but the SAME
+        // `identity_type` the attacker's row carries (both are `node` here).
+        // That is deliberate: the fourth member sorts before `key_id`, so a
+        // divergence there would be reported FIRST and this leg would assert on
+        // `identity_type` while still calling itself the self-attested name
+        // lift. Keeping the standing equal leaves the name and the pubkeys as
+        // the only disagreement, which is what leg (f) is named for; the
+        // relabel gets its own leg (g).
         crate::federation::admission::bind_subject_into_envelope(
             &mut foreign,
             &victim,
+            identity_type::NODE,
             &v_ed,
             v_pqc.as_deref(),
         )
@@ -1425,6 +1463,32 @@ pub mod test_support {
         self_blind.scrub_signature_classical = classical;
         self_blind.scrub_signature_pqc = pqc;
         refused(self_blind, "(f)", victim.clone()).await;
+
+        // (g) v31.0.0 (CIRISVerify 13.1.0) — THE RELABEL. Everything about this
+        //     record is the authority's honest work for this very subject: the
+        //     envelope, the hash, the signature, the name and both pubkeys.
+        //     Only the `identity_type` COLUMN is rewritten, on the OUTSIDE of
+        //     the signed bytes. `is_canonical` reads standing off that column
+        //     and `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it, so before
+        //     the fourth member this was a free privilege transfer — verify's
+        //     third 13.1.0 finding, reproduced at our registration door.
+        //
+        //     `node` → `agent` and not `node` → `canonical`: both are the same
+        //     defect, but `canonical` also wakes the #513 hardware-custody
+        //     floor, which could legitimately refuse FIRST — and an assertion
+        //     pinned on #659 that a neighbouring gate is actually satisfying is
+        //     a witness that passes for the wrong reason.
+        let relabelled = KeyRecord {
+            identity_type: identity_type::AGENT.to_owned(),
+            ..authority_signed_record(
+                &attacker,
+                identity_type::NODE,
+                &a_ed,
+                a_pqc.as_deref(),
+                &authority,
+            )
+        };
+        refused(relabelled, "(g)", "identity_type".to_owned()).await;
 
         // Nothing the gate refused reached the directory.
         for k in [&victim, &attacker] {
@@ -2082,6 +2146,7 @@ mod tests {
         crate::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             key_id,
+            identity_type,
             &ed_pk_b64,
             mldsa_pk_b64.as_deref(),
         )

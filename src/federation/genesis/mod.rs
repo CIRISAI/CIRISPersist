@@ -62,6 +62,40 @@ pub fn accord_holder_genesis_records() -> &'static [SignedKeyRecord] {
     })
 }
 
+/// v31.0.0 (CIRISVerify 13.1.0) — **THE PINNED TEST-ANCHOR PREIMAGE, as a
+/// function instead of a sentence.**
+///
+/// The `CIRIS_TEST_TRUST_ROOT_SCRUB[_PQC]` contract has always been a preimage
+/// two repos must agree on byte-for-byte, and until this cut it was pinned only
+/// in prose — with the literal `{"key_id": …, "test_anchor": true}` written out
+/// THREE times (here, in the #451 e2e, and in CIRISServer's harness). 13.1.0
+/// added `identity_type` and both pubkeys to the provenance-link subject
+/// binding, so the literal moved, and every copy that did not move became a
+/// terminus that cannot root. Exporting the envelope makes the next move one
+/// edit and gives the harness something to CALL rather than transcribe.
+///
+/// Callers sign `JCS(...)` of the returned object: classical = Ed25519 over
+/// those bytes, PQC = the bound hybrid form (`SelfSigner::sign_bound`) over the
+/// same bytes.
+#[cfg(feature = "test-anchor")]
+#[must_use]
+pub fn test_anchor_registration_envelope(
+    key_id: &str,
+    pubkey_ed25519_base64: &str,
+    pubkey_ml_dsa_65_base64: Option<&str>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({ "test_anchor": true });
+    crate::federation::admission::bind_subject_into_envelope(
+        &mut envelope,
+        key_id,
+        crate::federation::types::identity_type::ACCORD_HOLDER,
+        pubkey_ed25519_base64,
+        pubkey_ml_dsa_65_base64,
+    )
+    .expect("the synthesized test-anchor envelope is a JSON object");
+    envelope
+}
+
 /// v17.1.0 (CIRISPersist#449, CIRISVerify#202) — the SYNTHESIZED test-anchor
 /// holder rows: one deterministic self-signed `accord_holder` record per
 /// `CIRIS_TEST_TRUST_ROOT` pubkey (`test-accord-holder-{i}`), so the genesis
@@ -87,10 +121,15 @@ pub fn accord_holder_genesis_records() -> &'static [SignedKeyRecord] {
 ///   **`CIRIS_TEST_TRUST_ROOT_SCRUB_PQC`**) — comma-separated base64
 ///   self-scrub SIGNATURES over this row's canonical envelope, produced by
 ///   the harness (it holds the private halves). The signing contract is
-///   pinned: classical = Ed25519 over
-///   `JCS({"key_id":"test-accord-holder-{i}","test_anchor":true})` (the
-///   exact envelope synthesized here); PQC = the bound hybrid form
-///   (`SelfSigner::sign_bound` over the same canonical bytes). When present
+///   pinned by [`test_anchor_registration_envelope`] — **call it, do not
+///   transcribe it.** v31.0.0 (CIRISVerify 13.1.0) MOVED this preimage: the
+///   envelope was `{"key_id":…,"test_anchor":true}` and now additionally binds
+///   `identity_type` (`accord_holder`) and both of the row's pubkeys, because
+///   verify's provenance-link check requires the full subject binding and
+///   refuses a link whose signed bytes omit it. A harness still signing the
+///   old literal produces a terminus persist's `root_binding` will not confirm.
+///   Classical = Ed25519 over `JCS(...)` of that object; PQC = the bound
+///   hybrid form (`SelfSigner::sign_bound` over the same canonical bytes). When present
 ///   the seeded terminus is a fully scrub-VERIFYING rooting root — persist's
 ///   own `root_binding` Confirms a chain terminating here (its
 ///   `Ed25519Fallback` link policy verifies classical-only or full-hybrid).
@@ -142,21 +181,29 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     let mut out = Vec::with_capacity(keys.len());
     for (i, ed) in keys.iter().enumerate() {
         let key_id = format!("test-accord-holder-{i}");
-        let envelope = serde_json::json!({ "key_id": key_id, "test_anchor": true });
-        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-            .expect("canonicalize test-anchor envelope");
         // #451 — optional PQC pubkey + real self-scrub signatures (see the
         // doc contract above). The PQC scrub only rides alongside a
         // classical one (it is the BOUND half of a hybrid pair).
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — read BEFORE the envelope, because the
+        // envelope now BINDS the PQC pubkey rather than merely accompanying it.
         let pqc_pubkey = env_slot("CIRIS_TEST_TRUST_ROOT_PQC", i);
         let scrub_ed = env_slot("CIRIS_TEST_TRUST_ROOT_SCRUB", i);
         let scrub_pqc = scrub_ed
             .as_ref()
             .and_then(|_| env_slot("CIRIS_TEST_TRUST_ROOT_SCRUB_PQC", i));
+        let pubkey_ed25519_base64 = B64.encode(ed);
+        let envelope = test_anchor_registration_envelope(
+            &key_id,
+            &pubkey_ed25519_base64,
+            pqc_pubkey.as_deref(),
+        );
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+            .expect("canonicalize test-anchor envelope");
         out.push(SignedKeyRecord {
             record: crate::federation::KeyRecord {
                 key_id: key_id.clone(),
-                pubkey_ed25519_base64: B64.encode(ed),
+                pubkey_ed25519_base64,
                 pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
                 pubkey_ml_dsa_65_base64: pqc_pubkey,
                 algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
@@ -2456,7 +2503,19 @@ mod test_anchor_tests {
 
         // The HARNESS half of the #451 contract: self-scrub over persist's
         // pinned synthesized envelope (classical + bound PQC, sign_bound).
-        let envelope = serde_json::json!({ "key_id": "test-accord-holder-0", "test_anchor": true });
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — through
+        // `test_anchor_registration_envelope`, NOT a transcribed literal. This
+        // test stood in for CIRISServer's harness by re-writing the envelope by
+        // hand, so when 13.1.0 moved the preimage the producer and its own
+        // witness moved apart and the terminus stopped rooting. Calling the
+        // shared function is what makes this leg a real e2e rather than two
+        // copies of a string agreeing with each other.
+        let envelope = super::test_anchor_registration_envelope(
+            "test-accord-holder-0",
+            &root_member.ed25519_public_key_base64,
+            root_member.mldsa65_public_key_base64.as_deref(),
+        );
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
         let (scrub_ed, scrub_pqc) = root.sign_bound(&canonical).await.unwrap();
 

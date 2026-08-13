@@ -2861,12 +2861,12 @@ impl Engine {
     /// # v31.0.0 (CIRISPersist#659) — BREAKING: the caller's envelope is
     /// subject-BOUND before it is signed
     ///
-    /// `registration_envelope` is stamped with the derived `key_id` and BOTH of
-    /// this engine's pubkeys through
+    /// `registration_envelope` is stamped with the derived `key_id`, the
+    /// `identity_type` argument and BOTH of this engine's pubkeys through
     /// [`admission::bind_subject_into_envelope`](crate::federation::admission::bind_subject_into_envelope)
     /// — the one shared projection — before it is canonicalized and signed.
-    /// Every other field the caller passed survives untouched; the three bound
-    /// keys are overwritten if present.
+    /// Every other field the caller passed survives untouched; the bound keys
+    /// are overwritten if present.
     ///
     /// This is a **preimage change** for the node's own bootstrap row, and it
     /// is not cosmetic: that row replicates, and at every peer it lands on the
@@ -2943,10 +2943,20 @@ impl Engine {
         // locally and be refused by the whole mesh — fail-closed, but
         // fail-closed on the wrong side of the wire, and invisible until
         // peering. The caller's envelope is otherwise untouched.
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — `identity_type` is bound to the
+        // PARAMETER, which is exactly the value the row is stored with a few
+        // lines below (`identity_type: identity_type.to_owned()`), unmodified
+        // and with nothing in between that could rewrite it. That equality is
+        // the whole requirement: this row replicates, every peer re-checks the
+        // binding against the COLUMN it arrives carrying, and binding anything
+        // other than the stored standing would make the node's own bootstrap
+        // row unreplicatable.
         let mut registration_envelope = registration_envelope;
         crate::federation::admission::bind_subject_into_envelope(
             &mut registration_envelope,
             &key_id,
+            identity_type,
             &pubkey_ed25519_base64,
             pqc_pubkey_b64.as_deref(),
         )
