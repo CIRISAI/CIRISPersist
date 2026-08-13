@@ -4311,6 +4311,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             resealed,
             chrono::Utc::now(),
         )?;
+        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
+        // gate above does not pin. This door was the only write door into
+        // `federation_attestations` with no signature gate at all. One gate,
+        // three backends.
+        crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed).await?;
 
         let mut row = stored.clone();
         row.attestation_envelope = resealed.attestation_envelope.clone();
@@ -9615,6 +9620,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ));
         }
 
+        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
+        // PATH. This door writes a caller-supplied `identity_type` and ran no
+        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
+        // `is_canonical_effective` answer true for an attacker-named key.
+        // BEFORE any lock or DB work: the gates read the directory, which locks
+        // itself. One gate, three backends.
+        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
+            .await?;
+
         let now = chrono::Utc::now();
         // Build the federation_keys row with its persist_row_hash.
         let mut key = crate::federation::KeyRecord {
@@ -10414,6 +10428,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
         attestation_row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
         attestation_row.scrub_key_id = attestation.scrub_key_id.clone();
         attestation_row.scrub_timestamp = attestation.scrub_timestamp;
+        // v31.0.0 (CIRISPersist#656) — THE GATES #652 did not wire. The
+        // bindings hold by construction; the future-skew bound and "the
+        // caller's hash covers the bytes we rebuilt" do not. Both backends,
+        // one helper.
+        crate::federation::blobs::check_put_blob_admission(
+            &attestation_row,
+            &attestation.original_content_hash_hex,
+            chrono::Utc::now(),
+        )?;
         let attestation_envelope_value = attestation_row.attestation_envelope.clone();
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
@@ -28716,7 +28739,6 @@ mod tests {
     #[tokio::test]
     async fn sqlite_consent_revocation_transit_admits_and_sla_fires_end_to_end() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::tier_ingest::test_support::sign_envelope;
         use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use std::time::Duration;
         let backend = fresh_backend_with_occurrence("subject-c").await;
@@ -28731,32 +28753,22 @@ mod tests {
         // instant in the SIGNED envelope; the local write door stamps the column
         // FROM it (`admission::local_row_instant`), so the two agree by
         // construction and the row survives the binding gate at promotion.
-        let env = serde_json::json!({
-            "id": "rev-c", "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
-
+        // v31.0.0 (CIRISPersist#656) — and it states the typed-column MIRROR in
+        // those same signed bytes. The transit door RECEIVES bytes it did not
+        // mint, so it checks the mirror rather than stamping one; the producer
+        // therefore also states the `attestation_id` it bound.
         backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: "subject-c".into(),
-                attested_key_id: Some("target-c".into()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    env.clone(),
-                )
-                .unwrap(),
-                subject_key_ids: vec!["subject-c".into()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    "rev-c",
+                    "subject-c",
+                    "target-c",
+                    vec!["subject-c".into()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": "rev-c" }),
+                ),
+            )
             .await
             .expect("crypto-valid subject-side revocation transits the local tier");
 
@@ -30501,6 +30513,7 @@ mod tests {
     };
 
     fn blob_attestation(
+        sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
         attestation_id: &str,
@@ -30508,16 +30521,19 @@ mod tests {
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2): use Utc::now()
         // so the row lands inside the DEFAULT_HOLDS_BYTES_TTL window
         // — `list_holders` now filters TTL-expired rows.
-        PutBlobAttestation {
-            attesting_key_id: attesting_key_id.into(),
-            attestation_id: attestation_id.into(),
-            original_content_hash_hex: "abcdef01".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        }
+        //
+        // v31.0.0 (CIRISPersist#656) — takes the SHA now, because the declared
+        // `original_content_hash` must cover the envelope `put_blob` rebuilds,
+        // and that envelope is keyed on the SHA. It used to be `"abcdef01"`.
+        let now = chrono::Utc::now();
+        crate::federation::blobs::sealed_put_blob_attestation(
+            sha256,
+            attesting_key_id,
+            scrub_key_id,
+            attestation_id,
+            now,
+            now,
+        )
     }
 
     async fn blob_test_backend() -> SqliteBackend {
@@ -30562,6 +30578,7 @@ mod tests {
                 BlobBody::Inline(bytes.clone()),
                 Some("application/octet-stream"),
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30588,6 +30605,7 @@ mod tests {
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30610,6 +30628,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &wrong_sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30633,6 +30652,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30661,6 +30681,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30685,6 +30706,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30869,6 +30891,7 @@ mod tests {
                 BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30884,6 +30907,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30907,6 +30931,7 @@ mod tests {
                 BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30922,6 +30947,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30958,6 +30984,7 @@ mod tests {
                 BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -30979,6 +31006,7 @@ mod tests {
                 }),
                 None,
                 blob_attestation(
+                    &sha,
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -31005,25 +31033,24 @@ mod tests {
     /// TTL filter. Matches `blob_attestation()` shape but with the
     /// asserted_at / scrub_timestamp exposed.
     fn blob_attestation_at(
+        sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
         attestation_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> PutBlobAttestation {
-        PutBlobAttestation {
-            attesting_key_id: attesting_key_id.into(),
-            attestation_id: attestation_id.into(),
-            original_content_hash_hex: "abcdef01".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp,
+        crate::federation::blobs::sealed_put_blob_attestation(
+            sha256,
+            attesting_key_id,
+            scrub_key_id,
+            attestation_id,
             // This fixture's whole subject is the holder's INSTANT (it drives
             // the TTL arms), and as of #652 that is `asserted_at`. The
             // parameter keeps its name because every call site names the TTL
             // it is testing, but the two are one value here.
-            asserted_at: scrub_timestamp,
-        }
+            scrub_timestamp,
+            scrub_timestamp,
+        )
     }
 
     // ── v3.5.2 (CIRISPersist#130) — list_local_holders ──────────────
@@ -31048,6 +31075,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation_at(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -31090,7 +31118,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", holds_id.as_str()),
+                blob_attestation(&sha, "host-a", "host-a", holds_id.as_str()),
             )
             .await
             .unwrap();
@@ -31145,6 +31173,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation_at(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -31175,6 +31204,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 blob_attestation_at(
+                    &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
@@ -31202,7 +31232,12 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", holds_bytes_attestation_id.as_str()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    holds_bytes_attestation_id.as_str(),
+                ),
             )
             .await
             .unwrap();
@@ -34454,16 +34489,15 @@ mod tests {
             Sha256::digest(&bytes).into()
         };
         use crate::federation::BlobStorage;
-        let put_att = crate::federation::PutBlobAttestation {
-            attesting_key_id: "rs".into(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: hex::encode([0xab; 32]),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "rs".into(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        };
+        let now = chrono::Utc::now();
+        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+            &sha,
+            "rs",
+            "rs",
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        );
         backend
             .put_blob(
                 &sha,
@@ -34549,16 +34583,15 @@ mod tests {
         };
 
         use crate::federation::BlobStorage;
-        let put_att = crate::federation::PutBlobAttestation {
-            attesting_key_id: "rs".into(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: hex::encode([0xab; 32]),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "rs".into(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        };
+        let now = chrono::Utc::now();
+        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+            &schema_sha,
+            "rs",
+            "rs",
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        );
         backend
             .put_blob(
                 &schema_sha,
@@ -34643,16 +34676,15 @@ mod tests {
             Sha256::digest(&schema_bytes).into()
         };
         use crate::federation::BlobStorage;
-        let put_att = crate::federation::PutBlobAttestation {
-            attesting_key_id: "rs".into(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: hex::encode([0xab; 32]),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "rs".into(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        };
+        let now = chrono::Utc::now();
+        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+            &schema_sha,
+            "rs",
+            "rs",
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        );
         backend
             .put_blob(
                 &schema_sha,
@@ -37504,7 +37536,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37538,7 +37570,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37574,7 +37606,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37593,7 +37625,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37612,7 +37644,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37632,7 +37664,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37660,7 +37692,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -37697,7 +37729,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .unwrap();
@@ -38482,7 +38514,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(huge),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .expect_err("must trust-reject before size-reject");
@@ -38511,7 +38543,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(b"x".to_vec()),
                 None,
-                blob_attestation("", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .expect_err("empty key beats trust");
@@ -38530,7 +38562,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                blob_attestation("host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
             )
             .await
             .expect("trust admits");
@@ -40556,6 +40588,93 @@ mod tests {
                 crate::federation::Error::FederationTierUnverified { .. }
             ),
             "651: the refusal must be the authorship gate, got {err:?}"
+        );
+    }
+
+    // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, SQLITE legs ──
+
+    /// The SQLITE leg of the SEVENTH-SITE witness (see the memory + postgres
+    /// legs, and the shared body for the attack it closes).
+    #[tokio::test]
+    async fn transit_mirror_binding_parity_sqlite_656() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
+            &backend, "sq656",
+        )
+        .await;
+    }
+
+    /// The SQLITE leg of the RE-SEAL witness.
+    #[tokio::test]
+    async fn reseal_seal_gate_parity_sqlite_656() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
+            &backend, "sq656",
+        )
+        .await;
+    }
+
+    /// The SQLITE leg of the PEER-RECORD witness.
+    #[tokio::test]
+    async fn peer_record_role_gate_parity_sqlite_656() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
+            &backend, "sq656",
+        )
+        .await;
+    }
+
+    /// The SQLITE leg of the FOREIGN-RETRACTION witness.
+    #[tokio::test]
+    async fn foreign_retraction_cannot_sever_parity_sqlite_656() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
+            &backend, "sq656",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#656) — the SQLITE leg of the `put_blob` witness.
+    ///
+    /// **Two backends, not three: `MemoryBackend` implements no
+    /// `BlobStorage`,** so there is no memory door to gate. Stated here rather
+    /// than left as a silently-absent leg, because "the third leg is missing"
+    /// and "the third door does not exist" look identical from a test list, and
+    /// this release has twice been bitten by the first wearing the second's
+    /// clothes.
+    #[tokio::test]
+    async fn put_blob_admission_parity_sqlite_656() {
+        let backend = blob_test_backend().await;
+        crate::federation::blobs::exercise_put_blob_admission(&backend, "sq656").await;
+    }
+
+    /// The SQLITE leg of the CANONICAL-SUPERSEDE role-gate witness — the side
+    /// that has had these four gates since v22.0.0 (#543 H2) and, until now, no
+    /// test pinning them. That is why the postgres twin could diverge for nine
+    /// minor versions without anything going red.
+    #[tokio::test]
+    async fn canonical_supersede_role_gate_parity_sqlite_656() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let (laundering, clean) =
+            crate::federation::admission::ungated_doors_test_support::seed_canonical_supersede_fixture(
+                &backend, "sq656",
+            )
+            .await;
+        let a = backend
+            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: laundering })
+            .await
+            .map(|_| ());
+        let b = backend
+            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: clean })
+            .await
+            .map(|_| ());
+        crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
+            "sqlite", a, b,
         );
     }
 }

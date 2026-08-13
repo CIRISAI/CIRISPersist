@@ -83,7 +83,10 @@ pub mod paths {
     /// live — note the TARGET, `references_attestation_id`, was already
     /// signed) or append a canonical binding hash to `subject_key_ids` (which
     /// grants that key rule-2 revocation standing at
-    /// [`crate::federation::admission::withdraws_admission_rule_for`]), and
+    /// [`crate::federation::admission::resolve_withdraws_admission_rule`] — the
+    /// doc here named `withdraws_admission_rule_for`, which does not exist and
+    /// never did, so the reader chasing the authority claim landed nowhere
+    /// (v31.0.0, CIRISPersist#656)), and
     /// the row still verified.
     ///
     /// Stamped by
@@ -409,11 +412,62 @@ impl RowMirror {
     /// The same shape as CIRISPersist#598 (`assemble` sampling `Utc::now()`
     /// after signing) and #643's blob-eviction sweeper: **a write path that
     /// constructs signed bytes and then mutates the row.**
+    ///
+    /// # A re-stamp NARROWS a placement; it never RE-AUTHORS a row (#656)
+    ///
+    /// The overwrite is unconditional in one member and refused in the other
+    /// six. `base` already carries a mirror on every row that reached the
+    /// corpus through any v31 door, and that mirror is what its author signed.
+    /// So before the stamp, the mirror this write is about to REPLACE is
+    /// compared against the row's typed columns with `cohort_scope` — the one
+    /// member a placement-touching write is allowed to move — normalized away.
+    /// Any other divergence is refused.
+    ///
+    /// Without that arm this function LAUNDERS: hand it a row whose columns
+    /// were rewritten in transit and it re-derives the mirror from those
+    /// columns, satisfies
+    /// [`crate::federation::admission::check_promotion_admission`]'s binding
+    /// gate against the mirror it just wrote, and this node hybrid-signs the
+    /// rewritten meaning into the federation plane. That is exactly how a
+    /// relay-appended `subject_key_ids` entry — which #643 bound BECAUSE it
+    /// confers revocation authority — reached the signed bytes. The check is
+    /// [`crate::federation::admission::check_row_column_binding`] itself, asked
+    /// of the PRE-stamp shape, so there is still exactly one comparison as
+    /// there is exactly one projection.
+    ///
+    /// A `base` carrying NO mirror is refused by the same call. That is not a
+    /// new refusal class: such a row also carries no signed instants, and
+    /// [`crate::federation::admission::check_instant_binding`] at the promote
+    /// door already refused it.
     pub fn restamp_for_scope(
         base: &serde_json::Value,
         row: &super::Attestation,
         cohort_scope: &str,
     ) -> Result<serde_json::Value, super::Error> {
+        // The row AS THE BASE'S AUTHOR BOUND IT: the row's own columns, with
+        // the placement normalized to whatever the signed mirror states. If
+        // those two disagree anywhere else, some door between the author and
+        // here rewrote a column, and re-stamping would sign the rewrite.
+        {
+            let signed_scope = base
+                .get(paths::ROW)
+                .and_then(|m| m.get(row_paths::COHORT_SCOPE))
+                .and_then(serde_json::Value::as_str);
+            let mut as_authored = row.clone();
+            as_authored.attestation_envelope = base.clone();
+            if let Some(scope) = signed_scope {
+                as_authored.cohort_scope = scope.to_owned();
+            }
+            crate::federation::admission::check_row_column_binding(&as_authored).map_err(|e| {
+                super::Error::InvalidArgument(format!(
+                    "attestation {}: refusing to re-stamp the typed-column mirror for placement \
+                     {cohort_scope:?} — the mirror this write would REPLACE does not agree with \
+                     the row's own columns, so re-deriving it would sign a rewritten meaning \
+                     rather than narrow a placement (CIRISPersist#656): {e}",
+                    row.attestation_id,
+                ))
+            })?;
+        }
         let mut as_stored = row.clone();
         as_stored.cohort_scope = cohort_scope.to_owned();
         let mut envelope = base.clone();
@@ -468,9 +522,42 @@ impl RowMirror {
     /// leave a stored hash and signature covering an envelope that no longer
     /// exists — **this very defect, one door over**. For that shape persist is
     /// the receiver, so the mirror is the producer's to bind and persist's to
-    /// check; it is checked where the signature is (`put_attestation`, and the
-    /// promote door the SLA watcher drives it through), not silently written
-    /// here.
+    /// **CHECK — here, at this door**
+    /// ([`crate::federation::admission::check_row_column_binding`]).
+    ///
+    /// v31.0.0 (CIRISPersist#656) — **this paragraph used to end differently,
+    /// and the sentence it ended with was false in both halves.** It read: *"it
+    /// is checked where the signature is (`put_attestation`, and the promote
+    /// door the SLA watcher drives it through), not silently written here."*
+    ///
+    /// 1. **`put_attestation` is not where the signature is.** A transit
+    ///    revocation's signature is verified HERE — the local write door runs
+    ///    [`crate::federation::admission::verify_local_transit_revocation`] and
+    ///    the row never passes through `put_attestation` at all. The claim
+    ///    named a door this row does not use.
+    /// 2. **The promote door cannot check it.** Promotion RE-STAMPS the mirror
+    ///    FROM the row's typed columns ([`Self::restamp_for_scope`] →
+    ///    [`Self::stamp_into`]) before
+    ///    [`crate::federation::admission::check_promotion_admission`] reads it,
+    ///    so that gate compares the mirror against the columns it was just
+    ///    derived from and can only pass. Then this node hybrid-signs the
+    ///    result.
+    ///
+    /// So the five typed columns #643 bound were checked by **no door
+    /// anywhere** for a transit row: a relay could append a key to the
+    /// `subject_key_ids` COLUMN beside the subject's untouched, still-valid
+    /// signed envelope, and promotion would stamp the relay's list into the
+    /// bytes this node signs — and per #643 a canonical binding hash in
+    /// `subject_key_ids` confers REVOCATION AUTHORITY
+    /// ([`crate::federation::admission::resolve_withdraws_admission_rule`] rule
+    /// 2). The seventh site of *"signed bytes, then mutate the row"*.
+    ///
+    /// The rule was always right; only half of it was implemented. **The party
+    /// that MINTS the bytes stamps; the party that RECEIVES them CHECKS** — so
+    /// this function now does both, and which one it does is the same
+    /// `caller_signed` question. One helper, one decision, three backends: the
+    /// receiving half cannot be forgotten at a door that remembered the
+    /// stamping half, because they are the same call.
     ///
     /// # The instants ride the same rule (v31.0.0, CIRISPersist#598)
     ///
@@ -486,7 +573,13 @@ impl RowMirror {
         caller_signed: bool,
     ) -> Result<(), super::Error> {
         if caller_signed {
-            return Ok(());
+            // THE RECEIVING HALF (CIRISPersist#656). Persist did not mint these
+            // bytes, so it does not stamp them — and therefore it MUST check
+            // them, here, at the only door this row passes through. The
+            // instants are checked by the local door's own
+            // `check_instant_binding` call a few lines later; the mirror had
+            // nothing checking it at all until this line.
+            return crate::federation::admission::check_row_column_binding(row);
         }
         stamp_signed_instants(row)?;
         Self::stamp_row(row)

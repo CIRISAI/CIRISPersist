@@ -3308,6 +3308,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         resealed: &crate::federation::Attestation,
     ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
+        // gate does not pin. BEFORE the state lock, because the signature arm
+        // resolves registered pubkeys through the directory, which locks
+        // itself. The stored copy read here is re-found under the lock below
+        // and re-gated by the pure `check_reseal_admission` there, so the
+        // async read outside the lock cannot widen what is admitted.
+        {
+            let Some(stored) = crate::federation::FederationDirectory::get_attestation(
+                self,
+                &resealed.attestation_id,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed)
+                .await?;
+        }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             let Some(row) = state
@@ -6609,6 +6627,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "identity_type must be non-empty".into(),
             ));
         }
+
+        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
+        // PATH. This door writes a caller-supplied `identity_type` and ran no
+        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
+        // `is_canonical_effective` answer true for an attacker-named key.
+        // BEFORE any lock or DB work: the gates read the directory, which locks
+        // itself. One gate, three backends.
+        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
+            .await?;
 
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
@@ -15466,7 +15493,6 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_transit_admits_and_sla_fires_end_to_end() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::tier_ingest::test_support::sign_envelope;
         use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use crate::federation::FederationDirectory;
         use std::time::Duration;
@@ -15484,34 +15510,26 @@ mod tests {
         // subject (Ed25519 + ML-DSA-65 bound) over the CEG canonical form.
         // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
         // stamps the column from it.
-        let env = serde_json::json!({
-            "id": "rev-c", "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
-
+        // v31.0.0 (CIRISPersist#656) — the signed MIRROR too: the transit door
+        // RECEIVES bytes it did not mint, so the producer binds the typed
+        // columns and persist CHECKS them. The producer therefore states the
+        // `attestation_id` (one of the seven bound members) rather than letting
+        // persist mint a fresh v4 it could not have signed over.
+        //
         // Admit it through the REAL local-write admission path — accepted as a
         // TRANSIT write because the bound-hybrid signature verifies (§10.1.3).
         let att_id = backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: "subject-c".into(),
-                attested_key_id: Some("target-c".into()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    env.clone(),
-                )
-                .unwrap(),
-                subject_key_ids: vec!["subject-c".into()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    "rev-c",
+                    "subject-c",
+                    "target-c",
+                    vec!["subject-c".into()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": "rev-c" }),
+                ),
+            )
             .await
             .expect("crypto-valid subject-side revocation transits the local tier (§10.1.3)");
 
@@ -15659,8 +15677,7 @@ mod tests {
     #[tokio::test]
     async fn consent_promotion_overdue_reader_memory() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::tier_ingest::test_support::sign_envelope;
-        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::types::attestation_tier;
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
@@ -15677,29 +15694,20 @@ mod tests {
         // test above).
         // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
         // stamps the column from it.
-        let env = serde_json::json!({
-            "id": "rev-r", "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
+        // v31.0.0 (CIRISPersist#656) — the producer binds the mirror; see the
+        // SLA-loop fixture above.
         let att_id = backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: "subject-r".into(),
-                attested_key_id: Some("target-r".into()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
-                    .unwrap(),
-                subject_key_ids: vec!["subject-r".into()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    "rev-r",
+                    "subject-r",
+                    "target-r",
+                    vec!["subject-r".into()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": "rev-r" }),
+                ),
+            )
             .await
             .expect("transit local-tier revocation admits");
         let revoked_at = backend.list_consent_revocations(None).await.unwrap()[0].asserted_at;
@@ -18873,5 +18881,115 @@ mod tests {
         assert_eq!(stored.0, "e4sig-authority");
         assert_eq!(stored.1, expect_classical);
         assert_eq!(stored.2, expect_pqc);
+    }
+
+    // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, MEMORY legs ──
+    //
+    // Each is three lines over a shared body in `admission`, because every one
+    // of these findings was a door that had a gate on some backends (or some
+    // doors) and not others. A witness written into ONE backend's test module
+    // is how that class comes back.
+
+    /// The MEMORY leg of the SEVENTH-SITE witness: the transit branch of the
+    /// local write door CHECKS the typed-column mirror it deliberately does not
+    /// stamp. See the shared body for the attack it closes.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_mirror_binding_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the RE-SEAL witness: `reseal_attestation_v31` verifies
+    /// the seal it writes and refuses to move the consent fold's ordering key.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reseal_seal_gate_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the PEER-RECORD witness: `add_peer_record` cannot
+    /// self-claim a conferred role.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_record_role_gate_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the FOREIGN-RETRACTION witness: a `withdraws` or
+    /// `recants` from a key with no authority over the target cannot sever a
+    /// delegation edge, whatever order it arrives in.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn foreign_retraction_cannot_sever_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the CANONICAL-SUPERSEDE role-gate witness.
+    ///
+    /// **Memory has no `supersede_canonical_record` at all** — the whole
+    /// supersede plane is `#[cfg(any(feature = "postgres", feature =
+    /// "sqlite"))]`, so a supersede offer resolves through the DEFAULT trait
+    /// body to `put_public_key` + first-seen-wins. Memory is therefore not
+    /// ungated, it is INCAPABLE, and this leg asserts that rather than being
+    /// silently absent: "the third leg is missing" and "the third door does not
+    /// exist" look identical from a test list, and this substrate has twice
+    /// mistaken the first for the second.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn canonical_supersede_role_gate_parity_memory_656() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        let (laundering, _clean) =
+            crate::federation::admission::ungated_doors_test_support::seed_canonical_supersede_fixture(
+                &backend, "mem656",
+            )
+            .await;
+        let key_id = laundering.key_id.clone();
+        let outcome = backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: laundering })
+            .await;
+        // Two admissible shapes, and `Superseded` is neither: the default trait
+        // body routes to `put_public_key`, whose own role gates refuse the
+        // `canonical` claim outright (an `Err`), and where they do not it is
+        // first-seen-wins (`Refused`). What must never happen is the row being
+        // ADOPTED, which is the only way a role reaches the table here.
+        match &outcome {
+            Err(_) => {}
+            Ok(crate::federation::register::ReplicatedKeyOutcome::Refused { .. }) => {}
+            other => panic!(
+                "memory has no supersede plane, so the offer must be refused — never adopted: \
+                 {other:?}"
+            ),
+        }
+        let stored = FederationDirectory::lookup_public_key(&backend, &key_id)
+            .await
+            .expect("read")
+            .expect("the incumbent is still there");
+        assert!(
+            stored.capability_roles.is_empty(),
+            "and no role was laundered onto the row: {:?}",
+            stored.capability_roles
+        );
     }
 }

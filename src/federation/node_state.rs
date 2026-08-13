@@ -932,11 +932,8 @@ fn resolve_peer_quota_signal(directory: &dyn FederationDirectory) -> PeerQuotaSi
 pub mod parity_test_support {
     use super::*;
     use crate::federation::hard_case::HardCaseFilter;
-    use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
-    use crate::federation::types::{
-        attestation_type, cohort_scope, identity_type, KeyRecord, LocalAttestationInput,
-        SignedKeyRecord,
-    };
+    use crate::federation::tier_ingest::test_support::hybrid_pubkeys;
+    use crate::federation::types::{cohort_scope, identity_type, KeyRecord, SignedKeyRecord};
 
     /// A registerable key with REAL deterministic hybrid pubkeys, so the
     /// consent fixture's local-tier admission resolves the attester.
@@ -1114,30 +1111,20 @@ pub mod parity_test_support {
         }
         // v31.0.0 (CIRISPersist#598) — the signed instant; the local write
         // door stamps the `asserted_at` column FROM it.
-        let env = serde_json::json!({
-            "id": format!("{tag}-ns-rev"),
-            "dimension": "consent:state:revoked:v1",
-            "score": 1.0,
-            "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_h, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
-        dir.attestation_upsert_local(LocalAttestationInput {
-            attestation_id: None,
-            attesting_key_id: subject.clone(),
-            attested_key_id: Some(target.clone()),
-            attestation_type: attestation_type::SCORES.into(),
-            weight: None,
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
-                .unwrap(),
-            subject_key_ids: vec![subject.clone()],
-            cohort_scope: cohort_scope::SELF.to_string(),
-            scrub_signature_classical: Some(sig_classical),
-            scrub_signature_pqc: sig_pqc,
-        })
+        // v31.0.0 (CIRISPersist#656) — and the signed MIRROR: the transit door
+        // is a RECEIVING door, so the producer binds the typed columns and
+        // persist checks them. That is why the id is stated rather than minted.
+        dir.attestation_upsert_local(
+            crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                &format!("{tag}-ns-rev"),
+                &subject,
+                &target,
+                vec![subject.clone()],
+                cohort_scope::SELF,
+                chrono::Utc::now(),
+                serde_json::json!({ "id": format!("{tag}-ns-rev") }),
+            ),
+        )
         .await
         .expect("transit local-tier revocation admits");
 

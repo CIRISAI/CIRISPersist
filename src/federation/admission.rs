@@ -4061,6 +4061,121 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
     Ok(())
 }
 
+/// v31.0.0 (CIRISPersist#656) — **the re-seal door's SEAL gate**, run by every
+/// backend's
+/// [`reseal_attestation_v31`](crate::federation::FederationDirectory::reseal_attestation_v31)
+/// immediately after
+/// [`check_reseal_admission`](crate::federation::migration::check_reseal_admission)
+/// and before any mutation (verify-before-mutation, AV-9).
+///
+/// # What was open
+///
+/// The #650 re-seal door is a write door into `federation_attestations`, and it
+/// was the only one with **no signature gate**. Every sibling verifies the
+/// seal: `put_attestation` runs
+/// [`crate::federation::verify_federation_tier_ingest`], promotion re-signs
+/// with this node's own key, the local door runs
+/// [`verify_local_transit_revocation`] or writes the deferred empty sentinel.
+/// The re-seal door alone wrote `original_content_hash` and
+/// `scrub_signature_*` verbatim from its argument.
+///
+/// Its own trait doc claims *"**This is not a general re-sign door.** It exists
+/// for the migration and refuses everything else by refusing the legacy shape
+/// it is handed"*, and
+/// [`check_reseal_admission`](crate::federation::migration::check_reseal_admission)'s
+/// claims *"a re-seal changes the SEAL, never the row's meaning"*. Both
+/// described an intent the gate stack did not enforce: nothing required the
+/// STORED row to be legacy, and `asserted_at` — the key every consent fold
+/// ORDERS on, and the field CIRISPersist#598 exists to keep a lying clock from
+/// moving — was not in the immutable set. So a caller could take an
+/// already-conformant row, move its `asserted_at` 48 hours forward, hand over a
+/// signature that verifies against nothing, and have it written: #598's replay
+/// executed in place, plus #598's unsigned mute button via `expires_at`.
+///
+/// # The two arms
+///
+/// 1. **THE INSTANTS ARE THE ROW'S MEANING, so they are immutable** — modulo
+///    the ONE lossy step a v31 re-seal legitimately performs. The migration
+///    re-stamps through
+///    [`stamp_signed_instants`](crate::federation::envelope::stamp_signed_instants),
+///    which TRUNCATES to [`CONSENT_INSTANT_RESOLUTION_NANOS`], so exact
+///    equality would refuse the migration's own output on any row stored with
+///    sub-microsecond precision. The rule is therefore *"equal to the stored
+///    instant truncated"* — which permits the truncation and nothing else. A
+///    48-hour jump is refused; so is a one-microsecond one.
+/// 2. **THE SEAL MUST VERIFY.** Either the row carries the deferred
+///    empty-sentinel scrub envelope — in which case the STORED row must have
+///    carried it too (a re-seal may not DE-seal a row) — or it is
+///    hybrid-verified against the attester's REGISTERED pubkeys through the
+///    same [`crate::federation::verify_row_hybrid_signature`] every other door
+///    uses, which also cross-checks `original_content_hash` against the
+///    canonical bytes.
+///
+/// The migration's own output satisfies both by construction: `build_restamped`
+/// signs the re-stamped canonical with this node's key for an
+/// [`Authorship::OwnKey`](crate::federation::migration::Authorship::OwnKey) row
+/// (whose `attesting_key_id` IS this node's derived key id, so it verifies) and
+/// preserves the empty sentinel verbatim for an
+/// [`UnsealedLocal`](crate::federation::migration::Authorship::UnsealedLocal)
+/// one. A `Foreign` row is never re-stamped at all.
+///
+/// # Why here and not in the migration's own gate stack
+///
+/// The signature arm needs the directory (it resolves registered pubkeys and is
+/// therefore `async`), and `check_reseal_admission` is a pure function of two
+/// rows. Rather than make the pure gate impure, the door runs both: the shape
+/// gate, then this one. Both are called from all three backends, so neither can
+/// drift per backend.
+pub async fn check_reseal_seal_admission<F>(
+    directory: &F,
+    stored: &crate::federation::Attestation,
+    resealed: &crate::federation::Attestation,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let moved = |what: &str, from: String, to: String| {
+        Error::InvalidArgument(format!(
+            "reseal of attestation {}: `{what}` moved from {from} to {to} — a v31 re-seal changes \
+             the SEAL, never the instant the claim was asserted or the instant it stops \
+             applying. Those order and filter every consent fold, so moving one in place is \
+             CIRISPersist#598's replay wearing the migration's door (CIRISPersist#656). The only \
+             admitted change is truncation to the substrate resolution, which is what the \
+             re-stamp itself performs",
+            stored.attestation_id,
+        ))
+    };
+    if resealed.asserted_at != truncate_to_substrate_resolution(stored.asserted_at) {
+        return Err(moved(
+            "asserted_at",
+            stored.asserted_at.to_rfc3339(),
+            resealed.asserted_at.to_rfc3339(),
+        ));
+    }
+    if resealed.expires_at != stored.expires_at.map(truncate_to_substrate_resolution) {
+        return Err(moved(
+            "expires_at",
+            format!("{:?}", stored.expires_at),
+            format!("{:?}", resealed.expires_at),
+        ));
+    }
+
+    // THE SEAL. An unsealed row has nothing to verify — but it must have been
+    // unsealed BEFORE, or this door is a way to strip a signature off a row
+    // that had one.
+    if resealed.scrub_signature_classical.is_empty() {
+        if !stored.scrub_signature_classical.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "reseal of attestation {}: refusing to replace a real seal with the deferred \
+                 empty sentinel — a re-seal RE-signs, it never DE-signs (CIRISPersist#656)",
+                stored.attestation_id,
+            )));
+        }
+        return Ok(());
+    }
+    crate::federation::verify_row_hybrid_signature(directory, resealed).await
+}
+
 /// v21.6.0 (CIRISPersist#519 item 2a-iii) — the SIGNED touch-claim
 /// admission gate: the freshness-floor mirror of
 /// [`verify_signed_transport_destination`], closing the same class of hole
@@ -4797,17 +4912,81 @@ impl DelegationWalkPolicy {
 /// scoped-delegation BFS memoizes one read per distinct recipient. Extracting
 /// the FOLD and not the READ is what lets both planes share one definition of
 /// "retracted by name" without either inheriting the other's access pattern.
+///
+/// # v31.0.0 (CIRISPersist#656) — THE ATTESTER IS CHECKED HERE
+///
+/// This fold used to apply **no attester check at all**: any row of the right
+/// TYPE naming an id killed that edge, whoever wrote it. Its own doc (above)
+/// says the shape is what *"CEG §3.2.3 rules 2/3/4 produce"* — but producing
+/// that shape is not the same as being entitled to it, and this fold was the
+/// only thing standing between a `withdraws` row and a severed delegation.
+/// The two sibling folds both bind the attester: the granter-scoped BFS gate
+/// (a) reads `list_attestations_by(granter)`, and
+/// [`live_delegation_granters`]'s clause (3) reads
+/// `list_attestations_by(&r.attesting_key_id)` — each scoping the read to the
+/// edge's own attester. This fold reads neither; it was handed a slice of
+/// EVERYONE's rows and filtered only on type.
+///
+/// The write door does not cover for it. [`check_withdraws_admission`] returns
+/// `Ok(None)` — admit, no rule — when the target row is **not locally
+/// present**, deferring authority "to the read side" (its own words), and this
+/// IS the read side. So a foreign `withdraws` that arrives BEFORE its target
+/// killed a delegation edge on arrival order alone. Worse, `recants` reaches
+/// this fold too and there is **no `check_recants_admission` anywhere**, so a
+/// foreign `recants` never needed the race at all.
+///
+/// Both are authority DENIAL, which escalates: severing the incumbent's edge
+/// can leave the attacker the sole surviving proxy under
+/// [`resolve_withdraws_admission_rule`] rules 3/4, or a node with no
+/// [`owner_of`] at all.
+///
+/// So the fold now answers with the slice it already has, adding no read:
+///
+/// 1. the retraction must NAME a target present in this same slice — both call
+///    sites test membership against ids drawn from that slice, so a name it
+///    cannot resolve was already inert, and dropping it is behaviour-preserving
+///    rather than a new refusal.
+///
+///    **Measured, not assumed: this arm is an EQUIVALENT MUTANT today.**
+///    Deleting it (returning the unresolvable id into the set) leaves the
+///    three-backend witness green, which is the same statement as
+///    "behaviour-preserving" read from the other side. It is kept because it
+///    makes the fold's contract explicit — *a retraction I cannot resolve is a
+///    retraction I do not apply* — and because arm 2 needs the resolved target
+///    anyway. It is recorded as non-load-bearing so a later reader does not
+///    mistake it for a check that is protecting something;
+/// 2. and the retracting key must be entitled: the target's own attester
+///    (self-retraction, rule 1 — what both siblings enforce), or a member of
+///    the target's `subject_key_ids` (subject-side revocation, rule 2), or a
+///    key the WRITE door already resolved authority for
+///    (`withdraws_admission_rule.is_some()`, which covers the BFS-derived
+///    rules 3/4 that no sync fold can recompute).
+///
+/// Arm 3 is why this is not simply "compare attesters like the siblings do":
+/// the siblings model §6.1 self-retraction only, and narrowing this fold to
+/// that would drop the subject and proxy revocations it exists to see.
+/// `withdraws_admission_rule` is `None` for several distinct reasons (deferred,
+/// malformed, non-`withdraws`, `holds_bytes` target), so it is used only as an
+/// admitting arm and never as the sole test.
 fn retracted_edge_ids(rows: &[super::Attestation]) -> std::collections::HashSet<String> {
+    let by_id: std::collections::HashMap<&str, &super::Attestation> = rows
+        .iter()
+        .map(|r| (r.attestation_id.as_str(), r))
+        .collect();
     rows.iter()
         .filter(|g| {
             g.attestation_type == attestation_type::WITHDRAWS
                 || g.attestation_type == attestation_type::RECANTS
         })
         .filter_map(|g| {
-            crate::federation::precedence::references_attestation_id_from_envelope(
+            let target_id = crate::federation::precedence::references_attestation_id_from_envelope(
                 &g.attestation_envelope,
-            )
-            .map(str::to_owned)
+            )?;
+            let target = by_id.get(target_id)?;
+            let entitled = g.attesting_key_id == target.attesting_key_id
+                || target.subject_key_ids.contains(&g.attesting_key_id)
+                || g.withdraws_admission_rule.is_some();
+            entitled.then(|| target_id.to_owned())
         })
         .collect()
 }
@@ -7066,6 +7245,107 @@ pub async fn check_infra_attest_role_admission(
 ) -> Result<(), Error> {
     check_infra_attest_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
         .await
+}
+
+/// v31.0.0 (CIRISPersist#656) — **the FIFTH `federation_keys` admission path.**
+///
+/// [`crate::federation::FederationDirectory::add_peer_record`] is an INSERT
+/// into `federation_keys` with a caller-supplied `identity_type`, and it ran no
+/// role gate of any kind on any backend. It is FFI-reachable twice over — as
+/// the PyO3 `Engine.add_peer_record_json` method present in every shipped
+/// wheel, and as the always-compiled C-ABI `DirectoryOp::AddPeerRecord` capsule
+/// op — so `add_peer_record(k, pk, "canonical", None)` made
+/// [`is_canonical_effective`] answer `true` for an attacker-named key. The
+/// invariant [`is_canonical`]'s own doc rests on — *"a stored row can carry
+/// `canonical` only if it earned it via anchor-scrub, so this simple
+/// set-membership read is sufficient"* — was false through this door.
+///
+/// The error type's enumeration of where the canonical role is gated names four
+/// paths (*"direct registration, self-registration, replication of a
+/// self-signed row, and the `adopt_scrub_upgrade` self→anchored path"*). This
+/// is the fifth, and it is the one that had no gate. Recording it here rather
+/// than only in a commit message: a chokepoint inventory that is not exhaustive
+/// is the recurring shape of this whole release (#652 was found by counting
+/// doors rather than gates).
+///
+/// # What it runs, and why the set is what it is
+///
+/// The four accord/anchor-conferred gates `put_public_key` runs, in the same
+/// order, so a peer row cannot claim what a registration would have to earn.
+/// Plus one arm the other doors do not need:
+///
+/// **`accord_holder` is refused outright, not policy-checked.** The other doors
+/// hand `attestation_evidence` to
+/// [`crate::federation::FederationDirectory::hardware_attestation_policy`].
+/// This door has no evidence to hand it — `add_peer_record` hardcodes
+/// `attestation_evidence: None`, along with a fabricated
+/// `{"peer_added_by_operator": true}` registration envelope, an
+/// `original_content_hash` of 64 zeros, an EMPTY `scrub_signature_classical`
+/// and `scrub_key_id == key_id`. A door that structurally cannot carry the
+/// evidence a claim requires must refuse the claim, not evaluate it against
+/// evidence it does not have.
+///
+/// That same shape is why the remaining gates fail closed here rather than
+/// being decorative: a self-scrubbed record with an empty signature cannot
+/// satisfy an anchor-scrub or an m-of-n co-scrub. **A conferred role arrives
+/// through `put_public_key` with a record that was actually signed, or it does
+/// not arrive.**
+/// # Shape
+///
+/// Takes `(key_id, identity_type_claim)` rather than a record, and builds the
+/// probe itself, because the row `add_peer_record` writes is a CONSTANT modulo
+/// those two: empty `capability_roles`, no `attestation_evidence`, a fabricated
+/// registration envelope, an empty classical signature, `scrub_key_id ==
+/// key_id`. Constructing that probe once here rather than three times at three
+/// doors is the same rule the rest of this cut applies — one gate, three
+/// backends, and no per-backend copy to drift.
+pub async fn check_peer_record_admission(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    identity_type_claim: &str,
+) -> Result<(), Error> {
+    if identity_type::set_contains(identity_type_claim, identity_type::ACCORD_HOLDER) {
+        return Err(Error::InvalidArgument(format!(
+            "add_peer_record {key_id}: identity_type {identity_type_claim:?} claims `{}`, which is \
+             HARDWARE-attested — and an operator-added peer record carries no \
+             `attestation_evidence` to attest with (this door hardcodes it to None). Register an \
+             accord holder through the signed registration path, where its evidence can be \
+             checked (CIRISPersist#656/#543)",
+            identity_type::ACCORD_HOLDER,
+        )));
+    }
+    // The row this door would write, exactly: self-scrubbed, unsigned, no
+    // roles, no evidence. The gates read `identity_type`, `capability_roles`
+    // and the scrub set, so a probe that matches on those matches on
+    // everything they can see.
+    let now = chrono::Utc::now();
+    let probe = super::KeyRecord {
+        key_id: key_id.to_owned(),
+        pubkey_ed25519_base64: String::new(),
+        pubkey_ml_dsa_65_base64: None,
+        algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+        identity_type: identity_type_claim.to_owned(),
+        identity_ref: key_id.to_owned(),
+        valid_from: now,
+        valid_until: None,
+        registration_envelope: serde_json::json!({ "peer_added_by_operator": true }),
+        original_content_hash: "00".repeat(32),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: key_id.to_owned(),
+        scrub_timestamp: now,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        capability_roles: Vec::new(),
+        attestation_evidence: None,
+        consent_role: None,
+        additional_scrubs: Vec::new(),
+    };
+    check_canonical_role_admission(directory, &probe).await?;
+    check_infra_attest_role_admission(directory, &probe).await?;
+    check_co_steward_role_admission(directory, &probe).await?;
+    check_privileged_identity_type_admission(directory, &probe).await?;
+    Ok(())
 }
 
 /// [`check_infra_attest_role_admission`] with an explicit accord-holder roster —
@@ -18257,6 +18537,749 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 "accord holder {h:?} is steward-bound, which means this witness can no longer \
                  tell whether the resolver filters. The whole point is that it must NOT: holders \
                  are accord_holder-role, HardwareAttested, and filtering them returns empty"
+            );
+        }
+    }
+}
+
+/// v31.0.0 (CIRISPersist#656) — **the ungated-door witnesses**, one body per
+/// finding, run against `&dyn FederationDirectory` so memory, sqlite and
+/// postgres answer the same question with the same code.
+///
+/// Every finding in this cut is one shape: *a door that writes without the gate
+/// its siblings run*. Several were single-BACKEND or single-DOOR blind spots
+/// that a per-backend test could not have seen, so the witnesses live here and
+/// the backend test modules hold three-line legs. A witness written into one
+/// backend's test module is how the class comes back.
+///
+/// `suffix` scopes every fixture key so a run against a shared postgres test DB
+/// does not collide with a prior one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod ungated_doors_test_support {
+    use super::*;
+    use crate::federation::tier_ingest::test_support::{
+        bound_transit_revocation_input, hybrid_pubkeys, seal_row_in_place,
+    };
+    use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord};
+    use chrono::Utc;
+
+    /// A registered hybrid key whose fixture keypair the `test_support` signer
+    /// holds — so a row sealed for it actually verifies at every door.
+    pub(crate) async fn register(dir: &dyn FederationDirectory, key_id: &str, ty: &str) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let now = Utc::now();
+        dir.put_public_key(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: ty.to_owned(),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register fixture key");
+    }
+
+    /// A federation-tier `scores` row on `dimension`, UNSEALED — the caller
+    /// mutates what it needs and seals last.
+    pub(crate) fn federation_row(id: &str, author: &str, dimension: &str) -> Attestation {
+        let now = truncate_to_substrate_resolution(Utc::now());
+        Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: author.to_owned(),
+            attested_key_id: author.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": dimension, "score": 0.5, "confidence": 0.9,
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FINDING 1 — THE SEVENTH SITE
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **The transit door CHECKS the mirror it will not stamp.**
+    ///
+    /// The adversarial review proved the opposite: a relay could take the
+    /// subject's untouched, still-valid signed `consent:state:revoked`
+    /// envelope — whose `row` mirror honestly binds `subject_key_ids: [S]` —
+    /// and submit it with `[S, attacker]` in the typed COLUMN. It was admitted,
+    /// because [`check_row_column_binding`] is wired to `put_attestation`,
+    /// `set_attestation_cohort_scope` and the promote door, and NOT to the
+    /// local-write door on any backend. For a DURABLE local row that gap is
+    /// harmless — `stamp_local_row` stamps the mirror. For a TRANSIT row it
+    /// returned early BY DESIGN (the caller signed those bytes and stamping
+    /// would invalidate them), so the five typed columns were checked by **no
+    /// door anywhere**.
+    ///
+    /// Three legs, in the order they close the hole:
+    ///
+    /// 1. the divergent row is REFUSED at the door that stored it, naming the
+    ///    column — `subject_key_ids`, the one a canonical binding hash in which
+    ///    confers REVOCATION AUTHORITY (#643 /
+    ///    [`resolve_withdraws_admission_rule`] rule 2);
+    /// 2. the HONEST row is still admitted, so leg 1 is not a gate that refuses
+    ///    everything;
+    /// 3. the promote door's re-stamp REFUSES to launder a divergence rather
+    ///    than deriving the mirror from the rewritten columns and handing back
+    ///    bytes this node then signs.
+    ///
+    /// Leg 3 is independent, and it is the half the promote door could not
+    /// catch before: `restamp_for_scope` OVERWROTE the mirror before
+    /// [`check_promotion_admission`] compared it, so that gate validated the
+    /// mirror against the columns it had just derived it from.
+    pub(crate) async fn exercise_transit_mirror_binding(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::envelope::{paths, row_paths, RowMirror};
+        let subject = format!("aw-subject-{suffix}");
+        let target = format!("aw-target-{suffix}");
+        let attacker = format!("aw-attacker-{suffix}");
+        register(
+            dir,
+            &subject,
+            crate::federation::types::identity_type::AGENT,
+        )
+        .await;
+        register(dir, &target, crate::federation::types::identity_type::NODE).await;
+
+        // ── (1) THE ATTACK. The subject's signed envelope, untouched; one
+        //        unsigned column, appended in transit.
+        let attacked_id = format!("aw-transit-rev-{suffix}");
+        let mut relayed = bound_transit_revocation_input(
+            &attacked_id,
+            &subject,
+            &target,
+            vec![subject.clone()],
+            cohort_scope::SELF,
+            Utc::now(),
+            serde_json::json!({ "id": attacked_id }),
+        );
+        relayed.subject_key_ids = vec![subject.clone(), attacker.clone()];
+        let err = dir
+            .attestation_upsert_local(relayed)
+            .await
+            .expect_err("the transit door must refuse a row whose columns are unbound (#656)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(row_paths::SUBJECT_KEY_IDS),
+            "the refusal must NAME the rewritten column so an operator can see what was \
+             appended; got: {msg}"
+        );
+        assert!(
+            dir.get_attestation(&attacked_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "verify-before-mutation: a refused transit write leaves no row behind"
+        );
+
+        // ── (2) CONTROL. The honest row — same door, same shape, mirror and
+        //        columns agreeing — is still admitted. Without this leg, leg 1
+        //        would pass against a door that refuses everything.
+        let honest_id = format!("aw-transit-ok-{suffix}");
+        let honest = bound_transit_revocation_input(
+            &honest_id,
+            &subject,
+            &target,
+            vec![subject.clone()],
+            cohort_scope::SELF,
+            Utc::now(),
+            serde_json::json!({ "id": honest_id }),
+        );
+        let stored_id = dir
+            .attestation_upsert_local(honest)
+            .await
+            .expect("a transit revocation that BINDS its columns still transits (#656)");
+        assert_eq!(stored_id, honest_id, "the producer's bound id is honoured");
+        let stored = dir
+            .get_attestation(&honest_id)
+            .await
+            .expect("read")
+            .expect("the honest transit row is at rest");
+        assert_eq!(stored.tier, attestation_tier::LOCAL);
+        assert!(
+            !stored.scrub_signature_classical.is_empty(),
+            "a transit row rests carrying the SUBJECT's real signature, never the deferred \
+             sentinel — the property that makes stamping impossible and checking necessary"
+        );
+        check_row_column_binding(&stored)
+            .expect("the stored transit row satisfies the binding its peers will check");
+
+        // ── (3) THE PROMOTE DOOR DOES NOT LAUNDER. Take the honest stored row,
+        //        rewrite the column the way a relay would, and ask for the
+        //        re-stamp every promotion performs.
+        let mut rewritten = stored.clone();
+        rewritten.subject_key_ids = vec![subject.clone(), attacker.clone()];
+        let err = RowMirror::restamp_for_scope(
+            &rewritten.attestation_envelope,
+            &rewritten,
+            cohort_scope::COMMUNITY,
+        )
+        .expect_err(
+            "restamp_for_scope must refuse to re-derive a mirror that disagrees with the one it \
+             is replacing — otherwise promotion signs the relay's list (#656)",
+        );
+        assert!(
+            err.to_string().contains(row_paths::SUBJECT_KEY_IDS),
+            "the promote-door refusal names the column too: {err}"
+        );
+
+        // …and the same call on the UNTOUCHED row still works, because a
+        // re-stamp is allowed to move exactly one member: the placement.
+        let promoted = RowMirror::restamp_for_scope(
+            &stored.attestation_envelope,
+            &stored,
+            cohort_scope::COMMUNITY,
+        )
+        .expect("an honest row still promotes — the re-stamp narrows a placement");
+        assert_eq!(
+            promoted[paths::ROW][row_paths::SUBJECT_KEY_IDS],
+            serde_json::json!([subject]),
+            "and it carries the SUBJECT's list, which is the whole point"
+        );
+        assert_eq!(
+            promoted[paths::ROW][row_paths::COHORT_SCOPE],
+            serde_json::json!(cohort_scope::COMMUNITY),
+            "the one member a placement-touching write may move DID move"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FINDING 2 — THE RE-SEAL DOOR
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **The #650 re-seal door verifies the seal it writes, and the instants
+    /// are immutable across a re-seal.**
+    ///
+    /// The review wrote a garbage signature plus a 48-hour-forward
+    /// `asserted_at` onto a stored row through `reseal_attestation_v31`, and it
+    /// was accepted — CIRISPersist#598's replay executed in place, plus #598's
+    /// unsigned mute button via `expires_at`, through the only write door into
+    /// `federation_attestations` with no signature gate.
+    ///
+    /// Both halves are asserted, plus a control that a LEGITIMATE re-seal (the
+    /// migration's own shape: the bytes change, the meaning and the instants do
+    /// not) still lands — otherwise the fix would have closed the door rather
+    /// than gated it.
+    pub(crate) async fn exercise_reseal_seal_gate(dir: &dyn FederationDirectory, suffix: &str) {
+        let author = format!("aw-author-{suffix}");
+        register(dir, &author, crate::federation::types::identity_type::AGENT).await;
+        let id = format!("aw-reseal-{suffix}");
+
+        let mut row = federation_row(&id, &author, "aw:reseal:v1");
+        row.asserted_at =
+            truncate_to_substrate_resolution(Utc::now() - chrono::Duration::hours(48));
+        seal_row_in_place(&author, &mut row);
+        dir.put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("a well-formed row is admitted at the verifying door");
+        let stored = dir.get_attestation(&id).await.expect("read").expect("row");
+
+        // ── (1) THE INSTANT MAY NOT MOVE. Same pinned columns, and a REAL
+        //        signature over the moved bytes — refused anyway, because the
+        //        instant IS the row's meaning to every consent fold.
+        let bumped = truncate_to_substrate_resolution(Utc::now());
+        let mut moved = stored.clone();
+        moved.asserted_at = bumped;
+        moved.attestation_envelope[crate::federation::envelope::paths::ASSERTED_AT] =
+            serde_json::json!(bumped.to_rfc3339());
+        seal_row_in_place(&author, &mut moved);
+        let err = dir
+            .reseal_attestation_v31(&moved)
+            .await
+            .expect_err("a re-seal may not move `asserted_at` (#656/#598)");
+        assert!(
+            err.to_string().contains("asserted_at"),
+            "the refusal names the instant that moved: {err}"
+        );
+        assert_eq!(
+            dir.get_attestation(&id)
+                .await
+                .expect("read")
+                .expect("row")
+                .asserted_at,
+            stored.asserted_at,
+            "verify-before-mutation: the refused re-seal wrote nothing"
+        );
+
+        // ── (2) THE SEAL MUST VERIFY. Instants untouched this time; only the
+        //        seal is garbage.
+        let mut forged = stored.clone();
+        forged.original_content_hash = "00".repeat(32);
+        forged.scrub_signature_classical = "bm90LWEtc2lnbmF0dXJl".to_owned();
+        forged.scrub_signature_pqc = None;
+        let err = dir
+            .reseal_attestation_v31(&forged)
+            .await
+            .expect_err("a re-seal must carry a seal that verifies (#656)");
+        assert_eq!(
+            err.kind(),
+            "federation_federation_tier_unverified",
+            "and it is refused for exactly the reason every sibling door refuses it: {err}"
+        );
+        assert_eq!(
+            dir.get_attestation(&id)
+                .await
+                .expect("read")
+                .expect("row")
+                .scrub_signature_classical,
+            stored.scrub_signature_classical,
+            "the stored seal is untouched by the refused re-seal"
+        );
+
+        // ── (3) CONTROL — a LEGITIMATE re-seal still lands.
+        let mut honest = stored.clone();
+        honest.attestation_envelope["restamped"] = serde_json::json!(true);
+        seal_row_in_place(&author, &mut honest);
+        assert!(
+            dir.reseal_attestation_v31(&honest)
+                .await
+                .expect("a verifying re-seal that moves no instant is admitted"),
+            "the row was rewritten"
+        );
+        let after = dir.get_attestation(&id).await.expect("read").expect("row");
+        assert_eq!(
+            after.attestation_envelope["restamped"],
+            serde_json::json!(true),
+            "the honest re-seal actually landed, so legs 1 and 2 gate the door rather than \
+             closing it"
+        );
+        assert_eq!(after.asserted_at, stored.asserted_at);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FINDING 5 — add_peer_record
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **`add_peer_record` cannot self-claim a conferred role.**
+    ///
+    /// It is an INSERT into `federation_keys` with a caller-supplied
+    /// `identity_type`; it ran no role gate on any backend; and it is
+    /// FFI-reachable twice over — the PyO3 `Engine.add_peer_record_json` method
+    /// present in every shipped wheel, and the always-compiled C-ABI
+    /// `DirectoryOp::AddPeerRecord` capsule op. So
+    /// `add_peer_record(k, pk, "canonical", None)` made
+    /// [`is_canonical_effective`] answer `true` for an attacker-named key, and
+    /// the invariant [`is_canonical`]'s own doc rests on — *"a stored row can
+    /// carry `canonical` only if it earned it via anchor-scrub"* — was false
+    /// through this door.
+    ///
+    /// The comma-set leg is not decoration: `identity_type` is a SET, and a
+    /// gate that string-compared would miss `"node,canonical"`.
+    ///
+    /// The control leg is load-bearing: an ORDINARY peer add must still work,
+    /// because operator-authorized peer bootstrap is this door's whole job.
+    pub(crate) async fn exercise_peer_record_role_gate(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::identity_type;
+        let (ed_pk, _) = hybrid_pubkeys(&format!("aw-peer-{suffix}"));
+
+        // The claims whose conferral root is checked AT THIS CHOKEPOINT —
+        // `canonical` is `AnchorScrubbed` and `accord_holder` is
+        // `HardwareAttested` (see `identity_type::conferral_mode`). The
+        // `DelegatedFromTrustRoot` and self-descriptive claims are deliberately
+        // NOT in this list: a self-asserted `trusted_publisher` buys nothing
+        // because every consumer re-derives it from a `delegates_to` chain at
+        // USE, and refusing it here would fail closed on legitimate operators.
+        // Naming the distinction rather than testing a uniform refusal, because
+        // getting it wrong in the loose direction is a Sybil and in the strict
+        // direction is an outage.
+        for claim in [
+            identity_type::CANONICAL,
+            identity_type::ACCORD_HOLDER,
+            // `identity_type` is a SET: a gate that string-COMPARED would miss
+            // the claim hidden beside an innocuous one.
+            "node,canonical",
+            "agent,accord_holder",
+        ] {
+            let key_id = format!("aw-peer-{}-{suffix}", claim.replace(',', "-"));
+            let err = dir.add_peer_record(&key_id, &ed_pk, claim, None).await;
+            assert!(
+                err.is_err(),
+                "add_peer_record must REFUSE the self-claimed conferred role {claim:?} (#656) — \
+                 it carries no conferral evidence and never could"
+            );
+            assert!(
+                dir.lookup_public_key(&key_id)
+                    .await
+                    .expect("read")
+                    .is_none(),
+                "verify-before-mutation: the refused peer add wrote no federation_keys row for \
+                 {claim:?}"
+            );
+            assert!(
+                !is_canonical_effective(dir, &key_id)
+                    .await
+                    .expect("canonical read"),
+                "and the key the attacker named is not canonical"
+            );
+        }
+
+        // CONTROL — an ordinary peer add still works.
+        let ordinary = format!("aw-peer-ok-{suffix}");
+        dir.add_peer_record(&ordinary, &ed_pk, identity_type::AGENT, None)
+            .await
+            .expect("an ordinary operator peer add is untouched by the role gate");
+        assert!(
+            dir.lookup_public_key(&ordinary)
+                .await
+                .expect("read")
+                .is_some(),
+            "the ordinary peer really landed, so the refusals above are a gate and not a wall"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FINDING 7 — retracted_edge_ids
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **A FOREIGN retraction cannot sever a delegation edge.**
+    ///
+    /// [`check_withdraws_admission`] returns `Ok(None)` — admit, no rule — when
+    /// the target row is not locally present, deferring authority *"to the read
+    /// side"*; and the read-side fold [`retracted_edge_ids`] applied no attester
+    /// check at all. So a foreign `withdraws` arriving BEFORE its target killed
+    /// the edge on arrival order alone. `recants` is worse: it reaches the same
+    /// fold and there is no `check_recants_admission` anywhere in the tree, so
+    /// it needs no race.
+    ///
+    /// Both are authority DENIAL, which escalates — severing the incumbent's
+    /// edge can leave the attacker the sole surviving consent-revocation proxy,
+    /// or leave a node with no [`owner_of`] at all.
+    ///
+    /// Four legs: a foreign out-of-order `withdraws` does not sever; a foreign
+    /// `recants` does not sever; and the SUBJECT's own revocation still does —
+    /// the §3.2.3 rule-2 arm the fold exists to see, which a plain
+    /// same-attester comparison (what the two sibling folds do) would have
+    /// dropped.
+    pub(crate) async fn exercise_foreign_retraction_cannot_sever(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::identity_type;
+        let granter = format!("aw-granter-{suffix}");
+        let recipient = format!("aw-recipient-{suffix}");
+        let foreign = format!("aw-foreign-{suffix}");
+        // The recipient is an AGENT, not a NODE: CC 1.13.5 forbids a node-role
+        // delegate from carrying an agency scope, and `consent_revocation` is
+        // one — the scope whose severance is the escalation this witness is
+        // about.
+        register(dir, &granter, identity_type::USER).await;
+        register(dir, &recipient, identity_type::AGENT).await;
+        register(dir, &foreign, identity_type::AGENT).await;
+
+        let edge_id = format!("aw-edge-{suffix}");
+
+        // THE ATTACK, ordered so the retraction lands FIRST — the window
+        // `check_withdraws_admission` defers on.
+        let early_id = format!("aw-early-withdraws-{suffix}");
+        let mut early = federation_row(&early_id, &foreign, "aw:retract:v1");
+        early.attestation_type = attestation_type::WITHDRAWS.to_owned();
+        early.attested_key_id = recipient.clone();
+        early.attestation_envelope = serde_json::json!({
+            "dimension": "aw:retract:v1",
+            "references_attestation_id": edge_id.clone(),
+        });
+        seal_row_in_place(&foreign, &mut early);
+        dir.put_attestation(SignedAttestation { attestation: early })
+            .await
+            .expect("the write door still admits it — its authority is deferred, by design");
+        assert!(
+            dir.get_attestation(&early_id)
+                .await
+                .expect("read")
+                .expect("row")
+                .withdraws_admission_rule
+                .is_none(),
+            "the DEFERRED path is what this witness measures — if a rule was stamped the row took \
+             the resolved path and the witness proves nothing"
+        );
+
+        // NOW the edge arrives.
+        let mut edge = federation_row(&edge_id, &granter, "aw:edge:v1");
+        edge.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        edge.attested_key_id = recipient.clone();
+        // The recipient is a SUBJECT of the edge, which is what gives it §3.2.3
+        // rule-2 authority to revoke it — the control leg below.
+        edge.subject_key_ids = vec![recipient.clone()];
+        edge.attestation_envelope = serde_json::json!({
+            "scope": DELEGATION_SCOPE_CONSENT_REVOCATION,
+        });
+        seal_row_in_place(&granter, &mut edge);
+        dir.put_attestation(SignedAttestation { attestation: edge })
+            .await
+            .expect("the delegation edge lands");
+
+        let granters =
+            live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
+                .await
+                .expect("granters");
+        assert!(
+            granters.contains(&granter),
+            "FINDING 7 (#656): a foreign `withdraws` that arrived BEFORE its target must not \
+             sever the edge — authority is not a function of arrival order. Got {granters:?}"
+        );
+
+        // The `recants` variant needs no race at all.
+        let recants_id = format!("aw-recants-{suffix}");
+        let mut recants = federation_row(&recants_id, &foreign, "aw:retract:v1");
+        recants.attestation_type = attestation_type::RECANTS.to_owned();
+        recants.attested_key_id = recipient.clone();
+        recants.attestation_envelope = serde_json::json!({
+            "dimension": "aw:retract:v1",
+            "references_attestation_id": edge_id.clone(),
+        });
+        seal_row_in_place(&foreign, &mut recants);
+        dir.put_attestation(SignedAttestation {
+            attestation: recants,
+        })
+        .await
+        .expect("no `check_recants_admission` exists, so the write door admits it");
+        let granters =
+            live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
+                .await
+                .expect("granters");
+        assert!(
+            granters.contains(&granter),
+            "FINDING 7 (#656): a foreign `recants` reaches the same fold and needs no race — it \
+             must not sever the edge either. Got {granters:?}"
+        );
+
+        // CONTROL — the SUBJECT's own revocation still severs it.
+        let subject_id = format!("aw-subject-withdraws-{suffix}");
+        let mut subject_rev = federation_row(&subject_id, &recipient, "aw:retract:v1");
+        subject_rev.attestation_type = attestation_type::WITHDRAWS.to_owned();
+        subject_rev.attested_key_id = recipient.clone();
+        subject_rev.attestation_envelope = serde_json::json!({
+            "dimension": "aw:retract:v1",
+            "references_attestation_id": edge_id.clone(),
+        });
+        seal_row_in_place(&recipient, &mut subject_rev);
+        dir.put_attestation(SignedAttestation {
+            attestation: subject_rev,
+        })
+        .await
+        .expect("the subject's own revocation is admitted");
+        let granters =
+            live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
+                .await
+                .expect("granters");
+        assert!(
+            !granters.contains(&granter),
+            "the SUBJECT's own revocation must still sever the edge — otherwise the fix traded an \
+             authority BYPASS for an authority FREEZE. Got {granters:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FINDING 4 — supersede_canonical_record BACKEND PARITY
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **A canonical rotation cannot launder a role. On BOTH SQL backends.**
+    ///
+    /// v22.0.0 (CIRISPersist#543 H2) put four gates in front of
+    /// `supersede_canonical_record` — the `accord_holder` hardware-attestation
+    /// policy plus [`check_infra_attest_role_admission`],
+    /// [`check_co_steward_role_admission`] and
+    /// [`check_privileged_identity_type_admission`] — with a comment naming the
+    /// threat exactly: *"an already-canonical key could rotate in a successor
+    /// claiming `infra:attest` / co-steward / any privileged type without their
+    /// own conferral. Rotation must not be a role-laundering path."*
+    ///
+    /// **It landed on SQLite only.** Postgres went straight to
+    /// `verify_canonical_supersede`, which tests `identity_type` for MEMBERSHIP
+    /// of `canonical` and says nothing about any other token in that set or
+    /// about `capability_roles` at all — and the pg UPDATE then wrote `roles`
+    /// and `identity_type` verbatim. So on the backend PRODUCTION RUNS, a
+    /// canonical key with a valid m-of-n re-scrub could rotate in a successor
+    /// carrying `infra:attest`, the build-manifest signing root (#422).
+    /// Postgres's own caller comment said *"Backend-symmetric with SQLite"*.
+    /// The symmetry is now a TESTED property, because a comment about two files
+    /// decays whenever either moves — which is exactly what happened.
+    ///
+    /// # What this returns, and why the legs finish the assertion
+    ///
+    /// `supersede_canonical_record` is an INHERENT method on each SQL backend,
+    /// not a [`FederationDirectory`] method, so the shared body cannot call it.
+    /// It seeds the fixture and hands back the successor records; each leg
+    /// makes its own call and passes the outcome to
+    /// [`assert_role_launder_refused`].
+    ///
+    /// # Why the refusal is asserted by KIND
+    ///
+    /// The real accord ceremony's private halves are not in-tree, so no fixture
+    /// can mint a genuinely conferred `canonical`. That is fine, because the
+    /// two code paths refuse for DIFFERENT, typed reasons and the kind token is
+    /// what discriminates them:
+    ///
+    /// - **with the gates** the role check fires first and refuses
+    ///   `federation_infra_attest_role_not_accord_conferred` — *this successor
+    ///   did not earn `infra:attest`*;
+    /// - **without them** control reaches `verify_canonical_supersede`, which
+    ///   refuses `federation_conflict` — *this successor is not a valid
+    ///   canonical supersede*, a statement about the ROTATION and not about the
+    ///   role.
+    ///
+    /// A witness that only asserted "it errored" would have been green on the
+    /// vulnerable postgres build. Asserting the kind is what makes it a witness
+    /// rather than a report.
+    pub(crate) async fn seed_canonical_supersede_fixture(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) -> (crate::federation::KeyRecord, crate::federation::KeyRecord) {
+        use crate::federation::types::{identity_type, roles};
+        let key_id = format!("aw-canon-{suffix}");
+        let scrubber = format!("aw-canon-scrub-{suffix}");
+        register(dir, &scrubber, identity_type::NODE).await;
+
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(&key_id);
+        let base = |vf: &str, ty: &str| {
+            let when: chrono::DateTime<Utc> = vf.parse().expect("fixture instant");
+            crate::federation::KeyRecord {
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: ed_pk.clone(),
+                pubkey_ml_dsa_65_base64: mldsa_pk.clone(),
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: ty.to_owned(),
+                identity_ref: key_id.clone(),
+                valid_from: when,
+                valid_until: None,
+                // `supersede_precheck` reads `valid_from` out of the SIGNED
+                // envelope, so the monotonicity it enforces lives here.
+                registration_envelope: serde_json::json!({
+                    "key_id": key_id, "valid_from": vf,
+                }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                // NOT self-signed: `supersede_canonical_record` refuses a
+                // self-signed incumbent outright (that shape belongs to
+                // `adopt_scrub_upgrade`).
+                scrub_key_id: scrubber.clone(),
+                scrub_timestamp: when,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            }
+        };
+
+        // The INCUMBENT the successor will rotate over.
+        dir.put_public_key(SignedKeyRecord {
+            record: base("2026-01-01T00:00:00Z", identity_type::NODE),
+        })
+        .await
+        .expect("the incumbent registers");
+
+        // THE ATTACK: same key, same pubkeys, strictly-newer `valid_from`,
+        // anchor-scrubbed — everything `verify_canonical_supersede` looks at —
+        // and it quietly adds `infra:attest`, the build-manifest signing root.
+        let mut laundering = base(
+            "2026-06-01T00:00:00Z",
+            &format!("{},{}", identity_type::CANONICAL, identity_type::NODE),
+        );
+        laundering.capability_roles = vec![roles::INFRA_ATTEST.to_owned()];
+
+        // The same rotation claiming NOTHING extra — the control that the gates
+        // discriminate on the ROLE rather than refusing every rotation.
+        let clean = base(
+            "2026-06-01T00:00:00Z",
+            &format!("{},{}", identity_type::CANONICAL, identity_type::NODE),
+        );
+        (laundering, clean)
+    }
+
+    /// The assertion half of [`seed_canonical_supersede_fixture`] — see its doc
+    /// for why the refusal is discriminated by KIND and not merely by being an
+    /// error.
+    pub(crate) fn assert_role_launder_refused(
+        backend: &str,
+        laundering: Result<(), crate::federation::Error>,
+        clean: Result<(), crate::federation::Error>,
+    ) {
+        let err = laundering.expect_err(
+            "a canonical rotation that adds `infra:attest` must be REFUSED (#656/#543 H2)",
+        );
+        // WHICH gate refused is the whole assertion, and it reads two ways
+        // depending on whether this node holds an accord roster:
+        //
+        // - with a roster, the gate tallies the quorum and refuses
+        //   `federation_infra_attest_role_not_accord_conferred`;
+        // - without one (a bare test directory), every root-requiring gate
+        //   fast-fails `federation_no_constitutional_root_yet` — and that
+        //   message NAMES its operation, so `infra_attest_role_admission`
+        //   appearing in it is proof the role gate ran.
+        //
+        // A witness that only asserted "it errored" would have been GREEN on
+        // the vulnerable postgres build, which refused the very same record —
+        // with the very same KIND — from `verify_canonical_supersede`'s own
+        // canonical check, naming `canonical_role_admission` instead.
+        // Discriminating on WHICH gate spoke is what makes this a witness
+        // rather than a report.
+        let kind = err.kind();
+        let msg = err.to_string();
+        let from_the_role_gate = kind == "federation_infra_attest_role_not_accord_conferred"
+            || (kind == "federation_no_constitutional_root_yet"
+                && msg.contains("infra_attest_role_admission"));
+        assert!(
+            from_the_role_gate,
+            "({backend}) the refusal must come from the `infra:attest` ROLE gate, not from the \
+             supersede policy — a refusal naming `canonical_role_admission` means control reached \
+             `verify_canonical_supersede` and the four #543 H2 gates never ran here. \
+             kind={kind}: {msg}"
+        );
+        // CONTROL: the identical rotation WITHOUT the role claim gets past the
+        // role gates and is judged on the rotation itself. If this also
+        // reported the role refusal, the gate would be refusing unconditionally
+        // and the assertion above would prove nothing.
+        if let Err(e) = clean {
+            assert!(
+                !e.to_string().contains("infra_attest_role_admission")
+                    && e.kind() != "federation_infra_attest_role_not_accord_conferred",
+                "({backend}) a rotation claiming NO extra role must not be refused BY the role \
+                 gate — that would make the assertion above vacuous: {e}"
             );
         }
     }

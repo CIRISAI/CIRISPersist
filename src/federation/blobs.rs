@@ -1872,6 +1872,238 @@ pub fn holds_bytes_attestation_row(
     row
 }
 
+/// v31.0.0 (CIRISPersist#656) — **the `put_blob` door's admission gate**, run
+/// by both backends on the row [`holds_bytes_attestation_row`] just rebuilt,
+/// before anything is written.
+///
+/// # What #652 left open
+///
+/// #652 fixed the row SHAPE — the builder above stamps the #598 instants and
+/// the #643 mirror — but it wired no GATES. That was enough for the two
+/// bindings, which hold by construction, and not enough for anything else,
+/// because **the skew arm of [`check_instant_binding`] is not a binding
+/// property**. It compares `asserted_at` against wall-clock `now`, and
+/// [`PutBlobAttestation::asserted_at`] is caller-supplied and unbounded — so
+/// this door minted a FEDERATION-tier row (served and replicated; see the
+/// builder's `tier` note) whose consent-fold ordering key sat arbitrarily far
+/// in the future. Construction cannot satisfy a bound it does not know about,
+/// which is the general reason a deterministic builder is not a substitute for
+/// a gate.
+///
+/// Two arms:
+///
+/// 1. **[`check_instant_binding`]**, the same call every other door makes,
+///    which is where the skew bound lives.
+/// 2. **THE CALLER'S HASH MUST COVER THE BYTES PERSIST REBUILT.** The door
+///    writes the caller's `original_content_hash` and `scrub_signature_*` over
+///    an envelope it reconstructed itself, and nothing checked that the two
+///    describe the same thing. The reconstruction being deterministic is
+///    exactly what makes the cross-check possible — it is the property
+///    [`holds_bytes_attestation_row`]'s doc rests its *"the party that MINTS
+///    the bytes stamps, the party that RECEIVES them checks"* claim on — so it
+///    is used here rather than assumed. A signature over a different envelope
+///    than the one stored is the #649 divergence with the halves swapped.
+///
+/// `now` is a parameter so the skew bound is testable without sleeping.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn check_put_blob_admission(
+    row: &crate::federation::Attestation,
+    declared_content_hash_hex: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), BlobError> {
+    use sha2::{Digest, Sha256};
+
+    crate::federation::admission::check_instant_binding(
+        row,
+        now,
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )
+    .map_err(|e| BlobError::InvalidArgument(format!("holder attestation: {e}")))?;
+
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+        .map_err(|e| {
+        BlobError::Backend(format!(
+            "holder attestation canonicalize: {e} (CIRISPersist#656)"
+        ))
+    })?;
+    let rebuilt = hex::encode(Sha256::digest(&canonical));
+    if rebuilt != declared_content_hash_hex {
+        return Err(BlobError::InvalidArgument(format!(
+            "holder attestation {}: the declared original_content_hash {declared_content_hash_hex} \
+             does not cover the envelope persist stores — these bytes canonicalize to {rebuilt}. \
+             `put_blob` REBUILDS the holder envelope rather than storing the caller's, so a \
+             signature made over anything else covers an envelope that does not exist \
+             (CIRISPersist#656/#652)",
+            row.attestation_id,
+        )));
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#656) — **a `PutBlobAttestation` whose declared
+/// content hash actually covers the envelope `put_blob` will rebuild.**
+///
+/// Every backend's blob fixtures used to hard-code `original_content_hash_hex`
+/// to a placeholder (`"abcdef01"` / `"deadbeef"` — four bytes, where the column
+/// is a 32-byte digest). That is what let the missing
+/// [`check_put_blob_admission`] cross-check go unnoticed for a whole release:
+/// the fixtures asserted the door's behaviour on rows whose declared hash
+/// covered nothing, so no test could tell a correct hash from an absent one.
+/// This mints the hash the way [`BlobStorage::put_blob_signing`] does — from
+/// [`holds_bytes_attestation_envelope`] over the same four inputs — so the
+/// fixtures now exercise the shape production actually produces.
+///
+/// The signature stays a placeholder: `put_blob` does not verify signatures
+/// (see [`check_put_blob_admission`] for what it does check), and pretending
+/// otherwise in a fixture would be the same defect one field over.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn sealed_put_blob_attestation(
+    sha256: &[u8; 32],
+    attesting_key_id: &str,
+    scrub_key_id: &str,
+    attestation_id: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    scrub_timestamp: chrono::DateTime<chrono::Utc>,
+) -> PutBlobAttestation {
+    use sha2::{Digest, Sha256};
+    let envelope =
+        holds_bytes_attestation_envelope(sha256, attesting_key_id, attestation_id, asserted_at);
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+        .expect("the holds_bytes envelope canonicalizes");
+    PutBlobAttestation {
+        attesting_key_id: attesting_key_id.to_owned(),
+        attestation_id: attestation_id.to_owned(),
+        original_content_hash_hex: hex::encode(Sha256::digest(&canonical)),
+        scrub_signature_classical: "c2ln".to_owned(),
+        scrub_signature_pqc: None,
+        scrub_key_id: scrub_key_id.to_owned(),
+        scrub_timestamp,
+        asserted_at,
+    }
+}
+
+/// v31.0.0 (CIRISPersist#656) — **the `put_blob` admission witness**, shared by
+/// the sqlite and postgres legs.
+///
+/// **Two backends, not three: `MemoryBackend` implements no [`BlobStorage`],**
+/// so there is no memory door to gate. Recorded here rather than left as a
+/// silently-absent leg — "the third leg is missing" and "the third door does
+/// not exist" look identical from a test list.
+///
+/// #652 fixed the row SHAPE through one deterministic builder and wired no
+/// gates. Two things do not follow from construction, and both are asserted:
+///
+/// 1. **the future-skew bound**, which is not a binding property — it compares
+///    `asserted_at` against wall-clock `now`, and that field is caller-supplied
+///    and was unbounded, so this door minted a FEDERATION-tier row (served and
+///    replicated) whose consent-fold ordering key sat a year in the future.
+///    Exactly the claim CIRISPersist#598 exists to make false: *"a lying clock
+///    cannot mint a row no later row can out-sort."*
+/// 2. **the caller's `original_content_hash` covering the bytes persist
+///    rebuilt.** The door writes the caller's hash and signature over an
+///    envelope it reconstructs itself; nothing checked the two described the
+///    same thing.
+///
+/// Plus the control that an honest holder claim still lands — including one
+/// asserted in the PAST, which is the case #652 added the field for (*"a holder
+/// announcing bytes it has held for a week is making a claim about the week"*).
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn exercise_put_blob_admission<B>(backend: &B, suffix: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    exercise_put_blob_admission_for_host(backend, "host-a", suffix).await;
+}
+
+/// [`exercise_put_blob_admission`] against an explicit, already-registered
+/// `attesting_key_id` — the postgres leg bootstraps a per-run host so a shared
+/// test DB does not collide.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn exercise_put_blob_admission_for_host<B>(backend: &B, host: &str, suffix: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    use sha2::{Digest, Sha256};
+    let digest = |bytes: &[u8]| -> [u8; 32] { Sha256::digest(bytes).into() };
+
+    // ── (1) AN UNBOUNDED-FUTURE HOLDER CLAIM IS REFUSED.
+    let bytes = format!("skewed holder claim {suffix}").into_bytes();
+    let sha = digest(&bytes);
+    let far_future = crate::federation::admission::truncate_to_substrate_resolution(
+        chrono::Utc::now() + chrono::Duration::days(365),
+    );
+    let skew_id = format!("blob-skew-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &skew_id, far_future, far_future);
+    let err = backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+        .await
+        .expect_err("put_blob must apply the future-skew bound (#656)");
+    assert!(
+        err.to_string().contains("ahead of now"),
+        "the refusal is the SKEW arm specifically, not a binding arm: {err}"
+    );
+    assert!(
+        crate::federation::FederationDirectory::get_attestation(backend, &skew_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "verify-before-mutation: the refused holder claim wrote no attestation row"
+    );
+
+    // ── (2) A HASH THAT DOES NOT COVER THE REBUILT ENVELOPE IS REFUSED.
+    let liar_id = format!("blob-liar-{suffix}");
+    let now = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    let mut lying = sealed_put_blob_attestation(&sha, host, host, &liar_id, now, now);
+    lying.original_content_hash_hex = "00".repeat(32);
+    let err = backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, lying)
+        .await
+        .expect_err("put_blob must cross-check the declared hash against the rebuilt bytes (#656)");
+    assert!(
+        err.to_string().contains("original_content_hash"),
+        "the refusal names the field that does not cover the stored bytes: {err}"
+    );
+
+    // ── (3) CONTROL — an honest claim lands, and so does an honest one about
+    //        the PAST, which is the case `asserted_at` was added for.
+    let ok_id = format!("blob-ok-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &ok_id, now, now);
+    backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+        .await
+        .expect("an honest holder claim still lands — legs 1 and 2 gate the door, not close it");
+
+    let week_ago = crate::federation::admission::truncate_to_substrate_resolution(
+        chrono::Utc::now() - chrono::Duration::days(7),
+    );
+    let past_id = format!("blob-past-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &past_id, week_ago, now);
+    backend
+        .put_blob(&sha, BlobBody::Inline(bytes), None, att)
+        .await
+        .expect(
+            "a holder announcing bytes it has held for a week is making a claim about the week",
+        );
+    let row = crate::federation::FederationDirectory::get_attestation(backend, &past_id)
+        .await
+        .expect("read")
+        .expect("the past-dated holder attestation was written");
+    assert_eq!(row.asserted_at, week_ago, "the past instant is preserved");
+    assert_eq!(
+        row.tier,
+        crate::federation::types::attestation_tier::FEDERATION,
+        "and it is federation-tier, i.e. served and replicated — which is why the gate matters"
+    );
+    crate::federation::admission::check_instant_binding(
+        &row,
+        chrono::Utc::now(),
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )
+    .expect("the stored row satisfies the gate the door now runs");
+    crate::federation::admission::check_row_column_binding(&row)
+        .expect("and the #643 mirror #652 stamps");
+}
+
 /// v3.5.0 (CIRISPersist#125) — extract the canonical
 /// withdraws-emission triple (build envelope → canonicalize via
 /// production canonicalizer → sign → put_attestation) into a single

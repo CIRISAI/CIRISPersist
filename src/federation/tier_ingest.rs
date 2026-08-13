@@ -675,6 +675,91 @@ pub(crate) mod test_support {
         )
     }
 
+    /// v31.0.0 (CIRISPersist#656) — **a subject-side transit revocation whose
+    /// signed envelope BINDS the row it will be stored as.**
+    ///
+    /// The §10.1.3 transit door is the one write path where persist is the
+    /// RECEIVER of bytes it did not mint, so
+    /// [`RowMirror::stamp_local_row`](crate::federation::envelope::RowMirror::stamp_local_row)
+    /// declines to stamp and CHECKS instead. That makes the mirror the
+    /// producer's to bind — which in turn means the producer must choose the
+    /// `attestation_id` (it is one of the seven bound members), rather than
+    /// letting persist mint a fresh v4. Every fixture that used to pass
+    /// `attestation_id: None` and an unbound envelope was producing a row this
+    /// substrate's own `put_attestation` refuses; this is the shape a real
+    /// subject must send.
+    ///
+    /// The mirror is built through
+    /// [`RowMirror::of`](crate::federation::envelope::RowMirror::of) over the
+    /// row the input will become, so there is no second spelling of the
+    /// projection here either.
+    pub fn bound_transit_revocation_input(
+        attestation_id: &str,
+        subject: &str,
+        target: &str,
+        subject_key_ids: Vec<String>,
+        cohort_scope: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        extra: serde_json::Value,
+    ) -> crate::federation::types::LocalAttestationInput {
+        use crate::federation::types::{attestation_type, LocalAttestationInput};
+        let asserted = crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        let mut envelope = serde_json::json!({
+            "dimension": "consent:state:revoked:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
+        });
+        if let (Some(obj), Some(more)) = (envelope.as_object_mut(), extra.as_object()) {
+            for (k, v) in more {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        // THE MIRROR, from the row this input becomes
+        // (`LocalAttestationInput::into_transit_revocation_row`).
+        let mut as_stored = crate::federation::types::Attestation {
+            attestation_id: attestation_id.to_owned(),
+            attesting_key_id: subject.to_owned(),
+            attested_key_id: target.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: asserted,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: subject.to_owned(),
+            scrub_timestamp: asserted,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subject_key_ids.clone(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope.to_owned(),
+            tier: crate::federation::types::attestation_tier::LOCAL.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::envelope::RowMirror::stamp_row(&mut as_stored)
+            .expect("the fixture row carries no weight, so the mirror cannot fail");
+        let envelope = as_stored.attestation_envelope;
+        let (_hash, sig_classical, sig_pqc) = sign_envelope(subject, &envelope);
+        LocalAttestationInput {
+            attestation_id: Some(attestation_id.to_owned()),
+            attesting_key_id: subject.to_owned(),
+            attested_key_id: Some(target.to_owned()),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("the fixture envelope is an object"),
+            subject_key_ids,
+            cohort_scope: cohort_scope.to_owned(),
+            scrub_signature_classical: Some(sig_classical),
+            scrub_signature_pqc: sig_pqc,
+        }
+    }
+
     /// v31.0.0 (CIRISPersist#643) — **stamp the typed-column mirror into a
     /// hand-built row's envelope, then hybrid-sign it.**
     ///

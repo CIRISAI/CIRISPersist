@@ -3099,7 +3099,26 @@ impl PostgresBackend {
         // so it is a second path a `canonical` role could otherwise enter on.
         // Re-run the accord-conferred gate: `canonical` is admitted here only
         // if THIS incoming (anchor-scrubbed) record earned it via a real
-        // accord-holder scrubber. Backend-symmetric with SQLite.
+        // accord-holder scrubber.
+        //
+        // v22.0.0 (CIRISPersist#543 H2) — the HARDWARE gate belongs here too:
+        // `adopt_scrub_upgrade` CAN change `identity_type`, so it is a second
+        // path an `accord_holder` claim can enter on, and it ran every role
+        // gate EXCEPT the hardware-attestation check `put_public_key` applies.
+        // v31.0.0 (CIRISPersist#656) — and it landed on SQLite only. The
+        // comment that used to close this paragraph read "Backend-symmetric
+        // with SQLite", which was true when written at v13.0.0 and false from
+        // v22.0.0 onward: the SQLite twin gained a gate this copy never did. A
+        // symmetry claim is a claim about two files and decays whenever either
+        // moves, so it is now a tested property (the #656 three-backend
+        // witness) rather than a comment.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
+            self.hardware_attestation_policy().check(
+                &row.key_id,
+                row.attestation_evidence.as_ref(),
+                chrono::Utc::now(),
+            )?;
+        }
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
@@ -3276,6 +3295,36 @@ impl PostgresBackend {
 
         // Re-verify the full supersede policy at the mutation chokepoint
         // (defense in depth — never trust the plan alone on the Trust Root).
+        // v22.0.0 (CIRISPersist#543 H2) — RUN THE ROLE GATES HERE TOO.
+        // `supersede_canonical_record` writes BOTH `identity_type` AND `roles`
+        // on the successor row, behind only `verify_canonical_supersede`. That
+        // verify proves the SUPERSEDE is authorized by the incumbent — it does
+        // NOT prove the successor earned the roles it carries, so an
+        // already-canonical key could rotate in a successor claiming
+        // `infra:attest` / co-steward / any privileged type without their own
+        // conferral. Rotation must not be a role-laundering path: a successor
+        // earns each privileged claim the same way a fresh registration does.
+        //
+        // v31.0.0 (CIRISPersist#656) — **#543 H2 landed on ONE backend.** These
+        // four gates were written into the SQLite twin in v22.0.0 and never
+        // ported here, while the UPDATE below writes `identity_type` and
+        // `roles` verbatim from the caller's record — and production is
+        // postgres. `verify_canonical_supersede` only tests `identity_type` for
+        // MEMBERSHIP of `canonical`, so every other token in it, and the whole
+        // `capability_roles` vector, travelled unexamined. Recurrence eight-plus
+        // of the parity class this substrate keeps re-learning; the difference
+        // this time is that the witness runs on all three backends.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
+            self.hardware_attestation_policy().check(
+                &row.key_id,
+                row.attestation_evidence.as_ref(),
+                chrono::Utc::now(),
+            )?;
+        }
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
+
         if !crate::federation::register::verify_canonical_supersede(self, &existing, &row).await? {
             return Err(crate::federation::Error::Conflict(format!(
                 "supersede_canonical_record {}: supersede policy refused",
@@ -5115,6 +5164,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             resealed,
             chrono::Utc::now(),
         )?;
+        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
+        // gate above does not pin. This door was the only write door into
+        // `federation_attestations` with no signature gate at all. One gate,
+        // three backends.
+        crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed).await?;
 
         let mut row = stored.clone();
         row.attestation_envelope = resealed.attestation_envelope.clone();
@@ -10423,6 +10477,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ));
         }
 
+        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
+        // PATH. This door writes a caller-supplied `identity_type` and ran no
+        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
+        // `is_canonical_effective` answer true for an attacker-named key.
+        // BEFORE any lock or DB work: the gates read the directory, which locks
+        // itself. One gate, three backends.
+        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
+            .await?;
+
         // Build the federation_keys row + its persist_row_hash up
         // front (same shape as put_public_key but without the
         // SignedKeyRecord scrub envelope — peer-add is operator-
@@ -11190,6 +11253,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         attestation_row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
         attestation_row.scrub_key_id = attestation.scrub_key_id.clone();
         attestation_row.scrub_timestamp = attestation.scrub_timestamp;
+        // v31.0.0 (CIRISPersist#656) — THE GATES #652 did not wire. The
+        // bindings hold by construction; the future-skew bound and "the
+        // caller's hash covers the bytes we rebuilt" do not. Both backends,
+        // one helper.
+        crate::federation::blobs::check_put_blob_admission(
+            &attestation_row,
+            &attestation.original_content_hash_hex,
+            chrono::Utc::now(),
+        )?;
         // v31.0.0 (#644) — attestation_envelope is TEXT since V122. (Name kept
         // at the bind site below; the container is what changed.)
         let attestation_envelope_jsonb =
@@ -22033,7 +22105,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_consent_revocation_transit_admits_and_sla_fires_end_to_end() {
-        use crate::federation::tier_ingest::test_support::sign_envelope;
         use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use crate::federation::FederationDirectory;
         use std::time::Duration;
@@ -22060,32 +22131,22 @@ mod tests {
         // v31.0.0 (CIRISPersist#598) — a `consent:state:*` row states its own
         // instant in the SIGNED envelope; the local write door stamps the
         // column FROM it (`admission::local_row_instant`).
-        let env = serde_json::json!({
-            "id": format!("rev-{suffix}"), "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
-
+        // v31.0.0 (CIRISPersist#656) — and it states the typed-column MIRROR in
+        // those same signed bytes. The transit door RECEIVES bytes it did not
+        // mint, so it checks the mirror rather than stamping one; the producer
+        // therefore also states the `attestation_id` it bound.
         backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: subject.clone(),
-                attested_key_id: Some(target.clone()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    env.clone(),
-                )
-                .unwrap(),
-                subject_key_ids: vec![subject.clone()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    &format!("rev-{suffix}"),
+                    &subject,
+                    &target,
+                    vec![subject.clone()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": format!("rev-{suffix}") }),
+                ),
+            )
             .await
             .expect("crypto-valid subject-side revocation transits the local tier");
 
@@ -22189,7 +22250,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn pg_consent_promotion_overdue_reader() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::types::attestation_tier;
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let Some(dsn) = pg_dsn() else {
@@ -22211,31 +22272,21 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // v31.0.0 (CIRISPersist#598) — see the twin above.
-        let env = serde_json::json!({
-            "id": format!("rev-r-{suffix}"), "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
-        });
-        let (_hash, sig_classical, sig_pqc) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
+        // v31.0.0 (CIRISPersist#598/#656) — see the twin above: the producer
+        // binds both the signed instant and the typed-column mirror, and
+        // therefore states the `attestation_id` it bound.
         let att_id = backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: subject.clone(),
-                attested_key_id: Some(target.clone()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
-                    .unwrap(),
-                subject_key_ids: vec![subject.clone()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    &format!("rev-r-{suffix}"),
+                    &subject,
+                    &target,
+                    vec![subject.clone()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": format!("rev-r-{suffix}") }),
+                ),
+            )
             .await
             .expect("transit local-tier revocation admits");
         let revoked_at = backend
@@ -28218,20 +28269,25 @@ mod tests {
         ciris_verify_core::fedcode::derive_key_id(alias, &ed_pk)
     }
 
+    // v31.0.0 (CIRISPersist#656) — takes the SHA now, because the declared
+    // `original_content_hash` must cover the envelope `put_blob` rebuilds, and
+    // that envelope is keyed on the SHA. It used to be `"deadbeef"` — four
+    // bytes, in a column that holds a 32-byte digest, which is how a whole
+    // release of blob tests could pass without the cross-check existing.
     fn pg_blob_attestation(
+        sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
     ) -> crate::federation::PutBlobAttestation {
-        crate::federation::PutBlobAttestation {
-            attesting_key_id: attesting_key_id.into(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: "deadbeef".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        }
+        let now = chrono::Utc::now();
+        crate::federation::blobs::sealed_put_blob_attestation(
+            sha256,
+            attesting_key_id,
+            scrub_key_id,
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        )
     }
 
     #[tokio::test]
@@ -28253,7 +28309,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 Some("application/octet-stream"),
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .expect("put inline");
@@ -28322,7 +28378,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -28350,7 +28406,7 @@ mod tests {
                 &wrong,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&wrong, &host, &host),
             )
             .await
             .expect_err("must reject");
@@ -28377,7 +28433,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .expect_err("must reject");
@@ -28410,7 +28466,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -28438,7 +28494,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a),
             )
             .await
             .unwrap();
@@ -28447,7 +28503,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b),
             )
             .await
             .unwrap();
@@ -28477,7 +28533,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -28486,7 +28542,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -28515,7 +28571,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a),
             )
             .await
             .unwrap();
@@ -28528,7 +28584,7 @@ mod tests {
                     media_type: None,
                 }),
                 None,
-                pg_blob_attestation(&host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b),
             )
             .await
             .unwrap();
@@ -31201,22 +31257,21 @@ mod tests {
     //     24-hour TTL + ContentMiss feedback (postgres backend).
 
     fn pg_blob_attestation_at(
+        sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> crate::federation::PutBlobAttestation {
-        crate::federation::PutBlobAttestation {
-            attesting_key_id: attesting_key_id.into(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: "deadbeef".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: scrub_key_id.into(),
-            scrub_timestamp,
+        crate::federation::blobs::sealed_put_blob_attestation(
+            sha256,
+            attesting_key_id,
+            scrub_key_id,
+            &uuid::Uuid::new_v4().to_string(),
             // This fixture's whole subject is the holder's INSTANT (it drives
             // the TTL arms), and as of #652 that is `asserted_at`.
-            asserted_at: scrub_timestamp,
-        }
+            scrub_timestamp,
+            scrub_timestamp,
+        )
     }
 
     // ── v3.5.2 (CIRISPersist#130) — list_local_holders PG parity ─
@@ -31244,7 +31299,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation_at(&host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated),
             )
             .await
             .unwrap();
@@ -31297,7 +31352,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation_at(&host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated),
             )
             .await
             .unwrap();
@@ -31329,7 +31384,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation_at(&host, &host, fresh),
+                pg_blob_attestation_at(&sha, &host, &host, fresh),
             )
             .await
             .unwrap();
@@ -31352,6 +31407,7 @@ mod tests {
         let bytes = pg_blob_payload("content-miss");
         let sha = pg_sha256_of(&bytes);
         let holds_bytes_attestation = pg_blob_attestation_at(
+            &sha,
             &host,
             &host,
             chrono::Utc::now() - chrono::Duration::hours(1),
@@ -31467,16 +31523,15 @@ mod tests {
             Sha256::digest(&schema_bytes).into()
         };
         use crate::federation::BlobStorage;
-        let put_att = crate::federation::PutBlobAttestation {
-            attesting_key_id: steward.clone(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: hex::encode([0xab; 32]),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: steward.clone(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        };
+        let now = chrono::Utc::now();
+        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+            &schema_sha,
+            &steward,
+            &steward,
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        );
         backend
             .put_blob(
                 &schema_sha,
@@ -31561,16 +31616,15 @@ mod tests {
             Sha256::digest(&schema_bytes).into()
         };
         use crate::federation::BlobStorage;
-        let put_att = crate::federation::PutBlobAttestation {
-            attesting_key_id: steward.clone(),
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            original_content_hash_hex: hex::encode([0xab; 32]),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: steward.clone(),
-            scrub_timestamp: chrono::Utc::now(),
-            asserted_at: chrono::Utc::now(),
-        };
+        let now = chrono::Utc::now();
+        let put_att = crate::federation::blobs::sealed_put_blob_attestation(
+            &schema_sha,
+            &steward,
+            &steward,
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+            now,
+        );
         backend
             .put_blob(
                 &schema_sha,
@@ -33612,7 +33666,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(huge),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .expect_err("trust beats size");
@@ -33644,7 +33698,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -33690,7 +33744,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -33731,7 +33785,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -33764,7 +33818,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -33813,7 +33867,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&host, &host),
+                pg_blob_attestation(&sha, &host, &host),
             )
             .await
             .unwrap();
@@ -34586,7 +34640,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    pg_blob_attestation(&host, &host),
+                    pg_blob_attestation(&sha, &host, &host),
                 )
                 .await
                 .unwrap();
@@ -39081,6 +39135,141 @@ mod tests {
              the hash. SQLite stores all of these as TEXT; a JSONB column here is a backend \
              divergence in the bytes we re-publish:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, POSTGRES legs.
+    //
+    // **Production is postgres.** Two of these findings existed ONLY here
+    // (`supersede_canonical_record`'s four missing role gates and
+    // `adopt_scrub_upgrade`'s missing hardware gate), so this is the leg that
+    // was failing before the fix.
+
+    /// The POSTGRES leg of the SEVENTH-SITE witness: the transit branch of the
+    /// local write door CHECKS the typed-column mirror it deliberately does not
+    /// stamp.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_mirror_binding_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
+            &backend,
+            &format!("pg656{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// The POSTGRES leg of the RE-SEAL witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reseal_seal_gate_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
+            &backend,
+            &format!("pg656{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// The POSTGRES leg of the PEER-RECORD witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_record_role_gate_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
+            &backend,
+            &format!("pg656{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// The POSTGRES leg of the FOREIGN-RETRACTION witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn foreign_retraction_cannot_sever_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
+            &backend,
+            &format!("pg656{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// The POSTGRES leg of the `put_blob` witness. **Two backends, not three:**
+    /// `MemoryBackend` implements no `BlobStorage`, so there is no memory door
+    /// to gate — see the shared body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_blob_admission_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let host = format!("pgblob656-{}", uuid_like());
+        pg_blob_bootstrap_host(&backend, &host).await;
+        crate::federation::blobs::exercise_put_blob_admission_for_host(
+            &backend,
+            &host,
+            &format!("pg656{}", uuid_like()),
+        )
+        .await;
+    }
+
+    /// The POSTGRES leg of the CANONICAL-SUPERSEDE role-gate witness — **the
+    /// leg that was RED before this cut**, on the backend production runs.
+    ///
+    /// Verified against a real cluster before the fix was written: with the
+    /// four #543 H2 gates removed, this refused with
+    /// `federation_no_constitutional_root_yet` — the verdict of
+    /// `verify_canonical_supersede`'s own canonical check — proving control
+    /// reached the supersede policy and the role gates never ran here.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn canonical_supersede_role_gate_parity_postgres_656() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = format!("pg656{}", uuid_like());
+        let (laundering, clean) =
+            crate::federation::admission::ungated_doors_test_support::seed_canonical_supersede_fixture(
+                &backend, &suffix,
+            )
+            .await;
+        let a = backend
+            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: laundering })
+            .await
+            .map(|_| ());
+        let b = backend
+            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: clean })
+            .await
+            .map(|_| ());
+        crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
+            "postgres", a, b,
         );
     }
 }
