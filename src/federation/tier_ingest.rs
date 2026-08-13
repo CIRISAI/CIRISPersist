@@ -1105,6 +1105,17 @@ pub(crate) mod test_support {
     /// `nonce` is folded into the signed envelope, so two records for the
     /// same `key_id` with different nonces are distinct-but-valid versions
     /// (drives the conflicting-second-version / duplicity rows).
+    ///
+    /// # v31.0.0 (CIRISPersist#659) — the subject is BOUND
+    ///
+    /// The envelope is stamped with `key_id` and BOTH of the subject's pubkeys
+    /// through the one shared
+    /// [`crate::federation::admission::bind_subject_into_envelope`] before it is
+    /// canonicalized and signed, so every record this helper builds satisfies
+    /// `verify_key_registration`'s subject-binding gate by construction. This
+    /// is a **preimage change** — the signed bytes differ from pre-#659 — but
+    /// not a signature change: the subject's pubkeys are already derived here
+    /// from `key_id`, so no call site moves.
     pub fn replicated_key_record(
         key_id: &str,
         identity_type: &str,
@@ -1113,11 +1124,18 @@ pub(crate) mod test_support {
         nonce: &str,
     ) -> crate::federation::KeyRecord {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "key_id": key_id,
             "purpose": "federation-peering",
             "nonce": nonce,
         });
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut envelope,
+            key_id,
+            &ed_pk,
+            mldsa_pk.as_deref(),
+        )
+        .expect("bind the #659 subject into the registration envelope");
         let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);
         let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
         crate::federation::KeyRecord {
