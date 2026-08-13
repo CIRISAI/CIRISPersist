@@ -233,6 +233,22 @@ where
 /// `{revoked_key_id: victim, revoking_key_id: any-existing}` for a targeted
 /// de-peer / trust DoS. Now the revocation must be signed by the key it
 /// claims to act as, resolved from OUR directory.
+///
+/// # v31.0.0 (CIRISPersist#659) — the SUBJECT binds FIRST
+///
+/// Verifying the signature proves the revoker signed *some* envelope; it
+/// proved nothing about the row that envelope arrived on. Every field the
+/// substrate acts upon — `revoked_key_id` above all — was a plain column, so
+/// one validly-signed revocation could be re-pasted at any subject and any
+/// `revocation_id`, unboundedly often, with the producer's own signature
+/// still verifying. [`check_revocation_envelope_binding`] therefore runs as
+/// the FIRST statement here, ahead of the directory lookup this function
+/// needs, so the refusal is a pure function of the row and cannot depend on
+/// which keys this node happens to hold. Every backend's `put_revocation`
+/// runs it at the very top of the door as well; it is here too so no future
+/// door can acquire this plane without the binding.
+///
+/// [`check_revocation_envelope_binding`]: crate::federation::admission::check_revocation_envelope_binding
 pub async fn verify_revocation_admission<F>(
     directory: &F,
     row: &crate::federation::types::Revocation,
@@ -240,6 +256,7 @@ pub async fn verify_revocation_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    crate::federation::admission::check_revocation_envelope_binding(row)?;
     verify_envelope_hybrid_signature(
         directory,
         &row.revoking_key_id,
@@ -679,6 +696,44 @@ pub(crate) mod test_support {
             B64.encode(&ed_sig),
             Some(B64.encode(&pqc_sig)),
         )
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — **seal a [`Revocation`](crate::federation::Revocation):
+    /// bind its typed columns into `revocation_envelope`, then hybrid-sign the
+    /// result** under the row's own `revoking_key_id` (the key
+    /// [`super::verify_revocation_admission`] resolves pubkeys for — signing
+    /// under any other produces a row no backend admits).
+    ///
+    /// The de-conferral twin of [`seal_row_in_place`]. Hand it a row whose
+    /// typed columns are final and whose `original_content_hash` /
+    /// `scrub_signature_*` are placeholders, and get back the same row sealed.
+    /// The binding is stamped through
+    /// [`bind_revocation_into_envelope`](crate::federation::admission::bind_revocation_into_envelope)
+    /// — the SAME projection the gate compares against — so there is no second
+    /// spelling here either, and a fixture cannot certify a revocation this
+    /// substrate's own put door refuses.
+    ///
+    /// Note the instant truncation happens inside the producer, so a fixture
+    /// carrying `Utc::now()` nanoseconds is silently made postgres-storable
+    /// rather than dying at the gate. The witnesses that MEASURE the binding
+    /// build their divergence deliberately, AFTER sealing — a fixture that
+    /// merely forgot to seal is indistinguishable from a stale one.
+    pub fn seal_revocation_in_place(row: &mut crate::federation::Revocation) {
+        let signing_key_id = row.revoking_key_id.clone();
+        crate::federation::admission::bind_revocation_into_envelope(row)
+            .expect("the fixture revocation_envelope is a JSON object");
+        let (och, sc, sp) = sign_envelope(&signing_key_id, &row.revocation_envelope);
+        row.original_content_hash = och;
+        row.scrub_signature_classical = sc;
+        row.scrub_signature_pqc = sp;
+    }
+
+    /// [`seal_revocation_in_place`], by value.
+    pub fn seal_revocation(
+        mut row: crate::federation::Revocation,
+    ) -> crate::federation::Revocation {
+        seal_revocation_in_place(&mut row);
+        row
     }
 
     /// v31.0.0 (CIRISPersist#656) — **a subject-side transit revocation whose

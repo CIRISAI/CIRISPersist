@@ -809,6 +809,21 @@ pub enum RevocationBoundRefusal {
     /// standing on a key the same row says was already out. A bound is
     /// at-or-before the instant the revocation takes effect.
     BoundAfterEffective,
+    /// v31.0.0 (CIRISPersist#659) — the bound carries sub-microsecond
+    /// precision, which postgres `TIMESTAMPTZ` cannot store.
+    ///
+    /// The same class as [`crate::federation::admission::check_instant_binding`]'s
+    /// resolution clause and `operational::bind_instant_value`'s, on the field
+    /// this gate owns. Two consequences, both backend-dependent and both
+    /// silent before this variant: the bound orders
+    /// [`Revocation::suspects_statement_at`](super::types::Revocation::suspects_statement_at),
+    /// so the same statement would be *suspect* on sqlite/memory and *standing*
+    /// on postgres; and the row would be admitted here, stored truncated, and
+    /// then fail its OWN `TypedBoundDiverges` branch when a replicating peer
+    /// read it back and re-submitted it. REFUSED rather than truncated, for
+    /// the #598 reason: a substrate that silently rewrites a stored row no
+    /// longer means what it says.
+    BoundSubMicrosecond,
 }
 
 impl RevocationBoundRefusal {
@@ -821,6 +836,7 @@ impl RevocationBoundRefusal {
             Self::TypedBoundDiverges => "typed_bound_diverges",
             Self::BoundNotRfc3339 => "bound_not_rfc3339",
             Self::BoundAfterEffective => "bound_after_effective",
+            Self::BoundSubMicrosecond => "bound_sub_microsecond",
         }
     }
 
@@ -831,6 +847,7 @@ impl RevocationBoundRefusal {
         Self::TypedBoundDiverges,
         Self::BoundNotRfc3339,
         Self::BoundAfterEffective,
+        Self::BoundSubMicrosecond,
     ];
 }
 
@@ -889,6 +906,17 @@ pub fn check_revocation_bound(
             }
             if typed > row.effective_at {
                 return Err(RevocationBoundRefusal::BoundAfterEffective);
+            }
+            // v31.0.0 (CIRISPersist#659) — the resolution floor. Last, because
+            // the three branches above are about the bound DISAGREEING with
+            // something, and this one is about a bound that agrees with
+            // everything and still cannot survive a postgres round-trip. See
+            // `RevocationBoundRefusal::BoundSubMicrosecond`.
+            use chrono::Timelike as _;
+            if typed.nanosecond() % crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS
+                != 0
+            {
+                return Err(RevocationBoundRefusal::BoundSubMicrosecond);
             }
         }
     }
@@ -1133,6 +1161,38 @@ mod bound_tests {
             "a None bound must be skipped from canonical bytes so pre-v25.1 \
              rows and explicit unbounded rows hash identically"
         );
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — **the history bound sits on the substrate
+    /// resolution floor.**
+    ///
+    /// The third instant of the revocation plane, and the one this gate owns.
+    /// A sub-microsecond bound agrees with itself in both directions and still
+    /// cannot survive a postgres `TIMESTAMPTZ` round-trip: it would be admitted
+    /// here, stored truncated, and then refused by this gate's OWN
+    /// `TypedBoundDiverges` branch when a replicating peer read it back — and
+    /// meanwhile `suspects_statement_at` would answer differently on sqlite and
+    /// on postgres for the same statement. Refused rather than truncated, for
+    /// the #598 reason.
+    #[test]
+    fn a_sub_microsecond_bound_is_refused_659() {
+        // Coherent in every other respect: mirrored exactly, and at-or-before
+        // `effective_at`. Only the resolution is wrong.
+        let ns = "2026-08-01T00:00:00.000000500Z";
+        let mut r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", Some(ns));
+        r.revoked_after = Some(ts(ns));
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::BoundSubMicrosecond),
+            "postgres TIMESTAMPTZ cannot hold this, so admitting it makes the fold \
+             backend-dependent"
+        );
+        // The SAME bound truncated to the floor admits — so the refusal is
+        // about the resolution and nothing else.
+        let micro = "2026-08-01T00:00:00.000000Z";
+        let mut ok = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", Some(micro));
+        ok.revoked_after = Some(ts(micro));
+        assert_eq!(check_revocation_bound(&ok), Ok(()));
     }
 
     #[test]
@@ -1384,27 +1444,32 @@ pub(crate) mod bound_test_support {
         if let Some(b) = envelope_bound {
             envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(b.to_rfc3339());
         }
-        let (och, ed_sig, pqc_sig) =
-            crate::federation::tier_ingest::test_support::sign_envelope(revoker, &envelope);
+        // v31.0.0 (#659) — sealed through the ONE shared producer, which binds
+        // the six identifying columns and deliberately does NOT touch
+        // `revoked_after`. That is what lets this witness still author the
+        // bound divergences it exists to measure: the producer signs the
+        // envelope it was handed, bound and all.
         super::super::SignedRevocation {
-            revocation: super::super::types::Revocation {
-                revocation_id: uuid::Uuid::new_v4().to_string(),
-                revoked_key_id: revoked.to_owned(),
-                revoking_key_id: revoker.to_owned(),
-                reason: Some("compromise".to_owned()),
-                revoked_at: effective_at,
-                effective_at,
-                revocation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: ed_sig,
-                scrub_signature_pqc: pqc_sig,
-                scrub_key_id: revoker.to_owned(),
-                scrub_timestamp: effective_at,
-                pqc_completed_at: None,
-                observed_region: crate::federation::verify_coord::region::US.to_owned(),
-                revoked_after: typed_bound,
-                persist_row_hash: String::new(),
-            },
+            revocation: crate::federation::tier_ingest::test_support::seal_revocation(
+                super::super::types::Revocation {
+                    revocation_id: uuid::Uuid::new_v4().to_string(),
+                    revoked_key_id: revoked.to_owned(),
+                    revoking_key_id: revoker.to_owned(),
+                    reason: Some("compromise".to_owned()),
+                    revoked_at: effective_at,
+                    effective_at,
+                    revocation_envelope: envelope,
+                    original_content_hash: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: revoker.to_owned(),
+                    scrub_timestamp: effective_at,
+                    pqc_completed_at: None,
+                    observed_region: crate::federation::verify_coord::region::US.to_owned(),
+                    revoked_after: typed_bound,
+                    persist_row_hash: String::new(),
+                },
+            ),
         }
     }
 
@@ -1448,7 +1513,15 @@ pub(crate) mod bound_test_support {
         // the fold runs — a future-dated revocation is deliberately not
         // considered, and anchoring at `now` would make that correct behaviour
         // look like a bug on a fast machine.
-        let compromise = Utc::now() - Duration::hours(24);
+        // v31.0.0 (#659) — TRUNCATED TO MICROSECONDS at the source. `revoked_after`
+        // now carries the substrate resolution floor (`BoundSubMicrosecond`),
+        // and `effective_at` is truncated by the producer, so a nanosecond
+        // `Utc::now()` here would make the bound later than the instant it is
+        // measured against. The same #634/#598 skew, on this plane's third
+        // instant.
+        let compromise = crate::federation::admission::truncate_to_substrate_resolution(
+            Utc::now() - Duration::hours(24),
+        );
         let monday = compromise - Duration::hours(48);
         let after = compromise + Duration::hours(1);
 
@@ -1940,31 +2013,30 @@ mod tests {
         // Build a self-signed revocation (revoking_key_id empty skips
         // the trust gate; scrub_key_id = the revoked key, self-revoke).
         let now = chrono::Utc::now();
-        let rev_envelope = serde_json::json!({"revokes": dereg_id});
-        let _rev_canonical = ceg_produce_canonicalize(&rev_envelope).expect("canonicalize");
         // v21.0.0 (#502 E1) — sign the revocation envelope with the
         // revoking key's registered hybrid key so admission verifies it.
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&dereg_id, &rev_envelope);
-        let revocation = crate::federation::Revocation {
-            revocation_id: uuid::Uuid::new_v4().to_string(),
-            revoked_key_id: dereg_id.clone(),
-            revoking_key_id: dereg_id.clone(),
-            reason: Some("consent:replication withdrawn".to_owned()),
-            revoked_at: now,
-            effective_at: now,
-            revocation_envelope: rev_envelope.clone(),
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
-            scrub_key_id: dereg_id.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            observed_region: crate::federation::verify_coord::region::US.to_owned(),
-            // #570 ask 4 — unbounded: this fixture revokes the whole history.
-            revoked_after: None,
-            persist_row_hash: String::new(),
-        };
+        // v31.0.0 (#659) — over bytes that BIND the typed columns.
+        let revocation = crate::federation::tier_ingest::test_support::seal_revocation(
+            crate::federation::Revocation {
+                revocation_id: uuid::Uuid::new_v4().to_string(),
+                revoked_key_id: dereg_id.clone(),
+                revoking_key_id: dereg_id.clone(),
+                reason: Some("consent:replication withdrawn".to_owned()),
+                revoked_at: now,
+                effective_at: now,
+                revocation_envelope: serde_json::json!({"revokes": dereg_id}),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: dereg_id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.to_owned(),
+                // #570 ask 4 — unbounded: this fixture revokes the whole history.
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            },
+        );
         engine
             .deregister_federation_key(crate::federation::SignedRevocation { revocation })
             .await

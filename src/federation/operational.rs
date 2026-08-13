@@ -514,6 +514,40 @@ pub fn check_role_authority(
 /// mis-ordered array is caught loudly *before* the quorum would silently
 /// collapse on divergent JCS bytes.
 ///
+/// # v31.0.0 (CIRISPersist#659) — `threshold` HAS A FLOOR, AND IS SIGNED
+///
+/// `threshold` is the M of the M-of-N, and it arrived **caller-supplied and
+/// outside the signature**. Two independent holes:
+///
+/// 1. **No floor.** [`ciris_verify_core::threshold::verify_founder_quorum`],
+///    which this path routes through, rejects only `M == 0` and `M > N`.
+///    [`verify_quorum_policy`](ciris_verify_core::threshold::verify_quorum_policy)
+///    — the function that enforces the federation's one quorum rule, a strict
+///    majority `2M > N` — is NOT on this path. So `threshold: 1` admitted a
+///    licence grant carrying `capabilities_granted` and `max_autonomy_tier` on
+///    ONE steward signature, contradicting this repo's own recorded invariant
+///    (see [`crate::federation::reverse_quorum`]: *m-of-n OR reverse quorum,
+///    never 1-of-N capability-grant*). Every sibling m-of-n door in this crate
+///    already floors M at a strict majority; this one did not.
+/// 2. **Unsigned.** `threshold` lives on the WRAPPER, not on the record, so it
+///    was not covered by the quorum's own bytes and not covered by
+///    [`check_partner_record_binding`] either. A relay could therefore rewrite
+///    a `3` into a `1` in transit and the three stewards' signatures stayed
+///    valid — a floor alone would not have closed that, because the number the
+///    floor is applied to was the attacker's.
+///
+/// Both halves are fixed together and in this cut. Enforcing the floor is a
+/// pure tightening for a conformant producer; BINDING it is a preimage change,
+/// and v31.0.0 already forces the mesh-wide re-mint that pays for it. One
+/// release later this would mean re-collecting M steward signatures across
+/// organizations in a second ceremony against a live federation.
+///
+/// The floor is `QuorumPolicy::validate` itself — the SAME rule
+/// `verify_quorum_policy` applies — rather than `2 * m > n` re-spelled here,
+/// so persist never grows a second copy of the majority arithmetic. `N` is the
+/// **founder subset** of the roster, because that is the set
+/// `verify_founder_quorum` actually counts against.
+///
 /// # Errors
 /// [`Error::SetSemanticsUnsorted`] or [`Error::OperationalAuthority`].
 pub fn check_partner_set_and_quorum(
@@ -526,12 +560,36 @@ pub fn check_partner_set_and_quorum(
     // rollback counter and the first key of the `monotonic_quorum`
     // comparator — is one of those columns. Binding lives here rather than
     // at the three put doors so no backend can be added without it.
-    check_partner_record_binding(&signed.partner_record)?;
+    //
+    // v31.0.0 (CIRISPersist#659) — that now includes `threshold`, which lives
+    // on the WRAPPER: the number the floor below is applied to has to be a
+    // number the stewards attested to, or the floor is applied to whatever the
+    // relay chose.
+    check_partner_record_binding(signed)?;
     ciris_verify_core::operational_admit::check_set_semantics_sorted(
         &signed.partner_record.signed_envelope,
         PARTNER_RECORD_SET_FIELDS,
     )
     .map_err(|e| Error::SetSemanticsUnsorted(e.to_string()))?;
+    // v31.0.0 (CIRISPersist#659) — THE STRICT-MAJORITY FLOOR, before a single
+    // signature is counted (fail-closed, "no action"). N is the founder subset
+    // because that is the set `verify_founder_quorum` counts against.
+    let founder_n = steward_roster
+        .iter()
+        .filter(|m| matches!(m.role, Some(ciris_verify_core::threshold::Role::Founder)))
+        .count();
+    ciris_verify_core::threshold::QuorumPolicy::new(signed.threshold, founder_n)
+        .validate()
+        .map_err(|e| {
+            Error::OperationalAuthority(format!(
+                "partner_record quorum policy {}/{founder_n} refused: {e}. A licence grant \
+                 carries `capabilities_granted` and `max_autonomy_tier`, so it takes a STRICT \
+                 MAJORITY of the steward roster (2M > N) — the same rule every other m-of-n door \
+                 in this substrate applies, and the one this plane was missing \
+                 (CIRISPersist#659)",
+                signed.threshold,
+            ))
+        })?;
     ciris_verify_core::operational_admit::verify_partner_record_quorum(
         &signed.partner_record.signed_envelope,
         steward_roster,
@@ -947,10 +1005,22 @@ pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
 /// `JCS(signed_envelope)`, so requiring `revision` to live there makes the
 /// counter quorum-attested at zero additional cryptographic cost.
 ///
+/// # v31.0.0 (CIRISPersist#659) — it takes the WRAPPER, because `threshold` is
+/// on the wrapper
+///
+/// `SignedPartnerRecord::threshold` is the M of the M-of-N and it sat OUTSIDE
+/// the signed bytes, so a relay could rewrite a `3` into a `1` in transit with
+/// every steward signature still valid. It is the only security-relevant field
+/// of the submission that is not a column of [`PartnerRecord`], which is why
+/// this function's argument changed rather than a fourth binding helper being
+/// minted for one field. See [`check_partner_set_and_quorum`] for the floor
+/// that is applied to it once it is honest.
+///
 /// # Errors
 /// [`Error::OperationalEnvelopeUnbound`] on the first divergent column.
-pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
+pub fn check_partner_record_binding(signed: &SignedPartnerRecord) -> Result<(), Error> {
     const PLANE: &str = "partner_record";
+    let row = &signed.partner_record;
     let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
     bind_str(env, PLANE, id, "attestation_id", &row.attestation_id)?;
     bind_str(env, PLANE, id, "license_id", &row.license_id)?;
@@ -981,12 +1051,28 @@ pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
         u64::from(row.offline_grace_hours),
     )?;
     bind_u64(env, PLANE, id, "revision", row.revision)?;
+    // v31.0.0 (CIRISPersist#659) — the M of the M-of-N, bound LAST because it
+    // is the one member that is not a column of the record. `usize` → `u64` is
+    // lossless on every target this crate builds for.
+    bind_u64(
+        env,
+        PLANE,
+        id,
+        PARTNER_THRESHOLD_ENVELOPE_FIELD,
+        signed.threshold as u64,
+    )?;
     bind_instant(env, PLANE, id, "issued_at", row.issued_at)?;
     bind_instant(env, PLANE, id, "expires_at", row.expires_at)?;
     bind_instant(env, PLANE, id, "asserted_at", row.asserted_at)?;
     bind_opt_instant(env, PLANE, id, "withdrawn_at", row.withdrawn_at)?;
     Ok(())
 }
+
+/// v31.0.0 (CIRISPersist#659) — the `signed_envelope` key carrying the M-of-N
+/// threshold. [`SignedPartnerRecord::threshold`] must mirror it exactly, and
+/// [`check_partner_set_and_quorum`] floors the result at a strict majority of
+/// the founder roster.
+pub const PARTNER_THRESHOLD_ENVELOPE_FIELD: &str = "threshold";
 
 /// v31.0.0 (CIRISPersist#644) — the `organization` admission gate nobody
 /// was running: bind the projection, then hybrid-Strict verify the row's
@@ -1499,6 +1585,10 @@ pub mod test_support {
             "offline_grace_hours": 24,
             "status": status,
             "revision": revision,
+            // v31.0.0 (#659) — the M of the M-of-N joins the quorum-signed
+            // bytes: a relay can no longer talk a 3-of-5 licence down to a
+            // 1-of-5 while the stewards' own signatures stay valid.
+            super::PARTNER_THRESHOLD_ENVELOPE_FIELD: threshold,
             "issued_at": asserted_at.to_rfc3339(),
             "expires_at": asserted_at.to_rfc3339(),
             "asserted_at": asserted_at.to_rfc3339(),

@@ -5022,6 +5022,40 @@ pub enum Error {
         reason: RevocationBoundRefusal,
     },
 
+    /// v31.0.0 (CIRISPersist#659) — a [`Revocation`] carries a typed column
+    /// that its scrub signature does not cover and that disagrees with the
+    /// `revocation_envelope` it claims to project.
+    ///
+    /// The de-conferral plane is **producer envelope + typed projection**, the
+    /// same shape as the three operational planes
+    /// ([`Error::OperationalEnvelopeUnbound`]): the hybrid signature covers
+    /// `revocation_envelope` and nothing else, while WHICH KEY IS REVOKED,
+    /// WHO revoked it, WHICH ROW this is and WHEN it takes effect were all
+    /// plain caller-supplied columns. One validly-signed revocation could
+    /// therefore be re-pasted at an arbitrary `revoked_key_id` and an
+    /// arbitrary `revocation_id`, unboundedly often, with the producer's own
+    /// signature still verifying — an unbounded de-conferral primitive off a
+    /// single conferral.
+    ///
+    /// Fail-closed, and no legacy regime: an unbound revocation is REFUSED,
+    /// never stored-and-flagged. See
+    /// [`admission::check_revocation_envelope_binding`].
+    #[error(
+        "revocation {revocation_id:?}: typed column `{field}` is not bound to the signed \
+         `revocation_envelope` — {detail}. The scrub signature covers that envelope only, so an \
+         unbound column is authored by whoever relayed the row, not by whoever signed it — and \
+         `revoked_key_id` unbound means one signed revocation de-admits ANY key it is pasted \
+         onto (CIRISPersist#659)"
+    )]
+    RevocationEnvelopeUnbound {
+        /// The rejected row's `revocation_id`.
+        revocation_id: String,
+        /// The typed column that diverged.
+        field: &'static str,
+        /// How it diverged (column value vs signed value, or absence).
+        detail: String,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -6320,6 +6354,7 @@ impl Error {
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
+            Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",

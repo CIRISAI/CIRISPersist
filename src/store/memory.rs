@@ -3522,6 +3522,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // `original_content_hash` cover, so the stored column sha256sums to
         // the declared hash. Idempotent, therefore signature-transparent.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
+        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
+        // signature covers `revocation_envelope` and nothing else, so
+        // `revoked_key_id` / `revocation_id` / the instants were columns a
+        // relay could rewrite while the signature still verified — one
+        // conferred moderator's revocation, re-pasted at any key. Pure
+        // function of the row (AV-76 tier 1), run ahead of the trust gate and
+        // the authority resolution so the refusal never depends on roster,
+        // trust score or custody state. Placed HERE on memory too, in the same
+        // position as sqlite/postgres: the backend-symmetry lesson has cost
+        // this repo seven releases.
+        crate::federation::admission::check_revocation_envelope_binding(&row)?;
         // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking key is
         // the attester. v22.0.0 (CIRISPersist#543 finding 4): backend-
         // symmetric with sqlite + postgres, which have gated this path
@@ -9089,27 +9100,27 @@ mod tests {
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
-        let __rev_env = serde_json::json!({"id": id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &__rev_env);
-        Revocation {
+        // v31.0.0 (#659) — and the typed columns are BOUND INTO the bytes that
+        // signature covers, through the one shared producer, so a fixture
+        // cannot certify a revocation this substrate's own put door refuses.
+        crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: __rev_env,
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
             revoked_after: None,
             persist_row_hash: String::new(),
-        }
+        })
     }
 
     // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
@@ -12443,6 +12454,33 @@ mod tests {
         )
         .await
         .expect("547 wire-index-follows-mutators exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
+    /// NAMED, at the real `put_revocation` chokepoint, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("rev659-node-mem");
+        crate::federation::admission::r2_test_support::exercise_revocation_subject_binding(
+            &backend,
+            "mem659r",
+            "rev659-node-mem",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
+    /// and the M is signed. On memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn partner_threshold_floor_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
+            &backend, "mem659p",
+        )
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
