@@ -6984,7 +6984,11 @@ fn is_baked_genesis_canonical(row: &super::KeyRecord) -> bool {
 /// deadlock-safe (`2·M > N`, no `M==1` escape, declared `N` == live founder
 /// roster size).
 ///
-/// Steps: (3) resolve `roster_key_ids` to their PINNED directory pubkeys as
+/// Steps: (2b) v31.0.0 (CIRISPersist#659) — the envelope must BIND THE SUBJECT
+/// ([`verify_envelope_binds_subject`]: `key_id` and both pubkeys, REQUIRED and
+/// equal to the row's own columns). First, before any roster lookup, because
+/// every other step below is a question about the SIGNERS; (3) resolve
+/// `roster_key_ids` to their PINNED directory pubkeys as
 /// `Founder` members (skip unresolvable; `n = roster.len()`, never caller keys);
 /// (4) strict-majority policy `QuorumPolicy::new(n/2 + 1, n)`; (6) canonical
 /// bytes `ceg_produce_canonicalize(registration_envelope)` (JCS RFC 8785, the
@@ -7122,6 +7126,204 @@ pub fn verify_member_fips_custody_against(
     Ok(verdict)
 }
 
+/// v31.0.0 (CIRISPersist#659) — **THE SUBJECT OF A CONFERRAL, AS BOUND INTO
+/// THE CO-SCRUBBED `registration_envelope`.**
+///
+/// This is the ONE spelling of that projection. The PRODUCING side
+/// ([`bind_subject_into_envelope`], which every ceremony that mints a
+/// conferral record calls) and the CHECKING side
+/// ([`verify_envelope_binds_subject`], which the accord co-scrub quorum core
+/// calls) both derive the field set and its values from HERE, so the two can
+/// never drift apart. Two spellings of one projection is this release's
+/// signature defect — it produced #643, #598 and #652 — and this is
+/// deliberately not a fourth.
+///
+/// The fields are exactly the `federation_keys` columns that answer *"WHICH
+/// KEY is this?"*:
+///
+/// - **`key_id`** — the NAME. Bound by the first half of #659.
+/// - **`pubkey_ed25519_base64`** — the classical leg of the hybrid identity.
+/// - **`pubkey_ml_dsa_65_base64`** — the PQC leg; JSON `null` when the row
+///   carries none.
+///
+/// # Why both legs, and why `null` is a binding rather than a hole
+///
+/// This substrate's identity is a HYBRID keypair (see
+/// [`super::types::algorithm`]). Binding only the classical leg would leave
+/// the PQC leg substitutable — the same defect one field over, on the half
+/// that is supposed to survive a quantum adversary — so both legs are bound
+/// or neither is.
+///
+/// A row with no ML-DSA key binds `null`, which is an ASSERTION OF ABSENCE and
+/// not a gap: an attacker who pastes a co-scrub onto a record carrying their
+/// OWN ML-DSA key is refused by the `null` just as surely as by a differing
+/// string. (Whether a conferral SUBJECT may be non-hybrid at all is a separate
+/// policy question — a real one — and #659 does not decide it. What #659
+/// guarantees is that whatever the subject's PQC leg is, the co-scrubbers
+/// signed for THAT one.)
+///
+/// Every real in-repo artifact already satisfies this: the baked genesis
+/// canonical (`genesis/canonical_seed.json`) and the A1/B1/C1 accord holders
+/// (`genesis/accord_holder_seed.json`) each carry `key_id`,
+/// `pubkey_ed25519_base64` and `pubkey_ml_dsa_65_base64` inside
+/// `registration_envelope`, byte-equal to their own columns. For a conformant
+/// ceremony this is a TIGHTENING, not a preimage change.
+pub fn subject_binding(
+    key_id: &str,
+    pubkey_ed25519_base64: &str,
+    pubkey_ml_dsa_65_base64: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("key_id".into(), serde_json::Value::from(key_id));
+    m.insert(
+        "pubkey_ed25519_base64".into(),
+        serde_json::Value::from(pubkey_ed25519_base64),
+    );
+    m.insert(
+        "pubkey_ml_dsa_65_base64".into(),
+        match pubkey_ml_dsa_65_base64 {
+            Some(s) => serde_json::Value::from(s),
+            None => serde_json::Value::Null,
+        },
+    );
+    m
+}
+
+/// v31.0.0 (CIRISPersist#659) — the **PRODUCING** half of [`subject_binding`]:
+/// stamp the subject's identifying fields into `envelope` BEFORE it is
+/// canonicalized and co-scrubbed, so the bytes the accord family signs name
+/// the key they confer on.
+///
+/// Overwrites those three keys and leaves every other field of the caller's
+/// envelope untouched (`transport_hints`, `roles`, `purpose`, `valid_from`, …
+/// all survive) — the binding is ADDITIVE to whatever the ceremony wants to
+/// say. Errors if `envelope` is not a JSON object, because there is nowhere to
+/// put the binding and silently accepting that is how a subject-blind envelope
+/// gets minted.
+pub fn bind_subject_into_envelope(
+    envelope: &mut serde_json::Value,
+    key_id: &str,
+    pubkey_ed25519_base64: &str,
+    pubkey_ml_dsa_65_base64: Option<&str>,
+) -> Result<(), String> {
+    let was = json_type_name(envelope);
+    let obj = envelope.as_object_mut().ok_or_else(|| {
+        format!(
+            "registration_envelope for {key_id:?} is {was}, not a JSON object — the #659 subject \
+             binding has nowhere to live"
+        )
+    })?;
+    for (field, value) in subject_binding(key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64) {
+        obj.insert(field, value);
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#659) — the **CHECKING** half of [`subject_binding`]:
+/// does `row`'s co-scrubbed `registration_envelope` bind THIS row's subject?
+///
+/// # The defect
+///
+/// `verify_accord_family_coscrub_with` verifies m-of-n over
+/// `JCS(registration_envelope)` and, before #659, NOTHING tied those bytes to
+/// the record they arrived on. Every check on the path — withdrawal-wins, the
+/// #513 FIPS-custody floor, the quorum tally — is a question about the
+/// SIGNERS; none was a question about the SUBJECT. So one accord co-scrub set
+/// (three FIPS-certified, touch-required, distinct humans signing for key V)
+/// could be lifted verbatim onto a record for key A carrying A's OWN pubkeys,
+/// and the gate returned `Ok(())`. TESTED against the strict canonical gate —
+/// withdrawal-wins + the #513 ≥3-FIPS floor + the real quorum crypto —
+/// which admitted `canon-probe-ATTACKER` against an envelope naming
+/// `canon-probe-victim`.
+///
+/// This is the ONLY door `canonical`, `infra:attest`, the co-steward roles and
+/// every [`identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`] member enter
+/// through — at every `put_public_key` on all three backends AND in
+/// `apply_replicated_key_record` (anti-entropy). #513 prices minting a trust
+/// root at three non-virtualizable humans and calls it costly-but-possible.
+/// Unbound, that price bought an UNBOUNDED number of conferrals.
+///
+/// # Why the pubkeys and not the name alone
+///
+/// Binding `key_id` alone closes the "any key_id" hole but leaves a real race,
+/// not a theoretical one. On a node that has NOT yet replicated the victim's
+/// row there is no collision to refuse: an attacker registers `key_id = V`
+/// carrying their OWN pubkeys, the co-scrub confers, and that node's trust
+/// root is attacker-controlled. Replication ordering across the mesh is
+/// arbitrary and this gate also runs in anti-entropy, so a hostile peer can
+/// enter the race deliberately. A name-only binding attests *"the holder of
+/// key_id V may be canonical"* while the row asserting WHICH KEY that is stays
+/// unbound.
+///
+/// # REQUIRED, not checked-if-present
+///
+/// An absent field is a REFUSAL, not a tolerated legacy shape. An optional
+/// check is skippable by omission, which is the whole attack — and a tolerated
+/// absence is exactly how the name binding got left half-done in the first
+/// place. There is no legacy regime in v31 (the standing decision on #598,
+/// #640 and #643); a fresh genesis re-mints every conferral record against
+/// this preimage.
+pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), String> {
+    for (field, expected) in subject_binding(
+        &row.key_id,
+        &row.pubkey_ed25519_base64,
+        row.pubkey_ml_dsa_65_base64.as_deref(),
+    ) {
+        match row.registration_envelope.get(&field) {
+            Some(bound) if *bound == expected => {}
+            Some(bound) => {
+                return Err(format!(
+                    "the co-scrubbed registration_envelope binds {field} = {bound_brief}, but \
+                     this record carries {expected_brief} (key_id {key_id:?}). The accord quorum \
+                     verifies over those envelope bytes and NOTHING else, so honouring this would \
+                     confer the role on a subject the co-scrubbers never named (CIRISPersist#659)",
+                    bound_brief = brief_json(bound),
+                    expected_brief = brief_json(&expected),
+                    key_id = row.key_id,
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the co-scrubbed registration_envelope for {key_id:?} does not bind {field}. \
+                     The accord quorum verifies over those bytes ONLY, so an envelope that does \
+                     not name its subject confers on ANY record it is pasted onto. REQUIRED, not \
+                     check-if-present — an optional check is skippable by omission, which is the \
+                     whole attack (CIRISPersist#659)",
+                    key_id = row.key_id,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The JSON type name, for a refusal that has to say what it got instead of an
+/// object. Diagnostic only.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Render a JSON value for an error message, truncated. An ML-DSA-65 pubkey is
+/// ~2.6 KiB of base64 and two of them would bury the sentence that says what
+/// went wrong; a prefix plus the full length identifies the value without
+/// drowning the reason. Diagnostic only — never a comparison input.
+fn brief_json(v: &serde_json::Value) -> String {
+    let s = v.to_string();
+    let n = s.chars().count();
+    if n <= 48 {
+        return s;
+    }
+    let head: String = s.chars().take(44).collect();
+    format!("{head}…\" ({n} chars)")
+}
+
 /// The parameterized body of [`verify_accord_family_coscrub`].
 ///
 /// v21.3.0 (CIRISPersist#513) — two strictness knobs, BOTH engaged only by
@@ -7152,6 +7354,15 @@ where
     use ciris_verify_core::threshold::{
         verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
     };
+
+    // (2b) v31.0.0 (CIRISPersist#659) — **THE CO-SCRUB MUST NAME THE SUBJECT IT
+    // CONFERS ON.** FIRST, before a single roster lookup: everything below is a
+    // question about the SIGNERS, and until this ran there was no question
+    // about the SUBJECT anywhere on the path. Asking it first also makes the
+    // refusal deterministic — a subject-blind envelope is refused identically
+    // whether the roster resolves, whether the custody floor is met, and
+    // whether the signatures are real. See `verify_envelope_binds_subject`.
+    verify_envelope_binds_subject(row)?;
 
     // (3) Standing founder roster = the accord family resolved to their PINNED
     // directory pubkeys (never caller-supplied keys). Skip any that don't
@@ -7203,58 +7414,6 @@ where
         ));
     }
     let policy = QuorumPolicy::new(m, n);
-
-    // (5a) v31.0.0 (CIRISPersist#659) — **THE CO-SCRUB MUST NAME THE KEY IT
-    // CONFERS ON.** This is the #659 operational-plane defect one plane over,
-    // on the plane where it is worst.
-    //
-    // Everything below verifies m-of-n over `JCS(registration_envelope)` and
-    // NOTHING tied those bytes to `row.key_id`. So one accord co-scrub set —
-    // three FIPS-custody, touch-required humans signing for key V — could be
-    // lifted verbatim onto a record for key A, carrying A's OWN pubkeys, and
-    // this function returned `Ok(())`. TESTED before the fix: the strict
-    // canonical gate (withdrawal-wins + the #513 ≥3-FIPS floor + the real
-    // quorum crypto) admitted `canon-probe-ATTACKER` against an envelope
-    // naming `canon-probe-victim`.
-    //
-    // This is the ONLY door `canonical`, `infra:attest`, the co-steward roles
-    // and every `AUTHORITY_CONFERRING_IDENTITY_TYPES` member enter through, so
-    // one conferral ceremony conferred on unboundedly many key_ids — the
-    // anti-Sybil floor that makes minting a trust root "costly but possible"
-    // priced exactly ONE mint and delivered any number.
-    //
-    // A REQUIRED, EQUAL `key_id` inside the signed envelope, not merely one
-    // that agrees when present: an optional check is skippable by omission,
-    // which is the whole attack. Every real artifact already satisfies it —
-    // the baked genesis records and the A1/B1/C1 accord holders all carry
-    // `key_id` (with `algorithm`, `identity_type` and both pubkeys) inside
-    // `registration_envelope` — so this refuses nothing that a conformant
-    // ceremony produces.
-    match row
-        .registration_envelope
-        .get("key_id")
-        .and_then(|v| v.as_str())
-    {
-        Some(signed) if signed == row.key_id => {}
-        Some(signed) => {
-            return Err(format!(
-                "the co-scrubbed registration_envelope names key_id {signed:?}, but this record \
-                 is {:?}. The accord quorum below verifies over those envelope bytes and nothing \
-                 else, so honouring this would confer the role on a key the co-scrubbers never \
-                 named (CIRISPersist#659)",
-                row.key_id,
-            ));
-        }
-        None => {
-            return Err(format!(
-                "the co-scrubbed registration_envelope for {:?} carries no `key_id` string. The \
-                 accord quorum verifies over those bytes ONLY, so an envelope that does not name \
-                 its subject confers on ANY key_id it is pasted onto. REQUIRED, not \
-                 check-if-present (CIRISPersist#659)",
-                row.key_id,
-            ));
-        }
-    }
 
     // (6) The exact canonical bytes the scrubs signed = JCS(registration_envelope)
     // — the IDENTICAL function the single-scrub verify uses, so a base-field
@@ -13018,7 +13177,9 @@ where
 /// `canonical` cannot be self-claimed via ANY path.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod canonical_gate_tests {
-    use super::super::operational::test_support::{signed_canonical_record, Identity};
+    use super::super::operational::test_support::{
+        signed_canonical_record, Identity, PLACEHOLDER_SUBJECT_ED25519_BASE64,
+    };
     use super::super::types::{algorithm, identity_type, ScrubSig};
     use super::super::{is_canonical, FederationDirectory, KeyRecord, SignedKeyRecord};
     use super::accord_holder_roster_key_ids;
@@ -13087,6 +13248,8 @@ mod canonical_gate_tests {
         let rec = signed_canonical_record(
             "canon-floor-513",
             "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             serde_json::json!({ "key_id": "canon-floor-513" }),
             &[&holders[0], &holders[1], &holders[2]],
         );
@@ -13214,7 +13377,12 @@ mod canonical_gate_tests {
 
         let backend = crate::store::memory::MemoryBackend::new();
         let ca = MockYubicoCa::new();
-        let envelope = serde_json::json!({ "key_id": "canon-mockmint-513" });
+        // v31.0.0 (CIRISPersist#659) — the bytes the mock family signs are the
+        // SUBJECT'S OWN bound envelope, taken from the record itself rather
+        // than hand-written beside it. Two spellings of the preimage is how
+        // the fixture and the gate drift apart.
+        let mut rec = record("canon-mockmint-513", "canonical,node", "mm0");
+        let envelope = rec.registration_envelope.clone();
 
         let mut roster = Vec::new();
         let mut scrubs: Vec<super::super::types::ScrubSig> = Vec::new();
@@ -13243,13 +13411,6 @@ mod canonical_gate_tests {
             });
         }
 
-        let mut rec = record("canon-mockmint-513", "canonical,node", "mm0");
-        rec.registration_envelope = envelope.clone();
-        rec.original_content_hash = {
-            use sha2::{Digest, Sha256};
-            let bytes = ceg_produce_canonicalize(&envelope).unwrap();
-            hex::encode(Sha256::digest(&bytes))
-        };
         rec.scrub_key_id = scrubs[0].scrub_key_id.clone();
         rec.scrub_signature_classical = scrubs[0].scrub_signature_classical.clone();
         rec.scrub_signature_pqc = scrubs[0].scrub_signature_pqc.clone();
@@ -13282,9 +13443,21 @@ mod canonical_gate_tests {
     /// non-virtualizable humans; unbound, that price bought *any number* of
     /// trust roots.
     ///
-    /// Both directions, so the gate cannot pass by refusing everything: the
-    /// named subject MINTS, the unnamed one is REFUSED, and the refusal names
-    /// both ids.
+    /// # The residual the NAME binding alone leaves — the half this test grew for
+    ///
+    /// Binding `key_id` closes "any key_id", but on a node that has **not yet
+    /// replicated the victim's row** there is no collision to refuse. The
+    /// attacker registers `key_id = V` carrying their OWN pubkeys, the
+    /// co-scrub confers, and that node's trust root is attacker-controlled.
+    /// Replication ordering across the mesh is arbitrary and this gate runs in
+    /// anti-entropy too, so a hostile peer can enter the race deliberately. A
+    /// name-only binding attests *"the holder of key_id V may be canonical"*
+    /// while the row asserting WHICH KEY that is stays unbound. Legs (c) and
+    /// (d) are that race, one hybrid leg each.
+    ///
+    /// Every direction, so the gate cannot pass by refusing everything: the
+    /// named subject MINTS, each substitution is REFUSED, and each refusal
+    /// names the field that disagreed.
     #[tokio::test]
     async fn coscrub_confers_only_on_the_key_it_names_659() {
         use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
@@ -13293,11 +13466,19 @@ mod canonical_gate_tests {
         let backend = crate::store::memory::MemoryBackend::new();
         let ca = MockYubicoCa::new();
         let subject = "canon-659-subject";
-        // The three humans sign an envelope naming the SUBJECT.
-        let envelope = serde_json::json!({ "key_id": subject });
+        // The three humans sign the SUBJECT'S OWN bound envelope — name and
+        // BOTH pubkeys, through the one shared projection. Taken off the record
+        // rather than written beside it: a second spelling of the preimage is
+        // how a fixture and its gate drift apart.
+        let mut good = record(subject, "canonical,node", "m659a");
+        let envelope = good.registration_envelope.clone();
+        // An attacker's identity, minted the same way — a DIFFERENT Ed25519
+        // key, and (leg d) a real ML-DSA-65 key where the subject has none.
+        let attacker = record("canon-659-ATTACKER", "canonical,node", "m659a");
 
         let mut roster = Vec::new();
         let mut scrubs: Vec<super::super::types::ScrubSig> = Vec::new();
+        let mut a_pqc: Option<String> = None;
         for (i, kid) in ["m659a", "m659b", "m659c"].iter().enumerate() {
             let m = ca
                 .attest_member([0x90 + i as u8; 32], kid, "2026-07-26T00:00:00Z")
@@ -13305,6 +13486,7 @@ mod canonical_gate_tests {
             let mut rec = record(kid, identity_type::NODE, kid);
             rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
             rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
+            a_pqc = a_pqc.or_else(|| m.member.mldsa65_public_key_base64.clone());
             rec.attestation_evidence = Some(serde_json::to_value(&m.attestation).unwrap());
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
@@ -13320,7 +13502,11 @@ mod canonical_gate_tests {
                 scrub_signature_pqc: sig.mldsa65_signature_base64,
             });
         }
+        let a_pqc = a_pqc.expect("the mock CA mints hybrid members");
 
+        // Replay the ceremony VERBATIM onto a record — the whole attack in one
+        // closure. Nothing here forges anything; the attacker holds no accord
+        // key and does not need one.
         let stamp = |rec: &mut KeyRecord| {
             rec.registration_envelope = envelope.clone();
             rec.original_content_hash = {
@@ -13333,27 +13519,28 @@ mod canonical_gate_tests {
             rec.scrub_signature_pqc = scrubs[0].scrub_signature_pqc.clone();
             rec.additional_scrubs = scrubs[1..].to_vec();
         };
+        let strict = |rec: KeyRecord| {
+            let backend = &backend;
+            let roster = &roster;
+            let root = ca.root_der();
+            async move {
+                super::check_canonical_role_admission_over_roster_with_custody_root(
+                    backend, &rec, roster, root,
+                )
+                .await
+            }
+        };
 
         // (a) THE CONTROL — the named subject mints. Without this leg a gate
-        //     that refused every record would satisfy (b).
-        let mut good = record(subject, "canonical,node", &scrubs[0].scrub_key_id);
+        //     that refused every record would satisfy every other leg.
         stamp(&mut good);
-        super::check_canonical_role_admission_over_roster_with_custody_root(
-            &backend,
-            &good,
-            &roster,
-            ca.root_der(),
-        )
-        .await
-        .expect("#659: the key the co-scrubbers NAMED still mints through the strict floor");
+        strict(good.clone())
+            .await
+            .expect("#659: the key the co-scrubbers NAMED still mints through the strict floor");
 
-        // (b) THE LIFT. A different key_id, its own pubkeys, the three
-        //     humans' signatures replayed byte-for-byte. Nothing is forged.
-        let mut lifted = record(
-            "canon-659-ATTACKER",
-            "canonical,node",
-            &scrubs[0].scrub_key_id,
-        );
+        // (b) THE NAME LIFT. A different key_id, its own pubkeys, the three
+        //     humans' signatures replayed byte-for-byte.
+        let mut lifted = attacker.clone();
         stamp(&mut lifted);
         assert_eq!(
             lifted.additional_scrubs, good.additional_scrubs,
@@ -13363,41 +13550,90 @@ mod canonical_gate_tests {
             lifted.pubkey_ed25519_base64, good.pubkey_ed25519_base64,
             "#659: and the lifted record carries the ATTACKER's own pubkey"
         );
-        let err = super::check_canonical_role_admission_over_roster_with_custody_root(
-            &backend,
-            &lifted,
-            &roster,
-            ca.root_der(),
-        )
-        .await
-        .expect_err(
-            "#659: a co-scrub for one key must NOT confer `canonical` on another — this is the \
-             only door a trust root enters through",
+        let msg = format!(
+            "{}",
+            strict(lifted).await.expect_err(
+                "#659: a co-scrub for one key must NOT confer `canonical` on another — this is \
+                 the only door a trust root enters through",
+            )
         );
-        let msg = format!("{err}");
         assert!(
             msg.contains(subject) && msg.contains("canon-659-ATTACKER"),
             "#659: the refusal must name BOTH the key the envelope claims and the key the row \
              is: {msg}"
         );
 
-        // (c) An envelope that names NOBODY is refused too — an optional check
-        //     would be skippable by omission, which is the whole attack.
-        let mut anonymous = record("canon-659-anon", "canonical,node", &scrubs[0].scrub_key_id);
-        stamp(&mut anonymous);
-        anonymous.registration_envelope = serde_json::json!({ "not_a_key_id": subject });
-        let err = super::check_canonical_role_admission_over_roster_with_custody_root(
-            &backend,
-            &anonymous,
-            &roster,
-            ca.root_der(),
-        )
-        .await
-        .expect_err("#659: an envelope with no `key_id` confers on whatever it is pasted onto");
-        assert!(
-            format!("{err}").contains("no `key_id`"),
-            "#659: the refusal says the envelope named no subject: {err}"
+        // (c) THE RACE, CLASSICAL LEG. The victim's NAME with the attacker's
+        //     Ed25519 key — what a node that has not yet replicated the
+        //     victim's row would accept, because there is no collision for
+        //     `put_public_key` to refuse. The name binding passes here; only
+        //     the pubkey binding stops it.
+        let mut key_swap = good.clone();
+        key_swap
+            .pubkey_ed25519_base64
+            .clone_from(&attacker.pubkey_ed25519_base64);
+        assert_eq!(
+            key_swap.key_id, good.key_id,
+            "#659(c): the NAME is the victim's — the half a name-only binding would wave through"
         );
+        let msg = format!(
+            "{}",
+            strict(key_swap).await.expect_err(
+                "#659(c): the co-scrub names a SUBJECT, not a string — an attacker who takes the \
+                 victim's key_id on an unreplicated node must not inherit the ceremony",
+            )
+        );
+        assert!(
+            msg.contains("pubkey_ed25519_base64") && msg.contains("CIRISPersist#659"),
+            "#659(c): the refusal must name the field that disagreed and the gate: {msg}"
+        );
+
+        // (d) THE RACE, PQC LEG. Same name, same Ed25519 key, an ML-DSA-65 key
+        //     substituted where the co-scrubbers signed for NONE. Binding only
+        //     the classical leg would leave exactly this substitutable — the
+        //     same defect one field over, on the half meant to survive a
+        //     quantum adversary.
+        let mut pqc_swap = good.clone();
+        pqc_swap.pubkey_ml_dsa_65_base64 = Some(a_pqc);
+        assert_eq!(
+            (&pqc_swap.key_id, &pqc_swap.pubkey_ed25519_base64),
+            (&good.key_id, &good.pubkey_ed25519_base64),
+            "#659(d): name AND classical leg agree — ONLY the PQC leg differs"
+        );
+        let msg = format!(
+            "{}",
+            strict(pqc_swap).await.expect_err(
+                "#659(d): a bound `null` is an assertion of ABSENCE, not a hole — substituting a \
+                 PQC key the accord never signed for must be refused",
+            )
+        );
+        assert!(
+            msg.contains("pubkey_ml_dsa_65_base64") && msg.contains("CIRISPersist#659"),
+            "#659(d): the refusal must name the PQC leg: {msg}"
+        );
+
+        // (e) ABSENCE IS A REFUSAL, per bound field. An optional check is
+        //     skippable by omission, which is the whole attack — and a
+        //     tolerated absence is how the name binding got left half-done.
+        for missing in ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"] {
+            let mut partial = good.clone();
+            partial
+                .registration_envelope
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            let msg = format!(
+                "{}",
+                strict(partial).await.expect_err(
+                    "#659(e): an envelope that does not bind every subject field confers on \
+                     whatever it is pasted onto",
+                )
+            );
+            assert!(
+                msg.contains(&format!("does not bind {missing}")),
+                "#659(e): the refusal must name the ABSENT binding {missing}: {msg}"
+            );
+        }
     }
 
     /// v21.3.0 (CIRISPersist#513) — the grandfather matcher covers exactly
@@ -13434,12 +13670,20 @@ mod canonical_gate_tests {
             seed[i] = b;
         }
         let ed = SigningKey::from_bytes(&seed);
-        let envelope = serde_json::json!({ "key_id": key_id });
+        let pubkey_ed25519_base64 = B64.encode(ed.verifying_key().to_bytes());
+        // v31.0.0 (CIRISPersist#659) — the envelope BINDS the subject, through
+        // the same projection the co-scrub gate checks with. A fixture that
+        // minted a subject-blind envelope would be testing a shape the gate
+        // now refuses outright, and every conferral witness below would fail
+        // for the wrong reason.
+        let mut envelope = serde_json::json!({});
+        super::bind_subject_into_envelope(&mut envelope, key_id, &pubkey_ed25519_base64, None)
+            .expect("#659 subject binding");
         let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");
         let now = chrono::Utc::now();
         KeyRecord {
             key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: B64.encode(ed.verifying_key().to_bytes()),
+            pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64: None,
             algorithm: algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
@@ -13505,6 +13749,8 @@ mod canonical_gate_tests {
             signed_canonical_record(
                 "g1",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("g1"),
                 &[&founders[0], &founders[1]],
             ),
@@ -13515,7 +13761,14 @@ mod canonical_gate_tests {
 
         // (2) REFUSED: exactly ONE scrub (1-of-N is retired). Error cites m-of-n.
         let err = gate(
-            signed_canonical_record("g2", "canonical,node", env("g2"), &[&founders[0]]),
+            signed_canonical_record(
+                "g2",
+                "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                env("g2"),
+                &[&founders[0]],
+            ),
             roster.clone(),
         )
         .await
@@ -13531,8 +13784,14 @@ mod canonical_gate_tests {
         //     primitive cryptographically verifies each sig, so the forged one
         //     does NOT count → 1 < 2 → REFUSED. Counting claimed scrub_key_ids
         //     without verifying would WRONGLY admit this.
-        let mut forged =
-            signed_canonical_record("g3", "canonical,node", env("g3"), &[&founders[0]]);
+        let mut forged = signed_canonical_record(
+            "g3",
+            "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env("g3"),
+            &[&founders[0]],
+        );
         forged.additional_scrubs = vec![ScrubSig {
             scrub_key_id: founders[1].key_id.clone(),
             scrub_signature_classical: B64.encode([0u8; 64]),
@@ -13549,6 +13808,8 @@ mod canonical_gate_tests {
             signed_canonical_record(
                 "g4",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("g4"),
                 &[&founders[0], &founders[0]],
             ),
@@ -13563,7 +13824,14 @@ mod canonical_gate_tests {
         //     counts → REFUSED. A node cannot bootstrap itself into the set.
         let me_self = Identity::new("g5");
         let err = gate(
-            signed_canonical_record("g5", "canonical,node", env("g5"), &[&me_self, &founders[0]]),
+            signed_canonical_record(
+                "g5",
+                "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                env("g5"),
+                &[&me_self, &founders[0]],
+            ),
             roster.clone(),
         )
         .await
@@ -13588,6 +13856,8 @@ mod canonical_gate_tests {
             signed_canonical_record(
                 "g7",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("g7"),
                 &[&founders[0], &founders[1]],
             ),
@@ -13611,6 +13881,8 @@ mod canonical_gate_tests {
             signed_canonical_record(
                 "g8",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("g8"),
                 &[&founders[0], &founders[1]],
             ),
@@ -13624,6 +13896,8 @@ mod canonical_gate_tests {
             signed_canonical_record(
                 "g8b",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("g8b"),
                 &[&founders[0], &founders[1], &f3],
             ),
@@ -13641,6 +13915,8 @@ mod canonical_gate_tests {
             record: signed_canonical_record(
                 &store,
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env(&store),
                 &[&founders[0], &founders[1]],
             ),
@@ -13683,6 +13959,8 @@ mod canonical_gate_tests {
             record: signed_canonical_record(
                 &good,
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 good_env,
                 &[&accord[0], &accord[1]],
             ),
@@ -13700,6 +13978,8 @@ mod canonical_gate_tests {
                 record: signed_canonical_record(
                     &fresh,
                     "canonical,node",
+                    PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
                     serde_json::json!({ "key_id": fresh }),
                     &[&accord[0], &accord[1]],
                 ),
@@ -13738,6 +14018,8 @@ mod canonical_gate_tests {
                 record: signed_canonical_record(
                     &one,
                     "canonical,node",
+                    PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
                     serde_json::json!({"key_id": one}),
                     &[&accord[0]],
                 ),
@@ -13812,8 +14094,14 @@ mod canonical_gate_tests {
             "2026-07-11T00:00:00+00:00",
         );
         let two = [&founders[0], &founders[1]];
-        let existing =
-            signed_canonical_record("canon-1", "canonical,node", env_at("canon-1", t0), &two);
+        let existing = signed_canonical_record(
+            "canon-1",
+            "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env_at("canon-1", t0),
+            &two,
+        );
 
         let check = |record| {
             let dir = &dir;
@@ -13831,6 +14119,8 @@ mod canonical_gate_tests {
             check(signed_canonical_record(
                 "canon-1",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env_at("canon-1", t1),
                 &two
             ))
@@ -13843,6 +14133,8 @@ mod canonical_gate_tests {
             !check(signed_canonical_record(
                 "canon-1",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env_at("canon-1", t_minus),
                 &two
             ))
@@ -13854,6 +14146,8 @@ mod canonical_gate_tests {
             !check(signed_canonical_record(
                 "canon-1",
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env_at("canon-1", t1),
                 &[&founders[0]]
             ))
@@ -13865,6 +14159,8 @@ mod canonical_gate_tests {
             !check(signed_canonical_record(
                 "canon-1",
                 "node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env_at("canon-1", t1),
                 &two
             ))
@@ -13956,6 +14252,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i1",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i1"),
                 &[&founders[0], &founders[1]],
             )),
@@ -13969,6 +14267,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i2",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i2"),
                 &[&founders[0]],
             )),
@@ -13987,6 +14287,8 @@ mod canonical_gate_tests {
         let mut forged = with_infra_role(signed_canonical_record(
             "i3",
             identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             env("i3"),
             &[&founders[0]],
         ));
@@ -14005,6 +14307,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i4",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i4"),
                 &[&founders[0], &founders[0]],
             )),
@@ -14021,6 +14325,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i5",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i5"),
                 &[&me_self, &founders[0]],
             )),
@@ -14051,6 +14357,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i7",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i7"),
                 &[&founders[0], &founders[1]],
             )),
@@ -14063,6 +14371,8 @@ mod canonical_gate_tests {
             with_infra_role(signed_canonical_record(
                 "i7b",
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env("i7b"),
                 &[&founders[0], &founders[1], &f3],
             )),
@@ -14090,6 +14400,8 @@ mod canonical_gate_tests {
             record: with_infra_role(signed_canonical_record(
                 &good,
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 serde_json::json!({ "key_id": good }),
                 &[&accord[0], &accord[1]],
             )),
@@ -14114,6 +14426,8 @@ mod canonical_gate_tests {
                 record: with_infra_role(signed_canonical_record(
                     &one,
                     identity_type::NODE,
+                    PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
                     serde_json::json!({ "key_id": one }),
                     &[&accord[0]],
                 )),
@@ -14436,6 +14750,8 @@ mod canonical_gate_tests {
         let reg = signed_canonical_record(
             &reg_kid,
             "node,registry",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             env(&reg_kid),
             &[&accord[0], &accord[1]],
         );
@@ -14475,7 +14791,14 @@ mod canonical_gate_tests {
         let kid = format!("cs3-{tag}");
         let err = put(
             dir,
-            signed_canonical_record(&kid, "node,registry", env(&kid), &[&accord[0]]),
+            signed_canonical_record(
+                &kid,
+                "node,registry",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                env(&kid),
+                &[&accord[0]],
+            ),
         )
         .await
         .expect_err("(3) a single-scrub registry claim must be REFUSED");
@@ -14490,6 +14813,8 @@ mod canonical_gate_tests {
         let re_offer = signed_canonical_record(
             &reg_kid,
             "node,registry",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             env(&reg_kid),
             &[&accord[0], &accord[1]],
         );
@@ -14573,7 +14898,9 @@ mod canonical_gate_tests {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod canonical_withdrawal_tests {
     use super::super::accord_quorum::test_fixtures::signed_participation;
-    use super::super::operational::test_support::{signed_canonical_record, Identity};
+    use super::super::operational::test_support::{
+        signed_canonical_record, Identity, PLACEHOLDER_SUBJECT_ED25519_BASE64,
+    };
     use super::super::types::{algorithm, identity_type};
     use super::super::{FederationDirectory, KeyRecord, SignedKeyRecord};
     use super::{
@@ -14599,12 +14926,20 @@ mod canonical_withdrawal_tests {
             seed[i] = b;
         }
         let ed = SigningKey::from_bytes(&seed);
-        let envelope = serde_json::json!({ "key_id": key_id });
+        let pubkey_ed25519_base64 = B64.encode(ed.verifying_key().to_bytes());
+        // v31.0.0 (CIRISPersist#659) — the envelope BINDS the subject, through
+        // the same projection the co-scrub gate checks with. A fixture that
+        // minted a subject-blind envelope would be testing a shape the gate
+        // now refuses outright, and every conferral witness below would fail
+        // for the wrong reason.
+        let mut envelope = serde_json::json!({});
+        super::bind_subject_into_envelope(&mut envelope, key_id, &pubkey_ed25519_base64, None)
+            .expect("#659 subject binding");
         let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");
         let now = chrono::Utc::now();
         KeyRecord {
             key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: B64.encode(ed.verifying_key().to_bytes()),
+            pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64: None,
             algorithm: algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
@@ -14729,6 +15064,8 @@ mod canonical_withdrawal_tests {
             signed_canonical_record(
                 &good,
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env(&good),
                 &[&accord[0], &accord[1]],
             ),
@@ -14759,6 +15096,8 @@ mod canonical_withdrawal_tests {
                 record: signed_canonical_record(
                     &new,
                     "canonical,node",
+                    PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
                     env(&new),
                     &[&accord[0], &accord[1]],
                 ),
@@ -14801,6 +15140,8 @@ mod canonical_withdrawal_tests {
                 record: signed_canonical_record(
                     &new,
                     "canonical,node",
+                    PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
                     env(&new),
                     &[&accord[0], &accord[1]],
                 ),
@@ -15012,6 +15353,8 @@ mod canonical_withdrawal_tests {
             &signed_canonical_record(
                 &ex_succ,
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env(&ex_succ),
                 &[&accord[0], &accord[1]],
             ),
@@ -15025,6 +15368,8 @@ mod canonical_withdrawal_tests {
             &signed_canonical_record(
                 &ex_old,
                 "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env(&ex_old),
                 &[&accord[0], &accord[1]],
             ),
@@ -15123,16 +15468,28 @@ mod canonical_withdrawal_tests {
         // K EVEN with a valid 2-of-3 scrub set — the consult runs FIRST
         // (revocation-wins), so the withdrawal (not a quorum shortfall) is the
         // rejection cause.
-        let rec =
-            signed_canonical_record("K", "canonical,node", env("K"), &[&accord[0], &accord[1]]);
+        let rec = signed_canonical_record(
+            "K",
+            "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env("K"),
+            &[&accord[0], &accord[1]],
+        );
         let err = super::check_canonical_role_admission_over_roster_legacy(dir, &rec, &roster)
             .await
             .expect_err("withdrawn key cannot be re-conferred canonical");
         assert_eq!(err.kind(), "canonical_role_withdrawn");
 
         // A NON-withdrawn key with a valid 2-of-3 scrub set passes the gate.
-        let ok =
-            signed_canonical_record("J", "canonical,node", env("J"), &[&accord[0], &accord[1]]);
+        let ok = signed_canonical_record(
+            "J",
+            "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env("J"),
+            &[&accord[0], &accord[1]],
+        );
         super::check_canonical_role_admission_over_roster_legacy(dir, &ok, &roster)
             .await
             .expect("non-withdrawn 2-of-3 canonical passes the gate");
@@ -15143,8 +15500,14 @@ mod canonical_withdrawal_tests {
         dir.record_canonical_withdrawal("S", Some("S"), "digest-2")
             .await
             .expect("self-superseded tombstone");
-        let rec_s =
-            signed_canonical_record("S", "canonical,node", env("S"), &[&accord[0], &accord[1]]);
+        let rec_s = signed_canonical_record(
+            "S",
+            "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env("S"),
+            &[&accord[0], &accord[1]],
+        );
         super::check_canonical_role_admission_over_roster_legacy(dir, &rec_s, &roster)
             .await
             .expect("a superseded-to-self key is exempt from the withdrawal block");
@@ -15197,6 +15560,8 @@ mod canonical_withdrawal_tests {
             with_infra(signed_canonical_record(
                 &ci,
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 env(&ci),
                 &[&accord[0], &accord[1]],
             )),
@@ -15252,6 +15617,8 @@ mod canonical_withdrawal_tests {
         let re_offer = with_infra(signed_canonical_record(
             &ci,
             identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             env(&ci),
             &[&accord[0], &accord[1]],
         ));
@@ -15298,6 +15665,8 @@ mod canonical_withdrawal_tests {
         let rot_offer = with_infra(signed_canonical_record(
             &rot,
             identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             env(&rot),
             &[&accord[0], &accord[1]],
         ));

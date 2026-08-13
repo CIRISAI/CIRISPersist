@@ -19541,6 +19541,19 @@ mod accord_tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
+    /// real `put_public_key` chokepoint, on sqlite.
+    #[tokio::test]
+    async fn coscrub_subject_binding_sqlite_659() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_coscrub_subject_binding(
+            &backend, "sq659",
+        )
+        .await
+        .expect("659 subject-binding exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on sqlite.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_sqlite_548() {

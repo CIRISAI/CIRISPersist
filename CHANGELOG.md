@@ -241,7 +241,7 @@ the write door already resolved authority for. The third arm is why this is not
 simply *"compare attesters like the siblings do"* — the siblings model §6.1
 self-retraction only, and narrowing this fold to that would drop the subject-side
 and proxy revocations it exists to see.
-### Fixed — one accord co-scrub conferred `canonical` on ANY key_id — the ceremony never named its subject (#659)
+### Fixed — BREAKING — one accord co-scrub conferred `canonical` on ANY key_id, carrying ANY pubkeys — the ceremony never named its subject (#659)
 
 Found while closing #658; the same defect one plane over, on the plane where it
 is worst. **TESTED against the STRICT gate** — withdrawal-wins plus the #513
@@ -254,6 +254,19 @@ PROBE RESULT for key_id=canon-probe-ATTACKER envelope={"key_id":"canon-probe-vic
 Three FIPS-certified, touch-required, distinct `MockYubicoCa` members co-scrubbed
 an envelope naming one key. Their signatures, lifted verbatim onto a record with
 a different `key_id` and the **attacker's own pubkeys**, returned `Ok(())`.
+
+The same lift now, through the real `put_public_key` door — the accord's
+signatures are still real and still verify; what fails is the question nobody
+was asking:
+
+```
+the co-scrubbed registration_envelope binds pubkey_ed25519_base64 =
+"OuX9IebT7XYQFfir4CN/YNxoWevvAKEM0GO10swd74Q=", but this record carries
+"GGVMVyBOXU3GgaWIvSjHeZGG4vOrOUCw9Sl3XkG4nwQ=" (key_id "v659-mem659"). The
+accord quorum verifies over those envelope bytes and NOTHING else, so honouring
+this would confer the role on a subject the co-scrubbers never named
+(CIRISPersist#659)
+```
 
 `verify_accord_family_coscrub_with` verifies m-of-n over
 `ceg_produce_canonicalize(registration_envelope)` and nothing tied those bytes to
@@ -268,27 +281,120 @@ This is the only door `canonical`, `infra:attest`, the co-steward roles and ever
 humans and calls it "costly-but-possible"; unbound, that price bought an
 unbounded number of trust roots.
 
-- A **REQUIRED, EQUAL** `key_id` inside `registration_envelope`, checked once in
-  the shared co-scrub core so every conferral gate inherits it. Required rather
-  than checked-if-present: an optional check is skippable by omission, which is
-  the whole attack.
-- **Costs nothing.** Every real artifact already satisfies it — the baked genesis
-  canonical and the A1/B1/C1 accord holders all carry `key_id` (with `algorithm`,
-  `identity_type` and both pubkeys) inside `registration_envelope`. The full
-  sqlite suite is green, unchanged, with the gate in place.
-- Witness `coscrub_confers_only_on_the_key_it_names_659`, both directions plus
-  the omission case, over real quorum crypto and fabricated FIPS custody.
-- **Still open, and it is an operator call within this window:** the gate binds
-  the subject's NAME, not the subject's PUBKEYS. The residual is a race — on a
-  node that has not yet replicated the victim's row, an attacker registers the
-  victim's `key_id` carrying their own pubkeys and the co-scrub confers.
-  Binding the pubkeys closes it; measured cost is 21 in-repo fixture failures
-  and a shape change to `test_support::signed_canonical_record`, which is
-  exported under `test-anchor` to the downstream mesh sims. Whether it is
-  BREAKING depends on producers this repo cannot inspect: both real artifacts
-  already carry the pubkeys, so for a conformant ceremony it is a tightening —
-  but if any producer omits them it is a preimage change, and therefore this cut
-  or never. See #659.
+**THE REMEDY BINDS THE WHOLE SUBJECT — name AND both pubkeys.** A
+`registration_envelope` reaching the accord co-scrub quorum core must carry, as
+REQUIRED fields equal to the row's own columns:
+
+| bound field | why |
+| --- | --- |
+| `key_id` | the NAME — closes "one ceremony, any key_id" |
+| `pubkey_ed25519_base64` | the classical leg of the hybrid identity |
+| `pubkey_ml_dsa_65_base64` | the PQC leg; JSON `null` when the row has none |
+
+- **REQUIRED, not checked-if-present.** An absent field is a refusal. An optional
+  check is skippable by omission, which is the whole attack — and a tolerated
+  absence is exactly how the name binding got left half-done for one release.
+  There is no legacy regime in v31 (the standing decision on #598, #640, #643).
+- **Why the pubkeys and not the name alone.** Binding the name leaves a real
+  race, not a theoretical one. On a node that has **not yet replicated the
+  victim's row** there is no collision for `put_public_key` to refuse: the
+  attacker registers `key_id = V` carrying their OWN pubkeys, the co-scrub
+  confers, and that node's trust root is attacker-controlled. Replication
+  ordering across the mesh is arbitrary and the gate also runs in anti-entropy,
+  so a hostile peer can enter the race deliberately. A name-only binding attests
+  *"the holder of key_id V may be canonical"* while the row asserting WHICH KEY
+  that is stays unbound.
+- **Both legs or neither.** Binding only the classical half leaves the PQC half
+  substitutable — the same defect one field over, on the half meant to survive a
+  quantum adversary. A row with no ML-DSA key binds `null`, which is an
+  assertion of ABSENCE and not a hole: substituting a PQC key the accord never
+  signed for is refused by the `null` exactly as by a differing string.
+- **One spelling.** The projection lives once, in
+  `admission::subject_binding`. The producing side
+  (`admission::bind_subject_into_envelope`, called by
+  `test_support::signed_canonical_record` and `test_support::accord_conferred`)
+  and the checking side (`admission::verify_envelope_binds_subject`, called
+  FIRST in the co-scrub core, before a single roster lookup — every other step
+  there is a question about the SIGNERS, and asking this one first also makes
+  the refusal deterministic regardless of roster state) both derive the field
+  set and its values from there. Two spellings of one projection is this
+  release's signature defect — it produced #643, #598 and #652.
+- **Cost for a conformant ceremony: a tightening, not a preimage change.** Both
+  real in-repo artifacts already carry all three fields byte-equal to their own
+  columns — `genesis/canonical_seed.json` and the A1/B1/C1 holders in
+  `genesis/accord_holder_seed.json`. For a producer whose envelope omits them it
+  IS a preimage change, and that is why it lands in this cut: v31 already forces
+  a fresh genesis, and after 31.1.0 bakes the new portable trust root, changing
+  this preimage would mean a second ceremony against a live federation.
+- Witnesses: `coscrub_confers_only_on_the_key_it_names_659` (the strict
+  canonical gate — withdrawal-wins, the #513 ≥3-FIPS floor, real quorum crypto,
+  fabricated hardware custody) with five legs — the control mints, the name
+  lift, the classical-leg race, the PQC-leg race, and each bound field removed
+  in turn; plus `coscrub_subject_binding_{memory,sqlite,postgres}_659`, the same
+  five legs driven through the real `put_public_key` chokepoint on **all three
+  backends**, because a write gate witnessed on one backend is a write gate
+  shipped on one backend (#518/#543).
+- **Mutation-tested, 13/13 killed** — every kill keyed off nextest's SUMMARY
+  line, never off the `error: test run failed` epilogue that every failing run
+  prints. Two mutations SURVIVED the first campaign and both were real holes in
+  the witnesses, not false alarms: a producer that only filled MISSING binding
+  fields (a caller's hostile `key_id` would have ridden into the signed bytes),
+  and `test_support::accord_conferred` with its binding deleted (its callers all
+  carry `DelegatedFromTrustRoot` types today, so nothing reached the gate to
+  notice). Both now have witnesses, and both die.
+- **Fixture cost, measured rather than assumed.** With the gate added and the
+  producers left alone, 27 tests fail — 23 pre-existing fixtures plus this cut's
+  own witnesses. With the producers binding through the shared projection, the
+  cost is **zero**: 1932/1932 on sqlite, 2319/2319 on postgres+sqlite.
+- **The ELEVATION channel closes with it.** A plain `node`/`agent` row's
+  `key_id` is still not bound to its own single-scrub `registration_envelope`,
+  and the argument for leaving that alone was "such a row confers nothing".
+  That argument is incomplete on its own terms — a plain row CAN become the
+  subject of a conferral, through `adopt_scrub_upgrade` (self-signed → anchored)
+  and through the role-gated Insert branch of `apply_replicated_key_record`,
+  which skips `verify_key_registration` for exactly the privileged records and
+  leaves the accord co-scrub as their ONLY cryptographic proof. What closes the
+  channel is this binding rather than that one: elevation now requires an accord
+  envelope binding the row's ACTUAL pubkeys, which on an unreplicated node are
+  the attacker's and which the accord never signed for. As a side effect
+  `adopt_genesis_reanchor` — which pins Ed25519 in its `WHERE` but has
+  `pubkey_ml_dsa_65_base64` in its `SET` — can no longer swap a canonical's PQC
+  half.
+
+#### BREAKING for downstream mesh simulations — `test_support` signature change
+
+`operational::test_support::signed_canonical_record` and
+`signed_canonical_record_with_roles` are exported under the `test-anchor`
+feature to the CIRISServer / CIRISAgent mesh sims. Both now take the subject's
+pubkeys, immediately after `identity_type`:
+
+```rust
+// v30
+signed_canonical_record(key_id, identity_type, envelope, scrubbers)
+// v31
+signed_canonical_record(key_id, identity_type, pubkey_ed25519_base64,
+                        pubkey_ml_dsa_65_base64, envelope, scrubbers)
+```
+
+and they stamp the subject binding into `envelope` before signing it, leaving
+every other field of the caller's envelope untouched.
+
+- **Mechanical update:** insert `PLACEHOLDER_SUBJECT_ED25519_BASE64, None,` (the
+  constant is newly exported, and is the `[7u8; 32]` placeholder the helper
+  hardcoded before) to keep a record's columns byte-for-byte as they were.
+- **The one call shape that must change for real:** a sim that OVERWROTE
+  `record.pubkey_ed25519_base64` / `pubkey_ml_dsa_65_base64` after the call must
+  pass the keys through the helper instead. Post-hoc mutation now leaves the
+  co-scrubbed envelope binding a subject the row is not, and the gate refuses
+  it — correctly. One in-repo fixture did exactly this
+  (`exercise_ceremony_plane_capability_walk`) and was fixed the same way.
+- **Why the signature moved rather than staying silent.** The helper minted ONE
+  hardcoded placeholder pubkey for every record. That was harmless while the
+  pubkeys were decorative; #659 makes them the subject of the conferral, so a
+  helper that cannot express two subjects with different keys cannot express
+  the attack — and therefore cannot witness the fix. A loud compile break is
+  also the correct signal for a preimage change: it forces a look at every call
+  site, which a silent behaviour change would not.
 
 ### Fixed — BREAKING — one signed operational envelope could be installed at unboundedly many primary keys (#658)
 

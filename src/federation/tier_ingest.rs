@@ -488,6 +488,12 @@ pub(crate) mod test_support {
     /// the key_id over a `0x11` fill. Same shape as
     /// `register.rs::tests::signed_self_record`, so the two test corpora
     /// stay coherent.
+    /// **Truncates at 32 bytes.** Two `key_id`s sharing a 32-byte prefix are
+    /// therefore the SAME identity here — a real trap for a test that builds
+    /// ids as `{long_tag}-victim` / `{long_tag}-attacker` and then believes it
+    /// has two subjects. Put the distinguishing part FIRST, and assert the
+    /// pubkeys differ (CIRISPersist#659 hit exactly this, on postgres only,
+    /// where the tag carries a uuid).
     fn seed_for(key_id: &str) -> [u8; 32] {
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {

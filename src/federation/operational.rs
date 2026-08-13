@@ -1541,14 +1541,54 @@ pub mod test_support {
     /// (`verify_quorum_policy`) counts it. Pass the accord-holder `Identity`s as
     /// `scrubbers` (2 distinct for a 2-of-3 admit). `envelope` lets a test embed
     /// e.g. a `transport_hints` array (the bootstrap-dial-set surface).
+    ///
+    /// # v31.0.0 (CIRISPersist#659) — BREAKING: the subject is now BOUND
+    ///
+    /// The helper stamps the subject's `key_id` and BOTH pubkeys into
+    /// `envelope` before canonicalizing and signing it, through the one shared
+    /// [`crate::federation::admission::bind_subject_into_envelope`] — the same
+    /// projection the co-scrub gate checks with, so a record this helper builds
+    /// is conformant by construction and a caller cannot write the binding
+    /// wrong. Every other field of `envelope` survives untouched.
+    ///
+    /// Two changes, both deliberate:
+    ///
+    /// - a **preimage change** for any caller whose envelope did not already
+    ///   carry those three fields (the in-repo `{"key_id": k}` fixtures did
+    ///   not) — the signed bytes now differ, so records must be re-minted, not
+    ///   re-used;
+    /// - a **signature change**: the subject's pubkeys are explicit parameters.
+    ///   #659's second half is precisely that the accord signs for the
+    ///   subject's KEYS and not merely its name, and a helper that hardcoded
+    ///   ONE placeholder pubkey for every record could not express two records
+    ///   whose keys differ — i.e. could not express the attack, and so could
+    ///   not witness the fix.
+    ///
+    /// Mechanical update for downstream mesh simulations: insert
+    /// `PLACEHOLDER_SUBJECT_ED25519_BASE64, None,` after `identity_type` to
+    /// keep exactly the pre-#659 columns. A caller that used to OVERWRITE
+    /// `record.pubkey_ed25519_base64` after the call must pass the key here
+    /// instead — post-hoc mutation now (correctly) breaks the binding.
     pub fn signed_canonical_record(
         key_id: &str,
         identity_type: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
         envelope: serde_json::Value,
         scrubbers: &[&Identity],
     ) -> crate::federation::types::KeyRecord {
         use crate::federation::types::ScrubSig;
         use sha2::{Digest, Sha256};
+        // #659 — bind the subject BEFORE the bytes are formed: the accord
+        // family must sign a preimage that names the key it confers on.
+        let mut envelope = envelope;
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut envelope,
+            key_id,
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64,
+        )
+        .expect("bind the #659 subject into the registration envelope");
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
             .expect("canonicalize envelope");
         let now = chrono::Utc::now();
@@ -1567,8 +1607,8 @@ pub mod test_support {
         let first = scrub_sigs[0].clone();
         crate::federation::types::KeyRecord {
             key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: b64().encode([7u8; 32]),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+            pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.map(str::to_owned),
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: key_id.to_owned(),
@@ -1602,17 +1642,45 @@ pub mod test_support {
     /// them with [`register_accord_holder`], then read back with
     /// [`crate::federation::admission::has_accord_conferred_role_over_roster`] over
     /// their key_ids.
+    ///
+    /// v31.0.0 (CIRISPersist#659) — takes the subject's pubkeys for the same
+    /// reason [`signed_canonical_record`] does, and in the same position; see
+    /// that helper's BREAKING note.
     pub fn signed_canonical_record_with_roles(
         key_id: &str,
         identity_type: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
         roles: Vec<String>,
         envelope: serde_json::Value,
         scrubbers: &[&Identity],
     ) -> crate::federation::types::KeyRecord {
-        let mut rec = signed_canonical_record(key_id, identity_type, envelope, scrubbers);
+        let mut rec = signed_canonical_record(
+            key_id,
+            identity_type,
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64,
+            envelope,
+            scrubbers,
+        );
         rec.capability_roles = roles;
         rec
     }
+
+    /// v31.0.0 (CIRISPersist#659) — the subject Ed25519 pubkey
+    /// [`signed_canonical_record`] hardcoded for EVERY record it minted before
+    /// the subject binding landed (32 bytes of `0x07`, base64).
+    ///
+    /// Exported so a downstream mesh simulation's update is a two-token
+    /// insertion that preserves its records' columns byte-for-byte. It is a
+    /// PLACEHOLDER, not a key: no private half exists, so a record carrying it
+    /// can never sign anything, and two records carrying it are the SAME
+    /// identity as far as the #659 binding is concerned. A simulation that
+    /// needs distinct canonicals must now pass distinct keys — which is the
+    /// point of binding the pubkeys at all, and the reason this could not stay
+    /// a hidden constant.
+    pub const PLACEHOLDER_SUBJECT_ED25519_BASE64: &str =
+        "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
     /// v18.3.0 (CIRISPersist#484) — register `holder`'s PINNED hybrid
     /// pubkeys as a directory row so the accord roster resolves to keys the
@@ -1743,6 +1811,8 @@ pub mod test_support {
         let record = signed_canonical_record_with_roles(
             key_id,
             crate::federation::types::identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             roles.iter().map(|r| (*r).to_owned()).collect(),
             json!({ "key_id": key_id, "conferred_by": family_tag }),
             &[&holders[0], &holders[1]],
@@ -1844,6 +1914,18 @@ pub mod test_support {
         use crate::federation::types::ScrubSig;
         use sha2::{Digest, Sha256};
         assert!(!scrubbers.is_empty(), "at least one scrubber required");
+        // v31.0.0 (CIRISPersist#659) — the SECOND producer of co-scrubbed
+        // records, and therefore the second place the subject has to be bound.
+        // It runs through the same `bind_subject_into_envelope` the gate checks
+        // with, off the record's OWN key_id and pubkeys, so a fixture cannot
+        // hand the accord family a preimage that names somebody else.
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut record.registration_envelope,
+            &record.key_id,
+            &record.pubkey_ed25519_base64,
+            record.pubkey_ml_dsa_65_base64.as_deref(),
+        )
+        .expect("bind the #659 subject into the registration envelope");
         let bytes =
             crate::verify::canonical::ceg_produce_canonicalize(&record.registration_envelope)
                 .expect("canonicalize registration_envelope");
@@ -2068,6 +2150,173 @@ pub mod test_support {
             .await
     }
 
+    /// **v31.0.0 (CIRISPersist#659) — THE UNREPLICATED-NODE RACE, at the real
+    /// write chokepoint, on every backend.**
+    ///
+    /// The admission-module witness
+    /// (`canonical_gate_tests::coscrub_confers_only_on_the_key_it_names_659`)
+    /// drives the strict canonical gate directly with fabricated hardware
+    /// custody. This one drives `put_public_key` — the door every conferral
+    /// actually arrives through — so the binding is proved where the mesh
+    /// meets it, and proved identically on memory, sqlite and postgres. Backend
+    /// asymmetry in a write gate is this repo's oldest recurring defect
+    /// (#518/#543); a gate witnessed on one backend is a gate shipped on one
+    /// backend.
+    ///
+    /// **The scenario is the residual a NAME-only binding leaves.** The victim
+    /// `V` is deliberately NEVER stored: this is a node that has not yet
+    /// replicated `V`'s row, which is the whole point. There is no collision
+    /// for `put_public_key` to refuse, `V`'s name is exactly what the accord
+    /// signed, and the ONLY thing standing between the attacker and
+    /// `infra:attest` is whether the ceremony bound `V`'s KEYS as well as `V`'s
+    /// name. Replication ordering across the mesh is arbitrary and the same
+    /// gate runs in anti-entropy, so a hostile peer can enter this race
+    /// deliberately.
+    ///
+    /// Legs: (a) the honestly-bound subject ADMITS — without it a gate that
+    /// refused everything would pass; (b) the name lift; (c) the classical-leg
+    /// substitution; (d) the PQC-leg substitution, because binding one leg of a
+    /// hybrid identity leaves the other substitutable; (e) each bound field
+    /// removed in turn, because an optional check is skippable by omission.
+    pub async fn exercise_coscrub_subject_binding(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::types::{roles, SignedKeyRecord};
+
+        let holders = register_genesis_accord_roster(directory).await?;
+        let scrubbers = [&holders[0], &holders[1]];
+
+        // Two REAL, DISTINCT hybrid identities. Distinct keys are the point:
+        // the pre-#659 helper minted one placeholder pubkey for every record,
+        // which could not express two subjects at all.
+        //
+        // The distinguishing part goes FIRST. `hybrid_pubkeys` seeds from the
+        // key_id TRUNCATED TO 32 BYTES, and the postgres tag is a 38-char
+        // uuid-suffixed string — so `{tag}-victim` and `{tag}-attacker` seed
+        // IDENTICALLY and this whole witness would have been vacuous on the one
+        // backend production runs. Caught by the assertion below, which is why
+        // it is there.
+        let victim = format!("v659-{tag}");
+        let attacker = format!("a659-{tag}");
+        let (v_ed, v_pqc) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(&victim);
+        let (a_ed, a_pqc) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(&attacker);
+        assert_ne!(v_ed, a_ed, "({tag}) #659: the two subjects must differ");
+        assert_ne!(v_pqc, a_pqc, "({tag}) #659: …on BOTH hybrid legs");
+
+        let conferral = |key_id: &str, ed: &str, pqc: Option<&str>| {
+            signed_canonical_record_with_roles(
+                key_id,
+                crate::federation::types::identity_type::NODE,
+                ed,
+                pqc,
+                vec![roles::INFRA_ATTEST.to_owned()],
+                json!({ "purpose": "the #659 conferral ceremony" }),
+                &scrubbers,
+            )
+        };
+
+        // (a) THE CONTROL — an honestly co-scrubbed, honestly bound subject
+        //     takes `infra:attest` through the real door.
+        let admitted = format!("ok659-{tag}");
+        let (ok_ed, ok_pqc) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&admitted);
+        directory
+            .put_public_key(SignedKeyRecord {
+                record: conferral(&admitted, &ok_ed, ok_pqc.as_deref()),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({tag}) #659(a): a conferral whose envelope binds its own subject must still \
+                     admit — a gate that refuses everything proves nothing: {e}"
+                )
+            });
+
+        // The ceremony the accord actually performed, for the victim. Never
+        // stored — the node has not replicated it.
+        let ceremony = conferral(&victim, &v_ed, v_pqc.as_deref());
+
+        // Replay it verbatim onto `rec`. The attacker forges nothing: these are
+        // the holders' real signatures over the holders' real preimage.
+        let lift = |mut rec: crate::federation::types::KeyRecord| {
+            rec.registration_envelope = ceremony.registration_envelope.clone();
+            rec.original_content_hash
+                .clone_from(&ceremony.original_content_hash);
+            rec.scrub_key_id.clone_from(&ceremony.scrub_key_id);
+            rec.scrub_signature_classical
+                .clone_from(&ceremony.scrub_signature_classical);
+            rec.scrub_signature_pqc
+                .clone_from(&ceremony.scrub_signature_pqc);
+            rec.additional_scrubs
+                .clone_from(&ceremony.additional_scrubs);
+            rec
+        };
+
+        let refused =
+            |rec: crate::federation::types::KeyRecord, leg: &'static str, needle: String| {
+                let tag = tag.to_owned();
+                async move {
+                    let err = directory
+                        .put_public_key(SignedKeyRecord { record: rec })
+                        .await
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!(
+                            "({tag}) #659{leg}: the accord co-scrub must confer on the SUBJECT it \
+                             named, not on whatever record its signatures are pasted onto"
+                        )
+                        });
+                    let msg = format!("{err}");
+                    assert!(
+                    msg.contains(&needle) && msg.contains("CIRISPersist#659"),
+                    "({tag}) #659{leg}: the refusal must name the disagreeing binding {needle:?} \
+                     and the gate: {msg}"
+                );
+                }
+            };
+
+        // (b) THE NAME LIFT — a different key_id entirely.
+        refused(
+            lift(conferral(&attacker, &a_ed, a_pqc.as_deref())),
+            "(b)",
+            victim.clone(),
+        )
+        .await;
+
+        // (c) THE RACE, CLASSICAL LEG — the victim's NAME, the attacker's
+        //     Ed25519 key. The name binding waves this through; only the pubkey
+        //     binding stops it.
+        refused(
+            lift(conferral(&victim, &a_ed, v_pqc.as_deref())),
+            "(c)",
+            "pubkey_ed25519_base64".to_owned(),
+        )
+        .await;
+
+        // (d) THE RACE, PQC LEG — name and classical key both the victim's,
+        //     ONLY the ML-DSA-65 half swapped.
+        refused(
+            lift(conferral(&victim, &v_ed, a_pqc.as_deref())),
+            "(d)",
+            "pubkey_ml_dsa_65_base64".to_owned(),
+        )
+        .await;
+
+        // (e) ABSENCE IS A REFUSAL, per bound field.
+        for missing in ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"] {
+            let mut partial = conferral(&victim, &v_ed, v_pqc.as_deref());
+            partial
+                .registration_envelope
+                .as_object_mut()
+                .expect("the conferral envelope is an object")
+                .remove(missing);
+            refused(partial, "(e)", format!("does not bind {missing}")).await;
+        }
+
+        Ok(())
+    }
+
     /// **CIRISPersist#548 — the baked-seed shape: an accord co-scrub IS a
     /// conferral the capability walk must see.** The genesis seed carries the
     /// canonical's `infra:serve` as roles INSIDE its 2-of-3 co-scrubbed
@@ -2123,17 +2372,23 @@ pub mod test_support {
             register_accord_holder(directory, h).await?;
         }
         let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
-        let mut record = signed_canonical_record_with_roles(
+        // v31.0.0 (CIRISPersist#659) — the canonical's REAL pubkeys go THROUGH
+        // the helper, not onto the record afterwards. Post-hoc mutation used to
+        // be invisible; now it would leave the co-scrubbed envelope binding a
+        // subject the row is not, and the gate would (correctly) refuse. The
+        // production seed has always carried the real keys inside the signed
+        // envelope — this fixture now says so in the same order.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&canonical);
+        let record = signed_canonical_record_with_roles(
             &canonical,
             crate::federation::types::identity_type::NODE,
+            &ed_pk,
+            mldsa_pk.as_deref(),
             vec![INFRA_SERVE_SCOPE.to_owned()],
             json!({ "key_id": canonical, "conferred_by": tag }),
             &[&holders[0], &holders[1]],
         );
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&canonical);
-        record.pubkey_ed25519_base64 = ed_pk;
-        record.pubkey_ml_dsa_65_base64 = mldsa_pk;
         directory
             .put_public_key(crate::federation::types::SignedKeyRecord { record })
             .await?;
@@ -2347,6 +2602,8 @@ pub mod test_support {
         let record = signed_canonical_record_with_roles(
             &weak,
             crate::federation::types::identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec![INFRA_SERVE_SCOPE.to_owned()],
             json!({ "key_id": weak, "conferred_by": tag }),
             &[&holders[0]],
@@ -2665,6 +2922,8 @@ pub mod test_support {
         let self_only = signed_canonical_record_with_roles(
             &self_id,
             crate::federation::types::identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             json!({ "key_id": self_id }),
             &[&self_scrubber],
@@ -4548,6 +4807,135 @@ mod tests {
 
     fn t(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the exported migration constant IS the
+    /// pubkey `signed_canonical_record` used to hardcode. The CHANGELOG tells a
+    /// downstream mesh sim that passing it keeps a record's columns
+    /// byte-for-byte; that claim is CHECKED here rather than believed, because
+    /// a wrong constant would silently change every downstream preimage while
+    /// still compiling.
+    #[test]
+    fn placeholder_subject_pubkey_is_the_pre_659_literal_659() {
+        use base64::Engine as _;
+        assert_eq!(
+            test_support::PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            "#659: the exported placeholder must be the `[7u8; 32]` key the helper hardcoded, or \
+             the documented mechanical update is not byte-preserving"
+        );
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the ONE spelling, checked in both
+    /// directions: what the producer stamps is exactly what the checker
+    /// demands. A drift here is the #643/#598/#652 defect shape, and it would
+    /// be invisible to every gate test (both sides would simply agree on the
+    /// wrong thing) — so it is asserted against a LITERAL field set.
+    #[test]
+    fn subject_binding_has_one_spelling_659() {
+        use crate::federation::admission::{
+            bind_subject_into_envelope, subject_binding, verify_envelope_binds_subject,
+        };
+        let bound = subject_binding("k1", "ED", Some("PQC"));
+        assert_eq!(
+            bound.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["key_id", "pubkey_ed25519_base64", "pubkey_ml_dsa_65_base64"],
+            "#659: the bound field set is the row's identity, and both sides read it from here"
+        );
+        assert!(
+            subject_binding("k1", "ED", None)["pubkey_ml_dsa_65_base64"].is_null(),
+            "#659: an absent PQC leg binds `null` — an assertion of ABSENCE, not a missing field"
+        );
+
+        // Producer → checker, round trip, for a row with and without a PQC leg.
+        for pqc in [Some("PQC".to_owned()), None] {
+            let mut rec = crate::federation::types::KeyRecord {
+                pubkey_ml_dsa_65_base64: pqc.clone(),
+                ..test_support::signed_canonical_record(
+                    "k1",
+                    "node",
+                    "ED",
+                    pqc.as_deref(),
+                    json!({ "purpose": "round trip" }),
+                    &[&test_support::Identity::new("s1")],
+                )
+            };
+            verify_envelope_binds_subject(&rec)
+                .expect("#659: what the producer stamps, the checker accepts");
+            // …and the caller's own fields survive the stamping.
+            assert_eq!(rec.registration_envelope["purpose"], json!("round trip"));
+            // Any divergence on any bound field is a refusal.
+            rec.key_id = "k2".into();
+            let why = verify_envelope_binds_subject(&rec)
+                .expect_err("#659: a diverging subject is refused");
+            assert!(
+                why.contains("key_id") && why.contains("CIRISPersist#659"),
+                "{why}"
+            );
+        }
+
+        // The producer OVERWRITES a conflicting caller-supplied value; it does
+        // not defer to it. A fill-only-if-missing producer would let a caller's
+        // stale or hostile `key_id` ride into the bytes the accord signs, and
+        // the record would then be refused at the gate with the caller's value
+        // in the message — a confusing failure for a shape the helper is
+        // supposed to make impossible. (This arm exists because a mutation that
+        // changed `insert` to `entry().or_insert` survived the whole suite.)
+        let mut hostile = json!({
+            "key_id": "somebody-else",
+            "pubkey_ed25519_base64": "SOMEBODY-ELSES-KEY",
+            "pubkey_ml_dsa_65_base64": "SOMEBODY-ELSES-PQC-KEY",
+            "purpose": "kept",
+        });
+        bind_subject_into_envelope(&mut hostile, "k1", "ED", None).expect("bind");
+        assert_eq!(hostile["key_id"], json!("k1"));
+        assert_eq!(hostile["pubkey_ed25519_base64"], json!("ED"));
+        assert!(hostile["pubkey_ml_dsa_65_base64"].is_null());
+        assert_eq!(hostile["purpose"], json!("kept"));
+
+        // The producer refuses a non-object envelope rather than dropping the
+        // binding on the floor.
+        let mut not_an_object = json!("just a string");
+        assert!(bind_subject_into_envelope(&mut not_an_object, "k1", "ED", None).is_err());
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — [`test_support::accord_conferred`] is the
+    /// SECOND producer of co-scrubbed records, and it takes a record the caller
+    /// built — so it is the one that can be handed a subject-blind envelope.
+    ///
+    /// Its callers today all carry `ConferralMode::DelegatedFromTrustRoot`
+    /// types, which do not reach the co-scrub gate, so nothing else in the
+    /// suite notices whether it binds: a mutation deleting its binding survived
+    /// the entire suite. That is precisely why this witness exists — a producer
+    /// whose correctness nothing checks is a producer that will drift the
+    /// moment a caller of a gated type appears.
+    #[test]
+    fn accord_conferred_binds_the_subject_it_scrubs_659() {
+        use crate::federation::admission::verify_envelope_binds_subject;
+        let holder = test_support::Identity::new("ac659-h0");
+        // A record whose envelope names NOBODY — the shape the gate refuses.
+        let mut blind = test_support::signed_canonical_record(
+            "ac659-subject",
+            "node",
+            test_support::PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            json!({ "purpose": "unbound on purpose" }),
+            &[&holder],
+        );
+        blind.registration_envelope = json!({ "purpose": "unbound on purpose" });
+        assert!(
+            verify_envelope_binds_subject(&blind).is_err(),
+            "#659: the fixture must START from the shape the gate refuses"
+        );
+
+        let conferred = test_support::accord_conferred(blind, &[&holder]);
+        verify_envelope_binds_subject(&conferred)
+            .expect("#659: whatever `accord_conferred` scrubs, it must first bind");
+        assert_eq!(
+            conferred.registration_envelope["purpose"],
+            json!("unbound on purpose"),
+            "#659: and the caller's own fields survive the binding"
+        );
     }
 
     fn org(id: &str, asserted: i64, status: &str, withdrawn: bool) -> Organization {

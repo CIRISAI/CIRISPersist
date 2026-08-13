@@ -12291,7 +12291,7 @@ mod tests {
         use crate::federation::admission::has_accord_conferred_role_over_roster;
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record, signed_canonical_record_with_roles,
-            Identity,
+            Identity, PLACEHOLDER_SUBJECT_ED25519_BASE64,
         };
         let backend = MemoryBackend::new();
 
@@ -12315,6 +12315,8 @@ mod tests {
         let allow = signed_canonical_record_with_roles(
             "canon-484",
             "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             env.clone(),
             &[&holders[0], &holders[1]],
@@ -12336,6 +12338,8 @@ mod tests {
         let self_only = signed_canonical_record_with_roles(
             "canon-484-self",
             "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             serde_json::json!({ "key_id": "canon-484-self" }),
             &[&Identity::new("self-484")], // not in the roster → does not count
@@ -12358,7 +12362,14 @@ mod tests {
 
         // And the plain (rolesless) builder is unaffected — sanity that the
         // export didn't change existing behavior.
-        let _plain = signed_canonical_record("x-484", "node", env, &[&holders[0]]);
+        let _plain = signed_canonical_record(
+            "x-484",
+            "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env,
+            &[&holders[0]],
+        );
     }
 
     /// v21.14.0 (CIRISPersist#534) — the SAME backend-agnostic conferral body
@@ -12434,6 +12445,18 @@ mod tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
+    /// real `put_public_key` chokepoint, on memory.
+    #[tokio::test]
+    async fn coscrub_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_coscrub_subject_binding(
+            &backend, "mem659",
+        )
+        .await
+        .expect("659 subject-binding exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_memory_548() {
@@ -12475,6 +12498,7 @@ mod tests {
         };
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
         };
         use crate::federation::types::identity_type;
         let backend = MemoryBackend::new();
@@ -12492,6 +12516,8 @@ mod tests {
         let rec = signed_canonical_record_with_roles(
             "ciris-canonical-test-480",
             "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             serde_json::json!({ "key_id": "ciris-canonical-test-480" }),
             &[&holders[0], &holders[1]],
