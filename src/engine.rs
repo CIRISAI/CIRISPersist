@@ -2755,6 +2755,23 @@ impl Engine {
     ///
     /// The ML-DSA half is left to the cold-path PQC fill (matches the
     /// pre-#275 shape). Returns the registered (derived) key_id.
+    ///
+    /// # v31.0.0 (CIRISPersist#659) — BREAKING: the caller's envelope is
+    /// subject-BOUND before it is signed
+    ///
+    /// `registration_envelope` is stamped with the derived `key_id` and BOTH of
+    /// this engine's pubkeys through
+    /// [`admission::bind_subject_into_envelope`](crate::federation::admission::bind_subject_into_envelope)
+    /// — the one shared projection — before it is canonicalized and signed.
+    /// Every other field the caller passed survives untouched; the three bound
+    /// keys are overwritten if present.
+    ///
+    /// This is a **preimage change** for the node's own bootstrap row, and it
+    /// is not cosmetic: that row replicates, and at every peer it lands on the
+    /// `Insert` branch of `apply_replicated_key_record`, which runs
+    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+    /// — now REQUIRING the binding. Minting the row unbound would succeed
+    /// locally and be refused by the entire mesh.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn register_self_federation_key(
         &self,
@@ -2790,6 +2807,49 @@ impl Engine {
         })?;
         let pubkey_ed25519_base64 = B64.encode(&pubkey);
 
+        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
+        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
+        // the engine has a PQC identity. Pre-#275 the row left
+        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
+        // that never runs in a standalone / SQLite wheel). A registered key
+        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
+        // every hybrid-signed emission verified against it
+        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
+        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
+        // So a node that registered itself could not emit. The classical half
+        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
+        // identity in `pubkey_ed25519_base64`), so the row is internally
+        // consistent.
+        //
+        // v31.0.0 (CIRISPersist#659) — resolved BEFORE the envelope is
+        // canonicalized, because the subject binding below names it. The row's
+        // PQC leg and the leg the signature covers are now the same statement.
+        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
+            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
+            })?,
+            None => None,
+        };
+
+        // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
+        // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
+        // §5.6.8.15 gate is for PEER registration, see below) but it is
+        // verified at every PEER it replicates to: a fresh `key_id` arriving
+        // through `apply_replicated_key_record` takes the `Insert` branch and
+        // meets `verify_key_registration`, which now REQUIRES the binding. A
+        // node minting a subject-blind bootstrap row would register fine
+        // locally and be refused by the whole mesh — fail-closed, but
+        // fail-closed on the wrong side of the wire, and invisible until
+        // peering. The caller's envelope is otherwise untouched.
+        let mut registration_envelope = registration_envelope;
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut registration_envelope,
+            &key_id,
+            &pubkey_ed25519_base64,
+            pqc_pubkey_b64.as_deref(),
+        )
+        .map_err(crate::federation::Error::InvalidArgument)?;
+
         // Canonicalize the registration envelope with the production
         // Python-dumps canonicalizer (the rule the manual/FFI workflow
         // signs over), SHA-256 it, and classically self-sign with the
@@ -2810,25 +2870,6 @@ impl Engine {
             dt.with_nanosecond(micros * 1000).unwrap_or(dt)
         };
 
-        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
-        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
-        // the engine has a PQC identity. Pre-#275 the row left
-        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
-        // that never runs in a standalone / SQLite wheel). A registered key
-        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
-        // every hybrid-signed emission verified against it
-        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
-        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
-        // So a node that registered itself could not emit. The classical half
-        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
-        // identity in `pubkey_ed25519_base64`), so the row is internally
-        // consistent.
-        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
-            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
-            })?,
-            None => None,
-        };
         let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
             if pqc_pubkey_b64.is_some() {
                 let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
