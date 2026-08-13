@@ -3023,7 +3023,7 @@ pub(crate) mod test_support {
             .expect_err(
                 "({suffix}) THE GAP IS OPEN AGAIN. A transit revocation carrying no `row` mirror \
                  was ADMITTED at the local door. That is CIRISPersist#656's seventh site \
-                 reopened: the five typed columns of this row are now bound by no door \
+                 reopened: the seven typed columns of this row are now bound by no door \
                  anywhere, and the promote door will stamp whatever a relay put in them into \
                  bytes THIS NODE signs. It also invalidates the completion-marker premise — \
                  read this test's doc before changing it",

@@ -3893,8 +3893,13 @@ pub fn check_instant_binding(
 ///    *whether this is a retraction at all* — was not. Flip `withdraws` →
 ///    `scores` and the retraction becomes an ordinary claim while the thing it
 ///    retracted stays live. The reverse holds too.
-/// 2. **Authority injection.** [`withdraws_admission_rule_for`] returns rule 2
-///    standing (see [`resolve_withdraws_admission_rule`]) when a canonical
+/// 2. **Authority injection.** [`resolve_withdraws_admission_rule`] returns
+///    rule 2 standing (v31.0.0, CIRISPersist#658 — this named
+///    `withdraws_admission_rule_for`, which does not exist and never did, so
+///    the reader chasing the authority claim landed nowhere. #656 fixed the
+///    identical dead name in `envelope::paths::ROW`'s doc and this second copy
+///    survived, because rustdoc's `broken_intra_doc_links` is a `cargo doc`
+///    lint and no gate in this repo runs one) when a canonical
 ///    binding hash of the issuer appears in
 ///    `T.subject_key_ids`. APPENDING such a hash in transit therefore hands
 ///    that key revocation authority over the row, with the producer's
@@ -19297,7 +19302,7 @@ pub(crate) mod ungated_doors_test_support {
     /// local-write door on any backend. For a DURABLE local row that gap is
     /// harmless — `stamp_local_row` stamps the mirror. For a TRANSIT row it
     /// returned early BY DESIGN (the caller signed those bytes and stamping
-    /// would invalidate them), so the five typed columns were checked by **no
+    /// would invalidate them), so the seven typed columns were checked by **no
     /// door anywhere**.
     ///
     /// Three legs, in the order they close the hole:

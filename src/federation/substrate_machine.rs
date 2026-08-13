@@ -1339,21 +1339,29 @@ pub mod test_support {
             // mirror the harness signs is the mirror of the row the harness
             // submits — a mirror assembled anywhere else would drift from the
             // row and the differential would measure the drift, not the gate.
-            envelope
-                .as_object_mut()
-                .expect("harness envelopes are objects")
-                .insert(
-                    crate::federation::envelope::paths::ROW.into(),
-                    serde_json::json!({
-                        "attestation_id": id,
-                        "attesting_key_id": self.kid(attester),
-                        "attested_key_id": self.kid(op.subject),
-                        "attestation_type": structural
-                            .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
-                        "subject_key_ids": [self.kid(op.subject)],
-                        "cohort_scope": op.cohort_scope.as_str(),
-                    }),
-                );
+            //
+            // v31.0.0 (CIRISPersist#658) — built as a `RowMirror`, not as a
+            // `json!` literal with the same member names. `RowMirror` is
+            // `deny_unknown_fields` over a CLOSED set, so a hand-written twin
+            // is a second definition of the projection the gate checks — the
+            // exact defect class the paragraph above argues against, one layer
+            // down. As a struct literal an eighth member is a compile error
+            // here; as a `json!` it was a mirror the gate silently refused.
+            // (The same shape was found and fixed in `blobs.rs` this release.)
+            crate::federation::envelope::RowMirror {
+                attestation_id: id.clone(),
+                attesting_key_id: self.kid(attester),
+                attestation_type: structural
+                    .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
+                attested_key_id: self.kid(op.subject),
+                subject_key_ids: vec![self.kid(op.subject)],
+                cohort_scope: op.cohort_scope.as_str().to_owned(),
+                // Mirrors the `weight: None` this builder stamps on the row
+                // below; absent ⇔ the column is NULL.
+                weight: None,
+            }
+            .insert_into(&mut envelope, &id)
+            .expect("harness envelopes are objects");
             let (hash, classical, pqc) =
                 signature_for_key(op.signature, &self.kid(attester), &envelope);
             // v24.0.0 (CIRISPersist#556) — the co-signature set, over the SAME
@@ -3211,20 +3219,25 @@ mod proptests {
                 .insert("references_attestation_id".into(), r.into());
         }
         // v31.0.0 (CIRISPersist#643) — the mirror rides the SIGNED bytes.
-        envelope
-            .as_object_mut()
-            .expect("harness envelopes are objects")
-            .insert(
-                crate::federation::envelope::paths::ROW.into(),
-                serde_json::json!({
-                    "attestation_id": id,
-                    "attesting_key_id": Principal::A.key_id_in(tag),
-                    "attested_key_id": Principal::A.key_id_in(tag),
-                    "attestation_type": att_type,
-                    "subject_key_ids": [],
-                    "cohort_scope": cohort,
-                }),
-            );
+        //
+        // v31.0.0 (CIRISPersist#658) — and it is a `RowMirror`, not a `json!`
+        // twin of one. `Machine::row_for`'s comment argues that a mirror
+        // assembled anywhere else drifts from the row; this builder WAS that
+        // second assembly. Both now place the same closed-set type, so the
+        // next member added to it is a compile error in both rather than a
+        // silently short mirror in both.
+        crate::federation::envelope::RowMirror {
+            attestation_id: id.to_owned(),
+            attesting_key_id: Principal::A.key_id_in(tag),
+            attestation_type: att_type.to_owned(),
+            attested_key_id: Principal::A.key_id_in(tag),
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort.to_owned(),
+            // Mirrors the `weight: None` this builder stamps on the row below.
+            weight: None,
+        }
+        .insert_into(&mut envelope, id)
+        .expect("harness envelopes are objects");
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("fixed instant")
             .with_timezone(&chrono::Utc);

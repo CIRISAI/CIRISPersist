@@ -31449,8 +31449,19 @@ mod tests {
     /// How long the forcing-function blocking task stays in flight.
     /// Long enough that "did the GIL move?" is unambiguous, short
     /// enough that the suite doesn't notice.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — 1200 ms, widened to 2000 ms. It is the
+    /// SPAN THE TWO VERDICTS ARE SEPARATED BY: a wedged teardown holds the GIL
+    /// for about this long, an unwedged one for a thread spawn. [`GIL_BOUND`]
+    /// is derived from it, so widening the hold widens the healthy path's
+    /// headroom without weakening the detection — see `GIL_BOUND`'s doc for
+    /// why those two move in the same direction here and not in opposite ones.
     #[cfg(test)]
-    const WEDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
+    const WEDGE_HOLD_MS: u64 = 2000;
+
+    /// [`WEDGE_HOLD_MS`] as a `Duration`.
+    #[cfg(test)]
+    const WEDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(WEDGE_HOLD_MS);
 
     /// Start a tokio runtime with ONE `spawn_blocking` task that has
     /// **provably begun** and will not finish for [`WEDGE_HOLD`].
@@ -31551,10 +31562,36 @@ mod tests {
     }
 
     /// The upper bound a teardown step is allowed to hold the GIL for.
-    /// Generous (a thread spawn is ~50µs); the failure mode we care
-    /// about is *seconds*, so this discriminates cleanly.
+    ///
+    /// # Why it is half of [`WEDGE_HOLD`] and not a round number
+    ///
+    /// v31.0.0 (CIRISPersist#658) — this was a bare 250 ms against a 1200 ms
+    /// wedge: a 4.8x gap, in a test that also has to schedule a probe thread,
+    /// spawn an OS thread and re-acquire the interpreter lock. Under CPU
+    /// oversubscription that is a bound on the SCHEDULER, and the failure it
+    /// produces names a duration rather than a defect — the same class as the
+    /// #598 quota witness that measured machine speed.
+    ///
+    /// The asymmetry is what makes the fix cheap. The two verdicts this
+    /// separates are not symmetric under load:
+    ///
+    /// - a WEDGED teardown blocks for [`WEDGE_HOLD`], which is a `sleep` the
+    ///   test itself controls. Contention can only make it LONGER, never
+    ///   shorter, so the detection margin is monotone-safe and costs nothing
+    ///   to give away;
+    /// - an UNWEDGED teardown hands off to a thread and returns in
+    ///   microseconds. Contention makes THAT longer, and it is the only side
+    ///   that can flake.
+    ///
+    /// So the threshold is pushed as far toward the wedge as it can go while
+    /// leaving the wedge unmistakable: half the hold, against wedge witnesses
+    /// that assert `>= 0.7 * WEDGE_HOLD`, leaving the two regimes separated by
+    /// a clear `[0.5, 0.7] × WEDGE_HOLD` band. The healthy path's headroom
+    /// goes from 250 ms to a full second — four thousand times what a thread
+    /// spawn costs — and a breach still means what it says: teardown blocked
+    /// while holding the interpreter lock.
     #[cfg(test)]
-    const GIL_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+    const GIL_BOUND: std::time::Duration = std::time::Duration::from_millis(WEDGE_HOLD_MS / 2);
 
     /// Install a cell, then hand back a lone `PyEngine` handle that
     /// owns the LAST reference to the cell's runtime — the exact
@@ -31624,7 +31661,11 @@ mod tests {
         assert!(
             held < GIL_BOUND,
             "dropping the last Engine handle held the GIL for {held:?} \
-             — teardown must never block while the GIL is held (#572)"
+             — teardown must never block while the GIL is held (#572). \
+             The in-flight task is a {WEDGE_HOLD:?} sleep and the bound is \
+             {GIL_BOUND:?}: at or near the former this drop WAITED for the \
+             runtime, which is the wedge; well under it and a slow box is \
+             the only other reading."
         );
         let acquired = probe
             .recv()
@@ -31633,7 +31674,9 @@ mod tests {
         assert!(
             acquired < GIL_BOUND,
             "the GIL probe was starved for {acquired:?} by an Engine \
-             teardown (#572)"
+             teardown (#572) — a second Python thread could not run while \
+             the handle was dropped. The forcing task holds {WEDGE_HOLD:?}; \
+             a starvation near that length is the wedge, not contention."
         );
 
         // The teardown is deferred, not skipped: it really does finish,
@@ -31721,7 +31764,10 @@ mod tests {
         assert!(
             acquired < GIL_BOUND,
             "the GIL probe was starved for {acquired:?} by a DETACHED \
-             blocking wait — the detach is not doing its job (#580)"
+             blocking wait — the detach is not doing its job (#580). The \
+             wait is {WEDGE_HOLD:?} long and the bound is {GIL_BOUND:?}: a \
+             starvation approaching the former means `py.detach` did not \
+             release the interpreter, which is the whole of #580."
         );
     }
 
@@ -32123,7 +32169,11 @@ mod tests {
             .duration_since(t0);
         assert!(
             acquired < GIL_BOUND,
-            "reset_engine held the GIL for {acquired:?} while draining"
+            "reset_engine held the GIL for {acquired:?} while draining. The \
+             drain waits on a {WEDGE_HOLD:?} in-flight task and the bound is \
+             {GIL_BOUND:?}: a starvation approaching the former means the \
+             drain waited with the GIL HELD, which is a bounded drain and a \
+             #572 wedge wearing the same outcome string."
         );
         assert_eq!(engine_teardowns_in_flight(), 0);
     }

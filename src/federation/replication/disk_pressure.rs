@@ -109,7 +109,7 @@ impl PressureTier {
 /// v6.8.0 (CIRISPersist#149) — trust tier of a piece of content,
 /// deciding eviction/refusal priority. The substrate exposes the
 /// mechanism; the consumer composes the family-membership predicate
-/// (see [`DiskPressureConfig::is_family`]) from the existing trust
+/// (see [`DiskPressureConfig::is_local_or_family`]) from the existing trust
 /// hierarchy (`trust:direct` / `trust:partnered`, minus blackholed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustTier {

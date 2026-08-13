@@ -101,7 +101,12 @@ pub mod paths {
 /// v31.0.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
 /// object with a CLOSED member set (see [`RowMirror`]'s
 /// `deny_unknown_fields`), so "the mirror" is one vocabulary entry rather than
-/// five top-level keys accreted over five releases.
+/// SEVEN top-level keys accreted over five releases.
+///
+/// (v31.0.0, CIRISPersist#658 — "five top-level keys" here was the same
+/// undercount [`row_paths::ALL`] documents: it named the five members #643's
+/// messages listed and omitted `attestation_id` and `attesting_key_id`. The
+/// sibling spelling of this argument on [`RowMirror`] already said seven.)
 pub mod row_paths {
     /// The row's IDENTITY. Binding it makes a replay of a still-valid signed
     /// envelope under a fresh `attestation_id` structurally impossible: same
@@ -173,8 +178,12 @@ pub mod row_paths {
 /// `deny_unknown_fields` — an unexpected member inside `row` is a refusal, not
 /// a shrug. The mirror is not an extension point: anything that wants to ride
 /// the envelope rides the envelope's own `extra`, where the vocabulary hash
-/// covers it. A SIXTH column joining the mirror is a deliberate re-pin of
+/// covers it. An EIGHTH column joining the mirror is a deliberate re-pin of
 /// [`ENVELOPE_VOCABULARY_SHA256`], exactly as this one was.
+///
+/// (v31.0.0, CIRISPersist#658 — this read "A SIXTH column", counting from the
+/// undercount. The set is seven; the next one is the eighth, which is what
+/// `bootstrap_admission`'s exhaustive witness already calls it.)
 ///
 /// # `subject_key_ids` is ORDER-SENSITIVE
 ///
@@ -407,7 +416,15 @@ impl RowMirror {
 
     /// The ONE write of [`paths::ROW`] — every stamping entry point funnels
     /// here so there is one placement as well as one projection.
-    fn insert_into(
+    ///
+    /// v31.0.0 (CIRISPersist#658) — `pub(crate)` so the property harness's two
+    /// row builders can place a `RowMirror` instead of hand-writing a `json!`
+    /// object with the same member names. They cannot use [`Self::of`] (they
+    /// build the envelope before the `Attestation` exists), but they can build
+    /// the TYPE — and the type is `deny_unknown_fields` over a closed set, so
+    /// an eighth member breaks them at compile time rather than silently
+    /// producing a mirror the gate refuses.
+    pub(crate) fn insert_into(
         &self,
         envelope: &mut serde_json::Value,
         attestation_id: &str,
@@ -577,7 +594,7 @@ impl RowMirror {
     ///    derived from and can only pass. Then this node hybrid-signs the
     ///    result.
     ///
-    /// So the five typed columns #643 bound were checked by **no door
+    /// So the seven typed columns #643 bound were checked by **no door
     /// anywhere** for a transit row: a relay could append a key to the
     /// `subject_key_ids` COLUMN beside the subject's untouched, still-valid
     /// signed envelope, and promotion would stamp the relay's list into the
@@ -920,8 +937,10 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
         ],
         // v31.0.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
         // alongside the universal paths so a consumer can validate the mirror
-        // it must now stamp, and so adding a sixth column is a visible
-        // vocabulary change rather than a quiet one.
+        // it must now stamp, and so adding an EIGHTH column is a visible
+        // vocabulary change rather than a quiet one. (v31.0.0,
+        // CIRISPersist#658 — this said "a sixth column", counting from the
+        // five-member undercount the same cut corrected below.)
         // v31.0.0 (CIRISPersist#658) — read from `row_paths::ALL` rather than
         // re-spelled here. Byte-identical to the hand-written list it
         // replaces (same members, same order), so this does NOT move the
