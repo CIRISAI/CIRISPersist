@@ -5,6 +5,78 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.1.0] - 2026-08-13
+
+### Added — SECURITY — persist's copy of verify's subject binding now FAILS THE BUILD when it diverges (#663)
+
+Pinning `ciris-verify-*` at `v13.1.0` freezes *which verify code runs*. It does
+not make persist's own reimplementation agree with it. Two implementations of
+one check live in the same binary — `ciris_verify_core::subject_binding` (used
+by verify's provenance walk, its transport binding, and
+`KeyRecord::check_subject_binding`) and `admission::subject_binding` (used by
+`put_public_key`, `apply_replicated_key_record` and the accord co-scrub quorum
+core) — and at 13.0.0 they bound **four** members and **three**. Persist omitted
+`identity_type`, which `is_canonical` reads off the row to decide canonical
+standing. Same process, same release, different answers: a row could pass
+persist's door and fail verify's check. Both suites were fully green. The only
+thing that caught it was a human reading both files (#659, #661).
+
+Deleting persist's copy is not available — its `KeyRecord` is a distinct type
+carrying a declaration-order contract against CIRISRegistry's vendored shape.
+So the goal is not deduplication. It is **detectability**, and
+`tests/verify_subject_binding_conformance.rs` is it.
+
+**The member set is read off verify's own behaviour, not restated.** Verify
+exposes `SubjectBinding::members()`, but `check_subject_binding` builds its
+projection inline and consumes it, so no handle exists to call that on.
+Rebuilding it here with our own `.require(…)` chain would mint a THIRD spelling
+that drifts exactly like the first two. Instead the test *probes*: starting from
+an empty `registration_envelope`, it feeds back every member verify's errors
+name (`Missing { member }` → plant a sentinel → `Mismatch { member, claimed }`,
+where `claimed` is the JSON of the value verify expected) until the check
+returns `Ok`. The loop converges on exactly the members verify projects and the
+values it expects. **Add a fifth member in verify and the probe finds it with no
+edit in persist** — it reds persist's suite instead of silently widening the gap.
+
+The `require_optional` disposition is recovered by difference: an expected
+`null` is satisfied by omission, so it never surfaces as `Missing`. Running the
+probe against a record whose `Option` fields are all `None` and again with them
+all `Some` makes the optional members exactly the set difference. A member
+optional on one side and required on the other is the same class of gap as a
+missing one — it admits on one door and refuses on the other — and it now reds.
+
+Compared as **sets, not order**: both sides carry a `BTreeMap`-backed
+`serde_json::Map`, so both are already lexicographic, which is what JCS emits
+and therefore the order the co-scrubbers actually signed over. Nothing here
+asserts an insertion order.
+
+**CEG §0.9 is now a pinned contract rather than an adopted comment.** The
+omit-vs-materialize table is asserted as data against *both* implementations
+in-process — envelope omits + row claims nothing ⇒ ADMIT; envelope omits + row
+claims a key ⇒ REFUSE; envelope declares + row claims nothing ⇒ REFUSE — with
+both controls (same key ⇒ admit, different keys ⇒ refuse) so the table cannot
+pass by refusing, or admitting, everything. A future "simplification" to flat
+fail-closed reds, and so does one to flat tolerance.
+
+A third test iterates the projection and asserts that a DIVERGING value and an
+OMITTED member produce the same verdict on both implementations, for every
+member, against a row both with and without its optional legs — and that
+persist's refusal names the member verify named.
+
+**Mutation-tested, 5 for 5.** Dropping `identity_type`; binding it off the
+`key_id` column; making the optional leg required; flattening §0.9 in each
+direction. Every one reds the detector. The first also proves the probe is not
+vacuous — it reports `only ciris_verify_core binds: ["identity_type"]`, so it
+really did discover all four members off verify's behaviour.
+
+Filed CIRISVerify#254 asking verify to export the member list as data
+(`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the
+probe to one call, and to document `Mismatch.claimed`'s encoding, which the
+probe currently leans on as a `Display` detail. The better fix is on the record;
+this ships the gate meanwhile.
+
+No production code changed. Test-only.
+
 ## [31.0.0] - 2026-08-12
 
 ### BREAKING — this release requires a FRESH GENESIS. The baked seed will not load.
