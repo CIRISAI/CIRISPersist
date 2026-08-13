@@ -72,10 +72,12 @@ pub mod paths {
     /// so an unsigned column is an unsigned mute button.
     pub const EXPIRES_AT: &str = "expires_at";
     /// v31.0.0 (CIRISPersist#643) — **the TYPED-COLUMN MIRROR.** One object,
-    /// not five sibling keys: the five `federation_attestations` columns that
-    /// decide what a row MEANS and no signature covered
-    /// ([`super::RowMirror`] — `attestation_type`, `attested_key_id`,
-    /// `subject_key_ids`, `cohort_scope`, `weight`).
+    /// not seven sibling keys: the SEVEN `federation_attestations` columns that
+    /// decide what a row MEANS and IS, and that no signature covered
+    /// ([`super::RowMirror`] — `attestation_id`, `attesting_key_id`,
+    /// `attestation_type`, `attested_key_id`, `subject_key_ids`,
+    /// `cohort_scope`, `weight`; the canonical list is
+    /// [`super::row_paths::ALL`]).
     ///
     /// `original_content_hash` covers `attestation_envelope` and nothing else,
     /// so before this key a relay could flip `withdraws` → `scores` (the
@@ -118,16 +120,48 @@ pub mod row_paths {
     pub const COHORT_SCOPE: &str = "cohort_scope";
     /// How much it COUNTS.
     pub const WEIGHT: &str = "weight";
+
+    /// v31.0.0 (CIRISPersist#658) — **the member list, written ONCE.** Both
+    /// the published vocabulary (`row_members` in
+    /// [`super::envelope_vocabulary_json`]) and the refusal messages of
+    /// [`crate::federation::admission::check_row_column_binding`] read it from
+    /// here, because they previously each spelled their own and one of them
+    /// spelled FIVE while the gate enforced seven — telling an external
+    /// producer, during the release that forces every producer to re-mint,
+    /// to build a mirror that [`super::RowMirror`]'s `deny_unknown_fields`
+    /// would then refuse.
+    ///
+    /// Tied to the struct by `envelope_vocabulary_covers_every_typed_member`,
+    /// which compares the published list to [`super::RowMirror`]'s own
+    /// serialized member set rather than to a count.
+    pub const ALL: [&str; 7] = [
+        ATTESTATION_ID,
+        ATTESTING_KEY_ID,
+        ATTESTATION_TYPE,
+        ATTESTED_KEY_ID,
+        SUBJECT_KEY_IDS,
+        COHORT_SCOPE,
+        WEIGHT,
+    ];
 }
 
-/// v31.0.0 (CIRISPersist#643) — the signed twin of the five typed
+/// v31.0.0 (CIRISPersist#643) — the signed twin of the SEVEN typed
 /// `federation_attestations` columns the envelope never covered. Rides the
 /// envelope under [`paths::ROW`] as ONE object.
 ///
-/// # Why an object and not five sibling keys
+/// v31.0.0 (CIRISPersist#658) — **seven, and it always was.** The count in this
+/// doc, in the `paths::ROW` doc, in `check_row_column_binding`'s doc AND in its
+/// two refusal messages all said five, omitting `attestation_id` and
+/// `attesting_key_id` — which the type has carried and the gate has enforced
+/// since the mirror shipped. That is not a doc nit during a release that forces
+/// every producer to re-mint against these very messages. The list is now
+/// spelled once, in [`row_paths::ALL`], and the published `row_members` and the
+/// refusal messages both read it from there.
 ///
-/// Five top-level keys would be five independent vocabulary additions, each
-/// individually optional-looking, and a producer that stamped four of five
+/// # Why an object and not seven sibling keys
+///
+/// Seven top-level keys would be seven independent vocabulary additions, each
+/// individually optional-looking, and a producer that stamped six of seven
 /// would look conformant. One object is one presence check: the mirror is
 /// there in full or the row is refused.
 ///
@@ -282,7 +316,7 @@ pub struct EnvelopeCore {
     /// binding gate refuses any other pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    /// [`paths::ROW`] — v31.0.0 (#643). The signed twin of the five typed
+    /// [`paths::ROW`] — v31.0.0 (#643). The signed twin of the seven typed
     /// columns (see [`RowMirror`]). `None` on an envelope that has not been
     /// through
     /// [`crate::federation::attestation_emit::stamp_and_canonicalize`];
@@ -577,6 +611,50 @@ impl EnvelopeCore {
     }
 }
 
+/// v31.0.0 (CIRISPersist#658) — **the ONE exhaustive [`EnvelopeCore`]
+/// fixture**, and the reason it is a free function rather than a local in one
+/// test: it is an EXHAUSTIVE STRUCT LITERAL with no `..Default::default()`
+/// rest, so the compiler — not a reviewer, not a magic count — is what forces
+/// a newly typed envelope member to be declared here. Every witness that needs
+/// "the complete set of typed universal members" derives it from this value's
+/// serialized key set instead of re-listing the members and drifting.
+///
+/// The class this closes: `delivery_mode` / `deletion_window` were typed in
+/// v21.9.0, appeared in the docs AND in
+/// [`tests::envelope_core_paths_bind_serde_names`], and still never reached
+/// [`envelope_vocabulary_json`] — because every witness in the file enumerated
+/// members BY HAND, so each one only ever checked the members it happened to
+/// list. Two absences agreed with each other for five releases.
+#[cfg(test)]
+fn fully_populated_core() -> EnvelopeCore {
+    EnvelopeCore {
+        dimension: Some("d:v1".into()),
+        references_attestation_id: Some("ref-1".into()),
+        scope: Some(ScopeSet::Many(vec!["infra:serve".into()])),
+        pre_rotation_commitment: Some("ab".repeat(32)),
+        recovers: Some("old-root".into()),
+        successor_keys: Some(vec!["k1".into()]),
+        withdrawal_reason: Some("test".into()),
+        delivery_mode: Some("mandatory".into()),
+        deletion_window: Some("2027-01-01T00:00:00Z".into()),
+        asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
+        expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
+        row: Some(RowMirror {
+            attestation_id: "att-1".into(),
+            attesting_key_id: "k-auth".into(),
+            attestation_type: "scores".into(),
+            attested_key_id: "k-att".into(),
+            subject_key_ids: vec!["k-subj".into()],
+            cohort_scope: "federation".into(),
+            weight: serde_json::Number::from_f64(1.0),
+        }),
+        // Deliberately EMPTY: `extra` is the open half, and the typed
+        // key set is exactly what this value serializes to only while
+        // nothing untyped rides along.
+        extra: serde_json::Map::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,29 +665,7 @@ mod tests {
     /// as a silent NULL in a projection.
     #[test]
     fn envelope_core_paths_bind_serde_names() {
-        let core = EnvelopeCore {
-            dimension: Some("d:v1".into()),
-            references_attestation_id: Some("ref-1".into()),
-            scope: Some(ScopeSet::Many(vec!["infra:serve".into()])),
-            pre_rotation_commitment: Some("ab".repeat(32)),
-            recovers: Some("old-root".into()),
-            successor_keys: Some(vec!["k1".into()]),
-            withdrawal_reason: Some("test".into()),
-            delivery_mode: Some("mandatory".into()),
-            deletion_window: Some("2027-01-01T00:00:00Z".into()),
-            asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
-            expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
-            row: Some(RowMirror {
-                attestation_id: "att-1".into(),
-                attesting_key_id: "k-auth".into(),
-                attestation_type: "scores".into(),
-                attested_key_id: "k-att".into(),
-                subject_key_ids: vec!["k-subj".into()],
-                cohort_scope: "federation".into(),
-                weight: serde_json::Number::from_f64(1.0),
-            }),
-            extra: serde_json::Map::new(),
-        };
+        let core = fully_populated_core();
         let v = core.to_value();
         for (path, expect_present) in [
             (paths::DIMENSION, true),
@@ -740,6 +796,19 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             paths::RECOVERS,
             paths::SUCCESSOR_KEYS,
             paths::WITHDRAWAL_REASON,
+            // v31.0.0 (CIRISPersist#658) — the two v21.9.0 field-hoists, five
+            // releases late. `delivery_mode` and `deletion_window` became
+            // TYPED `EnvelopeCore` fields in v21.9.0 (#519 item 2) and were
+            // documented, round-trip-tested and byte-invariance-witnessed —
+            // but never joined the published vocabulary, so the document both
+            // sides agree on described 10 of the 12 universal keys. A consumer
+            // validating an envelope against it would have called the erasure
+            // deadline an unknown extension. Folded into THIS cut because the
+            // constant is already being re-pinned twice here (#598, #643) and
+            // the consumers that break are the same ones; a separate release
+            // would break them a third time for no new capability.
+            paths::DELIVERY_MODE,
+            paths::DELETION_WINDOW,
             // v31.0.0 (CIRISPersist#598) — the two signed instants. Added to
             // the vocabulary DELIBERATELY (this re-pins
             // `ENVELOPE_VOCABULARY_SHA256` and every consumer asserting it):
@@ -760,15 +829,11 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
         // alongside the universal paths so a consumer can validate the mirror
         // it must now stamp, and so adding a sixth column is a visible
         // vocabulary change rather than a quiet one.
-        "row_members": [
-            row_paths::ATTESTATION_ID,
-            row_paths::ATTESTING_KEY_ID,
-            row_paths::ATTESTATION_TYPE,
-            row_paths::ATTESTED_KEY_ID,
-            row_paths::SUBJECT_KEY_IDS,
-            row_paths::COHORT_SCOPE,
-            row_paths::WEIGHT,
-        ],
+        // v31.0.0 (CIRISPersist#658) — read from `row_paths::ALL` rather than
+        // re-spelled here. Byte-identical to the hand-written list it
+        // replaces (same members, same order), so this does NOT move the
+        // pinned hash on its own.
+        "row_members": row_paths::ALL,
         "consent_dimension_prefixes": [
             cd::STATE_GRANTED_PREFIX,
             cd::STATE_REVOKED_PREFIX,
@@ -797,8 +862,18 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// `row` joined `universal_paths` and its closed member set joined the
 /// document as `row_members`: the VERB of an attestation, and the field that
 /// grants revocation authority over it, are now signed material.
+/// v31.0.0 (CIRISPersist#658) — RE-PINNED A THIRD TIME, and deliberately in
+/// THIS release rather than the next. `delivery_mode` and `deletion_window`
+/// joined `universal_paths`: both have been typed [`EnvelopeCore`] fields
+/// since v21.9.0 (#519 item 2), so the published vocabulary described 10 of
+/// the 12 universal keys — including omitting the erasure deadline whose
+/// breach signal persist itself raises. This is not a new capability and it
+/// buys nothing on its own; it is folded in because the constant was already
+/// moving twice in this cut and the consumers that break (`/v1/health`, the
+/// cross-repo harness) are the same ones. Deferring would have broken them a
+/// THIRD time for two keys.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "0a6f72817eb39d4205ea024ce4a0056112a0614d5a023b8c2c7c88dcfb7264f5";
+    "1213fd3cf3109df92805cb1f6b0e39ae7637812b4fba23206a7860ba381107b2";
 
 #[cfg(test)]
 mod vocab_tests {
@@ -813,5 +888,92 @@ mod vocab_tests {
             "envelope vocabulary changed: re-pin ENVELOPE_VOCABULARY_SHA256 \
              deliberately (and notify /v1/health + consumer-test holders)"
         );
+    }
+
+    /// The set of keys a value serializes to — the *structural* enumeration of
+    /// a type's typed members, as opposed to a hand-written list of them.
+    fn serialized_members(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        v.as_object()
+            .expect("an envelope / mirror serializes to an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn declared(doc: &serde_json::Value, key: &str) -> std::collections::BTreeSet<String> {
+        doc[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{key}` is an array"))
+            .iter()
+            .map(|p| p.as_str().expect("a vocabulary entry is a string").into())
+            .collect()
+    }
+
+    /// **v31.0.0 (CIRISPersist#658) — THE DIVERGENCE GATE the pin gate is not.**
+    ///
+    /// [`envelope_vocabulary_hash_is_pinned`] detects a CHANGE to the published
+    /// list. It cannot detect a DIVERGENCE between that list and the typed
+    /// members it claims to describe, and it ran green for five releases with
+    /// `delivery_mode` and `deletion_window` typed, documented, round-trip
+    /// tested — and absent from the vocabulary. A check that cannot fail on the
+    /// defect it is nearest to is a report.
+    ///
+    /// This one is EXHAUSTIVE rather than counted. [`super::fully_populated_core`]
+    /// is an exhaustive struct literal, so a new [`EnvelopeCore`] field does not
+    /// compile until it is declared there; its serialized key set is then the
+    /// complete typed member set, and the assertion is SET EQUALITY against the
+    /// published `universal_paths` — both directions, so a vocabulary entry with
+    /// no typed member behind it fails too. No magic number: nothing here counts
+    /// twelve, and nothing needs updating when a thirteenth arrives except the
+    /// two places that genuinely define it.
+    ///
+    /// Same treatment one level down for [`RowMirror`] / `row_members`.
+    #[test]
+    fn envelope_vocabulary_covers_every_typed_member() {
+        let doc = envelope_vocabulary_json();
+        let core = super::fully_populated_core();
+
+        let typed = serialized_members(&core.to_value());
+        let published = declared(&doc, "universal_paths");
+        assert_eq!(
+            typed,
+            published,
+            "the published `universal_paths` and the typed `EnvelopeCore` members have DIVERGED. \
+             Typed but unpublished: {:?} (a consumer validating against the vocabulary would \
+             call these unknown extensions). Published but untyped: {:?}. Fix the list, then \
+             re-pin ENVELOPE_VOCABULARY_SHA256 deliberately.",
+            typed.difference(&published).collect::<Vec<_>>(),
+            published.difference(&typed).collect::<Vec<_>>(),
+        );
+
+        let mirror = serialized_members(
+            &serde_json::to_value(core.row.as_ref().expect("the fixture carries a mirror"))
+                .expect("RowMirror serializes"),
+        );
+        let published_members = declared(&doc, "row_members");
+        assert_eq!(
+            mirror,
+            published_members,
+            "the published `row_members` and the typed `RowMirror` members have DIVERGED. \
+             Typed but unpublished: {:?}. Published but untyped: {:?}.",
+            mirror.difference(&published_members).collect::<Vec<_>>(),
+            published_members.difference(&mirror).collect::<Vec<_>>(),
+        );
+
+        // The gate must be able to FAIL. An empty or one-sided comparison
+        // would satisfy every assertion above, so pin that both sides are
+        // non-trivially populated and that the two hoisted members — the ones
+        // that were missing — are actually present.
+        assert!(
+            typed.len() > 8 && mirror.len() > 4,
+            "the member sets went suspiciously small — the fixture stopped populating fields"
+        );
+        for member in [paths::DELIVERY_MODE, paths::DELETION_WINDOW] {
+            assert!(
+                published.contains(member),
+                "`{member}` was hoisted to a typed EnvelopeCore field in v21.9.0 and must be \
+                 part of the published vocabulary (CIRISPersist#658)"
+            );
+        }
     }
 }
