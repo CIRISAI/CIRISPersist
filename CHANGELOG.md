@@ -49,7 +49,7 @@ door on any backend**. For a durable local row that is harmless:
 `RowMirror::stamp_local_row` stamps the mirror. For a **transit** subject-side
 revocation (§10.1.3) it returns early BY DESIGN, because the caller hybrid-signed
 those bytes and stamping would invalidate the signature. So for that shape the
-five typed columns were checked by **no door anywhere**:
+seven typed columns were checked by **no door anywhere**:
 
 - the local door verifies the SIGNATURE (`verify_local_transit_revocation`) and
   never looked at the mirror;
@@ -497,6 +497,170 @@ reached with nothing wrong. Worse, the honest diagnosis — the `elapsed < windo
 assertion immediately below — never ran, because the panic fired first. The
 message now reports the measured per-write time against the refill rate and
 states both readings.
+
+### Fixed — the ONE placement-touching re-sign stored the envelope it had NOT canonicalized (#647 / #658)
+
+`Engine::reseal_for_scope` is the single recipe #649 folded promotion, the #510
+transform promotion and the #530 repair re-scope into. It canonicalized only to
+HASH and to SIGN, and then handed back the **un-canonicalized** value. Every
+backend's bind site writes `serde_json::to_string(&reseal.attestation_envelope)`,
+so `sha256(stored column) != original_content_hash` for **every promoted and
+every scope-changed row** — the one invariant the section below exists to state.
+
+Fixed at the PRODUCER, one line at one site. `promote_attestation` and
+`set_attestation_cohort_scope` are the two CONSUMERS of that one recipe; a
+defect that exists because a motion had several spellings is not repaired by
+giving its fix several spellings too.
+
+Bounded, not hypothetical. #650's boot classifier calls
+`check_canonical_at_rest` on every start, so an affected row self-heals at the
+next boot — but before that boot a peer ingesting it derives a DIFFERENT content
+hash (every reference to the row dangles), and the re-stamp that repairs it
+moves the row's wire address.
+
+Witnessed on sqlite and postgres, through BOTH consumers, by an assertion that
+spells the invariant literally —
+`sha256(serde_json::to_vec(stored envelope)) == original_content_hash` — taken on
+the row as read back from the backend rather than on a value the test built.
+The existing `attestation_promote_flips_local_to_federation_signed` went red on
+the fix, which is what says the defect was live: it had been pinning the
+promoted envelope byte-equal to a NON-canonical expectation (`weight: 1.0`,
+`score: 1.0`, whose canonical tokens are `1`).
+
+**Known and deliberately NOT fixed here:** `attestation_upsert_local` is a
+second, independent producer of non-canonical rows — it stores the caller's
+number tokens verbatim, so a local-tier row is non-canonical at rest before
+anything promotes it. It is not a one-liner: `canonicalize_in_place` there has
+to land AFTER `RowMirror::stamp_local_row`, because the stamp re-inserts
+`weight` and JCS renders `1.0` as `1`, and the transit-revocation path carries
+a caller's signature and wants a witness rather than an assumption. Those rows
+are re-stamped by the #650 boot migration (`classify_shape` calls them
+`Legacy`), which is a real remedy, but it means every pre-existing local row
+pays a migration pass it would not need if the door were fixed. Follow-up.
+
+### Fixed — five witnesses and one CI leg whose verdict was the machine's speed (#658)
+
+This repo has the lesson recorded twice — a witness that decayed on a calendar
+date, and the #598 quota test that measured a box rather than a bucket. Six more
+were still live, and one was a REPRODUCED breach, not a projection:
+`subscribe_detection_events`' four witnesses ran 6.5–7.5 s against a 6 s budget
+under 4–9x CPU oversubscription.
+
+None of these was fixed by raising a number. A larger magic number is the same
+defect with more slack, so in order of preference:
+
+- **`retire_runtime`'s ordering claim now has no clock at all.** "The caller is
+  not the one paying for the wait" was `t0.elapsed() < 150ms` around a call
+  whose one job is to spawn an OS thread. The in-flight blocking task is now
+  held open on a CHANNEL the test controls, and the assertion reads the work's
+  own completion flag: on a correct implementation the task CANNOT have
+  finished, at any machine speed, because nothing has released it. Exact, not
+  generous.
+- **`subscribe_detection_events`' filter-scoping negative is an ORDERING claim.**
+  "Poll for 3 s and assert the timeout fired" cannot tell EXCLUDED from MERELY
+  LATE. The harness now writes a matching SENTINEL timestamped after the
+  excluded row; the poller yields oldest-first, so draining up to the sentinel
+  and seeing only matching rows proves the row was dropped. Costs one poll
+  cycle instead of a fixed three seconds, and is strictly stronger.
+- **Where a real-time bound IS the property, the GAP got wider, not the number.**
+  `wait_quiesced(d)` must honour `d`: its in-flight work is now held for 30 s
+  rather than 800 ms, so the two readings the assertion separates ("waited for
+  the BOUND" / "waited for the WORK") are 300x apart instead of 8x. The same
+  move fixed the four 250 ms `GIL_BOUND` assertions: `WEDGE_HOLD` 1200 ms →
+  2000 ms and `GIL_BOUND` derived from it as half the hold. The asymmetry is
+  what makes it cheap — a wedged teardown blocks for a sleep the test controls,
+  which contention can only lengthen, so the detection margin is monotone-safe;
+  only the healthy side can flake, and its headroom went from 250 ms to a full
+  second.
+- **Delivery budgets now DERIVE from the cadence they are budgets for.**
+  `subscribe_detection_events`' 2 s `POLL_INTERVAL` was a `const` inside the
+  function body, so four witnesses spelled their budgets as literal seconds and
+  the 6 s one had quietly become three poll cycles. It is now
+  `Engine::DETECTION_POLL_INTERVAL` and the budget is fifteen cycles of it, in
+  ONE helper rather than four copies.
+- **Every message says what a breach MEANS.** The budgets are hang guards, not
+  properties, and each now says so with its own arithmetic in it.
+
+Measured, not asserted — under 288 busy loops on 32 cores (9x oversubscription),
+worst case over the full `engine` + `ffi::pyo3` suite at `--test-threads 64`:
+`wait_quiesced` 100.1 ms against a 3 s ceiling (30x), subscription delivery
+2.01 s against a 30 s budget (15x), GIL hold 0.19 ms and GIL starvation 3.0 ms
+against a 1 s bound (5297x / 332x). `retire_runtime` returned in 0.17 ms — 885x
+under the 150 ms bound that was deleted for being unmeasurable.
+
+### Fixed — a CI step where a slow BUILD surfaced as a job timeout (#658)
+
+`cargo nextest (default — fixture suite)` ran under `timeout-minutes: 5`, and it
+is the only invocation on that runner compiling the DEFAULT feature set — so the
+budget covered a full from-scratch rebuild of the dependency graph plus nine
+fixture tests. A cold or contended runner breached it as a **job timeout**: a
+killed step, no test output, no failing test name, no `::error` annotation. The
+least attributable outcome the workflow can produce, and the one thing this
+repo's "every CI failure must be attributable" rule forbids.
+
+Split into a BUILD step (`--no-run`, 30 min, because slow is not broken) and a
+RUN step (5 min, a cache hit plus nine tests). A build timeout can now only
+exhaust the build budget, and a run-budget breach means what it says: the
+fixture suite hung.
+
+### Testing — a 3-second sleep that asserted nothing, and a postgres parity that could not fail
+
+`subscribe_detection_events_drop_terminates_poll_task_{sqlite,postgres}` were
+`drop(stream); sleep(3s);` under a comment reading *"No assertion needed beyond
+reaching this line cleanly"*. They contained no assertion, so a poll task that
+leaked forever passed exactly as loudly as one that exited — the "a check that
+cannot fail is a report" shape. The task holds no observable `JoinHandle`, but
+it does hold an `Engine` clone, and an `Engine` holds a strong reference to its
+backend: the refcount now stands in for the task. It must go UP by exactly one
+on subscribe (which is what makes the probe live rather than decorative) and
+back down when the subscriber is dropped, and the wait returns on the EVENT so
+the budget is only ever paid by a failing run.
+
+`subscribe_detection_events_yields_new_events_only_postgres` gave its pre- and
+post-subscribe rows DIFFERENT `trace_id`s while subscribing with a `trace_id`
+filter — so the subscription's own filter already excluded the older row and the
+`assert_ne!` could not fail whatever the cursor did. One trace_id for both rows
+now, per-run uuid for isolation, so the CURSOR is the only thing that can
+exclude it. The filter-scoping witness, which had no postgres arm at all under a
+section header claiming "parity for the same four scenarios", now has one — that
+predicate is spelled per-backend, so a sqlite-only witness certified exactly the
+half that is not the production deployment.
+
+### Fixed — the property harness hand-wrote the row mirror it exists to check (#658)
+
+`substrate_machine.rs` built the `row` mirror as a `serde_json::json!` literal in
+TWO places. The first carries a comment arguing that "a mirror assembled
+anywhere else would drift from the row"; the second is that assembly. `RowMirror`
+is `deny_unknown_fields` over a closed set, so the next member added to it would
+have left both harness mirrors silently short and refused by the gate they exist
+to exercise. Both now place a `RowMirror` (via a `pub(crate)`
+`RowMirror::insert_into`), which makes an eighth member a compile error in both.
+The same shape was found and fixed in `blobs.rs` earlier this release; these were
+the survivors.
+
+### Fixed — sixteen dead rustdoc links, and the reason nothing was catching them (#658)
+
+`broken_intra_doc_links` is a **rustdoc** lint. `cargo check` cannot see it and
+`scripts/doc_version_refs.py` only checks that `vX.Y.Z` tokens match released
+CHANGELOG headers, so a doc link that names a renamed or deleted item survives
+every gate this repo runs. `cargo doc --no-deps` reports 292.
+
+Repaired here: every genuinely dead link in `engine.rs` (`PqcSigner`,
+`KeyringSignerHandle`, `ReplicationConfig`, `EvictionSweeper[::stop]`,
+`verify_storage_budget_wire`, `BlobError::NotHeld`, `Attestation`,
+`EmitAttestationInput::attested_key_id`, `at_rest_cascade::orchestrate::…`,
+`teardown::{wait_quiesced,retire_runtime}`), plus two whose target does not
+exist at all: `DiskPressureConfig::is_family` (it is `is_local_or_family`, dead
+in `engine.rs` AND in the module that owns the type) and
+`withdraws_admission_rule_for` in `check_row_column_binding`'s own doc — the
+same dead name #656 fixed in `envelope::paths::ROW`, whose second copy survived
+because no gate reads rustdoc.
+
+The remainder are inventoried, not fixed: ~110 are `cfg(test)` items invisible
+to a normal doc build, a dozen are feature-gated paths that resolve under their
+own feature, and the rest are genuine and spread across files this cut does not
+own. `-D rustdoc::broken_intra_doc_links` is the gate; it can be turned on once
+that backlog is cleared.
 
 ### Changed — BREAKING — persist stores the CANONICAL envelope now, not the producer's bytes (#647)
 

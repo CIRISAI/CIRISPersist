@@ -282,8 +282,36 @@ jobs:
             --features "${FEATURES}" \
             ${{ matrix.substrate.parts && format('--partition count:{0}/{1}', matrix.substrate.part, matrix.substrate.parts) || ' ' }} \
             ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
+      # v31.0.0 (CIRISPersist#658) — the BUILD and the RUN are SEPARATE steps
+      # with separate budgets, because they fail for different reasons and only
+      # one of them is a defect.
+      #
+      # This is the only invocation on this runner that compiles the DEFAULT
+      # feature set: every other step passes
+      # `--features "$(ci_feature_matrix.py set …)"`, so arriving here rebuilds
+      # the dependency graph and the crate itself from scratch. That build is
+      # minutes of work on a cold or contended runner, and it used to sit inside
+      # the same `timeout-minutes: 5` as the nine fixture tests. So a slow BUILD
+      # surfaced as a JOB TIMEOUT: a killed step, no test output, no failing test
+      # name, no `::error` annotation — the least attributable outcome this
+      # workflow can produce, and exactly what "every CI failure must be
+      # attributable" forbids.
+      #
+      # Split, a slow build can only ever exhaust the BUILD budget (named as
+      # such), and a breach of the run budget means what it says: nine fixture
+      # tests that execute in seconds did not finish in five minutes, i.e. the
+      # fixture suite HUNG. Do not merge these back into one step, and do not
+      # "fix" a build timeout by raising the run budget.
+      - name: cargo nextest build (default — fixture suite)
+        if: matrix.substrate.name == 'core-1'
+        # Compilation only. Generous on purpose: a cold runner compiling the
+        # default feature set from zero cache is slow, and slow is not broken.
+        timeout-minutes: 30
+        run: cargo nextest run --test wire_format_fixtures --no-run
       - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core-1'
+        # Execution only — the step above already compiled these binaries, so
+        # this is a cache hit plus nine tests. A breach is a hang, not a slow box.
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
       # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI

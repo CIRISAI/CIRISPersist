@@ -130,10 +130,10 @@ use crate::store::Error as StoreError;
 ///
 /// It is a deferred join, not a leak: the runtime is really dropped,
 /// really winds its workers down, and really waits for its in-flight
-/// blocking tasks — and [`wait_quiesced`] lets a caller (a test
+/// blocking tasks — and [`teardown::wait_quiesced`] lets a caller (a test
 /// fixture, a shutdown sequence) block on that completion with a
 /// bound, off the GIL. The only true leak is the thread-spawn-failed
-/// fallback in [`retire_runtime`], which is documented there.
+/// fallback in [`teardown::retire_runtime`], which is documented there.
 ///
 /// # Ordering
 ///
@@ -465,6 +465,23 @@ pub mod teardown {
             }
         }
 
+        /// v31.0.0 (CIRISPersist#658) — how long a test's in-flight blocking
+        /// task stays in flight when nothing releases it.
+        ///
+        /// It is NOT a budget and no assertion compares against it as one. Both
+        /// tests below hold a `spawn_blocking` task open on a channel and
+        /// release it explicitly, so in a healthy run the task waits
+        /// microseconds and this value is never reached. It exists so that a
+        /// REGRESSION — a `retire_runtime` that blocks its caller, which would
+        /// otherwise deadlock against the very channel meant to hold the task
+        /// open — self-releases and lands on a named assertion with a
+        /// diagnosis, instead of hanging until nextest SIGKILLs it at
+        /// `terminate-after` (six minutes, no message, no attribution).
+        ///
+        /// Comfortably under that six-minute kill, and three orders of
+        /// magnitude above anything the healthy path does.
+        const HELD_OPEN: Duration = Duration::from_secs(30);
+
         /// v24.3.0 (CIRISPersist#572) — the ordering contract, with no
         /// backend and no Python in the picture: `retire_runtime`
         /// releases the keepalive strictly AFTER the runtime's
@@ -474,6 +491,24 @@ pub mod teardown {
         /// backend handle while a `spawn_blocking` task is still using
         /// it is a use-after-free, and it is the half of #572 that
         /// presented downstream as "Bus error" rather than as a hang.
+        ///
+        /// # Why there is no elapsed-time assertion here
+        ///
+        /// v31.0.0 (CIRISPersist#658) — "the caller is not the one paying for
+        /// the wait" used to be spelled `t0.elapsed() < 150ms` around a call
+        /// whose one job is to SPAWN AN OS THREAD. That measures the
+        /// scheduler: on a contended box a `thread::Builder::spawn` plus a
+        /// mutex acquisition can take longer than 150 ms while the code under
+        /// test is perfectly correct, and the failure it produces names a
+        /// duration rather than a defect.
+        ///
+        /// The property was never a duration. It is an ORDERING: `retire_runtime`
+        /// returns to its caller while the runtime's blocking work is still
+        /// UNFINISHED. So the task is held open on a channel that only this
+        /// test can close, and the assertion reads the work's own completion
+        /// flag. On a correct implementation the task cannot possibly have
+        /// finished, at any machine speed, because nothing has released it —
+        /// the assertion is exact rather than generous.
         #[test]
         #[serial_test::serial(runtime_teardown_gauge)]
         fn keepalive_outlives_the_runtimes_in_flight_work() {
@@ -482,10 +517,17 @@ pub mod teardown {
 
             let rt = Runtime::new().expect("tokio runtime");
             let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            // The blocking task is held in flight by a CHANNEL, not by a sleep:
+            // the test decides when it finishes, so "still in flight" is a fact
+            // rather than a race against a timer.
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let flag = Arc::clone(&task_finished);
             rt.spawn_blocking(move || {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(400));
+                // `recv_timeout`, not `recv`: see `HELD_OPEN`. A blocking
+                // `recv` would turn the regression this test exists to catch
+                // into an unattributable SIGKILL.
+                let _ = release_rx.recv_timeout(HELD_OPEN);
                 flag.store(true, Ordering::SeqCst);
             });
             // Deterministic: the task has begun, so tokio's shutdown
@@ -496,15 +538,23 @@ pub mod teardown {
                 task_finished: Arc::clone(&task_finished),
                 saw_finished: Arc::clone(&saw_finished),
             };
-            let t0 = std::time::Instant::now();
             retire_runtime(rt, Box::new(witness));
-            // The caller is not the one paying for the wait.
+            // The caller is not the one paying for the wait — and nothing has
+            // released the task yet, so on a correct implementation this flag
+            // is false no matter how slow the box is.
             assert!(
-                t0.elapsed() < Duration::from_millis(150),
-                "retire_runtime blocked the caller for {:?}",
-                t0.elapsed()
+                !task_finished.load(Ordering::SeqCst),
+                "retire_runtime did not return until the runtime's in-flight blocking task \
+                 had finished. Nothing in this test released that task, so the only way to \
+                 observe it finished is to have waited {HELD_OPEN:?} for its own self-release \
+                 — i.e. retire_runtime blocked its caller on work the caller does not own \
+                 (#572). This is not a slow machine; it is the contract inverted."
             );
 
+            // Now let the runtime wind down, and only now.
+            release_tx
+                .send(())
+                .expect("the blocking task must still be waiting to be released");
             assert!(
                 wait_quiesced(Duration::from_secs(10)),
                 "retirement never completed"
@@ -520,26 +570,71 @@ pub mod teardown {
         /// v24.3.0 (CIRISPersist#572) — a `false` from `wait_quiesced`
         /// is a value, not a hang: the bound is honoured and the
         /// retirement keeps running on its own thread.
+        ///
+        /// # The one place a real-time bound IS the property
+        ///
+        /// v31.0.0 (CIRISPersist#658) — unlike its neighbour, this test cannot
+        /// be rewritten free of wall clocks: `wait_quiesced(d)` takes a
+        /// `Duration` and the whole claim is that it honours it. What it CAN
+        /// do is stop measuring the machine.
+        ///
+        /// The in-flight work is held open for [`HELD_OPEN`] instead of a
+        /// 800 ms sleep, which widens the gap the assertion has to straddle
+        /// from 100 ms-vs-800 ms (8x) to 100 ms-vs-30 s (300x). The two
+        /// readings a breach must tell apart are "waited for the BOUND" and
+        /// "waited for the WORK", and the threshold sits a factor of 30 above
+        /// the first and a factor of 10 below the second. A scheduler does not
+        /// dilate a single condvar timeout by 30x; a `wait_quiesced` that
+        /// ignores its argument misses by 300x.
+        ///
+        /// The LOWER bound is the half that can never flake — slowness only
+        /// makes it more true — and it is what stops a `wait_quiesced` that
+        /// returns `false` instantly from passing this test vacuously.
         #[test]
         #[serial_test::serial(runtime_teardown_gauge)]
         fn wait_quiesced_honours_its_bound() {
+            /// The argument under test.
+            const BOUND: Duration = Duration::from_millis(100);
+            /// 30x the bound, a tenth of the work. See the doc-comment.
+            const CEILING: Duration = Duration::from_secs(3);
+
             let rt = Runtime::new().expect("tokio runtime");
             let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             rt.spawn_blocking(move || {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(800));
+                let _ = release_rx.recv_timeout(HELD_OPEN);
             });
             started_rx.recv().expect("blocking task must start");
             retire_runtime(rt, Box::new(()));
 
             let t0 = std::time::Instant::now();
-            let quiesced = wait_quiesced(Duration::from_millis(100));
+            let quiesced = wait_quiesced(BOUND);
             let waited = t0.elapsed();
-            assert!(!quiesced, "should have reported a timeout");
+            // Exact, not timing-dependent: nothing has released the in-flight
+            // task, so the retirement CANNOT have completed.
             assert!(
-                waited < Duration::from_millis(400),
-                "the bound was not honoured; waited {waited:?}"
+                !quiesced,
+                "wait_quiesced reported the process quiesced, but the retirement's blocking \
+                 task has not been released and so cannot have finished — a `true` here is a \
+                 false quiesce, which is the use-after-free window #572 closed"
             );
+            assert!(
+                waited >= BOUND,
+                "wait_quiesced({BOUND:?}) returned after only {waited:?} — it reported a \
+                 timeout without waiting for one, so the bound is not a bound"
+            );
+            assert!(
+                waited < CEILING,
+                "wait_quiesced({BOUND:?}) took {waited:?}. The in-flight work is held for \
+                 {HELD_OPEN:?} and the bound is {BOUND:?}, so this is not a slow box: it \
+                 waited for the WORK instead of for the BOUND, which is the blocking-teardown \
+                 wedge #572 exists to prevent."
+            );
+
+            release_tx
+                .send(())
+                .expect("the blocking task must still be waiting to be released");
             // Still true afterwards: it finishes on its own.
             assert!(wait_quiesced(Duration::from_secs(10)));
         }
@@ -1030,7 +1125,7 @@ impl Engine {
     /// unlike [`Engine::with_signer_arcs`] (hybrid but with a **plaintext**
     /// Ed25519, defeating custody), an Engine built here produces a real
     /// [`ciris_crypto::HybridSignature`] — Ed25519 from the
-    /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`] — so the
+    /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`](ciris_keyring::PqcSigner) — so the
     /// storage-tier scrub signature (the produce/promote path that calls
     /// [`Engine::sign_hybrid`]) is hybrid **without ever unsealing the
     /// Ed25519 key**.
@@ -1263,7 +1358,8 @@ impl Engine {
 
     /// v6.8.0 (CIRISPersist#149) — is `attesting_key_id` local-or-family
     /// (and therefore NEVER refused / never proxy)? Uses the installed
-    /// [`DiskPressureConfig::is_family`] predicate against the local
+    /// [`DiskPressureConfig::is_local_or_family`](crate::federation::DiskPressureConfig::is_local_or_family)
+    /// predicate against the local
     /// signer key_id. With no disk-pressure config installed, only the
     /// local signer itself is treated as protected. This is the SAME
     /// classification the force-evict-proxy-first sweep uses.
@@ -1517,7 +1613,7 @@ impl Engine {
     /// v3.4.0 (CIRISPersist#123) — drive one sweep cycle against the
     /// underlying `federation_blobs` table. Returns a
     /// [`crate::federation::SweepReport`] summarizing the result. A
-    /// no-op when no [`ReplicationConfig`] is configured or
+    /// no-op when no [`ReplicationConfig`](crate::federation::ReplicationConfig) is configured or
     /// `storage_budget_bytes == u64::MAX`.
     ///
     /// Sovereign Pi-cron callers + the spawned-sweeper loop both call
@@ -1830,15 +1926,18 @@ impl Engine {
     }
 
     /// v3.4.0 (CIRISPersist#123) — spawn the background eviction
-    /// sweeper. Returns an [`EvictionSweeper`] handle whose
-    /// [`EvictionSweeper::stop`] method shuts the loop down. The
+    /// sweeper. Returns an [`EvictionSweeper`](crate::federation::EvictionSweeper)
+    /// handle whose
+    /// [`EvictionSweeper::stop`](crate::federation::EvictionSweeper::stop)
+    /// method shuts the loop down. The
     /// loop calls [`Engine::sweep_evictions_once`] every
     /// `cfg.sweep_interval` (clamped below by
     /// [`crate::federation::MIN_SWEEP_INTERVAL`]).
     ///
     /// Sovereign mode: the Rust-side caller owns the
-    /// [`EvictionSweeper`] handle and calls `.stop()` on shutdown.
-    /// PyO3 mode: the [`crate::ffi::pyo3::EngineCell`] owns the
+    /// [`EvictionSweeper`](crate::federation::EvictionSweeper) handle and calls
+    /// `.stop()` on shutdown.
+    /// PyO3 mode: `ffi::pyo3`'s private `EngineCell` owns the
     /// handle so all `PyEngine` clones share one loop —
     /// [`Engine::from_shared`] does NOT spawn a second loop.
     ///
@@ -2174,7 +2273,9 @@ impl Engine {
     /// 1. **PQC-mandatory bound-hybrid verify at ingest, BEFORE
     ///    persistence** (CC 5.3.2.4.3.1 store-path / CC 6.1.3): the wire's
     ///    Ed25519 + ML-DSA-65 halves must verify against the owner pubkeys
-    ///    — reuses [`verify_storage_budget_wire`]. This also re-runs the
+    ///    — reuses
+    ///    [`verify_storage_budget_wire`](crate::fountain::storage_contention::verify_storage_budget_wire).
+    ///    This also re-runs the
     ///    structural validation (no `self`/`family` scope, `pin_reserve ≤
     ///    budget`, sorted + deduped lists).
     /// 2. **§Q B3 anti-rollback**: a candidate whose `revision` does not
@@ -2658,7 +2759,8 @@ impl Engine {
     /// was constructed via [`Engine::from_shared`] (no LocalSigner
     /// propagation — the cohabitation accessor path); rebuild the
     /// caller-side LocalSigner from
-    /// `PyEngine::keyring_signer()`'s [`KeyringSignerHandle`] in that
+    /// `PyEngine::keyring_signer()`'s
+    /// [`KeyringSignerHandle`](crate::signing::KeyringSignerHandle) in that
     /// case. Returns
     /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured)
     /// when the Engine has a LocalSigner but no PQC identity
@@ -3752,6 +3854,24 @@ impl Engine {
     /// which is [`crate::federation::envelope::RowMirror::of`] — the SAME
     /// projection [`crate::federation::admission::check_row_column_binding`]
     /// compares against. There is no second spelling of it anywhere.
+    ///
+    /// # Canonical at rest (CIRISPersist#647)
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the envelope this returns is the CANONICAL
+    /// one, not the value the re-stamp happened to build. It used to
+    /// canonicalize only to hash and to sign, and then hand back the
+    /// un-canonicalized `Value`; every backend's bind site does
+    /// `serde_json::to_string(&reseal.attestation_envelope)`, so the column
+    /// stored a byte sequence that was NOT the one
+    /// `original_content_hash` digests. `sha256(stored column) !=
+    /// original_content_hash` for every promoted and every scope-changed row,
+    /// which is the one invariant #647 exists to state.
+    ///
+    /// Fixed HERE, at the producer, and deliberately not at
+    /// `promote_attestation` and `set_attestation_cohort_scope` — those are the
+    /// two CONSUMERS of this one recipe, and a defect that exists because a
+    /// motion had several spellings is not repaired by giving its fix several
+    /// spellings too.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn reseal_for_scope(
         &self,
@@ -3763,8 +3883,15 @@ impl Engine {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         use sha2::{Digest, Sha256};
 
-        let attestation_envelope =
+        let mut attestation_envelope =
             crate::federation::envelope::RowMirror::restamp_for_scope(base, row, cohort_scope)?;
+        // Canonicalize the VALUE, not just a copy of its bytes: after this the
+        // envelope's own `serde_json` serialization IS `canonical`, so the
+        // column a backend writes sha256sums to `original_content_hash`.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut attestation_envelope)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("{what} canonicalize at rest: {e}"))
+            })?;
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&attestation_envelope)
             .map_err(|e| {
             crate::federation::Error::Backend(format!("{what} canonicalize: {e}"))
@@ -3859,7 +3986,8 @@ impl Engine {
     /// → SHA-256 (`original_content_hash`) → hybrid-sign
     /// ([`LocalSigner::sign_hybrid`](crate::signing::LocalSigner::sign_hybrid),
     /// Ed25519 + ML-DSA-65 bound, the v9.0.0 / CC 5.3.2.4.3.1 PQC
-    /// requirement) → assemble the 20-field [`Attestation`] →
+    /// requirement) → assemble the 20-field
+    /// [`Attestation`](crate::federation::Attestation) →
     /// [`put_attestation`](crate::federation::FederationDirectory::put_attestation).
     /// Returns the `attestation_id`.
     ///
@@ -3869,10 +3997,13 @@ impl Engine {
     /// helper NEVER trusts a caller alias, which structurally kills the
     /// #247 FK-violation class (the same bug `attestation_promote` had).
     /// `attested_key_id` defaults to the derived key_id (self-attestation)
-    /// when [`EmitAttestationInput::attested_key_id`] is `None`.
+    /// when
+    /// [`EmitAttestationInput::attested_key_id`](crate::federation::types::EmitAttestationInput::attested_key_id)
+    /// is `None`.
     ///
     /// v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
-    /// [`EmitAttestationInput::attested_key_id`] names the row's **SUBJECT**
+    /// [`EmitAttestationInput::attested_key_id`](crate::federation::types::EmitAttestationInput::attested_key_id)
+    /// names the row's **SUBJECT**
     /// (the natural CEG cross-subject edge target, exactly how
     /// [`Self::grant_delegation`] keys a `delegates_to` by its recipient).
     /// This is the **witness-targets-subject** age-assurance surface: a
@@ -3927,7 +4058,8 @@ impl Engine {
     /// v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN
     /// **composed signer** (`Arc<dyn HardwareSigner>`), the common case: a
     /// node emitting a federation-tier row about itself with its configured
-    /// identity. Same canonicalize → hybrid-sign → 20-field [`Attestation`]
+    /// identity. Same canonicalize → hybrid-sign → 20-field
+    /// [`Attestation`](crate::federation::Attestation)
     /// → [`put_attestation`](crate::federation::FederationDirectory::put_attestation)
     /// recipe as [`Self::emit_attestation`], but signs via
     /// [`Self::sign_hybrid`] and derives `attesting_key_id`/`scrub_key_id`
@@ -5000,7 +5132,8 @@ impl Engine {
     /// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` /
     /// `scrub_signature_classical` / `scrub_signature_pqc` are the caller's
     /// authority signature over the removal, hybrid-Strict-verified before
-    /// any write (see [`at_rest_cascade::orchestrate::rekey_community_member_revoke`]).
+    /// any write (see
+    /// [`at_rest_cascade::orchestrate::rekey_community_member_revoke`](crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke)).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn rekey_community_member_revoke(
@@ -5358,7 +5491,7 @@ impl Engine {
     /// (`operation: "serve"`) — a PERMANENT signal: the peer should
     /// fetch from another holder. On the happy path returns the bytes
     /// via [`get_blob`](crate::federation::BlobStorage::get_blob)
-    /// ([`BlobError::NotHeld`] when absent).
+    /// ([`BlobError::NotHeld`](crate::federation::BlobError::NotHeld) when absent).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn serve_blob_to_peer(
         &self,
@@ -6836,6 +6969,18 @@ impl Engine {
         Ok(crate::cirisnode::KeyGrantListPage { items, next_cursor })
     }
 
+    /// v31.0.0 (CIRISPersist#658) — the `subscribe_detection_events` polling
+    /// cadence, hoisted out of that function's body.
+    ///
+    /// It is here because the witnesses in this file need it. Their delivery
+    /// budgets are multiples of THIS constant, not re-spelled seconds, so
+    /// changing the cadence moves the budgets with it instead of silently
+    /// eating their headroom — which is how the 6-second budget below came to
+    /// sit at three poll cycles and fail on a loaded box.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) const DETECTION_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(2);
+
     /// v2.13.0 (CIRISPersist#113) — push-based change feed scoped to
     /// `detection_events`. Backs CIRISLensCore#20's `lens.alerts.*`
     /// subscription delivery.
@@ -6887,9 +7032,11 @@ impl Engine {
     ) -> impl futures_core::Stream<
         Item = Result<crate::derived::DetectionEvent, crate::derived::Error>,
     > + Send {
-        // v0.1 polling cadence + channel capacity. See doc-comment for
-        // the v0.2 ask (configurable cadence + channel shape).
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        // v0.1 channel capacity. See doc-comment for the v0.2 ask
+        // (configurable cadence + channel shape). The cadence itself is
+        // [`Self::DETECTION_POLL_INTERVAL`] — hoisted out of this body in
+        // v31.0.0 (#658) so the witnesses derive their budgets from it.
+        const POLL_INTERVAL: std::time::Duration = Engine::DETECTION_POLL_INTERVAL;
         const CHANNEL_CAPACITY: usize = 256;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -9229,6 +9376,81 @@ mod tests {
         }
     }
 
+    /// v31.0.0 (CIRISPersist#658) — how long a `subscribe_detection_events`
+    /// witness waits for a row it has already written.
+    ///
+    /// # This is a HANG GUARD, not the property under test
+    ///
+    /// None of these witnesses asserts anything about latency. What they
+    /// assert is WHICH rows a subscription yields and in what order; the
+    /// timeout exists only so that "the subscription never delivered" fails
+    /// with a message instead of hanging until nextest SIGKILLs the process at
+    /// `terminate-after`. A budget that is merely *tight enough to be
+    /// interesting* is therefore all cost and no coverage — it converts load
+    /// into a red build that names a duration rather than a defect.
+    ///
+    /// It used to be a bare `Duration::from_secs(6)`, which was three poll
+    /// cycles, and it was REPRODUCIBLY breached at 6.5–7.5 s under 4–9x CPU
+    /// oversubscription: the subscriber and the poll task share one
+    /// `#[tokio::test]` current-thread runtime, so contention does not add to
+    /// one cycle — it multiplies across every cycle, the DB round trip inside
+    /// it, and the channel hand-off after it.
+    ///
+    /// Fifteen cycles is deliberately far past anything a correct
+    /// implementation needs (it delivers on the first or second), and still
+    /// well inside nextest's six-minute kill, so a breach can only mean
+    /// delivery did not happen at all.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    const SUBSCRIBE_DELIVERY_BUDGET: std::time::Duration =
+        Engine::DETECTION_POLL_INTERVAL.saturating_mul(15);
+
+    /// Take the next item from a detection-event subscription, or `None` when
+    /// nothing arrived inside [`SUBSCRIBE_DELIVERY_BUDGET`].
+    ///
+    /// v31.0.0 (CIRISPersist#658) — ONE spelling of the poll-with-a-budget
+    /// dance. It was copied into four witnesses, each with its own literal
+    /// seconds, which is why raising one of them would not have raised the
+    /// others.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn next_detection_event<S>(
+        stream: &mut std::pin::Pin<Box<S>>,
+    ) -> Option<crate::derived::DetectionEvent>
+    where
+        S: futures_core::Stream<
+            Item = Result<crate::derived::DetectionEvent, crate::derived::Error>,
+        >,
+    {
+        use std::task::{Context, Poll};
+        tokio::time::timeout(SUBSCRIBE_DELIVERY_BUDGET, async {
+            std::future::poll_fn(
+                |cx: &mut Context<'_>| -> Poll<
+                    Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+                > { stream.as_mut().poll_next(cx) },
+            )
+            .await
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|item| item.expect("the subscription surfaced a backend error"))
+    }
+
+    /// The message a missed delivery gets. Says what a breach MEANS, because
+    /// the reader of this line is the one person least able to argue with it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn subscribe_never_delivered(what: &str) -> String {
+        format!(
+            "the subscription never delivered {what}. Budget was {budget:?} — {cycles} poll \
+             cycles at the {interval:?} cadence, for a row that was already committed before \
+             the first cycle. A breach here is NOT a slow machine (a correct implementation \
+             delivers on cycle one or two); it means the row was never yielded at all.",
+            budget = SUBSCRIBE_DELIVERY_BUDGET,
+            interval = Engine::DETECTION_POLL_INTERVAL,
+            cycles =
+                SUBSCRIBE_DELIVERY_BUDGET.as_nanos() / Engine::DETECTION_POLL_INTERVAL.as_nanos(),
+        )
+    }
+
     /// SQLite: facade dispatches to the SqliteBackend's
     /// `DerivedSchema::get_detection_events`. Seed via the storage
     /// trait; read via the Engine facade. The acceptance is the
@@ -9440,9 +9662,6 @@ mod tests {
     #[tokio::test]
     async fn subscribe_detection_events_yields_new_events_only_sqlite() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
@@ -9459,37 +9678,77 @@ mod tests {
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter::default()));
 
         // Insert a row AFTER subscribe → should be yielded.
-        // Sleep ~2.2s (one poll cycle) so the poller wakes and reads.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        //
+        // v31.0.0 (CIRISPersist#658) — a `sleep(100ms)` used to sit here under
+        // the comment "Sleep ~2.2s (one poll cycle) so the poller wakes and
+        // reads", which described neither its duration nor its purpose: the
+        // poller's first wake is 2 s away either way, and nothing here needs
+        // to be timed against it. The cursor latches on `Utc::now()` INSIDE
+        // `subscribe_detection_events`, synchronously at the call above, and
+        // `EventFilter.since` is inclusive — so this row is after the cursor
+        // with or without a delay. Removed rather than re-timed.
         let new_ts = chrono::Utc::now();
         let new_ev = de_event_fixture("tr-NEW", b"canon-NEW", new_ts);
         sq.put_detection_event(new_ev.clone()).await.unwrap();
 
-        // Drain with a timeout. POLL_INTERVAL = 2s; allow 5s headroom.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
+        // The FIRST item the subscription produces is the assertion: if the
+        // subscribe-time cursor did not latch, the pre-subscribe row (ts 10 s
+        // older, and so yielded first within a batch) arrives ahead of it.
+        // That is an ORDERING claim, not a latency one — see
+        // `SUBSCRIBE_DELIVERY_BUDGET`.
+        let yielded = next_detection_event(&mut stream)
             .await
-        })
-        .await
-        .expect("subscribe yielded within 6s");
-        let yielded = next.expect("stream produced an item").expect("ok");
+            .unwrap_or_else(|| panic!("{}", subscribe_never_delivered("the after-subscribe row")));
+        assert_ne!(
+            yielded.detection_id, pre_ev.detection_id,
+            "the FIRST row a subscription yields was written BEFORE it subscribed — the \
+             subscribe-time cursor did not latch and the subscriber is replaying history"
+        );
         assert_eq!(
             yielded.detection_id, new_ev.detection_id,
             "subscribe yields the AFTER-subscribe row"
-        );
-        assert_ne!(
-            yielded.detection_id, pre_ev.detection_id,
-            "subscribe MUST NOT yield the BEFORE-subscribe row"
         );
 
         drop(stream);
     }
 
-    /// SQLite: dropping the Stream terminates the polling task — we
-    /// can't observe the JoinHandle directly, but the test passes
-    /// (does not hang) iff the polling task exits on next send/close.
+    /// Wait for a `subscribe_detection_events` poll task to release the
+    /// `Engine` clone it was spawned with — i.e. for the task to actually
+    /// exit — and return the strong count it settled on.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the task holds no observable `JoinHandle`,
+    /// but it does hold an `Engine`, and an `Engine` holds a strong reference
+    /// to its backend. That refcount is the liveness signal, and it is an
+    /// EVENT: the loop returns the moment it drops, so the budget is only ever
+    /// paid by a failing run.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn await_backend_refcount<T>(handle: &std::sync::Arc<T>, target: usize) -> usize {
+        let deadline = std::time::Instant::now() + SUBSCRIBE_DELIVERY_BUDGET;
+        loop {
+            let n = std::sync::Arc::strong_count(handle);
+            if n <= target || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// SQLite: dropping the Stream terminates the polling task.
+    ///
+    /// # This used to be a report, not a check
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the body was `drop(stream); sleep(3s);`
+    /// under a comment reading "No assertion needed beyond reaching this line
+    /// cleanly". It contained no assertion, so it could not fail: a poll task
+    /// that leaked forever passed it exactly as loudly as one that exited. All
+    /// three seconds bought was three seconds.
+    ///
+    /// The task holds no `JoinHandle` we can observe — but it does hold an
+    /// `Engine` clone, and an `Engine` holds a strong reference to its
+    /// backend. So the refcount stands in for the task, and the claim becomes
+    /// checkable: it goes UP by exactly one when we subscribe (which is what
+    /// makes the probe live rather than decorative) and back DOWN when the
+    /// subscriber is dropped.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_drop_terminates_poll_task_sqlite() {
@@ -9499,21 +9758,38 @@ mod tests {
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
+        let sq = std::sync::Arc::clone(engine.sqlite_backend().expect("sqlite present"));
+        let baseline = std::sync::Arc::strong_count(&sq);
 
         let stream = engine.subscribe_detection_events(EventFilter::default());
+        // Deterministic — the clone is taken synchronously inside
+        // `subscribe_detection_events`, before it spawns. If this ever stops
+        // holding, the probe below is reading nothing and the whole test goes
+        // back to being unable to fail.
+        assert_eq!(
+            std::sync::Arc::strong_count(&sq),
+            baseline + 1,
+            "the poll task must hold an Engine clone of its own — without it this test's \
+             liveness probe measures nothing"
+        );
+
         // Drop the subscription. The poll task's next iteration sees
         // tx.is_closed() → break, or its send returns Err → return.
-        // Either way the spawned task winds up. We give it 5s of
-        // wall-clock to do so; the test passing implies no leak.
+        // Either way the spawned task winds up and releases its Engine.
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        // If the spawned poll task were still alive + driving DB
-        // queries, the SqliteBackend's Mutex would be held when this
-        // test's tokio::test runtime tears down — exposed as flaky
-        // shutdowns on CI. The test passes today because the channel
-        // close terminates the task. No assertion needed beyond
-        // reaching this line cleanly.
-        // (Engine still owns the SqliteBackend Arc; that's expected.)
+        let settled = await_backend_refcount(&sq, baseline).await;
+        assert_eq!(
+            settled,
+            baseline,
+            "the poll task outlived its subscriber. It still holds an Engine — and so a live \
+             SqliteBackend Mutex — after the stream was dropped, which is the leak that \
+             presented as flaky runtime shutdowns on CI. Budget was \
+             {SUBSCRIBE_DELIVERY_BUDGET:?}; the task only has to survive to its next \
+             {interval:?} wake to notice the closed channel.",
+            interval = Engine::DETECTION_POLL_INTERVAL,
+        );
+        // (Engine still owns the SqliteBackend Arc; that's expected — `baseline`
+        // is the count WITH it.)
         let _ = engine;
     }
 
@@ -9524,13 +9800,27 @@ mod tests {
     /// This test confirms the trace_id scoping case (the only one
     /// EventFilter exposes today): rows for trace_id=T are yielded,
     /// rows for other trace_ids are not.
+    ///
+    /// # The exclusion is proven by a SENTINEL, not by a stopwatch
+    ///
+    /// v31.0.0 (CIRISPersist#658) — "rows for other trace_ids are not yielded"
+    /// used to be spelled "poll for 3 s and assert the timeout fired", which is
+    /// the weakest possible form of a negative: it cannot distinguish EXCLUDED
+    /// from MERELY LATE, so it fails on a loaded box (where a legitimately
+    /// excluded row still costs 3 s of nothing) and it passes on a broken one
+    /// whose leak happens to arrive on the next cycle.
+    ///
+    /// So the harness writes a THIRD row — `tr-MATCH`, timestamped strictly
+    /// AFTER the non-matching one. The poller yields a batch oldest-first and
+    /// advances its cursor monotonically, so a leaked `tr-OTHER` must arrive
+    /// BEFORE that sentinel. Draining up to the sentinel and finding only
+    /// `tr-MATCH` proves the row was DROPPED, because a row later than it has
+    /// already been delivered. No duration appears in the claim, and the test
+    /// costs one poll cycle instead of a fixed three seconds.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_filter_scopes_yielded_rows_sqlite() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
@@ -9543,8 +9833,9 @@ mod tests {
             ..Default::default()
         }));
 
-        // Insert one matching + one non-matching row.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // One matching row, one non-matching row, then a matching SENTINEL —
+        // strictly increasing `ts`, so the poller's oldest-first delivery makes
+        // "the sentinel arrived" mean "the non-matching row is not coming".
         let now = chrono::Utc::now();
         let matching = de_event_fixture("tr-MATCH", b"canon-MATCH", now);
         let nonmatching = de_event_fixture(
@@ -9552,37 +9843,44 @@ mod tests {
             b"canon-OTHER",
             now + chrono::Duration::milliseconds(1),
         );
+        let sentinel = de_event_fixture(
+            "tr-MATCH",
+            b"canon-SENTINEL",
+            now + chrono::Duration::milliseconds(2),
+        );
         sq.put_detection_event(matching.clone()).await.unwrap();
         sq.put_detection_event(nonmatching.clone()).await.unwrap();
+        sq.put_detection_event(sentinel.clone()).await.unwrap();
 
-        // Should yield exactly the matching row.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
-            .await
-        })
-        .await
-        .expect("subscribe yields within 6s");
-        let yielded = next.expect("item").expect("ok");
-        assert_eq!(yielded.trace_id, "tr-MATCH");
-        assert_eq!(yielded.detection_id, matching.detection_id);
-
-        // A second poll cycle should produce no other-trace rows;
-        // poll with a short timeout — if no row arrives, the filter
-        // is correctly excluding tr-OTHER.
-        let no_more = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
-            .await
-        })
-        .await;
-        assert!(
-            no_more.is_err(),
-            "filter must NOT yield non-matching tr-OTHER row \
-             (timeout exhausted; got = {:?})",
-            no_more
+        // Drain until the sentinel. Every row that arrives before it must be a
+        // `tr-MATCH` row — a `tr-OTHER` here is the filter leaking.
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_detection_event(&mut stream).await.unwrap_or_else(|| {
+                panic!(
+                    "{} (drained {seen:?} first)",
+                    subscribe_never_delivered("the tr-MATCH sentinel")
+                )
+            });
+            assert_eq!(
+                ev.trace_id,
+                "tr-MATCH",
+                "the subscription yielded trace_id={other:?}, which its EventFilter excludes. \
+                 This is not a late arrival: the row it leaked is OLDER than the tr-MATCH \
+                 sentinel this drain is still waiting for, so the poller had already committed \
+                 to delivering past it.",
+                other = ev.trace_id
+            );
+            let last = ev.detection_id == sentinel.detection_id;
+            seen.push(ev.detection_id);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![matching.detection_id, sentinel.detection_id],
+            "the filter must yield the two tr-MATCH rows, oldest-first, and nothing else"
         );
 
         drop(stream);
@@ -9745,9 +10043,6 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn subscribe_detection_events_yields_new_events_only_postgres() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -9759,39 +10054,51 @@ mod tests {
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
 
+        // v31.0.0 (CIRISPersist#658) — ONE trace_id for both rows. The
+        // per-run uuid keeps this test isolated from concurrent PG runs, but
+        // the pre- and post-subscribe rows used to carry DIFFERENT trace_ids,
+        // which meant the subscription's own filter already excluded the
+        // pre-subscribe row — so `assert_ne!` below could not fail whatever
+        // the cursor did, and the sqlite arm's actual claim had no postgres
+        // parity at all. Same trace, so the CURSOR is the only thing that can
+        // exclude the older row.
+        let trace = format!("tr-SUB-{}", uuid::Uuid::new_v4().simple());
+
         // Seed a row BEFORE subscribing.
-        let trace_pre = format!("tr-PRE-{}", uuid::Uuid::new_v4().simple());
         let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
-        let pre_ev = de_event_fixture(&trace_pre, b"canon-PRE", before_ts);
+        let pre_ev = de_event_fixture(&trace, b"canon-PRE", before_ts);
         pg.put_detection_event(pre_ev.clone()).await.unwrap();
 
         // Subscribe with a trace_id filter to isolate from concurrent runs.
-        let trace_new = format!("tr-NEW-{}", uuid::Uuid::new_v4().simple());
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
-            trace_id: Some(trace_new.clone()),
+            trace_id: Some(trace.clone()),
             ..Default::default()
         }));
 
-        // Insert NEW row after subscribe.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Insert NEW row after subscribe. No delay is needed: the cursor
+        // latches on `Utc::now()` synchronously inside
+        // `subscribe_detection_events`, and `EventFilter.since` is inclusive.
         let new_ts = chrono::Utc::now();
-        let new_ev = de_event_fixture(&trace_new, b"canon-NEW", new_ts);
+        let new_ev = de_event_fixture(&trace, b"canon-NEW", new_ts);
         pg.put_detection_event(new_ev.clone()).await.unwrap();
 
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
+        let yielded = next_detection_event(&mut stream)
             .await
-        })
-        .await
-        .expect("yielded within 6s");
-        let yielded = next.expect("item").expect("ok");
+            .unwrap_or_else(|| panic!("{}", subscribe_never_delivered("the after-subscribe row")));
+        assert_ne!(
+            yielded.detection_id, pre_ev.detection_id,
+            "the FIRST row a subscription yields was written BEFORE it subscribed — the \
+             subscribe-time cursor did not latch and the subscriber is replaying history"
+        );
         assert_eq!(yielded.detection_id, new_ev.detection_id);
-        assert_ne!(yielded.detection_id, pre_ev.detection_id);
         drop(stream);
     }
 
+    /// Postgres parity for
+    /// `subscribe_detection_events_drop_terminates_poll_task_sqlite` — same
+    /// refcount probe, same reason it replaced a `sleep(3s)` that asserted
+    /// nothing. A poll task that leaks here holds a live PG pool handle, not
+    /// merely a mutex.
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -9806,10 +10113,113 @@ mod tests {
         let engine = Engine::with_signer(signer, &dsn)
             .await
             .expect("construct PG engine");
+        let pg = std::sync::Arc::clone(engine.postgres_backend().expect("pg backend"));
+        let baseline = std::sync::Arc::strong_count(&pg);
+
         let stream = engine.subscribe_detection_events(EventFilter::default());
+        assert_eq!(
+            std::sync::Arc::strong_count(&pg),
+            baseline + 1,
+            "the poll task must hold an Engine clone of its own — without it this test's \
+             liveness probe measures nothing"
+        );
+
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let settled = await_backend_refcount(&pg, baseline).await;
+        assert_eq!(
+            settled,
+            baseline,
+            "the poll task outlived its subscriber and still holds a live PostgresBackend \
+             (and so a pooled connection) after the stream was dropped. Budget was \
+             {SUBSCRIBE_DELIVERY_BUDGET:?}; the task only has to survive to its next \
+             {interval:?} wake to notice the closed channel.",
+            interval = Engine::DETECTION_POLL_INTERVAL,
+        );
         let _ = engine;
+    }
+
+    /// Postgres parity for
+    /// `subscribe_detection_events_filter_scopes_yielded_rows_sqlite`.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the section above claims "postgres parity
+    /// for the same four scenarios" and shipped two. The filter-scoping claim
+    /// is the one that most needs both backends: the `trace_id` predicate is
+    /// spelled per-backend in the `DerivedSchema::get_detection_events` impls,
+    /// so a sqlite-only witness certifies exactly the half that is not the
+    /// production deployment.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn subscribe_detection_events_filter_scopes_yielded_rows_postgres() {
+        use crate::derived::{DerivedSchema, EventFilter};
+
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Per-run uuids so concurrent PG runs cannot cross-contaminate.
+        let want = format!("tr-MATCH-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("tr-OTHER-{}", uuid::Uuid::new_v4().simple());
+
+        let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
+            trace_id: Some(want.clone()),
+            ..Default::default()
+        }));
+
+        // Same sentinel construction as the sqlite arm: the excluded row is
+        // OLDER than a matching row we then wait for, so "the sentinel
+        // arrived" proves exclusion rather than lateness.
+        let now = chrono::Utc::now();
+        let matching = de_event_fixture(&want, b"canon-MATCH", now);
+        let nonmatching = de_event_fixture(
+            &other,
+            b"canon-OTHER",
+            now + chrono::Duration::milliseconds(1),
+        );
+        let sentinel = de_event_fixture(
+            &want,
+            b"canon-SENTINEL",
+            now + chrono::Duration::milliseconds(2),
+        );
+        pg.put_detection_event(matching.clone()).await.unwrap();
+        pg.put_detection_event(nonmatching.clone()).await.unwrap();
+        pg.put_detection_event(sentinel.clone()).await.unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_detection_event(&mut stream).await.unwrap_or_else(|| {
+                panic!(
+                    "{} (drained {seen:?} first)",
+                    subscribe_never_delivered("the matching sentinel")
+                )
+            });
+            assert_eq!(
+                ev.trace_id,
+                want,
+                "the subscription yielded trace_id={got:?}, which its EventFilter excludes. \
+                 This is not a late arrival: the row it leaked is OLDER than the sentinel this \
+                 drain is still waiting for.",
+                got = ev.trace_id
+            );
+            let last = ev.detection_id == sentinel.detection_id;
+            seen.push(ev.detection_id);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![matching.detection_id, sentinel.detection_id],
+            "the filter must yield the two matching rows, oldest-first, and nothing else"
+        );
+
+        drop(stream);
     }
 
     // ─── v3.3.0 (CIRISPersist#121) — put_blob_signing tests ────────
@@ -11558,6 +11968,42 @@ mod tests {
         ))
     }
 
+    /// v31.0.0 (CIRISPersist#647 / #658) — **the headline invariant, spelled
+    /// literally**: the bytes sitting in the `attestation_envelope` column
+    /// sha256sum to the row's own `original_content_hash`.
+    ///
+    /// Asserted against the row as READ BACK from a backend, never against an
+    /// in-memory value the test built, because the claim is about what is on
+    /// disk. Both placement-touching motions —
+    /// [`Engine::attestation_promote`] and the #530 repair re-scope — go
+    /// through `Engine::reseal_for_scope`, which used to canonicalize only to
+    /// hash and to sign and then hand back the UN-canonicalized value for the
+    /// backend to store. `sha256(column) != original_content_hash` for every
+    /// promoted and every re-scoped row, so a peer ingesting those bytes
+    /// derived a different content hash and every reference to the row
+    /// dangled.
+    ///
+    /// One helper rather than one spelling per call site: the defect existed
+    /// because a single motion had several spellings, and giving its witness
+    /// several spellings is how it comes back.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn assert_canonical_at_rest(row: &crate::federation::Attestation, what: &str) {
+        use sha2::{Digest as _, Sha256};
+        let stored =
+            serde_json::to_vec(&row.attestation_envelope).expect("a stored envelope re-serializes");
+        assert_eq!(
+            hex::encode(Sha256::digest(&stored)),
+            row.original_content_hash,
+            "{what}: sha256(stored attestation_envelope) != original_content_hash. The row is \
+             not canonical at rest (CIRISPersist#647): a peer ingesting these bytes derives a \
+             DIFFERENT content hash, so every reference to this row dangles, and the re-stamp \
+             that repairs it moves the row's wire address.\n  stored bytes: {}",
+            String::from_utf8_lossy(&stored),
+        );
+        crate::federation::canonical_at_rest::check_canonical_at_rest(&row.attestation_envelope)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+
     /// Seed a `federation_keys` row for `key_id` so the local-tier write
     /// gate's `attesting_key_id` FK and the promote path's `scrub_key_id`
     /// FK both hold.
@@ -11692,10 +12138,25 @@ mod tests {
         expected_envelope[crate::federation::envelope::paths::ROW]
             [crate::federation::envelope::row_paths::COHORT_SCOPE] =
             serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        // v31.0.0 (CIRISPersist#658) — …and CANONICAL, because the column a
+        // promotion writes is the one #647 says must sha256sum to
+        // `original_content_hash`. The expectation has to be canonicalized
+        // because `before` is not: `attestation_upsert_local` stores the
+        // producer's tokens verbatim, so this fixture's `weight: 1.0` /
+        // `score: 1.0` sit on disk as `1.0` while their canonical form is `1`.
+        // (That the LOCAL-tier write leaves a non-canonical row is a DIFFERENT
+        // producer and out of this cut's scope — the #650 boot classifier's
+        // `check_canonical_at_rest` arm re-stamps it. What this cut fixed is
+        // the promotion, which hashed and signed the canonical bytes and then
+        // stored the un-canonicalized value it had just hashed.)
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the expectation canonicalizes");
         assert_eq!(
             after.attestation_envelope, expected_envelope,
-            "promotion re-stamps the mirror's cohort_scope and NOTHING else"
+            "promotion re-stamps the mirror's cohort_scope, canonicalizes, and touches NOTHING \
+             else"
         );
+        assert_canonical_at_rest(&after, "the promoted row");
         crate::federation::admission::check_row_column_binding(&after)
             .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
@@ -11924,10 +12385,25 @@ mod tests {
         expected_envelope[crate::federation::envelope::paths::ROW]
             [crate::federation::envelope::row_paths::COHORT_SCOPE] =
             serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        // v31.0.0 (CIRISPersist#658) — …and CANONICAL, because the column a
+        // promotion writes is the one #647 says must sha256sum to
+        // `original_content_hash`. The expectation has to be canonicalized
+        // because `before` is not: `attestation_upsert_local` stores the
+        // producer's tokens verbatim, so this fixture's `weight: 1.0` /
+        // `score: 1.0` sit on disk as `1.0` while their canonical form is `1`.
+        // (That the LOCAL-tier write leaves a non-canonical row is a DIFFERENT
+        // producer and out of this cut's scope — the #650 boot classifier's
+        // `check_canonical_at_rest` arm re-stamps it. What this cut fixed is
+        // the promotion, which hashed and signed the canonical bytes and then
+        // stored the un-canonicalized value it had just hashed.)
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the expectation canonicalizes");
         assert_eq!(
             after.attestation_envelope, expected_envelope,
-            "promotion re-stamps the mirror's cohort_scope and NOTHING else"
+            "promotion re-stamps the mirror's cohort_scope, canonicalizes, and touches NOTHING \
+             else"
         );
+        assert_canonical_at_rest(&after, "the promoted row");
         crate::federation::admission::check_row_column_binding(&after)
             .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
@@ -12363,6 +12839,10 @@ mod tests {
             cohort_scope::FEDERATION,
             "now offer-visible: the covering grant's audience placed it"
         );
+        // The OTHER consumer of `Engine::reseal_for_scope`. Promotion is
+        // witnessed separately; this is the re-scope, and a fix that held for
+        // one and not the other would be the two-spellings defect again.
+        assert_canonical_at_rest(&fixed, "a #530-repaired re-scoped row");
 
         // Idempotent: a second repair finds nothing left stranded.
         let again = engine
@@ -12522,6 +13002,11 @@ mod tests {
             cohort_scope::FEDERATION,
             "the pg repair write-back placed it at the covering grant's audience"
         );
+        // Postgres parity for the sqlite arm's #647 claim. This backend is the
+        // one the invariant is stated in terms of — `sha256sum` of the column
+        // as `psql` prints it — so a sqlite-only witness would certify the
+        // half nobody hand-verifies.
+        assert_canonical_at_rest(&fixed, "a #530-repaired re-scoped row on postgres");
     }
 
     /// Emit a self-authored `withdraws` referencing `target_id` — the E7

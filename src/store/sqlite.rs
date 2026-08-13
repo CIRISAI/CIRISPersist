@@ -20349,8 +20349,11 @@ mod tests {
     /// [`fed_key`] (same deterministic seed per key_id).
     /// v31.0.0 (CIRISPersist#643) — delegates to
     /// [`tier_ingest::test_support::reseal`](crate::federation::tier_ingest::test_support::reseal),
-    /// which ALSO re-stamps the typed-column mirror from the row's own five
-    /// columns before signing. A mutation to `attestation_type` /
+    /// which ALSO re-stamps the typed-column mirror from the row's own SEVEN
+    /// columns before signing (v31.0.0, CIRISPersist#658 — this said five and
+    /// then listed five, omitting `attestation_id` and `attesting_key_id`; the
+    /// authority is [`row_paths::ALL`](crate::federation::envelope::row_paths::ALL)).
+    /// A mutation to `attestation_id` / `attesting_key_id` / `attestation_type` /
     /// `subject_key_ids` / `attested_key_id` / `cohort_scope` / `weight` is now
     /// exactly as much a re-sign trigger as a mutation to the envelope.
     fn resign_fed(row: &mut Attestation) {
