@@ -7220,7 +7220,25 @@ pub fn bind_subject_into_envelope(
 }
 
 /// v31.0.0 (CIRISPersist#659) — the **CHECKING** half of [`subject_binding`]:
-/// does `row`'s co-scrubbed `registration_envelope` bind THIS row's subject?
+/// does `row`'s signed `registration_envelope` bind THIS row's subject?
+///
+/// # The two callers
+///
+/// Both planes that verify a signature over `registration_envelope` ask this,
+/// and both ask it FIRST:
+///
+/// - the accord co-scrub quorum core (`verify_accord_family_coscrub_with`) —
+///   the CONFERRAL path, described below;
+/// - [`super::register::verify_key_registration`] — the path EVERY key in the
+///   mesh walks, which had the identical asymmetry: it resolved the SIGNER's
+///   pubkeys (off the record when self-attested, out of the directory for a
+///   granting authority), hybrid-verified over the envelope bytes, and asked
+///   nothing about the SUBJECT — so one authority signature lifted onto any
+///   row at all.
+///
+/// One projection, one spelling, two callers. The refusals below are worded for
+/// both, because a message naming an accord quorum on a plain peer registration
+/// would send an operator hunting for a quorum that is not there.
 ///
 /// # The defect
 ///
@@ -7273,10 +7291,11 @@ pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), Strin
             Some(bound) if *bound == expected => {}
             Some(bound) => {
                 return Err(format!(
-                    "the co-scrubbed registration_envelope binds {field} = {bound_brief}, but \
-                     this record carries {expected_brief} (key_id {key_id:?}). The accord quorum \
-                     verifies over those envelope bytes and NOTHING else, so honouring this would \
-                     confer the role on a subject the co-scrubbers never named (CIRISPersist#659)",
+                    "the signed registration_envelope binds {field} = {bound_brief}, but this \
+                     record carries {expected_brief} (key_id {key_id:?}). Every signature over \
+                     this row — the registration scrub and the accord co-scrub alike — is \
+                     verified over those envelope bytes and NOTHING else, so honouring this would \
+                     admit a subject the signers never named (CIRISPersist#659)",
                     bound_brief = brief_json(bound),
                     expected_brief = brief_json(&expected),
                     key_id = row.key_id,
@@ -7284,11 +7303,11 @@ pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), Strin
             }
             None => {
                 return Err(format!(
-                    "the co-scrubbed registration_envelope for {key_id:?} does not bind {field}. \
-                     The accord quorum verifies over those bytes ONLY, so an envelope that does \
-                     not name its subject confers on ANY record it is pasted onto. REQUIRED, not \
-                     check-if-present — an optional check is skippable by omission, which is the \
-                     whole attack (CIRISPersist#659)",
+                    "the signed registration_envelope for {key_id:?} does not bind {field}. Every \
+                     signature over this row is verified over those bytes ONLY, so an envelope \
+                     that does not name its subject stands for ANY record it is pasted onto. \
+                     REQUIRED, not check-if-present — an optional check is skippable by omission, \
+                     which is the whole attack (CIRISPersist#659)",
                     key_id = row.key_id,
                 ));
             }
