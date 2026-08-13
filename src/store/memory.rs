@@ -8273,9 +8273,9 @@ mod accord_tests {
     /// `run_v31_migration` marker-free — read its doc before changing it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    async fn a_v30_row_can_still_land_after_migration_memory_650() {
+    async fn a_v30_row_cannot_land_after_migration_memory_650() {
         let backend = MemoryBackend::new();
-        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
+        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
             &backend, "mem650g",
         )
         .await;

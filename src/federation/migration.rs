@@ -2901,14 +2901,19 @@ pub(crate) mod test_support {
         );
     }
 
-    /// v31.0.0 (CIRISPersist#650) — **THE PINNED GAP: why there is no
-    /// completion marker.**
+    /// v31.0.0 (CIRISPersist#650/#656) — **THE GAP THAT WAS, AND IS CLOSED.**
     ///
     /// A marker ("this corpus is migrated, skip the scan") is safe if and only
-    /// if a v30-shaped row cannot appear AFTER the migration. It can. This
-    /// witness is the proof, run against a real door on every backend, and it
-    /// exists so that the day the gap closes is a day this test goes RED rather
-    /// than a day nobody notices.
+    /// if a v30-shaped row cannot appear AFTER the migration. When this witness
+    /// was written, one could — and the witness was deliberately shaped so that
+    /// the day the gap closed would be a day it went RED rather than a day
+    /// nobody noticed.
+    ///
+    /// **That day came.** CIRISPersist#656 closed the transit door, this test
+    /// went red on all three backends exactly as designed, and it is now
+    /// inverted: it asserts the REFUSAL. The history is kept in place rather
+    /// than rewritten, because the composition below is the reason the hole
+    /// existed and is what a future reader needs in order not to reopen it.
     ///
     /// # The path
     ///
@@ -2918,30 +2923,38 @@ pub(crate) mod test_support {
     /// hybrid-signed those bytes and stamping would invalidate the signature
     /// and the hash derived from it. That exclusion is right.
     ///
-    /// What it leaves open is that the local door then asks
+    /// What it LEFT open is that the local door then asked
     /// `check_instant_binding` and **not** `check_row_column_binding` — by
     /// design too, since #649 chose to STAMP at this door rather than GATE at
-    /// it, and a transit row is checked "where the signature is", i.e. at the
-    /// promote door the consent-SLA watcher drives it through.
+    /// it, and a transit row was said to be checked "where the signature is",
+    /// i.e. at the promote door. Both halves of that sentence were false: the
+    /// promote door re-derived the mirror FROM the row's columns before
+    /// comparing it, so it validated the mirror against the very columns a
+    /// relay had rewritten, and then signed the result.
     ///
-    /// Compose the two and a caller can land a row whose signed envelope
-    /// carries `asserted_at` and no `row` mirror. It rests at `tier = local`,
-    /// v30-shaped, at any time — including long after this migration has run.
+    /// Composed, a caller could land a row whose signed envelope carried
+    /// `asserted_at` and no `row` mirror, resting at `tier = local`, v30-shaped,
+    /// at any time. Neither decision was wrong alone; only the composition was.
+    /// That is why it survived every review of either half.
     ///
-    /// # What that means for the marker, and for this routine
+    /// #656 fixed it at the same helper that made the stamping decision:
+    /// `stamp_local_row` now CHECKS when it does not stamp. The receiving half
+    /// cannot be forgotten at a door that remembered the minting half.
     ///
-    /// A marker would be a claim about the corpus that the corpus can falsify,
-    /// which makes it a cache that goes stale rather than a record of an
-    /// irreversible transition. So: no marker. The steady-state cost is instead
-    /// paid down by making a migrated corpus cost ONE indexed keyset scan —
-    /// `scan_corpus` keeps only the non-conformant rows, and
-    /// `run_v31_migration` short-circuits before the fold and the recursive walk
-    /// when there are none.
+    /// # What that means for the marker
     ///
-    /// The migration handles such a row correctly and conservatively: it is
-    /// foreign (the caller signed it) and local-tier (no peer can refill it), so
-    /// it is `RetainInert` — never purged.
-    pub(crate) async fn exercise_a_v30_row_can_still_land_after_migration(
+    /// With every door gated, "no v30-shaped row can appear after the
+    /// migration" is now a property of the substrate rather than a hope, so a
+    /// completion marker is no longer a cache that can go stale — it is a record
+    /// of an irreversible transition. Implementing one is therefore sound, and
+    /// this test is the standing proof of its premise: if a future change
+    /// reopens ANY door, this goes red again and the marker must come out with
+    /// it.
+    ///
+    /// The steady-state cost it would save was measured on an idle box: ~50 µs
+    /// per row, linear — 486 ms at 10k rows, 5.2 s at 100k, ~50 s at 1M, paid on
+    /// every boot forever.
+    pub(crate) async fn exercise_a_v30_row_cannot_land_after_migration(
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
@@ -2989,7 +3002,7 @@ pub(crate) mod test_support {
                     .to_rfc3339(),
         });
         let (_hash, sig_classical, sig_pqc) = seal::sign_envelope(&subject, &envelope);
-        let id = dir
+        let err = dir
             .attestation_insert_local(LocalAttestationInput {
                 attestation_id: None,
                 attesting_key_id: subject.clone(),
@@ -3007,47 +3020,33 @@ pub(crate) mod test_support {
                 scrub_signature_pqc: sig_pqc,
             })
             .await
-            .expect("({suffix}) a crypto-valid subject-side revocation transits the local tier");
+            .expect_err(
+                "({suffix}) THE GAP IS OPEN AGAIN. A transit revocation carrying no `row` mirror \
+                 was ADMITTED at the local door. That is CIRISPersist#656's seventh site \
+                 reopened: the five typed columns of this row are now bound by no door \
+                 anywhere, and the promote door will stamp whatever a relay put in them into \
+                 bytes THIS NODE signs. It also invalidates the completion-marker premise — \
+                 read this test's doc before changing it",
+            );
 
-        let stored = dir
-            .get_attestation(&id)
-            .await
-            .expect("read")
-            .expect("({suffix}) the transit row was written");
-
-        // THE FINDING. If this ever starts failing, the transit door has begun
-        // asking for the mirror — and a completion marker becomes implementable.
-        // Read the doc above before deleting this assertion.
+        // The refusal must be the BINDING gate, not an incidental failure. A
+        // row refused for the wrong reason would let the real hole reopen
+        // behind a passing test — the mistake four genesis witnesses made this
+        // same release by pinning one issue number.
+        let msg = err.to_string();
         assert!(
-            !classify_shape(&stored, chrono::Utc::now()).is_conformant(),
-            "({suffix}) a TRANSIT revocation now lands v31-shaped. That closes the only path \
-             CIRISPersist#650 found for a v30-shaped row to appear after the migration, which \
-             means a completion marker is now safe — see this test's doc and revisit \
-             `run_v31_migration`'s no-marker design"
+            msg.contains("CIRISPersist#643"),
+            "({suffix}) the refusal must name the row-column binding gate: {msg}"
         );
 
-        // And the migration treats it conservatively: foreign bytes, local
-        // tier, nowhere else to come back from.
-        let preview = run_v31_migration(
-            dir,
-            &signer,
-            &MigrationOptions {
-                dry_run: true,
-                ..MigrationOptions::default()
-            },
-        )
-        .await
-        .expect("({suffix}) preview");
-        let d = preview
-            .rows
-            .iter()
-            .find(|r| r.attestation_id == id)
-            .unwrap_or_else(|| panic!("({suffix}) the transit row must be visited"))
-            .disposition
-            .clone();
+        // And NOTHING landed: the corpus is still fully migrated, which is the
+        // marker's premise stated as a property rather than as a hope.
+        let after = run_v31_migration(dir, &signer, &MigrationOptions::default())
+            .await
+            .expect("({suffix}) post-probe migration");
         assert!(
-            matches!(d, Disposition::RetainInert { .. }),
-            "({suffix}) a caller-signed local-tier row must be RetainInert, got {d:?}"
+            !after.changed_anything(),
+            "({suffix}) a refused transit row left work behind: {after:?}"
         );
     }
 

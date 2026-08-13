@@ -21349,7 +21349,7 @@ mod tests {
     /// arm; shared body with memory + sqlite.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn a_v30_row_can_still_land_after_migration_postgres_650() {
+    async fn a_v30_row_cannot_land_after_migration_postgres_650() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -21357,7 +21357,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg650g{}", uuid_like());
-        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
+        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
             &backend, &tag,
         )
         .await;

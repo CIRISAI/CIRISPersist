@@ -40250,10 +40250,10 @@ mod tests {
     /// land after the migration, through the transit-revocation door. Sqlite
     /// arm; shared body with memory + postgres.
     #[tokio::test]
-    async fn a_v30_row_can_still_land_after_migration_sqlite_650() {
+    async fn a_v30_row_cannot_land_after_migration_sqlite_650() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::migration::test_support::exercise_a_v30_row_can_still_land_after_migration(
+        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
             &backend, "sq650g",
         )
         .await;
