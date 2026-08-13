@@ -2641,6 +2641,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         family_key_id: &str,
         member: types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "add_family_member",
@@ -3202,6 +3203,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         community_key_id: &str,
         member: types::CommunityMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "add_community_member",

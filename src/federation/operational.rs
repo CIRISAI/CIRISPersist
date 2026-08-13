@@ -3487,16 +3487,20 @@ pub mod test_support {
         for i in 3..5 {
             let extra = format!("{tag}-h{i}");
             register_typed_key(directory, &extra, identity_type::NODE).await?;
-            directory
-                .add_family_member(
-                    &accord,
-                    crate::federation::types::FamilyMember {
-                        key_id: extra,
-                        joined_at: chrono::Utc::now(),
-                        role: Some("founder".to_owned()),
-                    },
-                )
-                .await?;
+            // v31.0.0 (CIRISPersist#654) — the roster grow carries an authority
+            // signature over the GROWN envelope; the newcomer signs its own
+            // admission here purely because it is the key this fixture just
+            // registered.
+            let member = crate::federation::types::FamilyMember {
+                key_id: extra.clone(),
+                joined_at: chrono::Utc::now(),
+                role: Some("founder".to_owned()),
+            };
+            let spec = crate::federation::cohort::test_support::admit_family_via(
+                directory, &extra, &accord, &member,
+            )
+            .await;
+            directory.add_family_member(&accord, member, &spec).await?;
         }
 
         let after = trust_root_valid(directory, &user, &accord).await?;
@@ -4114,16 +4118,18 @@ pub mod test_support {
         for i in 3..5 {
             let extra = format!("{tag}-h{i}");
             register_typed_key(directory, &extra, identity_type::NODE).await?;
-            directory
-                .add_family_member(
-                    &accord,
-                    crate::federation::types::FamilyMember {
-                        key_id: extra,
-                        joined_at: chrono::Utc::now(),
-                        role: Some("founder".to_owned()),
-                    },
-                )
-                .await?;
+            // v31.0.0 (CIRISPersist#654) — signed roster grow; see the twin
+            // fixture above.
+            let member = crate::federation::types::FamilyMember {
+                key_id: extra.clone(),
+                joined_at: chrono::Utc::now(),
+                role: Some("founder".to_owned()),
+            };
+            let spec = crate::federation::cohort::test_support::admit_family_via(
+                directory, &extra, &accord, &member,
+            )
+            .await;
+            directory.add_family_member(&accord, member, &spec).await?;
         }
         let after_growth = resolve_transit_eligibility(directory, &user, &peer).await?;
         assert!(
@@ -4211,17 +4217,17 @@ pub mod test_support {
         // (3) attach_key_pqc_signature — four serialized columns at once.
         // A fresh hybrid-pending row, since the one above is already complete.
         let pending = format!("{tag}-pending");
-        let mut rec =
-            ts::replicated_key_record(&pending, identity_type::NODE, &pending, &pending, "boot");
-        let (pqc_pubkey, pqc_sig) = (
-            rec.pubkey_ml_dsa_65_base64
-                .take()
-                .expect("the deterministic record carries a PQC pubkey"),
-            rec.scrub_signature_pqc
-                .take()
-                .expect("the deterministic record carries a PQC signature"),
-        );
-        rec.pqc_completed_at = None;
+        // v31.0.0 (CIRISPersist#657) — the pending row is minted in the shape a
+        // legitimate cold-path fill-in has: self-scrubbed, with the ML-DSA
+        // pubkey bound into the signed `registration_envelope` (#659). Stripping
+        // the PQC leg off a `replicated_key_record` no longer produces a row the
+        // attach door will accept, and that is the point of #657 — an attached
+        // PUBLIC KEY has to be one the envelope's signer named.
+        let (mut rec, pqc_pubkey, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                &pending,
+            );
+        rec.identity_type = identity_type::NODE.into();
         directory
             .put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await?;
@@ -4232,6 +4238,100 @@ pub mod test_support {
             .await?;
         assert_advertised_key_ref_is_servable(directory, &pending, tag, "attach_key_pqc_signature")
             .await?;
+        Ok(())
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — **THE ATTESTATION PLANE'S INSTANCE OF THE
+    /// SAME ROUND TRIP.**
+    ///
+    /// #547 fixed the Key plane and #640 made the remedy a shared helper, but
+    /// `attach_attestation_pqc_signature` was never redirected through it: it
+    /// moves `scrub_signature_pqc`, `pqc_completed_at` and `persist_row_hash`
+    /// — three serialized columns — and left `signed_wire_index` describing the
+    /// pre-completion row. A federation-tier attestation that completed its PQC
+    /// leg therefore advertised a ref it could not serve, silently, exactly as
+    /// the Key plane did before #547.
+    ///
+    /// Driven from memory, sqlite AND postgres: the defect was in each
+    /// backend's own method, so a single-backend witness would have been the
+    /// test shape that let it live.
+    pub async fn exercise_attestation_wire_index_follows_pqc_attach(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        let owner = format!("owner-{tag}");
+        let node = format!("node-{tag}");
+        let att_id = format!("att-{tag}");
+        ts::register_identity_key(
+            directory,
+            &owner,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        ts::register_hybrid_key(directory, &node).await;
+
+        // A federation-tier row whose `pqc_completed_at` is still NULL — the
+        // shape `list_hybrid_pending_attestations` hands the cold-path sweep.
+        let mut row = ts::owner_binding_attestation(&att_id, &owner, &node);
+        let pqc_sig = row
+            .scrub_signature_pqc
+            .clone()
+            .expect("the deterministic row carries a PQC signature");
+        row.pqc_completed_at = None;
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await?;
+        assert_advertised_attestation_ref_is_servable(directory, &att_id, tag, "put_attestation")
+            .await?;
+
+        directory
+            .attach_attestation_pqc_signature(&att_id, &pqc_sig)
+            .await?;
+        assert_advertised_attestation_ref_is_servable(
+            directory,
+            &att_id,
+            tag,
+            "attach_attestation_pqc_signature",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the attestation twin of
+    /// [`assert_advertised_key_ref_is_servable`]: hash what this node
+    /// ADVERTISES for `attestation_id` and demand the point-read serve it,
+    /// byte-exact.
+    async fn assert_advertised_attestation_ref_is_servable(
+        directory: &dyn crate::federation::FederationDirectory,
+        attestation_id: &str,
+        tag: &str,
+        after: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let advertised = directory
+            .list_attestations_since(None, 10_000)
+            .await?
+            .into_iter()
+            .find(|a| a.attestation_id == attestation_id)
+            .unwrap_or_else(|| panic!("({tag}) {attestation_id} is advertised after {after}"));
+        let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
+        let served = directory
+            .lookup_signed_record_by_content_hash("Attestation", &hash)
+            .await?;
+        let served = served.unwrap_or_else(|| {
+            panic!(
+                "({tag}) after {after}: {attestation_id} advertises (Attestation, {hash}) and \
+                 CANNOT SERVE IT. Three serialized columns moved and `signed_wire_index` did not \
+                 follow, so the peer asks for exactly the ref we published and gets None — \
+                 silently (CIRISPersist#657, the #547/#640 class at its unfixed site)."
+            )
+        });
+        assert_eq!(
+            served,
+            serde_json::to_vec(&advertised).expect("advertised attestation re-serializes"),
+            "({tag}) after {after}: the served bytes must be the advertised bytes"
+        );
         Ok(())
     }
 

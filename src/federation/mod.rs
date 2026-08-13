@@ -1704,16 +1704,40 @@ pub trait FederationDirectory: Send + Sync {
     /// The family must exist ([`Error::InvalidArgument`] otherwise).
     /// Recomputes `persist_row_hash` over the grown roster.
     ///
-    /// This is the forward-path half of a membership-change re-key: the
-    /// at-rest cascade re-key
+    /// # v31.0.0 (CIRISPersist#654) — the addition carries an authority signature
+    ///
+    /// `spec` is the caller's hybrid signature over the **grown** record's
+    /// [`Family::signing_envelope`](types::Family::signing_envelope), verified
+    /// through the same [`verify_family_admission`] gate `put_family` and
+    /// `supersede_family` run (see [`cohort::AdmitSpec`] and
+    /// [`cohort::authorize_family_growth`]). Before this, roster growth was an
+    /// UNAUTHENTICATED write door into `federation_families.members` — inside
+    /// the signing preimage — that also left the row's stored
+    /// `authority_key_id` / `scrub_signature_*` describing the roster that used
+    /// to be there. Implementations MUST write the new signature columns in the
+    /// SAME statement as `members` + `persist_row_hash` (#651's rule: the
+    /// record and the signature that authorizes it travel together, because the
+    /// way they go stale is by being able to move apart) and MUST re-index
+    /// `signed_wire_index` afterwards (#547/#640).
+    ///
+    /// The idempotent no-op returns `Ok(false)` BEFORE the gate: no row is
+    /// written, so there is nothing to authorize, and demanding a signature
+    /// over a record that is not going to be stored would break the idempotency
+    /// the membership-change drivers depend on.
+    ///
+    /// This is the forward-path half of a membership-change: the at-rest
+    /// cascade re-key
     /// ([`rekey_family_member_add`](crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add))
-    /// grants the newcomer *past* family blobs; `add_family_member` puts
-    /// them on the roster so `resolve_recipients` includes them in
-    /// *future* writes too. The re-key driver calls this first.
+    /// grants an already-rostered member *past* family blobs; this call puts
+    /// them on the roster so `resolve_recipients` includes them in *future*
+    /// writes too. Since #654 the caller runs this FIRST and the re-key driver
+    /// second — the driver holds no key material, so it can neither produce
+    /// this signature nor relay one over a record it mints fields of.
     async fn add_family_member(
         &self,
         family_key_id: &str,
         member: types::FamilyMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error>;
 
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
@@ -2411,10 +2435,15 @@ pub trait FederationDirectory: Send + Sync {
     /// no-op returning `Ok(false)`; a genuine add returns `Ok(true)`. The
     /// community must exist ([`Error::InvalidArgument`] otherwise).
     /// Recomputes `persist_row_hash` over the grown roster.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — carries the same authority signature its
+    /// family twin does, verified through [`verify_community_admission`]; see
+    /// [`Self::add_family_member`] for why an addition needs one.
     async fn add_community_member(
         &self,
         community_key_id: &str,
         member: types::CommunityMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error>;
 
     // ── #249 Cut G1 ── the uniform rostered-group surface ──────────────
@@ -2644,11 +2673,18 @@ pub trait FederationDirectory: Send + Sync {
     /// [`RosterMember`] cannot, so `self` members are added via
     /// [`Self::put_identity_occurrence`]. Returns [`Error::InvalidArgument`]
     /// for `Cohort::SelfId`.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `spec` is the authority signature over the
+    /// grown roster, the exact mirror of the [`cohort::RevokeSpec`]
+    /// [`Self::revoke_member`] has taken since v21.0.0. Adding a seat and
+    /// removing one are the same act in opposite directions; only one of them
+    /// used to need proof.
     async fn add_member(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
         member: cohort::RosterMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         let member_key_id = member.key_id.clone();
         let (added, change_kind) = match cohort {
@@ -2660,6 +2696,7 @@ pub trait FederationDirectory: Send + Sync {
                         joined_at: member.joined_at,
                         role: member.role,
                     },
+                    spec,
                 )
                 .await?,
                 hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
@@ -2673,6 +2710,7 @@ pub trait FederationDirectory: Send + Sync {
                         joined_at: member.joined_at,
                         role: member.role,
                     },
+                    spec,
                 )
                 .await?,
                 hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
@@ -2841,13 +2879,21 @@ pub trait FederationDirectory: Send + Sync {
     /// `out` as active). A backend-level single-transaction `swap` (one
     /// `persist_row_hash` recompute, no torn read) is a Cut G2 hardening.
     /// `self` is rejected ([`Error::InvalidArgument`]) — see [`Self::add_member`].
+    ///
+    /// v31.0.0 (CIRISPersist#654) — a swap is two authorized acts, so it needs
+    /// TWO authorizations: `revoke_spec` for the removal (as before) and
+    /// `admit_spec` for the addition. The addition's signature is over the
+    /// roster as it will be AFTER the removal, because that is the state the
+    /// add is applied to — the removal is append-only, so `members[]` still
+    /// carries the outgoing key and the grown envelope contains both.
     async fn swap_member(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
         out_key_id: &str,
         in_member: cohort::RosterMember,
-        spec: cohort::RevokeSpec,
+        revoke_spec: cohort::RevokeSpec,
+        admit_spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         if cohort == cohort::Cohort::SelfId {
             return Err(Error::InvalidArgument(
@@ -2856,9 +2902,10 @@ pub trait FederationDirectory: Send + Sync {
                     .to_string(),
             ));
         }
-        self.revoke_member(cohort, group_key_id, out_key_id, spec)
+        self.revoke_member(cohort, group_key_id, out_key_id, revoke_spec)
             .await?;
-        self.add_member(cohort, group_key_id, in_member).await
+        self.add_member(cohort, group_key_id, in_member, admit_spec)
+            .await
     }
 
     // ── #249 Cut G2 ── supersede + versioning (CIRISServer #249 §3/§8) ──
@@ -3442,13 +3489,33 @@ pub trait FederationDirectory: Send + Sync {
     //   - Set pqc_completed_at = NOW()
     //   - Recompute persist_row_hash since row content changed
     //
-    // Persist does NOT verify the cryptographic validity of the PQC
-    // signature on attach — that's the writer's responsibility.
-    // Persist verifies on read at the consumer's policy layer.
+    // v31.0.0 (CIRISPersist#657) — CORRECTED IN PLACE. This comment used to
+    // read "Persist does NOT verify the cryptographic validity of the PQC
+    // signature on attach — that's the writer's responsibility. Persist
+    // verifies on read at the consumer's policy layer." It documented a defect
+    // as a design: true of a SIGNATURE, false of a KEY.
+    // `attach_key_pqc_signature` writes `pubkey_ml_dsa_65_base64` — the PQC
+    // half of an IDENTITY — and an unverified public key is not something a
+    // downstream reader can catch later, because every later verify resolves
+    // that key out of the directory and succeeds against it. So the key plane
+    // now gates at the door
+    // ([`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)):
+    // the signed `registration_envelope` must bind the attached ML-DSA-65
+    // pubkey (#659), and the post-attach row must verify hybrid-Strict.
+    //
+    // The two signature-only siblings below attach no key material, so their
+    // signature really is verified at the consumer's policy layer on read.
 
     /// Attach the PQC components to a hybrid-pending federation_keys row.
     /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
     /// Errors if the row is already PQC-complete.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — REFUSES unless the row's already-signed
+    /// `registration_envelope` binds the ML-DSA-65 pubkey being attached and
+    /// the post-attach row hybrid-Strict-verifies. See
+    /// [`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)
+    /// for why a row that bound `pubkey_ml_dsa_65_base64: null` may not attach
+    /// one afterwards.
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -3460,6 +3527,12 @@ pub trait FederationDirectory: Send + Sync {
     /// `federation_attestations` row. Attestations don't have their
     /// own pubkey — they reference the existing
     /// `federation_keys.scrub_key_id`'s pubkey for verification.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — implementations MUST re-index
+    /// `signed_wire_index` after the UPDATE. Three serialized columns move, so
+    /// the wire content hash moves with them; this is the #547/#640 stale-index
+    /// class, which was fixed at [`Self::attach_key_pqc_signature`] and not
+    /// here.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
@@ -3468,6 +3541,17 @@ pub trait FederationDirectory: Send + Sync {
 
     /// Attach the PQC signature to a hybrid-pending
     /// `federation_revocations` row. Same shape as attestations.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — deliberately does NOT re-index:
+    /// `federation_revocations` (the KEY-revocation plane, as distinct from the
+    /// `*MembershipRevocation` and `IdentityOccurrenceRevocation` planes, which
+    /// do have index kinds) has no `signed_wire_index` kind at all — no arm in
+    /// [`wire_index::reload_record_bytes`](crate::federation::wire_index::reload_record_bytes)
+    /// and no entry in
+    /// [`wire_index::all_kind_hash_keys`](crate::federation::wire_index::all_kind_hash_keys),
+    /// because no bulk signed-since surface serves it. There is no stale index
+    /// to fix here; if that plane ever gains a wire kind, this method gains the
+    /// re-index its two siblings have.
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,

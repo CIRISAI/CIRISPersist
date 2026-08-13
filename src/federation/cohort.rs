@@ -38,6 +38,422 @@ use serde::{Deserialize, Serialize};
 
 use super::types;
 
+/// v31.0.0 (CIRISPersist#654) — **THE ONE PLACE A ROSTER GROWS.**
+///
+/// Appends `member` to `family`, recomputes the server-computed
+/// `persist_row_hash` over the grown record, and hybrid-Strict-verifies
+/// `spec`'s authority signature over the grown record's
+/// [`signing_envelope`](types::Family::signing_envelope) through
+/// [`verify_family_admission`](super::verify_family_admission) — the SAME gate
+/// `put_family` and `supersede_family` run, not a second one written for the
+/// add path.
+///
+/// Every backend calls this and then writes what it returns, so "what a roster
+/// addition is signed over" is decided once. Verify-before-mutation (AV-9): the
+/// gate runs before the caller's UPDATE, so a refused addition never touches
+/// the row.
+///
+/// The constitutional family is reserved by that gate (#648) and therefore
+/// cannot grow through this door either — its roster changes through the
+/// genesis/assemble ceremony (`put_family_local`) and nothing else, which is
+/// the same single-door property #648 established for its creation.
+pub async fn authorize_family_growth<F>(
+    directory: &F,
+    family: &types::Family,
+    member: types::FamilyMember,
+    spec: &AdmitSpec,
+) -> Result<types::Family, super::Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let mut grown = family.clone();
+    grown.members.push(member);
+    let signed = super::SignedFamily {
+        family: grown,
+        authority_key_id: spec.authority_key_id.clone(),
+        scrub_signature_classical: spec.scrub_signature_classical.clone(),
+        scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+    };
+    super::verify_family_admission(directory, &signed).await?;
+    let mut grown = signed.family;
+    grown.persist_row_hash = types::compute_persist_row_hash(&grown)?;
+    Ok(grown)
+}
+
+/// v31.0.0 (CIRISPersist#654) — the ONE place a test produces the authority
+/// signature a roster addition now needs.
+///
+/// Every fixture on all three backends goes through these two helpers, so the
+/// witness that a roster grow is signed cannot drift from the gate that checks
+/// it — and a fixture that forgets to register `authority_key_id` fails closed
+/// exactly as production would.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod test_support {
+    use super::{types, AdmitSpec};
+
+    /// The [`AdmitSpec`] for appending `member` to `family`, hybrid-signed by
+    /// `authority_key_id`'s deterministic test keypair over the GROWN record's
+    /// `signing_envelope()` — the exact preimage
+    /// [`super::authorize_family_growth`] verifies.
+    ///
+    /// `authority_key_id` MUST already be registered (e.g. via
+    /// `tier_ingest::test_support::register_hybrid_key`), the same precondition
+    /// `sign_family` documents.
+    pub fn admit_family(
+        authority_key_id: &str,
+        family: &types::Family,
+        member: &types::FamilyMember,
+    ) -> AdmitSpec {
+        let mut grown = family.clone();
+        grown.members.push(member.clone());
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_family(authority_key_id, grown);
+        AdmitSpec {
+            authority_key_id: signed.authority_key_id,
+            scrub_signature_classical: signed.scrub_signature_classical,
+            scrub_signature_pqc: signed.scrub_signature_pqc,
+        }
+    }
+
+    /// The community mirror of [`admit_family`].
+    pub fn admit_community(
+        authority_key_id: &str,
+        community: &types::Community,
+        member: &types::CommunityMember,
+    ) -> AdmitSpec {
+        let mut grown = community.clone();
+        grown.members.push(member.clone());
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_community(authority_key_id, grown);
+        AdmitSpec {
+            authority_key_id: signed.authority_key_id,
+            scrub_signature_classical: signed.scrub_signature_classical,
+            scrub_signature_pqc: signed.scrub_signature_pqc,
+        }
+    }
+
+    /// Look the group up through `directory` and produce the [`AdmitSpec`] for
+    /// appending `member` — the one-call form for the many fixtures that do not
+    /// already hold the row.
+    pub async fn admit_family_via<F>(
+        directory: &F,
+        authority_key_id: &str,
+        family_key_id: &str,
+        member: &types::FamilyMember,
+    ) -> AdmitSpec
+    where
+        F: crate::federation::FederationDirectory + ?Sized,
+    {
+        let family = directory
+            .lookup_family(family_key_id)
+            .await
+            .expect("lookup_family")
+            .expect("family exists");
+        admit_family(authority_key_id, &family, member)
+    }
+
+    /// The cohort-parameterized form, for fixtures driving the uniform
+    /// [`add_member`](crate::federation::FederationDirectory::add_member) /
+    /// [`swap_member`](crate::federation::FederationDirectory::swap_member)
+    /// surface. `self` has no group row to sign over, so it returns an empty
+    /// spec — that arm refuses before the spec is ever looked at.
+    pub async fn admit_roster_member_via<F>(
+        directory: &F,
+        authority_key_id: &str,
+        cohort: super::Cohort,
+        group_key_id: &str,
+        member: &super::RosterMember,
+    ) -> AdmitSpec
+    where
+        F: crate::federation::FederationDirectory + ?Sized,
+    {
+        match cohort {
+            super::Cohort::Family => {
+                admit_family_via(
+                    directory,
+                    authority_key_id,
+                    group_key_id,
+                    &types::FamilyMember {
+                        key_id: member.key_id.clone(),
+                        joined_at: member.joined_at,
+                        role: member.role.clone(),
+                    },
+                )
+                .await
+            }
+            super::Cohort::Community | super::Cohort::Affiliations => {
+                admit_community_via(
+                    directory,
+                    authority_key_id,
+                    group_key_id,
+                    &types::CommunityMember {
+                        key_id: member.key_id.clone(),
+                        joined_at: member.joined_at,
+                        role: member.role.clone(),
+                    },
+                )
+                .await
+            }
+            super::Cohort::SelfId => AdmitSpec {
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+            },
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#654) — **ROSTER GROWTH IS AUTHORIZED, ON EVERY
+    /// BACKEND.**
+    ///
+    /// One body, driven from memory, sqlite AND postgres, because the defect
+    /// was in each backend's own `add_*_member` and a single-backend witness is
+    /// the test shape that let it live. Four properties per plane:
+    ///
+    /// 1. an EMPTY [`AdmitSpec`] — what every pre-#654 caller effectively
+    ///    supplied — is refused;
+    /// 2. a spec signed over a DIFFERENT grown roster does not admit this one;
+    /// 3. neither refusal touches `members` (verify-before-mutation, AV-9);
+    /// 4. after a genuine signed add, the STORED row re-verifies against the
+    ///    STORED signature — the property the old in-place mutation destroyed
+    ///    by rewriting `members` (inside `signing_envelope()`) and leaving the
+    ///    old `authority_key_id` / `scrub_signature_*` behind.
+    ///
+    /// Key ids lead with the DISTINGUISHING part:
+    /// `tier_ingest::test_support::seed_for` truncates at 32 bytes, and a
+    /// uuid-bearing postgres tag in front would collapse `…-seated` and
+    /// `…-newcomer` into ONE identity — making the whole witness vacuous on the
+    /// one backend production runs.
+    pub async fn exercise_roster_growth_is_authorized<F>(
+        directory: &F,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error>
+    where
+        F: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        let seated = format!("seated-{tag}");
+        let newcomer = format!("newcomer-{tag}");
+        let other = format!("other-{tag}");
+        let fam = format!("fam-{tag}");
+        let comm = format!("comm-{tag}");
+        // Members register as `user`-role identities: the community plane
+        // refuses an unstewarded member, and a witness that dies at THAT gate
+        // is not measuring the authorship one.
+        for k in [&seated, &newcomer, &other] {
+            ts::register_identity_key(directory, k, types::identity_type::USER).await;
+        }
+        for k in [&fam, &comm] {
+            ts::register_hybrid_key(directory, k).await;
+        }
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let unsigned = AdmitSpec {
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+        };
+
+        // ── family plane ────────────────────────────────────────────────
+        directory
+            .put_family(ts::sign_family(
+                &fam,
+                types::Family {
+                    family_key_id: fam.clone(),
+                    family_name: "roster growth".into(),
+                    members: vec![types::FamilyMember {
+                        key_id: seated.clone(),
+                        joined_at: now,
+                        role: None,
+                    }],
+                    founded_at: now,
+                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await?;
+        let member = types::FamilyMember {
+            key_id: newcomer.clone(),
+            joined_at: now,
+            role: None,
+        };
+        let err = directory
+            .add_family_member(&fam, member.clone(), &unsigned)
+            .await
+            .expect_err("(1) an unsigned family roster grow must be refused");
+        assert!(
+            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            "({tag}) the refusal is about AUTHORSHIP: {err:?}"
+        );
+        let wrong = admit_family_via(
+            directory,
+            &seated,
+            &fam,
+            &types::FamilyMember {
+                key_id: other.clone(),
+                joined_at: now,
+                role: None,
+            },
+        )
+        .await;
+        directory
+            .add_family_member(&fam, member.clone(), &wrong)
+            .await
+            .expect_err("(2) a signature over a different grown roster must not admit this one");
+        assert_eq!(
+            directory
+                .lookup_family(&fam)
+                .await?
+                .expect("family")
+                .members
+                .len(),
+            1,
+            "({tag}) (3) verify-before-mutation: neither refusal touched the family roster"
+        );
+        let admit = admit_family_via(directory, &seated, &fam, &member).await;
+        assert!(
+            directory.add_family_member(&fam, member, &admit).await?,
+            "({tag}) the signed grow is a genuine add"
+        );
+        let signed_fam = directory
+            .list_signed_families_since(None, u32::MAX)
+            .await?
+            .into_iter()
+            .find(|f| f.family.family_key_id == fam)
+            .expect("the grown family is served on the signed read surface");
+        assert_eq!(signed_fam.family.members.len(), 2, "({tag})");
+        crate::federation::verify_family_admission(directory, &signed_fam)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({tag}) (4) the STORED family must verify against its own STORED signature \
+                     — the roster and its authorization move together (#654/#651): {e}"
+                )
+            });
+
+        // ── community plane (the exact mirror) ───────────────────────────
+        directory
+            .put_community(ts::sign_community(
+                &comm,
+                types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "roster growth".into(),
+                    members: vec![types::CommunityMember {
+                        key_id: seated.clone(),
+                        joined_at: now,
+                        role: None,
+                    }],
+                    founded_at: now,
+                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await?;
+        let member = types::CommunityMember {
+            key_id: newcomer.clone(),
+            joined_at: now,
+            role: None,
+        };
+        directory
+            .add_community_member(&comm, member.clone(), &unsigned)
+            .await
+            .expect_err("(1) an unsigned community roster grow must be refused");
+        let wrong = admit_community_via(
+            directory,
+            &seated,
+            &comm,
+            &types::CommunityMember {
+                key_id: other.clone(),
+                joined_at: now,
+                role: None,
+            },
+        )
+        .await;
+        directory
+            .add_community_member(&comm, member.clone(), &wrong)
+            .await
+            .expect_err("(2) a signature over a different grown roster must not admit this one");
+        assert_eq!(
+            directory
+                .lookup_community(&comm)
+                .await?
+                .expect("community")
+                .members
+                .len(),
+            1,
+            "({tag}) (3) verify-before-mutation: neither refusal touched the community roster"
+        );
+        let admit = admit_community_via(directory, &seated, &comm, &member).await;
+        assert!(
+            directory
+                .add_community_member(&comm, member, &admit)
+                .await?,
+            "({tag}) the signed grow is a genuine add"
+        );
+        let signed_comm = directory
+            .list_signed_communities_since(None, u32::MAX)
+            .await?
+            .into_iter()
+            .find(|c| c.community.community_key_id == comm)
+            .expect("the grown community is served on the signed read surface");
+        assert_eq!(signed_comm.community.members.len(), 2, "({tag})");
+        crate::federation::verify_community_admission(directory, &signed_comm)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({tag}) (4) the STORED community must verify against its own STORED \
+                     signature (#654/#651): {e}"
+                )
+            });
+        Ok(())
+    }
+
+    /// The community mirror of [`admit_family_via`].
+    pub async fn admit_community_via<F>(
+        directory: &F,
+        authority_key_id: &str,
+        community_key_id: &str,
+        member: &types::CommunityMember,
+    ) -> AdmitSpec
+    where
+        F: crate::federation::FederationDirectory + ?Sized,
+    {
+        let community = directory
+            .lookup_community(community_key_id)
+            .await
+            .expect("lookup_community")
+            .expect("community exists");
+        admit_community(authority_key_id, &community, member)
+    }
+}
+
+/// v31.0.0 (CIRISPersist#654) — the community mirror of
+/// [`authorize_family_growth`]. Verifies through
+/// [`verify_community_admission`](super::verify_community_admission).
+pub async fn authorize_community_growth<F>(
+    directory: &F,
+    community: &types::Community,
+    member: types::CommunityMember,
+    spec: &AdmitSpec,
+) -> Result<types::Community, super::Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let mut grown = community.clone();
+    grown.members.push(member);
+    let signed = super::SignedCommunity {
+        community: grown,
+        authority_key_id: spec.authority_key_id.clone(),
+        scrub_signature_classical: spec.scrub_signature_classical.clone(),
+        scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+    };
+    super::verify_community_admission(directory, &signed).await?;
+    let mut grown = signed.community;
+    grown.persist_row_hash = types::compute_persist_row_hash(&grown)?;
+    Ok(grown)
+}
+
 /// One of the four rostered-group kinds. Serializes to the wire scope token
 /// (`"self"` / `"family"` / `"community"` / `"affiliations"`) so the cohort
 /// dispatch is portable over FFI / JSON.
@@ -158,6 +574,62 @@ impl From<types::IdentityOccurrence> for RosterMember {
             role: Some(o.device_class),
         }
     }
+}
+
+/// v31.0.0 (CIRISPersist#654) — the authority signature over a roster
+/// ADDITION, the exact mirror of [`RevokeSpec`]'s three signature fields.
+///
+/// # Why an addition needs one
+///
+/// Roster growth mutates `members`, and `members` is INSIDE
+/// [`Family::signing_envelope`](types::Family::signing_envelope) /
+/// [`Community::signing_envelope`](types::Community::signing_envelope) — the
+/// whole record minus the server-computed `persist_row_hash`. So an unsigned
+/// `add_*_member` left `federation_families` holding a roster no authority had
+/// ever signed, next to the `authority_key_id` / `scrub_signature_*` columns
+/// #651 taught `supersede_group_row` to keep in step, still describing the
+/// roster that USED to be there. And the roster is both the numerator and the
+/// denominator of
+/// [`family_quorum_over`](crate::federation::trust_root) and
+/// `wa_quorum_over_body`: a free seat changes who can charter a trust root and
+/// what threshold they must clear. The write door was reachable from PyO3 with
+/// no authority check at all.
+///
+/// # What the signature covers
+///
+/// `JCS(signing_envelope())` of the **GROWN** record — the stored group with
+/// this member appended — verified through the same
+/// [`verify_family_admission`](crate::federation::verify_family_admission) /
+/// [`verify_community_admission`](crate::federation::verify_community_admission)
+/// gate `put_*` and `supersede_*` run. That is byte-identical to what a
+/// supersede of the same grown record would be signed over, which is the point:
+/// growing a roster is not a lesser act than replacing one, so it is not a
+/// second, weaker spelling of it.
+///
+/// A caller therefore signs a record it can compute in full: read the group,
+/// append the member it chose (`key_id` / `joined_at` / `role` are all
+/// caller-known — the v21.0.0 #502 E4 rule that every field the gate verifies
+/// over must be caller-known IN ADVANCE, the same reason a revocation's
+/// `removed_at` is its caller-supplied `effective_at` and not a server-minted
+/// `now`). If the stored roster moved under the caller between reading and
+/// writing, the signature simply does not verify and the add fails closed.
+///
+/// Additive (`#[serde(default)]`) so an old JSON payload decodes fine and then
+/// fails closed at admission — an empty signer/signature never verifies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmitSpec {
+    /// The claimed authority for the addition — a `federation_keys.key_id`
+    /// whose REGISTERED pubkeys the signatures below must verify against.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over `JCS(signing_envelope())` of the
+    /// GROWN group record.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// The knobs of a roster removal / swap-out (#249 Cut G1 §1/§6), uniform

@@ -4209,16 +4209,20 @@ pub(crate) mod test_support {
         for i in 0..4 {
             let newcomer = format!("rq-newcomer{i}-{suffix}");
             register_user_key(dir, &newcomer).await;
-            dir.add_community_member(
-                &community,
-                CommunityMember {
-                    key_id: newcomer,
-                    joined_at: Utc::now(),
-                    role: Some("member".to_owned()),
-                },
+            // v31.0.0 (CIRISPersist#654) — the roster grow carries an authority
+            // signature over the GROWN envelope.
+            let member = CommunityMember {
+                key_id: newcomer.clone(),
+                joined_at: Utc::now(),
+                role: Some("member".to_owned()),
+            };
+            let spec = crate::federation::cohort::test_support::admit_community_via(
+                dir, &newcomer, &community, &member,
             )
-            .await
-            .expect("grow the commons");
+            .await;
+            dir.add_community_member(&community, member, &spec)
+                .await
+                .expect("grow the commons");
         }
         let f_grown = fold(&action).await;
         assert_eq!(f_grown.roster_size, 9, "({suffix})");

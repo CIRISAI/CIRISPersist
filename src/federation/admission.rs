@@ -7297,6 +7297,259 @@ pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), Strin
     Ok(())
 }
 
+/// v31.0.0 (CIRISPersist#657) — **THE COLD-PATH PQC FILL-IN IS A KEY
+/// INSTALLATION, AND IT IS NOW GATED LIKE ONE.**
+///
+/// # The defect
+///
+/// [`FederationDirectory::attach_key_pqc_signature`](super::FederationDirectory::attach_key_pqc_signature)
+/// writes `pubkey_ml_dsa_65_base64` — a PUBLIC KEY, not merely a signature —
+/// onto an existing `federation_keys` row, and until this cut it checked
+/// nothing about it: no proof the caller holds the matching private key, and no
+/// cross-check against the signed `registration_envelope` the row already
+/// carries. On a hybrid-pending row that is a permanent takeover of the PQC leg
+/// of somebody else's identity: every later hybrid verify of that key resolves
+/// the ATTACKER's ML-DSA pubkey out of the directory, and the classical leg
+/// alone is what the PQC leg exists to outlive.
+///
+/// The site's own comment said this was intentional — *"Persist does NOT verify
+/// the cryptographic validity of the PQC signature on attach — that's the
+/// writer's responsibility"* — which is true of a SIGNATURE and false of a
+/// KEY. That comment is corrected in place rather than deleted; it documented
+/// the defect as a design.
+///
+/// # Why this could not be fixed before #659, and why it can be now
+///
+/// Proof-of-possession is only well-defined on the SELF-scrubbed path
+/// (`scrub_key_id == key_id`), where the attached pubkey and the attached
+/// signature belong to the same keypair. On the ANCHOR-scrubbed path
+/// (`scrub_key_id != key_id`) the signature is the anchor's and the pubkey is
+/// the subject's, so nothing about the signature says anything about the key —
+/// unless the subject's ML-DSA pubkey is bound into the bytes the anchor
+/// signed. [CIRISPersist#659](`verify_envelope_binds_subject`) landed exactly
+/// that binding. Both halves are therefore closed here by ONE gate, in the
+/// order that makes the refusal deterministic.
+///
+/// 1. **[`verify_envelope_binds_subject`] over the POST-ATTACH row** — the #659
+///    projection, unchanged and not re-spelled. The `registration_envelope`
+///    must already bind `pubkey_ml_dsa_65_base64` equal to the key being
+///    attached.
+/// 2. **[`super::register::verify_key_registration`] over the POST-ATTACH row**
+///    — the SAME gate a fresh registration passes, which under
+///    [`HybridPolicy::Strict`](crate::verify::HybridPolicy) now has both legs
+///    to check. Self-scrub ⇒ this IS the proof of possession (the ML-DSA
+///    signature verifies under the ML-DSA pubkey being installed);
+///    anchor-scrub ⇒ the anchor really signed the envelope with its PQC leg,
+///    and step 1 has already tied that envelope to this subject's key.
+///
+/// # A row that bound `null` may not attach
+///
+/// `pubkey_ml_dsa_65_base64` binds as JSON `null` when the row carries no PQC
+/// key, and #659 is explicit that this is an ASSERTION OF ABSENCE rather than a
+/// gap. So a row whose envelope bound `null` and which later attaches a PQC key
+/// is asserting something no signer ever signed for — the accord (or the
+/// self-scrubber) put their name to *"this subject has no PQC leg"*. Step 1
+/// refuses it, and that refusal is correct rather than incidental: the repair
+/// is to re-mint the registration through `put_public_key` with an envelope
+/// that binds the key, not to let the substrate quietly upgrade an assertion of
+/// absence into an assertion of presence. Fail-closed, no legacy regime — the
+/// standing v31 decision on #598, #640, #643 and #659.
+///
+/// Verify-before-mutation (AV-9): callers run this BEFORE the UPDATE, so a
+/// refused attach never touches the row.
+pub async fn check_key_pqc_attachment<F>(
+    directory: &F,
+    post_attach: &super::KeyRecord,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    verify_envelope_binds_subject(post_attach).map_err(|why| {
+        Error::SignatureInvalid(format!(
+            "attach_key_pqc_signature refused for {key_id:?}: {why}",
+            key_id = post_attach.key_id
+        ))
+    })?;
+    super::register::verify_key_registration(directory, post_attach)
+        .await
+        .map_err(|e| {
+            Error::SignatureInvalid(format!(
+                "attach_key_pqc_signature refused for {key_id:?}: the row does not verify with the \
+                 attached ML-DSA-65 key and signature — an attached PUBLIC KEY that nothing proves \
+                 possession of is a permanent takeover of this identity's PQC leg \
+                 (CIRISPersist#657): {e}",
+                key_id = post_attach.key_id
+            ))
+        })
+        .map(|_outcome| ())
+}
+
+/// v31.0.0 (CIRISPersist#657) — the ONE fixture that mints a row the cold-path
+/// PQC fill-in can legitimately complete, shared by all three backends.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod pqc_attach_test_support {
+    /// A **self-scrubbed hybrid-pending** [`KeyRecord`](super::super::KeyRecord)
+    /// for `key_id`, plus the ML-DSA-65 pubkey and signature a legitimate
+    /// [`super::check_key_pqc_attachment`] will accept.
+    ///
+    /// The registration envelope carries the #659 subject binding INCLUDING the
+    /// PQC pubkey — which is the shape the hot/cold split actually has: a
+    /// producer knows its own ML-DSA public key at registration time and is
+    /// only slow to SIGN with it. The row is pending because
+    /// `scrub_signature_pqc` is absent, not because the key is unknown.
+    ///
+    /// Returns `(row, ml_dsa_pubkey_base64, scrub_signature_pqc)`.
+    pub fn hybrid_pending_self_scrubbed(key_id: &str) -> (super::super::KeyRecord, String, String) {
+        let (ed_pk, mldsa_pk) = super::super::tier_ingest::test_support::hybrid_pubkeys(key_id);
+        let mldsa_pk = mldsa_pk.expect("deterministic test keypair has an ML-DSA leg");
+        let mut envelope = serde_json::json!({ "purpose": "pqc-attach fixture" });
+        super::bind_subject_into_envelope(&mut envelope, key_id, &ed_pk, Some(&mldsa_pk))
+            .expect("envelope is an object");
+        let (original_content_hash, classical, pqc) =
+            super::super::tier_ingest::test_support::sign_envelope(key_id, &envelope);
+        let pqc = pqc.expect("deterministic test signer produces a PQC leg");
+        let row = super::super::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: ed_pk,
+            // Hybrid-PENDING: the column the cold path fills in.
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: super::super::types::algorithm::HYBRID.into(),
+            identity_type: super::super::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        (row, mldsa_pk, pqc)
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — **AN ATTACHED PUBLIC KEY NOTHING PROVES
+    /// POSSESSION OF IS REFUSED — ON EVERY BACKEND.**
+    ///
+    /// One body, driven from memory, sqlite AND postgres. The door is each
+    /// backend's own `attach_key_pqc_signature`, so a single-backend witness is
+    /// the shape that let #547's twin live at an unfixed site for four cuts.
+    ///
+    /// Three arms, each isolating one leg of the gate so no single deletion
+    /// survives:
+    /// 1. an ATTACKER's ML-DSA pubkey on the victim's row — the permanent
+    ///    takeover; refused by the #659 subject binding;
+    /// 2. the CORRECTLY BOUND pubkey with somebody else's signature — the
+    ///    binding passes, and proof-of-possession must still refuse;
+    /// 3. a row whose envelope bound `pubkey_ml_dsa_65_base64: null` — an
+    ///    ASSERTION OF ABSENCE, which may not be quietly upgraded.
+    ///
+    /// `tag` leads the key ids, never trails them: the shared seed derivation
+    /// truncates at 32 bytes, so a uuid-bearing postgres tag in FRONT would
+    /// make `victim` and `attacker` one identity and the witness vacuous on the
+    /// backend production runs.
+    pub async fn exercise_attach_key_pqc_is_gated<F>(
+        directory: &F,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error>
+    where
+        F: crate::federation::FederationDirectory + ?Sized,
+    {
+        let victim_id = format!("victim-{tag}");
+        let attacker_id = format!("attacker-{tag}");
+        let absent_id = format!("absent-{tag}");
+        let (victim_row, victim_pk, _victim_sig) = hybrid_pending_self_scrubbed(&victim_id);
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: victim_row })
+            .await?;
+        let (attacker_row, attacker_pk, attacker_sig) = hybrid_pending_self_scrubbed(&attacker_id);
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: attacker_row,
+            })
+            .await?;
+
+        // (1) The attacker's own PQC key, offered for the victim's row.
+        let err = directory
+            .attach_key_pqc_signature(&victim_id, &attacker_pk, &attacker_sig)
+            .await
+            .expect_err("(1) an ML-DSA pubkey the envelope does not bind must be refused");
+        assert!(
+            err.to_string().contains("657") || err.to_string().contains("659"),
+            "({tag}) the refusal names the binding: {err}"
+        );
+        let after = directory
+            .lookup_public_key(&victim_id)
+            .await?
+            .expect("victim row");
+        assert!(
+            after.pubkey_ml_dsa_65_base64.is_none() && after.pqc_completed_at.is_none(),
+            "({tag}) verify-before-mutation: the refused attach wrote nothing"
+        );
+
+        // (2) The BOUND pubkey with somebody else's signature. The #659 check
+        //     passes here, so this arm is what keeps the proof-of-possession
+        //     leg from being deletable without a test noticing.
+        directory
+            .attach_key_pqc_signature(&victim_id, &victim_pk, &attacker_sig)
+            .await
+            .expect_err("(2) the bound pubkey with another key's signature proves no possession");
+
+        // (3) A row that bound `null` asserted ABSENCE — no later upgrade.
+        let (mut absent_row, absent_pk, absent_sig) = hybrid_pending_self_scrubbed(&absent_id);
+        let mut envelope = serde_json::json!({ "purpose": "absence" });
+        super::bind_subject_into_envelope(
+            &mut envelope,
+            &absent_id,
+            &absent_row.pubkey_ed25519_base64,
+            None,
+        )
+        .expect("envelope is an object");
+        let (hash, classical, _pqc) =
+            super::super::tier_ingest::test_support::sign_envelope(&absent_id, &envelope);
+        absent_row.registration_envelope = envelope;
+        absent_row.original_content_hash = hash;
+        absent_row.scrub_signature_classical = classical;
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: absent_row })
+            .await?;
+        let err = directory
+            .attach_key_pqc_signature(&absent_id, &absent_pk, &absent_sig)
+            .await
+            .expect_err("(3) an envelope that bound `null` asserted ABSENCE — no upgrade");
+        assert!(
+            err.to_string().contains("null"),
+            "({tag}) the refusal points at the bound null: {err}"
+        );
+
+        // The green control: a legitimate fill-in still works.
+        let (ok_row, ok_pk, ok_sig) = hybrid_pending_self_scrubbed(&format!("ok-{tag}"));
+        let ok_id = ok_row.key_id.clone();
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: ok_row })
+            .await?;
+        directory
+            .attach_key_pqc_signature(&ok_id, &ok_pk, &ok_sig)
+            .await?;
+        let completed = directory
+            .lookup_public_key(&ok_id)
+            .await?
+            .expect("completed row");
+        assert!(
+            completed.is_pqc_complete()
+                && completed.pubkey_ml_dsa_65_base64.as_deref() == Some(&*ok_pk),
+            "({tag}) the gate admits a legitimate cold-path fill-in"
+        );
+        Ok(())
+    }
+}
+
 /// The JSON type name, for a refusal that has to say what it got instead of an
 /// object. Diagnostic only.
 fn json_type_name(v: &serde_json::Value) -> &'static str {
