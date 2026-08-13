@@ -63,11 +63,43 @@ OMITTED member produce the same verdict on both implementations, for every
 member, against a row both with and without its optional legs — and that
 persist's refusal names the member verify named.
 
-**Mutation-tested, 5 for 5.** Dropping `identity_type`; binding it off the
-`key_id` column; making the optional leg required; flattening §0.9 in each
-direction. Every one reds the detector. The first also proves the probe is not
-vacuous — it reports `only ciris_verify_core binds: ["identity_type"]`, so it
-really did discover all four members off verify's behaviour.
+**Two of verify's three planes, and the third named rather than faked.** 13.1.0
+applies this projection on three planes. The PROVENANCE plane
+(`provenance.rs:420`) is probed the same way and is worth probing even though
+#465 routed persist's chain walk through verify: persist is still the PRODUCER
+of every `registration_envelope` that walk inspects, so a member verify starts
+requiring and `bind_subject_into_envelope` does not stamp means **every chain
+persist mints stops rooting** — a federation-wide outage delivered by a
+dependency bump. The same test also pins verify's two checker planes against
+each other, which nothing in verify does either.
+
+The TRANSPORT plane (`transport_binding.rs:353`, a different projection —
+`attesting_key_id` + `transport_destination` + `encryption_pubkeys`) is **not**
+covered, and deliberately not faked. `verify_transport_binding` catches the
+`SubjectBindingError`, returns `Ok(reject(SubjectMismatch))`, and drops the
+detail through `tracing::warn!`, so the member name never leaves the function
+and the probe cannot converge. Log-scraping would be a half-probe that certifies
+an agreement it never checked. Persist's exposure there is also structurally
+different — `verify_signed_identity_occurrence` parses the envelope rather than
+restating the projection, so there is no second spelling in shipped code; the
+residual risk is producer-side and unguarded. CIRISVerify#254 carries the ask.
+
+**The fixture asserts its own distinguishability.** The probe recovers verify's
+expectation by VALUE, so two fixture fields sharing a value are indistinguishable
+to it — a member persist bound off the WRONG COLUMN would report agreement.
+Caught in review on #666: `key_id`/`identity_ref`/`scrub_key_id` shared one
+value and three timestamps shared another. Every field now carries its own
+sentinel, and a witness derives the pairwise-distinctness check from the
+SERIALIZED fixtures, so a field added later cannot quietly reuse a value. The
+failure mode it closes is a test that keeps passing while measuring less.
+
+**Mutation-tested, 6 for 6**, scored on the full five-test `Summary` line:
+dropping `identity_type` (4 red); binding it off the `key_id` column (4 red);
+making the optional leg required (4 red); flattening §0.9 in each direction
+(2 red each); and re-introducing the shared-sentinel blind spot (1 red). The
+first also proves neither probe is vacuous — it reports
+`only ciris_verify_core binds: ["identity_type"]`, so both really did discover
+all four members off verify's own behaviour.
 
 Filed CIRISVerify#254 asking verify to export the member list as data
 (`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the

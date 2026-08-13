@@ -64,24 +64,77 @@
 //! construction); nothing here asserts an insertion order, which would be a
 //! false failure waiting to happen.
 //!
-//! # MUTATION-TESTED — 5 mutations of the checked code, 5 killed
+//! # MUTATION-TESTED — 6 mutations, 6 killed
 //!
 //! A conformance test that passes under divergence is worse than none, because
 //! it certifies an agreement that does not exist. So the detector was checked
-//! against the divergences it claims to catch, each applied to
-//! `src/federation/admission.rs` and re-read off disk before running:
+//! against the divergences it claims to catch — each applied on disk, re-read
+//! back before running, and scored on nextest's `Summary [...] N tests run:`
+//! line (all five tests, never a single-test filter):
 //!
-//! | mutation | tests red |
+//! | mutation | of 5 tests |
 //! | --- | --- |
-//! | drop `identity_type` from `subject_binding` (the literal v31.0.0 defect) | 3 of 3 |
-//! | bind `identity_type` off the `key_id` column (right member, wrong value) | 2 of 3 |
-//! | bind the absent PQC leg as `""` instead of `null` (optional ⇒ required) | 3 of 3 |
-//! | flatten §0.9 to unconditional refusal (fail-closed "simplification") | 2 of 3 |
-//! | flatten §0.9 to unconditional tolerance (the other direction) | 2 of 3 |
+//! | drop `identity_type` from `subject_binding` (the literal v31.0.0 defect) | **4 red** |
+//! | bind `identity_type` off the `key_id` column (right member, wrong value) | **4 red** |
+//! | bind the absent PQC leg as `""` instead of `null` (optional ⇒ required) | **4 red** |
+//! | flatten §0.9 to unconditional refusal (fail-closed "simplification") | **2 red** |
+//! | flatten §0.9 to unconditional tolerance (the other direction) | **2 red** |
+//! | give two fixture fields one value again (the codex blind spot) | **1 red** |
 //!
-//! The first mutation also proves the probe is not vacuous: it reports
-//! `only ciris_verify_core binds: ["identity_type"]`, so the probe really did
-//! discover all four of verify's members off verify's own behaviour.
+//! The first five mutate `src/federation/admission.rs`; the sixth mutates this
+//! file's own fixture, because the thing it proves is that
+//! [`every_fixture_field_carries_its_own_sentinel`] actually guards the
+//! distinguishability the other four depend on. The §0.9 pair legitimately
+//! leaves three tests green — they change absence handling, not the projection.
+//!
+//! The first mutation also proves neither probe is vacuous: the key-record one
+//! reports `only ciris_verify_core binds: ["identity_type"]`, and the
+//! provenance one reds on the same missing member — so both really did discover
+//! all four of verify's members off verify's own behaviour, rather than off a
+//! list written in this file.
+//!
+//! # Three planes, and the two this file reaches
+//!
+//! CIRISVerify 13.1.0 applies the same projection idea on THREE planes, not
+//! one, and they are not the same projection:
+//!
+//! | plane | projection | covered here |
+//! | --- | --- | --- |
+//! | `KeyRecord::check_subject_binding` | `key_id`, `identity_type`, both pubkey legs | **yes** — probed, §1–3 below |
+//! | `provenance.rs:420` (per chain link) | the same four | **yes** — probed, §4 below |
+//! | `transport_binding.rs:353` | `attesting_key_id`, `transport_destination`, `encryption_pubkeys` | **NO — verify's error type makes it unreachable** |
+//!
+//! **Why the provenance plane is worth probing even though persist delegates
+//! the walk.** #465 routed persist's chain-walk crypto through
+//! `verify_provenance_chain_with_policy_and_terminus`, so there is no second
+//! CHECKER to diverge. But persist is still the PRODUCER: every
+//! `registration_envelope` verify's walk inspects was stamped by
+//! `bind_subject_into_envelope`, off `subject_binding`. If verify widens the
+//! provenance projection and persist's producer does not stamp the new member,
+//! **every chain persist mints stops rooting** — a total federation outage
+//! produced by a dependency bump, with nothing in either repo asserting the two
+//! stay aligned. §4 asserts it, on the producer/checker seam rather than the
+//! checker/checker one, and it also pins that verify's own two checker planes
+//! agree with each other.
+//!
+//! **Why the transport plane is NOT covered — reported, not forced.**
+//! `verify_transport_binding` catches the `SubjectBindingError` and returns
+//! `Ok(reject(TransportBindingReason::SubjectMismatch))`, logging the detail
+//! through `tracing::warn!` and dropping it. The member name and the expected
+//! value never leave the function, so **the probe cannot converge**: there is
+//! no way to learn which member failed, and therefore no way to enumerate
+//! verify's set. Log-scraping would be a half-probe that passes without ever
+//! reading verify's projection — precisely the "certifies an agreement that was
+//! never checked" failure this file exists to prevent — so it is not done here.
+//!
+//! Persist's exposure on that plane is also structurally different, which is
+//! why this is a gap and not a hole: `verify_signed_identity_occurrence`
+//! **parses** `transport_destination` and `encryption_pubkeys` out of the
+//! signed envelope and hands them straight to verify, rather than restating the
+//! projection. There is no second spelling in persist's shipped code to
+//! diverge. The residual risk is producer-side (an occurrence envelope minted
+//! without `attesting_key_id` — the exact defect #659 found in six fixtures),
+//! and it is unguarded. CIRISVerify#254 carries the ask.
 //!
 //! # If verify ever exports the list as data
 //!
@@ -100,24 +153,58 @@ use std::collections::{BTreeMap, BTreeSet};
 use ciris_persist::federation::admission::{subject_binding, verify_envelope_binds_subject};
 use ciris_persist::federation::KeyRecord as PersistKeyRecord;
 use ciris_verify_core::federation_self_record::KeyRecord as VerifyKeyRecord;
+use ciris_verify_core::provenance::{ProvenanceChain, ProvenanceError, ProvenanceLink};
 use ciris_verify_core::subject_binding::SubjectBindingError;
 use serde_json::{Map, Value};
 
 // ── The one subject both implementations are asked about ────────────────────
 //
-// Deliberately distinguishable per field: a projection that bound the wrong
-// column would still produce a set-equal map if every value were the same
-// string, so the VALUE comparison needs values that cannot be confused.
+// **EVERY field carries its own sentinel, and that is load-bearing.**
+//
+// The probe recovers verify's expected VALUE out of `Mismatch.claimed`, so the
+// detector distinguishes members BY VALUE. Two fixture fields sharing a value
+// are indistinguishable to it: if verify later projects `identity_ref` and
+// persist binds that member off `key_id` by mistake, a fixture where both
+// fields read `"conf-663-subject"` reports AGREEMENT on a wrong-column bind —
+// exactly the class #663 exists to catch, silently un-caught.
+//
+// Caught by codex review on CIRISPersist#666: the original fixture gave
+// `key_id`, `identity_ref` and `scrub_key_id` one value, and `valid_from`,
+// `scrub_timestamp` and `pqc_completed_at` another. The invariant is now
+// asserted rather than asserted-in-a-comment — see
+// `every_fixture_field_carries_its_own_sentinel`, which derives the check from
+// the serialized fixtures so a field added later cannot quietly reuse a value.
 
-const KEY_ID: &str = "conf-663-subject";
-const IDENTITY_TYPE: &str = "canonical,node";
-const ED25519: &str = "ED25519-LEG-conf-663";
-const MLDSA: &str = "MLDSA65-LEG-conf-663";
+const KEY_ID: &str = "conf-663-key-id";
+const IDENTITY_TYPE: &str = "conf-663-identity-type";
+const IDENTITY_REF: &str = "conf-663-identity-ref";
+const ALGORITHM: &str = "conf-663-algorithm";
+const ED25519: &str = "conf-663-pubkey-ed25519-base64";
+const MLDSA: &str = "conf-663-pubkey-ml-dsa-65-base64";
+const ORIGINAL_CONTENT_HASH: &str = "conf-663-original-content-hash";
+const SCRUB_KEY_ID: &str = "conf-663-scrub-key-id";
+const SCRUB_SIG_CLASSICAL: &str = "conf-663-scrub-signature-classical";
+const SCRUB_SIG_PQC: &str = "conf-663-scrub-signature-pqc";
+const PERSIST_ROW_HASH: &str = "conf-663-persist-row-hash";
+const ROLE: &str = "conf-663-role";
+// Distinct INSTANTS, not one instant reused — these are the three timestamp
+// fields the old fixture collapsed together.
+const VALID_FROM: &str = "2026-01-01T00:00:00Z";
+const VALID_UNTIL: &str = "2027-02-02T00:00:00Z";
+const SCRUB_TIMESTAMP: &str = "2026-03-03T00:00:00Z";
+const PQC_COMPLETED_AT: &str = "2026-04-04T00:00:00Z";
 
 /// A value no projection can legitimately expect, used to convert a `Missing`
 /// into a `Mismatch` so verify reports the value it wanted. The NUL byte keeps
-/// it out of every real key-id / base64 / identity-type vocabulary.
+/// it out of every real key-id / base64 / identity-type vocabulary — and out of
+/// every sentinel above, which the distinctness witness also checks.
 const PROBE_SENTINEL: &str = "\u{0}ciris-persist-663-probe-sentinel";
+
+/// Parse one of the fixed instants above into persist's typed column.
+fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
+    s.parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap_or_else(|e| panic!("#663: fixture instant {s:?} must be RFC-3339: {e}"))
+}
 
 /// Persist's projection for this subject, as a plain map.
 fn persist_projection(pqc: Option<&str>) -> Map<String, Value> {
@@ -139,20 +226,20 @@ fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecor
         key_id: KEY_ID.to_string(),
         pubkey_ed25519_base64: ED25519.to_string(),
         pubkey_ml_dsa_65_base64: opt(MLDSA),
-        algorithm: "hybrid-ed25519-mldsa65".to_string(),
+        algorithm: ALGORITHM.to_string(),
         identity_type: IDENTITY_TYPE.to_string(),
-        identity_ref: KEY_ID.to_string(),
-        valid_from: "2026-01-01T00:00:00Z".to_string(),
-        valid_until: opt("2027-01-01T00:00:00Z"),
+        identity_ref: IDENTITY_REF.to_string(),
+        valid_from: VALID_FROM.to_string(),
+        valid_until: opt(VALID_UNTIL),
         registration_envelope: envelope,
-        original_content_hash: String::new(),
-        scrub_signature_classical: "SCRUB-CLASSICAL".to_string(),
-        scrub_signature_pqc: opt("SCRUB-PQC"),
-        scrub_key_id: KEY_ID.to_string(),
-        scrub_timestamp: "2026-01-01T00:00:00Z".to_string(),
-        pqc_completed_at: opt("2026-01-01T00:00:00Z"),
-        persist_row_hash: String::new(),
-        roles: Vec::new(),
+        original_content_hash: ORIGINAL_CONTENT_HASH.to_string(),
+        scrub_signature_classical: SCRUB_SIG_CLASSICAL.to_string(),
+        scrub_signature_pqc: opt(SCRUB_SIG_PQC),
+        scrub_key_id: SCRUB_KEY_ID.to_string(),
+        scrub_timestamp: SCRUB_TIMESTAMP.to_string(),
+        pqc_completed_at: opt(PQC_COMPLETED_AT),
+        persist_row_hash: PERSIST_ROW_HASH.to_string(),
+        roles: vec![ROLE.to_string()],
         additional_scrubs: Vec::new(),
     }
 }
@@ -161,27 +248,24 @@ fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecor
 /// binding reads are meaningful; the binding check is pure over the row, so no
 /// signature, backend or clock is involved.
 fn persist_record(pqc: Option<&str>, envelope: Value) -> PersistKeyRecord {
-    let t = "2026-01-01T00:00:00Z"
-        .parse::<chrono::DateTime<chrono::Utc>>()
-        .expect("fixed RFC-3339 instant");
     PersistKeyRecord {
         key_id: KEY_ID.to_string(),
         pubkey_ed25519_base64: ED25519.to_string(),
         pubkey_ml_dsa_65_base64: pqc.map(str::to_string),
-        algorithm: "hybrid-ed25519-mldsa65".to_string(),
+        algorithm: ALGORITHM.to_string(),
         identity_type: IDENTITY_TYPE.to_string(),
-        identity_ref: KEY_ID.to_string(),
-        valid_from: t,
-        valid_until: None,
+        identity_ref: IDENTITY_REF.to_string(),
+        valid_from: instant(VALID_FROM),
+        valid_until: Some(instant(VALID_UNTIL)),
         registration_envelope: envelope,
-        original_content_hash: String::new(),
-        scrub_signature_classical: "SCRUB-CLASSICAL".to_string(),
-        scrub_signature_pqc: None,
-        scrub_key_id: KEY_ID.to_string(),
-        scrub_timestamp: t,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        capability_roles: Vec::new(),
+        original_content_hash: ORIGINAL_CONTENT_HASH.to_string(),
+        scrub_signature_classical: SCRUB_SIG_CLASSICAL.to_string(),
+        scrub_signature_pqc: Some(SCRUB_SIG_PQC.to_string()),
+        scrub_key_id: SCRUB_KEY_ID.to_string(),
+        scrub_timestamp: instant(SCRUB_TIMESTAMP),
+        pqc_completed_at: Some(instant(PQC_COMPLETED_AT)),
+        persist_row_hash: PERSIST_ROW_HASH.to_string(),
+        capability_roles: vec![ROLE.to_string()],
         attestation_evidence: None,
         consent_role: None,
         additional_scrubs: Vec::new(),
@@ -261,6 +345,115 @@ fn persist_optional_members() -> BTreeSet<String> {
         .filter(|(_, v)| v.is_null())
         .map(|(k, _)| k)
         .collect()
+}
+
+// ── 0. The fixture's own invariant ──────────────────────────────────────────
+
+/// Collect every string leaf in a serialized fixture, paired with its JSON
+/// path, EXCLUDING the `registration_envelope` subtree — that is the probe's
+/// workspace, not a fixture field, and it legitimately repeats the values it
+/// binds.
+fn string_leaves(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) => out.push((path.to_string(), s.clone())),
+        Value::Object(map) => {
+            for (k, v) in map {
+                if path.is_empty() && k == "registration_envelope" {
+                    continue;
+                }
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                string_leaves(v, &child, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                string_leaves(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// **The detector distinguishes members BY VALUE, so the fixture must give
+/// every field its own.**
+///
+/// Found by codex review on CIRISPersist#666. The probe recovers verify's
+/// expectation out of `Mismatch.claimed`; two fields carrying the same fixture
+/// value are therefore indistinguishable to it. If verify later projects
+/// `identity_ref` and persist binds that member off `key_id` by mistake, a
+/// fixture where both read `"conf-663-subject"` reports agreement on a
+/// wrong-column bind — the exact class this file exists to catch, silently
+/// un-caught. The original fixture collapsed `key_id`/`identity_ref`/
+/// `scrub_key_id` into one value and three timestamps into another.
+///
+/// **Derived, not listed.** The check walks the SERIALIZED fixtures, so a field
+/// added to either `KeyRecord` later is covered without anyone remembering to
+/// extend a table here. That matters more than the current fix: the failure
+/// mode is a test that keeps passing while quietly measuring less.
+#[test]
+fn every_fixture_field_carries_its_own_sentinel() {
+    let fixtures: [(&str, Value); 3] = [
+        (
+            "ciris_verify_core::KeyRecord",
+            serde_json::to_value(verify_record(true, Value::Object(Map::new())))
+                .expect("fixture serializes"),
+        ),
+        (
+            "ciris_persist::KeyRecord",
+            serde_json::to_value(persist_record(Some(MLDSA), Value::Object(Map::new())))
+                .expect("fixture serializes"),
+        ),
+        (
+            "ciris_verify_core::ProvenanceChain",
+            serde_json::to_value(verify_provenance_chain(true, Value::Object(Map::new())))
+                .expect("fixture serializes"),
+        ),
+    ];
+
+    for (what, fixture) in fixtures {
+        let mut leaves = Vec::new();
+        // `ProvenanceChain` nests the fields under `chain[0]`, and its own
+        // `key_id` is REQUIRED to equal `chain[0].key_id` — verify refuses with
+        // `QueriedKeyMismatch` otherwise. That is a structural equality the
+        // fixture must honour, not a sentinel collision, so the walk starts at
+        // the link. (Walking from the link's own object also keeps the
+        // `registration_envelope` skip working, which is keyed on the top
+        // level.)
+        if what.ends_with("ProvenanceChain") {
+            string_leaves(&fixture["chain"][0], "", &mut leaves);
+        } else {
+            string_leaves(&fixture, "", &mut leaves);
+        }
+
+        assert!(
+            leaves.len() > 5,
+            "#663: {what} yielded only {} string leaves — the walk is not reaching the fixture's \
+             fields, which would make this witness decorative",
+            leaves.len()
+        );
+
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for (path, value) in &leaves {
+            if let Some(first) = seen.insert(value.as_str(), path.as_str()) {
+                panic!(
+                    "#663: {what} gives `{first}` and `{path}` the SAME value {value:?}. The probe \
+                     recovers verify's expectation by VALUE, so two fields sharing one value are \
+                     indistinguishable to this detector: a member persist binds off the WRONG \
+                     COLUMN would report agreement. Give every field its own sentinel."
+                );
+            }
+            assert_ne!(
+                value.as_str(),
+                PROBE_SENTINEL,
+                "#663: {what}'s `{path}` equals PROBE_SENTINEL, which would make the probe \
+                 mistake a real expectation for its own planted value and mis-converge."
+            );
+        }
+    }
 }
 
 // ── 1. The member SET and its expected VALUES ───────────────────────────────
@@ -556,6 +749,156 @@ fn every_projected_member_agrees_across_both_implementations() {
                     "#663: verify must refuse the same absence on `{member}`: {v:?}"
                 );
             }
+        }
+    }
+}
+
+// ── 4. The PROVENANCE plane — the producer/checker seam ─────────────────────
+
+/// A single-link provenance chain for the same subject. Only the binding
+/// matters: `check` runs FIRST in verify's per-link loop, before the hash, the
+/// signatures and any terminus resolution (rule 4), so the probe never needs a
+/// real signature.
+fn verify_provenance_chain(materialize_optionals: bool, envelope: Value) -> ProvenanceChain {
+    let opt = |s: &str| {
+        if materialize_optionals {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    };
+    ProvenanceChain {
+        key_id: KEY_ID.to_string(),
+        chain: vec![ProvenanceLink {
+            key_id: KEY_ID.to_string(),
+            pubkey_ed25519_base64: ED25519.to_string(),
+            pubkey_ml_dsa_65_base64: opt(MLDSA),
+            identity_type: IDENTITY_TYPE.to_string(),
+            identity_ref: IDENTITY_REF.to_string(),
+            registration_envelope: envelope,
+            original_content_hash: ORIGINAL_CONTENT_HASH.to_string(),
+            scrub_signature_classical: SCRUB_SIG_CLASSICAL.to_string(),
+            scrub_signature_pqc: opt(SCRUB_SIG_PQC),
+            // The terminus rule wants `scrub_key_id == key_id` on a
+            // self-signed link. That is a REAL equality this fixture must
+            // honour, so the link deliberately breaks it and declares itself
+            // non-terminal — the walk then refuses on structure, AFTER the
+            // binding, which is all the probe needs (rule 4).
+            scrub_key_id: SCRUB_KEY_ID.to_string(),
+            scrub_timestamp: SCRUB_TIMESTAMP.to_string(),
+            is_self_signed: false,
+        }],
+        terminates_at_steward_bootstrap: false,
+    }
+}
+
+/// **Read verify's PROVENANCE-link projection off verify's own walk.**
+///
+/// Same technique as [`probe_verify_projection`], driven through
+/// `verify_provenance_chain` instead. The convergence signal differs: this walk
+/// cannot return `Ok` without a real signature, so the probe stops when the
+/// error stops being `SubjectBindingFailed` — at which point the binding has
+/// been satisfied and some later check (hash, linkage, terminus, signature) is
+/// speaking instead.
+fn probe_verify_provenance_projection(materialize_optionals: bool) -> BTreeMap<String, Value> {
+    let mut envelope = Map::new();
+    let mut discovered: BTreeMap<String, Value> = BTreeMap::new();
+
+    for _ in 0..128 {
+        let chain = verify_provenance_chain(materialize_optionals, Value::Object(envelope.clone()));
+        // No trusted bootstrap keys: the binding is checked long before any
+        // anchor resolution, which is the property rule 4 exists to give.
+        match ciris_verify_core::provenance::verify_provenance_chain(&chain, &[]) {
+            Err(ProvenanceError::SubjectBindingFailed {
+                source: SubjectBindingError::Missing { member, .. },
+                ..
+            }) => {
+                envelope.insert(member, Value::String(PROBE_SENTINEL.to_string()));
+            }
+            Err(ProvenanceError::SubjectBindingFailed {
+                source:
+                    SubjectBindingError::Mismatch {
+                        member, claimed, ..
+                    },
+                ..
+            }) => {
+                let expected: Value = serde_json::from_str(&claimed).unwrap_or_else(|e| {
+                    panic!(
+                        "#663: verify's provenance walk reported the value it expects for \
+                         `{member}` as {claimed:?}, which is not JSON ({e})."
+                    )
+                });
+                envelope.insert(member.clone(), expected.clone());
+                discovered.insert(member, expected);
+            }
+            // Any other outcome means the SUBJECT BINDING passed and a later
+            // check is speaking. That is the probe's convergence signal.
+            _ => return discovered,
+        }
+    }
+    panic!(
+        "#663: verify's provenance subject-binding probe did not converge in 128 steps — read \
+         `ciris_verify_core::provenance` before touching this bound."
+    )
+}
+
+/// **The provenance plane binds what persist produces.**
+///
+/// Persist does not re-implement this walk (#465 routed it through verify), so
+/// there is no second checker here. There IS a second half: persist MINTS every
+/// `registration_envelope` the walk inspects, through `bind_subject_into_envelope`
+/// off `subject_binding`. If verify widens this projection and persist's
+/// producer does not follow, every chain persist mints stops rooting — a
+/// federation-wide outage delivered by a dependency bump.
+///
+/// Asserted both ways: the member set verify's walk enforces equals the set
+/// persist produces, AND an envelope built by persist's producer actually
+/// satisfies the walk's binding.
+#[test]
+fn verify_provenance_plane_binds_exactly_what_persist_produces() {
+    let provenance = probe_verify_provenance_projection(true);
+    let produced: BTreeMap<String, Value> = persist_projection(Some(MLDSA)).into_iter().collect();
+
+    assert!(
+        !provenance.is_empty(),
+        "#663: the provenance probe discovered NO members, which would make this vacuous."
+    );
+    assert_eq!(
+        provenance, produced,
+        "#663: verify's PROVENANCE-link subject binding and persist's producer disagree. Persist \
+         mints every `registration_envelope` this walk inspects (via `bind_subject_into_envelope`, \
+         off `subject_binding`), so a member the walk requires and the producer does not stamp \
+         means EVERY CHAIN PERSIST MINTS STOPS ROOTING — delivered by a dependency bump, with \
+         nothing else in either repo asserting the two stay aligned."
+    );
+
+    // Verify's two checker planes must also agree with each other. They are
+    // separate `.require(…)` chains in verify's source (`federation_self_record`
+    // and `provenance.rs:420`); nothing in verify pins them together either.
+    assert_eq!(
+        probe_verify_projection(true),
+        provenance,
+        "#663: `KeyRecord::check_subject_binding` and the provenance walk project DIFFERENT \
+         members. They are separate builder chains in verify's own source, so they can drift from \
+         each other — and persist produces ONE envelope that must satisfy both."
+    );
+
+    // The round trip: what persist's producer actually emits satisfies the
+    // walk's binding, for a row with and without its optional leg.
+    for row_pqc in [None, Some(MLDSA)] {
+        let chain = verify_provenance_chain(false, bound_envelope(row_pqc));
+        let mut chain = chain;
+        chain.chain[0].pubkey_ml_dsa_65_base64 = row_pqc.map(str::to_string);
+        // Everything OTHER than a binding failure is a later check the fixture
+        // deliberately cannot satisfy (no real signature) — not this gate's
+        // business, so only the binding arm is examined.
+        if let Err(ProvenanceError::SubjectBindingFailed { source, .. }) =
+            ciris_verify_core::provenance::verify_provenance_chain(&chain, &[])
+        {
+            panic!(
+                "#663: an envelope built by persist's OWN producer must satisfy verify's \
+                 provenance-link binding (row_pqc={row_pqc:?}): {source}"
+            );
         }
     }
 }
