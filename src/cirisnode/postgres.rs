@@ -2615,6 +2615,10 @@ mod tests {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
+        // v31.0.0 (CIRISPersist#598/#643) — SEAL, don't hand-sign. The put door
+        // requires the signed instants and the typed-column mirror inside the
+        // envelope; a hand-signed fixture is a row no host can write.
+        let att = crate::federation::tier_ingest::test_support::seal_row(producer, att);
         backend
             .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
             .await
@@ -2661,6 +2665,9 @@ mod tests {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
+        // v31.0.0 (CIRISPersist#598/#643) — SEAL, don't hand-sign: the put door
+        // requires the signed instants and the typed-column mirror.
+        let att = crate::federation::tier_ingest::test_support::seal_row(granter, att);
         backend
             .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
             .await

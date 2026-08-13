@@ -17267,30 +17267,37 @@ mod tests {
             &producer,
             &establishing_envelope,
         );
+        // v31.0.0 (CIRISPersist#598/#643) — SEAL, don't hand-sign. Bound first so
+        // the mirror and the signed instants are stamped BEFORE the signature,
+        // which is the rule every producer on this substrate follows.
+        let establishing = crate::federation::types::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: producer.clone(),
+            attested_key_id: producer.clone(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: establishing_envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: producer.clone(),
+            scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![producer.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
         dir.put_attestation(crate::federation::types::SignedAttestation {
-            attestation: crate::federation::types::Attestation {
-                attestation_id: uuid::Uuid::new_v4().to_string(),
-                attesting_key_id: producer.clone(),
-                attested_key_id: producer.clone(),
-                attestation_type: crate::federation::types::attestation_type::SCORES.into(),
-                weight: None,
-                asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                expires_at: None,
-                attestation_envelope: establishing_envelope,
-                original_content_hash: och,
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-                scrub_key_id: producer.clone(),
-                scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
-                persist_row_hash: String::new(),
-                subject_key_ids: vec![producer.clone()],
-                withdraws_admission_rule: None,
-                cohort_scope: "federation".to_string(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &producer,
+                establishing,
+            ),
         })
         .await
         .expect("seed establishing content");
