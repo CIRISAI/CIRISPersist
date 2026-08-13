@@ -241,6 +241,140 @@ the write door already resolved authority for. The third arm is why this is not
 simply *"compare attesters like the siblings do"* — the siblings model §6.1
 self-retraction only, and narrowing this fold to that would drop the subject-side
 and proxy revocations it exists to see.
+### Fixed — BREAKING — SECURITY — a granting authority's signature over ONE envelope registered ANY key, carrying ANY pubkeys — #659 on the plane every key in the mesh walks (#659)
+
+The entry below closed this on the accord co-scrub: the CONFERRAL path, which
+only privileged keys walk. `verify_key_registration` is the identical asymmetry
+on the path **every key registering in the mesh walks**, and it was still open.
+
+The gate resolved the SIGNER's pubkeys — off the submitted record when
+`scrub_key_id == key_id`, out of the directory when a granting authority signed —
+hybrid-verified `Strict` over `ceg_produce_canonicalize(registration_envelope)`,
+cross-checked `original_content_hash`, and asked **nothing about the SUBJECT**.
+Neither `key_id` nor either pubkey was tied to the bytes that were signed. So one
+signature by one granting authority over one envelope lifted verbatim onto any
+row at all — any `key_id`, any hybrid keypair — and the gate returned `Ok`.
+
+The lift now, at `Engine::register_federation_key`, the entry CIRISServer and
+CIRISStatus call. The authority's signature is still real and still verifies;
+what fails is the question nobody was asking:
+
+```
+scrub-signature verification failed: registration subject binding: the signed
+registration_envelope binds key_id = "v659-mem659r", but this record carries
+"a659-mem659r" (key_id "a659-mem659r"). Every signature over this row — the
+registration scrub and the accord co-scrub alike — is verified over those
+envelope bytes and NOTHING else, so honouring this would admit a subject the
+signers never named (CIRISPersist#659)
+```
+
+and, on the leg where the name matches and only the post-quantum half was
+swapped — the substitution a classical-only binding would have waved through:
+
+```
+… binds pubkey_ml_dsa_65_base64 = "0dyOa+rY0lZfTr4WfhTH9eKNAccR9Sl+vPFzvc7Qxvo…"
+(2606 chars), but this record carries "NSyp7j8hmQH+U4XJIFt++UUb1iGmxr+d8VHaHuJRIvA…"
+(2606 chars) (key_id "v659-mem659r") …
+```
+
+**The remedy is the SAME projection, unchanged — not a fifth spelling.**
+`admission::subject_binding` served both planes with no change to its shape:
+the subject of a key registration and the subject of a conferral are the same
+triple, so they are the same function. `verify_key_registration` calls
+`admission::verify_envelope_binds_subject` — the same checker the co-scrub quorum
+core calls — and calls it **FIRST**: before the canonicalizer, before the hash
+cross-check, and above all before the granting-authority signer is resolved from
+the directory. Everything below that line is a question about the SIGNER, and the
+refusal is now deterministic regardless of whether the signer resolves, whether
+the row is self-attested, and whether the signatures are real.
+
+- **BOTH branches, because the check precedes the split.** The named finding is
+  the granting-authority branch, but the self-attested proof-of-possession
+  branch was subject-blind in exactly the same way: its signature verifies
+  against the record's OWN pubkeys, so a registrant could sign an envelope
+  naming somebody else's identity and the gate had no opinion. One check above
+  the branch covers both, which is also why there is nothing here for a future
+  third branch to forget.
+- **REQUIRED, not checked-if-present.** An absent binding is a refusal. No
+  legacy regime — the standing decision on #598, #640, #643 and the entry below,
+  and a tolerated absence is exactly how the name binding got left half-done in
+  the first place.
+- **Both hybrid legs.** Binding only the classical leg leaves the PQC leg
+  substitutable; a row with no ML-DSA key binds `null`, an assertion of absence.
+  The argument is the entry below's, unchanged.
+- **The refusal prose is now plane-neutral.** It said *"the accord quorum
+  verifies over those envelope bytes"*, which is false for a plain peer
+  registration and would send an operator hunting for a quorum that is not there.
+  One message, true on both planes; every load-bearing token (the field name,
+  both values, `CIRISPersist#659`) is unchanged.
+
+#### The producer nobody would have noticed until peering
+
+`Engine::register_self_federation_key` — the node's own bootstrap row — mints its
+`registration_envelope` from a caller-supplied value and writes straight through
+`put_public_key`, deliberately skipping the §5.6.8.15 gate (that gate is for PEER
+registration). It is now bound, and that is not tidiness: **the row replicates.**
+At every peer it lands on the `Insert` branch of `apply_replicated_key_record`,
+which runs `verify_key_registration`. A node minting a subject-blind bootstrap
+row would register perfectly well locally and be refused by the entire mesh —
+fail-closed on the far side of the wire, invisible until peering, and reported as
+a peer problem. The engine's ML-DSA pubkey is now resolved *before* the envelope
+is canonicalized, so the row's PQC leg and the leg its own signature covers are
+one statement. Every other field of the caller's envelope survives untouched.
+
+- **Sibling-branch audit.** `apply_replicated_key_record`'s `Insert` branch does
+  skip `verify_key_registration` entirely for role-gated records
+  (`record_is_role_gated`: `canonical`, `accord_holder`, `infra:attest`, the
+  co-steward roles) on both backends — `sqlite.rs` and its `postgres.rs` mirror.
+  **Confirmed, deliberate, and unchanged by this cut**: those records have their
+  own admission (m-of-n co-scrub / HW custody) and the E2 PoP gate must not
+  pre-empt it. What changes is that the accord co-scrub they fall back on is no
+  longer subject-blind either (the entry below), so both halves of that fork now
+  bind the same triple through the same function.
+- **Witnesses.** `registration_subject_binding_{memory,sqlite,postgres}_659` —
+  six legs on **all three backends**: the honestly bound control ADMITS, the
+  authority's signature lifted onto a different `key_id`, the victim's name with
+  the attacker's Ed25519 key, the same with only the ML-DSA-65 leg swapped, each
+  bound field REMOVED in turn, and the self-attested sibling branch. Plus two
+  legs in the Engine-level `register_matrix_{sqlite,postgres}`: the lift refused
+  at the real `register_federation_key` door leaving no row, and the node's own
+  `register_self_federation_key` output binding its own subject with the caller's
+  envelope fields intact.
+- **Mutation-tested, 8/8 killed.** Every verdict keyed off nextest's `Summary
+  [...] N tests run:` line — never the `error: test run failed` epilogue every
+  failing run prints — with each patch asserted to have a unique anchor, to
+  differ from baseline, to match the file re-read from disk, and to have run the
+  same test count as the baseline. Killed: the gate removed; the gate moved
+  BELOW the hybrid verify (the ordering is load-bearing, not stylistic); the
+  half-fix that binds `key_id` only; the ML-DSA leg dropped from the projection;
+  `key_id` dropped from the projection; absence tolerated instead of refused;
+  and each of the two producers un-bound. Run twice — once against the new
+  witnesses ALONE, to prove they are not decorative: six of the eight die to
+  `registration_subject_binding_*` and `register_matrix_sqlite` with no help from
+  the co-scrub suite.
+- **Fixture churn, measured rather than estimated.** With the gate added and
+  every producer left alone, **6 tests fail** on sqlite. Three producers had to
+  bind — one production (`Engine::register_self_federation_key`) and two
+  fixtures (`register::tests::signed_self_record`,
+  `tier_ingest::test_support::replicated_key_record`) — and each binds through
+  the shared `bind_subject_into_envelope`. **Not one of their 39 in-repo call
+  sites moved** (25 + 9 + 5): no signature changed, so the churn downstream of
+  the producers is zero. Green: 1934/1934 sqlite, 2322/2322 postgres+sqlite.
+- **No `test-anchor` signature changes.** `register::test_support` is new and
+  purely additive (`authority_signed_record`,
+  `exercise_registration_subject_binding`);
+  `tier_ingest::test_support::replicated_key_record` is `pub(crate)` and keeps
+  its signature, taking only a preimage change. The one public-API behaviour
+  change is `Engine::register_self_federation_key`, whose signature is also
+  unchanged — it now rewrites three keys of the envelope it is handed.
+
+**Blast radius: every producer of a `federation_keys` registration.** This is a
+preimage change for every key registering in the mesh, not only privileged ones.
+It lands in this cut for the same reason as everything else in v31: the release
+already forces a mesh-wide re-mint and a fresh genesis ceremony, and once 31.1.0
+bakes the new portable trust root, changing this preimage costs a second ceremony
+against a live federation.
+
 ### Fixed — BREAKING — one accord co-scrub conferred `canonical` on ANY key_id, carrying ANY pubkeys — the ceremony never named its subject (#659)
 
 Found while closing #658; the same defect one plane over, on the plane where it
@@ -260,12 +394,12 @@ signatures are still real and still verify; what fails is the question nobody
 was asking:
 
 ```
-the co-scrubbed registration_envelope binds pubkey_ed25519_base64 =
+the signed registration_envelope binds pubkey_ed25519_base64 =
 "OuX9IebT7XYQFfir4CN/YNxoWevvAKEM0GO10swd74Q=", but this record carries
-"GGVMVyBOXU3GgaWIvSjHeZGG4vOrOUCw9Sl3XkG4nwQ=" (key_id "v659-mem659"). The
-accord quorum verifies over those envelope bytes and NOTHING else, so honouring
-this would confer the role on a subject the co-scrubbers never named
-(CIRISPersist#659)
+"GGVMVyBOXU3GgaWIvSjHeZGG4vOrOUCw9Sl3XkG4nwQ=" (key_id "v659-mem659"). Every
+signature over this row — the registration scrub and the accord co-scrub alike —
+is verified over those envelope bytes and NOTHING else, so honouring this would
+admit a subject the signers never named (CIRISPersist#659)
 ```
 
 `verify_accord_family_coscrub_with` verifies m-of-n over
