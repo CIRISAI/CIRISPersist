@@ -17548,7 +17548,27 @@ mod tests {
             )
             .await
             .expect("list_attestations facade");
-        assert!(page.items.is_empty());
+        // v31.1.0 — boot now installs the baked bundle's DELEGATION PLANE
+        // (`genesis::seed_delegation_plane`), so a booted directory is no
+        // longer empty. What this test holds is that the facade DISPATCHES to
+        // the backend, and returning exactly the seeded genesis rows shows
+        // that better than an empty page did: an empty page is also what a
+        // facade that dispatched nowhere would return.
+        let ids: std::collections::BTreeSet<&str> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let baked: std::collections::BTreeSet<&str> =
+            crate::federation::genesis::canonical_genesis_bundle()
+                .attestations
+                .iter()
+                .map(|sa| sa.attestation.attestation_id.as_str())
+                .collect();
+        assert_eq!(
+            ids, baked,
+            "the facade returns exactly the baked delegation plane"
+        );
         assert!(page.next_cursor.is_none());
     }
 

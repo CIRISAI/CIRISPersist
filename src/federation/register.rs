@@ -2976,21 +2976,50 @@ mod tests {
             existing.original_content_hash, sr.record.original_content_hash,
             "same content hash — the very thing the refusals were reported against"
         );
-        assert_ne!(
-            existing.persist_row_hash,
-            super::super::types::compute_persist_row_hash(&sr.record).expect("row hash"),
-            "row bytes DIFFER (the write-time role lift), so `Unchanged` cannot catch this"
+        // v31.1.0 — this was `assert_ne!` on the premise that the write-time
+        // role lift always changes the row bytes, so `Unchanged` could not
+        // catch a re-offer and the DUPLICATE path had to. That premise was an
+        // artifact of the PRE-v31 seed, whose holder records arrived without
+        // their roles materialized. The v31 ceremony emits complete records,
+        // so the lift is a no-op and the bytes match — a better outcome, and
+        // one this assertion would have called a failure.
+        //
+        // What the test is NAMED for is that a re-offer reads as a duplicate.
+        // That is asserted below and is unaffected by which path detects it,
+        // so the mechanism is no longer pinned.
+        let _lift_changed_bytes = existing.persist_row_hash
+            != super::super::types::compute_persist_row_hash(&sr.record).expect("row hash");
+        assert_eq!(
+            existing.original_content_hash, sr.record.original_content_hash,
+            "the re-offer is the same signed assertion"
         );
 
-        assert_eq!(
-            engine
-                .apply_replicated_key_record(sr.clone())
-                .await
-                .expect("apply"),
-            ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::AlreadyAnchoredIdentical
-            },
-            "the canonical's own baked record must read as a DUPLICATE, not a re-scrub hijack"
+        // v31.1.0 — assert the PROPERTY, not the mechanism. Two outcomes mean
+        // "this is a duplicate": `Unchanged` (the byte-identical short-circuit)
+        // and `Refused { AlreadyAnchoredIdentical }` (the anchor comparison).
+        // Which one fires depends on whether the write-time role lift altered
+        // the row bytes, and the v31 ceremony emits records whose roles are
+        // already materialized — so the bytes now match and `Unchanged` catches
+        // it first. That is a better outcome, and pinning the old mechanism
+        // would have reported it as a regression.
+        //
+        // What must NOT happen is any outcome that MUTATES: an `Upgraded`,
+        // `Superseded` or `Inserted` here would be the canonical's own baked
+        // record re-scrubbing itself — the hijack this test is named for.
+        let outcome = engine
+            .apply_replicated_key_record(sr.clone())
+            .await
+            .expect("apply");
+        assert!(
+            matches!(
+                outcome,
+                ReplicatedKeyOutcome::Unchanged
+                    | ReplicatedKeyOutcome::Refused {
+                        reason: KeyRefusalReason::AlreadyAnchoredIdentical
+                    }
+            ),
+            "the canonical's own baked record must read as a DUPLICATE, not a re-scrub \
+             hijack — got {outcome:?}"
         );
     }
 

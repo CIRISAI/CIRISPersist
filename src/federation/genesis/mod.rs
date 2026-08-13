@@ -999,11 +999,30 @@ pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), 
         // passing the wall clock here would be the wrong argument to pass even
         // while the callee ignores it. If `classify_shape` ever starts honouring
         // `now`, this call site is already correct.
-        if let crate::federation::migration::RowShape::Legacy { why } =
-            crate::federation::migration::classify_shape(row, row.asserted_at)
-        {
-            return Err(why);
-        }
+        // v31.1.0 — ask the BINDING gates directly, NOT `classify_shape`.
+        //
+        // `classify_shape` also asks `check_canonical_at_rest`, which is a
+        // STORAGE invariant: `sha256(stored column) == original_content_hash`.
+        // An on-disk ceremony artifact is not "at rest in a database", and
+        // `put_attestation` CANONICALIZES on ingest by design (#647) — so a
+        // bundle whose envelope carries `weight: 1.0` where JCS emits `1` is
+        // admitted, stored canonical, and entirely valid. Its signatures were
+        // never at risk: `original_content_hash` is taken over
+        // `ceg_produce_canonicalize(envelope)`, and canonicalize(1.0) == "1".
+        //
+        // Asking the storage question here produced a FALSE "pre-v31" verdict
+        // for a genuinely v31 bundle, and the two halves disagreed out loud:
+        // the predicate said legacy while the real door admitted the row. That
+        // is #660's lesson one field over — a clock failure is not a shape
+        // failure, and neither is a serialization difference. Shape is the
+        // BINDING: does the row carry its mirror and its signed instants.
+        crate::federation::admission::check_row_column_binding(row).map_err(|e| e.to_string())?;
+        crate::federation::admission::check_instant_binding(
+            row,
+            row.asserted_at,
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1096,9 +1115,22 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
             // ── 31.1.0 and after: the re-signed bundle installs, as it always
             //    should have. This arm is the original #622 assertion verbatim.
             Ok(()) => {
-                dir.put_attestation(att.clone()).await.unwrap_or_else(|e| {
-                    panic!("genesis attestation {id:?} must install on EVERY backend: {e}")
-                });
+                // v31.1.0 — ALREADY-PRESENT is success, not failure. Boot now
+                // seeds the delegation plane (`seed_delegation_plane`), so on a
+                // directory that has booted, these rows are already in. The
+                // property #622 holds is "this bundle is installable on every
+                // backend", and a primary-key conflict is that property having
+                // already been satisfied — not a backend that refused it.
+                match dir.put_attestation(att.clone()).await {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(e, crate::federation::Error::Conflict(_))
+                            || e.to_string().contains("UNIQUE constraint")
+                            || e.to_string().contains("duplicate key") => {}
+                    Err(e) => {
+                        panic!("genesis attestation {id:?} must install on EVERY backend: {e}")
+                    }
+                }
                 let back = dir
                     .get_attestation(id)
                     .await
@@ -1480,6 +1512,60 @@ where
     }
     seed_canonical_servers(dir).await?;
     verify_canonical_seeded(dir).await?;
+    seed_delegation_plane(dir).await?;
+    verify_delegation_plane_seeded(dir).await?;
+    Ok(())
+}
+
+/// v31.1.0 — **install the baked bundle's DELEGATION PLANE at boot.**
+///
+/// Until 31.1.0 the boot seed installed only the KEY plane — the accord
+/// holders, the `humanity-accord` family, the canonical serve nodes — and the
+/// `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle` rows were
+/// installed by the explicit ceremony bake alone. That was survivable while
+/// the baked bundle predated #643, because those rows were refused anyway.
+///
+/// With a v31-shaped seed it stops being survivable: the rows are installable,
+/// nothing installs them, and [`verify_delegation_plane_seeded`] correctly
+/// reports `PreGenesis { leg: Delegation }` forever. A node would ship a valid
+/// trust root it never adopts — green artifact, dead conferral plane, which is
+/// the exact fail-open the fourth posture leg exists to catch.
+///
+/// Discipline matches [`seed_canonical_servers`] deliberately:
+/// - **already present ⇒ no-op.** `put_attestation` is idempotent on the
+///   primary key, and a `Conflict` here is boot NORMALITY on a seeded fleet.
+/// - **refused ⇒ `absent`, never `divergent`.** A refusal means this node is
+///   awaiting its ceremony, and it must BOOT. `divergent` refuses to serve, and
+///   an artifact that cannot install is not evidence of tampering — that
+///   distinction is what keeps 31.0.0's seedless boot working.
+pub async fn seed_delegation_plane<D>(dir: &D) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Delegation;
+    for sa in &canonical_genesis_bundle().attestations {
+        let id = &sa.attestation.attestation_id;
+        match dir.get_attestation(id).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(GenesisFault::unreadable(
+                    LEG,
+                    format!("lookup delegation row {id}: {e}"),
+                ))
+            }
+        }
+        match dir.put_attestation(sa.clone()).await {
+            Ok(()) => {}
+            Err(super::Error::Conflict(_)) => {}
+            Err(e) => {
+                return Err(GenesisFault::absent(
+                    LEG,
+                    format!("delegation row {id} could not be installed: {e}"),
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
