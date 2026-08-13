@@ -1,4 +1,4 @@
-//! v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+//! v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
 //! **Counter-RII `consent_role`** resolver.
 //!
 //! `federation_keys.consent_role` is the role token (see the
@@ -12,7 +12,7 @@
 //! substrate (no longer a reserved slot). The COLUMN itself already
 //! shipped in V020 (v1.3.0, the CIRISAgent#760 §RC "consent role lock"
 //! that CC 3.4.7.2 ratifies — `TEXT NOT NULL DEFAULT 'unregistered'`);
-//! v12.7.0 puts it on the wire ([`KeyRecord::consent_role`](super::KeyRecord),
+//! v13.0.0 puts it on the wire ([`KeyRecord::consent_role`](super::KeyRecord),
 //! `None` ⇔ the stored `'unregistered'`) and exposes this resolver.
 //!
 //! **What persist owns (and does NOT own).** The three ratified
@@ -47,6 +47,13 @@
 /// active → replication kept flowing to a peer that revoked. Versioned
 /// dimensions extend the prefix (`consent:state:revoked:v1`).
 pub mod consent_dimension {
+    /// v31.0.0 (CIRISPersist#598) — the prefix of EVERY consent-STATE
+    /// dimension, i.e. the exact axis both consent folds and the #598
+    /// instant-binding gate key on. It was spelled as a bare `"consent:state:"`
+    /// literal in three places (both folds and the gate that had to agree with
+    /// them); a fold that saw a wider set than the gate is precisely how a
+    /// row reaches the ordering without passing the binding.
+    pub const STATE_PREFIX: &str = "consent:state:";
     /// Prefix of every granted-state dimension.
     pub const STATE_GRANTED_PREFIX: &str = "consent:state:granted";
     /// Prefix of every revoked-state dimension.
@@ -57,7 +64,7 @@ pub mod consent_dimension {
 
 use super::{Error, FederationDirectory};
 
-/// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
+/// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
 /// `consent_role` of `key_id`.
 ///
 /// Returns `Ok(Some(role))` when the key exists and carries an assigned
@@ -104,6 +111,77 @@ pub fn consent_state_of(dimension: Option<&str>) -> super::hard_case::ConsentSta
         Some(d) if d.starts_with(consent_dimension::STATE_EXPIRED_PREFIX) => ConsentState::Expired,
         _ => ConsentState::Unspecified,
     }
+}
+
+/// v31.0.0 (CIRISPersist#598) — the **restriction rank** of a consent
+/// stance: how much a stance CLOSES, ordered so that a larger number is a
+/// more restrictive reading.
+///
+/// `Granted` is the sole fail-OPEN stance and therefore ranks lowest.
+/// `Unspecified` (an unknown `consent:state:*` value — forward-compat) ranks
+/// above it, because "we do not recognise this stance" must never resolve as
+/// a grant. `Expired` and `Revoked` are explicit closures.
+#[must_use]
+pub fn restriction_rank(state: super::hard_case::ConsentState) -> u8 {
+    use super::hard_case::ConsentState;
+    match state {
+        ConsentState::Granted => 0,
+        ConsentState::Unspecified => 1,
+        ConsentState::Expired => 2,
+        ConsentState::Revoked => 3,
+    }
+}
+
+/// v31.0.0 (CIRISPersist#598) — **THE consent-fold ordering key**, shared by
+/// [`resolve_consent_state`](super::FederationDirectory::resolve_consent_state)
+/// and [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
+/// so the two folds cannot disagree about which claim wins.
+///
+/// # The primary component is still the ROW COLUMN, on purpose
+///
+/// `#598`'s tempting fix is to re-key the fold to the envelope's signed
+/// instant. **That is wrong**, and it is wrong in a way that reads as a fix:
+/// a row that carries no envelope instant yields `None` for it, and both
+/// dispositions of `None` lose.
+///
+/// - `None`-sorts-LOW: every instant-less row sinks below every instant-
+///   bearing one, so a re-minted STALE grant carrying an instant beats a
+///   RECENT revoke that does not — the exact flip #598 reports, now caused by
+///   the fix.
+/// - `None`-falls-back-to-the-column: the attacker simply omits the envelope
+///   key and picks their own ordering key, which is the status quo with a
+///   longer code path.
+///
+/// So the ordering stays on the column and the SECURITY comes from the gate:
+/// [`crate::federation::admission::check_instant_binding`]
+/// refuses a `consent:state:*` row at every write door unless the column and
+/// the signed envelope carry the SAME instant. Once every stored row is
+/// bound, ordering on the column IS ordering on the signed instant — and the
+/// unbound rows the naive re-key had to reason about do not exist, because
+/// they were never admitted.
+///
+/// # The two tie-break components
+///
+/// `max_by_key` on a bare instant has NO tie-break: a grant and a revoke at
+/// the same instant resolved to whichever the backend's row order happened to
+/// present last, and the backends do not agree on that. The added components
+/// make it deterministic, in the RESTRICTION-WINS direction the rest of the
+/// substrate already uses ([`crate::federation::quarantine`],
+/// [`crate::federation::mesh_config`], [`crate::federation::precedence`]):
+///
+/// 1. [`restriction_rank`] — at one instant, the MOST restrictive stance wins.
+///    A grant can never out-rank a revoke it ties with.
+/// 2. `attestation_id` — total order for the remaining case (same instant,
+///    same stance), where the fold's ANSWER is identical either way, so this
+///    buys determinism without buying the attacker anything: an id chosen to
+///    sort high still cannot beat rank 1.
+#[must_use]
+pub fn fold_ordering_key(a: &super::Attestation) -> (chrono::DateTime<chrono::Utc>, u8, String) {
+    (
+        a.asserted_at,
+        restriction_rank(consent_state_of(envelope_dimension(a))),
+        a.attestation_id.clone(),
+    )
 }
 
 /// v16.1.0 (CIRISPersist#389) — the scopes an envelope GENUINELY names: the

@@ -1096,7 +1096,7 @@ mod ingest_gate_proof {
     fn row(attester: &str, envelope: serde_json::Value) -> Attestation {
         let (och, classical, pqc) = sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             // `::uuid`-cast on the PG write path — a real UUID, per the
             // uuid_like() fixture lesson.
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -1120,7 +1120,10 @@ mod ingest_gate_proof {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// **ERASABLE: total erasure changes nothing the wire looks at.** Mint,
@@ -1157,8 +1160,17 @@ mod ingest_gate_proof {
             .await
             .expect("get")
             .expect("row present");
+        // v31.0.0 (#647) — compared against the CANONICAL form of what was
+        // submitted, because `put_attestation` now stores canonical bytes.
+        // The claim under test is unchanged and unweakened: erasure must not
+        // move the stored envelope. Canonicalization is a property of INGEST,
+        // it happened once before this row was ever erased, and it is
+        // idempotent — so any drift observed here is still erasure's doing.
+        let mut expected_envelope = att.attestation_envelope.clone();
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the sealed envelope canonicalizes");
         assert_eq!(
-            stored.attestation_envelope, att.attestation_envelope,
+            stored.attestation_envelope, expected_envelope,
             "erasure must not have moved the stored envelope"
         );
         assert_eq!(

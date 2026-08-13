@@ -60,6 +60,35 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 const POSTGRES_ONLY_MSG: &str = "this build has no postgres backend — build \
 ciris-persist with feature `pyo3` (not `pyo3-sqlite`) for postgres";
 
+/// v31.0.0 (CIRISPersist#648) — the wheel's half of
+/// [`classify_genesis_seed`](crate::engine::classify_genesis_seed): an ABSENT
+/// or UNREADABLE constitutional seed leaves a pre-genesis node that boots and
+/// refuses every root-requiring gate; a DIVERGENT one still refuses to boot.
+///
+/// Shaped as an `.or_else` over the seeder's own `Result` so the wheel and
+/// `Engine::with_signer` share one rule. Two boot paths that disagree about
+/// which faults are survivable is precisely the drift #392 collapsed
+/// `seed_family_and_canonical` to prevent.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn pre_genesis_or_refuse(
+    fault: crate::federation::genesis::GenesisFault,
+) -> Result<(), crate::federation::genesis::GenesisFault> {
+    if fault.refuses_boot() {
+        return Err(fault);
+    }
+    tracing::warn!(
+        posture = "pre_genesis",
+        leg = fault.leg().as_str(),
+        fault = fault.as_str(),
+        detail = fault.detail(),
+        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+         genesis ceremony; until one completes, every operation that resolves authority to \
+         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+         — do not run an agent against this node."
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // v1.0.0-scaffold (CIRISPersist#193 + #194) — backend dispatch, typed
 // exception hierarchy, URL-sniff constructor. v1.4.0 ported the 9
@@ -779,7 +808,7 @@ pub struct PyEngine {
     /// state — `set_multimedia_config_json` mutates the shared slot.
     #[cfg(feature = "cirisnode")]
     multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
-    /// v12.2.1 (CIRISPersist#320) — the directory-ops-proxy capsule, built
+    /// v12.3.0 (CIRISPersist#320) — the directory-ops-proxy capsule, built
     /// once and **cached on the engine**. Consumers (CIRISEdge#245) extract the
     /// raw `Directory { data, vtable }` pointer and rely on the capsule (and
     /// thus the boxed `Arc<dyn FederationDirectory>` it owns + frees on GC)
@@ -789,7 +818,7 @@ pub struct PyEngine {
     /// `data` → `Arc::clone` UAF → SIGSEGV. Caching keeps it alive for the
     /// engine's lifetime, making the consumer contract sound.
     directory_ops_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
-    /// v12.2.1 (CIRISPersist#320) — same UAF fix for the other capsules that
+    /// v12.3.0 (CIRISPersist#320) — same UAF fix for the other capsules that
     /// hand out a raw pointer with a GC-freeing destructor. The executor one is
     /// the load-bearing case for the transport deadlock: `spawn` on a GC'd
     /// executor lands the task on a torn-down runtime (task never runs → the
@@ -1599,13 +1628,12 @@ impl PyEngine {
         #[cfg(feature = "postgres")]
         #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
         let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
-        let backend: BackendDispatch = if dsn.starts_with("postgresql://")
-            || dsn.starts_with("postgres://")
-        {
-            #[cfg(feature = "postgres")]
-            {
-                let pg = py.detach(|| {
-                    runtime.block_on(async {
+        let backend: BackendDispatch =
+            if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+                #[cfg(feature = "postgres")]
+                {
+                    let pg = py.detach(|| {
+                        runtime.block_on(async {
                         let pg = PostgresBackend::connect(dsn)
                             .await
                             .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
@@ -1615,52 +1643,59 @@ impl PyEngine {
                         // v12.0.2 (CIRISPersist#347) — first-boot-seed the
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
-                        pg.seed_genesis_accord_holders(
-                            &crate::federation::genesis::effective_accord_holder_records(),
-                        )
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        if let Err(e) = pg
+                            .seed_genesis_accord_holders(
+                                &crate::federation::genesis::effective_accord_holder_records(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                        }
                         // v13.4.1 (CIRISPersist#392) — run the SAME shared seed
                         // routine `Engine::with_signer` does (verify anchor →
                         // family #386 → canonical #390). Previously this pyo3 ctor
                         // stopped at the holder seed, so wheel consumers got no
                         // family + no canonical row — the seed paths had drifted.
+                        // v31.0.0 (CIRISPersist#648) — and the SAME survivability
+                        // classification, so the wheel and the Rust ctor cannot
+                        // disagree about which faults a node may boot through.
                         crate::federation::genesis::seed_family_and_canonical(&pg)
                             .await
+                            .or_else(pre_genesis_or_refuse)
                             .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(pg))
                     })
-                })?;
-                pg_backend_for_sweep = Some(pg.clone());
-                BackendDispatch::Postgres(pg)
-            }
-            // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
-            // backend compiled in, so a `postgresql://` dsn is rejected
-            // cleanly rather than silently falling through.
-            #[cfg(not(feature = "postgres"))]
-            {
-                return Err(PyValueError::new_err(format!(
-                    "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
-                )));
-            }
-        } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
-            #[cfg(feature = "sqlite")]
-            {
-                // URL parsing follows the SQLAlchemy / Python sqlite3
-                // convention the CIRISAgent ecosystem already uses:
-                //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
-                //   `sqlite:///relative.db`  → file at `relative.db`
-                //                              (strip leading `/`)
-                //   `sqlite:///:memory:`     → in-memory
-                //   `sqlite::memory:`        → in-memory (compact form)
-                //
-                // The `sqlite://` prefix is the URL scheme;
-                // `sqlite:///` is scheme + empty authority + path.
-                let in_memory = dsn == "sqlite::memory:"
-                    || dsn == "sqlite:///:memory:"
-                    || dsn == "sqlite://:memory:";
-                let sq = py.detach(|| {
-                    runtime.block_on(async {
+                    })?;
+                    pg_backend_for_sweep = Some(pg.clone());
+                    BackendDispatch::Postgres(pg)
+                }
+                // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
+                // backend compiled in, so a `postgresql://` dsn is rejected
+                // cleanly rather than silently falling through.
+                #[cfg(not(feature = "postgres"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
+                    )));
+                }
+            } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
+                #[cfg(feature = "sqlite")]
+                {
+                    // URL parsing follows the SQLAlchemy / Python sqlite3
+                    // convention the CIRISAgent ecosystem already uses:
+                    //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
+                    //   `sqlite:///relative.db`  → file at `relative.db`
+                    //                              (strip leading `/`)
+                    //   `sqlite:///:memory:`     → in-memory
+                    //   `sqlite::memory:`        → in-memory (compact form)
+                    //
+                    // The `sqlite://` prefix is the URL scheme;
+                    // `sqlite:///` is scheme + empty authority + path.
+                    let in_memory = dsn == "sqlite::memory:"
+                        || dsn == "sqlite:///:memory:"
+                        || dsn == "sqlite://:memory:";
+                    let sq = py.detach(|| {
+                        runtime.block_on(async {
                         let sq = if in_memory {
                             SqliteBackend::open_in_memory()
                                 .await
@@ -1684,40 +1719,45 @@ impl PyEngine {
                         // v12.0.2 (CIRISPersist#347) — first-boot-seed the
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
-                        sq.seed_genesis_accord_holders(
-                            &crate::federation::genesis::effective_accord_holder_records(),
-                        )
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        if let Err(e) = sq
+                            .seed_genesis_accord_holders(
+                                &crate::federation::genesis::effective_accord_holder_records(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                        }
                         // v13.4.1 (CIRISPersist#392) — same shared seed routine as
                         // Engine::with_signer (verify anchor → family #386 →
                         // canonical #390); this pyo3 ctor previously stopped at the
                         // holder seed, so wheel consumers got no family + canonical.
+                        // v31.0.0 (CIRISPersist#648) — same survivability rule too.
                         crate::federation::genesis::seed_family_and_canonical(&sq)
                             .await
+                            .or_else(pre_genesis_or_refuse)
                             .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(sq))
                     })
-                })?;
-                #[cfg(feature = "postgres")]
-                {
-                    pg_backend_for_sweep = None;
+                    })?;
+                    #[cfg(feature = "postgres")]
+                    {
+                        pg_backend_for_sweep = None;
+                    }
+                    BackendDispatch::Sqlite(sq)
                 }
-                BackendDispatch::Sqlite(sq)
-            }
-            #[cfg(not(feature = "sqlite"))]
-            {
-                return Err(PyValueError::new_err(format!(
-                    "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
                      was not compiled in for this ciris_persist build"
-                )));
-            }
-        } else {
-            return Err(PyValueError::new_err(format!(
-                "unrecognized dsn scheme: {dsn:?} \
+                    )));
+                }
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "unrecognized dsn scheme: {dsn:?} \
                  (expected `postgresql://…`, `postgres://…`, `sqlite:///…`, or `sqlite::memory:`)"
-            )));
-        };
+                )));
+            };
 
         // ciris-keyring: hardware-backed signer where available,
         // SoftwareSigner fallback otherwise. get_platform_signer
@@ -5916,7 +5956,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**. FFI mirror of
     /// [`Engine::apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record)
     /// — the apply the replication bridge routes `apply_key` to instead of
@@ -5976,7 +6016,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? Returns `True` iff its `federation_keys`
     /// row's `identity_type` set contains `canonical`. Because the substrate
     /// admission gate only ever admits `canonical` on an anchor-scrub-conferred
@@ -6067,7 +6107,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers** as a JSON array of `KeyRecord`s
     /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
     /// stable-sorted by `key_id`). Every returned row is anchor-scrub-conferred
@@ -6836,7 +6876,7 @@ impl PyEngine {
     /// did. Requires a PQC-configured local signer (the hybrid sign);
     /// raises if absent.
     ///
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
     /// names the row's **SUBJECT** (the cross-subject edge shape
     /// `delegates_to` uses). Omitted ⇒ self-attestation. This is the
     /// **witness-targets-subject** age surface: a `witness`-role engine
@@ -6903,7 +6943,7 @@ impl PyEngine {
     /// floor), computed internally. Surfaces a clear error if the engine
     /// has no composed hybrid signer (no local signer / no PQC half).
     ///
-    /// v12.7.0 (CIRISPersist#368) — despite the `_self` name (which refers
+    /// v13.0.0 (CIRISPersist#368) — despite the `_self` name (which refers
     /// to signing with the engine's OWN composed signer), the input's
     /// optional `attested_key_id` still names the row's SUBJECT, exactly as
     /// on [`PyEngine::emit_attestation`] — so a witness-role hardware-hybrid
@@ -11105,7 +11145,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+    /// v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
     /// no-moderator-no-federate admission VERDICT for one community: exactly
     /// the decision the federation-apply gate
     /// ([`admission::check_no_moderator_federate_apply`](crate::federation::admission::check_no_moderator_federate_apply),
@@ -11172,7 +11212,7 @@ impl PyEngine {
     /// not steward-bound). The most-reconstructed walk; exposing it stops
     /// consumers re-deriving the §5.6.8.10 graph.
     ///
-    /// v12.7.0 (CIRISPersist#367, CC 3.2) — this is also THE
+    /// v13.0.0 (CIRISPersist#367, CC 3.2) — this is also THE
     /// **steward-less-minor liveness predicate**: a PROVEN minor (witness
     /// `age_assurance:*:minor` about it, emittable cross-subject per #368)
     /// does NOT self-anchor, so it returns `true` only while a live
@@ -11314,7 +11354,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
     /// **Counter-RII `consent_role`** of `key_id`. Returns a JSON string: the
     /// assigned role token (`"temporary"` / `"partnered"` / `"anonymous"` /
     /// `"authorized_review"` / `"peer"` — the V020 vocabulary CC 3.4.7.2
@@ -11364,7 +11404,7 @@ impl PyEngine {
         })
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
     /// Counter-RII `consent_role` of `key_id`. `consent_role=None` revokes it
     /// (resets the V020 column to its `'unregistered'` default). This is the
     /// OQ-1 non-recursive overwrite: a subsequent call overwrites the single
@@ -12889,7 +12929,7 @@ impl PyEngine {
         })
     }
 
-    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys). Unlike `delete_traces_for_agent` (per-signing-key),
     /// this erases the agent's ENTIRE corpus and tombstones the derived
@@ -20827,17 +20867,28 @@ impl PyEngine {
     /// (JSON) into a `family`/`community` roster. Returns `True` on a genuine
     /// add, `False` if already present. Raises `ValueError` for the `self`
     /// cohort (occurrences are added via `put_identity_occurrence`).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is a
+    /// [`crate::federation::cohort::AdmitSpec`]
+    /// (`{authority_key_id, scrub_signature_classical, scrub_signature_pqc?}`),
+    /// the authority signature over `JCS(signing_envelope())` of the GROWN
+    /// group record. This surface WAS the reachable half of #654: roster growth
+    /// with no authority check at all, on the list that is both numerator and
+    /// denominator of every family quorum.
     fn cohort_add_member(
         &self,
         py: Python<'_>,
         cohort: &str,
         group_key_id: &str,
         member_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         let cohort = cohort_from_token(cohort)?;
         let member: crate::federation::cohort::RosterMember = serde_json::from_str(member_json)
             .map_err(|e| PyValueError::new_err(format!("cohort_add_member member JSON: {e}")))?;
+        let spec: crate::federation::cohort::AdmitSpec = serde_json::from_str(admit_spec_json)
+            .map_err(|e| PyValueError::new_err(format!("cohort_add_member AdmitSpec JSON: {e}")))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let group_key_id = group_key_id.to_owned();
@@ -20847,7 +20898,7 @@ impl PyEngine {
                     macro_rules! dispatch {
                         ($backend:expr) => {{
                             let b = $backend.clone();
-                            b.add_member(cohort, &group_key_id, member.clone())
+                            b.add_member(cohort, &group_key_id, member.clone(), &spec)
                                 .await
                                 .map_err(federation_err_to_py)
                         }};
@@ -20909,6 +20960,15 @@ impl PyEngine {
     /// [`crate::federation::cohort::RosterMember`] in `in_member_json` (revoke
     /// then add) in a `family`/`community` roster. `revoke_spec_json` is a
     /// [`crate::federation::cohort::RevokeSpec`]. Returns the add result.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is the addition's own
+    /// authority signature ([`crate::federation::cohort::AdmitSpec`]); a swap is
+    /// two authorized acts and now carries two authorizations. That is the
+    /// eighth argument, and the eighth is the one that makes the removal and
+    /// the addition each carry its own proof — collapsing the pair back into
+    /// one blob to please an argument count would re-create exactly the
+    /// "one authorization covers two acts" shape this fix removes.
+    #[allow(clippy::too_many_arguments)]
     fn cohort_swap_member(
         &self,
         py: Python<'_>,
@@ -20917,6 +20977,7 @@ impl PyEngine {
         out_key_id: &str,
         in_member_json: &str,
         revoke_spec_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         let cohort = cohort_from_token(cohort)?;
@@ -20926,6 +20987,9 @@ impl PyEngine {
             })?;
         let spec: crate::federation::cohort::RevokeSpec = serde_json::from_str(revoke_spec_json)
             .map_err(|e| PyValueError::new_err(format!("revoke_spec_json: {e}")))?;
+        let admit_spec: crate::federation::cohort::AdmitSpec =
+            serde_json::from_str(admit_spec_json)
+                .map_err(|e| PyValueError::new_err(format!("admit_spec_json: {e}")))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let group_key_id = group_key_id.to_owned();
@@ -20942,6 +21006,7 @@ impl PyEngine {
                                 &out_key_id,
                                 in_member.clone(),
                                 spec.clone(),
+                                &admit_spec,
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -21732,11 +21797,15 @@ impl PyEngine {
     /// [`crate::federation::types::CommunityMember`]. Returns `true` on a
     /// genuine add, `false` if the member was already on the roster
     /// (idempotent).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is a
+    /// [`crate::federation::cohort::AdmitSpec`]; see `cohort_add_member`.
     fn add_community_member(
         &self,
         py: Python<'_>,
         community_key_id: &str,
         member_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -21745,6 +21814,8 @@ impl PyEngine {
             let member: crate::federation::types::CommunityMember =
                 serde_json::from_str(member_json)
                     .map_err(|e| PyValueError::new_err(format!("CommunityMember decode: {e}")))?;
+            let spec: crate::federation::cohort::AdmitSpec = serde_json::from_str(admit_spec_json)
+                .map_err(|e| PyValueError::new_err(format!("AdmitSpec decode: {e}")))?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -21752,7 +21823,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .add_community_member(&community_key_id, member)
+                            .add_community_member(&community_key_id, member, &spec)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -21763,7 +21834,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .add_community_member(&community_key_id, member)
+                            .add_community_member(&community_key_id, member, &spec)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -28721,7 +28792,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // shape as the other admission-gate rejections.
         // v10.3.0 (#288, CC 3.4.5) — capacity:* self-emission is the same
         // admission-gate-rejection shape (caller-fault, ValueError).
-        // v12.7.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
+        // v13.0.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
         // exact sibling (subject-must-not-emit; caller-fault, ValueError).
         // (#590, CC 3.1.7 R2(b)) — emission on a governed family with no
         // registry row is a CONFORMANCE failure, and conformance failures are
@@ -28745,7 +28816,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.11.0 (CIRISPersist#143) — verify-coord R1/Q1 admission
         // rejections are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::RegionRejected { .. }
-        | crate::federation::Error::RevocationRollback { .. } => PyValueError::new_err(kind),
+        | crate::federation::Error::RevocationRollback { .. }
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback CEILING. Caller-fault
+        // in the same way the floor is: the remedy is a scrub instant on this
+        // node's clock, which is a fix to the submitted row.
+        | crate::federation::Error::RevocationScrubSkew { .. } => PyValueError::new_err(kind),
         // v3.12.0 (CIRISPersist#153 Asks 1-2) — CEG 0.7
         // identity_occurrence + family admission rejections are
         // caller-fault malformed-content; ValueError (4xx).
@@ -28831,7 +28906,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // as-self nor a live scoped delegation) is caller-side
         // authorization failure; ValueError (4xx).
         crate::federation::Error::DelegatedScopeUnauthorized { .. } => PyValueError::new_err(kind),
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
@@ -28851,7 +28926,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // error and widening it per-step would fork the FFI vocabulary on a
         // path no Python caller drives today.
         crate::federation::Error::OwnershipReclaimRefused { .. } => PyValueError::new_err(kind),
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
         // (founding-server) role that is not accord-conferred (self-claimed /
         // non-anchor-scrubbed) is a caller-side authorization failure;
         // ValueError (4xx). The `canonical` role is accord-CONFERRED, never
@@ -28904,6 +28979,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::ClockSkewViolation { .. }
         | crate::federation::Error::PaymentProcessorIdentifier { .. }
         | crate::federation::Error::OperationalAuthority(_)
+        // v31.0.0 (CIRISPersist#644) — a typed column diverging from the
+        // envelope its signature covers is caller-fault too.
+        | crate::federation::Error::OperationalEnvelopeUnbound { .. }
         | crate::federation::Error::PartnerRecordRollback { .. }
         | crate::federation::Error::SetSemanticsUnsorted(_) => PyValueError::new_err(kind),
         // v8.2.0 (CEG 1.0-RC11 §19.1) — a WholenessWitness admission
@@ -28931,6 +29009,37 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
+        // v31.0.0 (CIRISPersist#648) — NOT caller-fixable by fixing the
+        // argument: the node has no constitutional trust root, and the remedy
+        // is a genesis ceremony, not a better-formed request. A `ValueError`
+        // would tell a caller to edit its payload and retry forever.
+        //
+        // The `operation` token rides in the message so a Python consumer can
+        // branch on WHICH gate refused without a second copy of the taxonomy —
+        // same shape as `AdminActionUnattributed` below.
+        crate::federation::Error::NoConstitutionalRootYet { operation, leg, .. } => {
+            PyRuntimeError::new_err(format!("{kind}: {operation} ({} leg)", leg.as_str()))
+        }
+        // v31.0.0 (CIRISPersist#648) — caller-fixable only in the sense that
+        // the caller must stop: the constitutional family id is established by
+        // the genesis ceremony and is never a peer declaration.
+        crate::federation::Error::ConstitutionalFamilyReserved { .. } => {
+            PyValueError::new_err(kind)
+        }
+        // v31.0.0 (CIRISPersist#660) — the attestation-plane twin of the arm
+        // above, and mapped identically for the identical reason: a baked
+        // genesis delegation id is installed by the ceremony, so the caller must
+        // stop rather than reshape its payload and retry.
+        //
+        // The `field` token rides in the message so a Python consumer can tell
+        // the two halves of the rule apart — a local-tier row (`tier`) from an
+        // unseated author (`attesting_key_id`) — without a second copy of the
+        // taxonomy, the same shape as `NoConstitutionalRootYet` above.
+        crate::federation::Error::GenesisAttestationReserved {
+            attestation_id,
+            field,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {attestation_id} ({field})")),
         // v25.1.0 (CIRISPersist#570 ask 3/4) — caller-fixable, and the typed
         // token rides in the message so a Python consumer can branch on WHICH
         // branch refused without a second copy of the taxonomy. Both are
@@ -28942,6 +29051,18 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::RevocationBoundInvalid { reason } => {
             PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
         }
+        // v31.0.0 (CIRISPersist#659) — a revocation whose typed columns are
+        // not inside the bytes its scrub signature covers is caller-fault:
+        // the remedy is to re-mint the envelope with the binding, which is
+        // exactly what the message says. Same class as
+        // `OperationalEnvelopeUnbound` → ValueError (4xx). The FIELD rides in
+        // the message rather than the bare `kind`, so a Python consumer can
+        // tell "you forgot the binding" from "you rewrote the subject".
+        crate::federation::Error::RevocationEnvelopeUnbound {
+            revocation_id,
+            field,
+            detail,
+        } => PyValueError::new_err(format!("{kind}: {revocation_id} `{field}` — {detail}")),
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a
@@ -29097,6 +29218,17 @@ struct PutBlobAttestationWire {
     scrub_signature_pqc: Option<String>,
     scrub_key_id: String,
     scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    /// v31.0.0 (CIRISPersist#652) — when the HOLDER CLAIM is asserted, which
+    /// is not the same fact as when the signature was made.
+    ///
+    /// `#[serde(default)]` and NOT required: a caller that omits it keeps the
+    /// pre-#652 behaviour of the two instants coinciding, which is correct for
+    /// the common "announce what I just stored" case and is what every
+    /// existing Python caller means. The field exists so a holder announcing
+    /// bytes it has held for a week can say so — that is a claim about the
+    /// week, not about the moment it reached for its key.
+    #[serde(default)]
+    asserted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -29133,6 +29265,10 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
         scrub_signature_pqc: wire.attestation.scrub_signature_pqc,
         scrub_key_id: wire.attestation.scrub_key_id,
         scrub_timestamp: wire.attestation.scrub_timestamp,
+        asserted_at: wire
+            .attestation
+            .asserted_at
+            .unwrap_or(wire.attestation.scrub_timestamp),
     };
     Ok(PutBlobPayload {
         sha256: sha,
@@ -30218,7 +30354,7 @@ mod tests {
 
     /// **CIRISPersist#571 — the quota reason survives the FFI boundary.**
     ///
-    /// v24.3.0 (#575) typed the refusal and v24.4.0 (#583) made the set a
+    /// v24.3.0 (#575) typed the refusal and v25.1.0 (#583) made the set a
     /// product with the byte budgets; this boundary then mapped the whole thing
     /// to `PyRuntimeError::new_err(kind)` and dropped it, so Python saw only
     /// `federation_rate_limited` and could not tell a row-budget refusal from a
@@ -31360,8 +31496,19 @@ mod tests {
     /// How long the forcing-function blocking task stays in flight.
     /// Long enough that "did the GIL move?" is unambiguous, short
     /// enough that the suite doesn't notice.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — 1200 ms, widened to 2000 ms. It is the
+    /// SPAN THE TWO VERDICTS ARE SEPARATED BY: a wedged teardown holds the GIL
+    /// for about this long, an unwedged one for a thread spawn. [`GIL_BOUND`]
+    /// is derived from it, so widening the hold widens the healthy path's
+    /// headroom without weakening the detection — see `GIL_BOUND`'s doc for
+    /// why those two move in the same direction here and not in opposite ones.
     #[cfg(test)]
-    const WEDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
+    const WEDGE_HOLD_MS: u64 = 2000;
+
+    /// [`WEDGE_HOLD_MS`] as a `Duration`.
+    #[cfg(test)]
+    const WEDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(WEDGE_HOLD_MS);
 
     /// Start a tokio runtime with ONE `spawn_blocking` task that has
     /// **provably begun** and will not finish for [`WEDGE_HOLD`].
@@ -31462,10 +31609,36 @@ mod tests {
     }
 
     /// The upper bound a teardown step is allowed to hold the GIL for.
-    /// Generous (a thread spawn is ~50µs); the failure mode we care
-    /// about is *seconds*, so this discriminates cleanly.
+    ///
+    /// # Why it is half of [`WEDGE_HOLD`] and not a round number
+    ///
+    /// v31.0.0 (CIRISPersist#658) — this was a bare 250 ms against a 1200 ms
+    /// wedge: a 4.8x gap, in a test that also has to schedule a probe thread,
+    /// spawn an OS thread and re-acquire the interpreter lock. Under CPU
+    /// oversubscription that is a bound on the SCHEDULER, and the failure it
+    /// produces names a duration rather than a defect — the same class as the
+    /// #598 quota witness that measured machine speed.
+    ///
+    /// The asymmetry is what makes the fix cheap. The two verdicts this
+    /// separates are not symmetric under load:
+    ///
+    /// - a WEDGED teardown blocks for [`WEDGE_HOLD`], which is a `sleep` the
+    ///   test itself controls. Contention can only make it LONGER, never
+    ///   shorter, so the detection margin is monotone-safe and costs nothing
+    ///   to give away;
+    /// - an UNWEDGED teardown hands off to a thread and returns in
+    ///   microseconds. Contention makes THAT longer, and it is the only side
+    ///   that can flake.
+    ///
+    /// So the threshold is pushed as far toward the wedge as it can go while
+    /// leaving the wedge unmistakable: half the hold, against wedge witnesses
+    /// that assert `>= 0.7 * WEDGE_HOLD`, leaving the two regimes separated by
+    /// a clear `[0.5, 0.7] × WEDGE_HOLD` band. The healthy path's headroom
+    /// goes from 250 ms to a full second — four thousand times what a thread
+    /// spawn costs — and a breach still means what it says: teardown blocked
+    /// while holding the interpreter lock.
     #[cfg(test)]
-    const GIL_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+    const GIL_BOUND: std::time::Duration = std::time::Duration::from_millis(WEDGE_HOLD_MS / 2);
 
     /// Install a cell, then hand back a lone `PyEngine` handle that
     /// owns the LAST reference to the cell's runtime — the exact
@@ -31535,7 +31708,11 @@ mod tests {
         assert!(
             held < GIL_BOUND,
             "dropping the last Engine handle held the GIL for {held:?} \
-             — teardown must never block while the GIL is held (#572)"
+             — teardown must never block while the GIL is held (#572). \
+             The in-flight task is a {WEDGE_HOLD:?} sleep and the bound is \
+             {GIL_BOUND:?}: at or near the former this drop WAITED for the \
+             runtime, which is the wedge; well under it and a slow box is \
+             the only other reading."
         );
         let acquired = probe
             .recv()
@@ -31544,7 +31721,9 @@ mod tests {
         assert!(
             acquired < GIL_BOUND,
             "the GIL probe was starved for {acquired:?} by an Engine \
-             teardown (#572)"
+             teardown (#572) — a second Python thread could not run while \
+             the handle was dropped. The forcing task holds {WEDGE_HOLD:?}; \
+             a starvation near that length is the wedge, not contention."
         );
 
         // The teardown is deferred, not skipped: it really does finish,
@@ -31632,7 +31811,10 @@ mod tests {
         assert!(
             acquired < GIL_BOUND,
             "the GIL probe was starved for {acquired:?} by a DETACHED \
-             blocking wait — the detach is not doing its job (#580)"
+             blocking wait — the detach is not doing its job (#580). The \
+             wait is {WEDGE_HOLD:?} long and the bound is {GIL_BOUND:?}: a \
+             starvation approaching the former means `py.detach` did not \
+             release the interpreter, which is the whole of #580."
         );
     }
 
@@ -32034,7 +32216,11 @@ mod tests {
             .duration_since(t0);
         assert!(
             acquired < GIL_BOUND,
-            "reset_engine held the GIL for {acquired:?} while draining"
+            "reset_engine held the GIL for {acquired:?} while draining. The \
+             drain waits on a {WEDGE_HOLD:?} in-flight task and the bound is \
+             {GIL_BOUND:?}: a starvation approaching the former means the \
+             drain waited with the GIL HELD, which is a bounded drain and a \
+             #572 wedge wearing the same outcome string."
         );
         assert_eq!(engine_teardowns_in_flight(), 0);
     }

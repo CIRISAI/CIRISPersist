@@ -1199,6 +1199,14 @@ pub(crate) mod test_support {
         let dest_hash =
             compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
         let envelope = serde_json::json!({
+            // v31.0.0 (CIRISVerify 13.1.0) - `attesting_key_id` is BOUND into the
+            // signed bytes. It is a `SignedIdentityOccurrence` field living
+            // OUTSIDE them, so nothing tied the signer named on the wrapper to
+            // the signer the envelope is about: Mallory could re-present a
+            // victim's genuine envelope under her own transport destination and
+            // the signature still verified. Verify now refuses the pair as
+            // SubjectMismatch. Same spelling as verify's own fixture.
+            "attesting_key_id": alice_id,
             "identity_key_id": alice_id,
             "occurrence_key_id": phone_id,
             "transport_destination": {

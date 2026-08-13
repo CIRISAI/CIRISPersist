@@ -160,7 +160,7 @@ pub mod identity_type {
         LENSCORE_DETECTOR,
         VERIFY,
     ];
-    /// v8.9.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
+    /// v9.0.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
     /// fabric/infrastructure role. A CIRISServer (or any pure
     /// infrastructure node) self-registers its federation signing key
     /// with this `identity_type`. **A `node`-role key MUST NOT carry
@@ -175,7 +175,7 @@ pub mod identity_type {
     /// this publishes the canonical token so producer + verifier agree
     /// byte-for-byte.
     pub const NODE: &str = "node";
-    /// v12.7.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
+    /// v13.0.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
     /// Only `federation_keys` rows whose `identity_type` **set** contains
     /// this token may emit the detector-only reserved prefixes
     /// `detection:correlated_action:*` and `detection:distributive:access:*`
@@ -189,7 +189,7 @@ pub mod identity_type {
     /// prefix (ungated here), so anything on `detection:*` is a primary
     /// detector emission and gate-able with no envelope field.
     pub const LENSCORE_DETECTOR: &str = "lenscore_detector";
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
     /// **canonical / founding bootstrap server**. This role marks a node
     /// as a member of the founding canonical set; it is **accord-CONFERRED,
     /// never self-claimed**.
@@ -491,7 +491,7 @@ pub mod roles {
     pub const INFRA_ATTEST: &str = "infra:attest";
 }
 
-/// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+/// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
 /// **Counter-RII `consent_role`** vocabulary: the role tokens carried on
 /// [`KeyRecord::consent_role`] that gate Counter-RII probe detection
 /// (RATCHET `FSD/COUNTER_RII_DETECTION.md`; Lean `ConsentGate.lean`, 8
@@ -513,7 +513,7 @@ pub mod roles {
 /// admission in `put_public_key`/`set_consent_role` keeps the backends
 /// symmetric). CC 3.4.7.2's "non-breaking against the shipped flat
 /// substrate" language is literal: OQ-1's flat overwrite-on-revoke IS the
-/// natural UPDATE semantics of that column. v12.7.0 puts the field **on
+/// natural UPDATE semantics of that column. v13.0.0 puts the field **on
 /// the wire** ([`KeyRecord`]`::consent_role`, `None` ⇔ the stored
 /// `'unregistered'` default) and exposes the resolver + mutation surface.
 pub mod consent_role {
@@ -702,7 +702,7 @@ pub mod owner_binding {
     /// The owner-binding `delegation_purpose` (producer-side marker; the
     /// substrate gate keys on [`DIMENSION`], this documents the pair).
     pub const PURPOSE: &str = "responsible_for";
-    /// v13.2.1 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
+    /// v13.3.0 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
     /// marker carried as `registration/attestation_envelope.delegation_purpose`.
     /// The substrate recognizes an owner-binding by EITHER this
     /// `delegation_purpose` value OR the internal [`DIMENSION`] (the
@@ -713,7 +713,7 @@ pub mod owner_binding {
     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
 /// **two-prefix delegation scope split** that makes "infrastructure
 /// must not have agency" wire-checkable.
 ///
@@ -804,6 +804,61 @@ pub mod delegation_scope {
     /// A key blessed to publish content ratings has not thereby been blessed to
     /// declare a third party's age band.
     pub const INFRA_PUBLISH_RATING: &str = "infra:publish_rating";
+
+    /// v31.0.0 (CIRISPersist#612) — `infra:classify_content` — speak
+    /// **about a third party's content class**: the standing a
+    /// `content_class:*` emitter must hold before this node will honour a
+    /// WITHDRAWAL that clears a flag the emitter did not raise.
+    ///
+    /// The scope
+    /// [`resolve_content_class_flag`](crate::federation::FederationDirectory::resolve_content_class_flag)
+    /// resolves at USE, through
+    /// [`capability_roots_to_trusted_root`](crate::federation::trust_root::capability_roots_to_trusted_root),
+    /// against a root **the asking node itself trusts**.
+    ///
+    /// Like [`INFRA_PUBLISH_RATING`] it governs a **READ** door, not a write
+    /// door, and for the same constitutional reason: CC 3.3.12 leaves
+    /// `content_class:` open vocabulary, and CC 3.4.14 R1 makes the
+    /// `generated` / `generated_modified` marking universal — *every* attester
+    /// — so CIRISPersist#571 removed persist's CEG-sourced emitter rule as
+    /// stricter than the Constitution. An open write door and a
+    /// conferral-filtered read door is the shape CC describes; this token is
+    /// what makes the read side able to discriminate at all.
+    ///
+    /// # Why a CAPABILITY scope and NOT a rung on the moderation ladder
+    ///
+    /// [`MODERATION`] is authority to ACT ABOUT another party — emit a
+    /// moderation event, take content down, force a review, slash. A
+    /// content-class marking is an EPISTEMIC statement about content. Fusing
+    /// the two is the #532 axis-fusion class, so the test is mechanical:
+    ///
+    /// 1. **The intended holder is a NODE.** CIRISServer#363's emitter is a
+    ///    peer's own `substrate_persist` flag signer. A `node`-role delegate
+    ///    may carry ONLY `infra:*` —
+    ///    [`scopes_are_infra_only`](crate::federation::admission::scopes_are_infra_only)
+    ///    refuses every unprefixed duty token on a node key — so a ladder rung
+    ///    would be a scope the party that needs it structurally cannot hold.
+    /// 2. **A different resolver answers it.** Ladder rungs are resolved by the
+    ///    §11.10 duty walk over a roster the delegator governs
+    ///    (`check_moderation_admission` / `duty_holders_for_federation`). This
+    ///    is resolved on the CAPABILITY plane, against the ASKING node's trust
+    ///    root — which is precisely what #612 asked for, and what a duty walk
+    ///    cannot express (a peer classifier sits on no roster of ours).
+    /// 3. **Classification is not adjudication.** CC 3.4.14 R5 puts a false or
+    ///    stripped marking in front of a WA quorum on the `hard_case:*`
+    ///    evidence floor. "This is an infohazard" is the input; `takedown` /
+    ///    `slash` are sanctions a body may impose after one. One token for both
+    ///    would let a classifier's key slash, or a moderator's key silently
+    ///    re-classify.
+    ///
+    /// A fifth `infra:*` name rather than reuse of [`INFRA_DETECT`],
+    /// [`INFRA_PUBLISH_RATING`], [`INFRA_ATTEST_ASSURANCE`] or
+    /// [`INFRA_RECORD_HARD_CASE`], for the reason every one of them gives:
+    /// reusing `infra:detect` would let any adversarial-detection key clear a
+    /// CC 4.5.13 child-safety flag, and a key blessed to publish MPA-style
+    /// ratings has not thereby been blessed to declare content an infohazard.
+    /// One name, two authorities is the fusion class this repo keeps closing.
+    pub const INFRA_CLASSIFY_CONTENT: &str = "infra:classify_content";
 
     /// v30.2.0 (CIRISPersist#607) — `infra:detect` — emit on the adversarial
     /// detection plane (`detection:*`) about other parties.
@@ -954,6 +1009,7 @@ pub mod delegation_scope {
         INFRA_DETECT,
         INFRA_RECORD_HARD_CASE,
         INFRA_PUBLISH_RATING,
+        INFRA_CLASSIFY_CONTENT,
         // agency:* — what an agent may do on someone's behalf.
         AGENCY_ACT_ON_BEHALF,
         AGENCY_MESSAGE_IO,
@@ -989,6 +1045,7 @@ pub mod delegation_scope {
         INFRA_DETECT,
         INFRA_RECORD_HARD_CASE,
         INFRA_PUBLISH_RATING,
+        INFRA_CLASSIFY_CONTENT,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `agency:*` axis: what a key may do ON
@@ -1029,6 +1086,18 @@ pub mod delegation_scope {
     /// and re-exported here so the inventory and the minting site cannot
     /// disagree. Two arrays over one vocabulary would be the defect both #636
     /// and #637 exist to remove.
+    ///
+    /// # Still FIVE at v31.0.0 — a considered NO, not an omission
+    ///
+    /// CIRISPersist#612 minted [`INFRA_CLASSIFY_CONTENT`] and it is deliberately
+    /// **not** a sixth rung. "Asserts about another party" is not the ladder's
+    /// discriminator — [`INFRA_ATTEST_ASSURANCE`], [`INFRA_RECORD_HARD_CASE`],
+    /// [`INFRA_DETECT`] and [`INFRA_PUBLISH_RATING`] all do that and all sit on
+    /// [`INFRA`]. What makes a rung a rung is that it authorises an ACT the
+    /// §11.10 duty walk admits on a roster the delegator governs; a
+    /// content-class marking is an epistemic statement resolved on the
+    /// CAPABILITY plane against the asking node's own trust root. See
+    /// [`INFRA_CLASSIFY_CONTENT`] for the three-part axis test.
     pub const MODERATION: &[&str] = crate::federation::admission::DELEGATED_DUTY_SCOPES;
 
     /// v30.11.0 (CIRISPersist#636) — the recovery / succession axis: standing
@@ -1079,6 +1148,12 @@ pub mod delegation_scope {
         (
             "envelope::SCOPE",
             "the envelope FIELD NAME (\"scope\"), not a value that field may hold",
+        ),
+        (
+            "envelope::COHORT_SCOPE",
+            "v31.0.0 (CIRISPersist#643) — a MEMBER NAME inside the signed typed-column mirror \
+             (`envelope::row_paths::COHORT_SCOPE` = \"cohort_scope\"), not a delegates_to scope \
+             value. Its own closed inventory is types::cohort_scope",
         ),
         (
             "admission::ANALYZE_CONSENT_SCOPE",
@@ -1283,7 +1358,7 @@ pub struct KeyRecord {
     /// computations stay stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_evidence: Option<serde_json::Value>,
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
     /// **Counter-RII `consent_role`**. A single role token (see the
     /// [`consent_role`] vocabulary module — `temporary` / `partnered` /
     /// `anonymous` / `authorized_review` / `peer`) that gates the
@@ -1307,7 +1382,7 @@ pub struct KeyRecord {
     /// overwrite does NOT disturb the registration hash / CIRISRegistry
     /// vendored-shape parity, and `adopt_scrub_upgrade` deliberately does
     /// NOT touch it (an anchor-scrub upgrade must not clobber an assigned
-    /// role). Backward-compatible default: pre-v12.7.0 rows + rows with no
+    /// role). Backward-compatible default: pre-v13.0.0 rows + rows with no
     /// assigned role serialize without the field
     /// (`skip_serializing_if = "Option::is_none"`), so `persist_row_hash`
     /// stays byte-stable.
@@ -1812,6 +1887,53 @@ impl LocalAttestationInput {
             additional_scrubs: Vec::new(),
         }
     }
+}
+
+/// v31.0.0 (CIRISPersist#649) — **the re-stamped envelope and the scrub that
+/// covers it**: everything a PLACEMENT-TOUCHING write must carry now that
+/// `cohort_scope` lives INSIDE the signed bytes (CIRISPersist#643).
+///
+/// # Why this type exists
+///
+/// Before #643, `cohort_scope` was an unsigned column, so
+/// [`crate::federation::FederationDirectory::promote_attestation`] and
+/// [`crate::federation::FederationDirectory::set_attestation_cohort_scope`]
+/// could rewrite it in place and leave the signature alone. #643 bound it into
+/// `envelope.row`, and both primitives kept rewriting the column without
+/// re-stamping the mirror — so a promoted row asserted its PRE-promotion scope
+/// while its column said otherwise, and **every peer's `put_attestation`
+/// refused it** (CIRISPersist#649). Promotion succeeded locally the whole time,
+/// which is exactly what hid it.
+///
+/// A placement-touching write therefore re-signs, and the three things that
+/// must move together — the re-stamped envelope, the digest of its canonical
+/// bytes, and the signature over them — travel as ONE value rather than as six
+/// positional arguments a caller can get half-right. Build the envelope half
+/// with [`crate::federation::envelope::RowMirror::restamp_for_scope`]; both
+/// primitives re-run
+/// [`crate::federation::admission::check_row_column_binding`] over the row as
+/// it will be stored, so a caller that skips the re-stamp is REFUSED rather
+/// than silently minting a row no peer will take.
+#[derive(Debug, Clone)]
+pub struct AttestationReseal {
+    /// The envelope as it will be STORED and SERVED — the mirror already
+    /// re-stamped for the new placement, and the exact bytes
+    /// [`Self::original_content_hash`] / [`Self::scrub_signature_classical`]
+    /// were computed over.
+    pub attestation_envelope: serde_json::Value,
+    /// Hex `SHA-256` of the §0.9-canonical form of
+    /// [`Self::attestation_envelope`].
+    pub original_content_hash: String,
+    /// Base64 Ed25519 over the same canonical bytes.
+    pub scrub_signature_classical: String,
+    /// Base64 ML-DSA-65 over `canonical ‖ ed25519_sig` (CC 3.1.2.1).
+    pub scrub_signature_pqc: Option<String>,
+    /// The DERIVED federation `key_id` of the re-signer (never a keystore
+    /// alias — CIRISPersist#247); FKs to `federation_keys(key_id)`.
+    pub scrub_key_id: String,
+    /// The instant stamped onto `scrub_timestamp` (and `promoted_at`, on the
+    /// promotion path).
+    pub scrub_timestamp: DateTime<Utc>,
 }
 
 /// v9.3.0 (CIRISPersist#248) — inputs to
@@ -3633,6 +3755,104 @@ pub struct AnnouncedPeer {
     pub announce_count: i64,
 }
 
+/// v31.0.0 (CIRISPersist#646) — truncate one RFC-3339 timestamp string to
+/// microsecond precision, or return `None` when the string is not an RFC-3339
+/// instant carrying a sub-microsecond tail.
+///
+/// The `parse_from_rfc3339` guard is what makes this safe to run over an
+/// arbitrary JSON string: a base64 signature, a hex digest or a key_id cannot
+/// pass it, so nothing but an actual instant is ever rewritten.
+fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
+    let dot = s.find('.')?;
+    let frac_start = dot + 1;
+    let frac_len = s.as_bytes()[frac_start..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if frac_len <= 6 {
+        return None;
+    }
+    // Only rewrite something that really is an instant.
+    chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..frac_start + 6]);
+    out.push_str(&s[frac_start + frac_len..]);
+    Some(out)
+}
+
+/// v31.0.0 (CIRISPersist#646) — rewrite every RFC-3339 instant in `value` to
+/// microsecond precision, recursively.
+///
+/// # Why `persist_row_hash` must not see nanoseconds
+///
+/// `persist_row_hash` is a CROSS-NODE row identity: the write paths compare a
+/// freshly computed hash against the stored column to decide "same row or
+/// different row", and those comparisons **gate**. A mismatch is not a slow
+/// path — `put_public_key` returns `Error::Conflict("… already exists with
+/// different content")`, `put_goal` does the same, `adopt_scrub_upgrade`
+/// refuses as a downgrade/replace, and a miss on
+/// [`plan_replicated_key_apply`](super::register::plan_replicated_key_apply)'s
+/// idempotency fast path falls through to `plan_canonical_supersede`, which
+/// refuses a same-version re-apply as a re-scrub hijack. So an identity hash
+/// that disagrees with itself REFUSES legitimate writes.
+///
+/// And it did disagree, because the three backends store instants at three
+/// precisions:
+///
+/// * postgres `TIMESTAMPTZ` — **microseconds** (a sub-µs tail is rounded away
+///   on the way in);
+/// * sqlite — `to_rfc3339()` TEXT, **nanoseconds** preserved;
+/// * memory — the `DateTime<Utc>` itself, **nanoseconds** preserved.
+///
+/// The hash was computed over the struct the writer HELD, so a postgres node
+/// stored `H(nanoseconds)` beside a row holding microseconds. Serve that row
+/// and it is internally inconsistent — `record.persist_row_hash !=
+/// compute_persist_row_hash(record)` — and any peer that re-derives (which is
+/// exactly what the idempotency gates do) computes a different value and
+/// refuses.
+///
+/// # Why truncate rather than hash-as-stored
+///
+/// CIRISPersist#640's remedy for the WIRE INDEX is "hash the row as stored",
+/// and that is right there: the wire index hashes the exact bytes the read
+/// surface serves, whatever they are, and the normalization it has to survive
+/// is not only about clocks (`consent_role` is normalized too). It is the
+/// WRONG remedy here. Hashing as stored would make postgres compute
+/// `H(microseconds)` and sqlite `H(nanoseconds)` **for the same record**,
+/// which is precisely the disagreement a cross-node identity must not have.
+/// A row identity has to be a function of the record, not of who stored it.
+///
+/// Microseconds is the correct floor, not an arbitrary one: it is what
+/// postgres `TIMESTAMPTZ` holds, what Python's `datetime` (CIRISRegistry,
+/// CIRISAgent) can represent at all, and therefore the finest precision every
+/// participant in this mesh can reproduce. A nanosecond tail is a value no
+/// peer can round-trip, so no identity may depend on it.
+///
+/// Applied to the hash INPUT, not to the stored row: nothing here changes what
+/// a column holds or what a signature covers. The rows keep whatever precision
+/// their backend keeps; only the identity derived from them stops varying with
+/// it.
+fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(truncated) = truncate_rfc3339_to_microseconds(s) {
+                *s = truncated;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                truncate_instants_to_microseconds(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                truncate_instants_to_microseconds(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compute the canonical-bytes hash for a row used for
 /// `persist_row_hash`. Persist calls this server-side on every write
 /// path so consumers don't have to.
@@ -3644,6 +3864,9 @@ pub struct AnnouncedPeer {
 /// itself).
 ///
 /// Returns the hex-encoded SHA-256 string.
+///
+/// v31.0.0 (CIRISPersist#646) — every instant in the hashed value is first
+/// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use sha2::{Digest, Sha256};
@@ -3653,7 +3876,7 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
     // stable across populate/depopulate cycles (read response carries
     // the field; write submission may or may not).
     //
-    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1): also drop
+    // v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1): also drop
     // `consent_role`. It is a MUTABLE, overwrite-on-revoke operational
     // role marker — NOT part of the signed registration content — so it
     // MUST NOT enter the registration hash. Excluding it keeps
@@ -3666,6 +3889,9 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
         obj.remove("persist_row_hash");
         obj.remove("consent_role");
     }
+    // v31.0.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
+    // BEFORE HASHING. See `truncate_instants_to_microseconds`.
+    truncate_instants_to_microseconds(&mut value);
     let bytes = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&value)
         .map_err(|e| super::Error::Backend(format!("canonicalize for hash: {e}")))?;
@@ -3676,6 +3902,112 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v31.0.0 (CIRISPersist#646) — `persist_row_hash` does not depend on a
+    /// precision no participant can reproduce.
+    ///
+    /// The row identity has to be a function of the RECORD, not of who stored
+    /// it, because the write paths compare a freshly computed hash against the
+    /// stored column to decide "same row or different row" and REFUSE on a
+    /// mismatch (`put_public_key` → `Error::Conflict`, `put_goal` likewise,
+    /// `adopt_scrub_upgrade` → downgrade/replace refused,
+    /// `plan_replicated_key_apply` → falls through to a supersede that refuses
+    /// a same-version re-apply). Postgres holds microseconds and sqlite/memory
+    /// hold nanoseconds, so before this cut the same record hashed two ways
+    /// depending on which backend had touched it, and a byte-identical
+    /// re-apply could be refused as "different content".
+    #[test]
+    fn persist_row_hash_is_microsecond_stable_646() {
+        use chrono::Timelike as _;
+        let with_ns: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456789Z".parse().unwrap();
+        let truncated = with_ns.with_nanosecond(123_456_000).unwrap();
+        // The fixture must really differ below a microsecond, or this cannot fail.
+        assert_ne!(
+            with_ns.nanosecond() % 1_000,
+            0,
+            "the nanosecond fixture must carry a sub-microsecond tail"
+        );
+        assert_ne!(
+            with_ns, truncated,
+            "the two fixtures must be distinct instants"
+        );
+
+        let row = |t: chrono::DateTime<Utc>| KeyRecord {
+            key_id: "k1".into(),
+            pubkey_ed25519_base64: "AAAA".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: "hybrid".into(),
+            identity_type: "node".into(),
+            identity_ref: "k1".into(),
+            valid_from: t,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": "k1" }),
+            original_content_hash: "de".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k1".into(),
+            scrub_timestamp: t,
+            pqc_completed_at: Some(t),
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        assert_eq!(
+            compute_persist_row_hash(&row(with_ns)).unwrap(),
+            compute_persist_row_hash(&row(truncated)).unwrap(),
+            "a nanosecond tail no backend can round-trip must not change the row identity"
+        );
+    }
+
+    /// The truncation is a MICROSECOND floor, not a blanket timestamp erasure:
+    /// two instants that differ AT microsecond resolution must still hash
+    /// differently, or the identity would stop distinguishing real versions.
+    #[test]
+    fn persist_row_hash_still_separates_distinct_microseconds_646() {
+        let a: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123456Z".parse().unwrap();
+        let b: chrono::DateTime<Utc> = "2026-06-01T00:00:00.123457Z".parse().unwrap();
+        let row = |t: chrono::DateTime<Utc>| serde_json::json!({ "asserted_at": t.to_rfc3339() });
+        assert_ne!(
+            compute_persist_row_hash(&row(a)).unwrap(),
+            compute_persist_row_hash(&row(b)).unwrap(),
+            "one microsecond apart is a real difference and must survive"
+        );
+    }
+
+    /// The `parse_from_rfc3339` guard is what makes the rewrite safe over an
+    /// arbitrary JSON string. A base64 signature, a hex digest, a version
+    /// string — none may be touched however many dots and digits they carry.
+    #[test]
+    fn instant_truncation_never_touches_a_non_timestamp_646() {
+        for s in [
+            "1.2345678901234567890",
+            "sha256.1234567890abcdef",
+            "v1.2.3456789012",
+            "not-a-time.9999999",
+            "2026-13-45T99:99:99.1234567Z",
+        ] {
+            assert!(
+                super::truncate_rfc3339_to_microseconds(s).is_none(),
+                "must not rewrite non-instant {s:?}"
+            );
+        }
+        // …and it DOES rewrite a real one, or the guard would be vacuous.
+        assert_eq!(
+            super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456789Z").as_deref(),
+            Some("2026-06-01T00:00:00.123456Z"),
+        );
+        // A microsecond-or-coarser instant is already at the floor: left alone.
+        assert!(super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456Z").is_none());
+        assert!(super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00Z").is_none());
+        // The offset suffix survives the splice.
+        assert_eq!(
+            super::truncate_rfc3339_to_microseconds("2026-06-01T00:00:00.123456789+02:00")
+                .as_deref(),
+            Some("2026-06-01T00:00:00.123456+02:00"),
+        );
+    }
 
     /// v23.0.0 (CIRISPersist#551 item 6) — the Rust field is
     /// `capability_roles`; the WIRE name is still `roles`.
@@ -3936,7 +4268,7 @@ mod tests {
         assert_eq!(round.additional_scrubs, two.additional_scrubs);
     }
 
-    /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
+    /// v13.0.0 (CIRISPersist#368) — the FFI wire contract for the
     /// witness-targets-subject age surface: `EmitAttestationInput` JSON
     /// (the exact `PyEngine::emit_attestation` / `emit_attestation_self`
     /// input) carries the optional `attested_key_id` naming the SUBJECT,

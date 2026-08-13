@@ -63,7 +63,7 @@ pub mod test_support {
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
             attested_key_id: attested.to_owned(),
@@ -85,7 +85,10 @@ pub mod test_support {
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// **B1 — capacity self-attestation is refused on BOTH wire shapes.**
@@ -183,9 +186,22 @@ pub mod test_support {
     /// grants must name their scope exactly, a scope-less non-grant is
     /// blanket).
     ///
-    /// `asserted_at` is EXPLICIT because the fold is latest-wins on it: a
-    /// grant and a revoke minted at the same `Utc::now()` tie, and
-    /// `max_by_key` on a tie is unspecified — the sequence must advance.
+    /// `asserted_at` is EXPLICIT because the fold is latest-wins on it, and it
+    /// is stamped INTO the signed envelope as well as onto the row column —
+    /// [`crate::federation::admission::check_instant_binding`]
+    /// refuses the row if the two disagree (v31.0.0, CIRISPersist#598).
+    /// Truncated to the substrate resolution so the fixture measures ordering
+    /// rather than the precision difference between postgres `TIMESTAMPTZ` and
+    /// `Utc::now()`.
+    ///
+    /// v31.0.0 — the note that used to live here ("a grant and a revoke
+    /// minted at the same `Utc::now()` tie, and `max_by_key` on a tie is
+    /// unspecified — the sequence must advance") DOCUMENTED the missing
+    /// tie-break instead of fixing it. The fold now carries a deterministic
+    /// restriction-wins tie-break ([`crate::federation::consent::fold_ordering_key`]),
+    /// so a tie resolves to the restrictive stance on all three backends and
+    /// the fixture no longer has to keep the sequence advancing to be
+    /// meaningful.
     pub fn consent_scope_row(
         id: &str,
         subject: &str,
@@ -194,13 +210,16 @@ pub mod test_support {
         scopes: &[&str],
         asserted_at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = serde_json::json!({
             "dimension": stance_dimension,
             "scope": scopes,
+            crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(subject, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: subject.to_owned(),
             attested_key_id: covers.to_owned(),
@@ -222,7 +241,10 @@ pub mod test_support {
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(subject, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// **B5 (CIRISConstitution#46) — consent BEFORE scoring, for `capacity:*`.**
@@ -378,7 +400,7 @@ pub mod test_support {
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
             attested_key_id: attested.to_owned(),
@@ -400,7 +422,10 @@ pub mod test_support {
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// The families CC 3.4.5 dispositioned OUTSIDE the consent gate by name,
@@ -650,7 +675,7 @@ pub mod test_support {
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(&writer, &envelope);
             let now = chrono::Utc::now();
-            Attestation {
+            let mut sealed_row_ = Attestation {
                 attestation_id: uuid::Uuid::new_v4().to_string(),
                 attesting_key_id: writer.clone(),
                 attested_key_id: writer.clone(),
@@ -672,7 +697,13 @@ pub mod test_support {
                 tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
-            }
+            };
+            crate::federation::tier_ingest::test_support::seal_row_in_place(
+                &writer,
+                &mut sealed_row_,
+            );
+            crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+            sealed_row_
         };
 
         // (a) THE HAZARD: a typo'd mode must be refused, loudly, at the wire.
@@ -781,6 +812,47 @@ pub mod test_support {
         })
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
+
+        // (e) v31.0.0 (CIRISPersist#608) — **THE SANCTION COVERS THE
+        // SANCTIONING DIMENSION.**
+        //
+        // The gate used to exempt any row carrying `PEER_DEADMISSION_DIMENSION`
+        // regardless of author, so the de-admitted abuser could keep writing
+        // de-admission rows ABOUT THIRD PARTIES — the one dimension a sanctioned
+        // peer most wants, since it is how this node decides who else to refuse.
+        // Legs (a)-(d) all passed over that hole for eight majors: (c) refuses
+        // the abuser on `trust:demo:v1`, and nothing asked what happened on the
+        // sanction dimension itself.
+        let smuggled = scores_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &abuser,   // ATTESTER — already de-admitted at (b)
+            &innocent, // about a THIRD PARTY, not itself
+            PEER_DEADMISSION_DIMENSION,
+        );
+        let smuggled_id = smuggled.attestation_id.clone();
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: smuggled,
+            })
+            .await
+            .expect_err(
+                "({tag}) #608: a de-admitted peer must not author the de-admission dimension",
+            );
+        assert!(
+            format!("{err}").contains("de-admitted"),
+            "({tag}) #608: the refusal names the de-admission: {err}"
+        );
+
+        // REFUSED, not refused-after-storing. AV-9 wants the former, and the two
+        // are indistinguishable from the error alone.
+        let by_abuser = dir
+            .list_attestations_by(&abuser)
+            .await
+            .expect("({tag}) #608: list_attestations_by");
+        assert!(
+            !by_abuser.iter().any(|a| a.attestation_id == smuggled_id),
+            "({tag}) #608: the refused row was STORED anyway — refusal must leave no trace"
+        );
     }
 
     /// **B8 (CIRISPersist#589 / AV-83) — a PROMOTION faces the tier-4 stack,
@@ -789,7 +861,8 @@ pub mod test_support {
     /// # The hole this closes
     ///
     /// `Engine::attestation_promote` and the backends' `promote_attestation` /
-    /// `promote_attestation_transformed` re-signed a row and flipped `tier`
+    /// `promote_attestation_transformed` (folded into `promote_attestation` by
+    /// CIRISPersist#649) re-signed a row and flipped `tier`
     /// local→federation while running **no** put-gate whatsoever. Every gate
     /// that no-ops at the local tier had therefore never been asked about a
     /// promoted row, and promotion is the moment those rows become
@@ -847,9 +920,11 @@ pub mod test_support {
             let mut row = scores_row(id, &attester, &subject, dimension);
             if let Some(t) = att_type {
                 row.attestation_type = t.to_owned();
+                crate::federation::tier_ingest::test_support::reseal(&mut row);
             }
             row.tier = attestation_tier::LOCAL.to_owned();
             row.cohort_scope = cohort_scope::SELF.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             row
         };
 
@@ -892,10 +967,13 @@ pub mod test_support {
         // ── (c) NOT A LOCKDOWN — an ordinary local row admits AND promotes.
         let ok_id = uuid::Uuid::new_v4().to_string();
         let ok_row = local_row(&ok_id, "trust:demo:v1", None);
-        let (ok_och, ok_sc, ok_sp) = (
-            ok_row.original_content_hash.clone(),
-            ok_row.scrub_signature_classical.clone(),
-            ok_row.scrub_signature_pqc.clone(),
+        // v31.0.0 (CIRISPersist#649) — a promotion RE-STAMPS the mirror it
+        // re-signs, because it changes `cohort_scope`. `reseal_for_scope` is
+        // the fixture twin of `Engine::reseal_for_scope`.
+        let ok_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &attester,
+            &ok_row,
+            cohort_scope::FEDERATION,
         );
         dir.put_attestation(SignedAttestation {
             attestation: ok_row,
@@ -903,17 +981,9 @@ pub mod test_support {
         .await
         .expect("({tag}) B8: an ordinary local row still admits");
         assert!(
-            dir.promote_attestation(
-                &ok_id,
-                cohort_scope::FEDERATION,
-                &ok_sc,
-                ok_sp.as_deref(),
-                &ok_och,
-                &attester,
-                chrono::Utc::now(),
-            )
-            .await
-            .expect("({tag}) B8: an ordinary promotion still succeeds"),
+            dir.promote_attestation(&ok_id, cohort_scope::FEDERATION, &ok_reseal)
+                .await
+                .expect("({tag}) B8: an ordinary promotion still succeeds"),
             "({tag}) B8: and it flips the tier"
         );
 
@@ -928,10 +998,11 @@ pub mod test_support {
         let mut self_row = scores_row(&self_id, &bystander, &subject, "trust:demo:v1");
         self_row.tier = attestation_tier::LOCAL.to_owned();
         self_row.cohort_scope = cohort_scope::SELF.to_owned();
-        let (s_och, s_sc, s_sp) = (
-            self_row.original_content_hash.clone(),
-            self_row.scrub_signature_classical.clone(),
-            self_row.scrub_signature_pqc.clone(),
+        crate::federation::tier_ingest::test_support::reseal(&mut self_row);
+        let self_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &bystander,
+            &self_row,
+            cohort_scope::SELF,
         );
         dir.put_attestation(SignedAttestation {
             attestation: self_row,
@@ -947,10 +1018,10 @@ pub mod test_support {
         // capacity arm would have left this exactly as it was.
         let doomed_id = uuid::Uuid::new_v4().to_string();
         let doomed = local_row(&doomed_id, "trust:demo:v1", None);
-        let (d_och, d_sc, d_sp) = (
-            doomed.original_content_hash.clone(),
-            doomed.scrub_signature_classical.clone(),
-            doomed.scrub_signature_pqc.clone(),
+        let doomed_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &attester,
+            &doomed,
+            cohort_scope::FEDERATION,
         );
         dir.put_attestation(SignedAttestation {
             attestation: doomed,
@@ -975,15 +1046,7 @@ pub mod test_support {
         .expect("({tag}) B8: a node may always author its own de-admission");
 
         let err = dir
-            .promote_attestation(
-                &doomed_id,
-                cohort_scope::FEDERATION,
-                &d_sc,
-                d_sp.as_deref(),
-                &d_och,
-                &attester,
-                chrono::Utc::now(),
-            )
+            .promote_attestation(&doomed_id, cohort_scope::FEDERATION, &doomed_reseal)
             .await
             .expect_err(
                 "({tag}) B8: promoting a DE-ADMITTED author's row must be refused — AV-77 \
@@ -1023,15 +1086,7 @@ pub mod test_support {
         // good standing, so the ONLY reason this promotion can be refused is
         // the placement itself.
         let err = dir
-            .promote_attestation(
-                &self_id,
-                cohort_scope::SELF,
-                &s_sc,
-                s_sp.as_deref(),
-                &s_och,
-                &bystander,
-                chrono::Utc::now(),
-            )
+            .promote_attestation(&self_id, cohort_scope::SELF, &self_reseal)
             .await
             .expect_err("({tag}) B8: (federation, self) is refused by the primitive itself");
         assert!(
@@ -1061,6 +1116,7 @@ pub mod test_support {
         let mut legacy = scores_row(&uuid::Uuid::new_v4().to_string(), &bystander, &subject, DIM);
         legacy.tier = attestation_tier::FEDERATION.to_owned();
         legacy.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut legacy);
         let err = crate::federation::admission::check_promotion_admission(dir, &legacy, None)
             .await
             .expect_err(
@@ -1094,6 +1150,360 @@ pub mod test_support {
         crate::federation::admission::check_promotion_admission(dir, &legacy, None)
             .await
             .expect("({tag}) B8: with a live analyze grant the same promotion is admitted");
+    }
+
+    /// **B11 (CIRISPersist#649) — A PROMOTED ROW IS ACCEPTED BY A PEER.**
+    ///
+    /// # The hole this closes
+    ///
+    /// CIRISPersist#643 bound seven typed columns into the signed envelope
+    /// (`envelope.row`) and made `check_row_column_binding` refuse, at every
+    /// `put_attestation`, any row whose columns diverge from that mirror.
+    /// Promotion **re-signs the row and changes `cohort_scope`** — one of the
+    /// seven — and it was signing the PRE-promotion envelope. So every promoted
+    /// row carried a signed mirror asserting its old scope while its column said
+    /// otherwise: **the promoting node's own output was refused by every peer.**
+    /// Promotion is the local→federation path, so this broke the thing promotion
+    /// exists to do.
+    ///
+    /// # Why nothing caught it
+    ///
+    /// Every existing promotion witness asserted that promotion returned `Ok`
+    /// and that the row's own columns flipped. Both stayed true throughout —
+    /// the defect is entirely in what a DIFFERENT directory does with the
+    /// result, and nothing ever asked. `Ok` is not a replication property.
+    ///
+    /// So this witness ends at a **second directory's put door**, and the
+    /// negative arm is the pre-#649 row itself rather than a description of it:
+    /// a test that only ever feeds the peer the CORRECT bundle cannot tell
+    /// whether the re-stamp is load-bearing.
+    ///
+    /// # What it pins, on every backend
+    ///
+    /// (a) the LOCAL door stamps the mirror, so a row is self-describing from
+    /// the moment it is written and not first bound at republication; (a2/a3,
+    /// CIRISPersist#598) it stamps and TRUNCATES `expires_at` too, and clears
+    /// the key when the column is `None` — the two halves of the only binding
+    /// no other test in the tree reaches, because nothing else performs a
+    /// durable local write carrying an expiry; (b) the
+    /// promoted row's SIGNED envelope names its POST-promotion scope; (c) THE
+    /// WITNESS — a different directory's `put_attestation` ADMITS it; (d) the
+    /// pre-#649 shape (promoted columns, envelope signed before the scope
+    /// changed) is REFUSED by that same peer, and the refusal names
+    /// `cohort_scope`; (e) the promoting PRIMITIVE refuses to mint that shape at
+    /// all, so a caller that skips the re-stamp cannot ship one; and (f) that
+    /// refusal leaves the row byte-identical (AV-9).
+    ///
+    /// `origin` promotes; `peer` receives. They must be independent corpora —
+    /// see each backend's arm for how it gets a second directory.
+    pub async fn exercise_promoted_row_crosses_to_a_peer(
+        origin: &dyn FederationDirectory,
+        peer: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, cohort_scope, LocalAttestationInput};
+
+        // Invocation-unique — the postgres arm shares a long-lived database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let producer = format!("{tag}-p649-{run}");
+        ts::register_hybrid_key(origin, &producer).await;
+        // The peer must be able to resolve the author's pubkeys — that is what
+        // a real mesh peer has, and what the tier-3 hybrid verify needs.
+        ts::register_hybrid_key(peer, &producer).await;
+
+        let local_input = |dimension: &str| {
+            let mut envelope = crate::federation::envelope::EnvelopeCore {
+                dimension: Some(dimension.to_owned()),
+                ..Default::default()
+            };
+            envelope
+                .extra
+                .insert("score".into(), serde_json::json!(1.0));
+            envelope
+                .extra
+                .insert("confidence".into(), serde_json::json!(0.9));
+            LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: producer.clone(),
+                attested_key_id: None,
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: Some(1.0),
+                expires_at: None,
+                attestation_envelope: envelope,
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            }
+        };
+
+        // ── (a) THE LOCAL DOOR STAMPS. ────────────────────────────────
+        // Through the REAL local-write door (`attestation_insert_local`), not a
+        // hand-built row: the decision under witness is that persist stamps the
+        // mirror where it MINTS the bytes, and a fixture that stamped for it
+        // would be testing the fixture.
+        let id = origin
+            .attestation_insert_local(local_input("trust:demo:v1"))
+            .await
+            .expect("({tag}) #649: the local write admits");
+        let local = origin
+            .get_attestation(&id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #649: the local row exists");
+        crate::federation::admission::check_row_column_binding(&local).unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #649 (a): a locally-minted row must already carry its own signed \
+                 typed-column mirror — `put_attestation`'s binding gate is TIER-BLIND, so an \
+                 unstamped local row is one this substrate's own put door would refuse: {e}"
+            )
+        });
+
+        // ── (a2) THE LOCAL DOOR STAMPS `expires_at`, AND TRUNCATES IT. ─
+        //
+        // v31.0.0 (CIRISPersist#598). This arm exists because BOTH halves of
+        // the `expires_at` binding were unwitnessed on the durable local path:
+        // dropping the truncation, and never stamping the twin at all, each
+        // left the entire 1878-test corpus byte-identically green. The reason
+        // is narrow and worth stating — `local_row_instant` already truncates
+        // `asserted_at`, so the `asserted_at` half is load-bearing elsewhere and
+        // covered by accident, while `LocalAttestationInput::into_local_row`
+        // copies `input.expires_at` into the COLUMN verbatim and NO test in the
+        // tree performed a durable local write with an `expires_at` at all.
+        //
+        // So the input is deliberately the shape nothing else produces: a
+        // NANOSECOND-precision expiry in the typed field, and an envelope that
+        // does NOT carry it. That makes the two legs separately fatal —
+        //
+        //   - drop the TRUNCATION and the write is REFUSED for sub-microsecond
+        //     precision, because postgres TIMESTAMPTZ cannot store it;
+        //   - drop the TWIN stamp and the write is REFUSED for divergence,
+        //     because the column says `Some` while the envelope says nothing.
+        //
+        // — and it proves the twin is MINTED from the column rather than copied
+        // from a caller who happened to supply both.
+        let ns_expiry = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() + chrono::Duration::days(30),
+        ) + chrono::Duration::nanoseconds(500);
+        let expiring_id = {
+            let mut input = local_input("trust:demo:v1");
+            input.expires_at = Some(ns_expiry);
+            origin
+                .attestation_insert_local(input)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "({tag}) #598 (a2): a durable local write carrying a nanosecond-precision \
+                         `expires_at` must be ADMITTED — the door TRUNCATES to the substrate \
+                         resolution where it mints the signed twin, exactly as it does for \
+                         `asserted_at`. A refusal here means the truncation is gone and every \
+                         producer using `Utc::now()` is now writing rows this substrate rejects: \
+                         {e}"
+                    )
+                })
+        };
+        let expiring = origin
+            .get_attestation(&expiring_id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #598 (a2): the expiring local row exists");
+        let want = crate::federation::admission::truncate_to_substrate_resolution(ns_expiry);
+        assert_eq!(
+            expiring.expires_at,
+            Some(want),
+            "({tag}) #598 (a2): the stored `expires_at` COLUMN must be truncated to the \
+             substrate resolution, not stored verbatim"
+        );
+        assert_eq!(
+            expiring
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::EXPIRES_AT)
+                .and_then(|v| v.as_str()),
+            Some(want.to_rfc3339().as_str()),
+            "({tag}) #598 (a2): and the SIGNED envelope must carry the same instant. The fold \
+             DROPS an expired row, so an `expires_at` no signature covers is an unsigned mute \
+             button on whatever that row retracts"
+        );
+        // The gate itself, over the row as STORED — the same question a peer
+        // asks. Asserting the two fields above proves the stamp; running the
+        // gate proves the stamp is the one the gate accepts.
+        crate::federation::admission::check_instant_binding(
+            &expiring,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #598 (a2): a locally-minted row must already satisfy the instant \
+                 binding — the put door is TIER-BLIND, so a local row that does not is one \
+                 this substrate's own gate would refuse: {e}"
+            )
+        });
+
+        // ── (a3) `None` CLEARS THE KEY — the binding is BOTH directions.
+        // A caller whose envelope still carries a stale `expires_at` while the
+        // typed field is `None`. The door must REMOVE the key, not leave it:
+        // envelope-present / column-`None` is a refusal, and the two fields
+        // have independent sources (`EnvelopeCore` vs `LocalAttestationInput`),
+        // so they can disagree without anybody lying.
+        let cleared_id = {
+            let mut input = local_input("trust:demo:v1");
+            input.attestation_envelope.expires_at =
+                Some("2031-01-01T00:00:00.000000+00:00".to_owned());
+            input.expires_at = None;
+            origin
+                .attestation_insert_local(input)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "({tag}) #598 (a3): a local write whose envelope carries a stale \
+                         `expires_at` and whose column is `None` must be ADMITTED, with the \
+                         stale key CLEARED: {e}"
+                    )
+                })
+        };
+        let cleared = origin
+            .get_attestation(&cleared_id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #598 (a3): the row exists");
+        assert_eq!(cleared.expires_at, None);
+        assert!(
+            cleared
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::EXPIRES_AT)
+                .is_none(),
+            "({tag}) #598 (a3): the signed envelope must not keep an expiry the column does not \
+             have — a row that once carried an expiry and lost it would otherwise be refused \
+             for an expiry it no longer has. Stored envelope: {}",
+            cleared.attestation_envelope
+        );
+
+        // ── (b) THE PROMOTION RE-STAMPS WHAT IT RE-SIGNS. ─────────────
+        let reseal = ts::reseal_for_scope(&producer, &local, cohort_scope::FEDERATION);
+        assert!(
+            origin
+                .promote_attestation(&id, cohort_scope::FEDERATION, &reseal)
+                .await
+                .expect("({tag}) #649: the promotion succeeds"),
+            "({tag}) #649: and it flips the tier"
+        );
+        let promoted = origin
+            .get_attestation(&id)
+            .await
+            .expect("read back")
+            .expect("({tag}) #649: the promoted row exists");
+        assert_eq!(promoted.tier, attestation_tier::FEDERATION);
+        assert_eq!(promoted.cohort_scope, cohort_scope::FEDERATION);
+        assert_eq!(
+            promoted
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::ROW)
+                .and_then(|r| r.get(crate::federation::envelope::row_paths::COHORT_SCOPE))
+                .and_then(|v| v.as_str()),
+            Some(cohort_scope::FEDERATION),
+            "({tag}) #649 (b): the STORED signed envelope must name the POST-promotion scope — \
+             the promoting node signs the row it is about to become, not the one it was"
+        );
+
+        // ── (c) THE WITNESS: A DIFFERENT DIRECTORY ADMITS IT. ─────────
+        peer.put_attestation(SignedAttestation {
+            attestation: promoted.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #649 (c): a PROMOTED row must be admissible at a PEER — promotion is \
+                 the local→federation path, so a promoted row every peer refuses is a promotion \
+                 that did nothing. This is the assertion whose absence hid the defect: \
+                 promotion returned Ok the whole time. Refusal: {e}"
+            )
+        });
+        let at_peer = peer
+            .get_attestation(&id)
+            .await
+            .expect("read back at the peer")
+            .expect("({tag}) #649 (c): the peer stored the row");
+        assert_eq!(at_peer.tier, attestation_tier::FEDERATION);
+        assert_eq!(at_peer.cohort_scope, cohort_scope::FEDERATION);
+
+        // ── (d) THE PRE-#649 SHAPE IS REFUSED BY THAT SAME PEER. ──────
+        // Built exactly as the old code left it: promoted COLUMNS, and an
+        // envelope whose signature covers the mirror as it stood BEFORE the
+        // scope changed. Constructed at the row level rather than by asking the
+        // primitive, so this arm holds even if a future caller finds another
+        // way to mint the shape.
+        let stale_id = origin
+            .attestation_insert_local(local_input("trust:demo:v1"))
+            .await
+            .expect("({tag}) #649: the second local write admits");
+        let stale_local = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        let stale_reseal = ts::reseal_without_restamp(&producer, &stale_local);
+        let mut as_if_pre_649 = stale_local.clone();
+        as_if_pre_649.tier = attestation_tier::FEDERATION.to_owned();
+        as_if_pre_649.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        as_if_pre_649.promoted_at = Some(stale_reseal.scrub_timestamp);
+        as_if_pre_649.attestation_envelope = stale_reseal.attestation_envelope.clone();
+        as_if_pre_649.original_content_hash = stale_reseal.original_content_hash.clone();
+        as_if_pre_649.scrub_signature_classical = stale_reseal.scrub_signature_classical.clone();
+        as_if_pre_649.scrub_signature_pqc = stale_reseal.scrub_signature_pqc.clone();
+        as_if_pre_649.scrub_key_id = stale_reseal.scrub_key_id.clone();
+        as_if_pre_649.scrub_timestamp = stale_reseal.scrub_timestamp;
+        let err = peer
+            .put_attestation(SignedAttestation {
+                attestation: as_if_pre_649,
+            })
+            .await
+            .expect_err(
+                "({tag}) #649 (d): the PRE-#649 promoted shape must be REFUSED by the peer — a \
+                 witness that passes with and WITHOUT the re-stamp is not a witness",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(crate::federation::envelope::row_paths::COHORT_SCOPE),
+            "({tag}) #649 (d): and the refusal names the column that diverged: {msg}"
+        );
+
+        // ── (e) THE PRIMITIVE WILL NOT MINT IT. ───────────────────────
+        // Defence in depth: the peer refusing is the property, but a node that
+        // can still CREATE an unreplicable row will create one and never know.
+        let before = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        let err = origin
+            .promote_attestation(&stale_id, cohort_scope::FEDERATION, &stale_reseal)
+            .await
+            .expect_err(
+                "({tag}) #649 (e): promoting WITHOUT re-stamping the mirror must be refused at \
+                 the primitive, not silently stored",
+            );
+        assert!(
+            format!("{err}").contains(crate::federation::envelope::row_paths::COHORT_SCOPE),
+            "({tag}) #649 (e): the refusal names the diverging column: {err}"
+        );
+
+        // ── (f) AND THE REFUSAL MUTATES NOTHING (AV-9). ───────────────
+        let after = origin
+            .get_attestation(&stale_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        assert_eq!(
+            after.tier,
+            attestation_tier::LOCAL,
+            "({tag}) #649 (f): a refused promotion leaves the row at its original tier"
+        );
+        assert_eq!(
+            after.persist_row_hash, before.persist_row_hash,
+            "({tag}) #649 (f): byte-identical"
+        );
     }
 
     /// **B9 (CIRISPersist#592 / AV-84) — a TARGETED-COHORT placement is a
@@ -1160,6 +1570,7 @@ pub mod test_support {
             let mut row = scores_row(id, &producer, &stranger, "trust:demo:v1");
             row.tier = attestation_tier::LOCAL.to_owned();
             row.cohort_scope = cohort_scope::SELF.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             row
         };
         // …and P's OWN row: it names nobody but P.
@@ -1167,40 +1578,35 @@ pub mod test_support {
             let mut row = scores_row(id, &producer, &producer, "trust:demo:v1");
             row.tier = attestation_tier::LOCAL.to_owned();
             row.cohort_scope = cohort_scope::SELF.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             row
         };
 
-        let store = |row: Attestation| async {
-            let (id, och, sc, sp) = (
-                row.attestation_id.clone(),
-                row.original_content_hash.clone(),
-                row.scrub_signature_classical.clone(),
-                row.scrub_signature_pqc.clone(),
+        // v31.0.0 (CIRISPersist#649) — store the local row and hand back the
+        // RESEAL for the placement it will be promoted to: a promotion changes
+        // `cohort_scope`, which lives inside the signed bytes, so the mirror is
+        // re-stamped and the row re-signed before it is offered to the door.
+        let store = |row: Attestation, scope: &'static str| async {
+            let id = row.attestation_id.clone();
+            let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer, &row, scope,
             );
             dir.put_attestation(SignedAttestation { attestation: row })
                 .await
                 .expect("B9: the local write itself is admissible");
-            (id, och, sc, sp)
+            (id, reseal)
         };
 
         // ── (a) + (b) THE HOLE: a stranger's row into a cohort plane. ──
         for scope in [cohort_scope::COMMUNITY, cohort_scope::FAMILY] {
-            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(third_party(&uuid::Uuid::new_v4().to_string()), scope).await;
             let before = dir
                 .get_attestation(&id)
                 .await
                 .expect("read back")
                 .expect("row");
             let err = dir
-                .promote_attestation(
-                    &id,
-                    scope,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
+                .promote_attestation(&id, scope, &reseal)
                 .await
                 .expect_err(
                     "({tag}) B9: promoting a row that names a THIRD PARTY into a targeted \
@@ -1246,19 +1652,15 @@ pub mod test_support {
         // ban on promoting third-party rows — that would be a different gate,
         // silently widened under this one's name.
         {
-            let (id, och, sc, sp) = store(third_party(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(
+                third_party(&uuid::Uuid::new_v4().to_string()),
+                cohort_scope::FEDERATION,
+            )
+            .await;
             assert!(
-                dir.promote_attestation(
-                    &id,
-                    cohort_scope::FEDERATION,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
-                .await
-                .expect("({tag}) B9: a broad-tier promotion of the same row still succeeds"),
+                dir.promote_attestation(&id, cohort_scope::FEDERATION, &reseal)
+                    .await
+                    .expect("({tag}) B9: a broad-tier promotion of the same row still succeeds"),
                 "({tag}) B9: and it flips the tier"
             );
         }
@@ -1267,22 +1669,18 @@ pub mod test_support {
         // The #519/#510 motion this gate must not amputate: a producer's own
         // row, promoted to the audience its own signed grant named.
         {
-            let (id, och, sc, sp) = store(own(&uuid::Uuid::new_v4().to_string())).await;
+            let (id, reseal) = store(
+                own(&uuid::Uuid::new_v4().to_string()),
+                cohort_scope::COMMUNITY,
+            )
+            .await;
             assert!(
-                dir.promote_attestation(
-                    &id,
-                    cohort_scope::COMMUNITY,
-                    &sc,
-                    sp.as_deref(),
-                    &och,
-                    &producer,
-                    chrono::Utc::now(),
-                )
-                .await
-                .expect(
-                    "({tag}) B9: a producer's OWN row still reaches the community plane — \
+                dir.promote_attestation(&id, cohort_scope::COMMUNITY, &reseal)
+                    .await
+                    .expect(
+                        "({tag}) B9: a producer's OWN row still reaches the community plane — \
                      the #510 audience plane is intact"
-                ),
+                    ),
                 "({tag}) B9: and it flips the tier"
             );
             let after = dir
@@ -1304,8 +1702,14 @@ pub mod test_support {
         // and both leave a refused row byte-identical.
         {
             let stranded_id = uuid::Uuid::new_v4().to_string();
+            let stranded_row = scores_row(&stranded_id, &producer, &stranger, "trust:demo:v1");
+            let stranded_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer,
+                &stranded_row,
+                cohort_scope::COMMUNITY,
+            );
             dir.put_attestation(SignedAttestation {
-                attestation: scores_row(&stranded_id, &producer, &stranger, "trust:demo:v1"),
+                attestation: stranded_row,
             })
             .await
             .expect("({tag}) B9: the federation-tier third-party row admits");
@@ -1315,7 +1719,11 @@ pub mod test_support {
                 .expect("read back")
                 .expect("row");
             let err = dir
-                .set_attestation_cohort_scope(&stranded_id, cohort_scope::COMMUNITY)
+                .set_attestation_cohort_scope(
+                    &stranded_id,
+                    cohort_scope::COMMUNITY,
+                    &stranded_reseal,
+                )
                 .await
                 .expect_err(
                     "({tag}) B9: re-scoping a third-party row into a cohort plane must be \
@@ -1343,14 +1751,774 @@ pub mod test_support {
             // And the producer's own row still re-scopes: the repair motion is
             // narrowed, not disabled.
             let own_id = uuid::Uuid::new_v4().to_string();
+            let own_row = scores_row(&own_id, &producer, &producer, "trust:demo:v1");
+            let own_reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+                &producer,
+                &own_row,
+                cohort_scope::COMMUNITY,
+            );
             dir.put_attestation(SignedAttestation {
-                attestation: scores_row(&own_id, &producer, &producer, "trust:demo:v1"),
+                attestation: own_row,
             })
             .await
             .expect("({tag}) B9: the federation-tier own row admits");
-            dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY)
+            dir.set_attestation_cohort_scope(&own_id, cohort_scope::COMMUNITY, &own_reseal)
                 .await
                 .expect("({tag}) B9: the #530 repair motion still works on a producer's own row");
+        }
+    }
+
+    // ── B10 (CIRISPersist#598) — THE CONSENT INSTANT BINDING ─────────────
+    //
+    // | # | Invariant | Threat it denies |
+    // |---|---|---|
+    // | B10 | A `consent:state:*` row's `asserted_at` / `expires_at` COLUMNS
+    //        equal the instants in its own SIGNED envelope, on the substrate's
+    //        microsecond resolution and not in the future | Replaying a
+    //        subject's still-valid grant with a bumped column to un-revoke
+    //        their consent — no forgery, no broken signature |
+    //
+    // The pre-existing fold coverage was `sqlite.rs` only, single-writer, and
+    // assigned `asserted_at` BY HAND — which is precisely the operation the
+    // defect permits. Three legs, three backends, one body.
+
+    /// The three consent instants a witness needs, all on the substrate
+    /// resolution and all safely in the past: `t1` (grant), `t2` (revoke,
+    /// later), `t3` (the replay's bumped column, later still).
+    fn replay_instants() -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        (
+            now - chrono::Duration::seconds(300),
+            now - chrono::Duration::seconds(120),
+            now - chrono::Duration::seconds(10),
+        )
+    }
+
+    /// A third-party `capacity:*` claim by `attester` about `subject` — the
+    /// gate INSIDE persist that the replay re-opens
+    /// ([`crate::federation::admission::check_capacity_consent_admission`]).
+    fn capacity_claim(attester: &str, subject: &str) -> Attestation {
+        scores_row(
+            &uuid::Uuid::new_v4().to_string(),
+            attester,
+            subject,
+            "capacity:core_identity:v1",
+        )
+    }
+
+    /// **B10-a — THE REPLAY IS REFUSED.**
+    ///
+    /// The reported defect, end to end. `asserted_at` is a row column stored
+    /// verbatim by every backend and covered by no signature, so an attacker
+    /// needs no key material at all:
+    ///
+    /// 1. subject `S` grants `analyze` covering `P` at `t1`, then revokes at
+    ///    `t2 > t1`. The fold reads `Revoked` and `P`'s `capacity:*` claim
+    ///    about `S` is refused.
+    /// 2. the replay resubmits `S`'s **byte-identical, still-validly-signed**
+    ///    `t1` grant — same envelope, same `original_content_hash`, same
+    ///    hybrid signature, same `attesting_key_id` — with a fresh
+    ///    `attestation_id` and `asserted_at = t3 > t2`.
+    ///
+    /// Persist's ingest door carries **no caller identity**, which is why
+    /// "a DIFFERENT key replays it" is indistinguishable at the door from `S`
+    /// re-sending — and therefore why the defence has to be a property of the
+    /// ROW rather than of the sender. The row is refused because its column
+    /// diverges from its own signed envelope.
+    ///
+    /// Asserts the put is refused, the fold is STILL `Revoked`, and
+    /// `check_capacity_consent_admission` still refuses the third-party
+    /// `capacity:*` row — the last one because the fold and the gate are two
+    /// surfaces and a witness on only the fold would not have caught #598
+    /// biting inside persist.
+    pub async fn exercise_consent_replay_refusal(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let subject = format!("{tag}-598-subject");
+        let attester = format!("{tag}-598-attester");
+        for k in [&subject, &attester] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        let (t1, t2, t3) = replay_instants();
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+
+        // (a) the grant at t1 — this row is the attacker's ammunition, so keep
+        // it: the replay is this exact row with two fields changed.
+        let grant = consent_scope_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &subject,
+            &attester,
+            &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
+            &[analyze],
+            t1,
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: grant.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own grant admits: {e}"));
+
+        // (b) the revocation at t2 > t1 — the fold closes.
+        dir.put_attestation(SignedAttestation {
+            attestation: consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
+                &[analyze],
+                t2,
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own revocation admits: {e}"));
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B10-a: after the revoke the fold must read Revoked"
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: capacity_claim(&attester, &subject),
+        })
+        .await
+        .expect_err("({tag}) B10-a: with consent revoked, a capacity:* claim about S is refused");
+
+        // (c) THE REPLAY. Byte-identical signed envelope (so the hybrid verify
+        // still passes and `original_content_hash` still matches) and the
+        // ordering key bumped past the revocation.
+        //
+        // v31.0.0 (CIRISPersist#643) — the `attestation_id` bump this arm used
+        // to carry MOVED to (c2). #643 put the row id inside the signed mirror,
+        // so a fresh-id replay is now refused by the ID binding BEFORE the
+        // instant binding is reached — which would leave this arm passing for
+        // the wrong rule, i.e. no longer a #598 witness at all. Same id here,
+        // only the COLUMN bumped: that is the divergence #598 exists for.
+        let mut replay = grant.clone();
+        replay.asserted_at = t3;
+        assert_eq!(
+            replay.attestation_envelope, grant.attestation_envelope,
+            "({tag}) B10-a: the replay must be BYTE-IDENTICAL in the signed half — a witness \
+             that mutates the envelope is testing the signature, not the binding"
+        );
+        assert_eq!(
+            replay.scrub_signature_classical, grant.scrub_signature_classical,
+            "({tag}) B10-a: …and carries the subject's own still-valid signature"
+        );
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: replay,
+            })
+            .await
+            .expect_err(
+                "({tag}) B10-a: a replayed grant whose asserted_at COLUMN diverges from its \
+                 signed envelope must be REFUSED (CIRISPersist#598)",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("asserted_at") && msg.contains("598"),
+            "({tag}) B10-a: the refusal must name the field and the rule: {msg}"
+        );
+
+        // (c2) v31.0.0 (CIRISPersist#643) — THE SAME REPLAY WEARING A FRESH
+        // ID, which is how the attack was actually written before the row id
+        // was signed: `attestation_id` is the only PK and the §6.1 dedup
+        // returns `false` for a `scores` row, so a new id made the resubmission
+        // a NEW row rather than an idempotent no-op. Now the id rides the
+        // mirror, so the same signed bytes can only ever name one row — the
+        // replay is refused on the ID, one gate earlier than #598, and this arm
+        // pins WHICH rule caught it.
+        // The instant COLUMN is left alone here so the #598 gate passes and the
+        // ID binding is what refuses — one variable, one rule.
+        let mut fresh_id = grant.clone();
+        fresh_id.attestation_id = uuid::Uuid::new_v4().to_string();
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: fresh_id,
+            })
+            .await
+            .expect_err(
+                "({tag}) B10-a/#643: a replay under a FRESH attestation_id must be REFUSED — \
+                 the row id is inside the signed mirror",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("attestation_id") && msg.contains("643"),
+            "({tag}) B10-a/#643: the refusal must name the id binding: {msg}"
+        );
+
+        // (d) …and nothing moved: the fold is still closed and the gate INSIDE
+        // persist still refuses.
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B10-a: the replay must not flip the fold back to Granted"
+        );
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: capacity_claim(&attester, &subject),
+            })
+            .await
+            .expect_err(
+                "({tag}) B10-a: check_capacity_consent_admission must STILL refuse a \
+                 third-party capacity:* row about S",
+            );
+        assert_eq!(
+            err.kind(),
+            "federation_consent_gate_refused",
+            "({tag}) B10-a: and it refuses at the consent gate, not incidentally: {err:?}"
+        );
+    }
+
+    /// **B11 (CIRISPersist#643) — THE TYPED COLUMNS ARE SIGNED MATERIAL.**
+    ///
+    /// The signature covers `attestation_envelope` and nothing else, so before
+    /// this every typed column was a field a relay could rewrite while keeping
+    /// the producer's own signature valid. Two of them decide everything:
+    ///
+    /// - **the VERB.** `references_attestation_id` — the TARGET of a retraction
+    ///   — was already inside the signed envelope; `attestation_type` — whether
+    ///   this is a retraction at all — was not. Flip `withdraws` → `scores` and
+    ///   the retraction becomes an ordinary claim while the thing it retracted
+    ///   stays live.
+    /// - **the AUTHORITY.** `resolve_withdraws_admission_rule` returns rule-2
+    ///   standing when a canonical binding hash of the issuer appears in
+    ///   `subject_key_ids`. APPENDING one in transit hands that key revocation
+    ///   authority over the row.
+    ///
+    /// Every arm below MUTATES A COLUMN AND NOTHING ELSE on a row this
+    /// directory has already accepted in its honest form, so the signature, the
+    /// content hash and every other gate are held constant and the ONLY variable
+    /// is the binding. The control arm (a) is what makes that claim checkable:
+    /// without it, a refusal could be any of the twenty other gates.
+    ///
+    /// Absence is its own arm (h): the operator's standing decision on this
+    /// break window is to refuse an unbound row outright — no grandfathering, no
+    /// regime flag, nothing to find later.
+    pub async fn exercise_row_column_binding(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::envelope::{paths, row_paths};
+
+        // Invocation-unique: the postgres arm shares a long-lived database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let author = format!("{tag}-643a-{run}");
+        let other = format!("{tag}-643b-{run}");
+        for k in [&author, &other] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+
+        // The honest row, sealed the way a producer must now seal one.
+        let honest = |id: &str| {
+            let mut row = scores_row(id, &author, &author, "trust:demo:v1");
+            row.attestation_envelope
+                .as_object_mut()
+                .expect("envelope is an object")
+                .insert("references_attestation_id".into(), "target-1".into());
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
+            row
+        };
+
+        // ── (a) THE CONTROL. The honest row ADMITS. Without this arm every
+        //    refusal below could be some other gate and the witness would be a
+        //    check that cannot fail.
+        dir.put_attestation(SignedAttestation {
+            attestation: honest(&uuid::Uuid::new_v4().to_string()),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B11-a: a correctly sealed row must ADMIT: {e}"));
+
+        // Mutate ONE column on a freshly sealed row and demand a refusal that
+        // NAMES that column and the rule. `expect_err` alone would pass on an
+        // unregistered key or a broken signature.
+        async fn refuses(
+            dir: &dyn FederationDirectory,
+            tag: &str,
+            arm: &str,
+            member: &str,
+            row: Attestation,
+        ) {
+            let id = row.attestation_id.clone();
+            let Err(err) = dir
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+            else {
+                panic!("({tag}) B11-{arm}: a rewritten `{member}` must be REFUSED");
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(member) && msg.contains("643"),
+                "({tag}) B11-{arm}: the refusal must name `{member}` and the rule: {msg}"
+            );
+            assert_eq!(
+                err.kind(),
+                "federation_invalid_argument",
+                "({tag}) B11-{arm}: refusal kind is parity-asserted across backends: {err:?}"
+            );
+            // REFUSED, not refused-after-storing (AV-9).
+            assert!(
+                dir.get_attestation(&id)
+                    .await
+                    .expect("get_attestation")
+                    .is_none(),
+                "({tag}) B11-{arm}: a refused row must leave no trace"
+            );
+        }
+
+        // ── (b) VERB SUBSTITUTION — the headline. Sign a `withdraws`, ship a
+        //    `scores`. The envelope still names the target it retracts.
+        let mut verb = honest(&uuid::Uuid::new_v4().to_string());
+        verb.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut verb);
+        assert_eq!(
+            verb.attestation_envelope[paths::ROW][row_paths::ATTESTATION_TYPE],
+            serde_json::json!(crate::federation::types::attestation_type::WITHDRAWS),
+            "({tag}) B11-b: precondition — the signed mirror says `withdraws`"
+        );
+        verb.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
+        refuses(dir, tag, "b", row_paths::ATTESTATION_TYPE, verb).await;
+
+        // ── (c) AUTHORITY INJECTION — append a canonical binding hash to
+        //    `subject_key_ids`, which is what grants rule-2 revocation standing.
+        let mut authority = honest(&uuid::Uuid::new_v4().to_string());
+        authority
+            .subject_key_ids
+            .push(format!("sha256:{}", "0".repeat(64)));
+        refuses(dir, tag, "c", row_paths::SUBJECT_KEY_IDS, authority).await;
+
+        // ── (d) WHO THE CLAIM IS ABOUT.
+        let mut about = honest(&uuid::Uuid::new_v4().to_string());
+        about.attested_key_id = other.clone();
+        refuses(dir, tag, "d", row_paths::ATTESTED_KEY_ID, about).await;
+
+        // ── (e) WHO MAY SEE IT. Widening the audience of somebody else's row
+        //    is the confused-deputy shape one plane over from #443's route
+        //    hijack.
+        let mut audience = honest(&uuid::Uuid::new_v4().to_string());
+        audience.cohort_scope = crate::federation::types::cohort_scope::COMMUNITY.to_owned();
+        refuses(dir, tag, "e", row_paths::COHORT_SCOPE, audience).await;
+
+        // ── (f) HOW MUCH IT COUNTS. `trust_scoring` / `topology` fold
+        //    `weight.unwrap_or(1.0)`, so an unsigned weight is an unsigned
+        //    volume knob on a signed claim.
+        let mut louder = honest(&uuid::Uuid::new_v4().to_string());
+        louder.weight = Some(99.0);
+        refuses(dir, tag, "f", row_paths::WEIGHT, louder).await;
+
+        // ── (g) THE ROW'S IDENTITY. A fresh id on byte-identical signed
+        //    content is the REPLAY shape (#598 B10-a): with the id bound, the
+        //    same envelope can only ever name one row.
+        let mut replay = honest(&uuid::Uuid::new_v4().to_string());
+        replay.attestation_id = uuid::Uuid::new_v4().to_string();
+        refuses(dir, tag, "g", row_paths::ATTESTATION_ID, replay).await;
+
+        // ── (g2) WHO MADE THE CLAIM. Bound explicitly rather than left to the
+        //    ingest verifier's implicit binding, so the property survives the
+        //    local tier where signature verification is deferred.
+        let mut author_swap = honest(&uuid::Uuid::new_v4().to_string());
+        author_swap.attesting_key_id = other.clone();
+        let id = author_swap.attestation_id.clone();
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: author_swap,
+            })
+            .await
+            .expect_err("({tag}) B11-g2: a rewritten `attesting_key_id` must be REFUSED");
+        assert!(
+            format!("{err}").contains(row_paths::ATTESTING_KEY_ID)
+                && format!("{err}").contains("643"),
+            "({tag}) B11-g2: the refusal must name the authorship binding, not merely the \
+             signature: {err}"
+        );
+        assert!(
+            dir.get_attestation(&id).await.expect("get").is_none(),
+            "({tag}) B11-g2: a refused row must leave no trace"
+        );
+
+        // ── (h) ABSENCE. No `row` object at all — the pre-#643 wire shape.
+        //    REFUSED, not tolerated: there is no legacy regime.
+        let mut unbound = honest(&uuid::Uuid::new_v4().to_string());
+        unbound
+            .attestation_envelope
+            .as_object_mut()
+            .expect("envelope is an object")
+            .remove(paths::ROW);
+        // Re-sign the STRIPPED envelope, so the row is internally consistent in
+        // every way the OLD gates could see: valid hybrid signature, matching
+        // `original_content_hash`. The only thing wrong with it is that nothing
+        // binds its columns — which is exactly the pre-#643 status quo.
+        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &author,
+            &unbound.attestation_envelope,
+        );
+        unbound.original_content_hash = och;
+        unbound.scrub_signature_classical = sc;
+        unbound.scrub_signature_pqc = sp;
+        let id = unbound.attestation_id.clone();
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: unbound,
+            })
+            .await
+            .expect_err(
+                "({tag}) B11-h: a row carrying no signed `row` object must be REFUSED — no \
+                 grandfathering (CIRISPersist#643)",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(paths::ROW) && msg.contains("643"),
+            "({tag}) B11-h: the refusal must name the missing mirror and the rule: {msg}"
+        );
+        // v31.0.0 (CIRISPersist#658) — the message is a SPECIFICATION, not
+        // prose. This is the text an external producer builds its mirror from
+        // during the v31.0.0 re-mint, `RowMirror` is `deny_unknown_fields`,
+        // and only `subject_key_ids` / `weight` default — so a message that
+        // omits a required member refuses the producer a second time, by the
+        // very text that told it what to build. It named five while the gate
+        // enforced seven. Asserted EXHAUSTIVELY off `row_paths::ALL`, so a
+        // future eighth member cannot be added to the mirror and left out of
+        // the message.
+        for member in crate::federation::envelope::row_paths::ALL {
+            assert!(
+                msg.contains(member),
+                "({tag}) B11-h: the refusal must name every member a producer has to stamp — \
+                 `{member}` is missing from: {msg}"
+            );
+        }
+        assert!(
+            dir.get_attestation(&id).await.expect("get").is_none(),
+            "({tag}) B11-h: a refused row must leave no trace"
+        );
+
+        // ── (i) MALFORMED. A mirror missing ONE member is not a partial
+        //    binding, it is no binding — refused, and refused with the member
+        //    set named so a producer can fix it.
+        let mut partial = honest(&uuid::Uuid::new_v4().to_string());
+        partial.attestation_envelope[paths::ROW]
+            .as_object_mut()
+            .expect("mirror is an object")
+            .remove(row_paths::COHORT_SCOPE);
+        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &author,
+            &partial.attestation_envelope,
+        );
+        partial.original_content_hash = och;
+        partial.scrub_signature_classical = sc;
+        partial.scrub_signature_pqc = sp;
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: partial,
+            })
+            .await
+            .expect_err("({tag}) B11-i: a mirror missing a member must be REFUSED");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("643"),
+            "({tag}) B11-i: the refusal must name the rule: {msg}"
+        );
+        // v31.0.0 (CIRISPersist#658) — same specification duty as (h): this is
+        // the message the producer sees when its mirror is one member short,
+        // so it must list the members in full.
+        for member in crate::federation::envelope::row_paths::ALL {
+            assert!(
+                msg.contains(member),
+                "({tag}) B11-i: the malformed-mirror refusal must name every member — \
+                 `{member}` is missing from: {msg}"
+            );
+        }
+
+        // ── (j) NON-VACUITY OF THE CONTROL, at the end. The gate is a rule and
+        //    not a lockdown: after seven refusals a fresh honest row still
+        //    admits, so nothing above wedged the directory into refusing
+        //    everything (which would make every arm above pass for free).
+        dir.put_attestation(SignedAttestation {
+            attestation: honest(&uuid::Uuid::new_v4().to_string()),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B11-j: the gate is a door, not a wall: {e}"));
+    }
+
+    /// **B10-b — TWO DIRECTORIES FED THE SAME ENVELOPES CANNOT DISAGREE.**
+    ///
+    /// The divergent-order leg. Replica A is fed the two signed envelopes with
+    /// their true instants. Replica B is fed **the same two signed envelopes**
+    /// with the two `asserted_at` COLUMNS SWAPPED — a relaying node (or a
+    /// skewed clock) reordering a subject's consent history without touching a
+    /// signature. Before #598 that made the two replicas fold to opposite
+    /// verdicts about the same signed facts, which is the property a mesh
+    /// cannot have on the consent plane.
+    ///
+    /// Both replicas live in ONE directory under disjoint key pairs: the fold
+    /// is keyed on `(target, subject)`, so two disjoint pairs are two
+    /// independent replicas of the same history — and using one directory is
+    /// what lets the same body run on all three backends.
+    ///
+    /// The property proved is that **the signed envelopes decide the verdict
+    /// and the columns cannot change it**: replica B's swapped feed is
+    /// REFUSED, B stays non-Granted while it holds only the swapped rows, and
+    /// when B is fed the same envelopes with the instants those envelopes
+    /// themselves state, it converges on A's verdict exactly. Ordering is no
+    /// longer an input a relay gets to choose.
+    pub async fn exercise_consent_divergent_order(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+        let (t1, t2, _t3) = replay_instants();
+        let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
+        let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
+
+        let mut verdicts = Vec::new();
+        for (replica, swap) in [("a", false), ("b", true)] {
+            let subject = format!("{tag}-598-div{replica}-subject");
+            let attester = format!("{tag}-598-div{replica}-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            // The SIGNED envelopes are identical on both replicas (same
+            // stance, same scope, same signed instant). Only the row COLUMNS
+            // differ — swapped on replica B.
+            let grant = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                t1,
+            );
+            let revoke = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                t2,
+            );
+            if swap {
+                let mut swapped_grant = grant.clone();
+                let mut swapped_revoke = revoke.clone();
+                std::mem::swap(
+                    &mut swapped_grant.asserted_at,
+                    &mut swapped_revoke.asserted_at,
+                );
+                for (row, what) in [(swapped_grant, "grant"), (swapped_revoke, "revoke")] {
+                    dir.put_attestation(SignedAttestation { attestation: row })
+                        .await
+                        .expect_err(&format!(
+                            "({tag}) B10-b: replica b's {what} carries a column its own signed \
+                             envelope does not agree with and must be REFUSED \
+                             (CIRISPersist#598)"
+                        ));
+                }
+                // While B holds ONLY the swapped feed it must not have been
+                // talked into a grant. Pre-#598 this read Granted while A read
+                // Revoked — the mesh split this leg exists to deny.
+                assert_ne!(
+                    dir.resolve_scoped_consent(
+                        &attester,
+                        &subject,
+                        analyze,
+                        None,
+                        chrono::Utc::now()
+                    )
+                    .await
+                    .expect("fold reads"),
+                    ConsentState::Granted,
+                    "({tag}) B10-b: a swapped ordering column must never buy a GRANT"
+                );
+            }
+            // Both replicas are now fed the envelopes with the instants those
+            // envelopes THEMSELVES state — for A that is the only feed it ever
+            // saw; for B it is the honest relay of the same signed bytes.
+            for (row, what) in [(grant, "grant"), (revoke, "revoke")] {
+                dir.put_attestation(SignedAttestation { attestation: row })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("({tag}) B10-b/{replica}: the bound {what} admits: {e}")
+                    });
+            }
+            verdicts.push(
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("fold reads"),
+            );
+        }
+        assert_eq!(
+            verdicts[0], verdicts[1],
+            "({tag}) B10-b: two directories fed the SAME signed envelopes must fold to the same \
+             verdict — a swapped ordering column must not buy a different answer"
+        );
+        assert_eq!(
+            verdicts[0],
+            ConsentState::Revoked,
+            "({tag}) B10-b: …and the verdict they converge on is the subject's actual latest \
+             stance, not a shared blank"
+        );
+    }
+
+    /// **B10-c — SUB-MICROSECOND SPACING IS REFUSED, AND A TRUE TIE RESOLVES
+    /// RESTRICTIVE.**
+    ///
+    /// Two properties the three backends previously disagreed about.
+    ///
+    /// **(1) resolution.** sqlite stores RFC-3339 TEXT and memory holds a
+    /// `chrono` `DateTime` — both keep the full nanosecond — while postgres
+    /// `TIMESTAMPTZ` truncates to microseconds. So a grant and a revoke 500ns
+    /// apart were a strict order on two backends and a TIE on the third: the
+    /// same op sequence, two verdicts, decided by which database you asked.
+    /// The substrate now REFUSES a bound instant finer than a microsecond
+    /// (see [`crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS`]
+    /// for why refuse and not truncate), identically on all three.
+    ///
+    /// **(2) the tie.** With the sub-microsecond pair gone, a genuine tie is
+    /// still reachable — two claims in the same microsecond — and the fold had
+    /// **no tie-break at all**, so `max_by_key` returned whichever row the
+    /// backend's iteration order presented last. It now resolves
+    /// RESTRICTION-WINS, deterministically. Driven in BOTH insertion orders on
+    /// purpose: a single order can pass by luck on the backend whose row order
+    /// happens to favour the revoke, which is exactly how the gap survived.
+    pub async fn exercise_consent_tie_restriction_wins(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+        let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
+        let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
+        let base =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                - chrono::Duration::seconds(60);
+
+        // (1) 500ns apart — refused on EVERY backend, so no backend can be the
+        // one that reads this pair as a strict order.
+        {
+            let subject = format!("{tag}-598-ns-subject");
+            let attester = format!("{tag}-598-ns-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            // `consent_scope_row` truncates, so build the sub-microsecond row
+            // by hand: bump BOTH the column and the signed envelope so the
+            // divergence arm cannot be what refuses it — this arm must fail on
+            // RESOLUTION or it is testing the wrong rule.
+            let mut row = consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                base,
+            );
+            let skewed = base + chrono::Duration::nanoseconds(500);
+            row.asserted_at = skewed;
+            let (och, sc, sp) = {
+                let mut env = row.attestation_envelope.clone();
+                env[crate::federation::envelope::paths::ASSERTED_AT] =
+                    serde_json::Value::String(skewed.to_rfc3339());
+                let signed =
+                    crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
+                row.attestation_envelope = env;
+                // Deliberately NOT `reseal`: the seal TRUNCATES to the
+                // substrate resolution, which is the very skew this arm exists
+                // to have refused. Re-sealing here truncated the 500ns away and
+                // re-signed, and then the hand-computed signature below was
+                // written back over the re-sealed envelope — so the row was
+                // refused for a FAILED ED25519 VERIFY while the assertion
+                // demanded the resolution rule. The comment above already
+                // forbade this ("build the sub-microsecond row by hand"); the
+                // call contradicted it.
+                signed
+            };
+            row.original_content_hash = och;
+            row.scrub_signature_classical = sc;
+            row.scrub_signature_pqc = sp;
+            let err = dir
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err(
+                    "({tag}) B10-c: a sub-microsecond consent instant must be REFUSED — \
+                     postgres TIMESTAMPTZ cannot store it, so admitting it makes the fold's \
+                     answer depend on the backend (CIRISPersist#598)",
+                );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("sub-microsecond"),
+                "({tag}) B10-c: the refusal must name the RESOLUTION rule, not the binding: \
+                 {msg}"
+            );
+        }
+
+        // (2) a TRUE tie, fed in both orders. Restriction wins, both times,
+        // on every backend.
+        for (order, first_is_grant) in [("grant-first", true), ("revoke-first", false)] {
+            let subject = format!("{tag}-598-tie-{order}-subject");
+            let attester = format!("{tag}-598-tie-{order}-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            // The ids are ADVERSARIAL, not incidental. `fold_ordering_key` is
+            // `(asserted_at, restriction_rank, attestation_id)` resolved by
+            // `max_by_key`, so at a true instant-tie the id is the THIRD
+            // component — and with two random uuids it decides the winner
+            // roughly half the time. This arm then passed or failed by luck:
+            // deleting the restriction-rank tie-break entirely left it GREEN on
+            // whichever backend drew the kinder uuid, which is how it was
+            // caught (green on sqlite, red on memory, same binary).
+            //
+            // So: give the GRANT the lexically LARGER id. If the rank component
+            // is ever removed or reordered, the grant wins on id and the
+            // assertion below fails on every backend, deterministically. The
+            // ids stay real uuids because `attestation_id` is a UUID column on
+            // postgres — a symbolic id fails in the driver, before any fold.
+            let (lo, hi) = {
+                let (a, b) = (
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                );
+                if a < b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            };
+            let mk = |id: &str, dimension: &str| {
+                consent_scope_row(id, &subject, &attester, dimension, &[analyze], base)
+            };
+            let pair = if first_is_grant {
+                [mk(&hi, &granted), mk(&lo, &revoked)]
+            } else {
+                [mk(&lo, &revoked), mk(&hi, &granted)]
+            };
+            for row in pair {
+                dir.put_attestation(SignedAttestation { attestation: row })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("({tag}) B10-c/{order}: both tied stances admit: {e}")
+                    });
+            }
+            assert_eq!(
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("fold reads"),
+                ConsentState::Revoked,
+                "({tag}) B10-c/{order}: a grant and a revoke at the SAME instant must resolve \
+                 to the RESTRICTIVE stance, in either insertion order and on every backend \
+                 (CIRISPersist#598)"
+            );
+            // The gate inside persist must agree with the fold — the tie-break
+            // is only worth anything if it reaches the consumer.
+            dir.put_attestation(SignedAttestation {
+                attestation: capacity_claim(&attester, &subject),
+            })
+            .await
+            .expect_err(&format!(
+                "({tag}) B10-c/{order}: and the tied verdict CLOSES the capacity gate"
+            ));
         }
     }
 }

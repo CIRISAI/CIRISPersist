@@ -2498,7 +2498,7 @@ impl FederationDirectory for OpsDirectory {
         _key_id: &str,
         _consent_role: Option<&str>,
     ) -> Result<(), Error> {
-        // v12.7.0 (CIRISPersist#365) — no DirectoryOp in the capsule
+        // v13.0.0 (CIRISPersist#365) — no DirectoryOp in the capsule
         // protocol carries consent_role mutation; not routable here.
         Err(Error::Unsupported {
             method: "set_consent_role",
@@ -2641,6 +2641,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         family_key_id: &str,
         member: types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "add_family_member",
@@ -3202,6 +3203,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         community_key_id: &str,
         member: types::CommunityMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "add_community_member",
@@ -3263,11 +3265,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<bool, Error> {
         Err(Error::Unsupported {
             method: "promote_attestation",

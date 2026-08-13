@@ -1138,7 +1138,7 @@ pub(crate) mod test_support {
         asserted_at: DateTime<Utc>,
     ) -> Attestation {
         let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: author.to_owned(),
             attested_key_id: subject.to_owned(),
@@ -1160,7 +1160,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// A `delegates_to` edge `granter → grantee` bearing `scopes`.
@@ -1176,7 +1179,7 @@ pub(crate) mod test_support {
             "scope": scopes,
         });
         let (och, ed_sig, pqc_sig) = sign_envelope(granter, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: granter.to_owned(),
             attested_key_id: grantee.to_owned(),
@@ -1198,7 +1201,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(granter, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// Is `id` present in the relay page `list_attestation_log` serves?

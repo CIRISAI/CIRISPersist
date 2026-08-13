@@ -44,12 +44,17 @@ pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
 pub mod bootstrap_admission;
+pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+// (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
+// write door is open by constitutional decision (#571 / CC 3.3.12); this is
+// where the discrimination lives.
+pub mod content_class;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 // (CIRISPersist#519 / #520) — the family-rule INVENTORY: every namespace family
@@ -72,6 +77,9 @@ pub mod identity_aggregate;
 // consumer-owned.
 pub mod invariant;
 pub mod location;
+/// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
+/// folded CEG state from the owner root, then purge what is provably dead.
+pub mod migration;
 pub mod namespace;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /
@@ -105,6 +113,9 @@ pub mod read;
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
 pub mod envelope;
+/// v31.0.0 (CIRISPersist#645) — the byte-exactness witness for the V122
+/// signature-covered envelope columns.
+pub mod envelope_bytes;
 // v21.6.0 (CIRISPersist#519 item 2a-iii) — the signed `fresh_as_of`
 // freshness floor: SignedTouchClaim's storage + monotonic-max merge
 // (persist's half; the producer surface is edge/agent's, documented for
@@ -261,7 +272,7 @@ pub use admission::{
     check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
     check_cohort_scope, check_consensus_protocol_form, check_device_class,
     check_encryption_pubkeys, check_infra_attest_role_admission,
-    check_infra_attest_role_admission_over_roster, check_observed_region,
+    check_infra_attest_role_admission_over_roster, check_observed_region, check_row_column_binding,
     has_accord_conferred_role, has_accord_conferred_role_over_roster, is_canonical,
     is_canonical_effective, is_infra_attest, is_infra_attest_effective, op_withdraw_role,
     supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
@@ -379,10 +390,10 @@ pub use topology::{
 };
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
-    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
-    EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
-    IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow,
-    PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
+    Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
+    EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
+    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
     SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
     SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, TrustClass, TrustFilter,
@@ -733,7 +744,7 @@ pub trait FederationDirectory: Send + Sync {
         identity_type: &str,
     ) -> Result<Vec<KeyRecord>, Error>;
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
     /// or **overwrite** the Counter-RII [`consent_role`](types::consent_role)
     /// of `key_id`.
     ///
@@ -1014,24 +1025,147 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v31.0.0 (CIRISPersist#650) — **the ONLY unfiltered attestation
+    /// enumerator**: every row, every tier, every `cohort_scope`, keyset-paged
+    /// `attestation_id > after ORDER BY attestation_id ASC LIMIT limit`.
+    ///
+    /// Every other list method on this trait is tier-partitioned
+    /// (`list_attestations_for` / `_by` / `_since` / `list_attestation_log` all
+    /// pin `tier = 'federation'`; [`Self::list_local_tier_attestations`] pins
+    /// `'local'`), which is right for every CONSUMER read — a local-tier row
+    /// must never reach the serve wire. The v31 migration is not a consumer
+    /// read: it must FOLD, and a fold over a partition is a fold that can
+    /// resurrect the half it could not see. That is why this exists, and why it
+    /// is named for the one caller that may use it rather than being offered as
+    /// a general `list_attestations`.
+    ///
+    /// The keyset shape is [`Self::list_local_tier_attestations`]'s verbatim —
+    /// a stable resumption point rather than a chronological one, so a run
+    /// interrupted mid-corpus resumes without skipping or repeating. Default
+    /// `Unsupported`; sqlite/postgres/memory override.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_attestation_id, limit);
+        Err(Error::Unsupported {
+            method: "list_attestations_for_migration",
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **re-seal an EXISTING row in place**, under
+    /// its existing `attestation_id`.
+    ///
+    /// `resealed` is the row **as it will be stored**: the same row, with the
+    /// #598 signed instants and the #643 typed-column mirror stamped and the
+    /// seal recomputed over exactly those bytes. Implementations:
+    ///
+    /// 1. load the stored row; `Ok(false)` if it is gone (a concurrent purge is
+    ///    not an error);
+    /// 2. **REFUSE any divergence in an IMMUTABLE field** —
+    ///    `attesting_key_id`, `attested_key_id`, `attestation_type`,
+    ///    `subject_key_ids`, `cohort_scope`, `weight`, `tier`. A "re-seal" that
+    ///    could move a row between tiers or scopes would be a placement door
+    ///    beside [`Self::promote_attestation`] and
+    ///    [`Self::set_attestation_cohort_scope`], with none of their gates;
+    /// 3. run [`admission::check_instant_binding`] and
+    ///    [`admission::check_row_column_binding`] over `resealed`, so a caller
+    ///    that hands over a still-legacy row is REFUSED rather than silently
+    ///    writing one no peer will take (the CIRISPersist#649 rule);
+    /// 4. write `attestation_envelope`, `original_content_hash`,
+    ///    `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id`,
+    ///    `scrub_timestamp`, `additional_scrubs`, `asserted_at`, `expires_at`
+    ///    and the recomputed `persist_row_hash` in ONE statement.
+    ///
+    /// `asserted_at` / `expires_at` are mutable here precisely because #598
+    /// binds them: a legacy row minted with nanosecond precision cannot satisfy
+    /// the gate until the COLUMN is truncated to the substrate resolution
+    /// alongside its signed twin, and doing one without the other is the
+    /// divergence the gate exists to catch.
+    ///
+    /// **This is not a general re-sign door.** It exists for the migration and
+    /// refuses everything else by refusing the legacy shape it is handed. Any
+    /// other caller wanting to re-sign a row is changing its placement and
+    /// belongs at one of the two doors that gate that. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    ///
+    /// [`admission::check_instant_binding`]: admission::check_instant_binding
+    /// [`admission::check_row_column_binding`]: admission::check_row_column_binding
+    async fn reseal_attestation_v31(&self, resealed: &Attestation) -> Result<bool, Error> {
+        let _ = resealed;
+        Err(Error::Unsupported {
+            method: "reseal_attestation_v31",
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — **hard-delete ONE attestation row** by id.
+    /// `Ok(true)` if a row was removed, `Ok(false)` if it was already gone (so
+    /// a re-run of an interrupted migration is a no-op, not an error).
+    ///
+    /// The row's `attestation_subjects` projection goes with it (`ON DELETE
+    /// CASCADE` on the SQL backends; explicitly on memory). The V111 signed
+    /// wire index is NOT touched per row — the migration calls
+    /// [`Self::rebuild_signed_wire_index`] once at the end, which is the
+    /// sanctioned repair for exactly this and already exists on all three
+    /// backends.
+    ///
+    /// # This deletes user data, so the door carries the invariant
+    ///
+    /// The disposition is decided by
+    /// [`migration::classify`](migration::classify), which purges only on a
+    /// proof — a live tombstone from the row's own attester — or on the
+    /// operator's explicit recoverability licence. But *"the caller is careful"*
+    /// is the shape CIRISPersist#652 was: a door whose safety lives entirely in
+    /// its callers. So implementations re-ask the one question whose wrong
+    /// answer is unrecoverable, via
+    /// [`migration::check_purge_admission`](migration::check_purge_admission):
+    /// **an exclusion-bearing row is refused here**, tombstones included,
+    /// whatever the caller believes. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_attestation_v31",
+        })
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
-    /// an EXISTING attestation row: the promote-on-consent write-back
-    /// ([`crate::Engine::promote_consented_backlog`] flips a
-    /// freshly-promoted row's `cohort_scope` to
-    /// [`types::cohort_scope::FEDERATION`] right after
-    /// [`crate::Engine::attestation_promote`] has hybrid-signed it).
-    /// `cohort_scope` MUST be one of the closed-set values
+    /// an EXISTING attestation row: the second placement door, driven by
+    /// [`crate::Engine::repair_stranded_scope_backlog`] (CIRISPersist#530),
+    /// which re-scopes an ALREADY-federation row to a covering grant's
+    /// audience. `cohort_scope` MUST be one of the closed-set values
     /// ([`types::cohort_scope::is_valid`]) — implementations validate
     /// before writing and reject an out-of-set value with
     /// `InvalidArgument`. Also `InvalidArgument` if `attestation_id`
     /// does not exist. Default `Unsupported`; sqlite/postgres/memory
     /// override.
+    ///
+    /// # v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN
+    ///
+    /// This method's own doc used to end *"`cohort_scope` is a row attribute
+    /// outside the signed envelope, so the scrub signature stays valid"*.
+    /// CIRISPersist#643 made that sentence false: `cohort_scope` is one of the
+    /// seven columns bound into `envelope.row`, and
+    /// [`admission::check_row_column_binding`] refuses any row whose column
+    /// diverges from that mirror. Rewriting the column in place therefore
+    /// produced a row asserting its OLD scope — refused by every peer's
+    /// `put_attestation`, and by this node's own.
+    ///
+    /// So the caller re-stamps the mirror
+    /// ([`envelope::RowMirror::restamp_for_scope`]), re-signs the result, and
+    /// hands both over as `reseal`; the envelope, its digest, its signature
+    /// and the new placement land in ONE statement. Implementations re-run
+    /// [`admission::check_row_column_binding`] over the row as it will be
+    /// stored, so a caller that skips the re-stamp is REFUSED rather than
+    /// silently minting an unreplicable row.
     async fn set_attestation_cohort_scope(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
+        reseal: &AttestationReseal,
     ) -> Result<(), Error> {
-        let _ = (attestation_id, cohort_scope);
+        let _ = (attestation_id, cohort_scope, reseal);
         Err(Error::Unsupported {
             method: "set_attestation_cohort_scope",
         })
@@ -1570,16 +1704,40 @@ pub trait FederationDirectory: Send + Sync {
     /// The family must exist ([`Error::InvalidArgument`] otherwise).
     /// Recomputes `persist_row_hash` over the grown roster.
     ///
-    /// This is the forward-path half of a membership-change re-key: the
-    /// at-rest cascade re-key
+    /// # v31.0.0 (CIRISPersist#654) — the addition carries an authority signature
+    ///
+    /// `spec` is the caller's hybrid signature over the **grown** record's
+    /// [`Family::signing_envelope`](types::Family::signing_envelope), verified
+    /// through the same [`verify_family_admission`] gate `put_family` and
+    /// `supersede_family` run (see [`cohort::AdmitSpec`] and
+    /// [`cohort::authorize_family_growth`]). Before this, roster growth was an
+    /// UNAUTHENTICATED write door into `federation_families.members` — inside
+    /// the signing preimage — that also left the row's stored
+    /// `authority_key_id` / `scrub_signature_*` describing the roster that used
+    /// to be there. Implementations MUST write the new signature columns in the
+    /// SAME statement as `members` + `persist_row_hash` (#651's rule: the
+    /// record and the signature that authorizes it travel together, because the
+    /// way they go stale is by being able to move apart) and MUST re-index
+    /// `signed_wire_index` afterwards (#547/#640).
+    ///
+    /// The idempotent no-op returns `Ok(false)` BEFORE the gate: no row is
+    /// written, so there is nothing to authorize, and demanding a signature
+    /// over a record that is not going to be stored would break the idempotency
+    /// the membership-change drivers depend on.
+    ///
+    /// This is the forward-path half of a membership-change: the at-rest
+    /// cascade re-key
     /// ([`rekey_family_member_add`](crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add))
-    /// grants the newcomer *past* family blobs; `add_family_member` puts
-    /// them on the roster so `resolve_recipients` includes them in
-    /// *future* writes too. The re-key driver calls this first.
+    /// grants an already-rostered member *past* family blobs; this call puts
+    /// them on the roster so `resolve_recipients` includes them in *future*
+    /// writes too. Since #654 the caller runs this FIRST and the re-key driver
+    /// second — the driver holds no key material, so it can neither produce
+    /// this signature nor relay one over a record it mints fields of.
     async fn add_family_member(
         &self,
         family_key_id: &str,
         member: types::FamilyMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error>;
 
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
@@ -2277,10 +2435,15 @@ pub trait FederationDirectory: Send + Sync {
     /// no-op returning `Ok(false)`; a genuine add returns `Ok(true)`. The
     /// community must exist ([`Error::InvalidArgument`] otherwise).
     /// Recomputes `persist_row_hash` over the grown roster.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — carries the same authority signature its
+    /// family twin does, verified through [`verify_community_admission`]; see
+    /// [`Self::add_family_member`] for why an addition needs one.
     async fn add_community_member(
         &self,
         community_key_id: &str,
         member: types::CommunityMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error>;
 
     // ── #249 Cut G1 ── the uniform rostered-group surface ──────────────
@@ -2510,11 +2673,18 @@ pub trait FederationDirectory: Send + Sync {
     /// [`RosterMember`] cannot, so `self` members are added via
     /// [`Self::put_identity_occurrence`]. Returns [`Error::InvalidArgument`]
     /// for `Cohort::SelfId`.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `spec` is the authority signature over the
+    /// grown roster, the exact mirror of the [`cohort::RevokeSpec`]
+    /// [`Self::revoke_member`] has taken since v21.0.0. Adding a seat and
+    /// removing one are the same act in opposite directions; only one of them
+    /// used to need proof.
     async fn add_member(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
         member: cohort::RosterMember,
+        spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         let member_key_id = member.key_id.clone();
         let (added, change_kind) = match cohort {
@@ -2526,6 +2696,7 @@ pub trait FederationDirectory: Send + Sync {
                         joined_at: member.joined_at,
                         role: member.role,
                     },
+                    spec,
                 )
                 .await?,
                 hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
@@ -2539,6 +2710,7 @@ pub trait FederationDirectory: Send + Sync {
                         joined_at: member.joined_at,
                         role: member.role,
                     },
+                    spec,
                 )
                 .await?,
                 hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
@@ -2707,13 +2879,21 @@ pub trait FederationDirectory: Send + Sync {
     /// `out` as active). A backend-level single-transaction `swap` (one
     /// `persist_row_hash` recompute, no torn read) is a Cut G2 hardening.
     /// `self` is rejected ([`Error::InvalidArgument`]) — see [`Self::add_member`].
+    ///
+    /// v31.0.0 (CIRISPersist#654) — a swap is two authorized acts, so it needs
+    /// TWO authorizations: `revoke_spec` for the removal (as before) and
+    /// `admit_spec` for the addition. The addition's signature is over the
+    /// roster as it will be AFTER the removal, because that is the state the
+    /// add is applied to — the removal is append-only, so `members[]` still
+    /// carries the outgoing key and the grown envelope contains both.
     async fn swap_member(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
         out_key_id: &str,
         in_member: cohort::RosterMember,
-        spec: cohort::RevokeSpec,
+        revoke_spec: cohort::RevokeSpec,
+        admit_spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
         if cohort == cohort::Cohort::SelfId {
             return Err(Error::InvalidArgument(
@@ -2722,9 +2902,10 @@ pub trait FederationDirectory: Send + Sync {
                     .to_string(),
             ));
         }
-        self.revoke_member(cohort, group_key_id, out_key_id, spec)
+        self.revoke_member(cohort, group_key_id, out_key_id, revoke_spec)
             .await?;
-        self.add_member(cohort, group_key_id, in_member).await
+        self.add_member(cohort, group_key_id, in_member, admit_spec)
+            .await
     }
 
     // ── #249 Cut G2 ── supersede + versioning (CIRISServer #249 §3/§8) ──
@@ -2753,6 +2934,14 @@ pub trait FederationDirectory: Send + Sync {
     /// version. [`Error::InvalidArgument`] if the group does not exist or the
     /// cohort is `self`. Prefer the typed [`Self::supersede_family`] /
     /// [`Self::supersede_community`] wrappers.
+    /// v31.0.0 (CIRISPersist#651) — `new_snapshot` is the **SIGNED WRAPPER**
+    /// ([`types::SignedFamily`] / [`types::SignedCommunity`]), not the bare
+    /// record. Implementations decode the wrapper and MUST write
+    /// `authority_key_id` + `scrub_signature_{classical,pqc}` alongside the
+    /// record columns they update — the signature covers `members`,
+    /// `family_name`, `founded_at` and `consensus_protocol`, so a supersede
+    /// that rewrites those and leaves the old signature in place stores a row
+    /// that cannot verify against its own contents.
     async fn supersede_group_row(
         &self,
         cohort: cohort::Cohort,
@@ -2782,7 +2971,24 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.family.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.family)
+        // v31.0.0 (CIRISPersist#651) — THE AUTHORSHIP GATE. `put_family` has
+        // run this since v21.0.0 (#502 E4); supersede ran NOTHING, so
+        // `federation_families` had a SECOND write door that admitted a
+        // re-baselined roster, a new `consensus_protocol` and a new
+        // `family_name` on FK-existence alone. Superseding is not a lesser act
+        // than creating — it is the act that REPLACES what creation
+        // established — so it is gated identically, and before any write.
+        crate::federation::verify_family_admission(self, &new).await?;
+        // The snapshot is the SIGNED WRAPPER, not the bare record. Serializing
+        // `.family` alone is what dropped the caller's freshly-minted
+        // signature on the floor: `signing_envelope()` covers `members`,
+        // `family_name`, `founded_at` and `consensus_protocol`, so a supersede
+        // that carries the record without its signature leaves the stored
+        // `authority_key_id` / `scrub_signature_*` describing a roster that is
+        // no longer there. Same discipline as #649's `AttestationReseal`: the
+        // record and the signature that authorizes it travel together, because
+        // the way they go stale is by being able to move apart.
+        let snapshot = serde_json::to_value(&new)
             .map_err(|e| Error::Backend(format!("supersede_family snapshot serialize: {e}")))?;
         self.supersede_group_row(cohort::Cohort::Family, snapshot, authorization)
             .await
@@ -2796,7 +3002,10 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.community)
+        // v31.0.0 (CIRISPersist#651) — the authorship gate + the signed
+        // wrapper as the snapshot. See [`Self::supersede_family`] for why both.
+        crate::federation::verify_community_admission(self, &new).await?;
+        let snapshot = serde_json::to_value(&new)
             .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
         self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
             .await
@@ -2813,7 +3022,15 @@ pub trait FederationDirectory: Send + Sync {
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
         check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        let snapshot = serde_json::to_value(&new.community).map_err(|e| {
+        // v31.0.0 (CIRISPersist#651) — gated and signature-carrying for the
+        // same reason as its two siblings. #651 named the family and community
+        // arms; this THIRD arm shares `SignedCommunity` and the
+        // `federation_communities` storage with the community arm, so fixing
+        // the two named doors and leaving this one open would have left the
+        // identical hole reachable under a different discriminator — which is
+        // exactly the by-name evadability #598 refused for the instant gate.
+        crate::federation::verify_community_admission(self, &new).await?;
+        let snapshot = serde_json::to_value(&new).map_err(|e| {
             Error::Backend(format!("supersede_affiliations snapshot serialize: {e}"))
         })?;
         self.supersede_group_row(cohort::Cohort::Affiliations, snapshot, authorization)
@@ -3272,13 +3489,33 @@ pub trait FederationDirectory: Send + Sync {
     //   - Set pqc_completed_at = NOW()
     //   - Recompute persist_row_hash since row content changed
     //
-    // Persist does NOT verify the cryptographic validity of the PQC
-    // signature on attach — that's the writer's responsibility.
-    // Persist verifies on read at the consumer's policy layer.
+    // v31.0.0 (CIRISPersist#657) — CORRECTED IN PLACE. This comment used to
+    // read "Persist does NOT verify the cryptographic validity of the PQC
+    // signature on attach — that's the writer's responsibility. Persist
+    // verifies on read at the consumer's policy layer." It documented a defect
+    // as a design: true of a SIGNATURE, false of a KEY.
+    // `attach_key_pqc_signature` writes `pubkey_ml_dsa_65_base64` — the PQC
+    // half of an IDENTITY — and an unverified public key is not something a
+    // downstream reader can catch later, because every later verify resolves
+    // that key out of the directory and succeeds against it. So the key plane
+    // now gates at the door
+    // ([`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)):
+    // the signed `registration_envelope` must bind the attached ML-DSA-65
+    // pubkey (#659), and the post-attach row must verify hybrid-Strict.
+    //
+    // The two signature-only siblings below attach no key material, so their
+    // signature really is verified at the consumer's policy layer on read.
 
     /// Attach the PQC components to a hybrid-pending federation_keys row.
     /// Updates pubkey_ml_dsa_65_base64 + scrub_signature_pqc + pqc_completed_at.
     /// Errors if the row is already PQC-complete.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — REFUSES unless the row's already-signed
+    /// `registration_envelope` binds the ML-DSA-65 pubkey being attached and
+    /// the post-attach row hybrid-Strict-verifies. See
+    /// [`admission::check_key_pqc_attachment`](crate::federation::admission::check_key_pqc_attachment)
+    /// for why a row that bound `pubkey_ml_dsa_65_base64: null` may not attach
+    /// one afterwards.
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -3290,6 +3527,12 @@ pub trait FederationDirectory: Send + Sync {
     /// `federation_attestations` row. Attestations don't have their
     /// own pubkey — they reference the existing
     /// `federation_keys.scrub_key_id`'s pubkey for verification.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — implementations MUST re-index
+    /// `signed_wire_index` after the UPDATE. Three serialized columns move, so
+    /// the wire content hash moves with them; this is the #547/#640 stale-index
+    /// class, which was fixed at [`Self::attach_key_pqc_signature`] and not
+    /// here.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
@@ -3298,6 +3541,17 @@ pub trait FederationDirectory: Send + Sync {
 
     /// Attach the PQC signature to a hybrid-pending
     /// `federation_revocations` row. Same shape as attestations.
+    ///
+    /// v31.0.0 (CIRISPersist#657) — deliberately does NOT re-index:
+    /// `federation_revocations` (the KEY-revocation plane, as distinct from the
+    /// `*MembershipRevocation` and `IdentityOccurrenceRevocation` planes, which
+    /// do have index kinds) has no `signed_wire_index` kind at all — no arm in
+    /// [`wire_index::reload_record_bytes`](crate::federation::wire_index::reload_record_bytes)
+    /// and no entry in
+    /// [`wire_index::all_kind_hash_keys`](crate::federation::wire_index::all_kind_hash_keys),
+    /// because no bulk signed-since surface serves it. There is no stale index
+    /// to fix here; if that plane ever gains a wire kind, this method gains the
+    /// re-index its two siblings have.
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
@@ -3333,72 +3587,44 @@ pub trait FederationDirectory: Send + Sync {
     /// placement is #519's own "a promotion is placement-touching, so the
     /// primitive must carry it" argument applied one layer further down: an
     /// incomplete OR a partially-applied promotion is no longer expressible.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # v31.0.0 (CIRISPersist#649) — the primitive carries its ENVELOPE
+    ///
+    /// The same argument, one layer further still. CIRISPersist#643 bound
+    /// `cohort_scope` into `envelope.row`; promotion CHANGES `cohort_scope`
+    /// and RE-SIGNS the row, and it was re-signing the PRE-promotion envelope
+    /// — so the promoted row's signed mirror asserted its old scope while its
+    /// column said otherwise, and every peer's `put_attestation` refused it.
+    /// The promoting node's own output was unreplicable, and promotion
+    /// returned `Ok` throughout, which is what hid it.
+    ///
+    /// [`AttestationReseal`] now carries the RE-STAMPED envelope
+    /// ([`envelope::RowMirror::restamp_for_scope`]) alongside the digest and
+    /// signature computed over exactly those bytes, and the implementation
+    /// writes the envelope in the SAME statement as the placement and the tier
+    /// flip. Implementations re-run [`admission::check_row_column_binding`]
+    /// over the row as it will be stored (via
+    /// [`admission::check_promotion_admission`]), so a caller that skips the
+    /// re-stamp is REFUSED at the primitive.
+    ///
+    /// # This absorbed `promote_attestation_transformed`
+    ///
+    /// v21.3.0's #510 strip-then-promote variant existed for exactly one
+    /// reason: it additionally wrote back `attestation_envelope`. Once THIS
+    /// method must write the envelope back too, the two were the same method
+    /// under two names with two copies of one gate stack — the "door beside
+    /// the door" this repo keeps re-discovering. There is one promotion
+    /// primitive; a #510 restriction pipeline is just a different `base` handed
+    /// to [`envelope::RowMirror::restamp_for_scope`]
+    /// (see [`crate::Engine::promote_consented_backlog`]). The row's full
+    /// PRE-transform form remains queryable via the `trace_events` projection,
+    /// exactly as before.
     async fn promote_attestation(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &AttestationReseal,
     ) -> Result<bool, Error>;
-
-    /// v21.3.0 (CIRISPersist#510 P1) — the STRIP-then-promote write-back:
-    /// same contract as [`Self::promote_attestation`] (local→federation,
-    /// idempotent, `Err` if absent), except the caller has ALREADY applied
-    /// a covering grant's `StripField` restriction(s) to a CLONE of the
-    /// row's envelope and hybrid-signed THAT stripped canonical — so this
-    /// method additionally overwrites the `attestation_envelope` column
-    /// with `envelope_json` (the stripped shape) in the SAME write as the
-    /// tier flip. `original_content_hash_hex` is the hash of the STRIPPED
-    /// canonical (it is the content actually signed/shipped), not the
-    /// original.
-    ///
-    /// [`crate::Engine::promote_consented_backlog`] calls this INSTEAD of
-    /// [`Self::promote_attestation`] only when the restriction union for a
-    /// row contains at least one `StripField`; with no `StripField`
-    /// restrictions the byte-identical-wire property is preserved by
-    /// continuing to use `promote_attestation` unchanged. The row's full
-    /// PRE-strip form remains queryable via the `trace_events` projection
-    /// (decomposed at ingest/emit time, before any strip is applied), so a
-    /// downstream strip never destroys the substrate's own copy of the
-    /// original content — only the federation-tier envelope this method
-    /// writes back is narrowed.
-    ///
-    /// Default `Unsupported` (the same posture as the #509 FLOOR's three
-    /// new directory methods — this is an engine-internal primitive, not
-    /// wired into the FFI directory capsule); sqlite/postgres/memory
-    /// override.
-    /// v26.0.0 (CIRISPersist#589 / AV-83) — carries `cohort_scope` for the same
-    /// reason [`Self::promote_attestation`] does; see that method.
-    #[allow(clippy::too_many_arguments)]
-    async fn promote_attestation_transformed(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        envelope_json: &serde_json::Value,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, Error> {
-        let _ = (
-            attestation_id,
-            cohort_scope,
-            envelope_json,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            original_content_hash_hex,
-            scrub_key_id,
-            scrub_timestamp,
-        );
-        Err(Error::Unsupported {
-            method: "promote_attestation_transformed",
-        })
-    }
 
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
@@ -4290,6 +4516,13 @@ pub trait FederationDirectory: Send + Sync {
     /// v1 resolves the **direct** subject only; the `delegates_to` proxy
     /// chain (§8.1.11.1 `attesting_key_id ∈ delegates_to(s).proxies`) is
     /// a follow-up — a delegate-emitted stance is not yet folded in.
+    ///
+    /// v31.0.0 (CIRISPersist#598) — the winner is picked through
+    /// [`consent::fold_ordering_key`]: still latest-wins on the `asserted_at`
+    /// COLUMN (which every admitted `consent:state:*` row now proves equals
+    /// its own signed envelope instant), with a deterministic
+    /// RESTRICTION-WINS tie-break. Read that function's doc for why re-keying
+    /// this fold to the envelope instant is the wrong fix.
     async fn resolve_consent_state(
         &self,
         target_key_id: &str,
@@ -4301,10 +4534,11 @@ pub trait FederationDirectory: Send + Sync {
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
             .filter(|a| {
-                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+                consent::envelope_dimension(a)
+                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
             })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
-            .max_by_key(|a| a.asserted_at);
+            .max_by_key(consent::fold_ordering_key);
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),
         ))
@@ -4348,14 +4582,48 @@ pub trait FederationDirectory: Send + Sync {
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
             .filter(|a| {
-                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+                consent::envelope_dimension(a)
+                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
             })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
             .filter(|a| consent::matches_scoped_query(a, scope, qualifier))
-            .max_by_key(|a| a.asserted_at);
+            .max_by_key(consent::fold_ordering_key);
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),
         ))
+    }
+
+    /// v31.0.0 (CIRISPersist#612, CC 4.5.13) — the **other half** of the
+    /// infohazard reveal gate: fold the `content_class:{class}` flag plane for
+    /// `subject_key_id`, honouring a cross-emitter CLEAR only from a key holding
+    /// [`INFRA_CLASSIFY_CONTENT`](types::delegation_scope::INFRA_CLASSIFY_CONTENT)
+    /// conferred by a root **this node** accepts.
+    ///
+    /// [`Self::resolve_scoped_consent`] above answers *"did the subject consent
+    /// to this reveal?"*. This answers *"is the content flagged, by anyone whose
+    /// clearing I am obliged to honour?"* — the arm CIRISServer#363 reported as
+    /// a live fail-open, where an ordinary `agent`-typed key withdrew a flag it
+    /// had never raised and the gate returned `Allow`.
+    ///
+    /// The whole design, including why RAISES are deliberately **not**
+    /// conferral-filtered, lives in [`content_class`]. Default impl over
+    /// [`Self::list_attestations_for`] + the capability walk — no per-backend
+    /// SQL, so memory / sqlite / postgres inherit one fold.
+    ///
+    /// # Errors
+    ///
+    /// See [`content_class::resolve_content_class_flag`]: `InvalidArgument` for
+    /// a dimension outside [`content_class::FAMILY_STEM`],
+    /// [`Error::NodeIdentityUnset`] when the directory has no node identity to
+    /// resolve conferrals against, plus any backend/walk error. A caller that
+    /// cannot complete the fold must withhold.
+    async fn resolve_content_class_flag(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<content_class::ContentClassFlag, Error> {
+        content_class::resolve_content_class_flag(self, subject_key_id, dimension, now).await
     }
 
     /// Subject-side revocations (consent observability scan, §8.1.11.3 /
@@ -4838,6 +5106,40 @@ pub enum Error {
         reason: RevocationBoundRefusal,
     },
 
+    /// v31.0.0 (CIRISPersist#659) — a [`Revocation`] carries a typed column
+    /// that its scrub signature does not cover and that disagrees with the
+    /// `revocation_envelope` it claims to project.
+    ///
+    /// The de-conferral plane is **producer envelope + typed projection**, the
+    /// same shape as the three operational planes
+    /// ([`Error::OperationalEnvelopeUnbound`]): the hybrid signature covers
+    /// `revocation_envelope` and nothing else, while WHICH KEY IS REVOKED,
+    /// WHO revoked it, WHICH ROW this is and WHEN it takes effect were all
+    /// plain caller-supplied columns. One validly-signed revocation could
+    /// therefore be re-pasted at an arbitrary `revoked_key_id` and an
+    /// arbitrary `revocation_id`, unboundedly often, with the producer's own
+    /// signature still verifying — an unbounded de-conferral primitive off a
+    /// single conferral.
+    ///
+    /// Fail-closed, and no legacy regime: an unbound revocation is REFUSED,
+    /// never stored-and-flagged. See
+    /// [`admission::check_revocation_envelope_binding`].
+    #[error(
+        "revocation {revocation_id:?}: typed column `{field}` is not bound to the signed \
+         `revocation_envelope` — {detail}. The scrub signature covers that envelope only, so an \
+         unbound column is authored by whoever relayed the row, not by whoever signed it — and \
+         `revoked_key_id` unbound means one signed revocation de-admits ANY key it is pasted \
+         onto (CIRISPersist#659)"
+    )]
+    RevocationEnvelopeUnbound {
+        /// The rejected row's `revocation_id`.
+        revocation_id: String,
+        /// The typed column that diverged.
+        field: &'static str,
+        /// How it diverged (column value vs signed value, or absence).
+        detail: String,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -4889,6 +5191,110 @@ pub enum Error {
     #[error("genesis bundle refused: {detail}")]
     GenesisBundleInvalid {
         /// What failed.
+        detail: String,
+    },
+
+    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis refusal.** The operation
+    /// resolves authority to the constitutional trust root, and this node does
+    /// not hold one: the accord-holder roster and/or the keyless
+    /// `humanity-accord` family row are not installed.
+    ///
+    /// This is the typed answer to *"a node with no root must not become a node
+    /// that checks nothing"*. 31.0.0 is the binary that RUNS the genesis
+    /// ceremony, so it boots pre-genesis on purpose — and every gate in
+    /// [`genesis::ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// returns this rather than tallying a quorum against an empty roster and
+    /// discovering that nothing to check reads like nothing to refuse. That
+    /// inversion is the #632 defect and it is the one most likely to be
+    /// reintroduced here.
+    ///
+    /// The remedy is a ceremony, not a signature, and the message says so —
+    /// `accord family m-of-n not met (1-of-0)` would send an operator hunting
+    /// for a holder who was never going to answer.
+    #[error(
+        "no constitutional trust root yet: {operation} resolves authority to the accord root, \
+         which this node does not hold ({fault_kind} {leg} leg: {detail}). Run the genesis \
+         ceremony (or bake a seed) before this operation."
+    )]
+    NoConstitutionalRootYet {
+        /// WHICH gate refused — a token from
+        /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES).
+        operation: &'static str,
+        /// Which constitutional leg is missing — roster or threshold.
+        leg: genesis::GenesisLeg,
+        /// `absent` / `divergent` / `unreadable` — the
+        /// [`GenesisFault`](crate::federation::genesis::GenesisFault) class.
+        fault_kind: &'static str,
+        /// The specific finding.
+        detail: String,
+    },
+
+    /// v31.0.0 (CIRISPersist#648) — **the constitutional family id is
+    /// reserved.** A `federation_families` write named
+    /// [`HUMANITY_ACCORD_FAMILY_KEY_ID`](ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+    /// through an ordinary admission door.
+    ///
+    /// Before #648 this was defended by an accident of ordering: the seed was
+    /// unconditional, so the primary key was always already occupied by the
+    /// time any peer could write, and `put_family` refuses a collision with
+    /// different content. Allowing boot without a seed removes that accident
+    /// and opens the sharpest hole in the whole issue — a registered peer
+    /// declares a `humanity-accord` family with itself as the sole seat and
+    /// `founder_only` as the protocol, `family_charter_threshold` resolves to
+    /// 1, and one signature charters the constitutional root.
+    ///
+    /// So the reservation is now stated. The name enters this node's directory
+    /// through the genesis seeder / the assemble ceremony
+    /// ([`put_family_local`](FederationDirectory::put_family_local)) and
+    /// through nothing else — which is also the property that keeps a second
+    /// assemble from becoming a replacement.
+    #[error(
+        "family_key_id {family_key_id:?} is the constitutional accord family and is reserved: \
+         it is established by the genesis ceremony, never by a peer declaration \
+         (attesting key {attesting_key_id:?})"
+    )]
+    ConstitutionalFamilyReserved {
+        /// The reserved id the caller tried to claim.
+        family_key_id: String,
+        /// Who tried.
+        attesting_key_id: String,
+    },
+
+    /// v31.0.0 (CIRISPersist#660) — **a baked genesis delegation id is
+    /// reserved.** An attestation write claimed `genesis-charter` /
+    /// `genesis-grant:…` / `genesis-lifecycle` with content that is not the
+    /// baked ceremony row.
+    ///
+    /// The attestation-plane twin of [`Self::ConstitutionalFamilyReserved`],
+    /// and the same finding: nothing reserved these ids, so one ordinary
+    /// `scores` row from any registered key could take the primary key the
+    /// ceremony needs. On the family plane the consequence was a 1-of-1
+    /// charter; here it was worse in one specific way — the squat also flipped
+    /// [`genesis_posture`](genesis::genesis_posture) to
+    /// [`Divergent`](genesis::GenesisPosture::Divergent), which
+    /// [`refuses_boot`](genesis::GenesisFault::refuses_boot), so a peer could
+    /// deny a node its boot AND make the denial permanent by holding the key.
+    ///
+    /// The rule is stated as AUTHORSHIP — federation-tier, attested by a seated
+    /// accord holder — rather than as a door, because unlike the family plane
+    /// the delegation plane has no second door: the ceremony, the host's boot
+    /// write and a peer's replication all arrive at `put_attestation`. See
+    /// [`check_genesis_attestation_reserved`](genesis::check_genesis_attestation_reserved),
+    /// including why pinning the baked CONTENT instead would have refused the
+    /// re-ceremony these ids exist for.
+    #[error(
+        "attestation_id {attestation_id:?} is a baked genesis delegation row and is reserved: \
+         it is installed by the genesis ceremony, never by an ordinary write — this one's \
+         {field} {detail} (attesting key {attesting_key_id:?})"
+    )]
+    GenesisAttestationReserved {
+        /// The reserved id the caller tried to claim.
+        attestation_id: String,
+        /// Who tried.
+        attesting_key_id: String,
+        /// The first field that diverged from the baked row.
+        field: String,
+        /// What diverged, for an operator.
         detail: String,
     },
 
@@ -5044,7 +5450,7 @@ pub enum Error {
         attestation_type: String,
     },
 
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
     /// attestation was self-emitted (`attesting_key_id ==
     /// attested_key_id`). The witness rung is an attestation ABOUT a
     /// subject: CC 3.4.11 — "A subject MUST NOT emit on `age_assurance:`;
@@ -5275,6 +5681,44 @@ pub enum Error {
         submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
     },
 
+    /// v31.0.0 (CIRISPersist#659) — **the anti-rollback CEILING**: the
+    /// submitted revocation's `scrub_timestamp` is further in the future than
+    /// this node will accept.
+    ///
+    /// [`Error::RevocationRollback`] is the FLOOR, and on its own it makes
+    /// `scrub_timestamp` a monotonic latch on a key's entire de-admission
+    /// history with no upper bound. Self-revocation needs no conferral
+    /// ([`admission::check_revocation_authority`] — a compromised key must be
+    /// retirable by its holder), so one self-signed revocation dated at the
+    /// year 9999 made its own subject **immune to every later de-admission**,
+    /// a slash-conferred moderator's included. Binding `scrub_timestamp` into
+    /// the signed envelope (#659) closes the relay variant and cannot close
+    /// this one, because the attacker signs its own row. A latch needs a
+    /// ceiling as well as a floor.
+    ///
+    /// A DISTINCT variant rather than a second meaning for the floor's: the
+    /// floor's message says *"not strictly later than existing …"*, and
+    /// reporting a ceiling through it would tell an operator the one thing
+    /// that is not true — there is no existing revocation at that instant.
+    /// See [`admission::check_revocation_scrub_skew`].
+    #[error(
+        "anti-rollback ceiling: revocation for {revoked_key_id:?} scrub_timestamp \
+         {submitted_signed_timestamp} is {ahead_seconds}s ahead of this node's clock, beyond \
+         the {tolerance_seconds}s tolerance. The scrub instant is a MONOTONIC LATCH per \
+         revoked_key_id, so a future-dated one blocks every later de-admission of this key \
+         (CIRISPersist#659)"
+    )]
+    RevocationScrubSkew {
+        /// The `revoked_key_id` the new revocation targets.
+        revoked_key_id: String,
+        /// The submitted (rejected) `scrub_timestamp`.
+        submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
+        /// How far ahead of this node's clock it sits.
+        ahead_seconds: i64,
+        /// The tolerance it exceeded ([`admission::DEFAULT_MAX_TOUCH_SKEW`]).
+        tolerance_seconds: i64,
+    },
+
     /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8). The submitted
     /// identity_occurrence's `device_class` is outside the closed set
     /// `{phone, laptop, server, embedded, agent, service}`. Rejected at
@@ -5376,6 +5820,44 @@ pub enum Error {
     #[error("operational-data authority not established: {0}")]
     OperationalAuthority(String),
 
+    /// v31.0.0 (CIRISPersist#644, CEG 1.0-RC2 §5.6.8.13) — an
+    /// `organization` / `org_membership` / `partner_record` row carried a
+    /// typed column that its signature does not cover and that disagrees
+    /// with the signed envelope it claims to project.
+    ///
+    /// The three operational planes are **producer envelope + typed
+    /// projection**: the signature (or the M-of-N steward quorum) covers
+    /// `signed_envelope` and nothing else, while `resolve_lww` /
+    /// `resolve_monotonic_quorum` / the read surface all decide on the
+    /// COLUMNS beside it. Before this gate those columns — including the
+    /// `withdrawn_at` tombstone, `status`, `role`, the `asserted_at` LWW
+    /// key and the `partner_record` `revision` anti-rollback counter —
+    /// were authored by whoever wrote the row rather than by whoever
+    /// signed it, so replaying a still-validly-signed envelope with edited
+    /// columns needed no forgery at all.
+    ///
+    /// Fail-closed, and no legacy regime: an unbound row is REFUSED, not
+    /// downgraded. See
+    /// [`operational::check_organization_binding`] /
+    /// [`operational::check_org_membership_binding`] /
+    /// [`operational::check_partner_record_binding`].
+    #[error(
+        "{plane} row {attestation_id:?}: typed column `{field}` is not bound to the \
+         signed envelope — {detail}. The signature covers `signed_envelope` only, so an \
+         unbound column is authored by whoever wrote the row, not by whoever signed it \
+         (CIRISPersist#644)"
+    )]
+    OperationalEnvelopeUnbound {
+        /// `organization` | `org_membership` | `partner_record`.
+        plane: &'static str,
+        /// The rejected row's `attestation_id`.
+        attestation_id: String,
+        /// The typed column that diverged.
+        field: &'static str,
+        /// How it diverged (column value vs signed value, or absence).
+        detail: String,
+    },
+
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, F-AV-ROLLBACK) — a
     /// `partner_record` write whose `revision` does not strictly exceed
     /// the most-recent admitted `revision` for the same `license_id`. The
@@ -5468,7 +5950,7 @@ pub enum Error {
         scope: String,
     },
 
-    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
+    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
     /// was REFUSED because its `attested_key_id` resolves to a `node`-only
     /// [`crate::federation::types::identity_type::NODE`] identity but the
     /// delegation carries a scope that is NOT `infra:*` — i.e. an
@@ -5567,7 +6049,7 @@ pub enum Error {
         detail: String,
     },
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
     /// `federation_keys` row carrying the [`types::identity_type::CANONICAL`]
     /// role was REJECTED at admission because it is **not accord-conferred**.
     /// The `canonical` (founding bootstrap server) role is accord-CONFERRED,
@@ -6032,10 +6514,16 @@ impl Error {
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
+            Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
+            Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
+            Error::ConstitutionalFamilyReserved { .. } => {
+                "federation_constitutional_family_reserved"
+            }
+            Error::GenesisAttestationReserved { .. } => "federation_genesis_attestation_reserved",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
@@ -6070,12 +6558,14 @@ impl Error {
             Error::CohortScopeRejected { .. } => "federation_cohort_scope_rejected",
             Error::RegionRejected { .. } => "federation_region_rejected",
             Error::RevocationRollback { .. } => "federation_revocation_rollback",
+            Error::RevocationScrubSkew { .. } => "federation_revocation_scrub_skew",
             Error::DeviceClassRejected { .. } => "federation_device_class_rejected",
             Error::ConsensusProtocolMalformed { .. } => "federation_consensus_protocol_malformed",
             Error::WriteScopeRefused(_) => "federation_write_scope_refused",
             Error::ClockSkewViolation { .. } => "federation_clock_skew_violation",
             Error::PaymentProcessorIdentifier { .. } => "federation_payment_processor_identifier",
             Error::OperationalAuthority(_) => "federation_operational_authority",
+            Error::OperationalEnvelopeUnbound { .. } => "federation_operational_envelope_unbound",
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",

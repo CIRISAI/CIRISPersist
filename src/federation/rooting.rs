@@ -949,7 +949,32 @@ mod conformance_helpers {
     /// `identity_type` controls whether a self-signed row counts as a
     /// steward bootstrap.
     pub fn signed_record(subject: &TestKey, signer: &TestKey, identity_type: &str) -> KeyRecord {
-        let envelope = serde_json::json!({ "key_id": subject.key_id });
+        // v31.0.0 (CIRISVerify 13.1.0) — the envelope BINDS THE SUBJECT, and it
+        // does so through the one shared
+        // [`crate::federation::admission::bind_subject_into_envelope`] rather
+        // than a hand-written `{"key_id": …}` literal.
+        //
+        // This fixture feeds `verify_provenance`, and 13.1.0 added the SAME
+        // four-member subject binding to the provenance-link plane that it
+        // added to the key-record plane — checked FIRST, before the hash, the
+        // signatures and any anchor resolution. The defect it closes is the
+        // same one: the link's identity fields lived OUTSIDE the signed bytes,
+        // so an attacker could wrap a victim's genuine validly-signed envelope
+        // in a link declaring their own key_id and pubkeys, and the chain would
+        // root the ATTACKER's key with every hash and signature checking out.
+        //
+        // Going through the shared producer rather than restating the members
+        // is the point: persist now has ONE spelling of this projection and
+        // both planes that consume it read the same map.
+        let mut envelope = serde_json::json!({ "purpose": "rooting conformance fixture" });
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut envelope,
+            &subject.key_id,
+            identity_type,
+            &subject.pubkey_b64(),
+            Some(&subject.pubkey_ml_dsa_b64()),
+        )
+        .expect("bind the subject into the provenance link's signed bytes");
         // Sign over `canonical(registration_envelope)` using the SAME
         // canonicalizer rooting + register + the real producer use
         // (CIRISPersist#344) — NOT over the hash. `original_content_hash`

@@ -490,6 +490,7 @@ mod tests {
         let (id, attester, mut row) = build_row(dir, suffix, dimension).await;
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         dir.put_attestation(SignedAttestation { attestation: row })
             .await?;
         Ok((id, attester))
@@ -504,16 +505,20 @@ mod tests {
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::types::{attestation_tier, cohort_scope};
 
-        dir.promote_attestation(
-            id,
-            cohort_scope::FEDERATION,
-            "c2ln",
-            Some("cHFj"),
-            "deadbeef",
+        // v31.0.0 (CIRISPersist#649) — a promotion RE-STAMPS the mirror it
+        // re-signs (`cohort_scope` is inside the signed bytes), so the door
+        // takes the resealed bundle, not a bare signature triple.
+        let row = dir
+            .get_attestation(id)
+            .await?
+            .expect("the local row exists");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
             attester,
-            chrono::Utc::now(),
-        )
-        .await?;
+            &row,
+            cohort_scope::FEDERATION,
+        );
+        dir.promote_attestation(id, cohort_scope::FEDERATION, &reseal)
+            .await?;
         let stored = dir
             .get_attestation(id)
             .await?

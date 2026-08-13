@@ -631,10 +631,33 @@ where
             match self.backend.attestation_insert_local(input).await {
                 Ok(_) => trace_attestations_minted += 1,
                 Err(e) => {
+                    // v31.0.0 (CIRISPersist#598) — LOG THE ERROR, NOT JUST ITS
+                    // KIND. This warn used to carry `reason = e.kind()` alone,
+                    // which for every admission refusal is the single token
+                    // `federation_invalid_argument` — the gate's own sentence,
+                    // the one that names the column and the issue, was
+                    // discarded here.
+                    //
+                    // That mattered: when #598 made the local door refuse
+                    // every durable mint, this skip-and-warn turned the entire
+                    // trace-attestation plane dark — `minted` went 1 → 0 on
+                    // every node — and the only operator-visible trace of it
+                    // was a kind token shared with a dozen unrelated causes.
+                    // The mint is the OWNER-DOCTRINE chokepoint (the
+                    // attestation IS the trace's canonical home; `trace_events`
+                    // is its projection), so a silent total failure here is the
+                    // most expensive thing this pipeline can do quietly.
+                    //
+                    // The skip POSTURE is unchanged and still right — the #473
+                    // reason (producer key not yet federated on a relay ingest)
+                    // is genuinely transient and self-heals on replay. What
+                    // changes is that a NON-transient refusal, which will never
+                    // self-heal, now says what it was.
                     tracing::warn!(
                         write_path = "trace_ingest",
                         trace_id = %tid,
                         reason = %e.kind(),
+                        error = %e,
                         "ciris-persist: trace attestation mint skipped (#473)"
                     );
                     trace_attestations_skipped += 1;
@@ -774,7 +797,38 @@ where
     /// inline); an oversize trace gets a MANIFEST envelope (content hash +
     /// byte length + component count) — the payload stays queryable in the
     /// `trace_events` projection, and degradable-plane (fountain) retrieval
-    /// is the tracked follow-up. Either way the attestation admits.
+    /// is the tracked follow-up.
+    ///
+    /// # The stamp is not in these bytes (v31.0.0, CIRISPersist#653)
+    ///
+    /// This branch used to end "either way the attestation admits", and
+    /// CIRISPersist#643/#598 made that promise conditional at the margin. The
+    /// bytes measured here are the PRODUCER's envelope; the bytes actually
+    /// stored are that envelope plus persist's own stamp — the
+    /// [`RowMirror`](crate::federation::envelope::RowMirror) and the bound
+    /// instants, written at the local write door because that is the last
+    /// moment an unsigned local row's bytes are persist's to write. So a trace
+    /// whose canonical form lands in the ~250 bytes below the cap takes the
+    /// INLINE branch here and exceeds the cap once stamped.
+    ///
+    /// That is NOT resolved by reserving headroom here. Modelling the door's
+    /// stamp in the producer would be a second spelling of that projection, and
+    /// a second spelling that drifts is how a producer starts certifying rows
+    /// no host can write — the class this whole substrate keeps single-sourcing
+    /// away. It is resolved at the door, which now sizes the row as it will be
+    /// STORED
+    /// ([`check_envelope_size_admission`](crate::federation::admission::check_envelope_size_admission)
+    /// runs again after the stamp at all three local write funnels).
+    ///
+    /// The consequence for THIS function is worth stating plainly, because it
+    /// is a behaviour change and not merely a repaired invariant: such a trace
+    /// is now REFUSED at the local door — loudly, naming the bytes and the cap
+    /// — instead of being stored and refused later by every peer. It does not
+    /// fall back to the MANIFEST form, because this function has already
+    /// chosen the shape by the time the door sees it. Losing the mint visibly
+    /// at the right door beats storing a row this node can never replicate;
+    /// making the fallback itself margin-aware needs the producer to know the
+    /// stamp's size, which is the coupling rejected above.
     fn build_trace_attestation_input(
         &self,
         trace: &crate::schema::CompleteTrace,
@@ -1724,6 +1778,10 @@ mod tests {
         replicated.scrub_signature_classical = sig_c;
         replicated.scrub_signature_pqc = sig_p;
         replicated.scrub_key_id = key_id.clone();
+        // v31.0.0 (CIRISPersist#643) — the local mint stamped its mirror at the
+        // LOCAL tier; flipping `tier` does not change any bound column, but the
+        // re-seal is what keeps this fixture honest if it ever edits one.
+        crate::federation::tier_ingest::test_support::reseal(&mut replicated);
         node_b
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: replicated,

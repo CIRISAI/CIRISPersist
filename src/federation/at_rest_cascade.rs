@@ -821,8 +821,32 @@ pub mod orchestrate {
     ///
     /// A keyless newcomer occurrence is excluded (no grant) and surfaced as
     /// `hard_case:recipient_excluded`; the family roster itself is the
-    /// caller's responsibility (this runs *after* `put_family` admits the
+    /// caller's responsibility (this runs *after* the roster admits the
     /// member — the roster already names them).
+    ///
+    /// # v31.0.0 (CIRISPersist#654) — the doc above is TRUE again
+    ///
+    /// It was written for the original contract and then quietly falsified in
+    /// v6.2.0, when this driver started calling `add_family_member` itself. That
+    /// call was the whole of #654's exploit surface: this driver holds NO key
+    /// material — that is its point — so it could not produce, and cannot relay,
+    /// an authority signature over a roster it grows with a `joined_at` it mints
+    /// itself. Growing a roster from inside a key-less cascade orchestrator is
+    /// not a thing that can be made safe; it is a thing that has to stop.
+    ///
+    /// So the roster grow moved back OUT, to the caller, which reaches it
+    /// through the now-gated
+    /// [`add_family_member`](crate::federation::FederationDirectory::add_family_member)
+    /// / [`supersede_family`](crate::federation::FederationDirectory::supersede_family)
+    /// with a real signature, and this driver REFUSES a newcomer the roster
+    /// does not already name.
+    ///
+    /// The membership test is the **revocation-folded ACTIVE** roster, not the
+    /// raw `members[]`. Under the old shape a removed member could be handed
+    /// back every past family blob simply by re-running the driver — it would
+    /// re-add them to the roster and then re-key them — which is a
+    /// forward-secrecy hole in the one direction forward secrecy is supposed to
+    /// be automatic for the family tier.
     pub async fn rekey_family_member_add<B>(
         backend: &B,
         family_key_id: &str,
@@ -842,26 +866,29 @@ pub mod orchestrate {
                 ))
             })?;
 
-        // Forward-path half (v6.2.0, #161 A4/A5): put the newcomer on the
-        // roster so `resolve_recipients` includes them in FUTURE family
-        // writes. Idempotent — re-running the driver, or admitting an
-        // already-rostered member, is a no-op here. The re-key below is the
-        // backward-path half (grant the newcomer PAST family blobs). Order
-        // matters only for crash-consistency: roster-grow first means a
-        // crash between the two leaves a rostered member missing some past
-        // grants (recoverable by re-running the driver — re-key is
-        // idempotent), never a re-keyed member absent from the roster.
-        backend
-            .add_family_member(
-                family_key_id,
-                crate::federation::types::FamilyMember {
-                    key_id: new_member_identity_key_id.to_string(),
-                    joined_at: observed_at,
-                    role: None,
-                },
-            )
+        // v31.0.0 (CIRISPersist#654) — THE ROSTER PRECONDITION, replacing the
+        // v6.2.0 unauthenticated `add_family_member` call this driver used to
+        // make. The newcomer must already be an ACTIVE member; see the doc
+        // comment for why a key-less cascade orchestrator must not be the thing
+        // that grows a roster, and why the test is the revocation-folded roster
+        // rather than the raw one.
+        let active = backend
+            .active_family_members(family_key_id)
             .await
             .map_err(map_dir_err)?;
+        if !active
+            .iter()
+            .any(|m| m.key_id == new_member_identity_key_id)
+        {
+            return Err(BlobError::InvalidArgument(format!(
+                "rekey_family_member_add: {new_member_identity_key_id:?} is not an active member \
+                 of family {family_key_id:?}. The roster grow is the caller's, through the signed \
+                 add_family_member / supersede_family door — this driver holds no key material and \
+                 cannot authorize a membership change (CIRISPersist#654). Re-keying a member the \
+                 roster does not name would also hand every past family blob to someone whose \
+                 membership was revoked."
+            )));
+        }
 
         // Newcomers = the new member identity's active occurrences.
         let newcomers: Vec<Newcomer> = backend

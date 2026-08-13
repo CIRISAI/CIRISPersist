@@ -233,6 +233,22 @@ where
 /// `{revoked_key_id: victim, revoking_key_id: any-existing}` for a targeted
 /// de-peer / trust DoS. Now the revocation must be signed by the key it
 /// claims to act as, resolved from OUR directory.
+///
+/// # v31.0.0 (CIRISPersist#659) — the SUBJECT binds FIRST
+///
+/// Verifying the signature proves the revoker signed *some* envelope; it
+/// proved nothing about the row that envelope arrived on. Every field the
+/// substrate acts upon — `revoked_key_id` above all — was a plain column, so
+/// one validly-signed revocation could be re-pasted at any subject and any
+/// `revocation_id`, unboundedly often, with the producer's own signature
+/// still verifying. [`check_revocation_envelope_binding`] therefore runs as
+/// the FIRST statement here, ahead of the directory lookup this function
+/// needs, so the refusal is a pure function of the row and cannot depend on
+/// which keys this node happens to hold. Every backend's `put_revocation`
+/// runs it at the very top of the door as well; it is here too so no future
+/// door can acquire this plane without the binding.
+///
+/// [`check_revocation_envelope_binding`]: crate::federation::admission::check_revocation_envelope_binding
 pub async fn verify_revocation_admission<F>(
     directory: &F,
     row: &crate::federation::types::Revocation,
@@ -240,6 +256,7 @@ pub async fn verify_revocation_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    crate::federation::admission::check_revocation_envelope_binding(row)?;
     verify_envelope_hybrid_signature(
         directory,
         &row.revoking_key_id,
@@ -323,6 +340,29 @@ where
 /// wholesale. Run BEFORE any DB work (mirrors the #502 E1
 /// `verify_revocation_admission` shape this helper replicates for the family
 /// plane).
+///
+/// # v31.0.0 (CIRISPersist#648) — the constitutional family id is RESERVED here
+///
+/// Until this cut the `humanity-accord` id was protected by an accident of
+/// ordering rather than by a rule: the genesis seed was unconditional, so the
+/// primary key was always already taken before any peer could reach this door,
+/// and `put_family` refuses a collision that carries different content.
+///
+/// #648 makes boot-without-a-seed a supported state, which removes the
+/// accident. What it would have opened is the sharpest hole in the issue: a
+/// registered peer declares a `humanity-accord` family with itself as the sole
+/// seat and `founder_only` as the protocol,
+/// [`family_charter_threshold`](super::trust_root) resolves that to 1, and a
+/// single signature charters the constitutional root of the mesh. The
+/// signature check above would have passed — the peer really did sign it.
+///
+/// So the id is now reserved at the door. It enters this node's directory
+/// through the genesis seeder and the assemble ceremony
+/// ([`put_family_local`](FederationDirectory::put_family_local), which carries
+/// no authority signature because a keyless family has none to carry) and
+/// through nothing else. That single-door property is also what keeps a SECOND
+/// ceremony from replacing a first: the seeder's own already-entrenched check
+/// is a no-op, never an overwrite.
 pub async fn verify_family_admission<F>(
     directory: &F,
     signed: &super::SignedFamily,
@@ -330,6 +370,14 @@ pub async fn verify_family_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    if signed.family.family_key_id
+        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    {
+        return Err(Error::ConstitutionalFamilyReserved {
+            family_key_id: signed.family.family_key_id.clone(),
+            attesting_key_id: signed.authority_key_id.clone(),
+        });
+    }
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
@@ -457,6 +505,12 @@ pub(crate) mod test_support {
     /// the key_id over a `0x11` fill. Same shape as
     /// `register.rs::tests::signed_self_record`, so the two test corpora
     /// stay coherent.
+    /// **Truncates at 32 bytes.** Two `key_id`s sharing a 32-byte prefix are
+    /// therefore the SAME identity here — a real trap for a test that builds
+    /// ids as `{long_tag}-victim` / `{long_tag}-attacker` and then believes it
+    /// has two subjects. Put the distinguishing part FIRST, and assert the
+    /// pubkeys differ (CIRISPersist#659 hit exactly this, on postgres only,
+    /// where the tag carries a uuid).
     fn seed_for(key_id: &str) -> [u8; 32] {
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {
@@ -532,20 +586,31 @@ pub(crate) mod test_support {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
         // v30.12.0 (CIRISPersist#634) — TRUNCATED TO MICROSECONDS. Postgres
         // `TIMESTAMPTZ` is microsecond precision while `Utc::now()` carries
-        // nanoseconds, so a nanosecond-bearing fixture does not survive the
-        // round-trip: the wire index is written from the IN-MEMORY row at put
-        // time, and `list_signed_key_records_since` re-serializes the RELOADED
-        // (truncated) row, so the two hash differently and the advertised ref
-        // point-reads to `None`. The same trap the #610 rescope witness
-        // documents, and it is a property of the FIXTURE — rows arriving over
-        // the wire carry RFC-3339 instants that already round-trip losslessly.
-        // Truncating here keeps every postgres test measuring what it is for
-        // rather than clock precision.
+        // nanoseconds, so timestamps minted here do not survive the round-trip
+        // byte-for-byte on that backend.
+        //
+        // v31.0.0 (CIRISPersist#640) — this is NO LONGER what keeps the wire
+        // index honest. #634 read the skew as a fixture property; it was not —
+        // the write paths hashed the in-memory row while every read
+        // re-serializes the reloaded one, so the same divergence was reachable
+        // in production (`attach_key_pqc_signature` mints `pqc_completed_at` at
+        // nanosecond precision; replication from a sqlite origin carries
+        // nanosecond RFC-3339 over the wire). That is fixed at the source now:
+        // every `federation_keys` writer indexes the row AS STORED. See
+        // `wire_index::key_entry_as_stored`.
+        //
+        // The truncation stays because this fixture seeds hundreds of tests
+        // that are about something else, and a microsecond-clean row keeps
+        // them measuring what they are for. The #640 regression net is a
+        // DEDICATED nanosecond-bearing witness
+        // (`exercise_nanosecond_key_wire_ref_resolves`) — deliberately not
+        // this shared helper, so the net cannot be silently disarmed by a
+        // future fixture tidy-up.
         let now = {
             use chrono::Timelike as _;
-            chrono::Utc::now()
-                .with_nanosecond(chrono::Utc::now().nanosecond() / 1_000 * 1_000)
-                .unwrap_or_else(chrono::Utc::now)
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
+                .unwrap_or(dt)
         };
         let rec = crate::federation::KeyRecord {
             key_id: key_id.to_owned(),
@@ -631,6 +696,283 @@ pub(crate) mod test_support {
             B64.encode(&ed_sig),
             Some(B64.encode(&pqc_sig)),
         )
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — **seal a [`Revocation`](crate::federation::Revocation):
+    /// bind its typed columns into `revocation_envelope`, then hybrid-sign the
+    /// result** under the row's own `revoking_key_id` (the key
+    /// [`super::verify_revocation_admission`] resolves pubkeys for — signing
+    /// under any other produces a row no backend admits).
+    ///
+    /// The de-conferral twin of [`seal_row_in_place`]. Hand it a row whose
+    /// typed columns are final and whose `original_content_hash` /
+    /// `scrub_signature_*` are placeholders, and get back the same row sealed.
+    /// The binding is stamped through
+    /// [`bind_revocation_into_envelope`](crate::federation::admission::bind_revocation_into_envelope)
+    /// — the SAME projection the gate compares against — so there is no second
+    /// spelling here either, and a fixture cannot certify a revocation this
+    /// substrate's own put door refuses.
+    ///
+    /// Note the instant truncation happens inside the producer, so a fixture
+    /// carrying `Utc::now()` nanoseconds is silently made postgres-storable
+    /// rather than dying at the gate. The witnesses that MEASURE the binding
+    /// build their divergence deliberately, AFTER sealing — a fixture that
+    /// merely forgot to seal is indistinguishable from a stale one.
+    pub fn seal_revocation_in_place(row: &mut crate::federation::Revocation) {
+        let signing_key_id = row.revoking_key_id.clone();
+        crate::federation::admission::bind_revocation_into_envelope(row)
+            .expect("the fixture revocation_envelope is a JSON object");
+        let (och, sc, sp) = sign_envelope(&signing_key_id, &row.revocation_envelope);
+        row.original_content_hash = och;
+        row.scrub_signature_classical = sc;
+        row.scrub_signature_pqc = sp;
+    }
+
+    /// [`seal_revocation_in_place`], by value.
+    pub fn seal_revocation(
+        mut row: crate::federation::Revocation,
+    ) -> crate::federation::Revocation {
+        seal_revocation_in_place(&mut row);
+        row
+    }
+
+    /// v31.0.0 (CIRISPersist#656) — **a subject-side transit revocation whose
+    /// signed envelope BINDS the row it will be stored as.**
+    ///
+    /// The §10.1.3 transit door is the one write path where persist is the
+    /// RECEIVER of bytes it did not mint, so
+    /// [`RowMirror::stamp_local_row`](crate::federation::envelope::RowMirror::stamp_local_row)
+    /// declines to stamp and CHECKS instead. That makes the mirror the
+    /// producer's to bind — which in turn means the producer must choose the
+    /// `attestation_id` (it is one of the seven bound members), rather than
+    /// letting persist mint a fresh v4. Every fixture that used to pass
+    /// `attestation_id: None` and an unbound envelope was producing a row this
+    /// substrate's own `put_attestation` refuses; this is the shape a real
+    /// subject must send.
+    ///
+    /// The mirror is built through
+    /// [`RowMirror::of`](crate::federation::envelope::RowMirror::of) over the
+    /// row the input will become, so there is no second spelling of the
+    /// projection here either.
+    pub fn bound_transit_revocation_input(
+        attestation_id: &str,
+        subject: &str,
+        target: &str,
+        subject_key_ids: Vec<String>,
+        cohort_scope: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        extra: serde_json::Value,
+    ) -> crate::federation::types::LocalAttestationInput {
+        use crate::federation::types::{attestation_type, LocalAttestationInput};
+        let asserted = crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        let mut envelope = serde_json::json!({
+            "dimension": "consent:state:revoked:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
+        });
+        if let (Some(obj), Some(more)) = (envelope.as_object_mut(), extra.as_object()) {
+            for (k, v) in more {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        // THE MIRROR, from the row this input becomes
+        // (`LocalAttestationInput::into_transit_revocation_row`).
+        let mut as_stored = crate::federation::types::Attestation {
+            attestation_id: attestation_id.to_owned(),
+            attesting_key_id: subject.to_owned(),
+            attested_key_id: target.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: asserted,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: subject.to_owned(),
+            scrub_timestamp: asserted,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subject_key_ids.clone(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope.to_owned(),
+            tier: crate::federation::types::attestation_tier::LOCAL.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::envelope::RowMirror::stamp_row(&mut as_stored)
+            .expect("the fixture row carries no weight, so the mirror cannot fail");
+        let envelope = as_stored.attestation_envelope;
+        let (_hash, sig_classical, sig_pqc) = sign_envelope(subject, &envelope);
+        LocalAttestationInput {
+            attestation_id: Some(attestation_id.to_owned()),
+            attesting_key_id: subject.to_owned(),
+            attested_key_id: Some(target.to_owned()),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("the fixture envelope is an object"),
+            subject_key_ids,
+            cohort_scope: cohort_scope.to_owned(),
+            scrub_signature_classical: Some(sig_classical),
+            scrub_signature_pqc: sig_pqc,
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#643) — **stamp the typed-column mirror into a
+    /// hand-built row's envelope, then hybrid-sign it.**
+    ///
+    /// The fixture corpus builds [`Attestation`] rows by hand and signs the
+    /// envelope with [`sign_envelope`], which is exactly the producer shape the
+    /// binding gate now constrains: the SEVEN typed columns must appear inside
+    /// the SIGNED bytes (v31.0.0, CIRISPersist#658 — this said five; the
+    /// authority is [`crate::federation::envelope::row_paths::ALL`]).
+    /// Doing that by hand at every call site would be ~200
+    /// copies of one projection, and a copy that drifts is a fixture certifying
+    /// a row no host can write.
+    ///
+    /// So: hand it a row whose typed columns are final and whose
+    /// `original_content_hash` / `scrub_signature_*` are placeholders, and get
+    /// back the same row sealed — mirror stamped from
+    /// [`RowMirror::of`](crate::federation::envelope::RowMirror::of) (the SAME
+    /// projection the gate compares against), envelope canonicalized, hash and
+    /// both signature halves filled in.
+    ///
+    /// v31.0.0 (CIRISPersist#598) — **also stamps `asserted_at` /
+    /// `expires_at`.** It did not, when the #598 gate ran on `consent:state:*`
+    /// only and the instants were one dimension's property; the gate now binds
+    /// them on EVERY row, so a seal that left them out would produce a row
+    /// this substrate's own put door refuses — a fixture corpus certifying a
+    /// placement no host can write. The witnesses that measure the binding
+    /// itself are therefore NOT fixtures that forgot to seal (that failure
+    /// mode is indistinguishable from a stale fixture); they build the
+    /// divergence deliberately, AFTER sealing.
+    pub fn seal_row(signing_key_id: &str, mut row: Attestation) -> Attestation {
+        seal_row_in_place(signing_key_id, &mut row);
+        row
+    }
+
+    /// v31.0.0 (CIRISPersist#643) — [`seal_row`] in place, for the fixtures
+    /// that MUTATE a built row (change the verb, swap the envelope, add
+    /// subjects) and must re-seal afterwards. The whole corpus's `resign_*`
+    /// helpers delegate here, so "re-sign after mutating" and "re-stamp the
+    /// mirror after mutating" are ONE step that cannot be half-done.
+    pub fn seal_row_in_place(signing_key_id: &str, row: &mut Attestation) {
+        use crate::federation::envelope::paths;
+        // v31.0.0 (CIRISPersist#598) — the INSTANTS are part of the seal, not a
+        // separate step a fixture can forget. `check_instant_binding` now runs
+        // on every dimension, so a row sealed without them is one this
+        // substrate's own put door refuses.
+        //
+        // Through `envelope::stamp_signed_instants` — the SAME function the
+        // production local-write door stamps with — so the fixture corpus
+        // cannot certify a placement no host writes. It truncates the columns
+        // before mirroring them and clears `expires_at` in both directions;
+        // see its doc for why each of those is load-bearing.
+        crate::federation::envelope::stamp_signed_instants(row).expect("envelope is an object");
+        let mirror = crate::federation::envelope::RowMirror::of(row).expect("finite weight");
+        row.attestation_envelope[paths::ROW] =
+            serde_json::to_value(&mirror).expect("RowMirror serializes");
+        let (och, sc, sp) = sign_envelope(signing_key_id, &row.attestation_envelope);
+        row.original_content_hash = och;
+        row.scrub_signature_classical = sc;
+        row.scrub_signature_pqc = sp;
+    }
+
+    /// v31.0.0 (CIRISPersist#643) — [`seal_row_in_place`] under the row's OWN
+    /// `attesting_key_id`, the overwhelmingly common fixture case.
+    pub fn reseal(row: &mut Attestation) {
+        let signer = row.attesting_key_id.clone();
+        seal_row_in_place(&signer, row);
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the fixture twin of
+    /// `Engine::reseal_for_scope`**: re-stamp `row`'s typed-column mirror for
+    /// the placement it is about to land at, then hybrid-sign the result with
+    /// `signing_key_id`'s deterministic keys.
+    ///
+    /// Both placement-touching directory primitives
+    /// ([`crate::federation::FederationDirectory::promote_attestation`] and
+    /// [`crate::federation::FederationDirectory::set_attestation_cohort_scope`])
+    /// take this bundle, because `cohort_scope` lives INSIDE the signed bytes
+    /// and a placement change is therefore a re-sign. Fixtures use this rather
+    /// than hand-rolling the recipe: a hand-rolled copy that forgets the
+    /// re-stamp is the #649 defect wearing a test's clothes.
+    ///
+    /// `scrub_timestamp` is truncated to the substrate resolution so the
+    /// postgres arm (microseconds) and the in-memory row agree — the #646
+    /// nanosecond skew, avoided rather than re-measured.
+    pub fn reseal_for_scope(
+        signing_key_id: &str,
+        row: &Attestation,
+        cohort_scope: &str,
+    ) -> crate::federation::AttestationReseal {
+        let attestation_envelope = crate::federation::envelope::RowMirror::restamp_for_scope(
+            &row.attestation_envelope,
+            row,
+            cohort_scope,
+        )
+        .expect("finite weight");
+        reseal_over(signing_key_id, attestation_envelope)
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the PRE-#649 shape, on purpose**: sign
+    /// the row's CURRENT envelope, whose mirror still asserts the row's OLD
+    /// `cohort_scope`, and hand it to a placement-touching primitive.
+    ///
+    /// This is what promotion did for the whole of #643's life, and the reason
+    /// a promoted row was refused by every peer. It exists so the witness can
+    /// exercise the defect itself rather than a description of it: a test that
+    /// only ever passes the CORRECT bundle cannot tell whether the re-stamp is
+    /// load-bearing.
+    pub fn reseal_without_restamp(
+        signing_key_id: &str,
+        row: &Attestation,
+    ) -> crate::federation::AttestationReseal {
+        reseal_over(signing_key_id, row.attestation_envelope.clone())
+    }
+
+    fn reseal_over(
+        signing_key_id: &str,
+        attestation_envelope: serde_json::Value,
+    ) -> crate::federation::AttestationReseal {
+        let (original_content_hash, scrub_signature_classical, scrub_signature_pqc) =
+            sign_envelope(signing_key_id, &attestation_envelope);
+        crate::federation::AttestationReseal {
+            attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            scrub_key_id: signing_key_id.to_owned(),
+            scrub_timestamp: crate::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#643) — stamp **every tier-1 binding** and **do not
+    /// sign**.
+    ///
+    /// For the witnesses whose whole point is a row that reaches a LATER gate:
+    /// `unverifiable_row` must clear the tier-1 bindings and then be refused by
+    /// the tier-3 hybrid verify, so sealing it with a valid signature would
+    /// silently relocate what the test measures.
+    ///
+    /// v31.0.0 (CIRISPersist#598) — that means the INSTANTS as well as the
+    /// mirror. `check_instant_binding` became a tier-1 gate on every dimension,
+    /// so a row carrying only the mirror now dies at tier 1 — and a gate-ORDER
+    /// witness that dies at the wrong tier is not measuring the order. Stamping
+    /// them here rather than at the call sites keeps "clears tier 1, dies at
+    /// tier 3" a property of ONE helper, so the next tier-1 gate is added in
+    /// one place instead of silently disarming these witnesses.
+    ///
+    /// Still does not sign, which is the whole distinction from
+    /// [`seal_row_in_place`].
+    pub fn stamp_mirror(row: &mut Attestation) {
+        crate::federation::envelope::stamp_signed_instants(row).expect("envelope is an object");
+        crate::federation::envelope::RowMirror::stamp_row(row).expect("finite weight");
     }
 
     /// v21.0.0 (CIRISPersist#502 E4) — sign a [`Family`](crate::federation::types::Family)
@@ -820,6 +1162,17 @@ pub(crate) mod test_support {
     /// `nonce` is folded into the signed envelope, so two records for the
     /// same `key_id` with different nonces are distinct-but-valid versions
     /// (drives the conflicting-second-version / duplicity rows).
+    ///
+    /// # v31.0.0 (CIRISPersist#659) — the subject is BOUND
+    ///
+    /// The envelope is stamped with `key_id`, `identity_type` and BOTH of the
+    /// subject's pubkeys through the one shared
+    /// [`crate::federation::admission::bind_subject_into_envelope`] before it is
+    /// canonicalized and signed, so every record this helper builds satisfies
+    /// `verify_key_registration`'s subject-binding gate by construction. This
+    /// is a **preimage change** — the signed bytes differ from pre-#659 — but
+    /// not a signature change: the subject's pubkeys are already derived here
+    /// from `key_id`, so no call site moves.
     pub fn replicated_key_record(
         key_id: &str,
         identity_type: &str,
@@ -828,11 +1181,19 @@ pub(crate) mod test_support {
         nonce: &str,
     ) -> crate::federation::KeyRecord {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "key_id": key_id,
             "purpose": "federation-peering",
             "nonce": nonce,
         });
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut envelope,
+            key_id,
+            identity_type,
+            &ed_pk,
+            mldsa_pk.as_deref(),
+        )
+        .expect("bind the #659 subject into the registration envelope");
         let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);
         let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
         crate::federation::KeyRecord {
@@ -882,29 +1243,32 @@ pub(crate) mod test_support {
         });
         let (och, classical, pqc) = sign_envelope(owner, &envelope);
         let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        crate::federation::Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: owner.to_owned(),
-            attested_key_id: node.to_owned(),
-            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-            weight: Some(1.0),
-            asserted_at: ts,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: owner.to_owned(),
-            scrub_timestamp: ts,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        }
+        seal_row(
+            owner,
+            crate::federation::Attestation {
+                attestation_id: id.to_owned(),
+                attesting_key_id: owner.to_owned(),
+                attested_key_id: node.to_owned(),
+                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+                weight: Some(1.0),
+                asserted_at: ts,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+                scrub_key_id: owner.to_owned(),
+                scrub_timestamp: ts,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        )
     }
 }
 
@@ -989,7 +1353,7 @@ mod tests {
             "confidence": 0.9,
         });
         let (och, classical, pqc) = sign_envelope(attester, &envelope);
-        Attestation {
+        let mut sealed_row_ = Attestation {
             // attestation_id is `::uuid`-cast on the PG write path — use a
             // real UUID (project_test_fixtures_uuid_vs_uuid_like); `id` is
             // carried in the signed envelope for per-case uniqueness.
@@ -1018,7 +1382,10 @@ mod tests {
             tier: tier.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// The full CC 5.3.2.4.3.1 ingest-gate matrix, backend-agnostic — runs

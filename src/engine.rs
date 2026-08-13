@@ -130,10 +130,10 @@ use crate::store::Error as StoreError;
 ///
 /// It is a deferred join, not a leak: the runtime is really dropped,
 /// really winds its workers down, and really waits for its in-flight
-/// blocking tasks — and [`wait_quiesced`] lets a caller (a test
+/// blocking tasks — and [`teardown::wait_quiesced`] lets a caller (a test
 /// fixture, a shutdown sequence) block on that completion with a
 /// bound, off the GIL. The only true leak is the thread-spawn-failed
-/// fallback in [`retire_runtime`], which is documented there.
+/// fallback in [`teardown::retire_runtime`], which is documented there.
 ///
 /// # Ordering
 ///
@@ -405,29 +405,32 @@ pub mod teardown {
                 &envelope,
             );
             let now = chrono::Utc::now();
-            let att = crate::federation::Attestation {
-                attestation_id: uuid::Uuid::new_v4().to_string(),
-                attesting_key_id: "probe-stranger".into(),
-                attested_key_id: "probe-victim".into(),
-                attestation_type: "age_assurance:government:adult:v1".into(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: "probe-stranger".into(),
-                scrub_timestamp: now,
-                pqc_completed_at: Some(now),
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: "federation".into(),
-                tier: "federation".into(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            };
+            let att = crate::federation::tier_ingest::test_support::seal_row(
+                "probe-stranger",
+                crate::federation::Attestation {
+                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    attesting_key_id: "probe-stranger".into(),
+                    attested_key_id: "probe-victim".into(),
+                    attestation_type: "age_assurance:government:adult:v1".into(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: och,
+                    scrub_signature_classical: sc,
+                    scrub_signature_pqc: sp,
+                    scrub_key_id: "probe-stranger".into(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: Some(now),
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: "federation".into(),
+                    tier: "federation".into(),
+                    promoted_at: None,
+                    additional_scrubs: Vec::new(),
+                },
+            );
             let err = crate::federation::FederationDirectory::put_attestation(
                 sq.as_ref(),
                 crate::federation::SignedAttestation { attestation: att },
@@ -462,6 +465,23 @@ pub mod teardown {
             }
         }
 
+        /// v31.0.0 (CIRISPersist#658) — how long a test's in-flight blocking
+        /// task stays in flight when nothing releases it.
+        ///
+        /// It is NOT a budget and no assertion compares against it as one. Both
+        /// tests below hold a `spawn_blocking` task open on a channel and
+        /// release it explicitly, so in a healthy run the task waits
+        /// microseconds and this value is never reached. It exists so that a
+        /// REGRESSION — a `retire_runtime` that blocks its caller, which would
+        /// otherwise deadlock against the very channel meant to hold the task
+        /// open — self-releases and lands on a named assertion with a
+        /// diagnosis, instead of hanging until nextest SIGKILLs it at
+        /// `terminate-after` (six minutes, no message, no attribution).
+        ///
+        /// Comfortably under that six-minute kill, and three orders of
+        /// magnitude above anything the healthy path does.
+        const HELD_OPEN: Duration = Duration::from_secs(30);
+
         /// v24.3.0 (CIRISPersist#572) — the ordering contract, with no
         /// backend and no Python in the picture: `retire_runtime`
         /// releases the keepalive strictly AFTER the runtime's
@@ -471,6 +491,24 @@ pub mod teardown {
         /// backend handle while a `spawn_blocking` task is still using
         /// it is a use-after-free, and it is the half of #572 that
         /// presented downstream as "Bus error" rather than as a hang.
+        ///
+        /// # Why there is no elapsed-time assertion here
+        ///
+        /// v31.0.0 (CIRISPersist#658) — "the caller is not the one paying for
+        /// the wait" used to be spelled `t0.elapsed() < 150ms` around a call
+        /// whose one job is to SPAWN AN OS THREAD. That measures the
+        /// scheduler: on a contended box a `thread::Builder::spawn` plus a
+        /// mutex acquisition can take longer than 150 ms while the code under
+        /// test is perfectly correct, and the failure it produces names a
+        /// duration rather than a defect.
+        ///
+        /// The property was never a duration. It is an ORDERING: `retire_runtime`
+        /// returns to its caller while the runtime's blocking work is still
+        /// UNFINISHED. So the task is held open on a channel that only this
+        /// test can close, and the assertion reads the work's own completion
+        /// flag. On a correct implementation the task cannot possibly have
+        /// finished, at any machine speed, because nothing has released it —
+        /// the assertion is exact rather than generous.
         #[test]
         #[serial_test::serial(runtime_teardown_gauge)]
         fn keepalive_outlives_the_runtimes_in_flight_work() {
@@ -479,10 +517,17 @@ pub mod teardown {
 
             let rt = Runtime::new().expect("tokio runtime");
             let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            // The blocking task is held in flight by a CHANNEL, not by a sleep:
+            // the test decides when it finishes, so "still in flight" is a fact
+            // rather than a race against a timer.
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let flag = Arc::clone(&task_finished);
             rt.spawn_blocking(move || {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(400));
+                // `recv_timeout`, not `recv`: see `HELD_OPEN`. A blocking
+                // `recv` would turn the regression this test exists to catch
+                // into an unattributable SIGKILL.
+                let _ = release_rx.recv_timeout(HELD_OPEN);
                 flag.store(true, Ordering::SeqCst);
             });
             // Deterministic: the task has begun, so tokio's shutdown
@@ -493,15 +538,23 @@ pub mod teardown {
                 task_finished: Arc::clone(&task_finished),
                 saw_finished: Arc::clone(&saw_finished),
             };
-            let t0 = std::time::Instant::now();
             retire_runtime(rt, Box::new(witness));
-            // The caller is not the one paying for the wait.
+            // The caller is not the one paying for the wait — and nothing has
+            // released the task yet, so on a correct implementation this flag
+            // is false no matter how slow the box is.
             assert!(
-                t0.elapsed() < Duration::from_millis(150),
-                "retire_runtime blocked the caller for {:?}",
-                t0.elapsed()
+                !task_finished.load(Ordering::SeqCst),
+                "retire_runtime did not return until the runtime's in-flight blocking task \
+                 had finished. Nothing in this test released that task, so the only way to \
+                 observe it finished is to have waited {HELD_OPEN:?} for its own self-release \
+                 — i.e. retire_runtime blocked its caller on work the caller does not own \
+                 (#572). This is not a slow machine; it is the contract inverted."
             );
 
+            // Now let the runtime wind down, and only now.
+            release_tx
+                .send(())
+                .expect("the blocking task must still be waiting to be released");
             assert!(
                 wait_quiesced(Duration::from_secs(10)),
                 "retirement never completed"
@@ -517,26 +570,71 @@ pub mod teardown {
         /// v24.3.0 (CIRISPersist#572) — a `false` from `wait_quiesced`
         /// is a value, not a hang: the bound is honoured and the
         /// retirement keeps running on its own thread.
+        ///
+        /// # The one place a real-time bound IS the property
+        ///
+        /// v31.0.0 (CIRISPersist#658) — unlike its neighbour, this test cannot
+        /// be rewritten free of wall clocks: `wait_quiesced(d)` takes a
+        /// `Duration` and the whole claim is that it honours it. What it CAN
+        /// do is stop measuring the machine.
+        ///
+        /// The in-flight work is held open for [`HELD_OPEN`] instead of a
+        /// 800 ms sleep, which widens the gap the assertion has to straddle
+        /// from 100 ms-vs-800 ms (8x) to 100 ms-vs-30 s (300x). The two
+        /// readings a breach must tell apart are "waited for the BOUND" and
+        /// "waited for the WORK", and the threshold sits a factor of 30 above
+        /// the first and a factor of 10 below the second. A scheduler does not
+        /// dilate a single condvar timeout by 30x; a `wait_quiesced` that
+        /// ignores its argument misses by 300x.
+        ///
+        /// The LOWER bound is the half that can never flake — slowness only
+        /// makes it more true — and it is what stops a `wait_quiesced` that
+        /// returns `false` instantly from passing this test vacuously.
         #[test]
         #[serial_test::serial(runtime_teardown_gauge)]
         fn wait_quiesced_honours_its_bound() {
+            /// The argument under test.
+            const BOUND: Duration = Duration::from_millis(100);
+            /// 30x the bound, a tenth of the work. See the doc-comment.
+            const CEILING: Duration = Duration::from_secs(3);
+
             let rt = Runtime::new().expect("tokio runtime");
             let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             rt.spawn_blocking(move || {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(800));
+                let _ = release_rx.recv_timeout(HELD_OPEN);
             });
             started_rx.recv().expect("blocking task must start");
             retire_runtime(rt, Box::new(()));
 
             let t0 = std::time::Instant::now();
-            let quiesced = wait_quiesced(Duration::from_millis(100));
+            let quiesced = wait_quiesced(BOUND);
             let waited = t0.elapsed();
-            assert!(!quiesced, "should have reported a timeout");
+            // Exact, not timing-dependent: nothing has released the in-flight
+            // task, so the retirement CANNOT have completed.
             assert!(
-                waited < Duration::from_millis(400),
-                "the bound was not honoured; waited {waited:?}"
+                !quiesced,
+                "wait_quiesced reported the process quiesced, but the retirement's blocking \
+                 task has not been released and so cannot have finished — a `true` here is a \
+                 false quiesce, which is the use-after-free window #572 closed"
             );
+            assert!(
+                waited >= BOUND,
+                "wait_quiesced({BOUND:?}) returned after only {waited:?} — it reported a \
+                 timeout without waiting for one, so the bound is not a bound"
+            );
+            assert!(
+                waited < CEILING,
+                "wait_quiesced({BOUND:?}) took {waited:?}. The in-flight work is held for \
+                 {HELD_OPEN:?} and the bound is {BOUND:?}, so this is not a slow box: it \
+                 waited for the WORK instead of for the BOUND, which is the blocking-teardown \
+                 wedge #572 exists to prevent."
+            );
+
+            release_tx
+                .send(())
+                .expect("the blocking task must still be waiting to be released");
             // Still true afterwards: it finishes on its own.
             assert!(wait_quiesced(Duration::from_secs(10)));
         }
@@ -869,28 +967,61 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
+        // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
+        // `Backend` has no signer; this is the first point at which the backend
+        // and the signing key exist together. Idempotent, resumable, and never
+        // boot-fatal — see `federation::migration`.
+        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
-    /// v13.3.1 (CIRISPersist#387) — **TEST-ONLY** constructor: identical to
-    /// [`with_signer`](Self::with_signer) (connect + run migrations) but it
+    /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**: identical
+    /// to [`with_signer`](Self::with_signer) (connect + run migrations) but it
     /// **SKIPS the HUMANITY_ACCORD genesis seed** — no baked A1/B1/C1 holder
-    /// rows, no entrenched family row. Gated behind the `test-genesis-seam`
-    /// cargo feature (default OFF, absent from release builds), so this cannot
-    /// be reached in production — a node without the baked trust root is broken.
+    /// rows, no entrenched family row, no canonical.
     ///
-    /// The seed is deliberately **unconditional** in prod ([`with_signer`]): the
-    /// baked accord family IS the immutable trust root, and the assemble
-    /// ceremony is idempotent (an already-entrenched family is a no-op, never a
-    /// replacement — else a node owner could overwrite the constitutional family
-    /// with their own holders). This seam exists ONLY so downstream integration
-    /// tests can assemble a *controllable* custom-holder `humanity-accord`
-    /// family (with holders they can sign as) without the baked A1/B1/C1 +
-    /// family causing a UNIQUE conflict or an unsignable roster. Enable it in
-    /// `[dev-dependencies]` (e.g. CIRISServer's test build), never in
-    /// `[dependencies]`.
-    #[cfg(feature = "test-genesis-seam")]
-    pub async fn with_signer_no_genesis_seed(
+    /// This is a **supported, default-features** entry point as of 31.0.0. It
+    /// was `with_signer_no_genesis_seed`, fenced behind the `test-genesis-seam`
+    /// cargo feature and absent from every release build, on the reasoning that
+    /// *"a node without the baked trust root is broken"*. 31.0.0 is the release
+    /// that disproves that: it is the binary that RUNS the genesis ceremony
+    /// which produces the root a later cut bakes, so it has to be able to start
+    /// without one. The seam is not test-only any more; it is the boot mode of
+    /// a node that has not had its ceremony yet, and the feature that fenced it
+    /// is removed.
+    ///
+    /// # This is not a relaxation
+    ///
+    /// An Engine built here reports
+    /// [`GenesisPosture::PreGenesis`](crate::federation::genesis::GenesisPosture::PreGenesis)
+    /// from [`genesis_posture`](Self::genesis_posture), and every gate in
+    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// refuses with
+    /// [`Error::NoConstitutionalRootYet`](crate::federation::Error::NoConstitutionalRootYet).
+    /// A node with no trust root is a node that trusts nothing — it is NOT a
+    /// node that therefore checks nothing. Absence of a root is not absence of
+    /// a rule.
+    ///
+    /// # What it is still for, unchanged
+    ///
+    /// Downstream integration tests that assemble a *controllable*
+    /// custom-holder `humanity-accord` family (holders they can sign as) still
+    /// use it, and for the same reason: the baked A1/B1/C1 + family would
+    /// otherwise cause a UNIQUE conflict or an unsignable roster. That use is
+    /// now a special case of the general one rather than a fenced exception.
+    ///
+    /// # What has NOT changed
+    ///
+    /// The assemble ceremony remains **idempotent**: an already-entrenched
+    /// family is a no-op, never a replacement, so a node owner cannot overwrite
+    /// the constitutional family with their own holders. Trust roots CO-EXIST —
+    /// a second ceremony ADDS a root, addressed by its own `root_ref` and
+    /// resolved per user — and none of that is a licence to mutate a root that
+    /// already stands. See
+    /// [`seed_accord_family`](crate::federation::genesis::seed_accord_family)
+    /// and [`Error::ConstitutionalFamilyReserved`](crate::federation::Error::ConstitutionalFamilyReserved).
+    pub async fn with_signer_pre_genesis(
         signer: Arc<LocalSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
@@ -916,6 +1047,13 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
+        // pre-genesis node usually has nothing to migrate (no identity ⇒ no
+        // authorship), and the routine returns early in that case; but a node
+        // that HAS an identity and no trust root still owns rows, and
+        // withholding the migration from this constructor would make the
+        // corpus's shape depend on which constructor the host happened to use.
+        crate::federation::migration::run_v31_migration_at_boot(&engine).await;
         Ok(engine)
     }
 
@@ -987,7 +1125,7 @@ impl Engine {
     /// unlike [`Engine::with_signer_arcs`] (hybrid but with a **plaintext**
     /// Ed25519, defeating custody), an Engine built here produces a real
     /// [`ciris_crypto::HybridSignature`] — Ed25519 from the
-    /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`] — so the
+    /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`](ciris_keyring::PqcSigner) — so the
     /// storage-tier scrub signature (the produce/promote path that calls
     /// [`Engine::sign_hybrid`]) is hybrid **without ever unsealing the
     /// Ed25519 key**.
@@ -1220,7 +1358,8 @@ impl Engine {
 
     /// v6.8.0 (CIRISPersist#149) — is `attesting_key_id` local-or-family
     /// (and therefore NEVER refused / never proxy)? Uses the installed
-    /// [`DiskPressureConfig::is_family`] predicate against the local
+    /// [`DiskPressureConfig::is_local_or_family`](crate::federation::DiskPressureConfig::is_local_or_family)
+    /// predicate against the local
     /// signer key_id. With no disk-pressure config installed, only the
     /// local signer itself is treated as protected. This is the SAME
     /// classification the force-evict-proxy-first sweep uses.
@@ -1474,7 +1613,7 @@ impl Engine {
     /// v3.4.0 (CIRISPersist#123) — drive one sweep cycle against the
     /// underlying `federation_blobs` table. Returns a
     /// [`crate::federation::SweepReport`] summarizing the result. A
-    /// no-op when no [`ReplicationConfig`] is configured or
+    /// no-op when no [`ReplicationConfig`](crate::federation::ReplicationConfig) is configured or
     /// `storage_budget_bytes == u64::MAX`.
     ///
     /// Sovereign Pi-cron callers + the spawned-sweeper loop both call
@@ -1614,7 +1753,7 @@ impl Engine {
             }
         };
 
-        // v12.7.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
+        // v13.0.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
         // StorageBudgetV1 state (V092; written only after the PQC-mandatory
         // verify + B3 anti-rollback in `install_storage_budget_v1`) into
         // this cycle's pin classification:
@@ -1787,15 +1926,18 @@ impl Engine {
     }
 
     /// v3.4.0 (CIRISPersist#123) — spawn the background eviction
-    /// sweeper. Returns an [`EvictionSweeper`] handle whose
-    /// [`EvictionSweeper::stop`] method shuts the loop down. The
+    /// sweeper. Returns an [`EvictionSweeper`](crate::federation::EvictionSweeper)
+    /// handle whose
+    /// [`EvictionSweeper::stop`](crate::federation::EvictionSweeper::stop)
+    /// method shuts the loop down. The
     /// loop calls [`Engine::sweep_evictions_once`] every
     /// `cfg.sweep_interval` (clamped below by
     /// [`crate::federation::MIN_SWEEP_INTERVAL`]).
     ///
     /// Sovereign mode: the Rust-side caller owns the
-    /// [`EvictionSweeper`] handle and calls `.stop()` on shutdown.
-    /// PyO3 mode: the [`crate::ffi::pyo3::EngineCell`] owns the
+    /// [`EvictionSweeper`](crate::federation::EvictionSweeper) handle and calls
+    /// `.stop()` on shutdown.
+    /// PyO3 mode: `ffi::pyo3`'s private `EngineCell` owns the
     /// handle so all `PyEngine` clones share one loop —
     /// [`Engine::from_shared`] does NOT spawn a second loop.
     ///
@@ -1888,7 +2030,7 @@ impl Engine {
         }
     }
 
-    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// v7.0.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys).
     ///
@@ -2121,9 +2263,9 @@ impl Engine {
         }
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
 
-    /// v12.7.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
+    /// v13.0.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
     /// signed `StorageBudgetV1` so it GOVERNS this node's capacity
     /// eviction (#356 shipped build/verify as wire-negotiation only).
     /// Three gates, in order:
@@ -2131,7 +2273,9 @@ impl Engine {
     /// 1. **PQC-mandatory bound-hybrid verify at ingest, BEFORE
     ///    persistence** (CC 5.3.2.4.3.1 store-path / CC 6.1.3): the wire's
     ///    Ed25519 + ML-DSA-65 halves must verify against the owner pubkeys
-    ///    — reuses [`verify_storage_budget_wire`]. This also re-runs the
+    ///    — reuses
+    ///    [`verify_storage_budget_wire`](crate::fountain::storage_contention::verify_storage_budget_wire).
+    ///    This also re-runs the
     ///    structural validation (no `self`/`family` scope, `pin_reserve ≤
     ///    budget`, sorted + deduped lists).
     /// 2. **§Q B3 anti-rollback**: a candidate whose `revision` does not
@@ -2615,7 +2759,8 @@ impl Engine {
     /// was constructed via [`Engine::from_shared`] (no LocalSigner
     /// propagation — the cohabitation accessor path); rebuild the
     /// caller-side LocalSigner from
-    /// `PyEngine::keyring_signer()`'s [`KeyringSignerHandle`] in that
+    /// `PyEngine::keyring_signer()`'s
+    /// [`KeyringSignerHandle`](crate::signing::KeyringSignerHandle) in that
     /// case. Returns
     /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured)
     /// when the Engine has a LocalSigner but no PQC identity
@@ -2712,6 +2857,23 @@ impl Engine {
     ///
     /// The ML-DSA half is left to the cold-path PQC fill (matches the
     /// pre-#275 shape). Returns the registered (derived) key_id.
+    ///
+    /// # v31.0.0 (CIRISPersist#659) — BREAKING: the caller's envelope is
+    /// subject-BOUND before it is signed
+    ///
+    /// `registration_envelope` is stamped with the derived `key_id`, the
+    /// `identity_type` argument and BOTH of this engine's pubkeys through
+    /// [`admission::bind_subject_into_envelope`](crate::federation::admission::bind_subject_into_envelope)
+    /// — the one shared projection — before it is canonicalized and signed.
+    /// Every other field the caller passed survives untouched; the bound keys
+    /// are overwritten if present.
+    ///
+    /// This is a **preimage change** for the node's own bootstrap row, and it
+    /// is not cosmetic: that row replicates, and at every peer it lands on the
+    /// `Insert` branch of `apply_replicated_key_record`, which runs
+    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+    /// — now REQUIRING the binding. Minting the row unbound would succeed
+    /// locally and be refused by the entire mesh.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn register_self_federation_key(
         &self,
@@ -2747,6 +2909,59 @@ impl Engine {
         })?;
         let pubkey_ed25519_base64 = B64.encode(&pubkey);
 
+        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
+        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
+        // the engine has a PQC identity. Pre-#275 the row left
+        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
+        // that never runs in a standalone / SQLite wheel). A registered key
+        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
+        // every hybrid-signed emission verified against it
+        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
+        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
+        // So a node that registered itself could not emit. The classical half
+        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
+        // identity in `pubkey_ed25519_base64`), so the row is internally
+        // consistent.
+        //
+        // v31.0.0 (CIRISPersist#659) — resolved BEFORE the envelope is
+        // canonicalized, because the subject binding below names it. The row's
+        // PQC leg and the leg the signature covers are now the same statement.
+        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
+            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
+            })?,
+            None => None,
+        };
+
+        // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
+        // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
+        // §5.6.8.15 gate is for PEER registration, see below) but it is
+        // verified at every PEER it replicates to: a fresh `key_id` arriving
+        // through `apply_replicated_key_record` takes the `Insert` branch and
+        // meets `verify_key_registration`, which now REQUIRES the binding. A
+        // node minting a subject-blind bootstrap row would register fine
+        // locally and be refused by the whole mesh — fail-closed, but
+        // fail-closed on the wrong side of the wire, and invisible until
+        // peering. The caller's envelope is otherwise untouched.
+        //
+        // v31.0.0 (CIRISVerify 13.1.0) — `identity_type` is bound to the
+        // PARAMETER, which is exactly the value the row is stored with a few
+        // lines below (`identity_type: identity_type.to_owned()`), unmodified
+        // and with nothing in between that could rewrite it. That equality is
+        // the whole requirement: this row replicates, every peer re-checks the
+        // binding against the COLUMN it arrives carrying, and binding anything
+        // other than the stored standing would make the node's own bootstrap
+        // row unreplicatable.
+        let mut registration_envelope = registration_envelope;
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut registration_envelope,
+            &key_id,
+            identity_type,
+            &pubkey_ed25519_base64,
+            pqc_pubkey_b64.as_deref(),
+        )
+        .map_err(crate::federation::Error::InvalidArgument)?;
+
         // Canonicalize the registration envelope with the production
         // Python-dumps canonicalizer (the rule the manual/FFI workflow
         // signs over), SHA-256 it, and classically self-sign with the
@@ -2767,25 +2982,6 @@ impl Engine {
             dt.with_nanosecond(micros * 1000).unwrap_or(dt)
         };
 
-        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
-        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
-        // the engine has a PQC identity. Pre-#275 the row left
-        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
-        // that never runs in a standalone / SQLite wheel). A registered key
-        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
-        // every hybrid-signed emission verified against it
-        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
-        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
-        // So a node that registered itself could not emit. The classical half
-        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
-        // identity in `pubkey_ed25519_base64`), so the row is internally
-        // consistent.
-        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
-            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
-            })?,
-            None => None,
-        };
         let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
             if pqc_pubkey_b64.is_some() {
                 let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
@@ -3035,6 +3231,13 @@ impl Engine {
             );
             // CC#38 size discipline — oversize reassemblies take the
             // manifest form, same as the live mint.
+            //
+            // v31.0.0 (CIRISPersist#653) — and it inherits the live mint's caveat with
+            // it: these are the PRODUCER's bytes, not the stored ones, which
+            // also carry persist's own #643 mirror and #598 instants stamped
+            // at the local write door. See
+            // `ingest::IngestPipeline::build_trace_attestation_input` for why
+            // the headroom is not reserved on this side of the door.
             let value = envelope.to_value();
             let canonical = crate::verify::canonical::ceg_produce_canonicalize(&value)
                 .map_err(|e| Error::InvalidArgument(format!("backfill canonicalize: {e}")))?;
@@ -3080,7 +3283,32 @@ impl Engine {
             };
             match outcome {
                 Ok(_) => report.minted += 1,
-                Err(e) => report.skipped.push((trace_id, e.kind().to_owned())),
+                Err(e) => {
+                    // v31.0.0 (CIRISPersist#598) — the refusal REACHES A LOG,
+                    // not only the report. `TraceBackfillReport::skipped`
+                    // carries `(trace_id, error KIND)` and is a public
+                    // serde-stable shape, so the gate's own sentence — the one
+                    // naming the column and the issue — had nowhere to go and
+                    // was dropped on the floor at the only site that saw it.
+                    //
+                    // Same lesson as the live mint's warn in
+                    // `ingest::receive_and_persist_with`, one door over: when
+                    // #598 made the local write door refuse every durable mint,
+                    // this loop reported one `(trace_id,
+                    // "federation_invalid_argument")` pair per trace in the
+                    // corpus and said nothing else. A backfill is an
+                    // operator-run repair;
+                    // it must be able to tell an operator why it repaired
+                    // nothing.
+                    tracing::warn!(
+                        write_path = "trace_backfill",
+                        trace_id = %trace_id,
+                        reason = %e.kind(),
+                        error = %e,
+                        "ciris-persist: trace attestation backfill skipped (#478)"
+                    );
+                    report.skipped.push((trace_id, e.kind().to_owned()));
+                }
             }
         }
         Ok(report)
@@ -3126,8 +3354,6 @@ impl Engine {
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
 
         // v21.5.0 (CIRISPersist#519) — a promotion is a PLACEMENT-touching
         // primitive: it MUST carry the placement, not tier alone. Before #519
@@ -3191,61 +3417,30 @@ impl Engine {
         // `(federation, new)` with no intermediate state and no partial
         // application on refusal.
 
-        // 2. Canonicalize the envelope (produce gate → JCS post-cut) + hash.
-        let canonical = crate::verify::canonical::ceg_produce_canonicalize(
-            &row.attestation_envelope,
-        )
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("attestation_promote canonicalize: {e}"))
-        })?;
-        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
+        // 2. RE-STAMP → canonicalize → hash → hybrid-sign, in one recipe (see
+        // [`Self::reseal_for_scope`] — v31.0.0 / CIRISPersist#649).
+        let reseal = self
+            .reseal_for_scope(
+                &row.attestation_envelope,
+                &row,
+                cohort_scope,
+                "attestation_promote",
+            )
+            .await?;
 
-        // 3. Hybrid-sign the canonical bytes (matches the native produce
-        // path: signer.sign(canonical_bytes)).
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("attestation_promote sign_hybrid: {e}"))
-        })?;
-        let classical_b64 = B64.encode(&sig.classical.signature);
-        let pqc_b64 = B64.encode(&sig.pqc.signature);
-        // v9.3.0 (#247) — `scrub_key_id` FKs to `federation_keys(key_id)`,
-        // which is the **derived** wire key_id (`<label>-<fp>`), NOT the
-        // keystore alias `current_alias()`. Using the alias FK-violated on
-        // every node whose alias ≠ derived id (i.e. every real node).
-        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "attestation_promote derive scrub_key_id: {e}"
-            ))
-        })?;
-        let now = chrono::Utc::now();
-
-        // 4. Write back the scrub envelope + flip tier (signed-epoch gate
-        // on the verify side will read these post-cut as JCS).
+        // 3. Write back the re-stamped envelope + scrub envelope + flip tier
+        // (signed-epoch gate on the verify side will read these post-cut as
+        // JCS).
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                b.promote_attestation(
-                    attestation_id,
-                    cohort_scope,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(attestation_id, cohort_scope, &reseal)
+                    .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                b.promote_attestation(
-                    attestation_id,
-                    cohort_scope,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(attestation_id, cohort_scope, &reseal)
+                    .await
             }
         }
     }
@@ -3331,8 +3526,9 @@ impl Engine {
     /// P3 follow-up) — `to_transform_ops` skips them. When the resulting
     /// pipeline is non-empty, [`Self::promote_attestation_with_transforms`]
     /// signs the TRANSFORMED envelope and writes it back via
-    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`];
-    /// with an EMPTY pipeline (no restrictions, or only
+    /// [`crate::federation::FederationDirectory::promote_attestation`] (the
+    /// one promotion primitive since v31.0.0 / CIRISPersist#649); with an
+    /// EMPTY pipeline (no restrictions, or only
     /// `RecipientCapability` ones), [`Self::attestation_promote`] is used
     /// unchanged (the byte-identical-wire property #509 established is
     /// preserved for the common case). v21.7.0 kept the closed
@@ -3599,17 +3795,39 @@ impl Engine {
                     continue;
                 }
 
-                let rescope_result = match &self.backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(b) => {
-                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
-                            .await
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(b) => {
-                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
-                            .await
-                    }
+                // v31.0.0 (CIRISPersist#649) — A RE-SCOPE IS A RE-SIGN. This
+                // motion's own doc used to say `cohort_scope` sits "outside the
+                // signed envelope, so the scrub signature stays valid";
+                // CIRISPersist#643 made that false by binding it into
+                // `envelope.row`. Re-scoping in place therefore produced a row
+                // whose signed mirror asserted the OLD suppressed scope — a row
+                // the repair made visible and every peer refused, which is a
+                // repair that fixes the symptom and breaks the thing. So the
+                // mirror is re-stamped and the row re-signed with this node's
+                // key, exactly as `attestation_promote` does at the first
+                // placement door.
+                let rescope_result = self
+                    .reseal_for_scope(
+                        &row.attestation_envelope,
+                        row,
+                        &target,
+                        "repair_stranded_scope_backlog",
+                    )
+                    .await;
+                let rescope_result = match rescope_result {
+                    Ok(reseal) => match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            b.set_attestation_cohort_scope(&row.attestation_id, &target, &reseal)
+                                .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            b.set_attestation_cohort_scope(&row.attestation_id, &target, &reseal)
+                                .await
+                        }
+                    },
+                    Err(e) => Err(e),
                 };
                 match rescope_result {
                     Ok(()) => report.rescoped += 1,
@@ -3636,7 +3854,10 @@ impl Engine {
     /// hybrid-sign the TRANSFORMED bytes (NEVER the original — the
     /// signature must cover exactly what a recipient will see), and write
     /// back through
-    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`].
+    /// [`crate::federation::FederationDirectory::promote_attestation`] — the ONE
+    /// promotion primitive since v31.0.0 (CIRISPersist#649), which the #510
+    /// `_transformed` variant was folded into once EVERY promotion had to write
+    /// its envelope back.
     /// `original_content_hash` is the hash of the TRANSFORMED canonical —
     /// it is the content actually signed/shipped, matching how
     /// [`Self::attestation_promote`] hashes the (untransformed) canonical
@@ -3666,6 +3887,88 @@ impl Engine {
     /// (`dimension`/`trace_id` never stripped) lives inside
     /// [`crate::federation::transform::apply`]'s `StripField` arm, so it
     /// holds unchanged through the pipeline.
+    /// v31.0.0 (CIRISPersist#649) — **the ONE recipe for a placement-touching
+    /// re-sign**: re-stamp the typed-column mirror for the scope the row is
+    /// about to land at, canonicalize, hash, hybrid-sign, and resolve this
+    /// node's DERIVED federation key_id.
+    ///
+    /// All three placement-touching motions go through here —
+    /// [`Self::attestation_promote`],
+    /// [`Self::promote_attestation_with_transforms`] and
+    /// [`Self::repair_stranded_scope_backlog`] — because the defect this
+    /// closes was three copies of "canonicalize → sign → write a different
+    /// `cohort_scope`", and a fourth copy is how it comes back. `base` is the
+    /// envelope whose bytes will be SERVED: the row's own, or a #510
+    /// restriction pipeline's output.
+    ///
+    /// The re-stamp is [`crate::federation::envelope::RowMirror::restamp_for_scope`],
+    /// which is [`crate::federation::envelope::RowMirror::of`] — the SAME
+    /// projection [`crate::federation::admission::check_row_column_binding`]
+    /// compares against. There is no second spelling of it anywhere.
+    ///
+    /// # Canonical at rest (CIRISPersist#647)
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the envelope this returns is the CANONICAL
+    /// one, not the value the re-stamp happened to build. It used to
+    /// canonicalize only to hash and to sign, and then hand back the
+    /// un-canonicalized `Value`; every backend's bind site does
+    /// `serde_json::to_string(&reseal.attestation_envelope)`, so the column
+    /// stored a byte sequence that was NOT the one
+    /// `original_content_hash` digests. `sha256(stored column) !=
+    /// original_content_hash` for every promoted and every scope-changed row,
+    /// which is the one invariant #647 exists to state.
+    ///
+    /// Fixed HERE, at the producer, and deliberately not at
+    /// `promote_attestation` and `set_attestation_cohort_scope` — those are the
+    /// two CONSUMERS of this one recipe, and a defect that exists because a
+    /// motion had several spellings is not repaired by giving its fix several
+    /// spellings too.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn reseal_for_scope(
+        &self,
+        base: &serde_json::Value,
+        row: &crate::federation::Attestation,
+        cohort_scope: &str,
+        what: &str,
+    ) -> Result<crate::federation::AttestationReseal, crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let mut attestation_envelope =
+            crate::federation::envelope::RowMirror::restamp_for_scope(base, row, cohort_scope)?;
+        // Canonicalize the VALUE, not just a copy of its bytes: after this the
+        // envelope's own `serde_json` serialization IS `canonical`, so the
+        // column a backend writes sha256sums to `original_content_hash`.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut attestation_envelope)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("{what} canonicalize at rest: {e}"))
+            })?;
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&attestation_envelope)
+            .map_err(|e| {
+            crate::federation::Error::Backend(format!("{what} canonicalize: {e}"))
+        })?;
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let sig = self
+            .sign_hybrid(&canonical)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("{what} sign_hybrid: {e}")))?;
+        // v9.3.0 (#247) — `scrub_key_id` FKs to `federation_keys(key_id)`,
+        // which is the **derived** wire key_id (`<label>-<fp>`), NOT the
+        // keystore alias `current_alias()`. Using the alias FK-violated on
+        // every node whose alias ≠ derived id (i.e. every real node).
+        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("{what} derive scrub_key_id: {e}"))
+        })?;
+        Ok(crate::federation::AttestationReseal {
+            attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            scrub_key_id,
+            scrub_timestamp: chrono::Utc::now(),
+        })
+    }
+
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn promote_attestation_with_transforms(
         &self,
@@ -3675,8 +3978,6 @@ impl Engine {
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
 
         // v21.5.0 (CIRISPersist#519) — placement carriage, same contract as
         // `attestation_promote`: the transform path is also a placement-
@@ -3687,8 +3988,8 @@ impl Engine {
         // `set_attestation_cohort_scope` pre-stamp is GONE for the same reason
         // it is gone from `attestation_promote`: promotion can now be REFUSED
         // by `check_promotion_admission`, and a pre-stamp would leave a refused
-        // row mutated (AV-9). The placement rides
-        // `promote_attestation_transformed` and lands with the tier flip.
+        // row mutated (AV-9). The placement rides the promotion primitive and
+        // lands with the tier flip.
         if !cs::is_valid(cohort_scope) || cohort_scope == cs::SELF {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "promote_attestation_with_transforms: cohort_scope {cohort_scope:?} is not a \
@@ -3702,56 +4003,29 @@ impl Engine {
                 "promote_attestation_with_transforms apply_all: {e}"
             ))
         })?;
-
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&transformed).map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "promote_attestation_with_transforms canonicalize: {e}"
-                ))
-            })?;
-        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
-        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "promote_attestation_with_transforms sign_hybrid: {e}"
-            ))
-        })?;
-        let classical_b64 = B64.encode(&sig.classical.signature);
-        let pqc_b64 = B64.encode(&sig.pqc.signature);
-        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "promote_attestation_with_transforms derive scrub_key_id: {e}"
-            ))
-        })?;
-        let now = chrono::Utc::now();
+        // v31.0.0 (CIRISPersist#649) — the SAME recipe the untransformed path
+        // runs, over the TRANSFORMED bytes: a restriction pipeline is just a
+        // different `base`. The mirror is stamped AFTER the pipeline, so a
+        // strip can never leave the binding half-applied.
+        let reseal = self
+            .reseal_for_scope(
+                &transformed,
+                row,
+                cohort_scope,
+                "promote_attestation_with_transforms",
+            )
+            .await?;
 
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                b.promote_attestation_transformed(
-                    &row.attestation_id,
-                    cohort_scope,
-                    &transformed,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+                    .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                b.promote_attestation_transformed(
-                    &row.attestation_id,
-                    cohort_scope,
-                    &transformed,
-                    &classical_b64,
-                    Some(&pqc_b64),
-                    &original_content_hash_hex,
-                    &scrub_key_id,
-                    now,
-                )
-                .await
+                b.promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+                    .await
             }
         }
     }
@@ -3763,7 +4037,8 @@ impl Engine {
     /// → SHA-256 (`original_content_hash`) → hybrid-sign
     /// ([`LocalSigner::sign_hybrid`](crate::signing::LocalSigner::sign_hybrid),
     /// Ed25519 + ML-DSA-65 bound, the v9.0.0 / CC 5.3.2.4.3.1 PQC
-    /// requirement) → assemble the 20-field [`Attestation`] →
+    /// requirement) → assemble the 20-field
+    /// [`Attestation`](crate::federation::Attestation) →
     /// [`put_attestation`](crate::federation::FederationDirectory::put_attestation).
     /// Returns the `attestation_id`.
     ///
@@ -3773,10 +4048,13 @@ impl Engine {
     /// helper NEVER trusts a caller alias, which structurally kills the
     /// #247 FK-violation class (the same bug `attestation_promote` had).
     /// `attested_key_id` defaults to the derived key_id (self-attestation)
-    /// when [`EmitAttestationInput::attested_key_id`] is `None`.
+    /// when
+    /// [`EmitAttestationInput::attested_key_id`](crate::federation::types::EmitAttestationInput::attested_key_id)
+    /// is `None`.
     ///
-    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
-    /// [`EmitAttestationInput::attested_key_id`] names the row's **SUBJECT**
+    /// v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
+    /// [`EmitAttestationInput::attested_key_id`](crate::federation::types::EmitAttestationInput::attested_key_id)
+    /// names the row's **SUBJECT**
     /// (the natural CEG cross-subject edge target, exactly how
     /// [`Self::grant_delegation`] keys a `delegates_to` by its recipient).
     /// This is the **witness-targets-subject** age-assurance surface: a
@@ -3803,7 +4081,7 @@ impl Engine {
     pub async fn emit_attestation(
         &self,
         signer: &crate::signing::LocalSigner,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
         // Derive the registered federation key_id from the signer itself
         // (#247 floor) — never a caller-supplied alias.
@@ -3813,7 +4091,10 @@ impl Engine {
         // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
         // cannot emit a conformant federation-tier attestation — surface
         // honestly with the same message the self-emit path uses.
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
@@ -3828,7 +4109,8 @@ impl Engine {
     /// v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN
     /// **composed signer** (`Arc<dyn HardwareSigner>`), the common case: a
     /// node emitting a federation-tier row about itself with its configured
-    /// identity. Same canonicalize → hybrid-sign → 20-field [`Attestation`]
+    /// identity. Same canonicalize → hybrid-sign → 20-field
+    /// [`Attestation`](crate::federation::Attestation)
     /// → [`put_attestation`](crate::federation::FederationDirectory::put_attestation)
     /// recipe as [`Self::emit_attestation`], but signs via
     /// [`Self::sign_hybrid`] and derives `attesting_key_id`/`scrub_key_id`
@@ -3850,7 +4132,7 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn emit_attestation_self(
         &self,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
         // #247-correct derived federation key_id of the engine's own
         // composed signer (works for software + hardware-hybrid alike).
@@ -3858,7 +4140,10 @@ impl Engine {
             crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
         })?;
 
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
         // so a hardware-hybrid engine can emit here.
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
@@ -3899,14 +4184,17 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn assemble_attestation_self(
         &self,
-        input: crate::federation::EmitAttestationInput,
+        mut input: crate::federation::EmitAttestationInput,
     ) -> Result<crate::federation::SignedAttestation, crate::federation::Error> {
         let key_id = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "assemble_attestation_self derive key_id: {e}"
             ))
         })?;
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
+        // v31.0.0 (CIRISPersist#598) — stamp the row instants INTO the
+        // envelope before the bytes are signed; `assemble` reads them back out
+        // instead of sampling a second clock after the signature exists.
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "assemble_attestation_self sign_hybrid: {e} — a conformant federation-tier row \
@@ -3925,13 +4213,28 @@ impl Engine {
     /// content.
     ///
     /// v25.1.0 (CIRISPersist#582) — delegates to
-    /// [`attestation_emit::canonicalize`](crate::federation::attestation_emit::canonicalize),
+    /// [`attestation_emit::stamp_and_canonicalize`](crate::federation::attestation_emit::stamp_and_canonicalize),
     /// the backend-generic half of the recipe.
+    ///
+    /// v31.0.0 (CIRISPersist#598) — takes `&mut input` rather than a bare
+    /// envelope `Value`: the row instants are stamped into the envelope HERE,
+    /// before the bytes exist, so the signature covers them and
+    /// [`assemble`](crate::federation::attestation_emit::assemble) can read
+    /// them back out instead of sampling its own clock afterwards.
+    ///
+    /// v31.0.0 (CIRISPersist#643) — takes the signer's DERIVED `key_id` too:
+    /// the typed-column mirror stamped here must carry the EFFECTIVE
+    /// `attested_key_id`, which for a self-attestation is that key_id.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn emit_canonicalize(
-        envelope: &serde_json::Value,
+        input: &mut crate::federation::EmitAttestationInput,
+        attesting_key_id: &str,
     ) -> Result<Vec<u8>, crate::federation::Error> {
-        crate::federation::attestation_emit::canonicalize(envelope)
+        crate::federation::attestation_emit::stamp_and_canonicalize(
+            input,
+            attesting_key_id,
+            chrono::Utc::now(),
+        )
     }
 
     /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
@@ -4044,7 +4347,7 @@ impl Engine {
     /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
     ///
-    /// v12.7.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
+    /// v13.0.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
     /// governed by the user-target steward-binding gate
     /// ([`check_user_target_steward_binding_admission`](crate::federation::admission::check_user_target_steward_binding_admission)):
     /// the ONLY admissible user-target shapes are **minor-guardianship**
@@ -4880,7 +5183,8 @@ impl Engine {
     /// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` /
     /// `scrub_signature_classical` / `scrub_signature_pqc` are the caller's
     /// authority signature over the removal, hybrid-Strict-verified before
-    /// any write (see [`at_rest_cascade::orchestrate::rekey_community_member_revoke`]).
+    /// any write (see
+    /// [`at_rest_cascade::orchestrate::rekey_community_member_revoke`](crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke)).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn rekey_community_member_revoke(
@@ -5238,7 +5542,7 @@ impl Engine {
     /// (`operation: "serve"`) — a PERMANENT signal: the peer should
     /// fetch from another holder. On the happy path returns the bytes
     /// via [`get_blob`](crate::federation::BlobStorage::get_blob)
-    /// ([`BlobError::NotHeld`] when absent).
+    /// ([`BlobError::NotHeld`](crate::federation::BlobError::NotHeld) when absent).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn serve_blob_to_peer(
         &self,
@@ -5640,6 +5944,36 @@ impl Engine {
         }
     }
 
+    /// v31.0.0 (CIRISPersist#648) — **does this node hold a constitutional
+    /// trust root?**
+    ///
+    /// The read a host consults before deciding what it may run.
+    /// [`GenesisPosture::entrenched`](crate::federation::genesis::GenesisPosture::entrenched)
+    /// is the boolean; [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner)
+    /// is the warning line a node-mode host renders; the `leg` and `detail`
+    /// name what is missing.
+    ///
+    /// # Persist reports; the host decides
+    ///
+    /// The operator's rule is per-MODE: node mode ("brainless", no agent) boots
+    /// pre-genesis with a banner, agent mode must not, and the agent-mode
+    /// refusal is enforced in CIRISServer. This crate has no `node_mode` /
+    /// `agent_mode` concept and #648 deliberately does not introduce one. What
+    /// persist owes the layer above is an accurate, fail-closed answer — and it
+    /// enforces the consequences it CAN enforce itself, which is that every gate
+    /// in [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// refuses while this reads anything but `entrenched`.
+    ///
+    /// Re-derived from the directory on every call, never cached from boot: an
+    /// operator boots pre-genesis, runs the ceremony against the live node, and
+    /// this flips to `entrenched` without a restart. A posture captured at
+    /// construction would keep warning about a condition that had passed.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn genesis_posture(&self) -> crate::federation::genesis::GenesisPosture {
+        let dir = self.federation_directory();
+        crate::federation::genesis::genesis_posture(dir.as_ref()).await
+    }
+
     /// v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the **I1 age
     /// band** of `key_id`, resolved from its incoming age attestations
     /// (witness `age_assurance:*` OUTRANKS self-declared `age_self_declared:*`;
@@ -5686,14 +6020,19 @@ impl Engine {
     /// #249 Cut B — incrementally add `member` to `community_key_id`'s
     /// roster (idempotent on `member.key_id`). See
     /// [`FederationDirectory::add_community_member`](crate::federation::FederationDirectory::add_community_member).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `spec` is the caller's authority signature
+    /// over the GROWN roster; roster growth is no longer an unauthenticated
+    /// write door.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn add_community_member(
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
         self.federation_directory()
-            .add_community_member(community_key_id, member)
+            .add_community_member(community_key_id, member, spec)
             .await
     }
 
@@ -5920,7 +6259,7 @@ impl Engine {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply**: the anti-entropy apply the edge replication bridge routes
     /// `apply_key` to instead of raw
     /// [`put_public_key`](crate::federation::FederationDirectory::put_public_key)
@@ -5965,7 +6304,7 @@ impl Engine {
         }
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? True iff its `federation_keys` row's
     /// `identity_type` set contains `canonical`. Because the admission gate
     /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
@@ -5983,7 +6322,7 @@ impl Engine {
         crate::federation::is_canonical_effective(directory.as_ref(), key_id).await
     }
 
-    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: all `federation_keys` rows whose
     /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.
     /// Every returned row is (by the admission gate) anchor-scrub-conferred —
@@ -6686,6 +7025,18 @@ impl Engine {
         Ok(crate::cirisnode::KeyGrantListPage { items, next_cursor })
     }
 
+    /// v31.0.0 (CIRISPersist#658) — the `subscribe_detection_events` polling
+    /// cadence, hoisted out of that function's body.
+    ///
+    /// It is here because the witnesses in this file need it. Their delivery
+    /// budgets are multiples of THIS constant, not re-spelled seconds, so
+    /// changing the cadence moves the budgets with it instead of silently
+    /// eating their headroom — which is how the 6-second budget below came to
+    /// sit at three poll cycles and fail on a loaded box.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) const DETECTION_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(2);
+
     /// v2.13.0 (CIRISPersist#113) — push-based change feed scoped to
     /// `detection_events`. Backs CIRISLensCore#20's `lens.alerts.*`
     /// subscription delivery.
@@ -6737,9 +7088,11 @@ impl Engine {
     ) -> impl futures_core::Stream<
         Item = Result<crate::derived::DetectionEvent, crate::derived::Error>,
     > + Send {
-        // v0.1 polling cadence + channel capacity. See doc-comment for
-        // the v0.2 ask (configurable cadence + channel shape).
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        // v0.1 channel capacity. See doc-comment for the v0.2 ask
+        // (configurable cadence + channel shape). The cadence itself is
+        // [`Self::DETECTION_POLL_INTERVAL`] — hoisted out of this body in
+        // v31.0.0 (#658) so the witnesses derive their budgets from it.
+        const POLL_INTERVAL: std::time::Duration = Engine::DETECTION_POLL_INTERVAL;
         const CHANNEL_CAPACITY: usize = 256;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -6979,7 +7332,67 @@ pub enum EngineMaintenance {
     not(any(feature = "postgres", feature = "sqlite")),
     allow(unused_variables)
 )]
-async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch, EngineError> {
+/// v31.0.0 (CIRISPersist#648) — **the boot decision: which genesis faults may a
+/// node survive?**
+///
+/// Exactly one may not. Before this cut every seed failure was fatal, and it had
+/// to be, because the seeder returned an `Err(String)` in which "the accord
+/// holders were never seeded" and "somebody else's pubkey is sitting on A1's
+/// key_id" were the same value. With
+/// [`GenesisFault`](crate::federation::genesis::GenesisFault) splitting them:
+///
+/// - [`Absent`](crate::federation::genesis::GenesisFault::Absent) — a node
+///   before its ceremony. **Boots.** 31.0.0 is the binary that RUNS the
+///   ceremony, so refusing to start without the thing the ceremony produces is
+///   a deadlock. The node comes up in the pre-genesis posture, reports it
+///   (`Engine::genesis_posture`, `NodeState::genesis`), and every gate in
+///   `ROOT_REQUIRING_GATES` refuses.
+/// - [`Unreadable`](crate::federation::genesis::GenesisFault::Unreadable) — the
+///   backend could not answer. **Boots**, and is likewise not entrenched: an
+///   unanswered question is not a yes, so the same gates refuse. A node whose
+///   directory is broken should be able to come up far enough to say so.
+/// - [`Divergent`](crate::federation::genesis::GenesisFault::Divergent) —
+///   **REFUSES.** A constitutional row is present and wrong: a squatted holder
+///   key_id, a family whose entrenched protocol or founder seats were mutated,
+///   a canonical stripped of its role. That is an established root altered
+///   underneath the node, and #648 is about making a MISSING root survivable,
+///   never a TAMPERED one. Roots co-exist and a new ceremony adds one; nothing
+///   here may become a path to overwriting one that already stands.
+///
+/// The warning is `tracing::warn!` with a structured `posture` field rather than
+/// a bare message, because the host renders a banner from it — see
+/// [`GenesisPosture::banner`](crate::federation::genesis::GenesisPosture::banner).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn classify_genesis_seed(
+    outcome: Result<(), crate::federation::genesis::GenesisFault>,
+) -> Result<(), EngineError> {
+    let Err(fault) = outcome else { return Ok(()) };
+    if fault.refuses_boot() {
+        return Err(EngineError::GenesisSeed(fault.to_string()));
+    }
+    tracing::warn!(
+        posture = "pre_genesis",
+        leg = fault.leg().as_str(),
+        fault = fault.as_str(),
+        detail = fault.detail(),
+        "PRE-GENESIS BOOT: this node holds no constitutional trust root. It can host a \
+         genesis ceremony; until one completes, every operation that resolves authority to \
+         the accord root is REFUSED (federation_no_constitutional_root_yet). Node mode only \
+         — do not run an agent against this node."
+    );
+    Ok(())
+}
+
+async fn build_backend(
+    dsn: &str,
+    // Read only inside the backend `cfg` arms; a build with neither backend
+    // compiled in reaches the `UnrecognizedDsn` tail without consulting it.
+    #[cfg_attr(
+        not(any(feature = "postgres", feature = "sqlite")),
+        allow(unused_variables)
+    )]
+    seed_genesis: bool,
+) -> Result<BackendDispatch, EngineError> {
     if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
         #[cfg(feature = "postgres")]
         {
@@ -6987,27 +7400,31 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 .await
                 .map_err(EngineError::Store)?;
             pg.run_migrations().await.map_err(EngineError::Store)?;
-            // v13.3.1 (CIRISPersist#387) — the genesis seed is UNCONDITIONAL in
-            // production (`seed_genesis == true`): the baked HUMANITY_ACCORD
-            // holders + family ARE the immutable trust root. `seed_genesis ==
-            // false` is reachable ONLY via the feature-gated
-            // `with_signer_no_genesis_seed` (test-only, absent from prod builds),
-            // so downstream integration tests can assemble a controllable
-            // custom-holder family without the baked A1/B1/C1 + family blocking it.
+            // v31.0.0 (CIRISPersist#648) — the genesis seed is ATTEMPTED in
+            // production and no longer fatal when it is merely ABSENT. See
+            // `attempt_genesis_seed` for the classification and why divergence
+            // is still fatal. `seed_genesis == false` is the supported
+            // pre-genesis constructor `Engine::with_signer_pre_genesis`.
             if seed_genesis {
                 // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
-                // rooting-anchor rows (idempotent), then fail-secure verify.
-                pg.seed_genesis_accord_holders(
-                    &crate::federation::genesis::effective_accord_holder_records(),
-                )
-                .await
-                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                // rooting-anchor rows (idempotent). A write failure here is NOT
+                // decided on: `seed_family_and_canonical` opens with
+                // `verify_anchor_seeded`, which is the one place that can tell
+                // "never seeded" from "seeded by somebody else".
+                if let Err(e) = pg
+                    .seed_genesis_accord_holders(
+                        &crate::federation::genesis::effective_accord_holder_records(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                }
                 // v13.4.1 (#392) — the SHARED seed routine (verify anchor →
                 // family #386 → canonical #390), identical to the pyo3
                 // `PyEngine::new` path so they can't drift.
-                crate::federation::genesis::seed_family_and_canonical(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
+                classify_genesis_seed(
+                    crate::federation::genesis::seed_family_and_canonical(&pg).await,
+                )?;
             }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
@@ -7046,21 +7463,24 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                     .map_err(EngineError::Store)?
             };
             sq.run_migrations().await.map_err(EngineError::Store)?;
-            // v13.3.1 (CIRISPersist#387) — see the postgres leg: seed is
-            // unconditional in prod; skipped only via the feature-gated
-            // test-only `with_signer_no_genesis_seed`.
+            // v31.0.0 (CIRISPersist#648) — see the postgres leg: the seed is
+            // attempted, an ABSENT seed leaves a pre-genesis node that boots and
+            // refuses, a DIVERGENT one still refuses to boot.
             if seed_genesis {
                 // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
-                sq.seed_genesis_accord_holders(
-                    &crate::federation::genesis::effective_accord_holder_records(),
-                )
-                .await
-                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                if let Err(e) = sq
+                    .seed_genesis_accord_holders(
+                        &crate::federation::genesis::effective_accord_holder_records(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "genesis: accord-holder seed write failed");
+                }
                 // v13.4.1 (#392) — shared seed routine (verify anchor → family
                 // #386 → canonical #390); identical to the pyo3 path.
-                crate::federation::genesis::seed_family_and_canonical(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
+                classify_genesis_seed(
+                    crate::federation::genesis::seed_family_and_canonical(&sq).await,
+                )?;
             }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
@@ -7432,31 +7852,59 @@ mod tests {
         assert!(sq.admission_gate().is_none());
     }
 
-    /// v13.3.1 (CIRISPersist#387) — the TEST-ONLY seam: `with_signer_no_genesis_seed`
-    /// yields a clean engine with **no baked trust root** — no accord holders
-    /// (A1 absent), no entrenched family — so downstream integration tests can
-    /// assemble a controllable custom-holder `humanity-accord` family. The
-    /// default `with_signer` (prev test) DOES seed both. Gated behind the
-    /// `test-genesis-seam` feature so it is absent from release builds.
-    #[cfg(all(feature = "sqlite", feature = "test-genesis-seam"))]
+    /// v31.0.0 (CIRISPersist#648) — **a seedless node BOOTS**, and says so.
+    ///
+    /// Was `no_genesis_seed_seam_yields_a_clean_engine`, fenced behind
+    /// `test-genesis-seam`. The constructor is supported on a default build
+    /// now, so the witness is too: 31.0.0 is the binary that runs the ceremony
+    /// which produces the root, and a release build that could not reach this
+    /// state could not run the ceremony.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn no_genesis_seed_seam_yields_a_clean_engine() {
-        let engine = Engine::with_signer_no_genesis_seed(test_signer(), "sqlite::memory:")
+    async fn seedless_node_boots_and_reports_pre_genesis_648() {
+        use crate::federation::genesis::{GenesisLeg, GenesisPosture};
+
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
             .await
-            .expect("construct no-seed engine");
+            .expect("a node with no constitutional trust root must BOOT");
         let dir = engine.federation_directory();
         assert!(
             dir.lookup_family("humanity-accord")
                 .await
                 .unwrap()
                 .is_none(),
-            "the seam must NOT seed the entrenched accord family"
+            "pre-genesis: no entrenched accord family"
         );
         assert!(
             dir.lookup_public_key("A1").await.unwrap().is_none(),
-            "the seam must NOT seed the A1 accord holder"
+            "pre-genesis: no A1 accord holder"
         );
-        // And a normally-constructed engine DOES have both (the prod path).
+
+        // The state is REPORTED, typed, and names the leg — this is the half a
+        // server reads to render its banner and gate agent mode.
+        let posture = engine.genesis_posture().await;
+        assert!(
+            matches!(
+                posture,
+                GenesisPosture::PreGenesis {
+                    leg: GenesisLeg::Anchor,
+                    ..
+                }
+            ),
+            "the missing leg is the ROSTER, named: {posture:?}"
+        );
+        assert!(!posture.entrenched());
+        assert_eq!(posture.as_str(), "pre_genesis");
+        let banner = posture.banner().expect("node mode renders a banner");
+        assert!(
+            banner.contains("PRE-GENESIS"),
+            "the banner says what it is: {banner}"
+        );
+
+        // And a normally-constructed engine — the PROD path, the one 31.0.0
+        // actually ships. Its KEY plane seeds cleanly (the family lands), so
+        // this leg also pins that the three key legs are unaffected by the
+        // binding gates.
         let seeded = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct seeded engine");
@@ -7466,6 +7914,213 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let seeded_posture = seeded.genesis_posture().await;
+
+        // Branch on the ARTIFACT, exactly as the four genesis witnesses do, so
+        // 31.1.0's re-bake flips this back with nobody editing the test.
+        let bundle = crate::federation::genesis::canonical_genesis_bundle();
+        if crate::federation::genesis::bundle_delegation_plane_v31_shaped(bundle).is_err() {
+            // The state 31.0.0 SHIPS IN. Before the delegation plane became a
+            // posture leg this asserted `entrenched()` and no banner — and it
+            // PASSED, which is precisely the fail-open this leg closes: the key
+            // plane seeds, so three of four legs are green, while the rows that
+            // confer everything are refused and can never be installed.
+            assert!(
+                !seeded_posture.entrenched(),
+                "a node whose conferral plane cannot be installed is NOT entrenched: \
+                 {seeded_posture:?}"
+            );
+            assert!(
+                matches!(
+                    seeded_posture,
+                    GenesisPosture::PreGenesis {
+                        leg: GenesisLeg::Delegation,
+                        ..
+                    }
+                ),
+                "the missing leg is the DELEGATION plane, named: {seeded_posture:?}"
+            );
+            let banner = seeded_posture
+                .banner()
+                .expect("a node with a dead conferral plane renders a banner");
+            assert!(
+                banner.contains("PRE-GENESIS"),
+                "the operator is told, not left with a green light: {banner}"
+            );
+        } else {
+            // 31.1.0 onward: the re-baked bundle installs, all four legs seat.
+            assert!(
+                seeded_posture.entrenched(),
+                "a re-baked v31 seed IS entrenched: {seeded_posture:?}"
+            );
+            assert!(seeded_posture.banner().is_none());
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the anti-fail-open witness, and the most
+    /// important assertion in this cut.**
+    ///
+    /// A node with no trust root must not become a node that trusts nothing and
+    /// therefore CHECKS nothing. Every gate in
+    /// [`ROOT_REQUIRING_GATES`](crate::federation::genesis::ROOT_REQUIRING_GATES)
+    /// must refuse with the TYPED `federation_no_constitutional_root_yet` —
+    /// never `Ok(())`, never an empty-set-means-yes.
+    ///
+    /// The body lives in
+    /// [`exercise_seedless_gate_refusals`](crate::federation::genesis::posture::exercise_seedless_gate_refusals)
+    /// and runs identically on memory, sqlite and postgres; this leg proves it
+    /// of a directory reached through a real seedless ENGINE rather than a bare
+    /// backend, so the constructor and the gates are witnessed together.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seedless_node_refuses_every_root_requiring_gate_648() {
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let dir = engine.federation_directory();
+        crate::federation::genesis::posture::exercise_seedless_gate_refusals(
+            dir.as_ref(),
+            "engine-sqlite",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the ceremony can run on a seedless node,
+    /// and a second one does NOT replace the first.**
+    ///
+    /// Two properties in one witness because they are the same property seen
+    /// from either side: the pre-genesis state must be ENTERABLE (else 31.0.0
+    /// cannot produce the root 31.1.0 bakes) and it must be EXITABLE ONLY BY
+    /// ADDITION (else a node owner could overwrite the constitutional family
+    /// with their own holders).
+    ///
+    /// Trust roots co-exist — a new ceremony ADDS a root, addressed by its own
+    /// `root_ref` — so there is no replacement semantics to build. What there
+    /// is, is the idempotent-assemble behaviour that must not be lost.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn ceremony_runs_on_a_seedless_node_and_never_replaces_648() {
+        use crate::federation::genesis;
+        use crate::federation::FederationDirectory as _;
+
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let sq = engine.sqlite_backend().expect("sqlite");
+        assert!(!engine.genesis_posture().await.entrenched());
+
+        // ── the ceremony: roster, then threshold ──
+        sq.seed_genesis_accord_holders(&genesis::effective_accord_holder_records())
+            .await
+            .expect("the ceremony seats the roster on a pre-genesis node");
+        genesis::seed_accord_family(sq.as_ref())
+            .await
+            .expect("the ceremony entrenches the family on a pre-genesis node");
+
+        // The seat is established, so the gates that were refusing now adjudicate
+        // on the merits again — the refusal was about the ROOT, not about the row.
+        genesis::require_constitutional_root(sq.as_ref(), "witness")
+            .await
+            .expect("roster + threshold present ⇒ the chokepoint passes");
+
+        // ── a SECOND assemble is a no-op, never a replacement ──
+        let before = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("entrenched");
+        // A hostile re-assemble: same family id, the node owner's own sole seat,
+        // `founder_only` so the charter threshold would resolve to 1.
+        let hostile = crate::federation::types::Family {
+            family_key_id: "humanity-accord".into(),
+            family_name: "MINE".into(),
+            members: vec![crate::federation::types::FamilyMember {
+                key_id: "rogue-1".into(),
+                joined_at: chrono::Utc::now(),
+                role: Some("founder".into()),
+            }],
+            founded_at: chrono::Utc::now(),
+            consensus_protocol: "founder_only".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        let _ = sq.put_family_local(hostile).await; // whatever it returns…
+        let after = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(
+            after.members.len(),
+            before.members.len(),
+            "an entrenched family's seats are NOT replaceable"
+        );
+        assert_eq!(after.consensus_protocol, before.consensus_protocol);
+        assert!(after.consensus_protocol_entrenched);
+
+        // The seeder itself is idempotent by the same rule.
+        genesis::seed_accord_family(sq.as_ref())
+            .await
+            .expect("re-seed is a no-op");
+        let again = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(again.members.len(), before.members.len());
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — **the constitutional family id is
+    /// RESERVED**, which is the hole that opening the seedless door would
+    /// otherwise have created.
+    ///
+    /// Until this cut the id was protected by an accident of ordering: the seed
+    /// was unconditional, so the primary key was always taken before any peer
+    /// could write. On a pre-genesis node a registered peer could declare a
+    /// `humanity-accord` family with itself as the sole seat and `founder_only`
+    /// as the protocol, `family_charter_threshold` resolves that to 1, and one
+    /// signature charters the constitutional root of the mesh.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn constitutional_family_id_is_reserved_at_the_peer_door_648() {
+        let engine = Engine::with_signer_pre_genesis(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seedless boot");
+        let dir = engine.federation_directory();
+
+        let squat = crate::federation::SignedFamily {
+            family: crate::federation::types::Family {
+                family_key_id: "humanity-accord".into(),
+                family_name: "MINE".into(),
+                members: vec![crate::federation::types::FamilyMember {
+                    key_id: "rogue-1".into(),
+                    joined_at: chrono::Utc::now(),
+                    role: Some("founder".into()),
+                }],
+                founded_at: chrono::Utc::now(),
+                consensus_protocol: "founder_only".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+            authority_key_id: "rogue-1".into(),
+            scrub_signature_classical: "AA==".into(),
+            scrub_signature_pqc: None,
+        };
+        let err = dir
+            .put_family(squat)
+            .await
+            .expect_err("the constitutional family id must not be claimable by a peer");
+        assert_eq!(err.kind(), "federation_constitutional_family_reserved");
+        assert!(
+            dir.lookup_family("humanity-accord")
+                .await
+                .unwrap()
+                .is_none(),
+            "and nothing was written"
+        );
     }
 
     /// v13.4.0 (CIRISPersist#390) — the operator's success criterion: a FRESH
@@ -8777,6 +9432,81 @@ mod tests {
         }
     }
 
+    /// v31.0.0 (CIRISPersist#658) — how long a `subscribe_detection_events`
+    /// witness waits for a row it has already written.
+    ///
+    /// # This is a HANG GUARD, not the property under test
+    ///
+    /// None of these witnesses asserts anything about latency. What they
+    /// assert is WHICH rows a subscription yields and in what order; the
+    /// timeout exists only so that "the subscription never delivered" fails
+    /// with a message instead of hanging until nextest SIGKILLs the process at
+    /// `terminate-after`. A budget that is merely *tight enough to be
+    /// interesting* is therefore all cost and no coverage — it converts load
+    /// into a red build that names a duration rather than a defect.
+    ///
+    /// It used to be a bare `Duration::from_secs(6)`, which was three poll
+    /// cycles, and it was REPRODUCIBLY breached at 6.5–7.5 s under 4–9x CPU
+    /// oversubscription: the subscriber and the poll task share one
+    /// `#[tokio::test]` current-thread runtime, so contention does not add to
+    /// one cycle — it multiplies across every cycle, the DB round trip inside
+    /// it, and the channel hand-off after it.
+    ///
+    /// Fifteen cycles is deliberately far past anything a correct
+    /// implementation needs (it delivers on the first or second), and still
+    /// well inside nextest's six-minute kill, so a breach can only mean
+    /// delivery did not happen at all.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    const SUBSCRIBE_DELIVERY_BUDGET: std::time::Duration =
+        Engine::DETECTION_POLL_INTERVAL.saturating_mul(15);
+
+    /// Take the next item from a detection-event subscription, or `None` when
+    /// nothing arrived inside [`SUBSCRIBE_DELIVERY_BUDGET`].
+    ///
+    /// v31.0.0 (CIRISPersist#658) — ONE spelling of the poll-with-a-budget
+    /// dance. It was copied into four witnesses, each with its own literal
+    /// seconds, which is why raising one of them would not have raised the
+    /// others.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn next_detection_event<S>(
+        stream: &mut std::pin::Pin<Box<S>>,
+    ) -> Option<crate::derived::DetectionEvent>
+    where
+        S: futures_core::Stream<
+            Item = Result<crate::derived::DetectionEvent, crate::derived::Error>,
+        >,
+    {
+        use std::task::{Context, Poll};
+        tokio::time::timeout(SUBSCRIBE_DELIVERY_BUDGET, async {
+            std::future::poll_fn(
+                |cx: &mut Context<'_>| -> Poll<
+                    Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
+                > { stream.as_mut().poll_next(cx) },
+            )
+            .await
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|item| item.expect("the subscription surfaced a backend error"))
+    }
+
+    /// The message a missed delivery gets. Says what a breach MEANS, because
+    /// the reader of this line is the one person least able to argue with it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn subscribe_never_delivered(what: &str) -> String {
+        format!(
+            "the subscription never delivered {what}. Budget was {budget:?} — {cycles} poll \
+             cycles at the {interval:?} cadence, for a row that was already committed before \
+             the first cycle. A breach here is NOT a slow machine (a correct implementation \
+             delivers on cycle one or two); it means the row was never yielded at all.",
+            budget = SUBSCRIBE_DELIVERY_BUDGET,
+            interval = Engine::DETECTION_POLL_INTERVAL,
+            cycles =
+                SUBSCRIBE_DELIVERY_BUDGET.as_nanos() / Engine::DETECTION_POLL_INTERVAL.as_nanos(),
+        )
+    }
+
     /// SQLite: facade dispatches to the SqliteBackend's
     /// `DerivedSchema::get_detection_events`. Seed via the storage
     /// trait; read via the Engine facade. The acceptance is the
@@ -8988,9 +9718,6 @@ mod tests {
     #[tokio::test]
     async fn subscribe_detection_events_yields_new_events_only_sqlite() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
@@ -9007,37 +9734,77 @@ mod tests {
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter::default()));
 
         // Insert a row AFTER subscribe → should be yielded.
-        // Sleep ~2.2s (one poll cycle) so the poller wakes and reads.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        //
+        // v31.0.0 (CIRISPersist#658) — a `sleep(100ms)` used to sit here under
+        // the comment "Sleep ~2.2s (one poll cycle) so the poller wakes and
+        // reads", which described neither its duration nor its purpose: the
+        // poller's first wake is 2 s away either way, and nothing here needs
+        // to be timed against it. The cursor latches on `Utc::now()` INSIDE
+        // `subscribe_detection_events`, synchronously at the call above, and
+        // `EventFilter.since` is inclusive — so this row is after the cursor
+        // with or without a delay. Removed rather than re-timed.
         let new_ts = chrono::Utc::now();
         let new_ev = de_event_fixture("tr-NEW", b"canon-NEW", new_ts);
         sq.put_detection_event(new_ev.clone()).await.unwrap();
 
-        // Drain with a timeout. POLL_INTERVAL = 2s; allow 5s headroom.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
+        // The FIRST item the subscription produces is the assertion: if the
+        // subscribe-time cursor did not latch, the pre-subscribe row (ts 10 s
+        // older, and so yielded first within a batch) arrives ahead of it.
+        // That is an ORDERING claim, not a latency one — see
+        // `SUBSCRIBE_DELIVERY_BUDGET`.
+        let yielded = next_detection_event(&mut stream)
             .await
-        })
-        .await
-        .expect("subscribe yielded within 6s");
-        let yielded = next.expect("stream produced an item").expect("ok");
+            .unwrap_or_else(|| panic!("{}", subscribe_never_delivered("the after-subscribe row")));
+        assert_ne!(
+            yielded.detection_id, pre_ev.detection_id,
+            "the FIRST row a subscription yields was written BEFORE it subscribed — the \
+             subscribe-time cursor did not latch and the subscriber is replaying history"
+        );
         assert_eq!(
             yielded.detection_id, new_ev.detection_id,
             "subscribe yields the AFTER-subscribe row"
-        );
-        assert_ne!(
-            yielded.detection_id, pre_ev.detection_id,
-            "subscribe MUST NOT yield the BEFORE-subscribe row"
         );
 
         drop(stream);
     }
 
-    /// SQLite: dropping the Stream terminates the polling task — we
-    /// can't observe the JoinHandle directly, but the test passes
-    /// (does not hang) iff the polling task exits on next send/close.
+    /// Wait for a `subscribe_detection_events` poll task to release the
+    /// `Engine` clone it was spawned with — i.e. for the task to actually
+    /// exit — and return the strong count it settled on.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the task holds no observable `JoinHandle`,
+    /// but it does hold an `Engine`, and an `Engine` holds a strong reference
+    /// to its backend. That refcount is the liveness signal, and it is an
+    /// EVENT: the loop returns the moment it drops, so the budget is only ever
+    /// paid by a failing run.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn await_backend_refcount<T>(handle: &std::sync::Arc<T>, target: usize) -> usize {
+        let deadline = std::time::Instant::now() + SUBSCRIBE_DELIVERY_BUDGET;
+        loop {
+            let n = std::sync::Arc::strong_count(handle);
+            if n <= target || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// SQLite: dropping the Stream terminates the polling task.
+    ///
+    /// # This used to be a report, not a check
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the body was `drop(stream); sleep(3s);`
+    /// under a comment reading "No assertion needed beyond reaching this line
+    /// cleanly". It contained no assertion, so it could not fail: a poll task
+    /// that leaked forever passed it exactly as loudly as one that exited. All
+    /// three seconds bought was three seconds.
+    ///
+    /// The task holds no `JoinHandle` we can observe — but it does hold an
+    /// `Engine` clone, and an `Engine` holds a strong reference to its
+    /// backend. So the refcount stands in for the task, and the claim becomes
+    /// checkable: it goes UP by exactly one when we subscribe (which is what
+    /// makes the probe live rather than decorative) and back DOWN when the
+    /// subscriber is dropped.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_drop_terminates_poll_task_sqlite() {
@@ -9047,21 +9814,38 @@ mod tests {
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
+        let sq = std::sync::Arc::clone(engine.sqlite_backend().expect("sqlite present"));
+        let baseline = std::sync::Arc::strong_count(&sq);
 
         let stream = engine.subscribe_detection_events(EventFilter::default());
+        // Deterministic — the clone is taken synchronously inside
+        // `subscribe_detection_events`, before it spawns. If this ever stops
+        // holding, the probe below is reading nothing and the whole test goes
+        // back to being unable to fail.
+        assert_eq!(
+            std::sync::Arc::strong_count(&sq),
+            baseline + 1,
+            "the poll task must hold an Engine clone of its own — without it this test's \
+             liveness probe measures nothing"
+        );
+
         // Drop the subscription. The poll task's next iteration sees
         // tx.is_closed() → break, or its send returns Err → return.
-        // Either way the spawned task winds up. We give it 5s of
-        // wall-clock to do so; the test passing implies no leak.
+        // Either way the spawned task winds up and releases its Engine.
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        // If the spawned poll task were still alive + driving DB
-        // queries, the SqliteBackend's Mutex would be held when this
-        // test's tokio::test runtime tears down — exposed as flaky
-        // shutdowns on CI. The test passes today because the channel
-        // close terminates the task. No assertion needed beyond
-        // reaching this line cleanly.
-        // (Engine still owns the SqliteBackend Arc; that's expected.)
+        let settled = await_backend_refcount(&sq, baseline).await;
+        assert_eq!(
+            settled,
+            baseline,
+            "the poll task outlived its subscriber. It still holds an Engine — and so a live \
+             SqliteBackend Mutex — after the stream was dropped, which is the leak that \
+             presented as flaky runtime shutdowns on CI. Budget was \
+             {SUBSCRIBE_DELIVERY_BUDGET:?}; the task only has to survive to its next \
+             {interval:?} wake to notice the closed channel.",
+            interval = Engine::DETECTION_POLL_INTERVAL,
+        );
+        // (Engine still owns the SqliteBackend Arc; that's expected — `baseline`
+        // is the count WITH it.)
         let _ = engine;
     }
 
@@ -9072,13 +9856,27 @@ mod tests {
     /// This test confirms the trace_id scoping case (the only one
     /// EventFilter exposes today): rows for trace_id=T are yielded,
     /// rows for other trace_ids are not.
+    ///
+    /// # The exclusion is proven by a SENTINEL, not by a stopwatch
+    ///
+    /// v31.0.0 (CIRISPersist#658) — "rows for other trace_ids are not yielded"
+    /// used to be spelled "poll for 3 s and assert the timeout fired", which is
+    /// the weakest possible form of a negative: it cannot distinguish EXCLUDED
+    /// from MERELY LATE, so it fails on a loaded box (where a legitimately
+    /// excluded row still costs 3 s of nothing) and it passes on a broken one
+    /// whose leak happens to arrive on the next cycle.
+    ///
+    /// So the harness writes a THIRD row — `tr-MATCH`, timestamped strictly
+    /// AFTER the non-matching one. The poller yields a batch oldest-first and
+    /// advances its cursor monotonically, so a leaked `tr-OTHER` must arrive
+    /// BEFORE that sentinel. Draining up to the sentinel and finding only
+    /// `tr-MATCH` proves the row was DROPPED, because a row later than it has
+    /// already been delivered. No duration appears in the claim, and the test
+    /// costs one poll cycle instead of a fixed three seconds.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_filter_scopes_yielded_rows_sqlite() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
@@ -9091,8 +9889,9 @@ mod tests {
             ..Default::default()
         }));
 
-        // Insert one matching + one non-matching row.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // One matching row, one non-matching row, then a matching SENTINEL —
+        // strictly increasing `ts`, so the poller's oldest-first delivery makes
+        // "the sentinel arrived" mean "the non-matching row is not coming".
         let now = chrono::Utc::now();
         let matching = de_event_fixture("tr-MATCH", b"canon-MATCH", now);
         let nonmatching = de_event_fixture(
@@ -9100,37 +9899,44 @@ mod tests {
             b"canon-OTHER",
             now + chrono::Duration::milliseconds(1),
         );
+        let sentinel = de_event_fixture(
+            "tr-MATCH",
+            b"canon-SENTINEL",
+            now + chrono::Duration::milliseconds(2),
+        );
         sq.put_detection_event(matching.clone()).await.unwrap();
         sq.put_detection_event(nonmatching.clone()).await.unwrap();
+        sq.put_detection_event(sentinel.clone()).await.unwrap();
 
-        // Should yield exactly the matching row.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
-            .await
-        })
-        .await
-        .expect("subscribe yields within 6s");
-        let yielded = next.expect("item").expect("ok");
-        assert_eq!(yielded.trace_id, "tr-MATCH");
-        assert_eq!(yielded.detection_id, matching.detection_id);
-
-        // A second poll cycle should produce no other-trace rows;
-        // poll with a short timeout — if no row arrives, the filter
-        // is correctly excluding tr-OTHER.
-        let no_more = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
-            .await
-        })
-        .await;
-        assert!(
-            no_more.is_err(),
-            "filter must NOT yield non-matching tr-OTHER row \
-             (timeout exhausted; got = {:?})",
-            no_more
+        // Drain until the sentinel. Every row that arrives before it must be a
+        // `tr-MATCH` row — a `tr-OTHER` here is the filter leaking.
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_detection_event(&mut stream).await.unwrap_or_else(|| {
+                panic!(
+                    "{} (drained {seen:?} first)",
+                    subscribe_never_delivered("the tr-MATCH sentinel")
+                )
+            });
+            assert_eq!(
+                ev.trace_id,
+                "tr-MATCH",
+                "the subscription yielded trace_id={other:?}, which its EventFilter excludes. \
+                 This is not a late arrival: the row it leaked is OLDER than the tr-MATCH \
+                 sentinel this drain is still waiting for, so the poller had already committed \
+                 to delivering past it.",
+                other = ev.trace_id
+            );
+            let last = ev.detection_id == sentinel.detection_id;
+            seen.push(ev.detection_id);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![matching.detection_id, sentinel.detection_id],
+            "the filter must yield the two tr-MATCH rows, oldest-first, and nothing else"
         );
 
         drop(stream);
@@ -9293,9 +10099,6 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn subscribe_detection_events_yields_new_events_only_postgres() {
         use crate::derived::{DerivedSchema, EventFilter};
-        use futures_core::Stream;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -9307,39 +10110,51 @@ mod tests {
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
 
+        // v31.0.0 (CIRISPersist#658) — ONE trace_id for both rows. The
+        // per-run uuid keeps this test isolated from concurrent PG runs, but
+        // the pre- and post-subscribe rows used to carry DIFFERENT trace_ids,
+        // which meant the subscription's own filter already excluded the
+        // pre-subscribe row — so `assert_ne!` below could not fail whatever
+        // the cursor did, and the sqlite arm's actual claim had no postgres
+        // parity at all. Same trace, so the CURSOR is the only thing that can
+        // exclude the older row.
+        let trace = format!("tr-SUB-{}", uuid::Uuid::new_v4().simple());
+
         // Seed a row BEFORE subscribing.
-        let trace_pre = format!("tr-PRE-{}", uuid::Uuid::new_v4().simple());
         let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
-        let pre_ev = de_event_fixture(&trace_pre, b"canon-PRE", before_ts);
+        let pre_ev = de_event_fixture(&trace, b"canon-PRE", before_ts);
         pg.put_detection_event(pre_ev.clone()).await.unwrap();
 
         // Subscribe with a trace_id filter to isolate from concurrent runs.
-        let trace_new = format!("tr-NEW-{}", uuid::Uuid::new_v4().simple());
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
-            trace_id: Some(trace_new.clone()),
+            trace_id: Some(trace.clone()),
             ..Default::default()
         }));
 
-        // Insert NEW row after subscribe.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Insert NEW row after subscribe. No delay is needed: the cursor
+        // latches on `Utc::now()` synchronously inside
+        // `subscribe_detection_events`, and `EventFilter.since` is inclusive.
         let new_ts = chrono::Utc::now();
-        let new_ev = de_event_fixture(&trace_new, b"canon-NEW", new_ts);
+        let new_ev = de_event_fixture(&trace, b"canon-NEW", new_ts);
         pg.put_detection_event(new_ev.clone()).await.unwrap();
 
-        let next = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<
-                Option<Result<crate::derived::DetectionEvent, crate::derived::Error>>,
-            > { Pin::new(&mut stream).poll_next(cx) })
+        let yielded = next_detection_event(&mut stream)
             .await
-        })
-        .await
-        .expect("yielded within 6s");
-        let yielded = next.expect("item").expect("ok");
+            .unwrap_or_else(|| panic!("{}", subscribe_never_delivered("the after-subscribe row")));
+        assert_ne!(
+            yielded.detection_id, pre_ev.detection_id,
+            "the FIRST row a subscription yields was written BEFORE it subscribed — the \
+             subscribe-time cursor did not latch and the subscriber is replaying history"
+        );
         assert_eq!(yielded.detection_id, new_ev.detection_id);
-        assert_ne!(yielded.detection_id, pre_ev.detection_id);
         drop(stream);
     }
 
+    /// Postgres parity for
+    /// `subscribe_detection_events_drop_terminates_poll_task_sqlite` — same
+    /// refcount probe, same reason it replaced a `sleep(3s)` that asserted
+    /// nothing. A poll task that leaks here holds a live PG pool handle, not
+    /// merely a mutex.
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -9354,10 +10169,113 @@ mod tests {
         let engine = Engine::with_signer(signer, &dsn)
             .await
             .expect("construct PG engine");
+        let pg = std::sync::Arc::clone(engine.postgres_backend().expect("pg backend"));
+        let baseline = std::sync::Arc::strong_count(&pg);
+
         let stream = engine.subscribe_detection_events(EventFilter::default());
+        assert_eq!(
+            std::sync::Arc::strong_count(&pg),
+            baseline + 1,
+            "the poll task must hold an Engine clone of its own — without it this test's \
+             liveness probe measures nothing"
+        );
+
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let settled = await_backend_refcount(&pg, baseline).await;
+        assert_eq!(
+            settled,
+            baseline,
+            "the poll task outlived its subscriber and still holds a live PostgresBackend \
+             (and so a pooled connection) after the stream was dropped. Budget was \
+             {SUBSCRIBE_DELIVERY_BUDGET:?}; the task only has to survive to its next \
+             {interval:?} wake to notice the closed channel.",
+            interval = Engine::DETECTION_POLL_INTERVAL,
+        );
         let _ = engine;
+    }
+
+    /// Postgres parity for
+    /// `subscribe_detection_events_filter_scopes_yielded_rows_sqlite`.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — the section above claims "postgres parity
+    /// for the same four scenarios" and shipped two. The filter-scoping claim
+    /// is the one that most needs both backends: the `trace_id` predicate is
+    /// spelled per-backend in the `DerivedSchema::get_detection_events` impls,
+    /// so a sqlite-only witness certifies exactly the half that is not the
+    /// production deployment.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn subscribe_detection_events_filter_scopes_yielded_rows_postgres() {
+        use crate::derived::{DerivedSchema, EventFilter};
+
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+
+        // Per-run uuids so concurrent PG runs cannot cross-contaminate.
+        let want = format!("tr-MATCH-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("tr-OTHER-{}", uuid::Uuid::new_v4().simple());
+
+        let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
+            trace_id: Some(want.clone()),
+            ..Default::default()
+        }));
+
+        // Same sentinel construction as the sqlite arm: the excluded row is
+        // OLDER than a matching row we then wait for, so "the sentinel
+        // arrived" proves exclusion rather than lateness.
+        let now = chrono::Utc::now();
+        let matching = de_event_fixture(&want, b"canon-MATCH", now);
+        let nonmatching = de_event_fixture(
+            &other,
+            b"canon-OTHER",
+            now + chrono::Duration::milliseconds(1),
+        );
+        let sentinel = de_event_fixture(
+            &want,
+            b"canon-SENTINEL",
+            now + chrono::Duration::milliseconds(2),
+        );
+        pg.put_detection_event(matching.clone()).await.unwrap();
+        pg.put_detection_event(nonmatching.clone()).await.unwrap();
+        pg.put_detection_event(sentinel.clone()).await.unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_detection_event(&mut stream).await.unwrap_or_else(|| {
+                panic!(
+                    "{} (drained {seen:?} first)",
+                    subscribe_never_delivered("the matching sentinel")
+                )
+            });
+            assert_eq!(
+                ev.trace_id,
+                want,
+                "the subscription yielded trace_id={got:?}, which its EventFilter excludes. \
+                 This is not a late arrival: the row it leaked is OLDER than the sentinel this \
+                 drain is still waiting for.",
+                got = ev.trace_id
+            );
+            let last = ev.detection_id == sentinel.detection_id;
+            seen.push(ev.detection_id);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![matching.detection_id, sentinel.detection_id],
+            "the filter must yield the two matching rows, oldest-first, and nothing else"
+        );
+
+        drop(stream);
     }
 
     // ─── v3.3.0 (CIRISPersist#121) — put_blob_signing tests ────────
@@ -9449,12 +10367,19 @@ mod tests {
         // stable across the flip — and asserting via the gate (not a
         // pinned canonicalizer) keeps the test honest to whatever the
         // produce epoch is.
-        let envelope = holds_bytes_attestation_envelope(&sha);
+        // v31.0.0 (CIRISPersist#652) — the identity is minted FIRST, because
+        // the envelope now binds it. `now` is truncated to the substrate
+        // resolution because the builder truncates before it stamps, and this
+        // test recomputes the expected hash from the same inputs the engine
+        // will use — an untruncated `now` here would hash a different instant
+        // than the one that gets signed.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let attestation_id = uuid::Uuid::new_v4();
+        let envelope =
+            holds_bytes_attestation_envelope(&sha, &signer_alias, &attestation_id.to_string(), now);
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
-
-        let now = chrono::Utc::now();
-        let attestation_id = uuid::Uuid::new_v4();
         engine
             .put_blob_signing(
                 &sha,
@@ -9897,12 +10822,17 @@ mod tests {
             media_type: Some("application/octet-stream".into()),
         };
 
-        let envelope = holds_bytes_attestation_envelope(&sha);
+        // v31.0.0 (CIRISPersist#652) — identity and instant are minted FIRST,
+        // because the envelope now binds them; `now` is truncated because the
+        // builder truncates before it stamps, so an untruncated value here
+        // would hash a different instant than the one that gets signed.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let attestation_id = uuid::Uuid::new_v4();
+        let envelope =
+            holds_bytes_attestation_envelope(&sha, &key_id, &attestation_id.to_string(), now);
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
-
-        let now = chrono::Utc::now();
-        let attestation_id = uuid::Uuid::new_v4();
         engine
             .put_blob_signing(
                 &sha,
@@ -10221,7 +11151,7 @@ mod tests {
     /// the SHAs.
     #[cfg(feature = "sqlite")]
     async fn seed_proxy_blobs(engine: &Engine, peer_key: &str, n: usize) -> Vec<[u8; 32]> {
-        use crate::federation::{BlobBody, BlobStorage, FederationDirectory, PutBlobAttestation};
+        use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
         let sq = engine.sqlite_backend().expect("sqlite");
         // Peer key must exist (FK on the holds_bytes attestation).
         sq.put_public_key(sweeper_test_key(peer_key))
@@ -10237,20 +11167,17 @@ mod tests {
                 out.copy_from_slice(&Sha256::digest(&bytes));
                 out
             };
-            sq.put_blob(
-                &sha,
-                BlobBody::Inline(bytes),
-                None,
-                PutBlobAttestation {
-                    attesting_key_id: peer_key.to_string(),
-                    attestation_id: uuid::Uuid::new_v4().to_string(),
-                    original_content_hash_hex: "ab".repeat(32),
-                    scrub_signature_classical: "c2ln".to_string(),
-                    scrub_signature_pqc: None,
-                    scrub_key_id: peer_key.to_string(),
-                    scrub_timestamp: chrono::Utc::now(),
-                },
-            )
+            sq.put_blob(&sha, BlobBody::Inline(bytes), None, {
+                let now = chrono::Utc::now();
+                crate::federation::blobs::sealed_put_blob_attestation(
+                    &sha,
+                    peer_key,
+                    peer_key,
+                    &uuid::Uuid::new_v4().to_string(),
+                    now,
+                    now,
+                )
+            })
             .await
             .expect("put_blob proxy");
             shas.push(sha);
@@ -10369,7 +11296,7 @@ mod tests {
         );
     }
 
-    // ─── v12.7.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
+    // ─── v13.0.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
 
     /// §Q signer for the budget wires: a deterministic-enough hybrid pair
     /// (fresh per test; the pubkeys ride along). Built + used SYNCHRONOUSLY
@@ -11097,6 +12024,42 @@ mod tests {
         ))
     }
 
+    /// v31.0.0 (CIRISPersist#647 / #658) — **the headline invariant, spelled
+    /// literally**: the bytes sitting in the `attestation_envelope` column
+    /// sha256sum to the row's own `original_content_hash`.
+    ///
+    /// Asserted against the row as READ BACK from a backend, never against an
+    /// in-memory value the test built, because the claim is about what is on
+    /// disk. Both placement-touching motions —
+    /// [`Engine::attestation_promote`] and the #530 repair re-scope — go
+    /// through `Engine::reseal_for_scope`, which used to canonicalize only to
+    /// hash and to sign and then hand back the UN-canonicalized value for the
+    /// backend to store. `sha256(column) != original_content_hash` for every
+    /// promoted and every re-scoped row, so a peer ingesting those bytes
+    /// derived a different content hash and every reference to the row
+    /// dangled.
+    ///
+    /// One helper rather than one spelling per call site: the defect existed
+    /// because a single motion had several spellings, and giving its witness
+    /// several spellings is how it comes back.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn assert_canonical_at_rest(row: &crate::federation::Attestation, what: &str) {
+        use sha2::{Digest as _, Sha256};
+        let stored =
+            serde_json::to_vec(&row.attestation_envelope).expect("a stored envelope re-serializes");
+        assert_eq!(
+            hex::encode(Sha256::digest(&stored)),
+            row.original_content_hash,
+            "{what}: sha256(stored attestation_envelope) != original_content_hash. The row is \
+             not canonical at rest (CIRISPersist#647): a peer ingesting these bytes derives a \
+             DIFFERENT content hash, so every reference to this row dangles, and the re-stamp \
+             that repairs it moves the row's wire address.\n  stored bytes: {}",
+            String::from_utf8_lossy(&stored),
+        );
+        crate::federation::canonical_at_rest::check_canonical_at_rest(&row.attestation_envelope)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+
     /// Seed a `federation_keys` row for `key_id` so the local-tier write
     /// gate's `attesting_key_id` FK and the promote path's `scrub_key_id`
     /// FK both hold.
@@ -11218,8 +12181,40 @@ mod tests {
             "promoter scrub_key_id is the DERIVED federation key_id, not the alias (#247)"
         );
         assert!(after.promoted_at.is_some(), "promoted_at stamped");
-        // Envelope is untouched by promotion (signing reads it, never edits).
-        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+        // v31.0.0 (CIRISPersist#649) — the envelope is touched by promotion in
+        // EXACTLY ONE PLACE: the typed-column mirror's `cohort_scope`, which is
+        // the column the promotion changes. This assertion used to read
+        // "envelope is untouched by promotion (signing reads it, never edits)",
+        // and that WAS the defect: #643 bound `cohort_scope` into the signed
+        // envelope, so a promotion that left the envelope alone signed a mirror
+        // asserting the row's pre-promotion scope and every peer refused the
+        // result. Pinned member-by-member so a future change that edits
+        // anything ELSE is caught here.
+        let mut expected_envelope = before.attestation_envelope.clone();
+        expected_envelope[crate::federation::envelope::paths::ROW]
+            [crate::federation::envelope::row_paths::COHORT_SCOPE] =
+            serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        // v31.0.0 (CIRISPersist#658) — …and CANONICAL, because the column a
+        // promotion writes is the one #647 says must sha256sum to
+        // `original_content_hash`. The expectation has to be canonicalized
+        // because `before` is not: `attestation_upsert_local` stores the
+        // producer's tokens verbatim, so this fixture's `weight: 1.0` /
+        // `score: 1.0` sit on disk as `1.0` while their canonical form is `1`.
+        // (That the LOCAL-tier write leaves a non-canonical row is a DIFFERENT
+        // producer and out of this cut's scope — the #650 boot classifier's
+        // `check_canonical_at_rest` arm re-stamps it. What this cut fixed is
+        // the promotion, which hashed and signed the canonical bytes and then
+        // stored the un-canonicalized value it had just hashed.)
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the expectation canonicalizes");
+        assert_eq!(
+            after.attestation_envelope, expected_envelope,
+            "promotion re-stamps the mirror's cohort_scope, canonicalizes, and touches NOTHING \
+             else"
+        );
+        assert_canonical_at_rest(&after, "the promoted row");
+        crate::federation::admission::check_row_column_binding(&after)
+            .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
         // Idempotent: re-promoting a federation row is a no-op.
         let again = engine
@@ -11438,7 +12433,35 @@ mod tests {
         assert_eq!(after.original_content_hash.len(), 64);
         assert_eq!(after.scrub_key_id, occ);
         assert!(after.promoted_at.is_some());
-        assert_eq!(after.attestation_envelope, before.attestation_envelope);
+        // v31.0.0 (CIRISPersist#649) — the sqlite twin's rule, on postgres: a
+        // promotion edits EXACTLY the mirror's `cohort_scope` and nothing else.
+        // Leaving the envelope untouched was the defect — it signed a mirror
+        // asserting the pre-promotion scope, and every peer refused the result.
+        let mut expected_envelope = before.attestation_envelope.clone();
+        expected_envelope[crate::federation::envelope::paths::ROW]
+            [crate::federation::envelope::row_paths::COHORT_SCOPE] =
+            serde_json::json!(crate::federation::types::cohort_scope::FEDERATION);
+        // v31.0.0 (CIRISPersist#658) — …and CANONICAL, because the column a
+        // promotion writes is the one #647 says must sha256sum to
+        // `original_content_hash`. The expectation has to be canonicalized
+        // because `before` is not: `attestation_upsert_local` stores the
+        // producer's tokens verbatim, so this fixture's `weight: 1.0` /
+        // `score: 1.0` sit on disk as `1.0` while their canonical form is `1`.
+        // (That the LOCAL-tier write leaves a non-canonical row is a DIFFERENT
+        // producer and out of this cut's scope — the #650 boot classifier's
+        // `check_canonical_at_rest` arm re-stamps it. What this cut fixed is
+        // the promotion, which hashed and signed the canonical bytes and then
+        // stored the un-canonicalized value it had just hashed.)
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut expected_envelope)
+            .expect("the expectation canonicalizes");
+        assert_eq!(
+            after.attestation_envelope, expected_envelope,
+            "promotion re-stamps the mirror's cohort_scope, canonicalizes, and touches NOTHING \
+             else"
+        );
+        assert_canonical_at_rest(&after, "the promoted row");
+        crate::federation::admission::check_row_column_binding(&after)
+            .expect("a promoted row satisfies the binding its own peers will check (#649)");
 
         // Idempotent re-promote.
         let again = engine
@@ -11495,6 +12518,7 @@ mod tests {
             );
             row.tier = attestation_tier::LOCAL.to_owned();
             row.cohort_scope = cohort_scope::SELF.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut row);
             row
         };
 
@@ -11538,6 +12562,7 @@ mod tests {
         );
         ok_row.tier = attestation_tier::LOCAL.to_owned();
         ok_row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut ok_row);
         sq.put_attestation(SignedAttestation {
             attestation: ok_row,
         })
@@ -11617,6 +12642,7 @@ mod tests {
         );
         row.tier = attestation_tier::LOCAL.to_owned();
         row.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         sq.put_attestation(SignedAttestation { attestation: row })
             .await
             .expect("#589: the local row admits while its author is in good standing");
@@ -11794,7 +12820,13 @@ mod tests {
         // closed set) — that asymmetry with attestation_promote (which
         // rejects `self`) is exactly what lets a tier-only path mint the
         // incoherent state we are reproducing.
-        sq.set_attestation_cohort_scope(&id, cohort_scope::SELF)
+        let promoted = sq.get_attestation(&id).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &promoted.attesting_key_id,
+            &promoted,
+            cohort_scope::SELF,
+        );
+        sq.set_attestation_cohort_scope(&id, cohort_scope::SELF, &reseal)
             .await
             .expect("force scope back to self (strand it)");
         let r = sq.get_attestation(&id).await.unwrap().expect("row");
@@ -11863,6 +12895,10 @@ mod tests {
             cohort_scope::FEDERATION,
             "now offer-visible: the covering grant's audience placed it"
         );
+        // The OTHER consumer of `Engine::reseal_for_scope`. Promotion is
+        // witnessed separately; this is the re-scope, and a fix that held for
+        // one and not the other would be the two-spellings defect again.
+        assert_canonical_at_rest(&fixed, "a #530-repaired re-scoped row");
 
         // Idempotent: a second repair finds nothing left stranded.
         let again = engine
@@ -11986,7 +13022,13 @@ mod tests {
             .attestation_promote(&trace_id, cohort_scope::FEDERATION)
             .await
             .expect("promote to federation");
-        pg.set_attestation_cohort_scope(&trace_id, cohort_scope::SELF)
+        let promoted = pg.get_attestation(&trace_id).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &promoted.attesting_key_id,
+            &promoted,
+            cohort_scope::SELF,
+        );
+        pg.set_attestation_cohort_scope(&trace_id, cohort_scope::SELF, &reseal)
             .await
             .expect("force scope back to self (strand it)");
 
@@ -12016,6 +13058,11 @@ mod tests {
             cohort_scope::FEDERATION,
             "the pg repair write-back placed it at the covering grant's audience"
         );
+        // Postgres parity for the sqlite arm's #647 claim. This backend is the
+        // one the invariant is stated in terms of — `sha256sum` of the column
+        // as `psql` prints it — so a sqlite-only witness would certify the
+        // half nobody hand-verifies.
+        assert_canonical_at_rest(&fixed, "a #530-repaired re-scoped row on postgres");
     }
 
     /// Emit a self-authored `withdraws` referencing `target_id` — the E7
@@ -12432,10 +13479,19 @@ mod tests {
         let pipeline = transform::TransformPipeline(ops);
 
         // What the total algebra itself produces over the row's own
-        // pre-promotion envelope.
-        let expected = pipeline
-            .apply_all(&row.attestation_envelope)
-            .expect("apply_all over a strip_field-only pipeline is total");
+        // pre-promotion envelope — plus the ONE edit v31.0.0 (CIRISPersist#649)
+        // adds after it: the typed-column mirror re-stamped for the placement
+        // the promotion is about to land at. The strip must still be exactly
+        // `apply_all`'s output in every OTHER respect; a bespoke loop
+        // reappearing inside the transform path still fails here.
+        let expected = crate::federation::envelope::RowMirror::restamp_for_scope(
+            &pipeline
+                .apply_all(&row.attestation_envelope)
+                .expect("apply_all over a strip_field-only pipeline is total"),
+            &row,
+            crate::federation::types::cohort_scope::FEDERATION,
+        )
+        .expect("finite weight");
 
         // What the engine's promotion primitive actually signs and writes.
         let promoted = engine
@@ -13745,7 +14801,7 @@ mod tests {
         );
     }
 
-    // ── v12.7.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
+    // ── v13.0.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
     // Witness-targets-subject age graduation over the REAL emit path, and
     // the minor-guardianship admit + steward-less-minor fail-secure driven
     // end-to-end over `emit_attestation` / `grant_delegation` /
@@ -14692,33 +15748,28 @@ mod tests {
                 "{tag} groups_of(founder) contains the group"
             );
 
+            // v31.0.0 (CIRISPersist#654) — the roster grow now carries the
+            // founder's authority signature over the GROWN group envelope.
+            let mem_b_row = RosterMember {
+                key_id: mem_b.clone(),
+                joined_at: joined,
+                role: None,
+            };
+            let admit_b = crate::federation::cohort::test_support::admit_roster_member_via(
+                d, &founder, cohort, group, &mem_b_row,
+            )
+            .await;
             assert!(
-                d.add_member(
-                    cohort,
-                    group,
-                    RosterMember {
-                        key_id: mem_b.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
-                )
-                .await
-                .expect("add_member"),
+                d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                    .await
+                    .expect("add_member"),
                 "{tag} add_member(mem_b) is a genuine add"
             );
             assert_eq!(d.active_members(cohort, group).await.unwrap().len(), 2);
             assert!(
-                !d.add_member(
-                    cohort,
-                    group,
-                    RosterMember {
-                        key_id: mem_b.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
-                )
-                .await
-                .expect("add_member idempotent"),
+                !d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                    .await
+                    .expect("add_member idempotent"),
                 "{tag} re-add(mem_b) is a no-op"
             );
 
@@ -14750,16 +15801,25 @@ mod tests {
                 "{tag} revoke drops mem_b"
             );
 
+            let mem_c_row = RosterMember {
+                key_id: mem_c.clone(),
+                joined_at: joined,
+                role: None,
+            };
+            // v31.0.0 (CIRISPersist#654) — the add half of the swap is signed
+            // over the roster as it stands when the add runs. The removal is
+            // append-only, so `members[]` still carries `founder` and the grown
+            // envelope contains both.
+            let admit_c = crate::federation::cohort::test_support::admit_roster_member_via(
+                d, &founder, cohort, group, &mem_c_row,
+            )
+            .await;
             assert!(
                 d.swap_member(
                     cohort,
                     group,
                     &founder,
-                    RosterMember {
-                        key_id: mem_c.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
+                    mem_c_row,
                     crate::federation::tier_ingest::test_support::sign_revoke_spec(
                         cohort,
                         &founder,
@@ -14769,6 +15829,7 @@ mod tests {
                         None,
                         vec![],
                     ),
+                    &admit_c,
                 )
                 .await
                 .expect("swap_member"),
@@ -14859,6 +15920,11 @@ mod tests {
                     joined_at: joined,
                     role: None,
                 },
+                &crate::federation::cohort::AdmitSpec {
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                },
             )
             .await
             .unwrap_err();
@@ -14940,16 +16006,28 @@ mod tests {
         .expect("genesis put_family");
 
         // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
-        // #502 E4 note: `supersede_family` writes via `supersede_group_row`, NOT
-        // the newly-gated `put_family` — the wrapper's authority fields are
-        // unused on this path (out of scope; the quorum authorization below is
-        // this path's OWN real authority check), so empty placeholders satisfy
-        // the type only.
+        //
+        // v31.0.0 (CIRISPersist#651) — this comment used to say that because
+        // `supersede_family` writes via `supersede_group_row` and not the
+        // gated `put_family`, "the wrapper's authority fields are unused on
+        // this path", so empty placeholders satisfied the type. That sentence
+        // WAS the hole, written down and accepted as intentional: supersede
+        // was a SECOND, ungated write door into `federation_families`,
+        // admitting a re-baselined roster, a new `consensus_protocol` and a
+        // new `family_name` on FK-existence alone.
+        //
+        // The `authorization` below never substituted for authorship. It is
+        // the membership-change JUSTIFICATION recorded on the superseded prior
+        // version — a note about why the change was made, not a proof of who
+        // made it. `supersede_family` now hybrid-verifies the wrapper exactly
+        // as `put_family` does, so the fixture seals it through the same
+        // helper the genesis write above uses.
         let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
         let new_version = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(5),
@@ -14958,10 +16036,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 Some(auth.clone()),
             )
             .await
@@ -14999,10 +16074,19 @@ mod tests {
         assert!(d.group_at(Cohort::Family, &fam, 9).await.unwrap().is_none());
 
         // supersede on an unknown group is rejected.
+        //
+        // v31.0.0 (CIRISPersist#651) — SIGNED, deliberately, even though the
+        // row is meant to be refused. This assertion is about the UNKNOWN-GROUP
+        // rule, and `supersede_family` now hybrid-verifies authorship first, so
+        // an unsigned wrapper would be refused for having no registered
+        // attester and this test would silently start measuring the authorship
+        // gate instead of the rule it was written for. Sealing it with a
+        // registered key keeps the refusal under test the intended one.
         let err = d
             .supersede_family(
-                crate::federation::SignedFamily {
-                    family: types::Family {
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -15011,10 +16095,7 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
-                    authority_key_id: String::new(),
-                    scrub_signature_classical: String::new(),
-                    scrub_signature_pqc: None,
-                },
+                ),
                 None,
             )
             .await
@@ -15399,16 +16480,22 @@ mod tests {
         .expect("put_family");
 
         // add → §9 added event
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN family envelope.
+        let newcomer = RosterMember {
+            key_id: fmk[1].clone(),
+            joined_at: joined,
+            role: None,
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            d,
+            &fmk[0],
+            Cohort::Family,
+            &fam,
+            &newcomer,
+        )
+        .await;
         assert!(d
-            .add_member(
-                Cohort::Family,
-                &fam,
-                RosterMember {
-                    key_id: fmk[1].clone(),
-                    joined_at: joined,
-                    role: None
-                },
-            )
+            .add_member(Cohort::Family, &fam, newcomer, &admit)
             .await
             .expect("add_member"));
         // revoke → §9 removed event (family FS is inherent fresh-per-write)
@@ -16190,30 +17277,37 @@ mod tests {
             &producer,
             &establishing_envelope,
         );
+        // v31.0.0 (CIRISPersist#598/#643) — SEAL, don't hand-sign. Bound first so
+        // the mirror and the signed instants are stamped BEFORE the signature,
+        // which is the rule every producer on this substrate follows.
+        let establishing = crate::federation::types::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: producer.clone(),
+            attested_key_id: producer.clone(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: establishing_envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: producer.clone(),
+            scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![producer.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
         dir.put_attestation(crate::federation::types::SignedAttestation {
-            attestation: crate::federation::types::Attestation {
-                attestation_id: uuid::Uuid::new_v4().to_string(),
-                attesting_key_id: producer.clone(),
-                attested_key_id: producer.clone(),
-                attestation_type: crate::federation::types::attestation_type::SCORES.into(),
-                weight: None,
-                asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                expires_at: None,
-                attestation_envelope: establishing_envelope,
-                original_content_hash: och,
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-                scrub_key_id: producer.clone(),
-                scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
-                persist_row_hash: String::new(),
-                subject_key_ids: vec![producer.clone()],
-                withdraws_admission_rule: None,
-                cohort_scope: "federation".to_string(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
+            attestation: crate::federation::tier_ingest::test_support::seal_row(
+                &producer,
+                establishing,
+            ),
         })
         .await
         .expect("seed establishing content");

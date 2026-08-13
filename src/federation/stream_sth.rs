@@ -204,12 +204,27 @@ pub fn recompute_and_assert_root(
 /// hybrid STH returns `Some`.
 #[must_use]
 pub fn signature_b64_parts(sth: &SignedTreeHead) -> (String, Option<String>) {
+    hybrid_signature_b64_parts(&sth.signature)
+}
+
+/// v31.0.0 (CIRISPersist#657) — the body of [`signature_b64_parts`], lifted so
+/// the WITNESS cosignatures go through the identical projection the PRODUCER
+/// signature does.
+///
+/// A [`WitnessSignature`] carries the same
+/// [`HybridSignature`](ciris_crypto::HybridSignature) shape over the same
+/// [`SignedTreeHead::signing_bytes_of`] bytes, so it must be decomposed the
+/// same way — including the `ClassicalOnly ⇒ None` arm, which is what makes a
+/// classical-only cosignature fail hybrid-Strict instead of silently verifying
+/// on one leg. Two spellings of this projection would be one of them drifting.
+#[must_use]
+pub fn hybrid_signature_b64_parts(sig: &ciris_crypto::HybridSignature) -> (String, Option<String>) {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
-    let ed25519_sig_b64 = B64.encode(&sth.signature.classical.signature);
-    let pqc_sig_b64 = match sth.signature.mode {
+    let ed25519_sig_b64 = B64.encode(&sig.classical.signature);
+    let pqc_sig_b64 = match sig.mode {
         ciris_crypto::SignatureMode::ClassicalOnly => None,
-        _ => Some(B64.encode(&sth.signature.pqc.signature)),
+        _ => Some(B64.encode(&sig.pqc.signature)),
     };
     (ed25519_sig_b64, pqc_sig_b64)
 }
@@ -289,9 +304,20 @@ pub fn deserialize_signature(bytes: &[u8]) -> Result<ciris_crypto::HybridSignatu
 }
 
 /// JSON-serialize the witness cosignatures for the `witness_signatures`
-/// column (PG JSONB / SQLite TEXT). Stored as-provided — Cut C1b does
-/// NOT enforce a cosign quorum. Mirrors
+/// column (PG JSONB / SQLite TEXT). Mirrors
 /// `merkle_store::serialize_witness_signatures`.
+///
+/// v31.0.0 (CIRISPersist#657) — this doc used to say the witnesses were
+/// "stored as-provided". CORRECTED IN PLACE rather than deleted, because that
+/// sentence described the defect: an as-provided cosignature is a signature the
+/// substrate keeps and serves back through
+/// [`FederationDirectory`](super::FederationDirectory)'s STH reads without ever
+/// having checked it, which is worse than not keeping it because it LOOKS like
+/// evidence (the #556 preserve-set-equals-verified-set rule, on the
+/// transparency plane). Every cosignature reaching this encoder has now passed
+/// [`blobs::verify_stream_sth_witnesses`](super::blobs) at the door. There is
+/// still no cosign QUORUM — a quorum is a policy the consumer sets — but there
+/// is no longer an unverified one.
 pub fn serialize_witness_signatures(witnesses: &[WitnessSignature]) -> Result<String, BlobError> {
     serde_json::to_string(witnesses)
         .map_err(|e| BlobError::Backend(format!("stream-sth witness sigs serialize: {e}")))

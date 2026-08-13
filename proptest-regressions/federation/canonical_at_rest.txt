@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# v31.0.0 (CIRISPersist#647): these two seeds were surfaced by the MUTATION
+# run, not by a real red — M1 (canonicalize_in_place made a no-op) and M2
+# (storage-stability guard removed). They are checked in because they are
+# the two shapes that matter: a wide negative integer, and an object holding
+# both a U+E000 key and a supplementary-plane key — the UTF-16-vs-UTF-8
+# key-order divergence, which the property harness found on its own.
+cc f5e2d33b68ab876fc2c815f7c39ce8210485a0e3266a8a22f73b614d4e878285 # shrinks to v = Array [Array [Number(-28358119138907831)]]
+cc 91204a3cfc8cc674b751e4149b704e64c3c5bdffa1428755737d0551aa8eba1b # shrinks to v = Object {"\u{e000}": Null, "𐀀": Null}

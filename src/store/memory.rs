@@ -291,7 +291,7 @@ struct State {
     /// pressure/decay evict (by `retention_priority DESC`). Parity with
     /// the postgres/sqlite `content_symbols` table (V084).
     fountain_symbols: HashMap<String, HashMap<u32, crate::fountain::FountainSymbolV1>>,
-    /// v12.7.0 (§Q / CIRISPersist#370) — installed `StorageBudgetV1` pin
+    /// v13.0.0 (§Q / CIRISPersist#370) — installed `StorageBudgetV1` pin
     /// state, keyed by owner `node_id`. Parity with the postgres/sqlite
     /// `storage_budget_installed` table (V093). Replaced only by a
     /// strictly-higher revision (§Q B3 anti-rollback).
@@ -479,6 +479,48 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// v31.0.0 (CIRISPersist#646) — the memory twin of
+    /// `PostgresBackend`/`SqliteBackend::index_stored_record`: reload the row
+    /// through the read path's own dispatcher and index the bytes it returns.
+    /// See
+    /// [`wire_index::entry_as_stored`](crate::federation::wire_index::entry_as_stored).
+    ///
+    /// Memory rounds nothing and normalizes nothing, so this backend is where
+    /// the defect never bit — which is exactly why it must run the same
+    /// derivation. A rule only the failing backend follows is a rule the next
+    /// writer will not know about, and memory is the CONTROL every witness
+    /// compares against: it has to be running the code under test.
+    ///
+    /// The state `Mutex` is not reentrant and the reload takes it, so every
+    /// caller must have released its guard before awaiting this — which is also
+    /// what keeps these futures `Send`.
+    async fn index_stored_record(
+        &self,
+        kind: &str,
+        record_key_json: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(content_hash) =
+            crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
+        {
+            self.state
+                .lock()
+                .expect("memory backend lock")
+                .signed_wire_index
+                .insert((kind.to_owned(), content_hash), record_key_json.to_owned());
+        }
+        Ok(())
+    }
+
+    /// v31.0.0 (CIRISPersist#646) — the Key-plane shorthand for
+    /// [`index_stored_record`](Self::index_stored_record).
+    async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
+        self.index_stored_record(
+            "Key",
+            &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
+        )
+        .await
     }
 
     /// (CIRISPersist#593) — snapshot `(list_attestations_by,
@@ -876,7 +918,13 @@ impl MemoryBackend {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let attesting_key_id = input.attesting_key_id.clone();
-        let now = chrono::Utc::now();
+        // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+        // envelope when it carries one (see `admission::local_row_instant`), so
+        // a `consent:state:*` row staged at the local tier can still satisfy
+        // the instant binding at the promote door.
+        let now =
+            crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
+        let is_transit = transit.is_some();
         let mut row = match transit {
             Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
                 attestation_id.clone(),
@@ -887,6 +935,52 @@ impl MemoryBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
+        // THIS DOOR TOO, and this door is the one that actually mattered.
+        //
+        // `LocalAttestationInput::attestation_id` is caller-supplied (#473's
+        // deterministic-mint option), and the local door deliberately DEFERS
+        // `check_reserved_prefix_admission` to the promote gate — so a
+        // `genesis-charter` row could be staged here with no reservation check
+        // of any kind. Deferring THIS reservation the same way would not work,
+        // because the harm is not what the row says, it is that the row exists:
+        // `federation_attestations.attestation_id` is the primary key, and
+        // `get_attestation` — which `verify_delegation_plane_seeded` reads
+        // through — does not filter by tier. A local-tier squat is therefore
+        // fully sufficient to take the ceremony's key AND to flip the posture
+        // to `Divergent`, which refuses boot. Promotion never happens; it does
+        // not need to.
+        //
+        // Called on the assembled row, so it is the SAME predicate the
+        // federation door runs — one spelling. A local row can never equal the
+        // baked federation-tier ceremony row, so in practice this refuses every
+        // claim on those three ids, which is the intent.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
+        // See `crate::federation::envelope::RowMirror::stamp_local_row` for
+        // the decision and the transit exclusion. One helper, all three
+        // backends.
+        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, is_transit)?;
+        // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
+        // measured the PRODUCER's envelope; this one measures the bytes that
+        // actually land, which the #643 mirror and the #598 instants just grew
+        // by ~250. Without it a row in that window is admitted here and refused
+        // by the SAME function at the federation door on promotion or
+        // replication — locally Ok, globally unreplicable. Both calls stay: the
+        // early one is the cheap pre-filter that keeps hostile input away from
+        // the directory reads below it, this one is authoritative. See
+        // `check_envelope_size_admission` for why producers do not reserve
+        // headroom instead.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#598) — the same binding the federation door
+        // asks, asked at the local door too: a `consent:state:*` row that
+        // cannot state its own signed instant is refused where it is written,
+        // not where it is promoted.
+        crate::federation::admission::check_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // v18.0.0 (#473) — replay idempotence for caller-supplied DETERMINISTIC
@@ -1511,7 +1605,7 @@ impl Backend for MemoryBackend {
         Ok(out)
     }
 
-    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+    // ─── v13.0.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
 
     async fn put_installed_storage_budget(
         &self,
@@ -1839,6 +1933,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST, first thing: the
+        // registration envelope is replaced by its JCS form, so the bytes
+        // bound into `federation_keys.registration_envelope` are the bytes
+        // `verify_key_registration` hashes and the producer signed.
+        // Idempotent, therefore signature-transparent; ahead of the role
+        // lift so every reader below sees one shape.
+        crate::federation::canonical_at_rest::canonicalize_in_place(
+            &mut row.registration_envelope,
+        )?;
         // v19.0.0 (#486) — lift envelope-attested roles into the claim
         // surface BEFORE the role write-gates (lift-then-gate).
         crate::federation::admission::lift_envelope_attested_roles(&mut row);
@@ -1867,7 +1970,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )?;
         }
 
-        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
         // admission gate + 'unregistered'⇔None normalization as the SQL
         // backends (a stored-form 'unregistered' submitted on the wire
         // reads back as None everywhere).
@@ -1877,7 +1980,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .as_deref()
             .and_then(crate::federation::types::consent_role::wire_from_stored)
             .map(str::to_owned);
-        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — accord-conferred `canonical`
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — accord-conferred `canonical`
         // gate. Runs BEFORE the state lock (it calls lookup_public_key on self,
         // which acquires the lock itself) and BEFORE persist — a self-signed /
         // non-anchor-scrubbed `canonical` claim leaves no trace. Backend-
@@ -1897,26 +2000,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
         // Server-computed hash (excludes the field itself).
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        // Idempotent on key_id collision with matching content.
-        if let Some(existing) = state.federation_keys.get(&row.key_id) {
-            if existing.persist_row_hash == row.persist_row_hash {
-                return Ok(()); // exact duplicate — no-op
+        let key_id = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // Idempotent on key_id collision with matching content.
+            if let Some(existing) = state.federation_keys.get(&row.key_id) {
+                if existing.persist_row_hash == row.persist_row_hash {
+                    return Ok(()); // exact duplicate — no-op
+                }
+                return Err(crate::federation::Error::Conflict(format!(
+                    "key_id {} already exists with different content",
+                    row.key_id
+                )));
             }
-            return Err(crate::federation::Error::Conflict(format!(
-                "key_id {} already exists with different content",
-                row.key_id
-            )));
-        }
-        // v21.1.0 (CIRISPersist#507b) — `SignedKeyRecord` wraps the exact
-        // `row` the read surface re-serializes.
-        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
-        // path and the mutators cannot compute the entry differently.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        state.federation_keys.insert(row.key_id.clone(), row);
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+            // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
+            // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
+            // path and the mutators cannot compute the entry differently.
+            // v31.0.0 (CIRISPersist#640/#646) — indexed from the STORED row, after
+            // the insert AND after the guard is released; see
+            // `MemoryBackend::index_stored_record`.
+            let key_id = row.key_id.clone();
+            state.federation_keys.insert(key_id.clone(), row);
+            key_id
+        };
+        self.index_stored_key_row(&key_id).await?;
         Ok(())
     }
 
@@ -1955,35 +2061,35 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
-        let mut state = self.state.lock().expect("memory backend lock");
-        let existing =
-            state
-                .federation_keys
-                .get(&row.key_id)
-                .ok_or_else(|| Error::GenesisBundleInvalid {
+        let key_id = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let existing = state.federation_keys.get(&row.key_id).ok_or_else(|| {
+                Error::GenesisBundleInvalid {
                     detail: format!("re-anchor target {} has no existing row", row.key_id),
-                })?;
-        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
-            return Err(Error::GenesisBundleInvalid {
-                detail: format!("re-anchor {}: pubkey change refused", row.key_id),
-            });
-        }
-        if row.valid_from <= existing.valid_from {
-            return Err(Error::GenesisBundleInvalid {
-                detail: format!(
-                    "re-anchor {}: valid_from not newer than anchored — rollback refused",
-                    row.key_id
-                ),
-            });
-        }
-        // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
-        // row through EVERY mutator, not only `put_public_key`. See
-        // `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
-        state.federation_keys.insert(row.key_id.clone(), row);
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+                }
+            })?;
+            if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+                return Err(Error::GenesisBundleInvalid {
+                    detail: format!("re-anchor {}: pubkey change refused", row.key_id),
+                });
+            }
+            if row.valid_from <= existing.valid_from {
+                return Err(Error::GenesisBundleInvalid {
+                    detail: format!(
+                        "re-anchor {}: valid_from not newer than anchored — rollback refused",
+                        row.key_id
+                    ),
+                });
+            }
+            // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
+            // row through EVERY mutator, not only `put_public_key`.
+            // v31.0.0 (CIRISPersist#640/#646) — from the STORED row; see
+            // `MemoryBackend::index_stored_record`.
+            let key_id = row.key_id.clone();
+            state.federation_keys.insert(key_id.clone(), row);
+            key_id
+        };
+        self.index_stored_key_row(&key_id).await?;
         Ok(())
     }
 
@@ -2026,7 +2132,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
     /// consent_role. `None` revokes (back to the unset/'unregistered'
     /// default). No chain; a subsequent call overwrites. `consent_role`
     /// is excluded from `persist_row_hash`, so mutating it does not
@@ -2041,20 +2147,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let normalized: Option<String> = consent_role
             .and_then(crate::federation::types::consent_role::wire_from_stored)
             .map(str::to_owned);
-        let mut state = self.state.lock().expect("memory backend lock");
-        let Some(row) = state.federation_keys.get_mut(key_id) else {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "set_consent_role: no federation_keys row for {key_id}"
-            )));
-        };
-        row.consent_role = normalized;
-        // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
-        // `persist_row_hash` but IS in the bytes the read surface returns, so
-        // the WIRE content hash moves here. Re-index.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let Some(row) = state.federation_keys.get_mut(key_id) else {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "set_consent_role: no federation_keys row for {key_id}"
+                )));
+            };
+            row.consent_role = normalized;
+            // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
+            // `persist_row_hash` but IS in the bytes the read surface returns, so
+            // the WIRE content hash moves here. Re-index.
+            // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
+            // helper, after the guard is released.
+        }
+        self.index_stored_key_row(key_id).await?;
         Ok(())
     }
 
@@ -2218,10 +2325,76 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // This tier is IDENTICAL to the sqlite + postgres backends', gate for
         // gate and order for order.
         crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST. The envelope is
+        // replaced by its JCS form HERE, immediately behind the size gate
+        // that BOUNDS the canonicalization it pays for, so every gate below
+        // and every bind site downstream sees exactly the bytes the
+        // producer's signature and `original_content_hash` were taken over.
+        // An operator can then `sha256sum` the stored column and compare it
+        // to `original_content_hash` with no JCS implementation in hand.
+        //
+        // Signature-transparent: canonicalization is IDEMPOTENT (proven in
+        // `federation::canonical_at_rest`), so the hash cross-check and the
+        // hybrid verify further down see byte-identical input to what they
+        // would have seen without this line.
+        //
+        // This tier is IDENTICAL across memory / sqlite / postgres.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED.
+        // Immediately behind the canonicalization so the envelope compare sees
+        // the bytes that will be stored, and ahead of the #598/#643 binding
+        // gates so a squat is named by the reservation rather than by whichever
+        // neighbouring gate the attacker's row happens to trip first. The baked
+        // rows themselves pass here unchanged, so the pre-v31 refusal those two
+        // gates produce — the inversion `bundle_delegation_plane_v31_shaped`
+        // drives — is untouched. Pure ⇒ TIER 1; backend-symmetric across
+        // memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
+        // SQL backends refused a non-hex value only as a side effect of binding
+        // a BLOB/BYTEA; memory binds nothing and accepted it. Stated on all
+        // three so the answer is the same answer, not the same accident.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
+
+        // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
+        // `consent:state:*` row is refused unless its signed envelope carries
+        // an `asserted_at` (and `expires_at`) equal to the row column the
+        // consent fold orders on. `asserted_at` is stored VERBATIM from the
+        // caller here and no signature covers it, so without this a replay of
+        // a subject's own byte-identical, still-valid grant with a bumped
+        // column flipped a revocation back to Granted — and re-opened
+        // `check_capacity_consent_admission`, a gate inside persist. Pure
+        // function of (row, now) ⇒ AV-76 TIER 1, and a REFUSAL, so an early
+        // position is safe. Backend-symmetric across memory / sqlite /
+        // postgres, and asked again at the promote door
+        // (`check_promotion_admission`) so the local tier is not a way around
+        // it (B8).
+        crate::federation::admission::check_instant_binding(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+
+        // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN BINDING. The
+        // signature covers `attestation_envelope` and NOTHING ELSE, so
+        // `attestation_type` (the VERB), `subject_key_ids` (which grants
+        // revocation authority), `attested_key_id`, `cohort_scope` and
+        // `weight` were unsigned columns a relay could rewrite with the
+        // producer's own signature still verifying — flip `withdraws` to
+        // `scores` and a retraction becomes a claim while the thing it
+        // retracted stays live. Refused on ABSENCE or DIVERGENCE, no legacy
+        // regime. Pure function of the row => AV-76 TIER 1, tier-blind (a
+        // tier-scoped binding would be skippable by writing `tier = "local"`
+        // and promoting), and backend-symmetric across memory / sqlite /
+        // postgres.
+        crate::federation::admission::check_row_column_binding(&row)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
@@ -2466,7 +2639,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // scoped delegates_to chain. Absence ⇒ REJECT.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate. A no-op for non-`delegates_to` rows; for a
         // `delegates_to` whose recipient (`attested_key_id`) resolves to a
         // node-ONLY identity it REJECTS any scope set that is not
@@ -2566,6 +2739,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+        // v31.0.0 (CIRISPersist#646) — carried OUT of the guard scope: the
+        // reload the index derivation needs takes the same lock.
+        let wire_index_key: Option<String>;
 
         {
             let mut state = self.state.lock().expect("memory backend lock");
@@ -2654,16 +2830,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // tier only, the E5 invariant). `Attestation` IS its own signed
             // wrapper (inline scrub signature). Computed before the push
             // moves `row`.
-            if row.tier == crate::federation::types::attestation_tier::FEDERATION {
-                let wire_index_key = crate::federation::wire_index::record_key(&[(
-                    "attestation_id",
-                    &row.attestation_id,
-                )]);
-                let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-                state
-                    .signed_wire_index
-                    .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
-            }
+            // v31.0.0 (CIRISPersist#646) — indexed after the guard is
+            // released, from the STORED row; see `index_stored_record`.
+            wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
+                .then(|| {
+                    crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &row.attestation_id,
+                    )])
+                });
             state.federation_attestations.push(row);
             // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
             // `trace:complete:v1` attestation materializes its `trace_events`
@@ -2689,6 +2864,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         crate::federation::Error::Backend(format!("trace llm projection: {e}"))
                     })?;
             }
+        }
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
         }
         Ok(())
     }
@@ -3133,65 +3312,214 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
-    /// write-back: validate against the closed cohort_scope set, stamp
-    /// it, and recompute `persist_row_hash`.
+    /// v31.0.0 (CIRISPersist#650) — the unfiltered corpus enumerator: every
+    /// row, every tier. Twin of `list_local_tier_attestations` MINUS the tier
+    /// predicate; see the trait doc for why a fold may not run over a
+    /// partition.
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| match after_attestation_id {
+                Some(after) => a.attestation_id.as_str() > after,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — re-seal in place. The gate stack is
+    /// [`crate::federation::migration::check_reseal_admission`], shared with
+    /// sqlite and postgres, run on a CANDIDATE before `row` is touched: this
+    /// backend holds `&mut` into live state, so gating after stamping would
+    /// leave a REFUSED re-seal having already mutated the row — the AV-9
+    /// violation the SQL backends are structurally protected from by working on
+    /// a loaded copy.
+    async fn reseal_attestation_v31(
+        &self,
+        resealed: &crate::federation::Attestation,
+    ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
+        // gate does not pin. BEFORE the state lock, because the signature arm
+        // resolves registered pubkeys through the directory, which locks
+        // itself. The stored copy read here is re-found under the lock below
+        // and re-gated by the pure `check_reseal_admission` there, so the
+        // async read outside the lock cannot widen what is admitted.
+        {
+            let Some(stored) = crate::federation::FederationDirectory::get_attestation(
+                self,
+                &resealed.attestation_id,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed)
+                .await?;
+        }
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let Some(row) = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == resealed.attestation_id)
+            else {
+                return Ok(false);
+            };
+            crate::federation::migration::check_reseal_admission(
+                row,
+                resealed,
+                chrono::Utc::now(),
+            )?;
+            row.attestation_envelope = resealed.attestation_envelope.clone();
+            row.original_content_hash = resealed.original_content_hash.clone();
+            row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
+            row.scrub_key_id = resealed.scrub_key_id.clone();
+            row.scrub_timestamp = resealed.scrub_timestamp;
+            row.additional_scrubs = resealed.additional_scrubs.clone();
+            row.asserted_at = resealed.asserted_at;
+            row.expires_at = resealed.expires_at;
+            row.pqc_completed_at = resealed
+                .scrub_signature_pqc
+                .as_ref()
+                .map(|_| resealed.scrub_timestamp);
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            // The wire index moves WITH the row (#610): the re-seal recomputes
+            // `persist_row_hash`, so without re-indexing the row advertises a
+            // hash the index does not hold.
+            (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )])
+            })
+        };
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row, and the
+    /// V106 subject projection with it (the SQL backends get that from `ON
+    /// DELETE CASCADE`; memory has to say it).
+    async fn purge_attestation_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#650) — the door's own gate (AV-9:
+        // verify-before-mutation). Asked BEFORE the lock is taken, so a refusal
+        // cannot interleave with a mutation.
+        if let Some(row) = self.get_attestation(attestation_id).await? {
+            crate::federation::migration::check_purge_admission(&row)?;
+        }
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.federation_attestations.len();
+        state
+            .federation_attestations
+            .retain(|a| a.attestation_id != attestation_id);
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
+    /// validate against the closed cohort_scope set, stamp it alongside the
+    /// re-signed envelope, and recompute `persist_row_hash`.
     async fn set_attestation_cohort_scope(
         &self,
         attestation_id: &str,
         cohort_scope: &str,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<(), crate::federation::Error> {
         if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
             )));
         }
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state
-            .federation_attestations
-            .iter_mut()
-            .find(|a| a.attestation_id == attestation_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
-        // `repair_stranded_scope_backlog` re-scopes an already-federation row
-        // to a covering grant's audience through here, which can be
-        // `community` — so without this the standing gate on
-        // `promote_attestation` would have a door beside it, this repo's own
-        // recurring class.
-        //
-        // Gated on a CANDIDATE clone, before `row` is touched: this backend
-        // holds `&mut` into live state, so stamping first and checking second
-        // would leave a REFUSED re-scope having already mutated the row — the
-        // AV-9 violation sqlite/postgres are structurally protected from by
-        // working on a loaded copy. Memory tolerating what the SQL backends
-        // reject is exactly the class this ordering exists to deny.
-        let mut candidate = row.clone();
-        candidate.cohort_scope = cohort_scope.to_owned();
-        crate::federation::admission::check_promotion_cohort_standing(&candidate)?;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_attestations row {attestation_id} does not exist"
+                    ))
+                })?;
+            // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
+            // `repair_stranded_scope_backlog` re-scopes an already-federation row
+            // to a covering grant's audience through here, which can be
+            // `community` — so without this the standing gate on
+            // `promote_attestation` would have a door beside it, this repo's own
+            // recurring class.
+            //
+            // Gated on a CANDIDATE clone, before `row` is touched: this backend
+            // holds `&mut` into live state, so stamping first and checking second
+            // would leave a REFUSED re-scope having already mutated the row — the
+            // AV-9 violation sqlite/postgres are structurally protected from by
+            // working on a loaded copy. Memory tolerating what the SQL backends
+            // reject is exactly the class this ordering exists to deny.
+            let mut candidate = row.clone();
+            candidate.cohort_scope = cohort_scope.to_owned();
+            candidate.attestation_envelope = reseal.attestation_envelope.clone();
+            crate::federation::admission::check_promotion_cohort_standing(&candidate)?;
+            // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING at the
+            // SECOND placement door. `cohort_scope` is one of the seven columns
+            // #643 bound into the signed envelope, so re-scoping in place made
+            // the row's own mirror diverge from its column and every peer's
+            // `put_attestation` refused it. The caller re-stamps and re-signs;
+            // this refuses a caller that did not.
+            crate::federation::admission::check_row_column_binding(&candidate)?;
 
-        row.cohort_scope = cohort_scope.to_owned();
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v30.1.0 (CIRISPersist#610) — the wire index moves WITH the row.
-        // Same defect as the two SQL backends: this mutator recomputes
-        // `persist_row_hash`, so without re-indexing the row advertises a hash
-        // the index does not hold and the pack path cannot serve what the offer
-        // path offered. Federation-tier only, per the E5 invariant that governs
-        // the put path's own indexing.
-        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
-            state
-                .signed_wire_index
-                .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
+            row.cohort_scope = cohort_scope.to_owned();
+            row.attestation_envelope = reseal.attestation_envelope.clone();
+            row.original_content_hash = reseal.original_content_hash.clone();
+            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
+            row.scrub_key_id = reseal.scrub_key_id.clone();
+            row.scrub_timestamp = reseal.scrub_timestamp;
+            row.pqc_completed_at = reseal
+                .scrub_signature_pqc
+                .as_ref()
+                .map(|_| reseal.scrub_timestamp);
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            // v30.1.0 (CIRISPersist#610) — the wire index moves WITH the row.
+            // Same defect as the two SQL backends: this mutator recomputes
+            // `persist_row_hash`, so without re-indexing the row advertises a hash
+            // the index does not hold and the pack path cannot serve what the offer
+            // path offered. Federation-tier only, per the E5 invariant that governs
+            // the put path's own indexing.
+            (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )])
+            })
+        };
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
         }
         Ok(())
     }
@@ -3228,6 +3556,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
+        // envelope is stored as the JCS bytes its scrub signature and
+        // `original_content_hash` cover, so the stored column sha256sums to
+        // the declared hash. Idempotent, therefore signature-transparent.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
+        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
+        // signature covers `revocation_envelope` and nothing else, so
+        // `revoked_key_id` / `revocation_id` / the instants were columns a
+        // relay could rewrite while the signature still verified — one
+        // conferred moderator's revocation, re-pasted at any key. Pure
+        // function of the row (AV-76 tier 1), run ahead of the trust gate and
+        // the authority resolution so the refusal never depends on roster,
+        // trust score or custody state. Placed HERE on memory too, in the same
+        // position as sqlite/postgres: the backend-symmetry lesson has cost
+        // this repo seven releases.
+        crate::federation::admission::check_revocation_envelope_binding(&row)?;
         // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking key is
         // the attester. v22.0.0 (CIRISPersist#543 finding 4): backend-
         // symmetric with sqlite + postgres, which have gated this path
@@ -3237,14 +3581,68 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
-        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
-        // moderation act. Self-revocation passes untouched.
-        crate::federation::admission::check_revocation_authority(self, &row).await?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
+        // SQL backends bind this column as BLOB/BYTEA and so refused a non-hex
+        // value as a SIDE EFFECT of `hex::decode`; memory decodes nothing and
+        // accepted it. Stated here, and on both SQL backends, so all three give
+        // the same typed answer rather than two giving it by accident.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Hybrid-Strict vs the revoking key's registered
         // pubkeys — was FK + trust-score only, forgeable de-peer DoS.
+        //
+        // v31.0.0 (CIRISPersist#660) — moved AHEAD of the authority walk, which
+        // is where sqlite + postgres have always had it. Memory ran the
+        // directory walk first, i.e. it spent unauthenticated reads on a
+        // revocation whose signature it had not yet checked — the AV-76 tier
+        // order inverted on one backend only.
         crate::federation::verify_revocation_admission(self, &row).await?;
+        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
+        // moderation act. Self-revocation passes untouched.
+        crate::federation::admission::check_revocation_authority(self, &row).await?;
+        // v31.0.0 (CIRISPersist#659) — THE TWO GATES MEMORY NEVER RAN. sqlite
+        // and postgres have gated this door with the §3.11 closed-set region
+        // check and the per-`revoked_key_id` anti-rollback since v3.11.0;
+        // memory ran NEITHER, so a region outside the closed set and a
+        // non-monotonic scrub instant were both admitted on the one backend the
+        // in-process deployments and half the fixture corpus use. That is this
+        // release's own theme — a write door that skips a gate its siblings run
+        // (#656) — and the recurring backend-asymmetry class it has cost seven
+        // releases to learn.
+        crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: without a ceiling, one self-signed
+        // revocation dated far enough forward makes its own subject immune to
+        // every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        {
+            // The floor. Scoped so the lock is released before the gates below,
+            // keeping memory's gate ORDER identical to sqlite/postgres.
+            let state = self.state.lock().expect("memory backend lock");
+            let latest = state
+                .federation_revocations
+                .iter()
+                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .map(|r| r.scrub_timestamp)
+                .max();
+            if let Some(existing) = latest {
+                if row.scrub_timestamp <= existing {
+                    return Err(crate::federation::Error::RevocationRollback {
+                        revoked_key_id: row.revoked_key_id.clone(),
+                        existing_signed_timestamp: existing,
+                        submitted_signed_timestamp: row.scrub_timestamp,
+                    });
+                }
+            }
+        }
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the one
         // that was SIGNED, and must be coherent with `effective_at`. Runs
         // before persist_row_hash and before the push, so a refused bound
@@ -3263,6 +3661,33 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "revoking_key_id {} does not exist in federation_keys",
                 row.revoking_key_id
             )));
+        }
+        // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
+        // (CIRISPersist#660): absent on this backend entirely, so an OLD,
+        // still-validly-signed revocation could be replayed here to re-assert a
+        // state its subject had already moved past — refused on sqlite and
+        // postgres since v3.11.0. The RULE is the shared
+        // `check_revocation_anti_rollback`; only the "find the newest stored
+        // row" half is per-backend, and here it is a scan under the lock the
+        // push already holds, so the check and the insert cannot race.
+        //
+        // Sits after the FK emulation rather than before `check_revocation_bound`
+        // (the sqlite/postgres position) for one reason: memory's lookup needs
+        // this lock. Both are refusals that mutate nothing, so the order between
+        // them is not observable in state — only in which message an operator
+        // sees when a row violates both.
+        {
+            let latest = state
+                .federation_revocations
+                .iter()
+                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .map(|r| r.scrub_timestamp)
+                .max();
+            crate::federation::admission::check_revocation_anti_rollback(
+                &row.revoked_key_id,
+                latest,
+                row.scrub_timestamp,
+            )?;
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         state.federation_revocations.push(row);
@@ -3300,6 +3725,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #446 — the projection is computed inside the lock scope but applied
         // after it (put_transport_destination takes the lock itself), ONLY
         // when the occurrence write applied.
+        // v31.0.0 (CIRISPersist#646) — same for the wire-index derivation: it
+        // reloads through the read surface, which takes this lock.
+        let mut indexed: Option<String> = None;
         let projected_route = {
             let mut state = self.state.lock().expect("memory backend lock");
             if !state.federation_keys.contains_key(&row.identity_key_id) {
@@ -3336,14 +3764,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     ("identity_key_id", &row.identity_key_id),
                     ("occurrence_key_id", &row.occurrence_key_id),
                 ]);
-                let wire_index_hash = crate::federation::wire_index::content_hash_of(
-                    &crate::federation::SignedIdentityOccurrence {
-                        identity_occurrence: row.clone(),
-                        attesting_key_id: occurrence.attesting_key_id.clone(),
-                        signed_envelope: occurrence.signed_envelope.clone(),
-                        signature: occurrence.signature.clone(),
-                    },
-                )?;
                 // #418 — store the signature container in lockstep so the
                 // replication read reconstructs the tuple that was put.
                 state.federation_identity_occurrence_sigs.insert(
@@ -3355,13 +3775,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     ),
                 );
                 state.federation_identity_occurrences.insert(key, row);
-                state.signed_wire_index.insert(
-                    ("IdentityOccurrence".to_string(), wire_index_hash),
-                    wire_index_key,
-                );
+                indexed = Some(wire_index_key);
             }
             projected_route
         };
+        if let Some(wire_index_key) = indexed {
+            self.index_stored_record("IdentityOccurrence", &wire_index_key)
+                .await?;
+        }
         if let Some(route) = &projected_route {
             crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
         }
@@ -3439,7 +3860,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v17.0.0 (#443) — route-table PK (occ, kind) + the (epoch,
         // asserted_at) monotonic guard: a stale assertion is a silent no-op.
         //
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
         // unsigned writer never demotes a signed row. The signature
         // container is NEVER dropped by this path; a content-CHANGING
         // unsigned write against a signed row is a silent no-op (the
@@ -3495,53 +3916,55 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
         let d = &signed.transport_destination;
-        let mut state = self.state.lock().expect("memory backend lock");
-        let key = (d.occurrence_key_id.clone(), d.transport_kind.clone());
-        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
-        // monotonic-clock refusal applies only against a stored row that is
-        // itself SIGNED; a signed write always reclaims an unsigned row
-        // (occurrence-projection / announce state) regardless of clocks.
-        let stored_signed = state.transport_destination_sigs.contains_key(&key);
-        let fresh = match state.transport_destinations.get(&key) {
-            Some(ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
-            Some(ex) if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
-                return Ok(Outcome::Refused {
-                    reason: format!(
-                        "incoming (epoch {}, asserted_at {}) does not supersede stored \
+        let (wire_index_key, fresh) = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let key = (d.occurrence_key_id.clone(), d.transport_kind.clone());
+            // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
+            // monotonic-clock refusal applies only against a stored row that is
+            // itself SIGNED; a signed write always reclaims an unsigned row
+            // (occurrence-projection / announce state) regardless of clocks.
+            let stored_signed = state.transport_destination_sigs.contains_key(&key);
+            let fresh = match state.transport_destinations.get(&key) {
+                Some(ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
+                Some(ex)
+                    if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
+                {
+                    return Ok(Outcome::Refused {
+                        reason: format!(
+                            "incoming (epoch {}, asserted_at {}) does not supersede stored \
                          SIGNED (epoch {}, asserted_at {})",
-                        d.epoch,
-                        d.asserted_at.to_rfc3339(),
-                        ex.epoch,
-                        ex.asserted_at.to_rfc3339()
-                    ),
-                })
-            }
-            Some(_) => false,
-            None => true,
+                            d.epoch,
+                            d.asserted_at.to_rfc3339(),
+                            ex.epoch,
+                            ex.asserted_at.to_rfc3339()
+                        ),
+                    })
+                }
+                Some(_) => false,
+                None => true,
+            };
+            // Store the signature container in lockstep so the replication read
+            // reconstructs the tuple that was put (mirror of the occurrence /
+            // revocation sig maps).
+            state.transport_destination_sigs.insert(
+                key.clone(),
+                (
+                    signed.attesting_key_id.clone(),
+                    signed.signed_envelope.clone(),
+                    signed.signature.clone(),
+                ),
+            );
+            state.transport_destinations.insert(key.clone(), d.clone());
+            // v21.1.0 (CIRISPersist#507b) — `signed` IS the exact value
+            // `list_signed_transport_destinations_since` re-serializes.
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("occurrence_key_id", &key.0),
+                ("transport_kind", &key.1),
+            ]);
+            (wire_index_key, fresh)
         };
-        // Store the signature container in lockstep so the replication read
-        // reconstructs the tuple that was put (mirror of the occurrence /
-        // revocation sig maps).
-        state.transport_destination_sigs.insert(
-            key.clone(),
-            (
-                signed.attesting_key_id.clone(),
-                signed.signed_envelope.clone(),
-                signed.signature.clone(),
-            ),
-        );
-        state.transport_destinations.insert(key.clone(), d.clone());
-        // v21.1.0 (CIRISPersist#507b) — `signed` IS the exact value
-        // `list_signed_transport_destinations_since` re-serializes.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("occurrence_key_id", &key.0),
-            ("transport_kind", &key.1),
-        ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(signed)?;
-        state.signed_wire_index.insert(
-            ("TransportDestination".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+        self.index_stored_record("TransportDestination", &wire_index_key)
+            .await?;
         Ok(if fresh {
             Outcome::Inserted
         } else {
@@ -3801,22 +4224,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
         // `persist_row_hash` on its OWN local copy, invisible from here.
-        if let Some(reloaded) = self.lookup_family(&family_key_id).await? {
-            let wire_index_key =
-                crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]);
-            let wire_index_hash =
-                crate::federation::wire_index::content_hash_of(&crate::federation::SignedFamily {
-                    family: reloaded,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                })?;
-            self.state
-                .lock()
-                .expect("memory backend lock")
-                .signed_wire_index
-                .insert(("Family".to_string(), wire_index_hash), wire_index_key);
-        }
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -3851,21 +4263,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         family_key_id: &str,
         member: crate::federation::types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let family = state
-            .federation_families
-            .get_mut(family_key_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "add_family_member names unknown family_key_id {family_key_id:?}"
-                ))
-            })?;
+        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
+        // mutation; see the sqlite twin. It MUST run before `self.state.lock()`
+        // (the verify resolves keys through the directory, which takes the same
+        // lock) — the ordering `put_family` on this backend already documents.
+        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "add_family_member names unknown family_key_id {family_key_id:?}"
+            ))
+        })?;
         if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        family.members.push(member);
-        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(family)?;
+        let grown =
+            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // v31.0.0 (CIRISPersist#654/#651) — the roster and the signature
+            // that authorizes it are written together, under one guard.
+            state
+                .federation_families
+                .insert(family_key_id.to_owned(), grown);
+            state.federation_family_authority_sigs.insert(
+                family_key_id.to_owned(),
+                (
+                    spec.authority_key_id.clone(),
+                    spec.scrub_signature_classical.clone(),
+                    spec.scrub_signature_pqc.clone(),
+                ),
+            );
+        }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -3883,21 +4318,43 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let community = state
-            .federation_communities
-            .get_mut(community_key_id)
+        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
+        let community = self
+            .lookup_community(community_key_id)
+            .await?
             .ok_or_else(|| {
                 crate::federation::Error::InvalidArgument(format!(
                     "add_community_member names unknown community_key_id {community_key_id:?}"
                 ))
             })?;
         if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        community.members.push(member);
-        community.persist_row_hash = crate::federation::types::compute_persist_row_hash(community)?;
+        let grown =
+            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
+                .await?;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            state
+                .federation_communities
+                .insert(community_key_id.to_owned(), grown);
+            state.federation_community_authority_sigs.insert(
+                community_key_id.to_owned(),
+                (
+                    spec.authority_key_id.clone(),
+                    spec.scrub_signature_classical.clone(),
+                    spec.scrub_signature_pqc.clone(),
+                ),
+            );
+        }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
+        self.index_stored_record(
+            "Community",
+            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -3926,8 +4383,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend lock");
         match cohort {
             Cohort::Family => {
-                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
-                    .map_err(|e| {
+                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                // wrapper. Decoding the bare record here is what silently
+                // stranded the caller's signature while every field
+                // `signing_envelope()` covers was replaced below.
+                let crate::federation::SignedFamily {
+                    family: mut new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 new_fam.persist_row_hash =
@@ -3961,6 +4426,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         is_current: false,
                     });
                 state.federation_families.insert(key.clone(), new_fam);
+                // v31.0.0 (CIRISPersist#651) — the signature moves with the
+                // record it authorizes, in the same critical section.
+                state.federation_family_authority_sigs.insert(
+                    key.clone(),
+                    (
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    ),
+                );
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
@@ -3968,10 +4443,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 Ok(next)
             }
             Cohort::Community | Cohort::Affiliations => {
-                let mut new_comm: crate::federation::Community =
-                    serde_json::from_value(new_snapshot).map_err(|e| {
-                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                    })?;
+                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                // family arm above.
+                let crate::federation::SignedCommunity {
+                    community: mut new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                } = serde_json::from_value(new_snapshot).map_err(|e| {
+                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                })?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let key = new_comm.community_key_id.clone();
@@ -4003,6 +4484,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         is_current: false,
                     });
                 state.federation_communities.insert(key.clone(), new_comm);
+                // v31.0.0 (CIRISPersist#651) — see the family arm.
+                state.federation_community_authority_sigs.insert(
+                    key.clone(),
+                    (
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    ),
+                );
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
@@ -4110,44 +4600,39 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // for rosters with no node/agent members.
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.community_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "community_key_id {} does not exist in federation_keys",
-                row.community_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-        // consume `row.clone()` / `community.*`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[(
-            "community_key_id",
-            &row.community_key_id,
-        )]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedCommunity {
-                community: row.clone(),
-                authority_key_id: community.authority_key_id.clone(),
-                scrub_signature_classical: community.scrub_signature_classical.clone(),
-                scrub_signature_pqc: community.scrub_signature_pqc.clone(),
-            })?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        state.federation_community_authority_sigs.insert(
-            row.community_key_id.clone(),
-            (
-                community.authority_key_id,
-                community.scrub_signature_classical,
-                community.scrub_signature_pqc,
-            ),
-        );
-        state
-            .federation_communities
-            .insert(row.community_key_id.clone(), row);
-        state
-            .signed_wire_index
-            .insert(("Community".to_string(), wire_index_hash), wire_index_key);
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.community_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "community_key_id {} does not exist in federation_keys",
+                    row.community_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+            // consume `row.clone()` / `community.*`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "community_key_id",
+                &row.community_key_id,
+            )]);
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+            // signature the gate above already verified (was verified-then-
+            // discarded).
+            state.federation_community_authority_sigs.insert(
+                row.community_key_id.clone(),
+                (
+                    community.authority_key_id,
+                    community.scrub_signature_classical,
+                    community.scrub_signature_pqc,
+                ),
+            );
+            state
+                .federation_communities
+                .insert(row.community_key_id.clone(), row);
+            wire_index_key
+        };
+        self.index_stored_record("Community", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -4458,60 +4943,53 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             signed_envelope,
             signature,
         } = revocation;
-        let mut state = self.state.lock().expect("memory backend lock");
-        for k in [&row.identity_key_id, &row.occurrence_key_id] {
-            if !state.federation_keys.contains_key(k) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{k} does not exist in federation_keys"
-                )));
-            }
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-        // consume `row` / `attesting_key_id` / `signed_envelope` / `signature`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("identity_key_id", &key.0),
-            ("occurrence_key_id", &key.1),
-        ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: row.clone(),
-                attesting_key_id: attesting_key_id.clone(),
-                signed_envelope: signed_envelope.clone(),
-                signature: signature.clone(),
-            },
-        )?;
-        // #421 — store the signature container in lockstep so the replication
-        // read reconstructs the tuple that was put (mirror of the occurrence
-        // sig map).
-        state
-            .federation_identity_occurrence_revocation_sigs
-            .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
-        let revoked_at = row.revoked_at;
-        let occurrence_key_id = row.occurrence_key_id.clone();
-        state
-            .federation_identity_occurrence_revocations
-            .insert(key, row);
-        state.signed_wire_index.insert(
-            ("IdentityOccurrenceRevocation".to_string(), wire_index_hash),
-            wire_index_key,
-        );
-        // #446 de-projection (the projection's inverse): retire the LOCAL
-        // derived route materialized from this occurrence's binding. Narrow
-        // on purpose: only the signature-free projected/local row; a live
-        // SIGNED route retires via its own #443 signed-tombstone plane.
-        let route_key = (
-            occurrence_key_id,
-            crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
-        );
-        if !state.transport_destination_sigs.contains_key(&route_key) {
-            if let Some(route) = state.transport_destinations.get_mut(&route_key) {
-                if route.retired_at.is_none() {
-                    route.retired_at = Some(revoked_at);
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            for k in [&row.identity_key_id, &row.occurrence_key_id] {
+                if !state.federation_keys.contains_key(k) {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "{k} does not exist in federation_keys"
+                    )));
                 }
             }
-        }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+            // consume `row` / `attesting_key_id` / `signed_envelope` / `signature`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("identity_key_id", &key.0),
+                ("occurrence_key_id", &key.1),
+            ]);
+            // #421 — store the signature container in lockstep so the replication
+            // read reconstructs the tuple that was put (mirror of the occurrence
+            // sig map).
+            state
+                .federation_identity_occurrence_revocation_sigs
+                .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
+            let revoked_at = row.revoked_at;
+            let occurrence_key_id = row.occurrence_key_id.clone();
+            state
+                .federation_identity_occurrence_revocations
+                .insert(key, row);
+            // #446 de-projection (the projection's inverse): retire the LOCAL
+            // derived route materialized from this occurrence's binding. Narrow
+            // on purpose: only the signature-free projected/local row; a live
+            // SIGNED route retires via its own #443 signed-tombstone plane.
+            let route_key = (
+                occurrence_key_id,
+                crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
+            );
+            if !state.transport_destination_sigs.contains_key(&route_key) {
+                if let Some(route) = state.transport_destinations.get_mut(&route_key) {
+                    if route.retired_at.is_none() {
+                        route.retired_at = Some(revoked_at);
+                    }
+                }
+            }
+            wire_index_key
+        };
+        self.index_stored_record("IdentityOccurrenceRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -4578,66 +5056,59 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // indistinguishable from a real one.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
-        let mut state = self.state.lock().expect("memory backend lock");
-        for k in [&row.family_key_id, &row.removed_identity_key_id] {
-            if !state.federation_keys.contains_key(k) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{k} does not exist in federation_keys"
-                )));
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            for k in [&row.family_key_id, &row.removed_identity_key_id] {
+                if !state.federation_keys.contains_key(k) {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "{k} does not exist in federation_keys"
+                    )));
+                }
             }
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
-        // membership-change hard_case (`change_kind: "removed"`), keyed on
-        // the re-key epoch (`effective_at`). Idempotent on the event_id.
-        let event = crate::federation::hard_case::membership_removed_event(
-            crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
-            &row.family_key_id,
-            &row.removed_identity_key_id,
-            row.effective_at,
-        );
-        state
-            .federation_hard_case_events
-            .entry(event.event_id.clone())
-            .or_insert(event);
-        let revocation_key = (
-            row.family_key_id.clone(),
-            row.removed_identity_key_id.clone(),
-        );
-        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-        // consume `row.clone()` / `revocation.*`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("family_key_id", &revocation_key.0),
-            ("removed_identity_key_id", &revocation_key.1),
-        ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedFamilyMembershipRevocation {
-                family_membership_revocation: row.clone(),
-                authority_key_id: revocation.authority_key_id.clone(),
-                scrub_signature_classical: revocation.scrub_signature_classical.clone(),
-                scrub_signature_pqc: revocation.scrub_signature_pqc.clone(),
-            },
-        )?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        state
-            .federation_family_membership_revocation_authority_sigs
-            .insert(
-                revocation_key.clone(),
-                (
-                    revocation.authority_key_id,
-                    revocation.scrub_signature_classical,
-                    revocation.scrub_signature_pqc,
-                ),
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
+            // membership-change hard_case (`change_kind: "removed"`), keyed on
+            // the re-key epoch (`effective_at`). Idempotent on the event_id.
+            let event = crate::federation::hard_case::membership_removed_event(
+                crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+                &row.family_key_id,
+                &row.removed_identity_key_id,
+                row.effective_at,
             );
-        state
-            .federation_family_membership_revocations
-            .insert(revocation_key, row);
-        state.signed_wire_index.insert(
-            ("FamilyMembershipRevocation".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+            state
+                .federation_hard_case_events
+                .entry(event.event_id.clone())
+                .or_insert(event);
+            let revocation_key = (
+                row.family_key_id.clone(),
+                row.removed_identity_key_id.clone(),
+            );
+            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+            // consume `row.clone()` / `revocation.*`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("family_key_id", &revocation_key.0),
+                ("removed_identity_key_id", &revocation_key.1),
+            ]);
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+            // signature the gate above already verified (was verified-then-
+            // discarded).
+            state
+                .federation_family_membership_revocation_authority_sigs
+                .insert(
+                    revocation_key.clone(),
+                    (
+                        revocation.authority_key_id,
+                        revocation.scrub_signature_classical,
+                        revocation.scrub_signature_pqc,
+                    ),
+                );
+            state
+                .federation_family_membership_revocations
+                .insert(revocation_key, row);
+            wire_index_key
+        };
+        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -4658,92 +5129,85 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        for k in [&row.community_key_id, &row.removed_identity_key_id] {
-            if !state.federation_keys.contains_key(k) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{k} does not exist in federation_keys"
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            for k in [&row.community_key_id, &row.removed_identity_key_id] {
+                if !state.federation_keys.contains_key(k) {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "{k} does not exist in federation_keys"
+                    )));
+                }
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // Parity with pg/sqlite: the revocation table PK is
+            // (community_key_id, removed_identity_key_id) (V067), so a REPLAYED
+            // revocation hits a unique-violation at the INSERT and errors BEFORE
+            // the hard_case emission + epoch bump. Memory must reject the replay
+            // the same way (else memory would double-bump the DEK epoch where
+            // pg/sqlite leave it untouched — an observable gate-path divergence).
+            // Matches map_revocation_pg_err's non-FK Backend mapping.
+            let revocation_key = (
+                row.community_key_id.clone(),
+                row.removed_identity_key_id.clone(),
+            );
+            if state
+                .federation_community_membership_revocations
+                .contains_key(&revocation_key)
+            {
+                return Err(crate::federation::Error::Backend(format!(
+                    "insert community_membership_revocation: duplicate key value violates unique \
+                 constraint (community_key_id={}, removed_identity_key_id={})",
+                    revocation_key.0, revocation_key.1
                 )));
             }
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // Parity with pg/sqlite: the revocation table PK is
-        // (community_key_id, removed_identity_key_id) (V067), so a REPLAYED
-        // revocation hits a unique-violation at the INSERT and errors BEFORE
-        // the hard_case emission + epoch bump. Memory must reject the replay
-        // the same way (else memory would double-bump the DEK epoch where
-        // pg/sqlite leave it untouched — an observable gate-path divergence).
-        // Matches map_revocation_pg_err's non-FK Backend mapping.
-        let revocation_key = (
-            row.community_key_id.clone(),
-            row.removed_identity_key_id.clone(),
-        );
-        if state
-            .federation_community_membership_revocations
-            .contains_key(&revocation_key)
-        {
-            return Err(crate::federation::Error::Backend(format!(
-                "insert community_membership_revocation: duplicate key value violates unique \
-                 constraint (community_key_id={}, removed_identity_key_id={})",
-                revocation_key.0, revocation_key.1
-            )));
-        }
-        // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
-        // removal emission (`change_kind: "removed"`). Idempotent on event_id.
-        let event = crate::federation::hard_case::membership_removed_event(
-            crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
-            &row.community_key_id,
-            &row.removed_identity_key_id,
-            row.effective_at,
-        );
-        state
-            .federation_hard_case_events
-            .entry(event.event_id.clone())
-            .or_insert(event);
-        // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
-        // (the at-rest crypto half lives only on the BlobStorage backends;
-        // memory carries the rotation *state* so rotation-on-removal is
-        // observably present here too). Only on a genuinely new revocation
-        // (replays errored out above) — parity with pg/sqlite. Bump first →
-        // revocation insert moves `row`.
-        *state
-            .federation_community_dek_epoch
-            .entry(row.community_key_id.clone())
-            .or_insert(0) += 1;
-        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-        // consume `row.clone()` / `revocation.*`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("community_key_id", &revocation_key.0),
-            ("removed_identity_key_id", &revocation_key.1),
-        ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedCommunityMembershipRevocation {
-                community_membership_revocation: row.clone(),
-                authority_key_id: revocation.authority_key_id.clone(),
-                scrub_signature_classical: revocation.scrub_signature_classical.clone(),
-                scrub_signature_pqc: revocation.scrub_signature_pqc.clone(),
-            },
-        )?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        state
-            .federation_community_membership_revocation_authority_sigs
-            .insert(
-                revocation_key.clone(),
-                (
-                    revocation.authority_key_id,
-                    revocation.scrub_signature_classical,
-                    revocation.scrub_signature_pqc,
-                ),
+            // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
+            // removal emission (`change_kind: "removed"`). Idempotent on event_id.
+            let event = crate::federation::hard_case::membership_removed_event(
+                crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+                &row.community_key_id,
+                &row.removed_identity_key_id,
+                row.effective_at,
             );
-        state
-            .federation_community_membership_revocations
-            .insert(revocation_key, row);
-        state.signed_wire_index.insert(
-            ("CommunityMembershipRevocation".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+            state
+                .federation_hard_case_events
+                .entry(event.event_id.clone())
+                .or_insert(event);
+            // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
+            // (the at-rest crypto half lives only on the BlobStorage backends;
+            // memory carries the rotation *state* so rotation-on-removal is
+            // observably present here too). Only on a genuinely new revocation
+            // (replays errored out above) — parity with pg/sqlite. Bump first →
+            // revocation insert moves `row`.
+            *state
+                .federation_community_dek_epoch
+                .entry(row.community_key_id.clone())
+                .or_insert(0) += 1;
+            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+            // consume `row.clone()` / `revocation.*`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("community_key_id", &revocation_key.0),
+                ("removed_identity_key_id", &revocation_key.1),
+            ]);
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+            // signature the gate above already verified (was verified-then-
+            // discarded).
+            state
+                .federation_community_membership_revocation_authority_sigs
+                .insert(
+                    revocation_key.clone(),
+                    (
+                        revocation.authority_key_id,
+                        revocation.scrub_signature_classical,
+                        revocation.scrub_signature_pqc,
+                    ),
+                );
+            state
+                .federation_community_membership_revocations
+                .insert(revocation_key, row);
+            wire_index_key
+        };
+        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5017,45 +5481,41 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = proof.location_proof;
         // §0.8 canonicalization + §0.8.1 rough-only gate before write.
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.subject_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "subject_key_id {} does not exist in federation_keys",
-                row.subject_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let proof_key = (row.subject_key_id.clone(), row.asserted_at);
-        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-        // consume `row.clone()` / `proof.*`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &proof_key.0),
-            ("asserted_at", &proof_key.1.to_rfc3339()),
-        ]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedLocationProof {
-                location_proof: row.clone(),
-                authority_key_id: proof.authority_key_id.clone(),
-                scrub_signature_classical: proof.scrub_signature_classical.clone(),
-                scrub_signature_pqc: proof.scrub_signature_pqc.clone(),
-            },
-        )?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        state.federation_location_proof_authority_sigs.insert(
-            proof_key.clone(),
-            (
-                proof.authority_key_id,
-                proof.scrub_signature_classical,
-                proof.scrub_signature_pqc,
-            ),
-        );
-        state.federation_location_proofs.insert(proof_key, row);
-        state.signed_wire_index.insert(
-            ("LocationProof".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.subject_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "subject_key_id {} does not exist in federation_keys",
+                    row.subject_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let proof_key = (row.subject_key_id.clone(), row.asserted_at);
+            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+            // consume `row.clone()` / `proof.*`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("subject_key_id", &proof_key.0),
+                (
+                    "asserted_at",
+                    &crate::federation::wire_index::locator_instant(&proof_key.1),
+                ),
+            ]);
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+            // signature the gate above already verified (was verified-then-
+            // discarded).
+            state.federation_location_proof_authority_sigs.insert(
+                proof_key.clone(),
+                (
+                    proof.authority_key_id,
+                    proof.scrub_signature_classical,
+                    proof.scrub_signature_pqc,
+                ),
+            );
+            state.federation_location_proofs.insert(proof_key, row);
+            wire_index_key
+        };
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5104,41 +5564,47 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.organization;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
+        // row's OWN signature. Before the state lock: the verify resolves
+        // the attester's registered pubkeys, which locks the directory.
+        operational::verify_organization_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — resolve the steward roster from OUR directory
         // BEFORE the state lock (the resolve locks the directory itself).
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        let current: Vec<_> = state
-            .federation_org_memberships
-            .values()
-            .filter(|m| m.org_id == row.org_id)
-            .cloned()
-            .collect();
-        operational::check_role_authority(
-            &row.attesting_key_id,
-            &row.org_id,
-            &current,
-            &__stw_dir,
-            &__stw_roots,
-        )?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v21.1.0 (CIRISPersist#507b) — `Organization` carries its own
-        // single-signer signature fields inline — it IS the value
-        // `list_organizations_since` re-serializes, no separate wrapper.
-        // Computed before the insert below moves `row`.
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        memory_idempotent_insert(
-            &mut state.federation_organizations,
-            row.attestation_id.clone(),
-            row,
-            "organization",
-        )?;
-        state.signed_wire_index.insert(
-            ("Organization".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let current: Vec<_> = state
+                .federation_org_memberships
+                .values()
+                .filter(|m| m.org_id == row.org_id)
+                .cloned()
+                .collect();
+            operational::check_role_authority(
+                &row.attesting_key_id,
+                &row.org_id,
+                &current,
+                &__stw_dir,
+                &__stw_roots,
+            )?;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v21.1.0 (CIRISPersist#507b) — `Organization` carries its own
+            // single-signer signature fields inline — it IS the value
+            // `list_organizations_since` re-serializes, no separate wrapper.
+            // Computed before the insert below moves `row`.
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            memory_idempotent_insert(
+                &mut state.federation_organizations,
+                row.attestation_id.clone(),
+                row,
+                "organization",
+            )?;
+            wire_index_key
+        };
+        self.index_stored_record("Organization", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5150,39 +5616,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
+        // row's OWN signature, before the lock (see `put_organization`).
+        operational::verify_org_membership_admission(self, &row).await?;
         // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
         let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        let current: Vec<_> = state
-            .federation_org_memberships
-            .values()
-            .filter(|m| m.org_id == row.org_id)
-            .cloned()
-            .collect();
-        operational::check_role_authority(
-            &row.attesting_key_id,
-            &row.org_id,
-            &current,
-            &__stw_dir,
-            &__stw_roots,
-        )?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v21.1.0 (CIRISPersist#507b) — `OrgMembership` carries its own
-        // single-signer signature fields inline; see `put_organization`'s
-        // wire-index comment.
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
-        memory_idempotent_insert(
-            &mut state.federation_org_memberships,
-            row.attestation_id.clone(),
-            row,
-            "org_membership",
-        )?;
-        state.signed_wire_index.insert(
-            ("OrgMembership".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let current: Vec<_> = state
+                .federation_org_memberships
+                .values()
+                .filter(|m| m.org_id == row.org_id)
+                .cloned()
+                .collect();
+            operational::check_role_authority(
+                &row.attesting_key_id,
+                &row.org_id,
+                &current,
+                &__stw_dir,
+                &__stw_roots,
+            )?;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v21.1.0 (CIRISPersist#507b) — `OrgMembership` carries its own
+            // single-signer signature fields inline; see `put_organization`'s
+            // wire-index comment.
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            memory_idempotent_insert(
+                &mut state.federation_org_memberships,
+                row.attestation_id.clone(),
+                row,
+                "org_membership",
+            )?;
+            wire_index_key
+        };
+        self.index_stored_record("OrgMembership", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5200,52 +5671,46 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v21.0.0 (#502 E9) — steward roster from OUR directory.
         let (__stw_dir, _) = operational::resolve_steward_roster(self).await?;
         operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        let existing_max = state
-            .federation_partner_records
-            .values()
-            .filter(|p| p.license_id == signed.partner_record.license_id)
-            .map(|p| p.revision)
-            .max();
-        operational::check_partner_revision_monotonic(
-            &signed.partner_record.license_id,
-            signed.partner_record.revision,
-            existing_max,
-        )?;
-        // v5.2.0 (#194) — keep the M-of-N steward signature set + threshold so
-        // list_signed_partner_records_since reconstructs the full wrapper.
-        let steward_signatures = signed.steward_signatures;
-        let threshold = signed.threshold;
-        let mut row = signed.partner_record;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let attestation_id = row.attestation_id.clone();
-        // v21.1.0 (CIRISPersist#507b) — `PartnerRecord`'s M-of-N steward
-        // quorum is EXTERNAL to the row, so the read surface
-        // (`list_signed_partner_records_since`) returns the
-        // `SignedPartnerRecord` wrapper — hash that shape, not the bare row.
-        // Computed before the moves below.
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(
-            &crate::federation::SignedPartnerRecord {
-                partner_record: row.clone(),
-                steward_signatures: steward_signatures.clone(),
-                threshold,
-            },
-        )?;
-        memory_idempotent_insert(
-            &mut state.federation_partner_records,
-            attestation_id.clone(),
-            row,
-            "partner_record",
-        )?;
-        state
-            .federation_partner_record_sigs
-            .insert(attestation_id, (steward_signatures, threshold));
-        state.signed_wire_index.insert(
-            ("PartnerRecord".to_string(), wire_index_hash),
-            wire_index_key,
-        );
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let existing_max = state
+                .federation_partner_records
+                .values()
+                .filter(|p| p.license_id == signed.partner_record.license_id)
+                .map(|p| p.revision)
+                .max();
+            operational::check_partner_revision_monotonic(
+                &signed.partner_record.license_id,
+                signed.partner_record.revision,
+                existing_max,
+            )?;
+            // v5.2.0 (#194) — keep the M-of-N steward signature set + threshold so
+            // list_signed_partner_records_since reconstructs the full wrapper.
+            let steward_signatures = signed.steward_signatures;
+            let threshold = signed.threshold;
+            let mut row = signed.partner_record;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let attestation_id = row.attestation_id.clone();
+            // v21.1.0 (CIRISPersist#507b) — `PartnerRecord`'s M-of-N steward
+            // quorum is EXTERNAL to the row, so the read surface
+            // (`list_signed_partner_records_since`) returns the
+            // `SignedPartnerRecord` wrapper — hash that shape, not the bare row.
+            // Computed before the moves below.
+            let wire_index_key =
+                crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]);
+            memory_idempotent_insert(
+                &mut state.federation_partner_records,
+                attestation_id.clone(),
+                row,
+                "partner_record",
+            )?;
+            state
+                .federation_partner_record_sigs
+                .insert(attestation_id, (steward_signatures, threshold));
+            wire_index_key
+        };
+        self.index_stored_record("PartnerRecord", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -5850,30 +6315,52 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state.federation_keys.get_mut(key_id).ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_keys row {key_id} does not exist"
-            ))
-        })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_keys row {key_id} is already PQC-complete"
-            )));
+        // v31.0.0 (CIRISPersist#657) — verify-before-mutation over the row AS IT
+        // WOULD BE STORED; see the sqlite twin. It MUST run before
+        // `self.state.lock()`: the gate reads the directory through that same
+        // lock, so gating inside the critical section would deadlock this
+        // backend (the same ordering `promote_attestation` documents).
+        {
+            let current =
+                <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::federation::Error::InvalidArgument(format!(
+                            "federation_keys row {key_id} does not exist"
+                        ))
+                    })?;
+            if !current.is_pqc_complete() {
+                let mut post_attach = current;
+                post_attach.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+                post_attach.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+                crate::federation::admission::check_key_pqc_attachment(self, &post_attach).await?;
+            }
         }
-        row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        row.pqc_completed_at = Some(chrono::Utc::now());
-        // Recompute persist_row_hash since row content changed.
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
-        // the wire content hash moved with them. See `wire_index::key_entry`.
-        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
-        state
-            .signed_wire_index
-            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state.federation_keys.get_mut(key_id).ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_keys row {key_id} does not exist"
+                ))
+            })?;
+            if row.is_pqc_complete() {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "federation_keys row {key_id} is already PQC-complete"
+                )));
+            }
+            row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+            row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+            row.pqc_completed_at = Some(chrono::Utc::now());
+            // Recompute persist_row_hash since row content changed.
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
+            // the wire content hash moved with them.
+            // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
+            // helper, after the guard is released.
+        }
+        self.index_stored_key_row(key_id).await?;
         Ok(())
     }
 
@@ -5882,26 +6369,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state
-            .federation_attestations
-            .iter_mut()
-            .find(|a| a.attestation_id == attestation_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} is already PQC-complete"
-            )));
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_attestations row {attestation_id} does not exist"
+                    ))
+                })?;
+            if row.is_pqc_complete() {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "federation_attestations row {attestation_id} is already PQC-complete"
+                )));
+            }
+            row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+            row.pqc_completed_at = Some(chrono::Utc::now());
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        row.pqc_completed_at = Some(chrono::Utc::now());
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. Done
+        // AFTER the guard is released, the same shape `attach_key_pqc_signature`
+        // uses on this backend (the shared helper re-reads through the
+        // directory surface, which takes the same lock).
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -5921,11 +6419,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attestation_id: &str,
         cohort_scope: &str,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        reseal: &crate::federation::AttestationReseal,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
         // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
@@ -5935,6 +6429,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // critical section would deadlock this backend. Running it first is
         // also verify-before-mutation (AV-9) — a refused promotion never
         // touches the row.
+        //
+        // v31.0.0 (CIRISPersist#649) — gated on the RE-STAMPED envelope, the
+        // same discipline the transformed path always had: the gate must read
+        // the bytes this row will federate as, and `check_row_column_binding`
+        // inside it compares the mirror in THOSE bytes against the
+        // post-promotion columns.
         {
             let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
                 crate::federation::Error::InvalidArgument(format!(
@@ -5943,6 +6443,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })?;
             if current.tier != attestation_tier::FEDERATION {
                 let mut as_promoted = current;
+                as_promoted.attestation_envelope = reseal.attestation_envelope.clone();
                 as_promoted.tier = attestation_tier::FEDERATION.to_string();
                 as_promoted.cohort_scope = cohort_scope.to_owned();
                 crate::federation::admission::check_promotion_admission(
@@ -5953,137 +6454,52 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .await?;
             }
         }
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state
-            .federation_attestations
-            .iter_mut()
-            .find(|a| a.attestation_id == attestation_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        if row.tier == attestation_tier::FEDERATION {
-            return Ok(false);
-        }
-        let now = scrub_timestamp;
-        row.cohort_scope = cohort_scope.to_owned();
-        row.original_content_hash = original_content_hash_hex.to_owned();
-        row.scrub_signature_classical = scrub_signature_classical.to_owned();
-        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
-        row.scrub_key_id = scrub_key_id.to_owned();
-        row.scrub_timestamp = now;
-        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
-        row.tier = attestation_tier::FEDERATION.to_string();
-        row.promoted_at = Some(now);
-        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
-        // A local-tier row defers its signature, so any `additional_scrubs` it
-        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
-        // the row with this node's key and moves it into the federation plane,
-        // where the ingest verifier DOES check every scrub — so carrying the
-        // unverified set across would either launder it into the signed plane or
-        // (once corrupt) make the promoted row unverifiable at every peer with
-        // no error at the promote site. That is the #541 shape: the preserve set
-        // must equal the verified set. Co-signatures are earned at the ceremony
-        // that mints a federation-tier row, never inherited by a promotion.
-        row.additional_scrubs.clear();
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
-        // tier and therefore wire-servable; index it under its final
-        // post-promotion shape (matches `list_attestations_since`).
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
-        state
-            .signed_wire_index
-            .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
-        Ok(true)
-    }
-
-    async fn promote_attestation_transformed(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        envelope_json: &serde_json::Value,
-        scrub_signature_classical: &str,
-        scrub_signature_pqc: Option<&str>,
-        original_content_hash_hex: &str,
-        scrub_key_id: &str,
-        scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, crate::federation::Error> {
-        use crate::federation::types::attestation_tier;
-        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
-        // over the TRANSFORMED envelope. Runs before the state lock for the
-        // same deadlock reason as `promote_attestation`.
-        {
-            let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-            if current.tier != attestation_tier::FEDERATION {
-                let mut as_promoted = current;
-                as_promoted.attestation_envelope = envelope_json.clone();
-                as_promoted.tier = attestation_tier::FEDERATION.to_string();
-                as_promoted.cohort_scope = cohort_scope.to_owned();
-                crate::federation::admission::check_promotion_admission(
-                    self,
-                    &as_promoted,
-                    self.self_key_id().as_deref(),
-                )
-                .await?;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_attestations row {attestation_id} does not exist"
+                    ))
+                })?;
+            if row.tier == attestation_tier::FEDERATION {
+                return Ok(false);
             }
-        }
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state
-            .federation_attestations
-            .iter_mut()
-            .find(|a| a.attestation_id == attestation_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        if row.tier == attestation_tier::FEDERATION {
-            return Ok(false);
-        }
-        let now = scrub_timestamp;
-        row.cohort_scope = cohort_scope.to_owned();
-        row.attestation_envelope = envelope_json.clone();
-        row.original_content_hash = original_content_hash_hex.to_owned();
-        row.scrub_signature_classical = scrub_signature_classical.to_owned();
-        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
-        row.scrub_key_id = scrub_key_id.to_owned();
-        row.scrub_timestamp = now;
-        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
-        row.tier = attestation_tier::FEDERATION.to_string();
-        row.promoted_at = Some(now);
-        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
-        // A local-tier row defers its signature, so any `additional_scrubs` it
-        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
-        // the row with this node's key and moves it into the federation plane,
-        // where the ingest verifier DOES check every scrub — so carrying the
-        // unverified set across would either launder it into the signed plane or
-        // (once corrupt) make the promoted row unverifiable at every peer with
-        // no error at the promote site. That is the #541 shape: the preserve set
-        // must equal the verified set. Co-signatures are earned at the ceremony
-        // that mints a federation-tier row, never inherited by a promotion.
-        row.additional_scrubs.clear();
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
-        // served bytes, so the wire index must carry the NEW content hash —
-        // same hook as `promote_attestation`. (Hash computed while the row
-        // borrow is live; the map insert happens after it ends.)
-        let wire_index_key =
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
-        let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
-        state
-            .signed_wire_index
-            .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
+            let now = reseal.scrub_timestamp;
+            row.cohort_scope = cohort_scope.to_owned();
+            row.attestation_envelope = reseal.attestation_envelope.clone();
+            row.original_content_hash = reseal.original_content_hash.clone();
+            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
+            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
+            row.scrub_key_id = reseal.scrub_key_id.clone();
+            row.scrub_timestamp = now;
+            row.pqc_completed_at = reseal.scrub_signature_pqc.as_ref().map(|_| now);
+            row.tier = attestation_tier::FEDERATION.to_string();
+            row.promoted_at = Some(now);
+            // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+            // A local-tier row defers its signature, so any `additional_scrubs` it
+            // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+            // the row with this node's key and moves it into the federation plane,
+            // where the ingest verifier DOES check every scrub — so carrying the
+            // unverified set across would either launder it into the signed plane or
+            // (once corrupt) make the promoted row unverifiable at every peer with
+            // no error at the promote site. That is the #541 shape: the preserve set
+            // must equal the verified set. Co-signatures are earned at the ceremony
+            // that mints a federation-tier row, never inherited by a promotion.
+            row.additional_scrubs.clear();
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
+            // tier and therefore wire-servable; index it under its final
+            // post-promotion shape (matches `list_attestations_since`).
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)])
+        };
+        self.index_stored_record("Attestation", &wire_index_key)
+            .await?;
         Ok(true)
     }
 
@@ -6425,6 +6841,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "identity_type must be non-empty".into(),
             ));
         }
+
+        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
+        // PATH. This door writes a caller-supplied `identity_type` and ran no
+        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
+        // `is_canonical_effective` answer true for an attacker-named key.
+        // BEFORE any lock or DB work: the gates read the directory, which locks
+        // itself. One gate, three backends.
+        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
+            .await?;
 
         let now = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
@@ -7661,6 +8086,27 @@ impl crate::derived::DerivedSchema for MemoryBackend {
 mod accord_tests {
     use super::*;
 
+    /// v31.0.0 (CIRISPersist#647) — the MEMORY leg of the shared
+    /// canonical-at-rest witness (see
+    /// `sqlite::tests::envelope_bytes_round_trip_sqlite_644` and its postgres
+    /// twin). All three legs call the SAME
+    /// `envelope_bytes::test_support::exercise_envelope_byte_exactness` body.
+    ///
+    /// #645's version of this witness was SQL-only, because the defect it
+    /// chased was a column type. #647's property is not about columns — the
+    /// canonicalization runs in every backend's `put_*` — so a backend left
+    /// out of the parity claim is a backend that can silently skip it. That
+    /// is the recurring class this crate keeps paying for ("test every
+    /// backend, not just Memory" — and here, not just the SQL ones).
+    #[tokio::test]
+    async fn envelope_bytes_round_trip_memory_647() {
+        let backend = MemoryBackend::new();
+        crate::federation::envelope_bytes::test_support::exercise_envelope_byte_exactness(
+            &backend, "mem-647",
+        )
+        .await;
+    }
+
     /// #302 — full accord live-quorum storage flow on the memory backend (M4
     /// nonce / verify-before-mutation / M6 dedup / M2 immutability / H2 halt).
     /// Shares the assertion body with the sqlite + pg parity tests.
@@ -7695,12 +8141,103 @@ mod accord_tests {
         .await;
     }
 
+    /// #598 B10-a — a REPLAYED consent grant whose `asserted_at` column
+    /// diverges from its own signed envelope is refused, on the memory backend. Shares
+    /// the assertion body with the other two backends: the pre-#598 fold
+    /// coverage was sqlite-only and single-writer, which is the "test shape"
+    /// gap the defect lived in.
+    #[tokio::test]
+    async fn consent_replay_refused_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
+            &backend, "mem598a",
+        )
+        .await;
+    }
+
+    /// #644-a — an org row whose own signature does not verify is REFUSED,
+    /// on the memory backend.
+    #[tokio::test]
+    async fn org_bogus_signature_refused_memory_644() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
+            &backend, "mem644a",
+        )
+        .await;
+    }
+
+    /// #644-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
+    /// that the signature does not cover is REFUSED, on the memory backend.
+    #[tokio::test]
+    async fn unsigned_tombstone_refused_memory_644() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
+            &backend, "mem644b",
+        )
+        .await;
+    }
+
+    /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
+    /// legitimate later revision still admits, on the memory backend.
+    #[tokio::test]
+    async fn revision_inflation_refused_memory_644() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_revision_inflation_refused(
+            &backend, "mem644c",
+        )
+        .await;
+    }
+
+    /// #658 — one signed operational envelope may not be installed at a
+    /// second primary key, on the memory backend.
+    #[tokio::test]
+    async fn operational_id_replay_refused_memory_658() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_operational_id_replay_refused(
+            &backend, "mem658",
+        )
+        .await;
+    }
+
+    /// #598 B10-b — two directories fed the SAME signed envelopes with the two
+    /// `asserted_at` columns swapped fold to the SAME verdict, on the memory backend.
+    #[tokio::test]
+    async fn consent_divergent_order_agrees_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_divergent_order(
+            &backend, "mem598b",
+        )
+        .await;
+    }
+
+    /// #598 B10-c — a sub-microsecond consent instant is refused and a true
+    /// tie resolves RESTRICTIVE, in both insertion orders, on the memory backend.
+    #[tokio::test]
+    async fn consent_tie_resolves_restrictive_memory_598() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_tie_restriction_wins(
+            &backend, "mem598c"
+        )
+        .await;
+    }
     /// #543 AV-77 — de-admission stops an abuser and is revocable, on memory.
     ///
     /// The memory arm of the `{gate} × {backend}` matrix; the SAME shared
     /// exercise body the sqlite (`bootstrap_peer_deadmission_sqlite_543`) and
     /// postgres arms run, which is what makes it a parity proof rather than
     /// three tests that happen to agree today.
+    /// v31.0.0 (CIRISPersist#643) — the typed-column binding, memory arm.
+    /// Same shared body as the sqlite + postgres arms: a parity proof, not
+    /// three tests that happen to agree today.
+    #[tokio::test]
+    async fn row_column_binding_memory_643() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_row_column_binding(
+            &backend, "memory",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn bootstrap_peer_deadmission_memory_543() {
         let backend = MemoryBackend::new();
@@ -7881,6 +8418,96 @@ mod accord_tests {
             "mem589",
         )
         .await;
+    }
+
+    /// #649 B11 — a PROMOTED row is accepted by a DIFFERENT directory's
+    /// `put_attestation`, on memory. Two independent `MemoryBackend`s are two
+    /// genuinely separate corpora, so this arm is the strictest of the three.
+    /// Shared exercise body with sqlite + postgres.
+    #[tokio::test]
+    async fn promoted_row_crosses_to_a_peer_memory_649() {
+        let origin = MemoryBackend::new();
+        let peer = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
+            &origin, &peer, "mem649",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
+    /// the STORED envelope: strip the #598 instants and the #643 mirror, exactly
+    /// as a v30 writer would have left it.
+    ///
+    /// No production door can do this (both v31 gates refuse the shape), so the
+    /// seam has to reach the storage directly — which is why it lives here,
+    /// beside the private `State`, rather than on the trait.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[async_trait::async_trait]
+    impl crate::federation::migration::test_support::LegacyRowInstaller for MemoryBackend {
+        async fn downgrade_to_v30(&self, attestation_id: &str) {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .expect("downgrade_to_v30: row must exist");
+            row.attestation_envelope =
+                crate::federation::migration::test_support::v30_envelope(&row.attestation_envelope);
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, memory arm.
+    /// Shared exercise body with sqlite + postgres; the peer is a second
+    /// `MemoryBackend`, i.e. a genuinely separate corpus.
+    ///
+    /// Feature-gated because the shared body seals rows through
+    /// `tier_ingest::test_support`, which is itself gated — the same shape as
+    /// `load_bearing_predicate_parity_memory_564`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn v31_migration_memory_650() {
+        let origin = MemoryBackend::new();
+        let peer = MemoryBackend::new();
+        crate::federation::migration::test_support::exercise_v31_migration(
+            &origin, &origin, &peer, "mem650",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
+    /// CYCLIC graph, memory arm. Shared exercise body with sqlite + postgres.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn load_bearing_closure_memory_650() {
+        let backend = MemoryBackend::new();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_closure(
+            &backend, "mem650c",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE PINNED GAP: a v30-shaped row can STILL
+    /// land after the migration, through the transit-revocation door. Memory
+    /// arm; shared body with sqlite + postgres. This is the finding that keeps
+    /// `run_v31_migration` marker-free — read its doc before changing it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn a_v30_row_cannot_land_after_migration_memory_650() {
+        let backend = MemoryBackend::new();
+        crate::federation::migration::test_support::exercise_a_v30_row_cannot_land_after_migration(
+            &backend, "mem650g",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#650) — THE MUTATION. Pure, so it runs on every
+    /// backend leg: disable the fold (replay the interim states) and the
+    /// withdrawn grant flips from `Purge` to `Restamp` — i.e. it is re-minted
+    /// as a valid, freshly-signed, peer-admissible v31 row.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn the_v31_fold_is_load_bearing_650() {
+        crate::federation::migration::test_support::assert_the_fold_is_load_bearing();
     }
 
     /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
@@ -8119,7 +8746,7 @@ mod tests {
         assert_eq!(got.to_bytes(), vkey.to_bytes());
     }
 
-    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trip,
+    /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trip,
     /// OQ-1 overwrite-on-revoke via set_consent_role, and the
     /// consent_role_of resolver, on the memory backend.
     #[tokio::test]
@@ -8349,14 +8976,20 @@ mod tests {
     /// it. Call AFTER any post-construction mutation of
     /// `attestation_envelope` / `attesting_key_id`. Matching pubkeys are
     /// registered via [`fix_key`].
+    ///
+    /// v31.0.0 (CIRISPersist#643) — delegates to
+    /// [`tier_ingest::test_support::reseal`](crate::federation::tier_ingest::test_support::reseal),
+    /// which ALSO re-stamps the typed-column mirror from the row's own SEVEN
+    /// columns before signing (v31.0.0, CIRISPersist#658 — this said five and
+    /// then listed five, omitting `attestation_id` and `attesting_key_id`; the
+    /// authority is [`row_paths::ALL`](crate::federation::envelope::row_paths::ALL)).
+    /// A mutation to `attestation_id` / `attesting_key_id` / `attestation_type` /
+    /// `subject_key_ids` / `attested_key_id` / `cohort_scope` / `weight` is now
+    /// exactly as much a re-sign trigger as a mutation to the envelope, and
+    /// keeping both in one helper is what stops a fixture from re-signing half
+    /// the change.
     fn resign_fix(row: &mut Attestation) {
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &row.attesting_key_id,
-            &row.attestation_envelope,
-        );
-        row.original_content_hash = och;
-        row.scrub_signature_classical = classical;
-        row.scrub_signature_pqc = pqc;
+        crate::federation::tier_ingest::test_support::reseal(row);
     }
 
     fn fix_attestation(
@@ -8667,27 +9300,27 @@ mod tests {
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
-        let __rev_env = serde_json::json!({"id": id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &__rev_env);
-        Revocation {
+        // v31.0.0 (#659) — and the typed columns are BOUND INTO the bytes that
+        // signature covers, through the one shared producer, so a fixture
+        // cannot certify a revocation this substrate's own put door refuses.
+        crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: __rev_env,
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
             revoked_after: None,
             persist_row_hash: String::new(),
-        }
+        })
     }
 
     // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
@@ -8716,6 +9349,7 @@ mod tests {
     ) -> Attestation {
         let mut att = fix_attestation(id, attesting, attested, scrub_key_id);
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
@@ -9512,6 +10146,7 @@ mod tests {
         // federation} — never a wire value.
         let mut att = fix_attestation("cs-global", "cs-attester", "cs-attested", "cs-attester");
         att.cohort_scope = "global".to_string();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -9533,6 +10168,7 @@ mod tests {
         // Empty string — same closed-set refusal, same kind.
         let mut att = fix_attestation("cs-empty", "cs-attester", "cs-attested", "cs-attester");
         att.cohort_scope = String::new();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -9556,6 +10192,7 @@ mod tests {
                 "cs-attester",
             );
             att.cohort_scope = scope.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut att);
             backend
                 .put_attestation(SignedAttestation { attestation: att })
                 .await
@@ -9582,6 +10219,21 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "mem").await;
     }
 
+    /// v31.0.0 (CIRISPersist#612) — the `content_class:*` flag plane on the
+    /// memory backend. Shares its body with the sqlite and postgres twins.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn content_class_flag_plane_memory() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("cc-node-mem");
+        crate::federation::content_class::parity_test_support::assert_content_class_flag_plane(
+            &backend,
+            "cc-node-mem",
+            "mem",
+        )
+        .await;
+    }
+
     /// CIRISServer#356 — the operator read surface on the memory backend:
     /// unknown-not-green, the distinguished zeroes, and the read-only overdue
     /// query's zero-write proof. Shares its body with the sqlite and postgres
@@ -9595,7 +10247,7 @@ mod tests {
         .await;
     }
 
-    /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
+    /// v25.1.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
     /// the real envelope, on this backend, through the real host API. Shares
     /// the assertion body with the sqlite and postgres twins — a dimension
     /// wired on two backends out of three is the #541 recurrence class.
@@ -9780,6 +10432,7 @@ mod tests {
         });
         resign_fix(&mut est); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         est.subject_key_ids = vec!["subj-1".into(), "subj-2".into()];
+        resign_fix(&mut est); // #643 — a typed-column edit is a re-seal trigger
         backend
             .put_attestation(SignedAttestation { attestation: est })
             .await
@@ -9808,10 +10461,18 @@ mod tests {
     #[tokio::test]
     async fn attach_pqc_completes_hybrid_pending_key() {
         let backend = MemoryBackend::new();
+        // v31.0.0 (CIRISPersist#657) — a row the cold path can LEGITIMATELY
+        // complete: self-scrubbed, with the ML-DSA pubkey bound into the signed
+        // registration envelope. The old fixture attached the strings
+        // "test-mldsa-pubkey" / "test-mldsa-sig" and passed, which is the defect
+        // demonstrated in our own test suite.
+        let (row, mldsa_pk, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-pending",
+                crate::federation::types::identity_type::PRIMITIVE,
+            );
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key("k-pending", "primitive-a", "k-pending"),
-            })
+            .put_public_key(SignedKeyRecord { record: row })
             .await
             .unwrap();
         // Initially hybrid-pending.
@@ -9824,7 +10485,7 @@ mod tests {
 
         // Attach the PQC components.
         backend
-            .attach_key_pqc_signature("k-pending", "test-mldsa-pubkey", "test-mldsa-sig")
+            .attach_key_pqc_signature("k-pending", &mldsa_pk, &pqc_sig)
             .await
             .unwrap();
 
@@ -9833,32 +10494,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.is_pqc_complete());
-        assert_eq!(
-            row.pubkey_ml_dsa_65_base64.as_deref(),
-            Some("test-mldsa-pubkey")
-        );
-        assert_eq!(row.scrub_signature_pqc.as_deref(), Some("test-mldsa-sig"));
+        assert_eq!(row.pubkey_ml_dsa_65_base64.as_deref(), Some(&*mldsa_pk));
+        assert_eq!(row.scrub_signature_pqc.as_deref(), Some(&*pqc_sig));
         assert!(row.pqc_completed_at.is_some());
         // Hash recomputed.
         assert_eq!(row.persist_row_hash.len(), 64);
     }
 
+    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
+    /// memory. One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
+    #[tokio::test]
+    async fn attach_key_pqc_is_gated_memory_657() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
+            &backend, "mem657",
+        )
+        .await
+        .expect("657 attach-gate exercise");
+    }
+
     #[tokio::test]
     async fn attach_pqc_rejects_double_fill() {
         let backend = MemoryBackend::new();
+        let (row, mldsa_pk, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-double",
+                crate::federation::types::identity_type::PRIMITIVE,
+            );
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key("k-double", "primitive-a", "k-double"),
-            })
+            .put_public_key(SignedKeyRecord { record: row })
             .await
             .unwrap();
         backend
-            .attach_key_pqc_signature("k-double", "mldsa-pk-1", "mldsa-sig-1")
+            .attach_key_pqc_signature("k-double", &mldsa_pk, &pqc_sig)
             .await
             .unwrap();
         // Second attach errors with Conflict.
         let err = backend
-            .attach_key_pqc_signature("k-double", "mldsa-pk-2", "mldsa-sig-2")
+            .attach_key_pqc_signature("k-double", &mldsa_pk, &pqc_sig)
             .await
             .unwrap_err();
         assert!(matches!(err, crate::federation::Error::Conflict(_)));
@@ -9939,7 +10613,20 @@ mod tests {
             })
             .await
             .unwrap();
-        for id in &["k-a", "k-b", "k-c"] {
+        // v31.0.0 (CIRISPersist#657) — `k-a` is the row this test COMPLETES, so
+        // it is minted in the shape a legitimate cold-path fill-in has:
+        // self-scrubbed, ML-DSA pubkey bound into the signed envelope. `k-b` /
+        // `k-c` stay ordinary pending rows (never completed here).
+        let (k_a, k_a_mldsa_pk, k_a_pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-a",
+                crate::federation::types::identity_type::PRIMITIVE,
+            );
+        backend
+            .put_public_key(SignedKeyRecord { record: k_a })
+            .await
+            .unwrap();
+        for id in &["k-b", "k-c"] {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fix_key(id, "primitive", "steward"),
@@ -9981,7 +10668,7 @@ mod tests {
 
         // Attach PQC to one row in each table. Filter excludes them.
         backend
-            .attach_key_pqc_signature("k-a", "mldsa-pk", "mldsa-sig")
+            .attach_key_pqc_signature("k-a", &k_a_mldsa_pk, &k_a_pqc_sig)
             .await
             .unwrap();
         backend
@@ -10188,7 +10875,7 @@ mod tests {
         assert_eq!(remaining[0].trace_id, "trace-k2-t1");
     }
 
-    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure deletes the
+    /// v7.0.0 (CIRISPersist#222) — full Art. 17 erasure deletes the
     /// agent's traces across ALL signing keys (contrast the per-key
     /// `delete_traces_for_agent`), cascades LLM calls by trace_id,
     /// emits a `hard_case:trace_erasure` audit row, and is idempotent.
@@ -10512,7 +11199,13 @@ mod tests {
         );
         let mut w2 = w1.clone();
         w2.attestation_id = "w-2".into();
+        // v31.0.0 (CIRISPersist#598) — the LATER instant is what makes this a
+        // replay rather than a byte-identical resend, so it is part of what the
+        // seal must cover: set it BEFORE re-sealing, not after. Re-sealing
+        // afterwards left the column at 05-02 and the signed twin at 05-01,
+        // which is the exact divergence the instant-binding gate refuses.
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
+        crate::federation::tier_ingest::test_support::reseal(&mut w2);
         backend
             .put_attestation(SignedAttestation { attestation: w1 })
             .await
@@ -11222,14 +11915,48 @@ mod tests {
             vec![(canon.to_owned(), BakeItemOutcome::ReAnchored)],
             "the anchored-but-different canonical is re-anchored under quorum"
         );
+        // v31.0.0 (CIRISPersist#648) — the delegation plane is regime-branched
+        // on the ARTIFACT, not on an edited expectation.
+        //
+        // `genesis_v2.json` is the REAL 2026-07-23 ceremony artifact and it was
+        // signed before the #643 row mirror existed, so its delegation rows
+        // carry no signed `row` object and `put_attestation` refuses them. That
+        // gate closes the verb-substitution and authority-injection attacks and
+        // is not weakened here: a genesis-shaped carve-out would be a permanent
+        // hole in exactly the rows that grant everything.
+        //
+        // The KEY plane above is untouched and still proves the whole #490
+        // acceptance story (quorum verifies, the anchored-but-different
+        // canonical re-anchors under quorum, the #486 lift opens the trace
+        // plane). What the delegation half asserts now is the truth of a
+        // pre-v31 build: every row is SKIPPED, naming #643. When the same
+        // holders re-sign under the new envelope shape for 31.1.0, this flips
+        // back to `Anchored` by itself.
+        let artifact_bundle: crate::federation::genesis::GenesisBundle =
+            serde_json::from_str(artifact).expect("artifact parses");
+        let row_bound =
+            crate::federation::genesis::bundle_delegation_plane_v31_shaped(&artifact_bundle);
         for (id, outcome) in &report.attestations {
-            assert!(
-                matches!(
-                    outcome,
-                    BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
+            match &row_bound {
+                Ok(()) => assert!(
+                    matches!(
+                        outcome,
+                        BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
+                    ),
+                    "delegation-plane row {id} must land, got {outcome:?}"
                 ),
-                "delegation-plane row {id} must land, got {outcome:?}"
-            );
+                Err(_) => match outcome {
+                    BakeItemOutcome::Skipped(why) => assert!(
+                        crate::federation::genesis::is_v31_binding_refusal(why),
+                        "row {id} must be skipped BY THE BINDING GATE, not for some other \
+                         reason: {why}"
+                    ),
+                    other => panic!(
+                        "a pre-v31 delegation row {id} must be refused by the #643 gate, \
+                         got {other:?} — the gate has a hole"
+                    ),
+                },
+            }
         }
 
         // The mesh is bright: the re-blessed record claims infra:serve
@@ -11277,11 +12004,23 @@ mod tests {
         let steward = op::Identity::new("e9-steward");
         let admin = op::Identity::new("e9-admin");
 
-        // Grant BEFORE the steward is registered as a steward key → the
-        // resolved roster is empty → NoQualifyingGrant, refused.
+        // v31.0.0 (CIRISPersist#644) — the outsider is now REGISTERED (as a
+        // plain agent), which sharpens this test rather than weakening it.
+        // Before #644 the first leg refused a key the directory had never
+        // heard of, so "not a steward" and "not registered at all" were
+        // indistinguishable — and the row's own signature was never checked,
+        // so the leg could not have told them apart. Now the outsider's
+        // signature VERIFIES and the ONLY thing it lacks is steward status,
+        // which is precisely the E9 property under test.
+        let outsider = op::Identity::new("e9-outsider");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&backend, "e9-outsider")
+            .await;
+
+        // Grant rooted at a registered NON-steward → the resolved roster
+        // does not contain it → NoQualifyingGrant, refused.
         let grant = op::signed_membership(
             "e9-m1",
-            &steward,
+            &outsider,
             "e9-admin",
             "e9-org",
             "org_admin",
@@ -11291,7 +12030,7 @@ mod tests {
         let err = backend
             .put_org_membership(grant)
             .await
-            .expect_err("(E9) grant rooted at a non-registered steward is refused");
+            .expect_err("(E9) grant rooted at a non-steward is refused");
         assert!(
             err.kind().contains("operational_authority"),
             "kind {}",
@@ -11620,6 +12359,18 @@ mod tests {
     #[tokio::test]
     async fn envelope_attested_roles_lift_then_gate_486() {
         let backend = MemoryBackend::new();
+        // v31.0.0 (CIRISPersist#648) — seat the accord roster so the refusal
+        // below comes from the `infra:attest` CONFERRAL gate rather than from
+        // the empty-roster accident this fixture used to rely on. Plain `node`
+        // rows under the roster key_ids resolve without being able to confer
+        // anything. See `run_set_path_parity` for the same correction.
+        for kid in crate::federation::genesis::effective_accord_holder_records().iter() {
+            let mut seat = fix_key(&kid.record.key_id, "ref", &kid.record.key_id);
+            seat.identity_type = "node".to_owned();
+            let _ = backend
+                .put_public_key(SignedKeyRecord { record: seat })
+                .await;
+        }
 
         // Ungated role in the envelope, empty top-level roles (the exact
         // #480 shape): after put, the row CLAIMS infra:serve.
@@ -11785,7 +12536,7 @@ mod tests {
         use crate::federation::admission::has_accord_conferred_role_over_roster;
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record, signed_canonical_record_with_roles,
-            Identity,
+            Identity, PLACEHOLDER_SUBJECT_ED25519_BASE64,
         };
         let backend = MemoryBackend::new();
 
@@ -11809,6 +12560,8 @@ mod tests {
         let allow = signed_canonical_record_with_roles(
             "canon-484",
             "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             env.clone(),
             &[&holders[0], &holders[1]],
@@ -11830,6 +12583,8 @@ mod tests {
         let self_only = signed_canonical_record_with_roles(
             "canon-484-self",
             "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             serde_json::json!({ "key_id": "canon-484-self" }),
             &[&Identity::new("self-484")], // not in the roster → does not count
@@ -11852,7 +12607,14 @@ mod tests {
 
         // And the plain (rolesless) builder is unaffected — sanity that the
         // export didn't change existing behavior.
-        let _plain = signed_canonical_record("x-484", "node", env, &[&holders[0]]);
+        let _plain = signed_canonical_record(
+            "x-484",
+            "node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            env,
+            &[&holders[0]],
+        );
     }
 
     /// v21.14.0 (CIRISPersist#534) — the SAME backend-agnostic conferral body
@@ -11928,6 +12690,70 @@ mod tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
+    /// NAMED, at the real `put_revocation` chokepoint, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("rev659-node-mem");
+        crate::federation::admission::r2_test_support::exercise_revocation_subject_binding(
+            &backend,
+            "mem659r",
+            "rev659-node-mem",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on memory. The first two were
+    /// live on sqlite and postgres and ABSENT here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_rollback_and_region_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend, "mem659g",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
+    /// and the M is signed. On memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn partner_threshold_floor_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
+            &backend, "mem659p",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
+    /// real `put_public_key` chokepoint, on memory.
+    #[tokio::test]
+    async fn coscrub_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_coscrub_subject_binding(
+            &backend, "mem659",
+        )
+        .await
+        .expect("659 subject-binding exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#659, one plane wider) — a registration signature
+    /// admits only the key it names, on memory.
+    #[tokio::test]
+    async fn registration_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::register::test_support::exercise_registration_subject_binding(
+            &backend, "mem659r",
+        )
+        .await
+        .expect("659 registration subject-binding exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_memory_548() {
@@ -11969,6 +12795,7 @@ mod tests {
         };
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
         };
         use crate::federation::types::identity_type;
         let backend = MemoryBackend::new();
@@ -11986,6 +12813,8 @@ mod tests {
         let rec = signed_canonical_record_with_roles(
             "ciris-canonical-test-480",
             "canonical,node",
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
             vec!["infra:serve".to_owned()],
             serde_json::json!({ "key_id": "ciris-canonical-test-480" }),
             &[&holders[0], &holders[1]],
@@ -12045,6 +12874,7 @@ mod tests {
             crate::federation::trust_root::pre_rotation_commitment(&successors).unwrap();
         let mut d = fix_attestation(id, root, root, root);
         d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut d);
         d.attestation_envelope = serde_json::json!({
             "references_attestation_id": id,
             "scope": scope,
@@ -12068,6 +12898,7 @@ mod tests {
         // Target T: producer `prod`, subjects {s1, s2, canon}.
         let mut t = fix_attestation("t-1", "prod", "prod", "prod");
         t.subject_key_ids = vec!["s1".into(), "s2".into(), "canon".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut t);
         backend
             .put_attestation(SignedAttestation { attestation: t })
             .await
@@ -12156,6 +12987,7 @@ mod tests {
         a.attestation_envelope = env;
         resign_fix(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a.subject_key_ids = subject_key_ids.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
         a
     }
 
@@ -13064,6 +13896,13 @@ mod tests {
             &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         );
         d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap()); // past
+                                                                      // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
+                                                                      // now (envelope absent ⇔ column None), so setting the column is a
+                                                                      // re-sign trigger. That is the property under test here, from the other
+                                                                      // side: an expiry a writer could set ALONE would be an unsigned mute
+                                                                      // button, and this fixture's whole premise is that the expiry is what
+                                                                      // kills the delegation's liveness.
+        resign_fix(&mut d);
         backend
             .put_attestation(SignedAttestation { attestation: d })
             .await
@@ -13254,16 +14093,22 @@ mod tests {
             .expect("affiliations group (community row) created");
 
         // ── add via the affiliations cohort ────────────────────────────────
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.
+        let joiner_row = RosterMember {
+            key_id: "ob-joiner".into(),
+            joined_at: chrono::Utc::now(),
+            role: Some("member".into()),
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            &backend,
+            "ob-owner",
+            Cohort::Affiliations,
+            group,
+            &joiner_row,
+        )
+        .await;
         let added = backend
-            .add_member(
-                Cohort::Affiliations,
-                group,
-                RosterMember {
-                    key_id: "ob-joiner".into(),
-                    joined_at: chrono::Utc::now(),
-                    role: Some("member".into()),
-                },
-            )
+            .add_member(Cohort::Affiliations, group, joiner_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added, "genuine add returns true");
@@ -13935,6 +14780,7 @@ mod tests {
         // federation rows keep the fixture default.
         if tier == crate::federation::types::attestation_tier::LOCAL {
             a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
         }
         a
     }
@@ -14063,9 +14909,13 @@ mod tests {
     async fn bare_subject_side_revocation_via_put_attestation_gated() {
         let backend = consent_backend().await;
         let mut row = fix_attestation("bare-rev", "subject-key", "registry-steward", "subject-key");
+        // v31.0.0 (CIRISPersist#598) — the signed instant must equal the column.
+        row.asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(row.asserted_at);
         row.attestation_envelope = serde_json::json!({
             "id": "bare-rev", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
+            crate::federation::envelope::paths::ASSERTED_AT: row.asserted_at.to_rfc3339(),
         });
         row.subject_key_ids = vec!["subject-key".into()];
         row.tier = crate::federation::types::attestation_tier::LOCAL.into();
@@ -14079,6 +14929,7 @@ mod tests {
 
         // Forged signature → rejected (no put_attestation bypass of the gate).
         forged.attestation_id = "bare-rev-forged".into();
+        crate::federation::tier_ingest::test_support::reseal(&mut forged);
         forged.scrub_signature_classical = "AAAA".into();
         let err = backend
             .put_attestation(SignedAttestation {
@@ -14154,6 +15005,7 @@ mod tests {
         // no FK.)
         let mut target = fix_attestation("T-1", "producer", "producer", "registry-steward");
         target.subject_key_ids = vec![canonical_h.to_string()];
+        crate::federation::tier_ingest::test_support::reseal(&mut target);
         backend
             .put_attestation(SignedAttestation {
                 attestation: target.clone(),
@@ -14527,8 +15379,16 @@ mod tests {
             .await
             .unwrap();
         // Genuine add → true, appears in both lookup + active reader.
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
+        let admit = crate::federation::cohort::test_support::admit_community_via(
+            &backend,
+            &ids[0],
+            "addc-comm",
+            &member("addc-1"),
+        )
+        .await;
         assert!(backend
-            .add_community_member("addc-comm", member("addc-1"))
+            .add_community_member("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -14543,9 +15403,12 @@ mod tests {
             .members
             .iter()
             .any(|m| m.key_id == "addc-1"));
-        // Re-add same key → idempotent no-op (false), no duplicate.
+        // Re-add same key → idempotent no-op (false), no duplicate. The stale
+        // `admit` from the first add is deliberately reused: the no-op returns
+        // BEFORE the gate, because nothing is written and there is nothing to
+        // authorize (CIRISPersist#654).
         assert!(!backend
-            .add_community_member("addc-comm", member("addc-1"))
+            .add_community_member("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -14561,10 +15424,11 @@ mod tests {
             1,
             "no duplicate member row on re-add"
         );
-        // Unknown community → InvalidArgument.
+        // Unknown community → InvalidArgument (refused before the gate — there
+        // is no stored roster to have signed over).
         assert!(matches!(
             backend
-                .add_community_member("no-such-comm", member("addc-2"))
+                .add_community_member("no-such-comm", member("addc-2"), &admit)
                 .await
                 .unwrap_err(),
             crate::federation::Error::UnstewardedCommunityMember { .. }
@@ -14882,6 +15746,7 @@ mod tests {
         let bare_env = serde_json::json!({ "id": "bk-1", "dimension": "identity_binding:v1" });
         let mut row = fix_attestation("bk-1", "bk-prim", "bk-no", "bk-prim");
         row.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         refused(
             check_no_moderator_federate_apply(&b, &row)
                 .await
@@ -14891,6 +15756,7 @@ mod tests {
         // Same shape onto the MODERATORED community → ADMIT.
         let mut ok_row = fix_attestation("bk-2", "bk-user", "bk-ok", "bk-user");
         ok_row.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut ok_row);
         check_no_moderator_federate_apply(&b, &ok_row)
             .await
             .expect("membership-shaped row onto a moderatored community is admitted");
@@ -14904,6 +15770,7 @@ mod tests {
         // (2) EMITTED-BY-C shape — attesting_key_id = the community → REJECT.
         let mut by_c = fix_attestation("bk-3", "bk-no", "bk-prim", "bk-no");
         by_c.attestation_envelope = bare_env.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut by_c);
         refused(
             check_no_moderator_federate_apply(&b, &by_c)
                 .await
@@ -14915,6 +15782,7 @@ mod tests {
         let mut subj = fix_attestation("bk-4", "bk-prim", "bk-prim", "bk-prim");
         subj.attestation_envelope = bare_env.clone();
         subj.subject_key_ids = vec!["not-a-community".into(), "bk-no".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut subj);
         refused(
             check_no_moderator_federate_apply(&b, &subj)
                 .await
@@ -14923,6 +15791,7 @@ mod tests {
         );
         let mut subj_ok = subj.clone();
         subj_ok.subject_key_ids = vec!["not-a-community".into(), "bk-ok".into()];
+        crate::federation::tier_ingest::test_support::reseal(&mut subj_ok);
         check_no_moderator_federate_apply(&b, &subj_ok)
             .await
             .expect("subject-keyed row onto a moderatored community is admitted");
@@ -14996,7 +15865,6 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_transit_admits_and_sla_fires_end_to_end() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::tier_ingest::test_support::sign_envelope;
         use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use crate::federation::FederationDirectory;
         use std::time::Duration;
@@ -15012,31 +15880,28 @@ mod tests {
 
         // A subject-side `consent:state:revoked` envelope, hybrid-signed by the
         // subject (Ed25519 + ML-DSA-65 bound) over the CEG canonical form.
-        let env = serde_json::json!({
-            "id": "rev-c", "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
-
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
+        // stamps the column from it.
+        // v31.0.0 (CIRISPersist#656) — the signed MIRROR too: the transit door
+        // RECEIVES bytes it did not mint, so the producer binds the typed
+        // columns and persist CHECKS them. The producer therefore states the
+        // `attestation_id` (one of the seven bound members) rather than letting
+        // persist mint a fresh v4 it could not have signed over.
+        //
         // Admit it through the REAL local-write admission path — accepted as a
         // TRANSIT write because the bound-hybrid signature verifies (§10.1.3).
         let att_id = backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: "subject-c".into(),
-                attested_key_id: Some("target-c".into()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    env.clone(),
-                )
-                .unwrap(),
-                subject_key_ids: vec!["subject-c".into()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    "rev-c",
+                    "subject-c",
+                    "target-c",
+                    vec!["subject-c".into()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": "rev-c" }),
+                ),
+            )
             .await
             .expect("crypto-valid subject-side revocation transits the local tier (§10.1.3)");
 
@@ -15184,8 +16049,7 @@ mod tests {
     #[tokio::test]
     async fn consent_promotion_overdue_reader_memory() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::tier_ingest::test_support::sign_envelope;
-        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::types::attestation_tier;
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
@@ -15200,26 +16064,22 @@ mod tests {
         // A crypto-valid subject-side revocation, admitted as a TRANSIT
         // local-tier write (same real-admission fixture as the SLA loop
         // test above).
-        let env = serde_json::json!({
-            "id": "rev-r", "dimension": "consent:state:revoked:v1",
-            "score": 1.0, "confidence": 0.9,
-        });
-        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local door
+        // stamps the column from it.
+        // v31.0.0 (CIRISPersist#656) — the producer binds the mirror; see the
+        // SLA-loop fixture above.
         let att_id = backend
-            .attestation_upsert_local(LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: "subject-r".into(),
-                attested_key_id: Some("target-r".into()),
-                attestation_type: attestation_type::SCORES.into(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
-                    .unwrap(),
-                subject_key_ids: vec!["subject-r".into()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
-                scrub_signature_classical: Some(sig_classical),
-                scrub_signature_pqc: sig_pqc,
-            })
+            .attestation_upsert_local(
+                crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                    "rev-r",
+                    "subject-r",
+                    "target-r",
+                    vec!["subject-r".into()],
+                    crate::federation::types::cohort_scope::SELF,
+                    chrono::Utc::now(),
+                    serde_json::json!({ "id": "rev-r" }),
+                ),
+            )
             .await
             .expect("transit local-tier revocation admits");
         let revoked_at = backend.list_consent_revocations(None).await.unwrap()[0].asserted_at;
@@ -15438,6 +16298,7 @@ mod tests {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut att = fix_attestation(id, owner, node, owner);
         att.attestation_type = attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
@@ -15509,7 +16370,7 @@ mod tests {
         );
     }
 
-    /// v13.2.1 (CIRISPersist#378) — the owner-binding built with the **CC
+    /// v13.3.0 (CIRISPersist#378) — the owner-binding built with the **CC
     /// 2.4.1.2 canonical marker only** (`delegation_purpose: "owner_binding"`,
     /// **no `dimension`**) — the shape a raw `emit_attestation_self` `delegates_to`
     /// carries, and exactly what CIRISConformance `test_551` probes. Before the
@@ -15519,6 +16380,7 @@ mod tests {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut att = fix_attestation(id, owner, node, owner);
         att.attestation_type = attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         // CC 2.4.1.2 marker ONLY (no `dimension`). Carries the infra scopes so
         // it clears the node-agency gate and actually reaches the single-owner
         // gate under test (the marker recognition is the thing being proven).
@@ -15532,7 +16394,7 @@ mod tests {
         att
     }
 
-    /// v13.2.1 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
+    /// v13.3.0 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
     /// on the **CC-marker raw-emit path** (`delegation_purpose: "owner_binding"`,
     /// no dimension), not only persist's internal-dimension `steward_bind` path.
     /// A second distinct owner via the raw path is rejected; `owner_of` resolves
@@ -15611,10 +16473,16 @@ mod tests {
         seed_ob_keys(&backend).await;
         seed_second_owner(&backend, "ob-owner2").await;
 
-        // An already-expired incumbent binding (expires_at is a row field, not
-        // in the signed envelope, so the ingest signature is unaffected).
+        // An already-expired incumbent binding. v31.0.0 (CIRISPersist#598) —
+        // this comment used to read "expires_at is a row field, not in the
+        // signed envelope, so the ingest signature is unaffected". That
+        // sentence WAS the vulnerability: an expiry only the column carried was
+        // an unsigned mute button, since every consent fold DROPS an expired
+        // row. `expires_at` is now bound in both directions, so moving it is a
+        // re-sign trigger exactly like moving the envelope.
         let mut expired = fix_owner_binding("ob-b1", "ob-owner", "ob-node");
         expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        resign_fix(&mut expired);
         backend
             .put_attestation(SignedAttestation {
                 attestation: expired,
@@ -15777,6 +16645,7 @@ mod tests {
         let delegate = |id: &str, granter: &str, grantee: &str, sub: bool| {
             let mut d = fix_attestation(id, granter, grantee, granter);
             d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut d);
             d.attestation_envelope = serde_json::json!({
                 "references_attestation_id": id,
                 "scope": [DELEGATION_SCOPE_MODERATE],
@@ -15975,6 +16844,38 @@ mod tests {
         .await;
     }
 
+    /// v31.0.0 (CIRISPersist#640) — the MEMORY leg (the CONTROL: memory
+    /// neither rounds timestamps nor normalizes `consent_role`, so it must be
+    /// green before and after the fix; a red here means the shared derivation
+    /// broke, not that the skew was caught).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn nanosecond_key_wire_ref_resolves_memory_640() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &backend,
+            "memory-640",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#646) — the MEMORY leg of the every-kind witness.
+    /// The CONTROL: memory rounds nothing, so this must be green before AND
+    /// after the fix. A red here means the shared derivation broke, not that
+    /// the skew was caught.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn nanosecond_wire_refs_resolve_every_kind_memory_646() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
+            &backend,
+            "memory-646",
+        )
+        .await;
+    }
+
     /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the MEMORY leg of the shared
     /// namespace-registration witness. Memory tolerates what sqlite/postgres
     /// reject, which is exactly why it gets its own leg: an R2 refusal that
@@ -16143,6 +17044,7 @@ mod tests {
         let delegate = |id: &str, granter: &str, grantee: &str| {
             let mut d = fix_attestation(id, granter, grantee, granter);
             d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            crate::federation::tier_ingest::test_support::reseal(&mut d);
             d.attestation_envelope = serde_json::json!({
                 "references_attestation_id": id,
                 "scope": [DELEGATION_SCOPE_MODERATE],
@@ -16292,6 +17194,7 @@ mod tests {
         let row = |attn: &str, attesting: &str, attested: &str| {
             let mut a = fix_attestation("rp-att", attesting, attested, attesting);
             a.attestation_type = attn.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             a
         };
 
@@ -16424,6 +17327,7 @@ mod tests {
         // Federation put: refused before signature/directory work.
         let mut row = fix_attestation("cap-fed", "cap-k", "cap-k", "cap-k");
         row.attestation_envelope = oversize.clone();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
         let err = backend
             .put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
@@ -16528,6 +17432,80 @@ mod tests {
             .await
             .expect("holders seed");
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **revocation-door
+    /// parity** witness. This backend is the one that was wrong: it ran neither
+    /// `check_observed_region` nor the anti-rollback check, and it validated no
+    /// hex, so all three shapes sqlite + postgres refuse were accepted here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_door_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_revocation_parity(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **attestation
+    /// `original_content_hash` hex** parity witness.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn attestation_hash_hex_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_attestation_hash_hex_parity(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **genesis-id squat**
+    /// witness: a baked genesis `attestation_id` may not be claimed at either
+    /// write door, on any backend.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn genesis_id_squat_refused_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::genesis::exercise_genesis_id_squat_refused(&backend, "memory").await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **injected-squat**
+    /// witness. Reservation closes the doors; this asks what the classifier says
+    /// about a row that got in anyway (a restored backup, a direct write, a
+    /// pre-#660 corpus). The injection bypasses `put_attestation` deliberately —
+    /// that is the whole point — by pushing straight into backend state, which
+    /// is this backend's equivalent of the SQL legs' raw INSERT.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn injected_genesis_squat_is_divergent_memory_660() {
+        let backend = MemoryBackend::new();
+        let baked = &crate::federation::genesis::canonical_genesis_bundle().attestations[0];
+        let mut squat = baked.attestation.clone();
+        // The ONE field `verify_delegation_plane_seeded` reads to reach its
+        // divergent arm — a substituted conferral row.
+        squat.original_content_hash = "00".repeat(32);
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_attestations
+            .push(squat);
+        crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "memory").await;
+    }
+
+    /// v31.0.0 (CIRISPersist#648) — the MEMORY leg of the **anti-fail-open**
+    /// witness: a node with no accord roster refuses every root-requiring gate
+    /// with the typed `federation_no_constitutional_root_yet`.
+    ///
+    /// Memory is the leg that historically tolerates what the SQL backends
+    /// refuse, so it is the one most likely to turn a chokepoint into a no-op.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn seedless_gate_refusals_parity_memory_648() {
+        let backend = MemoryBackend::new();
+        crate::federation::genesis::posture::exercise_seedless_gate_refusals(&backend, "memory")
+            .await;
     }
 
     /// v30.3.0 (CIRISPersist#611) — the MEMORY leg of the shared
@@ -16720,6 +17698,7 @@ mod tests {
             a.scrub_signature_classical = sc_sig;
             a.scrub_signature_pqc = sp_sig;
             a.scrub_key_id = from.to_owned();
+            crate::federation::tier_ingest::test_support::reseal(&mut a);
             match backend
                 .put_attestation(crate::federation::SignedAttestation { attestation: a })
                 .await
@@ -17031,7 +18010,7 @@ mod tests {
             .expect("a node target is governed by the node-agency gate, not the user-target gate");
     }
 
-    // ── v12.7.0 (CIRISPersist#368, CC 3.4.11 / CC 3.4.13) ────────────────
+    // ── v13.0.0 (CIRISPersist#368, CC 3.4.11 / CC 3.4.13) ────────────────
     //    Witness-targets-subject age_assurance admission decision table.
 
     /// CC 3.4.11 witness-targets-subject decision table, through the REAL
@@ -17137,7 +18116,7 @@ mod tests {
 
     /// #368 read-side defense-in-depth: a self-emitted `age_assurance:*` row
     /// that PRE-DATES the admission gate (or arrived via replication before
-    /// v12.7.0) must not graduate its own emitter either. Injected directly
+    /// v13.0.0) must not graduate its own emitter either. Injected directly
     /// into backend state (bypassing `put_attestation`) to simulate the
     /// legacy row; `age_band` / `age_band_fine` skip it.
     #[tokio::test]
@@ -17211,6 +18190,7 @@ mod tests {
     ) -> Attestation {
         let mut att = fix_attestation(id, steward, ward, steward);
         att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut att);
         let mut env = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
@@ -18333,5 +19313,140 @@ mod tests {
         assert_eq!(stored.0, "e4sig-authority");
         assert_eq!(stored.1, expect_classical);
         assert_eq!(stored.2, expect_pqc);
+    }
+
+    // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, MEMORY legs ──
+    //
+    // Each is three lines over a shared body in `admission`, because every one
+    // of these findings was a door that had a gate on some backends (or some
+    // doors) and not others. A witness written into ONE backend's test module
+    // is how that class comes back.
+
+    /// The MEMORY leg of the SEVENTH-SITE witness: the transit branch of the
+    /// local write door CHECKS the typed-column mirror it deliberately does not
+    /// stamp. See the shared body for the attack it closes.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_mirror_binding_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the RE-SEAL witness: `reseal_attestation_v31` verifies
+    /// the seal it writes and refuses to move the consent fold's ordering key.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reseal_seal_gate_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the PEER-RECORD witness: `add_peer_record` cannot
+    /// self-claim a conferred role.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn peer_record_role_gate_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the FOREIGN-RETRACTION witness: a `withdraws` or
+    /// `recants` from a key with no authority over the target cannot sever a
+    /// delegation edge, whatever order it arrives in.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn foreign_retraction_cannot_sever_parity_memory_656() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
+            &backend, "mem656",
+        )
+        .await;
+    }
+
+    /// The MEMORY leg of the CANONICAL-SUPERSEDE role-gate witness.
+    ///
+    /// **Memory has no `supersede_canonical_record` at all** — the whole
+    /// supersede plane is `#[cfg(any(feature = "postgres", feature =
+    /// "sqlite"))]`, so a supersede offer resolves through the DEFAULT trait
+    /// body to `put_public_key` + first-seen-wins. Memory is therefore not
+    /// ungated, it is INCAPABLE, and this leg asserts that rather than being
+    /// silently absent: "the third leg is missing" and "the third door does not
+    /// exist" look identical from a test list, and this substrate has twice
+    /// mistaken the first for the second.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn canonical_supersede_role_gate_parity_memory_656() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        let (laundering, _clean) =
+            crate::federation::admission::ungated_doors_test_support::seed_canonical_supersede_fixture(
+                &backend, "mem656",
+            )
+            .await;
+        let key_id = laundering.key_id.clone();
+        let outcome = backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: laundering })
+            .await;
+        // Two admissible shapes, and `Superseded` is neither: the default trait
+        // body routes to `put_public_key`, whose own role gates refuse the
+        // `canonical` claim outright (an `Err`), and where they do not it is
+        // first-seen-wins (`Refused`). What must never happen is the row being
+        // ADOPTED, which is the only way a role reaches the table here.
+        match &outcome {
+            Err(_) => {}
+            Ok(crate::federation::register::ReplicatedKeyOutcome::Refused { .. }) => {}
+            other => panic!(
+                "memory has no supersede plane, so the offer must be refused — never adopted: \
+                 {other:?}"
+            ),
+        }
+        let stored = FederationDirectory::lookup_public_key(&backend, &key_id)
+            .await
+            .expect("read")
+            .expect("the incumbent is still there");
+        assert!(
+            stored.capability_roles.is_empty(),
+            "and no role was laundered onto the row: {:?}",
+            stored.capability_roles
+        );
+    }
+
+    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on memory.
+    /// One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
+    #[tokio::test]
+    async fn roster_growth_is_authorized_memory_654() {
+        let backend = MemoryBackend::new();
+        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
+            &backend, "mem654",
+        )
+        .await
+        .expect("654 roster-growth authorization exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
+    /// #547/#640 stale-index class, on memory.
+    #[tokio::test]
+    async fn attestation_wire_index_follows_pqc_attach_memory_657() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
+            &backend, "mem657",
+        )
+        .await
+        .expect("657 attestation wire-index exercise");
     }
 }

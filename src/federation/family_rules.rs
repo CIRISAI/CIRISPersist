@@ -343,8 +343,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "revocation:peer_admission:",
-        rule: "self-authored only AT CONSUMPTION — a de-admission is honoured on this node only \
-               if THIS node authored it, so a peer cannot de-admit a third party here (AV-77)",
+        rule: "self-authored, asked at BOTH ends — a de-admission is honoured on this node only \
+               if THIS node authored it (consumption), and since v31.0.0 (#608) a de-admitted \
+               peer cannot AUTHOR one either. The admission exemption used to key on the \
+               dimension, so the sanction did not cover the sanctioning dimension (AV-77)",
         enforced_at: &["federation::admission::check_peer_deadmission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
@@ -449,6 +451,26 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "slashing:",
+        "a RETENTION rule, not an admission rule — and the distinction is the whole \
+         entry. v31.0.0 (CIRISPersist#650) names this stem in \
+         `federation::migration::is_exclusion_bearing`, which decides what the v31 \
+         in-place migration may DELETE. It never decides what may be WRITTEN: \
+         persist still gates nothing on `slashing:` at admission (the module note \
+         above, and `tests::slashing_is_not_a_persist_ruled_family`, both hold \
+         unchanged — the only other `slashing` surface in the crate remains \
+         CIRISNode's `cirisnode_slashing_attestations`, a different plane). \
+         Naming it here is the same move `moderation:` / `quarantine:` / \
+         `reconsideration:` get from their inventory rows: a slashing outcome is \
+         one of the classes whose deletion would silently RE-ADMIT the key it \
+         excluded, because exclusion in this substrate is not structural — no \
+         fresh trust root removes an old key, and `federation_revocations` has no \
+         replication cursor to refill it from. So the migration refuses to purge \
+         it. Purge polarity is not a dimension-family rule and must not be \
+         derived into `persist_ruled_prefixes()`; if persist ever gates \
+         `slashing:` at a WRITE door, this entry must go.",
+    ),
+    (
         "regime:",
         "NOT persist-ruled, and still deliberately so (CIRISPersist#571) — but the \
          REASON changed at the rc3 re-vendor and the old one is dead. It used to \
@@ -487,6 +509,26 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          and the reader weighs it (\"polarity carries certifier confidence; not a \
          slashing input\") — so an open write door with a publisher-filtered read \
          door is the shape CC describes, not a gap.",
+    ),
+    (
+        "content_class:",
+        "a READ-side filter, not an admission rule — the same shape as \
+         `content_rating:` above, arrived at the same way. Persist gated this \
+         family to `substrate_persist` from v3.0.0 under CEG 0.3 §5.6.8.3 until \
+         CC catalogued it; CC 3.3.12 declares it OPEN VOCABULARY and CC 3.4.14 R1 \
+         makes the `generated`/`generated_modified` marking universal — EVERY \
+         attester — so the write gate was refusing the very row CC makes \
+         mandatory, and CIRISPersist#571 removed it. The literal is now \
+         `content_class::FAMILY_STEM`, whose only use is the READ door \
+         `FederationDirectory::resolve_content_class_flag` (v31.0.0, \
+         CIRISPersist#612). That door admits nothing and refuses nothing: it \
+         FOLDS rows already stored, honouring a withdrawal that clears another \
+         emitter's flag only from a key a root this node trusts has conferred \
+         `infra:classify_content` on. An open write door with a \
+         conferral-filtered read door is the shape CC describes — see \
+         `admission::MEDIA_PLANE_FAMILIES_CC_LEAVES_OPEN`. It becomes \
+         persist-RULED only if a gate ever refuses a `content_class:` row at \
+         write time, at which point this line must go.",
     ),
     (
         "admin_action:",

@@ -887,7 +887,20 @@ pub trait BlobStorage: Send + Sync {
                 }
             }
 
-            let envelope = holds_bytes_attestation_envelope(sha256);
+            // v31.0.0 (CIRISPersist#652) — the v31-SHAPED envelope: the #598
+            // instants and the #643 mirror ride the bytes this signer is about
+            // to sign. `put_blob` rebuilds these exact bytes from the same
+            // four inputs, so persist still verifies the caller signed the row
+            // it is storing. `now` is BOTH instants here because the signing
+            // helper mints the claim and signs it in one motion — a caller
+            // that wants to assert an older claim uses `put_blob` directly and
+            // states `asserted_at` itself.
+            let envelope = holds_bytes_attestation_envelope(
+                sha256,
+                attesting_key_id,
+                &attestation_id.to_string(),
+                now,
+            );
             // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
             let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
                 .map_err(|e| {
@@ -921,6 +934,7 @@ pub trait BlobStorage: Send + Sync {
                 scrub_signature_pqc: None,
                 scrub_key_id,
                 scrub_timestamp: now,
+                asserted_at: now,
             };
 
             self.put_blob(sha256, body, media_type, att).await
@@ -1519,6 +1533,23 @@ pub struct PutBlobAttestation {
     pub scrub_key_id: String,
     /// Timestamp on the scrub signature.
     pub scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    /// v31.0.0 (CIRISPersist#652) — **when the HOLDER CLAIM is asserted**, and
+    /// now a field of its own.
+    ///
+    /// Both backends used to populate the `asserted_at` COLUMN from
+    /// [`Self::scrub_timestamp`]: *when the signature was made* standing in for
+    /// *when the claim was asserted*. Two different facts sharing one value is
+    /// survivable while nothing reads it; `asserted_at` is what every fold
+    /// orders on and what CIRISPersist#598 binds into the signed envelope, so
+    /// it is not survivable now. It is also the caller's to state, not
+    /// persist's to infer — a holder announcing bytes it has held for a week
+    /// is making a claim about the week, not about the moment it reached for
+    /// its key.
+    ///
+    /// Truncated to the substrate resolution when the envelope is stamped (see
+    /// [`holds_bytes_attestation_row`]), so a caller passing `Utc::now()`
+    /// verbatim is correct rather than refused.
+    pub asserted_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// v2.3 (CIRISPersist#103) — typed errors from the [`BlobStorage`] trait.
@@ -1717,10 +1748,10 @@ pub fn holds_bytes_attestation_type(sha256: &[u8; 32]) -> String {
     )
 }
 
-/// v2.3 (CIRISPersist#103) — compute the canonical
-/// `attestation_envelope` JSON for a `holds_bytes` attestation.
+/// v2.3 (CIRISPersist#103) — the canonical `attestation_envelope` JSON for a
+/// `holds_bytes` attestation.
 ///
-/// Shape:
+/// Base shape, before the v31 bindings below are stamped onto it:
 ///
 /// ```json
 /// {
@@ -1728,11 +1759,349 @@ pub fn holds_bytes_attestation_type(sha256: &[u8; 32]) -> String {
 ///   "evidence_refs": ["<full-hex-sha256>"]
 /// }
 /// ```
-pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "holds_bytes",
-        "evidence_refs": [hex::encode(sha256)],
-    })
+///
+/// # v31.0.0 (CIRISPersist#652) — why this takes the row, not just the SHA
+///
+/// It used to take `sha256` alone, and that was the whole defect. The
+/// `put_blob` door RECONSTRUCTS this envelope rather than storing the
+/// caller's, so the envelope must be a pure function of things persist also
+/// knows — which is what kept it to the SHA, and which is exactly why it could
+/// carry neither the #598 instants nor the #643 mirror. Both bind ROW fields.
+///
+/// So the row's identity is threaded in instead. Determinism — the property
+/// the whole door rests on — is preserved, because every remaining bound field
+/// is fixed BY CONSTRUCTION at this door: `attested_key_id` is the attester (a
+/// holder attests itself), `attestation_type` is
+/// [`holds_bytes_attestation_type`] of the same SHA, `subject_key_ids` is
+/// empty, `cohort_scope` is `federation`, and `weight` / `expires_at` are
+/// `None`. Persist can still rebuild these exact bytes and therefore still
+/// verify that the caller signed the row it is actually storing. The rule is
+/// unchanged — **the party that MINTS the bytes stamps, the party that
+/// RECEIVES them checks** — it simply runs over a bigger input.
+#[must_use]
+pub fn holds_bytes_attestation_envelope(
+    sha256: &[u8; 32],
+    attesting_key_id: &str,
+    attestation_id: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    holds_bytes_attestation_row(sha256, attesting_key_id, attestation_id, asserted_at)
+        .attestation_envelope
+}
+
+/// v31.0.0 (CIRISPersist#652) — **the ONE definition of a `holds_bytes` row**,
+/// v31-shaped and ready to sign, with the scrub fields left empty for whoever
+/// fills them.
+///
+/// # What was open
+///
+/// `put_blob` raw-INSERTed straight into `federation_attestations`, bypassing
+/// `put_attestation` and therefore BOTH binding gates. Three consequences, and
+/// the third is the one that bites:
+///
+/// 1. the envelope was `{"kind","evidence_refs"}` — no #598 instants, no #643
+///    mirror, so every field that decides what the row MEANS was unsigned;
+/// 2. `asserted_at` was populated from `scrub_timestamp` — *when the signature
+///    was made* standing in for *when the claim was asserted*, two different
+///    facts sharing one column;
+/// 3. the `tier` column was **omitted from the INSERT entirely**, so it took
+///    the schema default `'federation'` — and `list_attestations_since`
+///    filters on exactly that tier. **The tier nobody chose is the tier that
+///    replicates.** So these rows went out to every peer, and every peer's
+///    `put_attestation` refused them, because they were minted through a door
+///    that never asked what the peers ask.
+///
+/// # Shape
+///
+/// Returns the row with `original_content_hash` / `scrub_signature_*` /
+/// `scrub_key_id` / `persist_row_hash` blank. The signing side
+/// ([`BlobStorage::put_blob_signing`]) canonicalizes
+/// `attestation_envelope`, signs, and fills them; the receiving side
+/// (`put_blob`) rebuilds the identical row and copies the caller's values in.
+/// One definition, so the bytes the caller signed and the bytes persist stores
+/// cannot drift — which is the #649/#643 defect class, and the reason this is
+/// a function and not two struct literals in two backends.
+///
+/// Infallible by construction: the mirror stamp fails only on a non-finite
+/// `weight` (always `None` here) and the instant stamp only on a non-object
+/// envelope (built as an object one line above).
+#[must_use]
+pub fn holds_bytes_attestation_row(
+    sha256: &[u8; 32],
+    attesting_key_id: &str,
+    attestation_id: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> crate::federation::Attestation {
+    let mut row = crate::federation::Attestation {
+        attestation_id: attestation_id.to_owned(),
+        attesting_key_id: attesting_key_id.to_owned(),
+        // A holder attestation attests the HOLDER ITSELF — "I (key_id=X) hold
+        // the bytes". No second key is involved.
+        attested_key_id: attesting_key_id.to_owned(),
+        attestation_type: holds_bytes_attestation_type(sha256),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: serde_json::json!({
+            "kind": "holds_bytes",
+            "evidence_refs": [hex::encode(sha256)],
+        }),
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: String::new(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
+        // self-attestation; subject-side authority does not apply.
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+        // v31.0.0 (CIRISPersist#652) — STATED, not defaulted. Both backends
+        // omitted this column from the INSERT and inherited the schema default,
+        // which happens to be the tier `list_attestations_since` serves.
+        tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
+    crate::federation::envelope::stamp_signed_instants(&mut row)
+        .expect("the holds_bytes envelope is built as an object one line above");
+    crate::federation::envelope::RowMirror::stamp_row(&mut row)
+        .expect("a holds_bytes row carries no weight, so the mirror cannot fail");
+    row
+}
+
+/// v31.0.0 (CIRISPersist#656) — **the `put_blob` door's admission gate**, run
+/// by both backends on the row [`holds_bytes_attestation_row`] just rebuilt,
+/// before anything is written.
+///
+/// # What #652 left open
+///
+/// #652 fixed the row SHAPE — the builder above stamps the #598 instants and
+/// the #643 mirror — but it wired no GATES. That was enough for the two
+/// bindings, which hold by construction, and not enough for anything else,
+/// because **the skew arm of [`check_instant_binding`] is not a binding
+/// property**. It compares `asserted_at` against wall-clock `now`, and
+/// [`PutBlobAttestation::asserted_at`] is caller-supplied and unbounded — so
+/// this door minted a FEDERATION-tier row (served and replicated; see the
+/// builder's `tier` note) whose consent-fold ordering key sat arbitrarily far
+/// in the future. Construction cannot satisfy a bound it does not know about,
+/// which is the general reason a deterministic builder is not a substitute for
+/// a gate.
+///
+/// Two arms:
+///
+/// 1. **[`check_instant_binding`]**, the same call every other door makes,
+///    which is where the skew bound lives.
+/// 2. **THE CALLER'S HASH MUST COVER THE BYTES PERSIST REBUILT.** The door
+///    writes the caller's `original_content_hash` and `scrub_signature_*` over
+///    an envelope it reconstructed itself, and nothing checked that the two
+///    describe the same thing. The reconstruction being deterministic is
+///    exactly what makes the cross-check possible — it is the property
+///    [`holds_bytes_attestation_row`]'s doc rests its *"the party that MINTS
+///    the bytes stamps, the party that RECEIVES them checks"* claim on — so it
+///    is used here rather than assumed. A signature over a different envelope
+///    than the one stored is the #649 divergence with the halves swapped.
+///
+/// `now` is a parameter so the skew bound is testable without sleeping.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn check_put_blob_admission(
+    row: &crate::federation::Attestation,
+    declared_content_hash_hex: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), BlobError> {
+    use sha2::{Digest, Sha256};
+
+    crate::federation::admission::check_instant_binding(
+        row,
+        now,
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )
+    .map_err(|e| BlobError::InvalidArgument(format!("holder attestation: {e}")))?;
+
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+        .map_err(|e| {
+        BlobError::Backend(format!(
+            "holder attestation canonicalize: {e} (CIRISPersist#656)"
+        ))
+    })?;
+    let rebuilt = hex::encode(Sha256::digest(&canonical));
+    if rebuilt != declared_content_hash_hex {
+        return Err(BlobError::InvalidArgument(format!(
+            "holder attestation {}: the declared original_content_hash {declared_content_hash_hex} \
+             does not cover the envelope persist stores — these bytes canonicalize to {rebuilt}. \
+             `put_blob` REBUILDS the holder envelope rather than storing the caller's, so a \
+             signature made over anything else covers an envelope that does not exist \
+             (CIRISPersist#656/#652)",
+            row.attestation_id,
+        )));
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#656) — **a `PutBlobAttestation` whose declared
+/// content hash actually covers the envelope `put_blob` will rebuild.**
+///
+/// Every backend's blob fixtures used to hard-code `original_content_hash_hex`
+/// to a placeholder (`"abcdef01"` / `"deadbeef"` — four bytes, where the column
+/// is a 32-byte digest). That is what let the missing
+/// [`check_put_blob_admission`] cross-check go unnoticed for a whole release:
+/// the fixtures asserted the door's behaviour on rows whose declared hash
+/// covered nothing, so no test could tell a correct hash from an absent one.
+/// This mints the hash the way [`BlobStorage::put_blob_signing`] does — from
+/// [`holds_bytes_attestation_envelope`] over the same four inputs — so the
+/// fixtures now exercise the shape production actually produces.
+///
+/// The signature stays a placeholder: `put_blob` does not verify signatures
+/// (see [`check_put_blob_admission`] for what it does check), and pretending
+/// otherwise in a fixture would be the same defect one field over.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn sealed_put_blob_attestation(
+    sha256: &[u8; 32],
+    attesting_key_id: &str,
+    scrub_key_id: &str,
+    attestation_id: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    scrub_timestamp: chrono::DateTime<chrono::Utc>,
+) -> PutBlobAttestation {
+    use sha2::{Digest, Sha256};
+    let envelope =
+        holds_bytes_attestation_envelope(sha256, attesting_key_id, attestation_id, asserted_at);
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+        .expect("the holds_bytes envelope canonicalizes");
+    PutBlobAttestation {
+        attesting_key_id: attesting_key_id.to_owned(),
+        attestation_id: attestation_id.to_owned(),
+        original_content_hash_hex: hex::encode(Sha256::digest(&canonical)),
+        scrub_signature_classical: "c2ln".to_owned(),
+        scrub_signature_pqc: None,
+        scrub_key_id: scrub_key_id.to_owned(),
+        scrub_timestamp,
+        asserted_at,
+    }
+}
+
+/// v31.0.0 (CIRISPersist#656) — **the `put_blob` admission witness**, shared by
+/// the sqlite and postgres legs.
+///
+/// **Two backends, not three: `MemoryBackend` implements no [`BlobStorage`],**
+/// so there is no memory door to gate. Recorded here rather than left as a
+/// silently-absent leg — "the third leg is missing" and "the third door does
+/// not exist" look identical from a test list.
+///
+/// #652 fixed the row SHAPE through one deterministic builder and wired no
+/// gates. Two things do not follow from construction, and both are asserted:
+///
+/// 1. **the future-skew bound**, which is not a binding property — it compares
+///    `asserted_at` against wall-clock `now`, and that field is caller-supplied
+///    and was unbounded, so this door minted a FEDERATION-tier row (served and
+///    replicated) whose consent-fold ordering key sat a year in the future.
+///    Exactly the claim CIRISPersist#598 exists to make false: *"a lying clock
+///    cannot mint a row no later row can out-sort."*
+/// 2. **the caller's `original_content_hash` covering the bytes persist
+///    rebuilt.** The door writes the caller's hash and signature over an
+///    envelope it reconstructs itself; nothing checked the two described the
+///    same thing.
+///
+/// Plus the control that an honest holder claim still lands — including one
+/// asserted in the PAST, which is the case #652 added the field for (*"a holder
+/// announcing bytes it has held for a week is making a claim about the week"*).
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn exercise_put_blob_admission<B>(backend: &B, suffix: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    exercise_put_blob_admission_for_host(backend, "host-a", suffix).await;
+}
+
+/// [`exercise_put_blob_admission`] against an explicit, already-registered
+/// `attesting_key_id` — the postgres leg bootstraps a per-run host so a shared
+/// test DB does not collide.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn exercise_put_blob_admission_for_host<B>(backend: &B, host: &str, suffix: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    use sha2::{Digest, Sha256};
+    let digest = |bytes: &[u8]| -> [u8; 32] { Sha256::digest(bytes).into() };
+
+    // ── (1) AN UNBOUNDED-FUTURE HOLDER CLAIM IS REFUSED.
+    let bytes = format!("skewed holder claim {suffix}").into_bytes();
+    let sha = digest(&bytes);
+    let far_future = crate::federation::admission::truncate_to_substrate_resolution(
+        chrono::Utc::now() + chrono::Duration::days(365),
+    );
+    let skew_id = format!("blob-skew-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &skew_id, far_future, far_future);
+    let err = backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+        .await
+        .expect_err("put_blob must apply the future-skew bound (#656)");
+    assert!(
+        err.to_string().contains("ahead of now"),
+        "the refusal is the SKEW arm specifically, not a binding arm: {err}"
+    );
+    assert!(
+        crate::federation::FederationDirectory::get_attestation(backend, &skew_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "verify-before-mutation: the refused holder claim wrote no attestation row"
+    );
+
+    // ── (2) A HASH THAT DOES NOT COVER THE REBUILT ENVELOPE IS REFUSED.
+    let liar_id = format!("blob-liar-{suffix}");
+    let now = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    let mut lying = sealed_put_blob_attestation(&sha, host, host, &liar_id, now, now);
+    lying.original_content_hash_hex = "00".repeat(32);
+    let err = backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, lying)
+        .await
+        .expect_err("put_blob must cross-check the declared hash against the rebuilt bytes (#656)");
+    assert!(
+        err.to_string().contains("original_content_hash"),
+        "the refusal names the field that does not cover the stored bytes: {err}"
+    );
+
+    // ── (3) CONTROL — an honest claim lands, and so does an honest one about
+    //        the PAST, which is the case `asserted_at` was added for.
+    let ok_id = format!("blob-ok-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &ok_id, now, now);
+    backend
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
+        .await
+        .expect("an honest holder claim still lands — legs 1 and 2 gate the door, not close it");
+
+    let week_ago = crate::federation::admission::truncate_to_substrate_resolution(
+        chrono::Utc::now() - chrono::Duration::days(7),
+    );
+    let past_id = format!("blob-past-{suffix}");
+    let att = sealed_put_blob_attestation(&sha, host, host, &past_id, week_ago, now);
+    backend
+        .put_blob(&sha, BlobBody::Inline(bytes), None, att)
+        .await
+        .expect(
+            "a holder announcing bytes it has held for a week is making a claim about the week",
+        );
+    let row = crate::federation::FederationDirectory::get_attestation(backend, &past_id)
+        .await
+        .expect("read")
+        .expect("the past-dated holder attestation was written");
+    assert_eq!(row.asserted_at, week_ago, "the past instant is preserved");
+    assert_eq!(
+        row.tier,
+        crate::federation::types::attestation_tier::FEDERATION,
+        "and it is federation-tier, i.e. served and replicated — which is why the gate matters"
+    );
+    crate::federation::admission::check_instant_binding(
+        &row,
+        chrono::Utc::now(),
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )
+    .expect("the stored row satisfies the gate the door now runs");
+    crate::federation::admission::check_row_column_binding(&row)
+        .expect("and the #643 mirror #652 stamps");
 }
 
 /// v3.5.0 (CIRISPersist#125) — extract the canonical
@@ -1803,30 +2172,18 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         &prior.attestation_id,
         &prior.attestation_type,
     );
-    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
-    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
-    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
-    // which the gate's ceg_produce_canonicalize would not match).
-    let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-        .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
-    let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
-    // federation-tier withdraws carries the PQC half the ingest gate
-    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
-    // CANNOT emit a conformant federation-tier withdraws — surface that
-    // honestly (no classical-only fallback / silent skip / local
-    // downgrade).
-    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
-        BlobError::Backend(format!(
-            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
-             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
-        ))
-    })?;
-    let scrub_signature_classical = B64.encode(&sig.classical.signature);
-    let scrub_signature_pqc = B64.encode(&sig.pqc.signature);
-
-    let row = crate::federation::Attestation {
-        attestation_id: uuid::Uuid::new_v4().to_string(),
+    // v31.0.0 (#643/#598) — the row is ASSEMBLED FIRST, then stamped, then
+    // signed. This helper hand-rolls the emit recipe (it predates
+    // `attestation_emit`), and the two bindings are both over material the
+    // signature covers, so the order is forced: build → stamp → canonicalize →
+    // sign. Without it persist's own eviction sweeper emits rows its own
+    // put-gate refuses.
+    //
+    // `attestation_id` is minted here rather than at the literal because it is
+    // signed material — the mirror carries it.
+    let attestation_id = uuid::Uuid::new_v4().to_string();
+    let mut row = crate::federation::Attestation {
+        attestation_id,
         attesting_key_id: signer_key_id.to_owned(),
         // The withdraws row's FK target is `signer_key_id`: the host
         // attests it itself no longer holds the bytes. Matches the
@@ -1837,9 +2194,10 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         asserted_at: now,
         expires_at: None,
         attestation_envelope: envelope,
-        original_content_hash,
-        scrub_signature_classical,
-        scrub_signature_pqc: Some(scrub_signature_pqc),
+        // Filled in below, once there are bytes to sign.
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
         scrub_key_id: signer_key_id.to_owned(),
         scrub_timestamp: now,
         pqc_completed_at: Some(now),
@@ -1854,6 +2212,52 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         promoted_at: None,
         additional_scrubs: Vec::new(),
     };
+
+    // v31.0.0 (CIRISPersist#598) — THE SIGNED INSTANTS, before the signature.
+    // Through the shared placement rather than a fourth hand-rolled copy; it
+    // also TRUNCATES `asserted_at` to the substrate resolution, which is why
+    // the two derived timestamps are re-read from the row afterwards instead of
+    // from `now` — a row whose three instants differ in their last nanoseconds
+    // is one the postgres arm stores differently from the sqlite arm.
+    crate::federation::envelope::stamp_signed_instants(&mut row)
+        .map_err(|e| BlobError::Backend(format!("withdraws instant stamp: {e}")))?;
+    row.scrub_timestamp = row.asserted_at;
+    row.pqc_completed_at = Some(row.asserted_at);
+    // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN MIRROR, from
+    // `RowMirror::of` and NOT a hand-written `json!` literal.
+    //
+    // The literal that stood here was correct only by coincidence.
+    // [`RowMirror`] is `deny_unknown_fields` over a CLOSED member set, so the
+    // next column bound into it would have left this one site silently
+    // stamping a mirror missing that field — #643 re-opened at exactly one
+    // door, and the door persist's own eviction sweeper writes through.
+    // `RowMirror::of` is the one projection the GATE compares against, so
+    // there is now nothing here that can drift from it.
+    crate::federation::envelope::RowMirror::stamp_row(&mut row)
+        .map_err(|e| BlobError::Backend(format!("withdraws row mirror stamp: {e}")))?;
+
+    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
+    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
+    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
+    // which the gate's ceg_produce_canonicalize would not match).
+    let canonical_bytes =
+        crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+            .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
+    row.original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
+    // federation-tier withdraws carries the PQC half the ingest gate
+    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
+    // CANNOT emit a conformant federation-tier withdraws — surface that
+    // honestly (no classical-only fallback / silent skip / local
+    // downgrade).
+    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
+        BlobError::Backend(format!(
+            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
+             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+        ))
+    })?;
+    row.scrub_signature_classical = B64.encode(&sig.classical.signature);
+    row.scrub_signature_pqc = Some(B64.encode(&sig.pqc.signature));
 
     directory
         .put_attestation(crate::federation::SignedAttestation { attestation: row })
@@ -2154,6 +2558,102 @@ where
     })
 }
 
+/// v31.0.0 (CIRISPersist#657) — **step 5b of the `put_stream_sth` gate**: the
+/// WITNESS cosignatures, verified with the same discipline as the producer's.
+///
+/// # The defect
+///
+/// `put_stream_sth` verified the producer signature and then stored
+/// `witness_signatures` verbatim, and NO verify call for them existed anywhere
+/// in `src/`. `latest_stream_sth` reads them back and hands them to callers, so
+/// the substrate was preserving and presenting co-signatures it had never
+/// checked. That is the #556 rule — the preserve set must equal the verified
+/// set — on the transparency plane, and it is worse than dropping them would
+/// be: an unchecked cosignature LOOKS like the split-view evidence
+/// [`SignedTreeHead::witness_quorum_met`](ciris_verify_core::transparency::SignedTreeHead::witness_quorum_met)
+/// is built to provide, and anyone can mint one by generating a keypair.
+///
+/// # The roster is `federation_keys` — the same one the producer resolves in
+///
+/// A witness is not a new kind of principal needing a new roster. It is a
+/// registered federation key that watched this log, so `witness_id` resolves
+/// through [`verify_hybrid_via_directory`](crate::verify::verify_hybrid_via_directory)
+/// exactly as `producer_key_id` does: authority re-derived from THIS node's own
+/// verified state, never from keys carried on the row (the #377 rule). Each
+/// cosignature must clear all four checks, and a failure REFUSES THE WHOLE PUT
+/// rather than silently not counting — "does not count" is the right answer
+/// when tallying a quorum, and the wrong one when the question is whether to
+/// durably store and later serve the thing:
+///
+/// 1. **distinct `witness_id`** — a repeat would inflate any count downstream;
+/// 2. **known witness** — an unregistered `witness_id` is refused (fail closed
+///    on absence, the standing v31 decision; there is no legacy regime in which
+///    an unknown cosigner is stored anyway);
+/// 3. **CEG 0.2 §10.3.1 consistency proof** verifies against
+///    `(tree_size, root_hash)` — without it a cosignature is "quorum on a
+///    string" rather than quorum on log consistency;
+/// 4. **hybrid-Strict signature** over the IDENTICAL
+///    [`signing_bytes_of`](ciris_verify_core::transparency::SignedTreeHead::signing_bytes_of)
+///    bytes the producer signed, against the witness's PINNED directory
+///    pubkeys.
+///
+/// An STH with no witnesses is `Ok(())` — the field is optional, and the
+/// refusal is for an unverifiable one, never for an absent one.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn verify_stream_sth_witnesses<F>(
+    directory: &F,
+    sth: &ciris_verify_core::transparency::SignedTreeHead,
+) -> Result<(), BlobError>
+where
+    F: crate::federation::FederationDirectory,
+{
+    if sth.witness_signatures.is_empty() {
+        return Ok(());
+    }
+    let signing_bytes = sth.signing_bytes_of();
+    let mut seen: Vec<&str> = Vec::with_capacity(sth.witness_signatures.len());
+    for ws in &sth.witness_signatures {
+        if seen.contains(&ws.witness_id.as_str()) {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_stream_sth: witness {witness_id:?} cosigned this STH twice — a duplicate \
+                 inflates every downstream witness count (CIRISPersist#657)",
+                witness_id = ws.witness_id
+            )));
+        }
+        seen.push(ws.witness_id.as_str());
+        ws.consistency_proof
+            .verify(sth.tree_size, &sth.root_hash)
+            .map_err(|e| {
+                BlobError::InvalidArgument(format!(
+                    "put_stream_sth: witness {witness_id:?} cosignature carries a §10.3.1 \
+                     consistency proof that does not chain to this STH: {e}",
+                    witness_id = ws.witness_id
+                ))
+            })?;
+        let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
+            crate::federation::stream_sth::hybrid_signature_b64_parts(&ws.signature);
+        crate::verify::verify_hybrid_via_directory(
+            directory,
+            &signing_bytes,
+            &ws.witness_id,
+            &ed25519_sig_b64,
+            ml_dsa_65_sig_b64.as_deref(),
+            crate::verify::HybridPolicy::Strict,
+            None,
+        )
+        .await
+        .map(|_outcome| ())
+        .map_err(|e| {
+            BlobError::InvalidArgument(format!(
+                "put_stream_sth: witness cosignature verification failed for \
+                 witness_id={witness_id}: {e}",
+                witness_id = ws.witness_id
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// v4.1 (CIRISPersist#142, Cut B) — validate a `put_blob_chunks`
 /// request and produce the ordered list of rows to insert in one txn
 /// (the N chunk rows followed by the manifest row last).
@@ -2266,6 +2766,237 @@ pub(crate) fn prepare_chunk_rows(
     Ok(rows)
 }
 
+#[cfg(all(test, feature = "sqlite"))]
+mod put_blob_binding_tests {
+    use super::*;
+
+    /// **CIRISPersist#652 — the row `put_blob` mints must clear the doors
+    /// `put_blob` skips.**
+    ///
+    /// `put_blob` raw-INSERTs into `federation_attestations`, so neither
+    /// binding gate ever ran on a `holds_bytes` row. Combined with the `tier`
+    /// column being omitted from that INSERT — taking the schema default
+    /// `'federation'`, which is exactly what `list_attestations_since` serves
+    /// — every blob announcement replicated to every peer and every peer
+    /// refused it. **The tier nobody chose is the tier that replicates.**
+    ///
+    /// The witness runs the REAL gates over the row as STORED. That is the
+    /// honest test for a door that BYPASSES those gates: asserting on the
+    /// envelope the builder returns would only prove the builder agrees with
+    /// itself, whereas this proves the bytes that landed in the table are ones
+    /// a receiver would accept.
+    #[tokio::test]
+    async fn put_blob_mints_a_row_that_satisfies_both_binding_gates_652() {
+        use crate::federation::BlobStorage as _;
+        use crate::federation::FederationDirectory as _;
+        use crate::store::{Backend as _, SqliteBackend};
+
+        let sq = SqliteBackend::open_in_memory().await.expect("open");
+        sq.run_migrations().await.expect("migrations");
+        let holder = "h652";
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, holder).await;
+
+        // Inline bodies are hash-checked at the door, so the SHA is the
+        // payload's own.
+        let payload = b"652-witness".to_vec();
+        let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&payload).into();
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        // Deliberately DISTINCT, and this is the point of the pair: the two
+        // used to be one value, with `asserted_at` populated from
+        // `scrub_timestamp`. A holder announcing bytes it has held for an hour
+        // is making a claim about the hour, not about the moment it reached
+        // for its key.
+        let asserted_at = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        let scrub_timestamp =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let envelope = holds_bytes_attestation_envelope(&sha, holder, &attestation_id, asserted_at);
+        let canonical =
+            crate::verify::canonical::ceg_produce_canonicalize(&envelope).expect("canonicalize");
+        let (och, classical, pqc) =
+            crate::federation::tier_ingest::test_support::sign_envelope(holder, &envelope);
+        assert_eq!(
+            och,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical)),
+            "the test's own signing helper must hash the same bytes it signs"
+        );
+
+        sq.put_blob(
+            &sha,
+            crate::federation::BlobBody::Inline(payload),
+            None,
+            PutBlobAttestation {
+                attesting_key_id: holder.to_owned(),
+                attestation_id: attestation_id.clone(),
+                original_content_hash_hex: och,
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+                scrub_key_id: holder.to_owned(),
+                scrub_timestamp,
+                asserted_at,
+            },
+        )
+        .await
+        .expect("#652: put_blob admits");
+
+        let stored = sq
+            .get_attestation(&attestation_id)
+            .await
+            .expect("read back")
+            .expect("#652: the holds_bytes row was written");
+
+        // (1) THE TWO GATES `put_blob` NEVER ASKED.
+        crate::federation::admission::check_instant_binding(
+            &stored,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )
+        .expect("#652/#598: the stored holds_bytes row must carry its signed instants");
+        crate::federation::admission::check_row_column_binding(&stored)
+            .expect("#652/#643: the stored holds_bytes row must carry its typed-column mirror");
+
+        // (2) `asserted_at` IS THE CLAIM'S INSTANT, not the signature's.
+        assert_eq!(
+            stored.asserted_at, asserted_at,
+            "#652: the column must carry the instant the CLAIM was asserted"
+        );
+        assert_ne!(
+            stored.asserted_at, stored.scrub_timestamp,
+            "#652: and it must be free to differ from when the signature was made — if these \
+             are forced equal the conflation is back, and this witness would not notice"
+        );
+
+        // (3) THE TIER IS STATED, AND THE ROW ACTUALLY REPLICATES.
+        //
+        // Being honest about what each half proves: the equality below is a
+        // PIN, not a differential — the schema default is `'federation'` too,
+        // so it cannot distinguish "the door chose this" from "the door said
+        // nothing and the column filled itself in". What it buys is that the
+        // value now travels through the builder, so a schema whose default
+        // ever changes fails HERE instead of silently republishing at a tier
+        // nobody picked.
+        //
+        // The leg with teeth is the one after it: `list_attestations_since` is
+        // the surface a peer PULLS, it filters on this tier, and it is the
+        // reason a wrong value is a mesh-wide event rather than a cosmetic
+        // one.
+        assert_eq!(
+            stored.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "#652: put_blob must STATE the tier it publishes at"
+        );
+        let since = sq
+            .list_attestations_since(Some(asserted_at - chrono::Duration::minutes(5)), 100)
+            .await
+            .expect("list_attestations_since");
+        assert!(
+            since.iter().any(|r| r.attestation_id == attestation_id),
+            "#652: the holder announcement must appear on the REPLICATION surface — that is              what makes the tier load-bearing rather than cosmetic, and what turned an              unbound row into something every peer in the mesh refused"
+        );
+
+        // (4) THE WITNESS: the row survives the round-trip and is admissible
+        // through the REAL `put_attestation` at an INDEPENDENT directory —
+        // the door it always bypassed, on a corpus that never saw it. This is
+        // the assertion whose absence hid the defect: `put_blob` returned Ok
+        // the whole time.
+        let peer = crate::store::MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&peer, holder).await;
+        peer.put_attestation(crate::federation::SignedAttestation {
+            attestation: stored.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "#652: a `holds_bytes` row is federation-tier and therefore REPLICATES — \
+                 `list_attestations_since` serves exactly this tier. A row every peer refuses \
+                 is a blob announcement that announces nothing. Refusal: {e}"
+            )
+        });
+    }
+}
+
+/// v31.0.0 (CIRISPersist#660) — **`put_blob` states its `cohort_scope`**, the
+/// sibling of the #652 `tier` finding on the same INSERT.
+///
+/// `cohort_scope` was omitted from the `federation_attestations` column list on
+/// BOTH SQL backends and took the V056 schema default `'federation'`. That
+/// happened to equal what [`holds_bytes_attestation_row`] puts in the row the
+/// `persist_row_hash` is computed over — and, since #643, what the signed `row`
+/// MIRROR inside the envelope declares. Two values agreeing because nobody chose
+/// either is not a binding: change the builder or the schema default and the
+/// stored column silently stops matching the bytes that were signed.
+///
+/// # What gives this witness teeth
+///
+/// Not the equality — the default coincides, so a pin alone cannot tell "the
+/// door chose this" from "the column filled itself in" (the #652 witness says
+/// the same about `tier`, and is right to). The teeth are
+/// [`check_row_column_binding`](crate::federation::admission::check_row_column_binding):
+/// `cohort_scope` is one of the seven columns #643 binds into the signed
+/// envelope, so a stored value that diverges from the builder's is a row this
+/// substrate's own put door refuses. Asserted over the row **as read back from
+/// the table**, which is the only form that can see an INSERT's omission at all.
+///
+/// Two backends, not three: `put_blob` is [`BlobStorage`], which the memory
+/// backend does not implement. The parity set here is exactly the set of
+/// backends that have the door.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn exercise_put_blob_states_its_cohort_scope<B>(be: &B, tag: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    let holder = format!("{tag}-660-blobholder");
+    crate::federation::tier_ingest::test_support::register_hybrid_key(be, &holder).await;
+
+    let payload = format!("660-{tag}").into_bytes();
+    let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&payload).into();
+    let attestation_id = uuid::Uuid::new_v4().to_string();
+    let asserted_at =
+        crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    let envelope = holds_bytes_attestation_envelope(&sha, &holder, &attestation_id, asserted_at);
+    let (och, classical, pqc) =
+        crate::federation::tier_ingest::test_support::sign_envelope(&holder, &envelope);
+
+    be.put_blob(
+        &sha,
+        BlobBody::Inline(payload),
+        None,
+        PutBlobAttestation {
+            attesting_key_id: holder.clone(),
+            attestation_id: attestation_id.clone(),
+            original_content_hash_hex: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: holder.clone(),
+            scrub_timestamp: asserted_at,
+            asserted_at,
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] put_blob must admit an ordinary inline body: {e:?}"));
+
+    let stored = crate::federation::FederationDirectory::get_attestation(be, &attestation_id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the holds_bytes row must have been written"));
+
+    // THE ASSERTION WITH TEETH: the stored columns must match the signed mirror.
+    // An INSERT that omits `cohort_scope` and lets the default fill it in reds
+    // here the moment the builder and the default stop coinciding.
+    crate::federation::admission::check_row_column_binding(&stored).unwrap_or_else(|e| {
+        panic!(
+            "[{tag}] the STORED holds_bytes row must satisfy the #643 column binding — a \
+             column the INSERT never named cannot be one the signature covers: {e}"
+        )
+    });
+    assert_eq!(
+        stored.cohort_scope,
+        crate::federation::types::cohort_scope::FEDERATION,
+        "[{tag}] put_blob must STATE the cohort_scope it publishes at"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2296,11 +3027,52 @@ mod tests {
     #[test]
     fn holds_bytes_envelope_shape() {
         let sha = [0x42_u8; 32];
-        let env = holds_bytes_attestation_envelope(&sha);
+        let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let env = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at);
         assert_eq!(env["kind"], "holds_bytes");
         let refs = env["evidence_refs"].as_array().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0], hex::encode(sha));
+
+        // v31.0.0 (CIRISPersist#652) — and the two BINDINGS, which is the
+        // whole point of the widened signature. Without them `put_blob`
+        // minted federation-tier rows that no peer's `put_attestation` would
+        // accept, through a door that never asked what the peers ask.
+        assert_eq!(
+            env[crate::federation::envelope::paths::ASSERTED_AT],
+            serde_json::json!(at.to_rfc3339()),
+            "#598: the holder's assertion instant rides the SIGNED bytes"
+        );
+        assert!(
+            env.get(crate::federation::envelope::paths::EXPIRES_AT)
+                .is_none(),
+            "#598: a holder claim carries no expiry, and the binding is \
+             both-directions, so the key must be ABSENT rather than null"
+        );
+        let mirror = &env[crate::federation::envelope::paths::ROW];
+        use crate::federation::envelope::row_paths as rp;
+        assert_eq!(mirror[rp::ATTESTATION_ID], "att-1");
+        assert_eq!(mirror[rp::ATTESTING_KEY_ID], "k-holder");
+        assert_eq!(
+            mirror[rp::ATTESTED_KEY_ID],
+            "k-holder",
+            "#643: a holder attests ITSELF — 'I hold the bytes'"
+        );
+        assert_eq!(
+            mirror[rp::ATTESTATION_TYPE],
+            holds_bytes_attestation_type(&sha)
+        );
+        assert_eq!(mirror[rp::COHORT_SCOPE], "federation");
+
+        // DETERMINISM — the property the `put_blob` door rests on. Persist
+        // reconstructs this envelope rather than storing the caller's, so the
+        // same four inputs must give byte-identical bytes or the caller's
+        // signature covers something else.
+        assert_eq!(
+            env,
+            holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at),
+            "the envelope must be a PURE function of its four inputs"
+        );
     }
 
     // ── v4.1 (CIRISPersist#142, Cut B) — ChunkManifest JCS ──────────
@@ -2523,7 +3295,8 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let sha = [0x42u8; 32];
-        let envelope = holds_bytes_attestation_envelope(&sha);
+        let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let envelope = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at);
 
         // The production canonicalizer's output for this envelope.
         let python_bytes = PythonJsonDumpsCanonicalizer
@@ -2531,13 +3304,43 @@ mod tests {
             .expect("python canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&python_bytes));
 
-        // Direct identity check: the bytes are byte-for-byte the
-        // sorted-keys ASCII shape we expect.
-        let expected_str = format!(
-            "{{\"evidence_refs\":[\"{}\"],\"kind\":\"holds_bytes\"}}",
-            hex::encode(sha)
+        // Direct identity check: the bytes are the sorted-keys ASCII shape.
+        //
+        // v31.0.0 (CIRISPersist#652) — asserted STRUCTURALLY rather than
+        // against a hand-written literal. The literal that stood here spelled
+        // the entire envelope, so widening it to carry the #598/#643 bindings
+        // meant hand-transcribing a nested object — and a transcription is
+        // just a second definition of the shape, which is the defect class
+        // this cut is closing everywhere else. What the literal actually
+        // WITNESSED was "no whitespace, keys sorted, ASCII" — a
+        // whitespace-emitting or key-order-unstable canonicalizer — and that
+        // is asserted directly below, over the real shape rather than a copy
+        // of it.
+        let text = std::str::from_utf8(&python_bytes).expect("canonical bytes are UTF-8");
+        assert!(text.is_ascii(), "canonical bytes must be ASCII: {text}");
+        assert!(
+            !text.contains(' ') && !text.contains('\n'),
+            "canonical bytes must carry no whitespace: {text}"
         );
-        assert_eq!(python_bytes, expected_str.as_bytes());
+        let reparsed: serde_json::Value =
+            serde_json::from_str(text).expect("canonical bytes reparse");
+        assert_eq!(
+            reparsed, envelope,
+            "canonicalization must be VALUE-PRESERVING — it reorders and \
+             tightens bytes, it does not change what the envelope says"
+        );
+        let top_keys: Vec<&str> = reparsed
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut sorted = top_keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            top_keys, sorted,
+            "keys must be emitted SORTED: {top_keys:?}"
+        );
 
         // Pin the hex hash so any future canonicalizer drift (or
         // envelope-shape change) forces an explicit test update.

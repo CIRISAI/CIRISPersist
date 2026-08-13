@@ -9,7 +9,7 @@
 //! - `age_assurance:*` — the **witness** rung (provider/government). The
 //!   `attestation_type` is reserved to a `witness`-role emitter at admission
 //!   (see [`super::admission::check_reserved_prefix_admission`]). Authoritative.
-//!   v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13): the row names its SUBJECT
+//!   v13.0.0 (CIRISPersist#368, CC 3.4.11/3.4.13): the row names its SUBJECT
 //!   via `attested_key_id` — the same cross-subject edge shape `delegates_to`
 //!   uses — so a witness graduates a **different** subject's band by emitting
 //!   with [`EmitAttestationInput::attested_key_id`](super::EmitAttestationInput::attested_key_id)
@@ -237,7 +237,7 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
         }
         let at = r.attestation_type.as_str();
         if at.starts_with("age_assurance:") {
-            // v12.7.0 (CIRISPersist#368, CC 3.4.11) — read-side
+            // v13.0.0 (CIRISPersist#368, CC 3.4.11) — read-side
             // defense-in-depth: a SELF-emitted witness row (attester ==
             // attested) confers nothing. The admission gate
             // (`check_reserved_prefix_admission`) rejects the shape at
@@ -300,7 +300,7 @@ pub async fn age_band_fine(
         }
         let at = r.attestation_type.as_str();
         if at.starts_with("age_assurance:") {
-            // v12.7.0 (CIRISPersist#368, CC 3.4.11) — a self-emitted witness
+            // v13.0.0 (CIRISPersist#368, CC 3.4.11) — a self-emitted witness
             // row confers nothing (see `age_band`; same defense-in-depth).
             if r.attesting_key_id == r.attested_key_id {
                 continue;

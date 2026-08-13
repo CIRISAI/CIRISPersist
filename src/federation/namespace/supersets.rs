@@ -1675,8 +1675,8 @@ mod tests {
     /// shipped a wheel declaring `ciris-verify>=10.0.0,<11` over a build that
     /// linked v11** — `pip install ciris-persist ciris-verify==11.x` resolves
     /// to a hard conflict against our own dependency. The file's own comment
-    /// block records four earlier instances of exactly this (v3.0.1, v5.0.0,
-    /// v6.2.0, v8.0.0). Four burns and a fifth: the lesson was written down
+    /// block records four earlier instances of exactly this (CIRISVerify
+    /// v3.0.1, v5.0.0, v6.2.0, v8.0.0). Four burns and a fifth: the lesson was written down
     /// and still not enforced, which is what a comment can never do.
     ///
     /// Same class as [`evidence_cc_impl_rows_pin_the_current_crate_version`]

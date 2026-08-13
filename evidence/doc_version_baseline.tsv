@@ -1,36 +1,46 @@
 # Doc-comment version references that name a version with no tag and no CHANGELOG entry.
 # RATCHET BASELINE. A version listed here is grandfathered; anything NEW fails the gate.
 # Burn this down (CIRISPersist#599) -- do not add to it.
+#
+# v30.12.0 burndown: 10 versions / 170 references retired. What is left is NOT
+# the same kind of thing the retired rows were, so the rows are grouped by WHY
+# they are still here. Only ONE group is a persist phantom, and it names work
+# that is still unshipped, so there is no real version to name instead.
+#
+# The classification, so the next pass does not re-derive it:
+#
+#   FALSE POSITIVE  another project's version. `doc_version_refs.py`'s NAMED_CRATE
+#                   guard reads only the text BEFORE the version ON THE SAME LINE,
+#                   so a citation whose project name wrapped to the previous line
+#                   ("...matching CIRISAgent\n//! v2.8.13's `wa_cert`") is invisible
+#                   to it, as is any project not in its alternation (CIRISEdge,
+#                   CIRISConformance, FSD-NNN). These doc comments are CORRECT and
+#                   unambiguous to a reader; rewording them to satisfy a line-local
+#                   regex would be gaming the gate, not improving the docs. The fix
+#                   is in the GUARD -- widen the project list and let it see the
+#                   enclosing doc block -- not in `src/`.
+#
+#   TAG-ONLY        a real persist release with a git tag and no CHANGELOG entry.
+#                   The gate reads CHANGELOG only, deliberately: consulting `git tag`
+#                   as well made it ENVIRONMENT-DEPENDENT -- green on a full local
+#                   clone, RED in CI's shallow checkout. The reference is TRUE; the
+#                   debt is the missing entry. Fix = backfill the CHANGELOG, then
+#                   delete the row.
+#
+#   PLANNED         a persist version that was named for work which was never cut,
+#                   and the work is STILL unshipped. There is no honest version to
+#                   substitute; naming a real one would assert something false.
+#
 # version	refs	note
-12.7.0	93	PERSIST PHANTOM - never shipped
-24.4.0	42	PERSIST PHANTOM - never shipped
-6.9.0	13	PERSIST PHANTOM - never shipped
-8.9.0	10	PERSIST PHANTOM - never shipped
-21.3.1	9	PERSIST PHANTOM - never shipped
-2.8.13	7	CIRISAgent
-13.2.1	6	PERSIST PHANTOM - never shipped
-5.11.0	4	PERSIST PHANTOM - never shipped
-2.7.9	4	CIRISAgent FSD
-10.6.2	3	CIRISVerify
-3.0.1	3	cited as historical
-0.13.0	3	CIRISEdge
-12.2.1	2	PERSIST PHANTOM - never shipped
-5.10.0	2	PERSIST PHANTOM - never shipped
-0.6.2	2	secrets pipeline
-0.15.0	1	CIRISEdge
-10.6.3	1	CIRISVerify
-10.8.0	1	CIRISVerify
-10.9.0	1	CIRISVerify
-10.11.0	1	CIRISVerify
-10.10.0	1	CIRISVerify
-1.8.5	1	PERSIST PHANTOM - never shipped
-0.10.0	1	CIRISConformance
-0.13.1	1	CIRISEdge
-1.4.3	1	FSD-002
-# --- TAG-ONLY (v30.2.0): real releases with a git tag but NO CHANGELOG entry.
-# The gate reads CHANGELOG only, deliberately: consulting `git tag` as well made
-# it ENVIRONMENT-DEPENDENT — green on a full local clone, RED in CI's shallow
-# checkout. These are not phantoms; they are documentation debt of a different
-# kind, and they belong in the CHANGELOG rather than here.
-2.0.5	3	TAG EXISTS, no CHANGELOG entry — backfill the entry, then delete this row
-2.1.0	1	TAG EXISTS, no CHANGELOG entry — backfill the entry, then delete this row
+#
+# ── FALSE POSITIVE: CIRISVerify ────────────────────────────────────────────────
+#
+# ── FALSE POSITIVE: CIRISAgent ─────────────────────────────────────────────────
+#
+# ── FALSE POSITIVE: other CIRIS projects ───────────────────────────────────────
+#
+# ── TAG-ONLY: real release, CHANGELOG entry missing ────────────────────────────
+2.0.5	5	TAG EXISTS, no CHANGELOG entry -- iOS Secure-Enclave signer backoff + boot-time audit-chain self-verification, all in `ffi/pyo3.rs`. Backfill the entry, then delete this row
+#
+# ── PLANNED: named a cut that never happened, and the work is still unshipped ──
+0.6.2	2	PERSIST PLANNED, never cut -- "v0.6.2 pipeline orchestration" for `decapsulate_secrets_in_parameters`, which is STILL a stub on both backends. The comment at `secrets/postgres.rs:1728` mirrors the runtime error STRING at `secrets/postgres.rs:601` (code, not a doc comment); correcting only the comment would desync them, and no shipped version implements the capability. Retire this row when the orchestration ships -- or when the stub is removed

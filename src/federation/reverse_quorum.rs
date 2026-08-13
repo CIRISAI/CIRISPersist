@@ -3713,18 +3713,7 @@ pub(crate) mod test_support {
         co_signers: &[&str],
     ) -> Attestation {
         let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
-        let additional_scrubs = co_signers
-            .iter()
-            .map(|k| {
-                let (_h, c, p) = sign_envelope(k, &envelope);
-                crate::federation::types::ScrubSig {
-                    scrub_key_id: (*k).to_owned(),
-                    scrub_signature_classical: c,
-                    scrub_signature_pqc: p,
-                }
-            })
-            .collect();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: author.to_owned(),
             attested_key_id: subject.to_owned(),
@@ -3745,8 +3734,24 @@ pub(crate) mod test_support {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
-            additional_scrubs,
-        }
+            additional_scrubs: Vec::new(),
+        };
+        // v31.0.0 (CIRISPersist#643) — seal FIRST (the mirror joins the signed
+        // bytes), then co-sign the SEALED envelope: every scrub is over the same
+        // preimage (#556), and the mirror is part of that preimage now.
+        crate::federation::tier_ingest::test_support::seal_row_in_place(author, &mut sealed_row_);
+        sealed_row_.additional_scrubs = co_signers
+            .iter()
+            .map(|k| {
+                let (_h, c, p) = sign_envelope(k, &sealed_row_.attestation_envelope);
+                crate::federation::types::ScrubSig {
+                    scrub_key_id: (*k).to_owned(),
+                    scrub_signature_classical: c,
+                    scrub_signature_pqc: p,
+                }
+            })
+            .collect();
+        sealed_row_
     }
 
     /// Seed a `reverse_quorum:2/3:3600` community over `members`, plus a
@@ -4204,16 +4209,20 @@ pub(crate) mod test_support {
         for i in 0..4 {
             let newcomer = format!("rq-newcomer{i}-{suffix}");
             register_user_key(dir, &newcomer).await;
-            dir.add_community_member(
-                &community,
-                CommunityMember {
-                    key_id: newcomer,
-                    joined_at: Utc::now(),
-                    role: Some("member".to_owned()),
-                },
+            // v31.0.0 (CIRISPersist#654) — the roster grow carries an authority
+            // signature over the GROWN envelope.
+            let member = CommunityMember {
+                key_id: newcomer.clone(),
+                joined_at: Utc::now(),
+                role: Some("member".to_owned()),
+            };
+            let spec = crate::federation::cohort::test_support::admit_community_via(
+                dir, &newcomer, &community, &member,
             )
-            .await
-            .expect("grow the commons");
+            .await;
+            dir.add_community_member(&community, member, &spec)
+                .await
+                .expect("grow the commons");
         }
         let f_grown = fold(&action).await;
         assert_eq!(f_grown.roster_size, 9, "({suffix})");

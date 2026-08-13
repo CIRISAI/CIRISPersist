@@ -89,39 +89,97 @@ pub fn content_hash_of_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// v24.1.0 (CIRISPersist#547) — the `("Key", content_hash) → record_key` entry
-/// for one `federation_keys` row, as `(content_hash, record_key)`.
+/// v31.0.0 (CIRISPersist#646) — the microsecond-truncated RFC-3339 spelling
+/// used for the ONE `record_key` field that is not a byte-transparent TEXT id:
+/// `LocationProof.asserted_at`.
 ///
-/// # Why this is a function and not two lines at each write site
+/// Twelve of the thirteen kinds locate their row by string ids (`key_id`,
+/// `attestation_id`, `occurrence_key_id`, `transport_kind`, …) — TEXT columns
+/// that no backend normalizes, so the writer's spelling and the stored
+/// spelling are the same bytes. `LocationProof` locates by
+/// `(subject_key_id, asserted_at)`, and `asserted_at` is a `TIMESTAMPTZ` on
+/// postgres: a sub-microsecond `asserted_at` was written into the record_key
+/// at full precision and then compared, at point-read time, against the
+/// ROUNDED value the row came back with. It never matched, so the ref
+/// resolved to `None` — the same #640 defect one level up, in the index KEY
+/// rather than the index HASH, and not fixable by hashing the stored row
+/// because the locator is what finds the stored row in the first place.
 ///
-/// `signed_wire_index` is a SECOND list that must agree with `federation_keys`,
-/// and #547 is what happens when it does not. Three `UPDATE federation_keys`
-/// paths — `adopt_scrub_upgrade`, `supersede_canonical_record`,
+/// A locator has to be derivable WITHOUT a read (that is what it is for), so
+/// it cannot be "whatever the backend stored". It is pinned instead to the
+/// coarsest precision any supported backend holds — the same microsecond
+/// floor, and for the same reason, as
+/// [`compute_persist_row_hash`](crate::federation::types::compute_persist_row_hash).
+/// Used by the put path, by `all_kind_hash_keys`, and by the comparison in
+/// [`reload_record_bytes`]'s `LocationProof` arm, so all three spell it alike.
+#[must_use]
+pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Timelike as _;
+    // `nanosecond()` can exceed 1e9 on a leap second; `min` keeps the
+    // truncation total without inventing a different instant.
+    let sub_us = t.nanosecond().min(999_999_999) % 1_000;
+    t.with_nanosecond(t.nanosecond() - sub_us)
+        .unwrap_or(*t)
+        .to_rfc3339()
+}
+
+/// v31.0.0 (CIRISPersist#646) — THE index entry for any kind, derived from
+/// the row **as stored**: reload through [`reload_record_bytes`] — the exact
+/// function the point-read resolves with — and hash those bytes.
+///
+/// # Why this is one function and not thirteen
+///
+/// v24.1.0 (CIRISPersist#547) fixed index-key COVERAGE: three `UPDATE
+/// federation_keys` paths — `adopt_scrub_upgrade`, `supersede_canonical_record`,
 /// `adopt_genesis_reanchor` — mutated the row and left the index holding the
-/// PRE-mutation hash. `put_public_key` was the only writer that maintained it.
-/// So a node scrub-upgraded while running advertised the hash of its NEW row
-/// (`list_signed_key_records_since` re-serializes the current row) while the
-/// index still pointed at the old one: the peer asked for exactly the ref we
-/// had just advertised and `lookup_signed_record_by_content_hash` returned
-/// `None`. Measured in CIRISServer adopting v22.0.1 — advertise and reload were
-/// byte-identical, so it was never a serialization drift; it was index KEY
-/// COVERAGE, which is why `rebuild_signed_wire_index()` cured it.
+/// PRE-mutation hash, so a node scrub-upgraded while running advertised the
+/// hash of its NEW row and could not serve it. v31.0.0 (CIRISPersist#640)
+/// then fixed the index-hash DERIVATION, on ONE plane (`Key`), by reloading
+/// and hashing what the read returns. Both remedies were applied to the site
+/// that had failed and nowhere else, which is how the same defect arrived a
+/// third time: the other twelve kinds still hashed the struct the writer
+/// happened to hold, at fifteen sites per backend, forty-five in all.
 ///
-/// That is the same shape as #541's preserve-set ≢ verified-set: two lists,
-/// maintained separately, free to disagree. The remedy is the same — make the
-/// agreement come from ONE derivation. Every `federation_keys` write that
-/// changes a **serialized** column ends here, so the hash the index carries is
-/// computed from the exact value the read surface re-serializes, by one
-/// function, from the one row the writer is about to store.
+/// That is #541's preserve-set ≢ verified-set at a third address — two lists
+/// maintained separately are free to disagree, and the only durable remedy is
+/// to make the agreement come from ONE derivation.
 ///
-/// Callers hold the pair across a `move` closure (the SQL backends compute it
-/// before the row is consumed by the statement, exactly as `put_public_key`
-/// already did) and upsert it with their own dialect-specific statement.
-pub(crate) fn key_entry(row: &crate::federation::KeyRecord) -> Result<(String, String), Error> {
-    let content_hash = content_hash_of(&crate::federation::SignedKeyRecord {
-        record: row.clone(),
-    })?;
-    Ok((content_hash, record_key(&[("key_id", &row.key_id)])))
+/// The derivation and the resolution are the SAME question — "what bytes does
+/// this ref stand for?" — asked at write time and at read time. Answering it
+/// with two pieces of code is what lets them disagree. So the write path now
+/// calls the read path's dispatcher: `content_hash_of_bytes(reload_record_bytes(..))`
+/// is, by construction, the value
+/// [`FederationDirectory::lookup_signed_record_by_content_hash`](super::FederationDirectory::lookup_signed_record_by_content_hash)
+/// recomputes when it self-checks. There is no second derivation left to drift.
+///
+/// Returns `None` when the reload finds nothing — a concurrent delete, a
+/// `WHERE` that matched no row, or a row the read surface filters out (a
+/// local-tier attestation, an unsigned bake family). The caller then writes no
+/// entry, which is correct: an index entry for a row the read surface will not
+/// serve is exactly the dangling ref this closes.
+///
+/// # Cost, honestly
+///
+/// Five kinds reload targeted — `Key`/`Attestation` by single-row getter,
+/// `IdentityOccurrence`/`IdentityOccurrenceRevocation`/`TransportDestination`
+/// scoped to their parent — so those puts take one extra point read. The other
+/// eight (`Family`, `Community`, `LocationProof`, both membership revocations,
+/// `Organization`, `OrgMembership`, `PartnerRecord`) have no subject-scoped
+/// signed read on the trait, so [`reload_record_bytes`] filters them from a
+/// `_since(None, u32::MAX)` scan and the put inherits that O(table) cost.
+/// Those are governance and operational writes (a family formed, a partner
+/// admitted), not per-request work, and their point-read was ALREADY that
+/// scan. The trade is deliberate: the scan is now the only thing left to make
+/// cheaper, and making it cheaper in `reload_record_bytes` fixes both paths at
+/// once — which was never true while the write path had its own derivation.
+pub(crate) async fn entry_as_stored(
+    dir: &dyn super::FederationDirectory,
+    kind: &str,
+    record_key_json: &str,
+) -> Result<Option<String>, Error> {
+    Ok(reload_record_bytes(dir, kind, record_key_json)
+        .await?
+        .map(|bytes| content_hash_of_bytes(&bytes)))
 }
 
 /// v21.1.0 (CIRISPersist#507b) — the shared per-kind reload dispatcher every
@@ -262,9 +320,14 @@ pub async fn reload_record_bytes(
             let rows = dir
                 .list_signed_location_proofs_since(None, u32::MAX)
                 .await?;
+            // v31.0.0 (CIRISPersist#646) — compared through
+            // `locator_instant`, the microsecond-floor spelling the put path
+            // and `all_kind_hash_keys` both write. A raw `to_rfc3339()`
+            // comparison could not match on postgres, whose `TIMESTAMPTZ`
+            // hands back a rounded `asserted_at`.
             match rows.into_iter().find(|r| {
                 r.location_proof.subject_key_id == subject_key_id
-                    && r.location_proof.asserted_at.to_rfc3339() == asserted_at
+                    && locator_instant(&r.location_proof.asserted_at) == asserted_at
             }) {
                 Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "LocationProof"))?),
                 None => None,
@@ -542,7 +605,10 @@ pub async fn all_kind_hash_keys(
     {
         let rk = record_key(&[
             ("subject_key_id", &r.location_proof.subject_key_id),
-            ("asserted_at", &r.location_proof.asserted_at.to_rfc3339()),
+            (
+                "asserted_at",
+                &locator_instant(&r.location_proof.asserted_at),
+            ),
         ]);
         out.push(("LocationProof", content_hash_of(&r)?, rk));
     }
@@ -617,6 +683,30 @@ mod tests {
     fn record_key_field_missing_errors() {
         let rk = record_key(&[("key_id", "abc123")]);
         assert!(record_key_field(&rk, "nope").is_err());
+    }
+
+    /// v31.0.0 (CIRISPersist#646) — the locator floor. A `LocationProof`
+    /// written with a nanosecond `asserted_at` must produce the SAME record_key
+    /// as the same row reloaded from a backend that rounded it, or the
+    /// point-read cannot find the row its own index points at.
+    #[test]
+    fn locator_instant_floors_at_microseconds_646() {
+        use chrono::Timelike as _;
+        let ns: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00.123456789Z".parse().unwrap();
+        assert_ne!(
+            ns.nanosecond() % 1_000,
+            0,
+            "the fixture must carry a sub-microsecond tail"
+        );
+        let rounded = ns.with_nanosecond(123_456_000).unwrap();
+        assert_eq!(
+            locator_instant(&ns),
+            locator_instant(&rounded),
+            "the writer's nanoseconds and the backend's microseconds must spell one locator"
+        );
+        // Still a floor, not an erasure: a whole microsecond apart stays apart.
+        let next_us = ns.with_nanosecond(123_457_000).unwrap();
+        assert_ne!(locator_instant(&ns), locator_instant(&next_us));
     }
 
     #[test]

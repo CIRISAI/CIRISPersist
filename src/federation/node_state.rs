@@ -274,6 +274,30 @@ pub struct TrustRootSignal {
     pub drill_band: StateBand,
 }
 
+/// v31.0.0 (CIRISPersist#648) — the constitutional-seed leg of the operator
+/// surface: is there a trust root on this node to resolve authority TO?
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisSignal {
+    /// The roll-up band. Lossy — [`Self::posture`] is the authority.
+    ///
+    /// `Entrenched` is green. `PreGenesis` is **yellow**, not red: a node that
+    /// has not had its ceremony is not a broken node, it is an early one, and
+    /// 31.0.0 ships in exactly this state on purpose. `Divergent` is red — an
+    /// established root altered underneath the node. `Unreadable` is
+    /// [`StateBand::Unknown`], for the reason that variant exists.
+    pub band: StateBand,
+    /// The full typed posture — state token, which leg, and the finding.
+    /// Never collapsed into `band`.
+    pub posture: super::genesis::GenesisPosture,
+    /// [`GenesisPosture::banner`](super::genesis::GenesisPosture::banner) —
+    /// the sentence a node-mode host renders, or `None` when entrenched.
+    ///
+    /// Carried on the signal rather than left to the consumer to compose so
+    /// that every host warns with the same words about the same condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+}
+
 /// CIRISServer#356 — do this node's OWN past statements still stand, given the
 /// revocations it holds?
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +521,29 @@ pub struct NodeState {
     /// undrilled about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown: Vec<String>,
+    /// v31.0.0 (CIRISPersist#648) — **does this node hold a constitutional
+    /// trust root at all?**
+    ///
+    /// [`Self::trust_root`] answers a DIFFERENT question and the two are easy
+    /// to fuse: it walks the roots this node's own `trust:accepts` edges name
+    /// and reports whether one of them still holds. A node that has never had
+    /// its genesis ceremony has no such edges, so that signal reads
+    /// [`TrustRootStanding::NoTrustEdges`] — which is also what a fully-rooted
+    /// node reads the moment an operator deletes its subscription. Same token,
+    /// two situations, one of which is remediated by re-attaching and the other
+    /// by a ceremony.
+    ///
+    /// This names which. It reports the CONSTITUTIONAL seat — the accord holder
+    /// roster, the keyless `humanity-accord` family row, the baked canonical —
+    /// as
+    /// [`GenesisPosture`](super::genesis::GenesisPosture), the same value
+    /// [`Engine::genesis_posture`](crate::Engine::genesis_posture) returns and
+    /// the same one every gate in
+    /// [`ROOT_REQUIRING_GATES`](super::genesis::ROOT_REQUIRING_GATES) refuses
+    /// on. A node-mode host renders
+    /// [`GenesisPosture::banner`](super::genesis::GenesisPosture::banner) from
+    /// it; the agent-mode refusal is CIRISServer's, not persist's.
+    pub genesis: GenesisSignal,
     /// `trust_root_valid` + `DrillFreshness`, on one verdict.
     pub trust_root: TrustRootSignal,
     /// `KeyStatementStanding` for this node's own key at [`Self::as_of`].
@@ -561,6 +608,7 @@ pub async fn resolve_node_state(
     let now = opts.now;
     let self_key_id = opts.self_key_id.filter(|s| !s.is_empty());
 
+    let genesis = resolve_genesis_signal(directory).await;
     let trust_root = resolve_trust_root_signal(directory, self_key_id, opts.root_key_id, now).await;
     let key_statements = resolve_key_statement_signal(directory, self_key_id, now).await;
     let quarantine = resolve_quarantine_signal(directory, self_key_id, now).await;
@@ -570,6 +618,7 @@ pub async fn resolve_node_state(
     let mut unknown: Vec<String> = Vec::new();
     let mut band = StateBand::Green;
     for (name, b) in [
+        ("genesis", genesis.band),
         ("trust_root", trust_root.band),
         ("trust_root.drill_band", trust_root.drill_band),
         ("key_statements", key_statements.band),
@@ -588,6 +637,7 @@ pub async fn resolve_node_state(
         self_key_id: self_key_id.map(ToOwned::to_owned),
         band,
         unknown,
+        genesis,
         trust_root,
         key_statements,
         quarantine,
@@ -599,6 +649,30 @@ pub async fn resolve_node_state(
             .collect(),
         targeted: targeted_signals(),
     })
+}
+
+/// v31.0.0 (CIRISPersist#648) — the constitutional-seed leg.
+///
+/// Re-derived on every read for the reason
+/// [`genesis_posture`](super::genesis::genesis_posture) documents: the
+/// pre-genesis → entrenched transition happens WHILE the process runs, so a
+/// value cached at boot would keep warning after the ceremony that fixed it.
+async fn resolve_genesis_signal(directory: &dyn FederationDirectory) -> GenesisSignal {
+    use super::genesis::GenesisPosture;
+    let posture = super::genesis::genesis_posture(directory).await;
+    let band = match posture {
+        GenesisPosture::Entrenched => StateBand::Green,
+        // Yellow, not red: 31.0.0 ships in this state deliberately. It warrants
+        // attention (a ceremony is owed) and it is not a malfunction.
+        GenesisPosture::PreGenesis { .. } => StateBand::Yellow,
+        GenesisPosture::Divergent { .. } => StateBand::Red,
+        GenesisPosture::Unreadable { .. } => StateBand::Unknown,
+    };
+    GenesisSignal {
+        band,
+        banner: posture.banner(),
+        posture,
+    }
 }
 
 /// The trust-root leg. Candidate roots come from THIS node's own live
@@ -858,11 +932,8 @@ fn resolve_peer_quota_signal(directory: &dyn FederationDirectory) -> PeerQuotaSi
 pub mod parity_test_support {
     use super::*;
     use crate::federation::hard_case::HardCaseFilter;
-    use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
-    use crate::federation::types::{
-        attestation_type, cohort_scope, identity_type, KeyRecord, LocalAttestationInput,
-        SignedKeyRecord,
-    };
+    use crate::federation::tier_ingest::test_support::hybrid_pubkeys;
+    use crate::federation::types::{cohort_scope, identity_type, KeyRecord, SignedKeyRecord};
 
     /// A registerable key with REAL deterministic hybrid pubkeys, so the
     /// consent fixture's local-tier admission resolves the attester.
@@ -1038,27 +1109,22 @@ pub mod parity_test_support {
                 .await
                 .expect("register");
         }
-        let env = serde_json::json!({
-            "id": format!("{tag}-ns-rev"),
-            "dimension": "consent:state:revoked:v1",
-            "score": 1.0,
-            "confidence": 0.9,
-        });
-        let (_h, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
-        dir.attestation_upsert_local(LocalAttestationInput {
-            attestation_id: None,
-            attesting_key_id: subject.clone(),
-            attested_key_id: Some(target.clone()),
-            attestation_type: attestation_type::SCORES.into(),
-            weight: None,
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
-                .unwrap(),
-            subject_key_ids: vec![subject.clone()],
-            cohort_scope: cohort_scope::SELF.to_string(),
-            scrub_signature_classical: Some(sig_classical),
-            scrub_signature_pqc: sig_pqc,
-        })
+        // v31.0.0 (CIRISPersist#598) — the signed instant; the local write
+        // door stamps the `asserted_at` column FROM it.
+        // v31.0.0 (CIRISPersist#656) — and the signed MIRROR: the transit door
+        // is a RECEIVING door, so the producer binds the typed columns and
+        // persist checks them. That is why the id is stated rather than minted.
+        dir.attestation_upsert_local(
+            crate::federation::tier_ingest::test_support::bound_transit_revocation_input(
+                &format!("{tag}-ns-rev"),
+                &subject,
+                &target,
+                vec![subject.clone()],
+                cohort_scope::SELF,
+                chrono::Utc::now(),
+                serde_json::json!({ "id": format!("{tag}-ns-rev") }),
+            ),
+        )
         .await
         .expect("transit local-tier revocation admits");
 

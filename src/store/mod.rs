@@ -91,7 +91,7 @@ pub enum Error {
     #[error("aggregation meta rejected: {0}")]
     AggregationMetaRejected(#[from] crate::fountain::AggregationMetaError),
 
-    /// v12.7.0 (§Q / CIRISPersist#370) — a `StorageBudgetV1` pin-install was
+    /// v13.0.0 (§Q / CIRISPersist#370) — a `StorageBudgetV1` pin-install was
     /// refused: the bound-hybrid signature did not verify (PQC-mandatory —
     /// verify at the gate, before persistence), the shape was structurally
     /// invalid, or the candidate `revision` did not supersede the installed

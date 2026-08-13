@@ -56,6 +56,204 @@ pub mod paths {
     /// consented payload must be deleted (persist-owned lifecycle
     /// processor — the breach signal). Hoisted from `extra`, byte-invariant.
     pub const DELETION_WINDOW: &str = "deletion_window";
+    /// v31.0.0 (CIRISPersist#598) — **the SIGNED assertion instant.** The
+    /// `federation_attestations.asserted_at` COLUMN is stored verbatim from
+    /// the caller on all three backends and is not covered by any signature
+    /// (`original_content_hash` covers `attestation_envelope` and nothing
+    /// else). The consent fold orders on that column, so a replay of a
+    /// subject's own still-valid grant with a bumped column flipped a
+    /// revocation back to Granted. This key is the column's signed twin:
+    /// [`crate::federation::admission::check_instant_binding`]
+    /// refuses a `consent:state:*` row whose column and envelope disagree.
+    pub const ASSERTED_AT: &str = "asserted_at";
+    /// v31.0.0 (CIRISPersist#598) — the SIGNED expiry instant, the twin of
+    /// `federation_attestations.expires_at`. Same unsigned row column, same
+    /// treatment: the consent fold drops a row whose `expires_at` has passed,
+    /// so an unsigned column is an unsigned mute button.
+    pub const EXPIRES_AT: &str = "expires_at";
+    /// v31.0.0 (CIRISPersist#643) — **the TYPED-COLUMN MIRROR.** One object,
+    /// not seven sibling keys: the SEVEN `federation_attestations` columns that
+    /// decide what a row MEANS and IS, and that no signature covered
+    /// ([`super::RowMirror`] — `attestation_id`, `attesting_key_id`,
+    /// `attestation_type`, `attested_key_id`, `subject_key_ids`,
+    /// `cohort_scope`, `weight`; the canonical list is
+    /// [`super::row_paths::ALL`]).
+    ///
+    /// `original_content_hash` covers `attestation_envelope` and nothing else,
+    /// so before this key a relay could flip `withdraws` → `scores` (the
+    /// retraction becomes an ordinary claim and the thing it retracted stays
+    /// live — note the TARGET, `references_attestation_id`, was already
+    /// signed) or append a canonical binding hash to `subject_key_ids` (which
+    /// grants that key rule-2 revocation standing at
+    /// [`crate::federation::admission::resolve_withdraws_admission_rule`] — the
+    /// doc here named `withdraws_admission_rule_for`, which does not exist and
+    /// never did, so the reader chasing the authority claim landed nowhere
+    /// (v31.0.0, CIRISPersist#656)), and
+    /// the row still verified.
+    ///
+    /// Stamped by
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`] BEFORE
+    /// the bytes are signed; enforced at every `put_attestation` by
+    /// [`crate::federation::admission::check_row_column_binding`].
+    pub const ROW: &str = "row";
+}
+
+/// v31.0.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
+/// object with a CLOSED member set (see [`RowMirror`]'s
+/// `deny_unknown_fields`), so "the mirror" is one vocabulary entry rather than
+/// SEVEN top-level keys accreted over five releases.
+///
+/// (v31.0.0, CIRISPersist#658 — "five top-level keys" here was the same
+/// undercount [`row_paths::ALL`] documents: it named the five members #643's
+/// messages listed and omitted `attestation_id` and `attesting_key_id`. The
+/// sibling spelling of this argument on [`RowMirror`] already said seven.)
+pub mod row_paths {
+    /// The row's IDENTITY. Binding it makes a replay of a still-valid signed
+    /// envelope under a fresh `attestation_id` structurally impossible: same
+    /// bytes ⇒ same id ⇒ the PK dedup absorbs it as an idempotent no-op.
+    pub const ATTESTATION_ID: &str = "attestation_id";
+    /// WHO made the claim. Emergently bound already (the ingest verifier
+    /// resolves this key's registered pubkeys and the producer's signature
+    /// verifies under no other), but bound EXPLICITLY here so the property
+    /// holds on the local tier too, where signature verification is deferred.
+    pub const ATTESTING_KEY_ID: &str = "attesting_key_id";
+    /// The VERB — `scores` / `withdraws` / `supersedes` / `recants` /
+    /// `delegates_to`.
+    pub const ATTESTATION_TYPE: &str = "attestation_type";
+    /// Who the claim is ABOUT.
+    pub const ATTESTED_KEY_ID: &str = "attested_key_id";
+    /// §4.2.6 subjects — the field that GRANTS revocation authority.
+    pub const SUBJECT_KEY_IDS: &str = "subject_key_ids";
+    /// Who may SEE it.
+    pub const COHORT_SCOPE: &str = "cohort_scope";
+    /// How much it COUNTS.
+    pub const WEIGHT: &str = "weight";
+
+    /// v31.0.0 (CIRISPersist#658) — **the member list, written ONCE.** Both
+    /// the published vocabulary (`row_members` in
+    /// [`super::envelope_vocabulary_json`]) and the refusal messages of
+    /// [`crate::federation::admission::check_row_column_binding`] read it from
+    /// here, because they previously each spelled their own and one of them
+    /// spelled FIVE while the gate enforced seven — telling an external
+    /// producer, during the release that forces every producer to re-mint,
+    /// to build a mirror that [`super::RowMirror`]'s `deny_unknown_fields`
+    /// would then refuse.
+    ///
+    /// Tied to the struct by `envelope_vocabulary_covers_every_typed_member`,
+    /// which compares the published list to [`super::RowMirror`]'s own
+    /// serialized member set rather than to a count.
+    pub const ALL: [&str; 7] = [
+        ATTESTATION_ID,
+        ATTESTING_KEY_ID,
+        ATTESTATION_TYPE,
+        ATTESTED_KEY_ID,
+        SUBJECT_KEY_IDS,
+        COHORT_SCOPE,
+        WEIGHT,
+    ];
+}
+
+/// v31.0.0 (CIRISPersist#643) — the signed twin of the SEVEN typed
+/// `federation_attestations` columns the envelope never covered. Rides the
+/// envelope under [`paths::ROW`] as ONE object.
+///
+/// v31.0.0 (CIRISPersist#658) — **seven, and it always was.** The count in this
+/// doc, in the `paths::ROW` doc, in `check_row_column_binding`'s doc AND in its
+/// two refusal messages all said five, omitting `attestation_id` and
+/// `attesting_key_id` — which the type has carried and the gate has enforced
+/// since the mirror shipped. That is not a doc nit during a release that forces
+/// every producer to re-mint against these very messages. The list is now
+/// spelled once, in [`row_paths::ALL`], and the published `row_members` and the
+/// refusal messages both read it from there.
+///
+/// # Why an object and not seven sibling keys
+///
+/// Seven top-level keys would be seven independent vocabulary additions, each
+/// individually optional-looking, and a producer that stamped six of seven
+/// would look conformant. One object is one presence check: the mirror is
+/// there in full or the row is refused.
+///
+/// # Closed member set
+///
+/// `deny_unknown_fields` — an unexpected member inside `row` is a refusal, not
+/// a shrug. The mirror is not an extension point: anything that wants to ride
+/// the envelope rides the envelope's own `extra`, where the vocabulary hash
+/// covers it. An EIGHTH column joining the mirror is a deliberate re-pin of
+/// [`ENVELOPE_VOCABULARY_SHA256`], exactly as this one was.
+///
+/// (v31.0.0, CIRISPersist#658 — this read "A SIXTH column", counting from the
+/// undercount. The set is seven; the next one is the eighth, which is what
+/// `bootstrap_admission`'s exhaustive witness already calls it.)
+///
+/// # `subject_key_ids` is ORDER-SENSITIVE
+///
+/// The mirror carries the list AS A LIST and
+/// [`crate::federation::admission::check_row_column_binding`] compares it
+/// element-by-element. Every *semantic* consumer is a membership test
+/// (`iter().any`, `HashSet::contains`, `for subj in …` — the rule-2/3/4 arms,
+/// the V106 subject projection, the trace self-emission polarity check), so
+/// nothing reads position. But
+/// [`crate::federation::types::compute_persist_row_hash`] and
+/// [`crate::federation::wire_index::content_hash_of`] both serialize the field
+/// as an ORDERED JSON array, so a set-wise comparison here would let a relay
+/// permute the list, change the row's content hash and its wire-index address,
+/// and still satisfy the binding — a divergence traded one plane over rather
+/// than closed. Order round-trips verbatim on all three backends (sqlite
+/// `TEXT` JSON array, postgres JSONB array, memory `Vec`), so the strict
+/// comparison is exactly reproducible and is never a false refusal.
+/// # What is deliberately NOT in the mirror
+///
+/// Binding a field that the receiving node RE-DERIVES from its own verified
+/// state would be worse than leaving it unbound — it would make a peer's
+/// signed opinion about our placement decisions into something we have to
+/// honour. So:
+///
+/// - `tier`, `promoted_at` — this node's own placement of the row. Re-gated at
+///   every door ([`check_local_tier_eligibility`], [`check_promotion_admission`]).
+/// - `withdraws_admission_rule` — audit metadata RE-DERIVED at admission by
+///   [`resolve_withdraws_admission_rule`]; a signed claim to a rule would be a
+///   producer asserting its own authority.
+/// - `persist_row_hash` — locally computed, over the row including this
+///   envelope; binding it would be circular.
+/// - `original_content_hash`, `scrub_signature_*` — the signature and its
+///   digest cannot live inside the bytes they cover.
+/// - `scrub_key_id`, `scrub_timestamp`, `pqc_completed_at` — signature
+///   metadata, legitimately REWRITTEN when a promoting node re-scrubs the row.
+///   No authority gate reads them (the ingest verifier resolves
+///   `attesting_key_id`); `additional_scrubs` are each verified individually
+///   over the same preimage (#556), which is a stronger property than binding.
+/// - `asserted_at`, `expires_at` — bound, but as TOP-LEVEL envelope keys by
+///   CIRISPersist#598 in this same break window, not inside `row`. They are
+///   assertion-native (the validity interval of a claim, which any CEG reader
+///   expects at the envelope root) rather than persist projections, and
+///   [`check_instant_binding`] reads them there.
+///
+/// [`check_local_tier_eligibility`]: crate::federation::admission::check_local_tier_eligibility
+/// [`check_promotion_admission`]: crate::federation::admission::check_promotion_admission
+/// [`resolve_withdraws_admission_rule`]: crate::federation::admission::resolve_withdraws_admission_rule
+/// [`check_instant_binding`]: crate::federation::admission::check_instant_binding
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowMirror {
+    /// [`row_paths::ATTESTATION_ID`].
+    pub attestation_id: String,
+    /// [`row_paths::ATTESTING_KEY_ID`].
+    pub attesting_key_id: String,
+    /// [`row_paths::ATTESTATION_TYPE`].
+    pub attestation_type: String,
+    /// [`row_paths::ATTESTED_KEY_ID`].
+    pub attested_key_id: String,
+    /// [`row_paths::SUBJECT_KEY_IDS`] — order-sensitive (see the type doc).
+    #[serde(default)]
+    pub subject_key_ids: Vec<String>,
+    /// [`row_paths::COHORT_SCOPE`].
+    pub cohort_scope: String,
+    /// [`row_paths::WEIGHT`] — absent ⇔ the row column is `None`. Held as a
+    /// [`serde_json::Number`] rather than an `f64` so [`EnvelopeCore`] keeps
+    /// its `Eq` (and so a non-finite weight, which JSON cannot represent at
+    /// all, is refused at the stamp instead of silently becoming `null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<serde_json::Number>,
 }
 
 /// A delegation `scope` in either established wire shape.
@@ -116,10 +314,390 @@ pub struct EnvelopeCore {
     /// breach signal — see [`super::deletion_window`]). Byte-invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_window: Option<String>,
+    /// [`paths::ASSERTED_AT`] — v31.0.0 (#598). RFC-3339. The signed twin
+    /// of the `asserted_at` ROW COLUMN the consent fold orders on. Stamped
+    /// by [`crate::federation::attestation_emit::stamp_and_canonicalize`]
+    /// BEFORE the bytes are signed, and read back out by
+    /// [`crate::federation::attestation_emit::assemble`] — the emit path no
+    /// longer samples a second clock after signing, so the two can never
+    /// disagree at the mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asserted_at: Option<String>,
+    /// [`paths::EXPIRES_AT`] — v31.0.0 (#598). RFC-3339. The signed twin of
+    /// the `expires_at` ROW COLUMN. `None` ⇔ the row column is `None`; the
+    /// binding gate refuses any other pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// [`paths::ROW`] — v31.0.0 (#643). The signed twin of the seven typed
+    /// columns (see [`RowMirror`]). `None` on an envelope that has not been
+    /// through
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`];
+    /// `put_attestation` REFUSES such a row on every backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<RowMirror>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RowMirror {
+    /// v31.0.0 (CIRISPersist#643) — **the ONE definition of "the mirror this
+    /// row implies"**, shared by the stamp side
+    /// ([`crate::federation::attestation_emit::stamp_and_canonicalize`] builds
+    /// the same shape from the emit input) and the check side
+    /// ([`crate::federation::admission::check_row_column_binding`] compares
+    /// against this). Two definitions of the projection would be two
+    /// definitions of the binding, and this substrate has a recorded defect
+    /// class for exactly that.
+    ///
+    /// Fails only on a non-finite `weight`, which JSON cannot represent at all
+    /// — refused rather than silently serialized as `null`.
+    pub fn of(row: &super::Attestation) -> Result<Self, super::Error> {
+        Ok(Self {
+            attestation_id: row.attestation_id.clone(),
+            attesting_key_id: row.attesting_key_id.clone(),
+            attestation_type: row.attestation_type.clone(),
+            attested_key_id: row.attested_key_id.clone(),
+            subject_key_ids: row.subject_key_ids.clone(),
+            cohort_scope: row.cohort_scope.clone(),
+            weight: match row.weight {
+                None => None,
+                Some(w) => Some(serde_json::Number::from_f64(w).ok_or_else(|| {
+                    super::Error::InvalidArgument(format!(
+                        "attestation {}: `weight` {w} is not finite and cannot be bound into the \
+                         signed envelope (CIRISPersist#643)",
+                        row.attestation_id
+                    ))
+                })?),
+            },
+        })
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **stamp [`Self::of`] into an envelope
+    /// VALUE**: the ONE placement of the one projection, for every write path
+    /// that owns the bytes it is about to sign.
+    ///
+    /// [`crate::federation::attestation_emit::stamp_and_canonicalize`] cannot
+    /// use this (at the mint there is no row yet — it builds the mirror from
+    /// the emit input and the id it is minting). Every OTHER producing path
+    /// has a row in hand: the local-tier write, and the two placement-touching
+    /// re-signs (promotion and the #530 repair re-scope). Those go through
+    /// here rather than each spelling `envelope[paths::ROW] =
+    /// to_value(RowMirror::of(row))`, because a copied projection is a second
+    /// definition of the binding and this substrate has a recorded defect
+    /// class for exactly that.
+    ///
+    /// Refuses a non-object envelope rather than silently replacing it — an
+    /// envelope is always an object (see [`EnvelopeCore::from_value`]), and
+    /// `serde_json`'s `IndexMut` would otherwise *overwrite* a scalar with an
+    /// object and lose the producer's bytes.
+    pub fn stamp_into(
+        envelope: &mut serde_json::Value,
+        row: &super::Attestation,
+    ) -> Result<(), super::Error> {
+        let mirror = Self::of(row)?;
+        mirror.insert_into(envelope, &row.attestation_id)
+    }
+
+    /// [`Self::stamp_into`] for a producer that owns the whole row — it stamps
+    /// the row's mirror into the row's OWN envelope.
+    ///
+    /// Exists because `stamp_into(&mut row.attestation_envelope, &row)` cannot
+    /// borrow-check: the projection is read from the same value it writes back
+    /// into. Taking `&mut Attestation` and sequencing the two internally is the
+    /// only spelling that compiles, so it is the only one every whole-row
+    /// producer should use.
+    pub fn stamp_row(row: &mut super::Attestation) -> Result<(), super::Error> {
+        let mirror = Self::of(row)?;
+        let attestation_id = row.attestation_id.clone();
+        mirror.insert_into(&mut row.attestation_envelope, &attestation_id)
+    }
+
+    /// The ONE write of [`paths::ROW`] — every stamping entry point funnels
+    /// here so there is one placement as well as one projection.
+    ///
+    /// v31.0.0 (CIRISPersist#658) — `pub(crate)` so the property harness's two
+    /// row builders can place a `RowMirror` instead of hand-writing a `json!`
+    /// object with the same member names. They cannot use [`Self::of`] (they
+    /// build the envelope before the `Attestation` exists), but they can build
+    /// the TYPE — and the type is `deny_unknown_fields` over a closed set, so
+    /// an eighth member breaks them at compile time rather than silently
+    /// producing a mirror the gate refuses.
+    pub(crate) fn insert_into(
+        &self,
+        envelope: &mut serde_json::Value,
+        attestation_id: &str,
+    ) -> Result<(), super::Error> {
+        let obj = envelope.as_object_mut().ok_or_else(|| {
+            super::Error::InvalidArgument(format!(
+                "attestation {attestation_id}: attestation_envelope must be a JSON object to \
+                 carry the signed `{}` mirror (CIRISPersist#649)",
+                paths::ROW,
+            ))
+        })?;
+        obj.insert(
+            paths::ROW.to_owned(),
+            serde_json::to_value(self).map_err(|e| {
+                super::Error::Backend(format!("RowMirror serialize: {e} (CIRISPersist#649)"))
+            })?,
+        );
+        Ok(())
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the envelope a PLACEMENT-TOUCHING write
+    /// must sign AND store.**
+    ///
+    /// `base` is the envelope whose bytes will actually be served — the row's
+    /// own for an ordinary promotion, the TRANSFORMED clone for a #510
+    /// restriction pipeline. `row` is the row as it stands; `cohort_scope` is
+    /// the placement it is about to land at. The returned envelope carries the
+    /// mirror of the row **as it will be stored**, so the bytes signed over it
+    /// and the columns written beside it are one statement.
+    ///
+    /// This exists because promotion RE-SIGNS a row and CHANGES `cohort_scope`
+    /// — one of the seven columns #643 bound — so re-signing the pre-promotion
+    /// envelope produced a row asserting its old scope while its column said
+    /// otherwise, and every peer's `put_attestation` refused it. Promotion is
+    /// the local→federation path, so that broke the thing promotion is for.
+    /// The same shape as CIRISPersist#598 (`assemble` sampling `Utc::now()`
+    /// after signing) and #643's blob-eviction sweeper: **a write path that
+    /// constructs signed bytes and then mutates the row.**
+    ///
+    /// # A re-stamp NARROWS a placement; it never RE-AUTHORS a row (#656)
+    ///
+    /// The overwrite is unconditional in one member and refused in the other
+    /// six. `base` already carries a mirror on every row that reached the
+    /// corpus through any v31 door, and that mirror is what its author signed.
+    /// So before the stamp, the mirror this write is about to REPLACE is
+    /// compared against the row's typed columns with `cohort_scope` — the one
+    /// member a placement-touching write is allowed to move — normalized away.
+    /// Any other divergence is refused.
+    ///
+    /// Without that arm this function LAUNDERS: hand it a row whose columns
+    /// were rewritten in transit and it re-derives the mirror from those
+    /// columns, satisfies
+    /// [`crate::federation::admission::check_promotion_admission`]'s binding
+    /// gate against the mirror it just wrote, and this node hybrid-signs the
+    /// rewritten meaning into the federation plane. That is exactly how a
+    /// relay-appended `subject_key_ids` entry — which #643 bound BECAUSE it
+    /// confers revocation authority — reached the signed bytes. The check is
+    /// [`crate::federation::admission::check_row_column_binding`] itself, asked
+    /// of the PRE-stamp shape, so there is still exactly one comparison as
+    /// there is exactly one projection.
+    ///
+    /// A `base` carrying NO mirror is refused by the same call. That is not a
+    /// new refusal class: such a row also carries no signed instants, and
+    /// [`crate::federation::admission::check_instant_binding`] at the promote
+    /// door already refused it.
+    pub fn restamp_for_scope(
+        base: &serde_json::Value,
+        row: &super::Attestation,
+        cohort_scope: &str,
+    ) -> Result<serde_json::Value, super::Error> {
+        // The row AS THE BASE'S AUTHOR BOUND IT: the row's own columns, with
+        // the placement normalized to whatever the signed mirror states. If
+        // those two disagree anywhere else, some door between the author and
+        // here rewrote a column, and re-stamping would sign the rewrite.
+        {
+            let signed_scope = base
+                .get(paths::ROW)
+                .and_then(|m| m.get(row_paths::COHORT_SCOPE))
+                .and_then(serde_json::Value::as_str);
+            let mut as_authored = row.clone();
+            as_authored.attestation_envelope = base.clone();
+            if let Some(scope) = signed_scope {
+                as_authored.cohort_scope = scope.to_owned();
+            }
+            crate::federation::admission::check_row_column_binding(&as_authored).map_err(|e| {
+                super::Error::InvalidArgument(format!(
+                    "attestation {}: refusing to re-stamp the typed-column mirror for placement \
+                     {cohort_scope:?} — the mirror this write would REPLACE does not agree with \
+                     the row's own columns, so re-deriving it would sign a rewritten meaning \
+                     rather than narrow a placement (CIRISPersist#656): {e}",
+                    row.attestation_id,
+                ))
+            })?;
+        }
+        let mut as_stored = row.clone();
+        as_stored.cohort_scope = cohort_scope.to_owned();
+        let mut envelope = base.clone();
+        Self::stamp_into(&mut envelope, &as_stored)?;
+        Ok(envelope)
+    }
+
+    /// v31.0.0 (CIRISPersist#649) — **the local-tier write STAMPS.** Called by
+    /// all three backends' `write_local_attestation` on the assembled row,
+    /// before `persist_row_hash`.
+    ///
+    /// # The decision, and why
+    ///
+    /// The choice was "stamp at write" vs "stay unstamped until sealed".
+    /// **Stamp**, on the emit path's own rule: *the party that MINTS the bytes
+    /// stamps; the party that RECEIVES them checks.* At this door persist mints
+    /// the bytes — it assigns `attestation_id` (a `Uuid::new_v4()` unless the
+    /// producer supplied a deterministic one), defaults `attested_key_id` to the
+    /// attester, and stamps `tier`/`cohort_scope`. Four of the seven bound
+    /// columns are therefore persist's own values, and a producer literally
+    /// cannot bind them in advance.
+    ///
+    /// Three consequences settle it:
+    ///
+    /// 1. **`put_attestation`'s binding gate is TIER-BLIND** (#643, deliberately
+    ///    — a tier-scoped binding is skippable by writing `tier = "local"`). So
+    ///    an unstamped local row is a row this substrate's OWN put door refuses:
+    ///    two local-write doors, one of which mints rows the other rejects. That
+    ///    is the "door beside the door" class, minted fresh.
+    /// 2. **The promote door now asks the same question**
+    ///    ([`crate::federation::admission::check_promotion_admission`]). Leaving
+    ///    the stamp to promotion means the FIRST time a local row's meaning is
+    ///    bound is the moment it is republished — so nothing at rest at the local
+    ///    tier is self-describing, and the substrate's own copy is the one plane
+    ///    where a rewritten `attestation_type` leaves no trace.
+    /// 3. **It is free and lossless here.** A durable local row carries the
+    ///    deferred empty-sentinel scrub envelope (`scrub_signature_classical =
+    ///    ""`), so there is no signature to invalidate: this is the last moment
+    ///    the bytes are persist's to write. Promotion's re-stamp then becomes a
+    ///    one-column narrowing (`cohort_scope`) of an already-correct mirror
+    ///    rather than a first stamp.
+    ///
+    /// # The transit exclusion (`caller_signed`)
+    ///
+    /// A **subject-side revocation transiting** the local tier
+    /// ([`crate::federation::types::LocalAttestationInput::into_transit_revocation_row`])
+    /// is NOT persist's to stamp: the caller hybrid-signed
+    /// `JCS(attestation_envelope)` and
+    /// [`crate::federation::admission::verify_local_transit_revocation`] has
+    /// already verified that signature and derived `original_content_hash` from
+    /// those exact bytes. Stamping afterwards would rewrite the signed bytes and
+    /// leave a stored hash and signature covering an envelope that no longer
+    /// exists — **this very defect, one door over**. For that shape persist is
+    /// the receiver, so the mirror is the producer's to bind and persist's to
+    /// **CHECK — here, at this door**
+    /// ([`crate::federation::admission::check_row_column_binding`]).
+    ///
+    /// v31.0.0 (CIRISPersist#656) — **this paragraph used to end differently,
+    /// and the sentence it ended with was false in both halves.** It read: *"it
+    /// is checked where the signature is (`put_attestation`, and the promote
+    /// door the SLA watcher drives it through), not silently written here."*
+    ///
+    /// 1. **`put_attestation` is not where the signature is.** A transit
+    ///    revocation's signature is verified HERE — the local write door runs
+    ///    [`crate::federation::admission::verify_local_transit_revocation`] and
+    ///    the row never passes through `put_attestation` at all. The claim
+    ///    named a door this row does not use.
+    /// 2. **The promote door cannot check it.** Promotion RE-STAMPS the mirror
+    ///    FROM the row's typed columns ([`Self::restamp_for_scope`] →
+    ///    [`Self::stamp_into`]) before
+    ///    [`crate::federation::admission::check_promotion_admission`] reads it,
+    ///    so that gate compares the mirror against the columns it was just
+    ///    derived from and can only pass. Then this node hybrid-signs the
+    ///    result.
+    ///
+    /// So the seven typed columns #643 bound were checked by **no door
+    /// anywhere** for a transit row: a relay could append a key to the
+    /// `subject_key_ids` COLUMN beside the subject's untouched, still-valid
+    /// signed envelope, and promotion would stamp the relay's list into the
+    /// bytes this node signs — and per #643 a canonical binding hash in
+    /// `subject_key_ids` confers REVOCATION AUTHORITY
+    /// ([`crate::federation::admission::resolve_withdraws_admission_rule`] rule
+    /// 2). The seventh site of *"signed bytes, then mutate the row"*.
+    ///
+    /// The rule was always right; only half of it was implemented. **The party
+    /// that MINTS the bytes stamps; the party that RECEIVES them CHECKS** — so
+    /// this function now does both, and which one it does is the same
+    /// `caller_signed` question. One helper, one decision, three backends: the
+    /// receiving half cannot be forgotten at a door that remembered the
+    /// stamping half, because they are the same call.
+    ///
+    /// # The instants ride the same rule (v31.0.0, CIRISPersist#598)
+    ///
+    /// [`crate::federation::admission::check_instant_binding`] covers EVERY
+    /// dimension as of this cut, so consequence 1 above is now true one field
+    /// over: a local row whose envelope carries no signed `asserted_at` is a
+    /// row this substrate's own put door refuses. The stamp therefore places
+    /// the instants as well as the mirror — through
+    /// [`stamp_signed_instants`], the one placement — and the transit
+    /// exclusion below governs both for exactly the same reason.
+    pub fn stamp_local_row(
+        row: &mut super::Attestation,
+        caller_signed: bool,
+    ) -> Result<(), super::Error> {
+        if caller_signed {
+            // THE RECEIVING HALF (CIRISPersist#656). Persist did not mint these
+            // bytes, so it does not stamp them — and therefore it MUST check
+            // them, here, at the only door this row passes through. The
+            // instants are checked by the local door's own
+            // `check_instant_binding` call a few lines later; the mirror had
+            // nothing checking it at all until this line.
+            return crate::federation::admission::check_row_column_binding(row);
+        }
+        stamp_signed_instants(row)?;
+        Self::stamp_row(row)
+    }
+}
+
+/// v31.0.0 (CIRISPersist#598) — **the ONE placement of the signed instants**,
+/// the [`RowMirror::stamp_into`] discipline for the two fields the mirror does
+/// not carry.
+///
+/// [`crate::federation::admission::check_instant_binding`] binds
+/// `asserted_at` and `expires_at` to their signed twins on every row of every
+/// dimension. Three producers must satisfy it, and each one MINTS the bytes it
+/// is about to sign: the emit path
+/// ([`crate::federation::attestation_emit::stamp_and_canonicalize`], which
+/// stamps from its typed input before a row exists), the local-tier write
+/// ([`RowMirror::stamp_local_row`]), and the fixture seal
+/// (`tier_ingest::test_support::seal_row_in_place`). The latter two have a row
+/// in hand and share this function, because a copied projection is a second
+/// definition of the binding and this substrate has a recorded defect class
+/// for exactly that.
+///
+/// Both columns are truncated to the substrate resolution FIRST, then written
+/// to the envelope from the truncated columns — the same order
+/// `stamp_and_canonicalize` uses. The gate REFUSES sub-microsecond precision
+/// rather than rounding it (see
+/// [`crate::federation::admission::CONSENT_INSTANT_RESOLUTION_NANOS`]), and
+/// `chrono::Utc::now()` is nanosecond-precise, so truncating where the signed
+/// twin is minted keeps column and twin equal BY CONSTRUCTION rather than by
+/// the caller remembering.
+///
+/// `expires_at` is bound in BOTH directions, so `None` REMOVES the key rather
+/// than leaving it: a row that once carried an expiry and lost it would
+/// otherwise be refused for an expiry it no longer has.
+///
+/// **Not for a row whose bytes someone else signed.** This rewrites the
+/// envelope, which invalidates any signature and any hash already derived from
+/// it — see the transit exclusion on [`RowMirror::stamp_local_row`]. A
+/// receiver CHECKS these; it does not stamp them.
+pub fn stamp_signed_instants(row: &mut super::Attestation) -> Result<(), super::Error> {
+    use crate::federation::admission::truncate_to_substrate_resolution as trunc;
+    row.asserted_at = trunc(row.asserted_at);
+    row.expires_at = row.expires_at.map(trunc);
+    let asserted = row.asserted_at.to_rfc3339();
+    let expires = row.expires_at.map(|t| t.to_rfc3339());
+    let obj = row.attestation_envelope.as_object_mut().ok_or_else(|| {
+        super::Error::InvalidArgument(format!(
+            "attestation {}: attestation_envelope must be a JSON object to carry the signed \
+             `{}` / `{}` instants (CIRISPersist#598)",
+            row.attestation_id,
+            paths::ASSERTED_AT,
+            paths::EXPIRES_AT,
+        ))
+    })?;
+    obj.insert(
+        paths::ASSERTED_AT.to_owned(),
+        serde_json::Value::String(asserted),
+    );
+    match expires {
+        None => {
+            obj.remove(paths::EXPIRES_AT);
+        }
+        Some(t) => {
+            obj.insert(paths::EXPIRES_AT.to_owned(), serde_json::Value::String(t));
+        }
+    }
+    Ok(())
 }
 
 impl EnvelopeCore {
@@ -143,6 +721,50 @@ impl EnvelopeCore {
     }
 }
 
+/// v31.0.0 (CIRISPersist#658) — **the ONE exhaustive [`EnvelopeCore`]
+/// fixture**, and the reason it is a free function rather than a local in one
+/// test: it is an EXHAUSTIVE STRUCT LITERAL with no `..Default::default()`
+/// rest, so the compiler — not a reviewer, not a magic count — is what forces
+/// a newly typed envelope member to be declared here. Every witness that needs
+/// "the complete set of typed universal members" derives it from this value's
+/// serialized key set instead of re-listing the members and drifting.
+///
+/// The class this closes: `delivery_mode` / `deletion_window` were typed in
+/// v21.9.0, appeared in the docs AND in
+/// [`tests::envelope_core_paths_bind_serde_names`], and still never reached
+/// [`envelope_vocabulary_json`] — because every witness in the file enumerated
+/// members BY HAND, so each one only ever checked the members it happened to
+/// list. Two absences agreed with each other for five releases.
+#[cfg(test)]
+fn fully_populated_core() -> EnvelopeCore {
+    EnvelopeCore {
+        dimension: Some("d:v1".into()),
+        references_attestation_id: Some("ref-1".into()),
+        scope: Some(ScopeSet::Many(vec!["infra:serve".into()])),
+        pre_rotation_commitment: Some("ab".repeat(32)),
+        recovers: Some("old-root".into()),
+        successor_keys: Some(vec!["k1".into()]),
+        withdrawal_reason: Some("test".into()),
+        delivery_mode: Some("mandatory".into()),
+        deletion_window: Some("2027-01-01T00:00:00Z".into()),
+        asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
+        expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
+        row: Some(RowMirror {
+            attestation_id: "att-1".into(),
+            attesting_key_id: "k-auth".into(),
+            attestation_type: "scores".into(),
+            attested_key_id: "k-att".into(),
+            subject_key_ids: vec!["k-subj".into()],
+            cohort_scope: "federation".into(),
+            weight: serde_json::Number::from_f64(1.0),
+        }),
+        // Deliberately EMPTY: `extra` is the open half, and the typed
+        // key set is exactly what this value serializes to only while
+        // nothing untyped rides along.
+        extra: serde_json::Map::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,18 +775,7 @@ mod tests {
     /// as a silent NULL in a projection.
     #[test]
     fn envelope_core_paths_bind_serde_names() {
-        let core = EnvelopeCore {
-            dimension: Some("d:v1".into()),
-            references_attestation_id: Some("ref-1".into()),
-            scope: Some(ScopeSet::Many(vec!["infra:serve".into()])),
-            pre_rotation_commitment: Some("ab".repeat(32)),
-            recovers: Some("old-root".into()),
-            successor_keys: Some(vec!["k1".into()]),
-            withdrawal_reason: Some("test".into()),
-            delivery_mode: Some("mandatory".into()),
-            deletion_window: Some("2027-01-01T00:00:00Z".into()),
-            extra: serde_json::Map::new(),
-        };
+        let core = fully_populated_core();
         let v = core.to_value();
         for (path, expect_present) in [
             (paths::DIMENSION, true),
@@ -176,6 +787,9 @@ mod tests {
             (paths::WITHDRAWAL_REASON, true),
             (paths::DELIVERY_MODE, true),
             (paths::DELETION_WINDOW, true),
+            (paths::ASSERTED_AT, true),
+            (paths::EXPIRES_AT, true),
+            (paths::ROW, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -183,6 +797,35 @@ mod tests {
                 "paths::{path} does not bind an EnvelopeCore serde field"
             );
         }
+        // v31.0.0 (CIRISPersist#643) — the same binding one level down: every
+        // `row_paths` constant must name a real [`RowMirror`] serde field, or
+        // the gate would compare a member the wire never carries.
+        let row_v = v.get(paths::ROW).expect("row mirror serialized");
+        for path in [
+            row_paths::ATTESTATION_ID,
+            row_paths::ATTESTING_KEY_ID,
+            row_paths::ATTESTATION_TYPE,
+            row_paths::ATTESTED_KEY_ID,
+            row_paths::SUBJECT_KEY_IDS,
+            row_paths::COHORT_SCOPE,
+            row_paths::WEIGHT,
+        ] {
+            assert!(
+                row_v.get(path).is_some(),
+                "row_paths::{path} does not bind a RowMirror serde field"
+            );
+        }
+        // The member set is CLOSED: an unknown member is refused, not ignored.
+        let mut junk = row_v.clone();
+        junk.as_object_mut()
+            .unwrap()
+            .insert("smuggled".into(), serde_json::json!(1));
+        let mut env_junk = v.clone();
+        env_junk[paths::ROW] = junk;
+        assert!(
+            EnvelopeCore::from_value(env_junk).is_err(),
+            "an unknown member inside `row` must be REFUSED (the mirror is a closed vocabulary)"
+        );
         // Round-trip losslessness incl. extras.
         let mut with_extra = core.clone();
         with_extra
@@ -263,7 +906,46 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             paths::RECOVERS,
             paths::SUCCESSOR_KEYS,
             paths::WITHDRAWAL_REASON,
+            // v31.0.0 (CIRISPersist#658) — the two v21.9.0 field-hoists, five
+            // releases late. `delivery_mode` and `deletion_window` became
+            // TYPED `EnvelopeCore` fields in v21.9.0 (#519 item 2) and were
+            // documented, round-trip-tested and byte-invariance-witnessed —
+            // but never joined the published vocabulary, so the document both
+            // sides agree on described 10 of the 12 universal keys. A consumer
+            // validating an envelope against it would have called the erasure
+            // deadline an unknown extension. Folded into THIS cut because the
+            // constant is already being re-pinned twice here (#598, #643) and
+            // the consumers that break are the same ones; a separate release
+            // would break them a third time for no new capability.
+            paths::DELIVERY_MODE,
+            paths::DELETION_WINDOW,
+            // v31.0.0 (CIRISPersist#598) — the two signed instants. Added to
+            // the vocabulary DELIBERATELY (this re-pins
+            // `ENVELOPE_VOCABULARY_SHA256` and every consumer asserting it):
+            // an ordering key that decides consent must be part of the
+            // vocabulary both sides agree on, not a row column one side can
+            // choose.
+            paths::ASSERTED_AT,
+            paths::EXPIRES_AT,
+            // v31.0.0 (CIRISPersist#643) — the typed-column mirror. Added
+            // DELIBERATELY (re-pinning `ENVELOPE_VOCABULARY_SHA256` a second
+            // time in this cut): the VERB of an attestation, and the field
+            // that grants revocation authority over it, must be part of the
+            // vocabulary both sides agree on rather than unsigned columns a
+            // relay can rewrite.
+            paths::ROW,
         ],
+        // v31.0.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
+        // alongside the universal paths so a consumer can validate the mirror
+        // it must now stamp, and so adding an EIGHTH column is a visible
+        // vocabulary change rather than a quiet one. (v31.0.0,
+        // CIRISPersist#658 — this said "a sixth column", counting from the
+        // five-member undercount the same cut corrected below.)
+        // v31.0.0 (CIRISPersist#658) — read from `row_paths::ALL` rather than
+        // re-spelled here. Byte-identical to the hand-written list it
+        // replaces (same members, same order), so this does NOT move the
+        // pinned hash on its own.
+        "row_members": row_paths::ALL,
         "consent_dimension_prefixes": [
             cd::STATE_GRANTED_PREFIX,
             cd::STATE_REVOKED_PREFIX,
@@ -283,8 +965,27 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// The PINNED envelope-vocabulary hash (see
 /// `envelope_vocabulary_hash_is_pinned` — computed == pinned is a gating
 /// witness; changing the vocabulary without a deliberate re-pin fails CI).
+/// v31.0.0 (CIRISPersist#598) — RE-PINNED. `asserted_at` and `expires_at`
+/// joined `universal_paths`: the instant that decides which consent claim
+/// wins is now part of the vocabulary both sides agree on. Consumers
+/// asserting the old hash BREAK, deliberately and loudly (operator decision
+/// on #598 — no grandfathering).
+/// v31.0.0 (CIRISPersist#643) — RE-PINNED AGAIN, same window, same decision.
+/// `row` joined `universal_paths` and its closed member set joined the
+/// document as `row_members`: the VERB of an attestation, and the field that
+/// grants revocation authority over it, are now signed material.
+/// v31.0.0 (CIRISPersist#658) — RE-PINNED A THIRD TIME, and deliberately in
+/// THIS release rather than the next. `delivery_mode` and `deletion_window`
+/// joined `universal_paths`: both have been typed [`EnvelopeCore`] fields
+/// since v21.9.0 (#519 item 2), so the published vocabulary described 10 of
+/// the 12 universal keys — including omitting the erasure deadline whose
+/// breach signal persist itself raises. This is not a new capability and it
+/// buys nothing on its own; it is folded in because the constant was already
+/// moving twice in this cut and the consumers that break (`/v1/health`, the
+/// cross-repo harness) are the same ones. Deferring would have broken them a
+/// THIRD time for two keys.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "f1a0bc77d24915fc1e099c4715621c936ca4fb38678b71268b88a9d614c04929";
+    "1213fd3cf3109df92805cb1f6b0e39ae7637812b4fba23206a7860ba381107b2";
 
 #[cfg(test)]
 mod vocab_tests {
@@ -299,5 +1000,92 @@ mod vocab_tests {
             "envelope vocabulary changed: re-pin ENVELOPE_VOCABULARY_SHA256 \
              deliberately (and notify /v1/health + consumer-test holders)"
         );
+    }
+
+    /// The set of keys a value serializes to — the *structural* enumeration of
+    /// a type's typed members, as opposed to a hand-written list of them.
+    fn serialized_members(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        v.as_object()
+            .expect("an envelope / mirror serializes to an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn declared(doc: &serde_json::Value, key: &str) -> std::collections::BTreeSet<String> {
+        doc[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{key}` is an array"))
+            .iter()
+            .map(|p| p.as_str().expect("a vocabulary entry is a string").into())
+            .collect()
+    }
+
+    /// **v31.0.0 (CIRISPersist#658) — THE DIVERGENCE GATE the pin gate is not.**
+    ///
+    /// [`envelope_vocabulary_hash_is_pinned`] detects a CHANGE to the published
+    /// list. It cannot detect a DIVERGENCE between that list and the typed
+    /// members it claims to describe, and it ran green for five releases with
+    /// `delivery_mode` and `deletion_window` typed, documented, round-trip
+    /// tested — and absent from the vocabulary. A check that cannot fail on the
+    /// defect it is nearest to is a report.
+    ///
+    /// This one is EXHAUSTIVE rather than counted. [`super::fully_populated_core`]
+    /// is an exhaustive struct literal, so a new [`EnvelopeCore`] field does not
+    /// compile until it is declared there; its serialized key set is then the
+    /// complete typed member set, and the assertion is SET EQUALITY against the
+    /// published `universal_paths` — both directions, so a vocabulary entry with
+    /// no typed member behind it fails too. No magic number: nothing here counts
+    /// twelve, and nothing needs updating when a thirteenth arrives except the
+    /// two places that genuinely define it.
+    ///
+    /// Same treatment one level down for [`RowMirror`] / `row_members`.
+    #[test]
+    fn envelope_vocabulary_covers_every_typed_member() {
+        let doc = envelope_vocabulary_json();
+        let core = super::fully_populated_core();
+
+        let typed = serialized_members(&core.to_value());
+        let published = declared(&doc, "universal_paths");
+        assert_eq!(
+            typed,
+            published,
+            "the published `universal_paths` and the typed `EnvelopeCore` members have DIVERGED. \
+             Typed but unpublished: {:?} (a consumer validating against the vocabulary would \
+             call these unknown extensions). Published but untyped: {:?}. Fix the list, then \
+             re-pin ENVELOPE_VOCABULARY_SHA256 deliberately.",
+            typed.difference(&published).collect::<Vec<_>>(),
+            published.difference(&typed).collect::<Vec<_>>(),
+        );
+
+        let mirror = serialized_members(
+            &serde_json::to_value(core.row.as_ref().expect("the fixture carries a mirror"))
+                .expect("RowMirror serializes"),
+        );
+        let published_members = declared(&doc, "row_members");
+        assert_eq!(
+            mirror,
+            published_members,
+            "the published `row_members` and the typed `RowMirror` members have DIVERGED. \
+             Typed but unpublished: {:?}. Published but untyped: {:?}.",
+            mirror.difference(&published_members).collect::<Vec<_>>(),
+            published_members.difference(&mirror).collect::<Vec<_>>(),
+        );
+
+        // The gate must be able to FAIL. An empty or one-sided comparison
+        // would satisfy every assertion above, so pin that both sides are
+        // non-trivially populated and that the two hoisted members — the ones
+        // that were missing — are actually present.
+        assert!(
+            typed.len() > 8 && mirror.len() > 4,
+            "the member sets went suspiciously small — the fixture stopped populating fields"
+        );
+        for member in [paths::DELIVERY_MODE, paths::DELETION_WINDOW] {
+            assert!(
+                published.contains(member),
+                "`{member}` was hoisted to a typed EnvelopeCore field in v21.9.0 and must be \
+                 part of the published vocabulary (CIRISPersist#658)"
+            );
+        }
     }
 }

@@ -231,7 +231,7 @@ pub(crate) mod test_support {
         let (och, ed_sig, pqc_sig) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
             attested_key_id: attester.to_owned(),
@@ -253,7 +253,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(attester, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// Ids visible to a LIVE-lifecycle read under `filter`, or `None` only when

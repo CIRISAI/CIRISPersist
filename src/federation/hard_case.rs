@@ -58,7 +58,7 @@ pub mod kind {
     /// `subject_key_id` = the excluded occurrence; `detail` carries the
     /// scope + the count of blobs they were excluded from.
     pub const RECIPIENT_EXCLUDED: &str = "recipient_excluded";
-    /// GDPR Art. 17 / DSAR (CIRISPersist#222, v6.9.0) — persist erased an
+    /// GDPR Art. 17 / DSAR (CIRISPersist#222, v7.0.0) — persist erased an
     /// agent's full trace corpus via
     /// [`Engine::delete_traces_for_agent_id_hash`](crate::Engine::delete_traces_for_agent_id_hash):
     /// hard-deleted `trace_events` + `trace_llm_calls`, tombstoned the

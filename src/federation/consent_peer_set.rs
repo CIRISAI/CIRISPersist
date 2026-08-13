@@ -93,7 +93,7 @@ pub(crate) mod test_support {
         let (och, ed_sig, pqc_sig) =
             crate::federation::tier_ingest::test_support::sign_envelope(node, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: node.to_owned(),
             attested_key_id: node.to_owned(),
@@ -115,7 +115,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(node, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     fn withdraws(id: &str, issuer: &str, target_id: &str) -> Attestation {
@@ -126,7 +129,7 @@ pub(crate) mod test_support {
         let (och, ed_sig, pqc_sig) =
             crate::federation::tier_ingest::test_support::sign_envelope(issuer, &envelope);
         let now = chrono::Utc::now();
-        Attestation {
+        let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: issuer.to_owned(),
             attested_key_id: issuer.to_owned(),
@@ -148,7 +151,10 @@ pub(crate) mod test_support {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(issuer, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
     }
 
     /// A grant to peer P1 makes `list_consent_peers` include P1; a
@@ -301,14 +307,23 @@ pub(crate) mod test_support {
         );
 
         // ── set_attestation_cohort_scope: write-back + validation ──
-        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION)
+        // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN: `cohort_scope`
+        // is bound into the signed envelope, so the door takes the re-stamped
+        // + re-signed bundle beside the new placement.
+        let local1_row = dir.get_attestation(&local1).await.unwrap().expect("row");
+        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
+            &local1_row.attesting_key_id,
+            &local1_row,
+            cohort_scope::FEDERATION,
+        );
+        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION, &reseal)
             .await
             .expect("cohort_scope write-back");
         let after = dir.get_attestation(&local1).await.unwrap().expect("row");
         assert_eq!(after.cohort_scope, cohort_scope::FEDERATION);
 
         let invalid = dir
-            .set_attestation_cohort_scope(&local1, "not-a-real-scope")
+            .set_attestation_cohort_scope(&local1, "not-a-real-scope", &reseal)
             .await;
         assert!(
             matches!(invalid, Err(crate::federation::Error::InvalidArgument(_))),
@@ -319,6 +334,7 @@ pub(crate) mod test_support {
             .set_attestation_cohort_scope(
                 "00000000-0000-0000-0000-000000000000",
                 cohort_scope::FEDERATION,
+                &reseal,
             )
             .await;
         assert!(
