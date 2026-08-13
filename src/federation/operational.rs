@@ -854,11 +854,40 @@ fn bind_opt_instant(
 /// v31.0.0 (CIRISPersist#644) — refuse an [`Organization`] whose typed
 /// projection disagrees with the envelope its signature covers.
 ///
+/// # `attestation_id` binds FIRST (v31.0.0, CIRISPersist#658)
+///
+/// The attestation plane has bound the row's own identity since #643, and
+/// [`crate::federation::envelope::row_paths::ATTESTATION_ID`] states the
+/// reason: *same bytes ⇒ same id*, so re-submitting a still-valid signed
+/// envelope collides with itself on the primary key and the dedup absorbs it
+/// as an idempotent no-op. Replay stops being *refused* and starts being
+/// *impossible to express*.
+///
+/// These three planes did not have it. Every other security-relevant column
+/// was bound, and the one column that says WHICH ROW THIS IS was authored by
+/// whoever wrote the row. The structural consequence is certain and does not
+/// depend on any exploitation story: **one signed envelope could be installed
+/// at unboundedly many primary keys**, each a fully valid row by every gate in
+/// the file, each carrying an attacker-chosen §6.1 tie-break key
+/// ([`lww_wins`] / [`partner_wins`] break ties on smallest `attestation_id`)
+/// and each minting its own `signed_wire_index` entry. Escalation past that —
+/// actually winning the merge — additionally needs an `asserted_at` tie, so it
+/// is narrower than "replay wins"; the unbounded fan-out of a single signed
+/// envelope is not narrow, and it is what the binding closes.
+///
+/// Costed as free rather than cheap: this changes the SIGNING PREIMAGE of all
+/// three planes, so every producer must re-mint — and v31.0.0 forces exactly
+/// that re-mint anyway. `PartnerRecord`'s envelope is signed by an M-of-N
+/// steward quorum, so the same change one release later would mean
+/// re-collecting M steward signatures across organizations in a second
+/// ceremony against a live federation.
+///
 /// # Errors
 /// [`Error::OperationalEnvelopeUnbound`] on the first divergent column.
 pub fn check_organization_binding(row: &Organization) -> Result<(), Error> {
     const PLANE: &str = "organization";
     let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "attestation_id", &row.attestation_id)?;
     bind_str(env, PLANE, id, "org_id", &row.org_id)?;
     bind_str(env, PLANE, id, "name", &row.name)?;
     bind_str(env, PLANE, id, "org_type", &row.org_type)?;
@@ -891,6 +920,7 @@ pub fn check_organization_binding(row: &Organization) -> Result<(), Error> {
 pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
     const PLANE: &str = "org_membership";
     let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "attestation_id", &row.attestation_id)?;
     bind_str(env, PLANE, id, "user_id", &row.user_id)?;
     bind_str(env, PLANE, id, "org_id", &row.org_id)?;
     bind_str(env, PLANE, id, "role", &row.role)?;
@@ -922,6 +952,7 @@ pub fn check_org_membership_binding(row: &OrgMembership) -> Result<(), Error> {
 pub fn check_partner_record_binding(row: &PartnerRecord) -> Result<(), Error> {
     const PLANE: &str = "partner_record";
     let (env, id) = (&row.signed_envelope, row.attestation_id.as_str());
+    bind_str(env, PLANE, id, "attestation_id", &row.attestation_id)?;
     bind_str(env, PLANE, id, "license_id", &row.license_id)?;
     bind_str(env, PLANE, id, "partner_id", &row.partner_id)?;
     bind_str(env, PLANE, id, "org_id", &row.org_id)?;
@@ -1346,7 +1377,10 @@ pub mod test_support {
         // its own binding after a postgres round-trip.
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        // v31.0.0 (#658) — the row's own IDENTITY is signed material now, so
+        // a caller that wants a second row must mint a second envelope.
         let envelope = json!({
+            "attestation_id": attestation_id,
             "user_id": user_id,
             "org_id": org_id,
             "role": role,
@@ -1387,7 +1421,9 @@ pub mod test_support {
         // v31.0.0 (#644) — see `signed_membership`.
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        // v31.0.0 (#658) — see `signed_membership`.
         let envelope = json!({
+            "attestation_id": attestation_id,
             "org_id": org_id,
             "name": "Acme",
             "org_type": "partner",
@@ -1445,7 +1481,10 @@ pub mod test_support {
         // `signed_membership`).
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        // v31.0.0 (#658) — the identity joins the quorum-signed bytes: a
+        // second primary key now requires a second M-of-N ceremony.
         let envelope = json!({
+            "attestation_id": attestation_id,
             "license_id": license_id,
             "partner_id": "p1",
             "org_id": "org-x",
@@ -4035,8 +4074,15 @@ pub mod test_support {
         // (b) The SAME row with only the Ed25519 half replaced. Everything
         //     else — envelope, attesting_key_id, every typed column — is
         //     byte-identical to the row that just admitted.
+        //
+        //     v31.0.0 (#658): the `attestation_id` is deliberately NOT moved
+        //     any more. It is signed material now, so a forger cannot pick a
+        //     fresh primary key without minting a fresh envelope — and the
+        //     write is refused at the pre-DB gate, before the PK is ever
+        //     consulted. (Were the signature check to disappear, this write
+        //     would return Ok on sqlite's `ON CONFLICT DO NOTHING` and the
+        //     `expect_err` below would fail LOUDLY rather than pass.)
         let mut forged = good.clone();
-        forged.organization.attestation_id = format!("{tag}-o-forged");
         forged.organization.ed25519_signature_base64 =
             base64::engine::general_purpose::STANDARD.encode([0x41u8; 64]);
         assert_eq!(
@@ -4107,8 +4153,8 @@ pub mod test_support {
 
         // (a) The tombstone. Signature untouched and still valid; only the
         //     unsigned column moves.
+        // v31.0.0 (#658) — the id stays put; see `exercise_org_bogus_signature_refused`.
         let mut tombstoned = good.clone();
-        tombstoned.organization.attestation_id = format!("{tag}-o-tomb");
         tombstoned.organization.withdrawn_at = Some(now + Duration::seconds(60));
         assert_eq!(
             tombstoned.organization.ed25519_signature_base64,
@@ -4140,7 +4186,6 @@ pub mod test_support {
 
         // (c) `status` is bound too — the other half of the same column.
         let mut restatused = good.clone();
-        restatused.organization.attestation_id = format!("{tag}-o-status");
         restatused.organization.status = "deactivated".into();
         let err = dir
             .put_organization(restatused)
@@ -4223,8 +4268,10 @@ pub mod test_support {
         // (b) THE LOCKOUT ATTEMPT. The attacker holds no steward key. They
         //     take the record above — whose quorum signatures remain
         //     entirely valid — and raise only the unsigned column.
+        // v31.0.0 (#658) — the id stays put. It is quorum-signed material
+        // now, so the attacker cannot even give the lockout row a primary key
+        // of its own without a second M-of-N ceremony.
         let mut inflated = r1.clone();
-        inflated.partner_record.attestation_id = format!("{tag}-p-inflated");
         inflated.partner_record.revision = u64::MAX;
         assert_eq!(
             inflated.steward_signatures, r1.steward_signatures,
@@ -4278,6 +4325,217 @@ pub mod test_support {
         assert!(
             rows.iter().all(|r| r.revision <= 2),
             "({tag}) #644-c: no inflated revision was ever stored"
+        );
+    }
+
+    /// **#658 — ONE SIGNED ENVELOPE, ONE PRIMARY KEY.**
+    ///
+    /// #644 bound every security-relevant column on these three planes
+    /// EXCEPT the one that says which row this is. The attestation plane had
+    /// bound its identity since #643 for a stated reason (see
+    /// [`crate::federation::envelope::row_paths::ATTESTATION_ID`]): same bytes
+    /// ⇒ same id ⇒ the PK dedup absorbs a resubmission as an idempotent no-op,
+    /// which makes replay *impossible to express* rather than merely refused.
+    ///
+    /// **The witness is written against the STRUCTURAL fact, not an
+    /// escalation story.** Whether the attacker goes on to WIN a merge is
+    /// narrower than replay — [`lww_wins`] / [`partner_wins`] reach the
+    /// `attestation_id` tie-break only on an `asserted_at` (and, for partner,
+    /// `revision` + status-rank) tie. What is certain and unconditional is
+    /// this: one still-valid signed envelope could be installed at unboundedly
+    /// many primary keys, each a fully valid row by every other gate, each
+    /// with an attacker-chosen §6.1 tie-break key, and each minting its own
+    /// `signed_wire_index` entry. That is what the legs below pin.
+    ///
+    /// The last leg is the one that keeps this honest: a row genuinely
+    /// RE-MINTED at a new id — fresh envelope, freshly signed — must still
+    /// admit. Otherwise the fix would read as "second rows are impossible"
+    /// rather than "second rows must be authored".
+    pub async fn exercise_operational_id_replay_refused(
+        dir: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        let s1 = Identity::new(&format!("{tag}-s1"));
+        let s2 = Identity::new(&format!("{tag}-s2"));
+        for s in [&s1, &s2] {
+            w644_register_steward(dir, s).await;
+        }
+        let org_id = format!("{tag}-org");
+        let user_id = format!("{tag}-user");
+        let license = format!("{tag}-lic");
+        let now = w644_now();
+
+        // The replayed ids are chosen to sort BEFORE the originals, so each
+        // one is the row §6.1 hands the tie-break to. Nothing below depends
+        // on that — it is pinned so the stake is legible.
+        let (o_id, o_replay) = (format!("{tag}-o-1"), format!("{tag}-o-0"));
+        let (m_id, m_replay) = (format!("{tag}-m-1"), format!("{tag}-m-0"));
+        let (p_id, p_replay) = (format!("{tag}-p-1"), format!("{tag}-p-0"));
+        for (orig, replay) in [(&o_id, &o_replay), (&m_id, &m_replay), (&p_id, &p_replay)] {
+            assert!(
+                replay < orig,
+                "({tag}) #658: the replay id must sort first — it is the §6.1 tie-break winner"
+            );
+        }
+
+        // ── (a) organization ────────────────────────────────────────
+        let org = signed_organization(&o_id, &org_id, &s1, "active", now);
+        dir.put_organization(org.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #658: the genuinely signed org row admits: {e}"));
+
+        let mut org_replay = org.clone();
+        org_replay.organization.attestation_id.clone_from(&o_replay);
+        assert_eq!(
+            org_replay.organization.signed_envelope, org.organization.signed_envelope,
+            "({tag}) #658: the attacker forges NOTHING — the envelope and its signature are \
+             the producer's own, replayed verbatim"
+        );
+        assert_eq!(
+            org_replay.organization.ed25519_signature_base64,
+            org.organization.ed25519_signature_base64
+        );
+        let err = dir.put_organization(org_replay).await.expect_err(
+            "({tag}) #658: one signed org envelope may not be installed at a second primary key",
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_operational_envelope_unbound",
+            "({tag}) #658: refused as an unbound column, not incidentally: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("attestation_id"),
+            "({tag}) #658: the refusal names the column it is about: {err}"
+        );
+
+        // ── (b) org_membership ──────────────────────────────────────
+        let mem = signed_membership(&m_id, &s1, &user_id, &org_id, "org_admin", "active", now);
+        dir.put_org_membership(mem.clone())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("({tag}) #658: the genuinely signed membership admits: {e}")
+            });
+
+        let mut mem_replay = mem.clone();
+        mem_replay
+            .org_membership
+            .attestation_id
+            .clone_from(&m_replay);
+        assert_eq!(
+            mem_replay.org_membership.signed_envelope, mem.org_membership.signed_envelope,
+            "({tag}) #658: nothing is forged on the membership plane either"
+        );
+        let err = dir
+            .put_org_membership(mem_replay)
+            .await
+            .expect_err("({tag}) #658: a membership envelope binds to ONE attestation_id");
+        assert_eq!(err.kind(), "federation_operational_envelope_unbound");
+        assert!(format!("{err}").contains("attestation_id"), "{err}");
+
+        // ── (c) partner_record — the M-of-N plane ───────────────────
+        let stewards: Vec<&Identity> = vec![&s1, &s2];
+        let pr = signed_partner_record(&p_id, &license, 1, "active", now, &stewards, 2, false);
+        dir.put_partner_record(pr.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #658: the quorum-signed record admits: {e}"));
+
+        let mut pr_replay = pr.clone();
+        pr_replay
+            .partner_record
+            .attestation_id
+            .clone_from(&p_replay);
+        assert_eq!(
+            pr_replay.steward_signatures, pr.steward_signatures,
+            "({tag}) #658: the M-of-N steward quorum is REPLAYED VERBATIM — the attacker holds \
+             no steward key, which is exactly why binding the id here is the expensive one to \
+             defer: a second primary key now costs a second ceremony"
+        );
+        let err = dir
+            .put_partner_record(pr_replay)
+            .await
+            .expect_err("({tag}) #658: a quorum-signed envelope binds to ONE attestation_id");
+        assert_eq!(err.kind(), "federation_operational_envelope_unbound");
+        assert!(format!("{err}").contains("attestation_id"), "{err}");
+
+        // ── (d) NO FAN-OUT: one envelope, one row, one wire-index entry ──
+        let orgs = dir.list_organizations_for(&org_id).await.expect("orgs");
+        assert_eq!(
+            orgs.len(),
+            1,
+            "({tag}) #658: the refused replay must not have landed a second organization row"
+        );
+        let mems = dir
+            .list_org_memberships_for(&org_id)
+            .await
+            .expect("memberships");
+        assert_eq!(mems.len(), 1, "({tag}) #658: no second membership row");
+        let prs = dir
+            .list_partner_records_for(&license)
+            .await
+            .expect("partner records");
+        assert_eq!(prs.len(), 1, "({tag}) #658: no second partner_record row");
+
+        // The wire index is the half that makes the fan-out REACHABLE: every
+        // distinct `attestation_id` mints its own `record_key`, so an
+        // unbounded id fan-out is an unbounded set of addresses a peer can
+        // pull the same signed bytes from. Counted through this node's own
+        // index derivation, tag-scoped (postgres shares one DB across tests).
+        let indexed = crate::federation::wire_index::all_kind_hash_keys(dir)
+            .await
+            .expect("wire index derivation");
+        for kind in ["Organization", "OrgMembership", "PartnerRecord"] {
+            let n = indexed
+                .iter()
+                .filter(|(k, _, rk)| *k == kind && rk.contains(tag))
+                .count();
+            assert_eq!(
+                n, 1,
+                "({tag}) #658: `{kind}` must have exactly ONE wire-index address for one signed \
+                 envelope — found {n}"
+            );
+        }
+
+        // ── (e) THE FIX DID NOT BRICK THE PLANE ─────────────────────
+        // A row genuinely re-minted at the new id — a NEW envelope, signed
+        // afresh — still admits on all three planes. Without this leg, a gate
+        // that simply refused every `attestation_id` would pass everything
+        // above.
+        let later = now + Duration::seconds(1);
+        dir.put_organization(signed_organization(
+            &o_replay, &org_id, &s1, "active", later,
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #658: a genuinely RE-MINTED organization at the same id the replay \
+                     tried to use must admit — the binding requires authorship, it does not ban \
+                     second rows: {e}"
+            )
+        });
+        dir.put_org_membership(signed_membership(
+            &m_replay,
+            &s1,
+            &user_id,
+            &org_id,
+            "org_admin",
+            "active",
+            later,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #658: a re-minted membership must admit: {e}"));
+        dir.put_partner_record(signed_partner_record(
+            &p_replay, &license, 2, "active", later, &stewards, 2, false,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #658: a re-minted partner_record must admit: {e}"));
+
+        assert_eq!(
+            dir.list_organizations_for(&org_id)
+                .await
+                .expect("orgs")
+                .len(),
+            2,
+            "({tag}) #658: the authored second row DID land"
         );
     }
 }

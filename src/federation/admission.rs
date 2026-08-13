@@ -3862,16 +3862,28 @@ pub fn check_instant_binding(
 /// [`crate::federation::tier_ingest::verify_federation_tier_ingest`] verifies
 /// the hybrid signature over `attestation_envelope` and cross-checks
 /// `original_content_hash` against that envelope's canonical SHA-256. **That
-/// is the entire coverage.** Five typed `federation_attestations` columns —
-/// the ones that decide what a row MEANS — had no envelope twin and no gate:
+/// is the entire coverage.** **SEVEN** typed `federation_attestations` columns
+/// — the ones that decide what a row MEANS — had no envelope twin and no gate:
 ///
 /// | column | what it decides |
 /// |---|---|
+/// | `attestation_id` | **the row's IDENTITY** — same bytes ⇒ same id, so replay is structurally impossible rather than merely refused |
+/// | `attesting_key_id` | WHO made the claim |
 /// | `attestation_type` | **the VERB** (`scores` / `withdraws` / `supersedes` / `recants` / `delegates_to`) |
 /// | `subject_key_ids` | **grants revocation authority** ([`resolve_withdraws_admission_rule`] rules 2/3/4) |
 /// | `attested_key_id` | who the claim is ABOUT |
 /// | `cohort_scope` | who may SEE it |
 /// | `weight` | how much it COUNTS |
+///
+/// Seven, not five: [`RowMirror`] has carried `attestation_id` and
+/// `attesting_key_id` since the mirror shipped, and this gate has always
+/// enforced them. The count in this doc and in the refusal message below said
+/// five for both — which matters more than a doc nit during the v31.0.0
+/// re-ceremony, because that message is what an external producer debugs
+/// against, [`RowMirror`] is `deny_unknown_fields`, and only
+/// `subject_key_ids` / `weight` default. A producer following the old message
+/// built a five-member mirror and was refused a second time, by a message that
+/// had told it the wrong thing (CIRISPersist#658).
 ///
 /// Two attacks, both **signature-preserving** — the relay changes a column,
 /// re-uses the producer's own untouched signature, and the row verifies:
@@ -3897,7 +3909,7 @@ pub fn check_instant_binding(
 ///    operator's standing decision on this break window (#598, #640, #643) is
 ///    to break NOW, before the first agent release on the mesh. There is no
 ///    grandfathering regime and no compatibility flag to find later.
-/// 2. **DIVERGENCE** of any of the five, each named individually so the
+/// 2. **DIVERGENCE** of any of the seven, each named individually so the
 ///    refusal says which column was rewritten.
 ///
 /// `subject_key_ids` is compared **ORDER-SENSITIVELY** — see [`RowMirror`] for
@@ -3922,32 +3934,40 @@ pub fn check_instant_binding(
 /// [`RowMirror`]: crate::federation::envelope::RowMirror
 pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
     use crate::federation::envelope::{paths, row_paths, RowMirror};
+    /// The mirror's member list, read from the ONE definition
+    /// ([`row_paths::ALL`]) rather than re-spelled per message.
+    const ROW_MIRROR_MEMBERS: [&str; 7] = row_paths::ALL;
 
     let Some(raw) = row.attestation_envelope.get(paths::ROW) else {
+        // v31.0.0 (CIRISPersist#658) — the member list here is the ONE
+        // spelled from `row_paths`, in the order the gate checks them, and it
+        // is SEVEN. It said five while the gate enforced seven, which during
+        // the v31.0.0 re-mint is what an external producer builds its mirror
+        // from — and `RowMirror` is `deny_unknown_fields` with only
+        // `subject_key_ids` / `weight` defaulted, so a five-member mirror is
+        // refused again by the very message that specified it.
         return Err(Error::InvalidArgument(format!(
             "attestation {} carries no signed `{}` object in its envelope. The signature covers \
-             `attestation_envelope` and NOTHING ELSE, so `attestation_type` (the verb), \
+             `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
+             `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
              `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
              `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
-             signature still verified. An unbound row is REFUSED (no legacy regime; \
-             CIRISPersist#643)",
+             signature still verified. The mirror's members are exactly {:?} — all seven, \
+             REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
+             column is NULL), and no others (the member set is closed). An unbound row is \
+             REFUSED (no legacy regime; CIRISPersist#643)",
             row.attestation_id,
             paths::ROW,
+            ROW_MIRROR_MEMBERS,
         )));
     };
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
         Error::InvalidArgument(format!(
             "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
-             (members are exactly {:?}; CIRISPersist#643)",
+             (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
             row.attestation_id,
             paths::ROW,
-            [
-                row_paths::ATTESTATION_TYPE,
-                row_paths::ATTESTED_KEY_ID,
-                row_paths::SUBJECT_KEY_IDS,
-                row_paths::COHORT_SCOPE,
-                row_paths::WEIGHT,
-            ],
+            ROW_MIRROR_MEMBERS,
         ))
     })?;
 
@@ -7183,6 +7203,58 @@ where
         ));
     }
     let policy = QuorumPolicy::new(m, n);
+
+    // (5a) v31.0.0 (CIRISPersist#659) — **THE CO-SCRUB MUST NAME THE KEY IT
+    // CONFERS ON.** This is the #659 operational-plane defect one plane over,
+    // on the plane where it is worst.
+    //
+    // Everything below verifies m-of-n over `JCS(registration_envelope)` and
+    // NOTHING tied those bytes to `row.key_id`. So one accord co-scrub set —
+    // three FIPS-custody, touch-required humans signing for key V — could be
+    // lifted verbatim onto a record for key A, carrying A's OWN pubkeys, and
+    // this function returned `Ok(())`. TESTED before the fix: the strict
+    // canonical gate (withdrawal-wins + the #513 ≥3-FIPS floor + the real
+    // quorum crypto) admitted `canon-probe-ATTACKER` against an envelope
+    // naming `canon-probe-victim`.
+    //
+    // This is the ONLY door `canonical`, `infra:attest`, the co-steward roles
+    // and every `AUTHORITY_CONFERRING_IDENTITY_TYPES` member enter through, so
+    // one conferral ceremony conferred on unboundedly many key_ids — the
+    // anti-Sybil floor that makes minting a trust root "costly but possible"
+    // priced exactly ONE mint and delivered any number.
+    //
+    // A REQUIRED, EQUAL `key_id` inside the signed envelope, not merely one
+    // that agrees when present: an optional check is skippable by omission,
+    // which is the whole attack. Every real artifact already satisfies it —
+    // the baked genesis records and the A1/B1/C1 accord holders all carry
+    // `key_id` (with `algorithm`, `identity_type` and both pubkeys) inside
+    // `registration_envelope` — so this refuses nothing that a conformant
+    // ceremony produces.
+    match row
+        .registration_envelope
+        .get("key_id")
+        .and_then(|v| v.as_str())
+    {
+        Some(signed) if signed == row.key_id => {}
+        Some(signed) => {
+            return Err(format!(
+                "the co-scrubbed registration_envelope names key_id {signed:?}, but this record \
+                 is {:?}. The accord quorum below verifies over those envelope bytes and nothing \
+                 else, so honouring this would confer the role on a key the co-scrubbers never \
+                 named (CIRISPersist#659)",
+                row.key_id,
+            ));
+        }
+        None => {
+            return Err(format!(
+                "the co-scrubbed registration_envelope for {:?} carries no `key_id` string. The \
+                 accord quorum verifies over those bytes ONLY, so an envelope that does not name \
+                 its subject confers on ANY key_id it is pasted onto. REQUIRED, not \
+                 check-if-present (CIRISPersist#659)",
+                row.key_id,
+            ));
+        }
+    }
 
     // (6) The exact canonical bytes the scrubs signed = JCS(registration_envelope)
     // — the IDENTICAL function the single-scrub verify uses, so a base-field
@@ -13191,6 +13263,141 @@ mod canonical_gate_tests {
         )
         .await
         .expect("3 mock-FIPS members with real hybrid scrubs must mint through the strict floor");
+    }
+
+    /// **v31.0.0 (CIRISPersist#659) — ONE CEREMONY, ONE KEY.**
+    ///
+    /// The #659 operational-plane defect on the plane where it is worst. The
+    /// accord quorum verifies m-of-n over `JCS(registration_envelope)` and
+    /// NOTHING tied those bytes to `row.key_id`, so one co-scrub set — three
+    /// FIPS-custody, touch-required humans signing for key V — lifted verbatim
+    /// onto a record for key A, carrying A's OWN pubkeys, returned `Ok(())`.
+    /// The strict gate admitted it: withdrawal-wins, the #513 3-FIPS floor and
+    /// the real quorum crypto all passed, because every one of them is a
+    /// question about the SIGNERS and none is a question about the SUBJECT.
+    ///
+    /// This is the only door `canonical`, `infra:attest`, the co-steward roles
+    /// and every `AUTHORITY_CONFERRING_IDENTITY_TYPES` member enter through.
+    /// The anti-Sybil floor prices minting a trust root at three
+    /// non-virtualizable humans; unbound, that price bought *any number* of
+    /// trust roots.
+    ///
+    /// Both directions, so the gate cannot pass by refusing everything: the
+    /// named subject MINTS, the unnamed one is REFUSED, and the refusal names
+    /// both ids.
+    #[tokio::test]
+    async fn coscrub_confers_only_on_the_key_it_names_659() {
+        use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+
+        let backend = crate::store::memory::MemoryBackend::new();
+        let ca = MockYubicoCa::new();
+        let subject = "canon-659-subject";
+        // The three humans sign an envelope naming the SUBJECT.
+        let envelope = serde_json::json!({ "key_id": subject });
+
+        let mut roster = Vec::new();
+        let mut scrubs: Vec<super::super::types::ScrubSig> = Vec::new();
+        for (i, kid) in ["m659a", "m659b", "m659c"].iter().enumerate() {
+            let m = ca
+                .attest_member([0x90 + i as u8; 32], kid, "2026-07-26T00:00:00Z")
+                .await;
+            let mut rec = record(kid, identity_type::NODE, kid);
+            rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
+            rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
+            rec.attestation_evidence = Some(serde_json::to_value(&m.attestation).unwrap());
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+            roster.push((*kid).to_string());
+            let (_, sig) = produce_signed_identity_occurrence(&m.holder, envelope.clone())
+                .await
+                .unwrap();
+            scrubs.push(super::super::types::ScrubSig {
+                scrub_key_id: (*kid).to_string(),
+                scrub_signature_classical: sig.ed25519_signature_base64,
+                scrub_signature_pqc: sig.mldsa65_signature_base64,
+            });
+        }
+
+        let stamp = |rec: &mut KeyRecord| {
+            rec.registration_envelope = envelope.clone();
+            rec.original_content_hash = {
+                use sha2::{Digest, Sha256};
+                let bytes = ceg_produce_canonicalize(&envelope).unwrap();
+                hex::encode(Sha256::digest(&bytes))
+            };
+            rec.scrub_key_id = scrubs[0].scrub_key_id.clone();
+            rec.scrub_signature_classical = scrubs[0].scrub_signature_classical.clone();
+            rec.scrub_signature_pqc = scrubs[0].scrub_signature_pqc.clone();
+            rec.additional_scrubs = scrubs[1..].to_vec();
+        };
+
+        // (a) THE CONTROL — the named subject mints. Without this leg a gate
+        //     that refused every record would satisfy (b).
+        let mut good = record(subject, "canonical,node", &scrubs[0].scrub_key_id);
+        stamp(&mut good);
+        super::check_canonical_role_admission_over_roster_with_custody_root(
+            &backend,
+            &good,
+            &roster,
+            ca.root_der(),
+        )
+        .await
+        .expect("#659: the key the co-scrubbers NAMED still mints through the strict floor");
+
+        // (b) THE LIFT. A different key_id, its own pubkeys, the three
+        //     humans' signatures replayed byte-for-byte. Nothing is forged.
+        let mut lifted = record(
+            "canon-659-ATTACKER",
+            "canonical,node",
+            &scrubs[0].scrub_key_id,
+        );
+        stamp(&mut lifted);
+        assert_eq!(
+            lifted.additional_scrubs, good.additional_scrubs,
+            "#659: the ceremony is REPLAYED VERBATIM — the attacker holds no accord key"
+        );
+        assert_ne!(
+            lifted.pubkey_ed25519_base64, good.pubkey_ed25519_base64,
+            "#659: and the lifted record carries the ATTACKER's own pubkey"
+        );
+        let err = super::check_canonical_role_admission_over_roster_with_custody_root(
+            &backend,
+            &lifted,
+            &roster,
+            ca.root_der(),
+        )
+        .await
+        .expect_err(
+            "#659: a co-scrub for one key must NOT confer `canonical` on another — this is the \
+             only door a trust root enters through",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(subject) && msg.contains("canon-659-ATTACKER"),
+            "#659: the refusal must name BOTH the key the envelope claims and the key the row \
+             is: {msg}"
+        );
+
+        // (c) An envelope that names NOBODY is refused too — an optional check
+        //     would be skippable by omission, which is the whole attack.
+        let mut anonymous = record("canon-659-anon", "canonical,node", &scrubs[0].scrub_key_id);
+        stamp(&mut anonymous);
+        anonymous.registration_envelope = serde_json::json!({ "not_a_key_id": subject });
+        let err = super::check_canonical_role_admission_over_roster_with_custody_root(
+            &backend,
+            &anonymous,
+            &roster,
+            ca.root_der(),
+        )
+        .await
+        .expect_err("#659: an envelope with no `key_id` confers on whatever it is pasted onto");
+        assert!(
+            format!("{err}").contains("no `key_id`"),
+            "#659: the refusal says the envelope named no subject: {err}"
+        );
     }
 
     /// v21.3.0 (CIRISPersist#513) — the grandfather matcher covers exactly

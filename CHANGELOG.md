@@ -241,6 +241,156 @@ the write door already resolved authority for. The third arm is why this is not
 simply *"compare attesters like the siblings do"* — the siblings model §6.1
 self-retraction only, and narrowing this fold to that would drop the subject-side
 and proxy revocations it exists to see.
+### Fixed — one accord co-scrub conferred `canonical` on ANY key_id — the ceremony never named its subject (#659)
+
+Found while closing #658; the same defect one plane over, on the plane where it
+is worst. **TESTED against the STRICT gate** — withdrawal-wins plus the #513
+≥3-FIPS-custody floor plus the real quorum crypto:
+
+```
+PROBE RESULT for key_id=canon-probe-ATTACKER envelope={"key_id":"canon-probe-victim"}: Ok(())
+```
+
+Three FIPS-certified, touch-required, distinct `MockYubicoCa` members co-scrubbed
+an envelope naming one key. Their signatures, lifted verbatim onto a record with
+a different `key_id` and the **attacker's own pubkeys**, returned `Ok(())`.
+
+`verify_accord_family_coscrub_with` verifies m-of-n over
+`ceg_produce_canonicalize(registration_envelope)` and nothing tied those bytes to
+`row.key_id`. Every check in the path — withdrawal-wins, the custody floor, the
+quorum tally — is a question about the SIGNERS; none was a question about the
+SUBJECT.
+
+This is the only door `canonical`, `infra:attest`, the co-steward roles and every
+`AUTHORITY_CONFERRING_IDENTITY_TYPES` member enter through, at every
+`put_public_key` on all three backends and in `apply_replicated_key_record`. The
+#513 anti-Sybil floor prices minting a trust root at three non-virtualizable
+humans and calls it "costly-but-possible"; unbound, that price bought an
+unbounded number of trust roots.
+
+- A **REQUIRED, EQUAL** `key_id` inside `registration_envelope`, checked once in
+  the shared co-scrub core so every conferral gate inherits it. Required rather
+  than checked-if-present: an optional check is skippable by omission, which is
+  the whole attack.
+- **Costs nothing.** Every real artifact already satisfies it — the baked genesis
+  canonical and the A1/B1/C1 accord holders all carry `key_id` (with `algorithm`,
+  `identity_type` and both pubkeys) inside `registration_envelope`. The full
+  sqlite suite is green, unchanged, with the gate in place.
+- Witness `coscrub_confers_only_on_the_key_it_names_659`, both directions plus
+  the omission case, over real quorum crypto and fabricated FIPS custody.
+- **Still open, and it is an operator call within this window:** the gate binds
+  the subject's NAME, not the subject's PUBKEYS. The residual is a race — on a
+  node that has not yet replicated the victim's row, an attacker registers the
+  victim's `key_id` carrying their own pubkeys and the co-scrub confers.
+  Binding the pubkeys closes it; measured cost is 21 in-repo fixture failures
+  and a shape change to `test_support::signed_canonical_record`, which is
+  exported under `test-anchor` to the downstream mesh sims. Whether it is
+  BREAKING depends on producers this repo cannot inspect: both real artifacts
+  already carry the pubkeys, so for a conformant ceremony it is a tightening —
+  but if any producer omits them it is a preimage change, and therefore this cut
+  or never. See #659.
+
+### Fixed — BREAKING — one signed operational envelope could be installed at unboundedly many primary keys (#658)
+
+#644 bound every security-relevant typed column on `organization`,
+`org_membership` and `partner_record` — except the one that says **which row
+this is**. `attestation_id` was authored by whoever wrote the row.
+
+The attestation plane has not had this hole since #643, and
+`envelope::row_paths::ATTESTATION_ID` states the reason: *same bytes ⇒ same id*
+⇒ the primary-key dedup absorbs a resubmission as an idempotent no-op. Replay
+stops being *refused* and starts being *impossible to express*.
+
+**The structural fact, which is certain:** a still-valid signed envelope —
+nothing forged, the producer's own signature replayed verbatim — could be
+installed at any number of primary keys. Each one was a fully valid row by
+every other gate, each carried an attacker-chosen §6.1 tie-break key
+(`lww_wins` / `partner_wins` break ties on smallest `attestation_id`), and each
+minted its own `signed_wire_index` entry, so the fan-out was addressable by
+peers. Escalation past that — actually winning a merge — additionally needs an
+`asserted_at` tie, so it is narrower than "replay wins"; the witness is written
+against the structural fact, not the escalation.
+
+- `check_organization_binding` / `check_org_membership_binding` /
+  `check_partner_record_binding` bind `attestation_id` **first**, before any
+  other column, mirroring `RowMirror`'s ordering and for the same reason.
+- **This moves the SIGNING PREIMAGE of all three planes.** Every producer must
+  re-mint — which v31.0.0 forces anyway, which is the entire reason this is
+  here rather than in 31.1.0. `PartnerRecord`'s envelope is signed by an M-of-N
+  **steward quorum**: the same change one release later would mean re-collecting
+  M steward signatures across organizations in a second ceremony, against a live
+  federation and after 31.1.0 bakes the new portable trust root.
+- The three `test_support` builders stamp the id before signing.
+- Witness `exercise_operational_id_replay_refused`, driven from memory + sqlite
+  + postgres: the verbatim replay refused on each of the three planes (naming
+  `attestation_id`), no second row, exactly one wire-index address per plane,
+  and — the leg that keeps it honest — a row genuinely **re-minted** at the new
+  id still admits. The binding requires authorship; it does not ban second rows.
+
+### Fixed — BREAKING — the published envelope vocabulary was missing two typed members, and the gate could not see it (#658)
+
+`envelope_vocabulary_json`'s `universal_paths` listed **10** of the **12**
+`paths` constants. `delivery_mode` and `deletion_window` were hoisted into
+typed `EnvelopeCore` fields in v21.9.0 (#519 item 2), documented, round-trip
+tested and byte-invariance witnessed — and never joined the vocabulary. For
+five releases the document both sides agree on omitted the erasure deadline
+whose breach signal persist itself raises.
+
+- `ENVELOPE_VOCABULARY_SHA256` **re-pinned a third time in this cut** to
+  `1213fd3cf3109df92805cb1f6b0e39ae7637812b4fba23206a7860ba381107b2`. Folded in
+  here because the constant was already moving twice (#598, #643) and the
+  consumers that break (`/v1/health`, the cross-repo harness) are the same ones;
+  deferring would have broken them a THIRD time, for two keys, delivering no new
+  capability.
+- **The gate could not fail on this.** `envelope_vocabulary_hash_is_pinned`
+  detects a CHANGE to the list; it cannot detect a DIVERGENCE between the list
+  and the typed members it claims to describe, and it ran green throughout. New
+  `envelope_vocabulary_covers_every_typed_member` asserts **set equality**, both
+  directions, between `universal_paths` and the serialized member set of an
+  **exhaustive** `EnvelopeCore` literal — so a thirteenth field does not compile
+  until it is declared, and does not pass until it is published. No magic
+  number. Same treatment for `row_members` vs `RowMirror`.
+- `transform::PROTECTED_ROOT_MEMBERS` gains `deletion_window` and
+  `delivery_mode`. The first is a live hole: an absent window is not
+  "unspecified", it is `DeletionWindowStatus::NoWindow` — *the lifecycle rule
+  does not apply* — so a sanctioned family transform running
+  `strip_field("deletion_window")` cancels an erasure deadline, and the network
+  cannot raise a breach signal about a deadline it deleted. The second belongs
+  for a reason already on the record here: absent means `BestEffort`, and
+  persist already refuses a *typo'd* `delivery_mode` at all three put doors
+  (CIRISEdge#428) on the ground that a bad value must be "REFUSED, not silently
+  demoted". A strip achieves the identical demotion through a sanctioned door.
+- New `strip_field_protects_every_listed_root_member` drives the protection off
+  the constant itself — `dimension` had a witness, the #598/#643 additions did
+  not, which is how `deletion_window` stayed strippable.
+
+### Fixed — the refusal message an external producer will debug against said FIVE members; the gate enforces SEVEN (#658)
+
+Non-breaking, and it matters more than a doc nit precisely because v31.0.0
+forces every producer to re-mint. `check_row_column_binding`'s absence message,
+its malformed-mirror message and its doc table all said five members;
+`RowMirror` has carried `attestation_id` and `attesting_key_id` since the mirror
+shipped and the gate has always enforced them. `RowMirror` is
+`deny_unknown_fields` with only `subject_key_ids` and `weight` defaulted, so a
+producer that followed the message built a five-member mirror and was refused a
+second time — by the message that had specified it.
+
+Both messages and the doc now say seven, name every member, and state which
+default. The list lives once, in `envelope::row_paths::ALL`, read by both the
+messages and the published `row_members` (byte-identical to the hand-written
+array it replaces — it does not move the hash on its own).
+
+### Fixed — a `panic!` that told the reader the one thing that was not true (#658)
+
+The #598 per-peer quota witness ended its failure message "no amount of slowness
+explains this". The bucket refills continuously at
+`PER_PEER_ATTESTATION_WRITES_PER_WINDOW / PER_PEER_ATTESTATION_WRITE_WINDOW` =
+10 tokens/s, so draining the `2n` flood cap needs `n` tokens more than the
+bucket holds: at ≥ 50 ms per write the refill supplies them and the cap is
+reached with nothing wrong. Worse, the honest diagnosis — the `elapsed < window`
+assertion immediately below — never ran, because the panic fired first. The
+message now reports the measured per-write time against the refill rate and
+states both readings.
 
 ### Changed — BREAKING — persist stores the CANONICAL envelope now, not the producer's bytes (#647)
 
@@ -993,10 +1143,12 @@ before the first agent release on the mesh.
   therefore independent of whether V122 has landed.
 - `transform::PROTECTED_ROOT_MEMBERS` gains `row`, `asserted_at`, `expires_at`:
   a family transform must not strip a signed twin.
-- `ENVELOPE_VOCABULARY_SHA256` **re-pinned** to
-  `0a6f72817eb39d4205ea024ce4a0056112a0614d5a023b8c2c7c88dcfb7264f5`
-  (`row` joined `universal_paths`; its closed member set joined the document as
-  `row_members`). Consumers asserting the old hash break, deliberately.
+- `ENVELOPE_VOCABULARY_SHA256` **re-pinned** — `row` joined `universal_paths`
+  and its closed member set joined the document as `row_members`. Consumers
+  asserting the old hash break, deliberately. (That intermediate value moved
+  again inside this same release; the value to assert against 31.0.0 is
+  `1213fd3cf3109df92805cb1f6b0e39ae7637812b4fba23206a7860ba381107b2` — see the
+  #658 vocabulary entry at the top.)
 - `blobs::emit_withdraws_attestation_helper` (the eviction sweeper's hand-rolled
   emit recipe) stamps the mirror — without it, persist emitted rows its own
   put-gate refused.

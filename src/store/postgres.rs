@@ -21080,6 +21080,24 @@ mod tests {
         .await;
     }
 
+    /// #658 — one signed operational envelope may not be installed at a
+    /// second primary key, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn operational_id_replay_refused_postgres_658() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("p658{}", &uuid_like()[..6]);
+        crate::federation::operational::test_support::exercise_operational_id_replay_refused(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     /// #598 B10-b — two directories fed the SAME signed envelopes with the two
     /// `asserted_at` columns swapped fold to the SAME verdict, on postgres.
     #[tokio::test]

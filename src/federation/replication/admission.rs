@@ -2171,12 +2171,29 @@ pub mod gate_order_test_support {
             }
         }
         let at = rate_limited.unwrap_or_else(|| {
+            // v31.0.0 (CIRISPersist#658) — this message used to end "no amount
+            // of slowness explains this", which is FALSE and would have been
+            // read by the one person least able to argue with it. The bucket
+            // refills continuously at `n / window` = 10 tokens/s, so draining
+            // `2n` needs `n` tokens more than the bucket holds: at ≥ 50 ms per
+            // write the refill supplies them and the cap is reached WITHOUT
+            // any defect. Worse, the honest diagnosis — the `elapsed < window`
+            // assertion just below — never runs, because this panic fires
+            // first. So the message states the ambiguity and reports the
+            // measurement that resolves it.
+            let elapsed = started.elapsed();
+            let per_write = elapsed / (2 * n);
+            let refill = super::PER_PEER_ATTESTATION_WRITE_WINDOW / n;
             panic!(
-                "AV-76: the per-peer quota must be charged on the FIRST gate — {cap} \
-                 consecutive writes from one peer inside one window were ALL admitted past it. \
-                 The bucket refills at only {n} per {window:?}, so no amount of slowness \
-                 explains this: the quota is not wired into `put_attestation` at all, or it is \
-                 charged after the gate that refuses these rows.",
+                "AV-76: {cap} consecutive writes from one peer were ALL admitted past the \
+                 per-peer quota. This drain took {elapsed:?} ({per_write:?} per write). Two \
+                 readings, and the timing tells them apart:\n  \
+                 - if that is at or above {refill:?} per write, the bucket refilled as fast as \
+                   it drained and this run measured the machine, not the gate — the flood cap \
+                   ({cap}) is too small for a box this slow;\n  \
+                 - otherwise the quota is not wired into `put_attestation` at all, or it is \
+                   charged AFTER the gate that refuses these rows.\n\
+                 The bucket holds {n} and refills over {window:?}.",
                 cap = 2 * n,
                 window = super::PER_PEER_ATTESTATION_WRITE_WINDOW,
             )

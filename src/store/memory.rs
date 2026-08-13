@@ -7980,6 +7980,17 @@ mod accord_tests {
         .await;
     }
 
+    /// #658 — one signed operational envelope may not be installed at a
+    /// second primary key, on the memory backend.
+    #[tokio::test]
+    async fn operational_id_replay_refused_memory_658() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_operational_id_replay_refused(
+            &backend, "mem658",
+        )
+        .await;
+    }
+
     /// #598 B10-b — two directories fed the SAME signed envelopes with the two
     /// `asserted_at` columns swapped fold to the SAME verdict, on the memory backend.
     #[tokio::test]

@@ -761,6 +761,29 @@ fn in_range_value(input: &Value, lo: f64, hi: f64) -> Result<Value, TransformErr
 /// [`crate::federation::admission::check_row_column_binding`] refuse, arriving
 /// via a sanctioned door instead of a hostile relay.
 ///
+/// v31.0.0 (CIRISPersist#658) — the two v21.9.0 field-hoists join the list.
+/// #643 added the three signed twins and stopped at the boundary of its own
+/// issue, leaving the LIFECYCLE half of the envelope strippable:
+///
+/// - **`deletion_window` — a live hole, and the one that matters.** An absent
+///   window is not "unspecified", it is
+///   [`crate::federation::deletion_window::DeletionWindowStatus::NoWindow`]:
+///   *the lifecycle rule does not apply.* So a sanctioned family transform
+///   running `strip_field("deletion_window")` CANCELS an erasure deadline, and
+///   the breach signal that would have fired is persist's own
+///   ([`crate::federation::deletion_window::run_deletion_window_watch`] — "the
+///   network itself raises a breach signal"). The network cannot raise a
+///   signal about a deadline the network deleted.
+/// - **`delivery_mode` — yes, and for a reason already on the record here.**
+///   Absent means `BestEffort`, so stripping `"mandatory"` DEMOTES a delivery
+///   commitment. Persist already refuses a *typo'd* `delivery_mode` at all
+///   three put doors ([`crate::federation::admission::check_delivery_mode_vocabulary`],
+///   CIRISEdge#428) on exactly that ground — the witness there says a bad value
+///   must be "REFUSED, not silently demoted". A strip achieves the identical
+///   silent demotion through a sanctioned door instead of a typo. Refusing one
+///   and honouring the other is incoherent, and the processor being edge-owned
+///   changes who ACTS on the value, not who may delete it in transit.
+///
 /// **Known residue, stated rather than discovered later:** this protection
 /// covers SINGLE-SEGMENT root paths only, so `strip_field("row/attestation_type")`
 /// still resolves and removes a mirror member. That is not a hole in the
@@ -774,6 +797,8 @@ const PROTECTED_ROOT_MEMBERS: &[&str] = &[
     crate::federation::envelope::paths::ASSERTED_AT,
     crate::federation::envelope::paths::EXPIRES_AT,
     crate::federation::envelope::paths::ROW,
+    crate::federation::envelope::paths::DELIVERY_MODE,
+    crate::federation::envelope::paths::DELETION_WINDOW,
 ];
 
 /// Apply one `strip_field` `path` to `envelope` IN PLACE. `path` is a
@@ -791,8 +816,8 @@ const PROTECTED_ROOT_MEMBERS: &[&str] = &[
 ///   never an error; a grant naming a path this envelope shape doesn't
 ///   carry is not a grammar violation.
 /// - Root-safety: a path that resolves to exactly one segment naming a
-///   [`PROTECTED_ROOT_MEMBERS`] entry (`"dimension"` or `"trace_id"`) is
-///   REFUSED (`tracing::warn!`), never silently honored.
+///   [`PROTECTED_ROOT_MEMBERS`] entry is REFUSED (`tracing::warn!`), never
+///   silently honored.
 fn strip_field_impl(envelope: &mut Value, path: &str) {
     let segments: Vec<&str> = path
         .trim_start_matches('/')
@@ -1362,6 +1387,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, env, "\"dimension\" at root is protected");
+    }
+
+    /// v31.0.0 (CIRISPersist#658) — the protection is exercised for EVERY
+    /// member of the list, not for the one member somebody happened to write a
+    /// test for. `dimension` had a witness; the three #598/#643 additions and
+    /// the two #658 additions would not have had one, which is precisely how
+    /// `deletion_window` stayed strippable while its breach signal shipped.
+    ///
+    /// Driven off the constant itself, so a seventh member is covered the
+    /// moment it is added — with a floor on the list length and an explicit
+    /// pin on the two lifecycle members, because an assertion looped over an
+    /// empty list passes vacuously.
+    #[test]
+    fn strip_field_protects_every_listed_root_member() {
+        use crate::federation::envelope::paths;
+        assert!(
+            PROTECTED_ROOT_MEMBERS.len() >= 7,
+            "the protected list shrank — a member was removed without a decision"
+        );
+        for member in [paths::DELIVERY_MODE, paths::DELETION_WINDOW] {
+            assert!(
+                PROTECTED_ROOT_MEMBERS.contains(&member),
+                "`{member}` is a typed lifecycle member a sanctioned transform must not delete \
+                 (CIRISPersist#658)"
+            );
+        }
+
+        for member in PROTECTED_ROOT_MEMBERS {
+            // The envelope carries the protected member plus one member that
+            // is legitimately strippable, so a transform that refused
+            // EVERYTHING would fail this witness too.
+            let env = serde_json::json!({ *member: "v", "payload": "p" });
+            for path in [(*member).to_string(), format!("/{member}")] {
+                let out = apply(&TransformOp::StripField { path: path.clone() }, &env).unwrap();
+                assert_eq!(
+                    out, env,
+                    "strip_field({path:?}) removed the protected root member `{member}`"
+                );
+            }
+            let stripped = apply(
+                &TransformOp::StripField {
+                    path: "/payload".to_string(),
+                },
+                &env,
+            )
+            .unwrap();
+            assert_eq!(
+                stripped,
+                serde_json::json!({ *member: "v" }),
+                "an UNprotected member beside `{member}` must still strip — otherwise this \
+                 witness would pass against a strip_field that does nothing at all"
+            );
+        }
     }
 
     #[test]
