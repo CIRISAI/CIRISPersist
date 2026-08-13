@@ -1,4 +1,4 @@
--- V122 — v30.13.0 (CIRISPersist#645): **the signature-covered envelope columns
+-- V122 — v31.0.0 (CIRISPersist#645): **the signature-covered envelope columns
 --        become TEXT, because JSONB is not a byte-preserving container.**
 --        Postgres dialect. SQLite needs NO twin: every column named here has
 --        been TEXT on SQLite since the day it was created, which is exactly
@@ -87,7 +87,7 @@ ALTER TABLE cirislens.federation_keys
         USING registration_envelope::text;
 
 COMMENT ON COLUMN cirislens.federation_keys.registration_envelope IS
-    'v30.13.0 (CIRISPersist#645) — TEXT, not JSONB: the exact bytes the '
+    'v31.0.0 (CIRISPersist#645) — TEXT, not JSONB: the exact bytes the '
     'producer signed. See V122 for the measurement and for what pre-V122 rows '
     'lost. SQLite parity: TEXT since V004.';
 
@@ -134,7 +134,7 @@ CREATE INDEX IF NOT EXISTS federation_attestations_composer_ref
     );
 
 COMMENT ON COLUMN cirislens.federation_attestations.attestation_envelope IS
-    'v30.13.0 (CIRISPersist#645) — TEXT, not JSONB. Query sites that need to '
+    'v31.0.0 (CIRISPersist#645) — TEXT, not JSONB. Query sites that need to '
     'reach inside cast explicitly (attestation_envelope::jsonb->>…); the cast '
     'is immutable and the two expression indexes above are built over it. '
     'SQLite parity: TEXT since V004.';
@@ -147,7 +147,7 @@ ALTER TABLE cirislens.federation_revocations
         USING revocation_envelope::text;
 
 COMMENT ON COLUMN cirislens.federation_revocations.revocation_envelope IS
-    'v30.13.0 (CIRISPersist#645) — TEXT, not JSONB. V118 reads `revoked_after` '
+    'v31.0.0 (CIRISPersist#645) — TEXT, not JSONB. V118 reads `revoked_after` '
     'out of this envelope; it is the SIGNED bound, so byte fidelity is load-'
     'bearing. SQLite parity: TEXT since V004.';
 
