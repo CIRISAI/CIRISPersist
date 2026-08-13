@@ -4289,6 +4289,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED. See
+        // the memory backend's put_attestation for the placement rationale;
+        // pure ⇒ TIER 1, backend-symmetric across memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
+        // STATED rather than left to the `hex::decode` at bind time. See the
+        // memory backend: binding nothing, it accepted what this refuses.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
@@ -5473,6 +5484,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
+
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
+        // STATED. The `hex::decode` at bind time refuses the same values but
+        // only as a side effect of binding a BYTEA, which is why the memory
+        // backend — binding nothing — accepted them. Placed HERE, ahead of the
+        // signature verify, on all three backends: `verify_revocation_admission`
+        // also cross-checks the hash, so a hex check sitting behind it on one
+        // backend and ahead of it on another would give two different refusals
+        // for one row.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
 
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
         // revocation MUST be hybrid-Strict-signed by its declared revoking
@@ -11328,8 +11352,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                 asserted_at, expires_at, attestation_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                cohort_scope\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             &[
                 &attestation.attestation_id,
                 &attestation.attesting_key_id,
@@ -11355,6 +11380,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 // and `list_attestations_since` filters on exactly that tier.
                 // The tier nobody chose is the tier that replicates.
                 &attestation_row.tier,
+                // v31.0.0 (CIRISPersist#660) — and `cohort_scope` alongside it,
+                // for the identical reason: omitted from the column list, it
+                // took the V056 schema default `'federation'`, which happens to
+                // equal what `holds_bytes_attestation_row` puts in the row the
+                // persist_row_hash covers. Two values agreeing because nobody
+                // chose either is not a binding.
+                &attestation_row.cohort_scope,
             ],
         )
         .await
@@ -14665,6 +14697,11 @@ impl PostgresBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
+        // THIS DOOR TOO. See the memory backend's local door for why this one
+        // cannot defer to the promote gate the way `check_reserved_prefix_admission`
+        // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
         // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
         // decision and the transit exclusion. One helper, all three backends.
@@ -15723,17 +15760,25 @@ async fn check_revocation_anti_rollback_postgres(
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
 
-    if let Some(r) = row {
-        let existing: chrono::DateTime<chrono::Utc> = r.get(0);
-        if submitted_ts <= existing {
-            return Err(crate::federation::Error::RevocationRollback {
-                revoked_key_id: revoked_key_id.to_owned(),
-                existing_signed_timestamp: existing,
-                submitted_signed_timestamp: submitted_ts,
-            });
-        }
-    }
-    Ok(())
+    // v31.0.0 (CIRISPersist#660) — the LOOKUP is backend-specific, the RULE is
+    // not. See `admission::check_revocation_anti_rollback`.
+    //
+    // Read through `safe_get_with` rather than a bare `Row::get` (#28): a bare
+    // decode PANICS on an unexpected NULL, and panicking inside an ANTI-ROLLBACK
+    // gate would turn a data problem into a downed write path — on the one
+    // check whose whole job is to refuse cleanly.
+    let latest = row
+        .map(|r| {
+            let ts: Result<chrono::DateTime<chrono::Utc>, _> =
+                r.safe_get_with("scrub_timestamp", crate::federation::Error::Backend);
+            ts
+        })
+        .transpose()?;
+    crate::federation::admission::check_revocation_anti_rollback(
+        revoked_key_id,
+        latest,
+        submitted_ts,
+    )
 }
 
 /// v2.10.0 (CIRISPersist#114) — Postgres row → [`crate::federation::Goal`].
@@ -21862,6 +21907,109 @@ mod tests {
             .await
             .expect("holders seed");
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the POSTGRES leg of the **revocation-door
+    /// parity** witness (see the memory + sqlite legs).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn revocation_door_parity_postgres_660() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::backend_parity_test_support::exercise_revocation_parity(
+            &backend, "postgres",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the POSTGRES leg of the **attestation
+    /// `original_content_hash` hex** parity witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn attestation_hash_hex_parity_postgres_660() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::backend_parity_test_support::exercise_attestation_hash_hex_parity(
+            &backend, "postgres",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the POSTGRES leg of the **`put_blob` states
+    /// its `cohort_scope`** witness (see the sqlite leg; memory has no
+    /// `BlobStorage` door).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn put_blob_states_cohort_scope_postgres_660() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::blobs::exercise_put_blob_states_its_cohort_scope(&backend, "postgres")
+            .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the POSTGRES leg of the **genesis-id squat**
+    /// witness (see the memory + sqlite legs). Postgres is the backend
+    /// production runs and the one #622 proved can refuse a symbolic
+    /// `attestation_id` outright, so the reservation has to be witnessed here
+    /// rather than inferred from the other two.
+    ///
+    /// Isolated database: the witness asserts the posture does not MOVE, which a
+    /// concurrent Engine-constructing test in the shared db could otherwise
+    /// change underneath it.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn genesis_id_squat_refused_parity_postgres_660() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            crate::federation::genesis::exercise_genesis_id_squat_refused(&backend, "postgres")
+                .await;
+        })
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the POSTGRES leg of the **injected-squat**
+    /// witness (see the memory + sqlite legs). A raw `UPDATE` renames an
+    /// ordinary admitted row onto a genesis id — the "beneath persist" case.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn injected_genesis_squat_is_divergent_postgres_660() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            let decoy =
+                crate::federation::genesis::seed_decoy_attestation(&backend, "postgres").await;
+            let target = crate::federation::genesis::genesis_delegation_ids()[0];
+            let client = backend.pool().get().await.expect("client");
+            let n = client
+                .execute(
+                    "UPDATE cirislens.federation_attestations SET attestation_id = $1 \
+                     WHERE attestation_id = $2",
+                    &[&target, &decoy],
+                )
+                .await
+                .expect("inject");
+            assert_eq!(n, 1, "the injection must actually have moved a row");
+            crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "postgres")
+                .await;
+        })
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the POSTGRES leg of the **anti-fail-open**

@@ -32,6 +32,213 @@ column on postgres have already lost the producer's numeric literals
 release, and no migration recovers it — re-publish is the only remedy.
 
 
+### Fixed — SECURITY — a peer could deny a node its boot with ONE ordinary attestation (#660)
+
+The baked genesis delegation ids — `genesis-charter`,
+`genesis-grant:ciris-canonical-1-d7bdeu223k`, `genesis-lifecycle` — were
+**reserved nowhere.** One `scores` row from any registered key, written under one
+of them, was admitted at both write doors. Two things followed, both remote and
+neither authenticated:
+
+1. `verify_delegation_plane_seeded` found a row whose `original_content_hash` is
+   not the baked one, classified it `divergent`, and `refuses_boot()` is true for
+   exactly that arm. **The node refused to boot.**
+2. `federation_attestations.attestation_id` is the primary key, so the key the
+   real ceremony needs was then TAKEN. The denial was permanent, not transient.
+
+This is the delegation leg #648 added, turned inside out. #648 closed a
+fail-OPEN banner (a 31.0.0 node reporting `Entrenched` on a root whose conferral
+rows can never install); without a reservation it opened a fail-CLOSED denial in
+its place, and the attacker chose which side of the absent/divergent split a node
+landed on.
+
+#648 had already found and named this exact shape one plane over: **nothing
+reserved the `humanity-accord` FAMILY id either**, defended only by an accident
+of ordering. `Error::GenesisAttestationReserved` is that finding on the
+attestation plane and takes the same shape — a typed refusal, at the door, naming
+the reservation. The rule:
+
+> A row claiming a baked genesis delegation id must be **federation-tier** and
+> **attested by a seated accord holder** on this node's effective roster.
+
+That is `check_reserved_prefix_admission`'s own `accord:*` rule (CC 3.4.1, the
+one constitutional asymmetry) applied to the id namespace instead of the type
+namespace. The id set is derived from `canonical_genesis_bundle()`, never
+re-listed, so 31.1.0's re-bake moves the reservation with it.
+
+**The first version of this gate was wrong, and the existing suite caught it.**
+It pinned CONTENT — "must be byte-identical to the baked row" — which reads well
+and would have reserved the ids against the one operation they exist for.
+`bake_real_genesis_v2_artifact_490` and
+`genesis_candidate_bundle_roots_to_the_family_under_quorum_557` install a
+CANDIDATE re-mint bundle: a re-ceremony legitimately reissues `genesis-charter`
+with new content and new instants. Both went red immediately. **The ids belong to
+the accord holders, not to one artifact.**
+
+Gated at BOTH doors on all three backends. The local door
+(`attestation_insert_local`) is not a formality — its `attestation_id` is
+caller-supplied (#473), it deliberately defers
+`check_reserved_prefix_admission` to promotion, and `get_attestation` does not
+filter by tier. A local-tier row was therefore already sufficient to take the key
+and flip the posture; promotion never had to happen.
+
+**What this does and does not close.** It closes the finding as reported: an
+ordinary peer can no longer reach the `divergent` arm by writing. It does not
+make `Divergent` unreachable outright, and the honest statement of what remains
+is that a **seated accord holder** can still write a divergent conferral row
+(that is the constitutional root itself, and refusing to serve is correct), and
+so can a write **beneath persist** — a restored backup, a direct `UPDATE`, a
+pre-#660 corpus. Both remaining routes are ones where `refuses_boot` is the right
+answer. The one that was wrong was a stranger choosing it for you.
+
+Witnessed both ways, on memory, sqlite AND postgres:
+`exercise_genesis_id_squat_refused` (refused at both doors, nothing written, and
+the posture does not MOVE) and `assert_injected_squat_is_divergent` (a row
+injected past the door is still classified divergent, still refuses boot, still
+banners "Do not serve"). The rogue row is fully sealed before it is offered, so
+it is a row every other gate would have admitted.
+
+### Testing — a 17-mutation campaign, and the one that found a decorative witness (#660)
+
+Every gate above was mutated and the witnesses re-run. Detection keys on
+nextest's `Summary [...] N tests run:` line rather than the `error: test run
+failed` epilogue — a COMPILE error prints that epilogue too, so matching it
+reports kills that were never measured. Per mutation the harness asserts the
+anchor occurs exactly once, the patch differs from baseline, and the file
+re-read from disk equals the patch.
+
+**One survivor, and it was a real gap.** Deleting the federation-tier half of
+the genesis reservation changed nothing: both squat rows in the witness are
+*also* refused by the accord-holder half, so the tier arm could have been dead
+code and the suite would not have noticed — while a seated accord holder could
+have staged a LOCAL-tier row under a genesis id and taken the primary key
+without ever touching the federation plane. The witness now offers a local-tier
+row at the federation door (which is tier-blind, see `check_capacity_never_local`)
+and asserts the refusal names `tier` rather than `attesting_key_id`. The
+mutation now dies.
+
+**And the postgres leg earned its place immediately.** The revocation witness
+was green on memory and sqlite and red on postgres, with
+`revocation_id is not a valid UUID` — `federation_revocations.revocation_id` is
+typed `UUID` there, so a readable string id is refused by the DRIVER before any
+persist logic runs, while memory and sqlite accept any TEXT. That is #622's
+`attestation_id` story on the revocation plane, and it is exactly the reason a
+single-backend witness is not evidence. The fixture mints UUIDs now; the
+underlying id-type divergence between the backends is noted, not changed, since
+nothing today requires a symbolic revocation id the way genesis requires a
+symbolic `attestation_id`.
+
+**One equivalent mutant, recorded rather than papered over.**
+`migration::classify_shape` DISCARDS its `now` argument by design (#650) and the
+genesis call site also passes `row.asserted_at`, so the clock-independence
+property has two independent guarantees and neither single mutation can change
+behaviour. Mutating both together reds
+`delegation_plane_shape_is_clock_independent_660`, which is where that witness's
+teeth actually are. The redundancy is kept and the reasoning is now stated at the
+call site.
+
+### Fixed — the genesis bundle digest binds serve-node IDENTITY; the doc claimed it bound their CONTENT (#660)
+
+`authorization_digest`'s module doc ended *"a co-signer cannot be replayed onto a
+bundle with a swapped serve node or a widened charter."* Half of that was true.
+
+- **A widened charter — genuinely covered.** Each attestation contributes its
+  whole `attestation_envelope`, so the conferral plane is bound byte-for-byte.
+- **A swapped serve node — covered only by IDENTITY.** `serve_nodes` and
+  `holders` contribute their `key_id`s and nothing else. Substituting the RECORD
+  under an unchanged `key_id` — different pubkey, `registration_envelope`, scrub
+  set, `valid_from`, roles, custody evidence — does not appear in the digest at
+  all.
+
+**The doc is corrected in place, not deleted.** This release has already found
+four comments that documented a security property as intentional when it was the
+defect; a fifth would be worse than none, because a comment is what a reviewer
+trusts instead of reading the preimage. The corrected text also names what
+actually stops the substitution — `put_public_key`'s canonical-role admission (a
+2-of-3 accord co-scrub re-verified against this node's pinned anchors) and
+`bake_assembled_genesis`'s pubkey + `valid_from` guards — so a reader is pointed
+at the real mechanism rather than at a digest that never did that job.
+
+**The digest was NOT widened, and that is a deliberate call.** The preimage is a
+cross-repo wire contract, declared byte-identical to the PRODUCER's (CIRISServer
+`mesh_genesis::authorization_digest`), and holder authorizations are signed over
+the producer's construction. Widening it consumer-side alone would make persist
+refuse every bundle CIRISServer emits — including the baked `canonical_seed.json`
+whose authorizations are already signed over the narrow preimage. It is the right
+change and the v31 re-ceremony is the right window, so it is tracked as
+CIRISServer-side work with both halves landing together, not described as covered.
+
+### Fixed — the boot classifier existed twice more, and both copies read the wall clock (#660)
+
+`migration::classify_shape` (#650) is the routine that answers *"is this row
+v31-shaped?"*. The genesis module had two more hand-rolled copies of it —
+`verify_delegation_plane_seeded`'s shape half (the REAL boot path) and
+`bundle_delegation_plane_v31_shaped` — and both had drifted from it in three
+ways:
+
+1. they passed `Utc::now()` to `check_instant_binding` where the classifier
+   deliberately passes the ROW'S OWN `asserted_at`. That arm is a FRESHNESS
+   bound, not a shape fact, and #650 fixed exactly this because reading a clock
+   problem as a shape problem got a legitimate peer corpus PURGED. Here the
+   consequence was different and just as bad: on a node whose clock lags — a VM
+   snapshot restore, a container up before NTP — a fully entrenched root demoted
+   to `pre_genesis`, raised the PRE-GENESIS banner and told the host to refuse
+   agent mode. **A self-inflicted outage from a clock.**
+2. they ran the two gates in the opposite order, so a row failing both drew a
+   different sentence here than in the migration report;
+3. neither asked `check_canonical_at_rest` (#647), so the genesis leg called a
+   row conformant that the migration classifier calls legacy.
+
+Both now call `classify_shape(row, row.asserted_at)`. One spelling. Freshness is
+still enforced where it belongs — the put doors, promotion, and
+`check_reseal_admission`, all against the true clock.
+
+The four artifact-branched genesis witnesses are untouched and still branch on
+`bundle_delegation_plane_v31_shaped`, so 31.1.0's re-bake still flips them by
+itself. `delegation_plane_shape_is_clock_independent_660` seals a row one hour
+AHEAD of the checking clock and asserts it is v31-shaped anyway — with a dye test
+asserting the SAME row read through `Utc::now()` IS refused, so the fixture
+cannot rot into a tautology.
+
+### Fixed — backend parity: three gates memory never ran, and a column two backends never named (#660)
+
+*Memory tolerates what the SQL backends reject* has recurred at least eight times
+in recent releases. Four more instances, each now witnessed from ONE shared body
+that memory, sqlite and postgres all run:
+
+- **`put_revocation` ran neither `check_observed_region` nor the anti-rollback
+  check on memory.** sqlite and postgres have run both since v3.11.0, and carry
+  the V058 CHECK constraint behind the region gate as well. On memory an
+  arbitrary `observed_region` was accepted, and an OLD, still-validly-signed
+  revocation could be REPLAYED to re-assert a state its subject had already moved
+  past. The anti-rollback comparison was spelled out twice (once per SQL helper)
+  and nowhere a third time; it is now the shared
+  `admission::check_revocation_anti_rollback`, with only the per-backend "find
+  the newest stored row" half left to differ.
+- **The reverse direction, found by looking:** memory ran
+  `check_revocation_authority` (a directory walk) BEFORE
+  `verify_revocation_admission` (the signature verify) — the AV-76 tier order
+  inverted on one backend only, spending unauthenticated reads on a revocation
+  whose signature had not been checked. Reordered to match.
+- **`original_content_hash` was validated as hex only by accident.** The column is
+  `BLOB`/`BYTEA`, so the SQL backends had to `hex::decode` it to bind and refused
+  a non-hex value as a side effect; memory decodes nothing and accepted
+  `"abcdef0"` — a row unwritable on the two backends production runs. Now stated
+  as `admission::check_content_hash_hex` on all three, at the same position on
+  both the attestation and revocation doors. The rule is deliberately EXACTLY
+  `hex::decode`'s and not "64 characters": widening it would refuse rows the SQL
+  backends admit today, which would be a new rule wearing a parity fix's clothes.
+- **`put_blob` relied on a `cohort_scope` schema default on BOTH SQL backends** —
+  the exact sibling of the `tier` omission #652 fixed on the same INSERT. It
+  coincided with what `holds_bytes_attestation_row` puts in the row the
+  `persist_row_hash` covers, and (since #643) with what the signed `row` mirror
+  declares. Two values agreeing because nobody chose either is not a binding. Now
+  named explicitly in both column lists. The witness's teeth are
+  `check_row_column_binding` over the row **as read back from the table** — the
+  only form that can see an INSERT's omission at all. Two backends, not three:
+  `put_blob` is `BlobStorage`, which memory does not implement, so the parity set
+  is exactly the set of backends that have the door.
+
 ### Fixed — SECURITY — six doors that wrote without the gates their siblings run (#656)
 
 The v31.0.0 pre-cut adversarial review found the same shape six more times, and

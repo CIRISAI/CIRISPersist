@@ -507,6 +507,170 @@ pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     })
 }
 
+/// v31.0.0 (CIRISPersist#660) — **the baked delegation-plane ids, as a closed
+/// set**, derived from the artifact rather than re-listed.
+///
+/// Today: `genesis-charter`, `genesis-grant:ciris-canonical-1-d7bdeu223k`,
+/// `genesis-lifecycle`. Deriving it from [`canonical_genesis_bundle`] means a
+/// re-bake that renames or adds a conferral row moves the reservation with it;
+/// a hand-written list would reserve the OLD names and leave the new ones open,
+/// which is the failure this whole class keeps taking.
+#[must_use]
+pub fn genesis_delegation_ids() -> Vec<&'static str> {
+    canonical_genesis_bundle()
+        .attestations
+        .iter()
+        .map(|a| a.attestation.attestation_id.as_str())
+        .collect()
+}
+
+/// The baked row for `id`, if `id` is a genesis delegation id.
+fn baked_delegation_row(id: &str) -> Option<&'static super::Attestation> {
+    canonical_genesis_bundle()
+        .attestations
+        .iter()
+        .map(|a| &a.attestation)
+        .find(|a| a.attestation_id == id)
+}
+
+/// v31.0.0 (CIRISPersist#660) — **the genesis delegation ids are RESERVED** to
+/// the accord holders, at every write door.
+///
+/// # The hole this closes
+///
+/// `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle` were reserved
+/// NOWHERE. One ordinary `scores` row from any registered key, written under one
+/// of those ids, was admitted — and two things followed, both remote and both
+/// unauthenticated:
+///
+/// 1. [`verify_delegation_plane_seeded`] found a row whose
+///    `original_content_hash` is not the baked one, classified it
+///    [`GenesisFault::divergent`], and
+///    [`GenesisFault::refuses_boot`](GenesisFault::refuses_boot) is true for
+///    exactly that arm — so **a peer could deny a node its boot** by writing one
+///    attestation. #648 added the delegation leg to close a fail-OPEN banner;
+///    without this reservation it opened a fail-CLOSED denial in its place.
+/// 2. The primary key was then TAKEN, so the real ceremony row could never
+///    install. The denial was permanent, not transient.
+///
+/// # Shape: mirrored from the #648 family reservation
+///
+/// [`Error::ConstitutionalFamilyReserved`](super::Error::ConstitutionalFamilyReserved)
+/// reserved the `humanity-accord` FAMILY id after the same finding on the family
+/// plane — nothing reserved it, and only an accident of ordering (the seed was
+/// unconditional, so the key was always already taken) had defended it. This is
+/// that finding on the ATTESTATION plane and it takes the same shape: a typed
+/// refusal, at the door, naming the reservation.
+///
+/// It differs from #648 in one way, and the difference is forced by the plane.
+/// The family reservation could be ABSOLUTE at the peer door because the
+/// ceremony writes families through a different method
+/// ([`put_family_local`](super::FederationDirectory::put_family_local)). The
+/// delegation plane has no second door: [`bake_assembled_genesis`], the host's
+/// stage-1 boot write, and a peer's replication all arrive at
+/// `put_attestation`. So the reservation names an AUTHOR instead:
+///
+/// > A row claiming a baked genesis delegation id must be **federation-tier**
+/// > and **attested by a seated accord holder** on this node's effective roster.
+///
+/// That is `check_reserved_prefix_admission`'s own `accord:*` rule
+/// (CC 3.4.1, the one constitutional asymmetry) applied to the id namespace
+/// rather than the type namespace, and it draws exactly the trust boundary #648
+/// drew for the family id.
+///
+/// # Why NOT "must be byte-identical to the baked row"
+///
+/// That was the first form of this gate and it was wrong — caught by
+/// `bake_real_genesis_v2_artifact_490` and
+/// `genesis_candidate_bundle_roots_to_the_family_under_quorum_557`, which install
+/// a CANDIDATE re-mint bundle. A re-ceremony legitimately reissues
+/// `genesis-charter` with new content and new instants; pinning the content
+/// would have reserved the ids against the one operation they exist for, and
+/// 31.1.0's re-bake would have been refused by its own substrate. The ids belong
+/// to the accord holders, not to one artifact.
+///
+/// # What this does and does not close
+///
+/// It closes the finding as reported: *one ordinary `scores` row from any
+/// registered key*. An ordinary peer cannot claim these ids at either door, so
+/// it can neither take the primary key the ceremony needs nor drive
+/// [`verify_delegation_plane_seeded`] to its `divergent` arm — which
+/// [`GenesisFault::refuses_boot`], and was therefore a remote, unauthenticated,
+/// permanent boot-denial.
+///
+/// It does NOT make `Divergent` unreachable outright, and the honest statement
+/// of what remains is:
+///
+/// - a **seated accord holder** can still write a divergent conferral row. That
+///   is the constitutional root itself, the same authority that could simply
+///   re-charter the mesh, and `refuses_boot` is the correct response to a root
+///   that has genuinely altered its own delegation plane;
+/// - a write **beneath persist** — a restored backup, a direct `UPDATE`, a
+///   pre-#660 corpus — is unreachable by any door and equally must classify as
+///   divergent.
+///
+/// Both remaining routes are ones where refusing to serve is the right answer.
+/// The one that was wrong was a stranger choosing it for you. Witnessed in
+/// `exercise_genesis_id_squat_refused` (refused at both doors, posture
+/// unmoved) and `assert_injected_squat_is_divergent` (still classified, still
+/// refuses boot, still banners).
+///
+/// # Tier 1
+///
+/// Pure: a string compare against a 3-element set, then a membership test
+/// against the baked roster. No directory read — the roster is re-derived from
+/// this node's own baked state, never from anything the row carries (#377).
+///
+/// # Errors
+///
+/// [`Error::GenesisAttestationReserved`](super::Error::GenesisAttestationReserved)
+/// naming the id, the claimant and which half of the rule it failed.
+pub fn check_genesis_attestation_reserved(row: &super::Attestation) -> Result<(), super::Error> {
+    if baked_delegation_row(&row.attestation_id).is_none() {
+        // The overwhelmingly common path: not a genesis id, nothing to say.
+        return Ok(());
+    }
+    let refuse = |field: &str, detail: String| super::Error::GenesisAttestationReserved {
+        attestation_id: row.attestation_id.clone(),
+        attesting_key_id: row.attesting_key_id.clone(),
+        field: field.to_owned(),
+        detail,
+    };
+
+    // (a) FEDERATION TIER. A ceremony row is federation-tier by construction;
+    // the local door mints local-tier rows and is never a genesis door. This
+    // half is what makes the local door safe without a second rule there — and
+    // the local door DOES have to be gated, because `get_attestation` does not
+    // filter by tier, so a local-tier row is already enough to take the key and
+    // flip the posture.
+    if row.tier != crate::federation::types::attestation_tier::FEDERATION {
+        return Err(refuse(
+            "tier",
+            format!(
+                "is {:?} — the genesis delegation plane is federation-tier, and a local-tier \
+                 row under this id would take the primary key the ceremony needs",
+                row.tier
+            ),
+        ));
+    }
+
+    // (b) A SEATED ACCORD HOLDER. Re-derived from THIS node's effective baked
+    // roster — the same selector `verify_bundle_quorum` and the admission
+    // quorum ride — never from anything the row carries.
+    let seated = effective_accord_holder_records()
+        .iter()
+        .any(|h| h.record.key_id == row.attesting_key_id);
+    if !seated {
+        return Err(refuse(
+            "attesting_key_id",
+            "is not a seated accord holder on this node's roster — these ids are installed \
+             by the genesis ceremony, and the ceremony is the accord holders"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// First-boot-seed the baked 2-of-3 canonical genesis server(s)
 /// (CIRISPersist#390). Generic over [`FederationDirectory`] (pg/sqlite-symmetric).
 ///
@@ -695,22 +859,36 @@ where
                 ),
             ));
         }
-        // Then SHAPE: a row installed under the pre-#643 envelope is the state
+        // Then SHAPE: a row installed under the pre-v31 envelope is the state
         // 31.0.0 ships in, so it is `absent` — awaiting the re-ceremony.
-        if let Err(e) = crate::federation::admission::check_row_column_binding(&row) {
+        //
+        // v31.0.0 (CIRISPersist#660) — asked through the MIGRATION classifier
+        // rather than by re-listing its gates. This was a second implementation
+        // of [`classify_shape`](crate::federation::migration::classify_shape) and
+        // it disagreed with the first in three ways, one of them live:
+        //
+        // - it evaluated `check_instant_binding` at `Utc::now()` instead of the
+        //   ROW'S OWN `asserted_at`. #650 fixed exactly that in the classifier
+        //   because the skew arm is a FRESHNESS bound, not a shape fact — and
+        //   here the consequence was that a node with a lagging clock (VM
+        //   snapshot, container up before NTP) demoted a fully entrenched root
+        //   to `pre_genesis`, raised the banner and told the host to refuse
+        //   agent mode. A posture that changes because the clock moved is not
+        //   reporting on a trust root.
+        // - it ran the two gates in the opposite order, so a row failing both
+        //   drew a different sentence here than in the migration report.
+        // - it never asked `check_canonical_at_rest` (#647), so this leg called
+        //   a row conformant that the migration classifier calls legacy.
+        //
+        // One spelling. Freshness is still enforced where it belongs — the put
+        // doors, promotion, and `check_reseal_admission`, all against the true
+        // clock.
+        if let crate::federation::migration::RowShape::Legacy { why } =
+            crate::federation::migration::classify_shape(&row, row.asserted_at)
+        {
             return Err(GenesisFault::absent(
                 LEG,
-                format!("delegation row {id} predates the #643 row mirror: {e}"),
-            ));
-        }
-        if let Err(e) = crate::federation::admission::check_instant_binding(
-            &row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        ) {
-            return Err(GenesisFault::absent(
-                LEG,
-                format!("delegation row {id} predates the #598 signed instants: {e}"),
+                format!("delegation row {id} is not v31-shaped: {why}"),
             ));
         }
     }
@@ -743,19 +921,42 @@ where
 pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), String> {
     for att in &bundle.attestations {
         let row = &att.attestation;
-        // BOTH binding gates, because "v31-shaped" is a property of the
-        // envelope, not of one issue number. Asking only about the #643 mirror
-        // was over-specific the moment #598's instant gate widened past
-        // `consent:state:*`: the stale bundle now trips the instant gate FIRST,
-        // and a predicate that answered "row-bound: no" for the wrong reason
-        // would still be answering by accident.
-        crate::federation::admission::check_row_column_binding(row).map_err(|e| e.to_string())?;
-        crate::federation::admission::check_instant_binding(
-            row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )
-        .map_err(|e| e.to_string())?;
+        // "v31-shaped" is a property of the envelope, not of one issue number.
+        // Asking only about the #643 mirror was over-specific the moment #598's
+        // instant gate widened past `consent:state:*`: the stale bundle now
+        // trips the instant gate FIRST, and a predicate that answered
+        // "row-bound: no" for the wrong reason would still be answering by
+        // accident.
+        //
+        // v31.0.0 (CIRISPersist#660) — so ask the ONE routine that already owns
+        // that question, [`classify_shape`](crate::federation::migration::classify_shape),
+        // at the row's own instant. This was the second of two copies of it
+        // living in this file; see `verify_delegation_plane_seeded` for the
+        // three ways both copies had drifted. Evaluating at `asserted_at`
+        // matters here for a reason of its own: a BAKED artifact's instants are
+        // fixed at ceremony time and recede further into the past with every
+        // release, so a wall-clock skew arm was asking a question about the
+        // build clock, not about the bundle.
+        //
+        // **Measured, not assumed: `row.asserted_at` here is an EQUIVALENT
+        // MUTANT today.** `classify_shape` DISCARDS its `now` argument
+        // (`let _ = now;`, #650) and evaluates the binding at the row's own
+        // instant regardless, so replacing this argument with `Utc::now()`
+        // changes nothing — a mutation campaign confirmed it survives, as does
+        // the converse mutation inside `classify_shape`. Only mutating BOTH
+        // reaches the skew arm, and that pair reds
+        // `delegation_plane_shape_is_clock_independent_660`.
+        //
+        // The redundancy is kept deliberately and stated rather than removed:
+        // it is defence in depth for a property whose absence is silent, and
+        // passing the wall clock here would be the wrong argument to pass even
+        // while the callee ignores it. If `classify_shape` ever starts honouring
+        // `now`, this call site is already correct.
+        if let crate::federation::migration::RowShape::Legacy { why } =
+            crate::federation::migration::classify_shape(row, row.asserted_at)
+        {
+            return Err(why);
+        }
     }
     Ok(())
 }
@@ -893,6 +1094,303 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
     }
 }
 
+/// An ordinary, wholly unremarkable `scores` row under `id` from `attester` —
+/// the "one row from any registered key" of the #660 finding. Caller seals it.
+///
+/// Shared by the squat witness and by the injected-squat legs, so the row the
+/// door refuses and the row a backend smuggles past the door are the SAME row.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) fn ordinary_scores_row(id: &str, attester: &str) -> super::Attestation {
+    use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+    let now = chrono::Utc::now();
+    super::Attestation {
+        attestation_id: id.to_owned(),
+        attesting_key_id: attester.to_owned(),
+        attested_key_id: attester.to_owned(),
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: Some(1.0),
+        asserted_at: now,
+        expires_at: None,
+        attestation_envelope: serde_json::json!({
+            "id": id,
+            "dimension": "trust:demo:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        }),
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: attester.to_owned(),
+        scrub_timestamp: now,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        tier: attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// v31.0.0 (CIRISPersist#660) — write a decoy row under an ORDINARY id, and
+/// return that id, so a SQL leg can then rename it onto a genesis id beneath
+/// persist (the "however it got there" case: a direct `UPDATE`, a restored
+/// backup, a pre-#660 corpus). The write goes through the real door, so what
+/// gets renamed is a genuinely well-formed row and not a fixture artefact.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn seed_decoy_attestation(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) -> String {
+    use crate::federation::tier_ingest::test_support as ts;
+    // Distinguishing part FIRST — `seed_for` truncates key_ids at 32 bytes.
+    let attester = format!("{tag}-660-decoy-signer");
+    ts::register_identity_key(
+        dir,
+        &attester,
+        crate::federation::types::identity_type::AGENT,
+    )
+    .await;
+    let id = format!("{tag}-660-decoy");
+    dir.put_attestation(super::SignedAttestation {
+        attestation: ts::seal_row(&attester, ordinary_scores_row(&id, &attester)),
+    })
+    .await
+    .expect("the decoy row is ordinary and must be admitted");
+    id
+}
+
+/// v31.0.0 (CIRISPersist#660) — **the squat witness, on every backend.**
+///
+/// A peer could deny a node its boot with ONE ordinary attestation. The baked
+/// genesis ids were reserved nowhere, so a `scores` row written under
+/// `genesis-charter` made [`verify_delegation_plane_seeded`] report `Divergent`,
+/// which [`GenesisFault::refuses_boot`] — and took the primary key the real
+/// ceremony needs, making the denial permanent.
+///
+/// Three properties, and the third is the one that keeps the fix honest:
+///
+/// 1. **BOTH doors refuse.** `put_attestation` AND the local door
+///    (`attestation_insert_local`, whose `attestation_id` is caller-supplied).
+///    The local one is not a formality — it is the cheaper attack, because
+///    `get_attestation` does not filter by tier, so a local-tier row is already
+///    enough to take the key and flip the posture.
+/// 2. **Nothing is written, and the posture does NOT become divergent.** This
+///    is the "verify that, do not assume it" half: reservation is only a fix if
+///    `Divergent` actually stops being reachable by this route.
+/// 3. **The ceremony's own rows still pass the reservation.** A gate that
+///    reserved the ids by refusing everything would also refuse genesis, and the
+///    node would simply fail differently. Asserted against the baked artifact,
+///    so a re-bake that changes the ids re-checks itself.
+///
+/// The rogue row is FULLY SEALED before it is offered — mirror stamped, instants
+/// stamped, hybrid-signed — so it is a row every other gate would admit. A
+/// witness built from a malformed row would pass against a deleted reservation,
+/// which is the failure mode this file has already paid for once.
+///
+/// The refusal is asserted on the TYPED `kind()`, never on an issue number in a
+/// message.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn exercise_genesis_id_squat_refused(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{
+        attestation_tier, attestation_type, cohort_scope, identity_type,
+    };
+
+    const RESERVED: &str = "federation_genesis_attestation_reserved";
+
+    // Trap paid for today: `test_support::seed_for` truncates key_ids at 32
+    // bytes, so two ids sharing a 32-byte prefix ARE one identity. The
+    // distinguishing part goes FIRST.
+    let rogue = format!("{tag}-660-squatter");
+    ts::register_identity_key(dir, &rogue, identity_type::AGENT).await;
+
+    // (3) The reservation must not refuse the ceremony it exists to protect.
+    for sa in &canonical_genesis_bundle().attestations {
+        check_genesis_attestation_reserved(&sa.attestation).unwrap_or_else(|e| {
+            panic!(
+                "[{tag}] the BAKED row {:?} must pass its own reservation — a gate that \
+                 refuses genesis has not reserved the id, it has deleted it: {e}",
+                sa.attestation.attestation_id
+            )
+        });
+    }
+
+    let posture_before = posture::genesis_posture(dir).await;
+
+    for id in genesis_delegation_ids() {
+        // ── door 1: the federation door. A fully sealed, otherwise-admissible
+        //    row — the strongest form of the claim.
+        let err = dir
+            .put_attestation(super::SignedAttestation {
+                attestation: ts::seal_row(&rogue, ordinary_scores_row(id, &rogue)),
+            })
+            .await
+            .expect_err("a squat on a baked genesis id must be REFUSED at the federation door");
+        assert_eq!(
+            err.kind(),
+            RESERVED,
+            "[{tag}] {id}: the refusal must be the RESERVATION, not a neighbouring gate \
+             that happened to fire first: {err}"
+        );
+        assert!(
+            dir.get_attestation(id).await.expect("read back").is_none(),
+            "[{tag}] {id}: a refused squat writes NOTHING — and the primary key stays free \
+             for the ceremony"
+        );
+
+        // ── door 2: the LOCAL door, where `attestation_id` is caller-supplied
+        //    and `check_reserved_prefix_admission` is deliberately deferred to
+        //    promotion. Deferring THIS one the same way would leave the whole
+        //    attack open, because taking the key is the attack.
+        let err = dir
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: Some(id.to_owned()),
+                attesting_key_id: rogue.clone(),
+                attested_key_id: None,
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: Some(1.0),
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "id": id, "dimension": "trust:demo:v1", "score": 1.0, "confidence": 0.9,
+                    }),
+                )
+                .expect("envelope"),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect_err("a squat on a baked genesis id must be REFUSED at the LOCAL door too");
+        assert_eq!(
+            err.kind(),
+            RESERVED,
+            "[{tag}] {id}: the local door must refuse with the same typed reservation: {err}"
+        );
+        assert!(
+            dir.get_attestation(id).await.expect("read back").is_none(),
+            "[{tag}] {id}: a refused local squat writes NOTHING — note `get_attestation` does \
+             NOT filter by tier, which is exactly why this door had to be gated"
+        );
+
+        // ── the TIER half, on its own. The two rows above are BOTH refused by
+        //    the accord-holder half, so neither of them can tell whether the
+        //    federation-tier half runs at all — a mutation deleting it survived
+        //    this witness until this leg existed.
+        //
+        //    `put_attestation` accepts `tier = "local"` (see
+        //    `check_capacity_never_local` for why that door is tier-blind), so a
+        //    LOCAL-tier row offered at the FEDERATION door isolates the tier
+        //    arm: it must be refused naming `tier`, not `attesting_key_id`.
+        //    That distinction is what a seated accord holder writing a
+        //    local-tier row would otherwise exploit to take the primary key
+        //    without ever touching the federation plane.
+        let mut local_tier = ordinary_scores_row(id, &rogue);
+        local_tier.tier = attestation_tier::LOCAL.to_owned();
+        local_tier.cohort_scope = cohort_scope::SELF.to_owned();
+        let err = dir
+            .put_attestation(super::SignedAttestation {
+                attestation: ts::seal_row(&rogue, local_tier),
+            })
+            .await
+            .expect_err("a local-tier row under a genesis id must be REFUSED");
+        assert_eq!(
+            err.kind(),
+            RESERVED,
+            "[{tag}] {id}: local-tier squat must hit the reservation: {err}"
+        );
+        match &err {
+            super::Error::GenesisAttestationReserved { field, .. } => assert_eq!(
+                field, "tier",
+                "[{tag}] {id}: the TIER half must be the one that refuses a local-tier row — \
+                 if `attesting_key_id` answers here, the tier arm is dead code and a seated \
+                 holder could stage a local-tier row under this id"
+            ),
+            other => panic!("[{tag}] {id}: {other:?}"),
+        }
+        assert!(
+            dir.get_attestation(id).await.expect("read back").is_none(),
+            "[{tag}] {id}: a refused local-tier squat writes NOTHING"
+        );
+    }
+
+    // (2) `Divergent` is not reachable by this route. Stated as an equality
+    // against the posture BEFORE the attempts rather than as `!= divergent`: a
+    // squat must not move the posture at all.
+    let posture_after = posture::genesis_posture(dir).await;
+    assert_ne!(
+        posture_after.as_str(),
+        "divergent",
+        "[{tag}] a refused squat must never produce CONSTITUTIONAL DIVERGENCE — that arm \
+         refuses boot, which is the remote denial #660 closes"
+    );
+    assert_eq!(
+        posture_before.as_str(),
+        posture_after.as_str(),
+        "[{tag}] a refused squat must not move the posture at all"
+    );
+}
+
+/// v31.0.0 (CIRISPersist#660) — **the other half: a corpus that contains one
+/// anyway.**
+///
+/// Reservation closes the write doors. It cannot close a restored backup, a
+/// direct `UPDATE`, or a corpus written by a pre-#660 binary — so the classifier
+/// still has to answer for that row, and the answer still has to be defensible.
+///
+/// It is: `Divergent` on the delegation leg, which
+/// [`GenesisFault::refuses_boot`], with a banner naming what happened. That is
+/// the CORRECT verdict once squatting is unreachable remotely — a divergent
+/// delegation row now necessarily means an established root was altered beneath
+/// persist, which is precisely the case #648 built the arm for. Before #660 the
+/// same verdict was wrong, because a peer chose it for you.
+///
+/// The caller injects the row (each backend's own bypass — a raw INSERT, a state
+/// push); the assertion is shared so the three legs cannot disagree about what
+/// "defensible" means.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_injected_squat_is_divergent(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let fault = verify_delegation_plane_seeded(dir)
+        .await
+        .expect_err("an injected squat must be classified, never passed");
+    assert_eq!(
+        fault.as_str(),
+        "divergent",
+        "[{tag}] a substituted conferral row is DIVERGENT, not absent: {fault}"
+    );
+    assert_eq!(
+        fault.leg(),
+        GenesisLeg::Delegation,
+        "[{tag}] and it is the delegation leg that diverged: {fault}"
+    );
+    assert!(
+        fault.refuses_boot(),
+        "[{tag}] a root altered beneath persist must not serve: {fault}"
+    );
+    let posture: GenesisPosture = fault.into();
+    assert_eq!(
+        posture.as_str(),
+        "divergent",
+        "[{tag}] and the posture says so"
+    );
+    let banner = posture
+        .banner()
+        .unwrap_or_else(|| panic!("[{tag}] a divergent posture MUST carry an operator banner"));
+    assert!(
+        banner.contains("CONSTITUTIONAL DIVERGENCE") && banner.contains("Do not serve"),
+        "[{tag}] the banner must tell the operator not to serve: {banner}"
+    );
+}
+
 /// v13.4.1 (CIRISPersist#392) — the **single shared genesis-seed routine** run
 /// by BOTH engine constructors ([`Engine::with_signer`](crate::engine::Engine::with_signer)
 /// AND the pyo3 `PyEngine::new`), so they are **seed-identical by construction**
@@ -940,6 +1438,79 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// v31.0.0 (CIRISPersist#660) — **the delegation leg's verdict must not
+    /// depend on the wall clock.**
+    ///
+    /// [`bundle_delegation_plane_v31_shaped`] and the shape half of
+    /// [`verify_delegation_plane_seeded`] were two hand-rolled copies of
+    /// [`classify_shape`](crate::federation::migration::classify_shape), and
+    /// both passed `Utc::now()` to `check_instant_binding` where the classifier
+    /// deliberately passes the ROW'S OWN `asserted_at` (#650).
+    ///
+    /// `check_instant_binding`'s fourth arm is a FRESHNESS bound — reject
+    /// `asserted_at > now + max_skew` — so on a node whose clock lags (a VM
+    /// snapshot restore, a container up before NTP) a perfectly bound delegation
+    /// row reads as "not v31-shaped". On the posture path that demotes a fully
+    /// entrenched root to `pre_genesis`, raises the PRE-GENESIS banner and tells
+    /// the host to refuse agent mode — a self-inflicted outage from a clock.
+    ///
+    /// The fixture is the difference stated directly: a row sealed one hour in
+    /// the FUTURE relative to the checking clock. Correctly bound, wrong only if
+    /// the wall clock is the reference. Freshness is still enforced where it
+    /// belongs (the put doors, promotion, `check_reseal_admission`), all against
+    /// the true clock — this leg is asking about shape.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn delegation_plane_shape_is_clock_independent_660() {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        let signer = "660clock-signer";
+        let mut row = super::ordinary_scores_row("660clock-row", signer);
+        // One hour AHEAD of the checking clock: the exact input the skew arm
+        // rejects and the binding does not care about.
+        row.asserted_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        ts::seal_row_in_place(signer, &mut row);
+        // Canonical at rest (#647), the way a real put door leaves the row: the
+        // seal stamps `weight: 1.0` into the mirror and JCS renders that `1`.
+        // `original_content_hash` is already SHA-256 of the CANONICAL form, so
+        // this only settles the stored bytes — it does not disturb the seal.
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)
+            .expect("canonicalize");
+
+        let bundle = super::GenesisBundle {
+            version: 2,
+            family_key_id: "humanity-accord".to_owned(),
+            holders: Vec::new(),
+            serve_nodes: Vec::new(),
+            consensus_protocol: "quorum:2/3".to_owned(),
+            attestations: vec![crate::federation::SignedAttestation { attestation: row }],
+            authorizations: Vec::new(),
+            produced_at: "2026-08-12T00:00:00Z".to_owned(),
+        };
+
+        super::bundle_delegation_plane_v31_shaped(&bundle).unwrap_or_else(|why| {
+            panic!(
+                "a correctly bound delegation row must be v31-SHAPED regardless of where the \
+                 wall clock happens to be — shape is not freshness: {why}"
+            )
+        });
+
+        // And the dye test: the SAME row read through the wall clock is refused,
+        // which is what makes the assertion above a difference rather than a
+        // tautology. If this ever stops failing, the fixture has gone stale and
+        // the assertion above proves nothing.
+        let skewed = crate::federation::admission::check_instant_binding(
+            &bundle.attestations[0].attestation,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        );
+        assert!(
+            skewed.is_err(),
+            "the fixture must actually trip the wall-clock skew arm, or this witness is \
+             measuring nothing"
+        );
+    }
+
     /// **CIRISPersist#557 — the CEREMONY DRY RUN.** Installs a candidate
     /// re-mint bundle through the REAL gates and asserts it roots to the
     /// FAMILY under quorum — the validation promised on #557 before any
