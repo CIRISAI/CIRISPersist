@@ -371,29 +371,37 @@ pub(crate) mod test_support {
         .await
         .expect("register the self-revoking key");
 
-        let rev_envelope =
-            awkward_envelope(&[("revoked_key_id", serde_json::Value::String(rev_kid.clone()))]);
-        let (rev_och, rev_ed, rev_pqc) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&rev_kid, &rev_envelope);
         let rev_id = uuid::Uuid::new_v4().to_string();
-        let revocation = crate::federation::Revocation {
-            revocation_id: rev_id.clone(),
-            revoked_key_id: rev_kid.clone(),
-            revoking_key_id: rev_kid.clone(),
-            reason: Some("644 byte-exactness witness".to_owned()),
-            revoked_at: now,
-            effective_at: now,
-            revocation_envelope: rev_envelope.clone(),
-            original_content_hash: rev_och,
-            scrub_signature_classical: rev_ed,
-            scrub_signature_pqc: rev_pqc,
-            scrub_key_id: rev_kid.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            observed_region: crate::federation::verify_coord::region::US.to_owned(),
-            revoked_after: None,
-            persist_row_hash: String::new(),
-        };
+        // v31.0.0 (#659) — sealed through the one shared producer, which stamps
+        // the six-member subject binding into the AWKWARD envelope and signs
+        // the result. The expected bytes are therefore the SEALED envelope, not
+        // the pre-seal one: what this witness measures is that whatever the
+        // producer signed comes back byte-exact, and the binding is now part of
+        // what the producer signed.
+        let revocation = crate::federation::tier_ingest::test_support::seal_revocation(
+            crate::federation::Revocation {
+                revocation_id: rev_id.clone(),
+                revoked_key_id: rev_kid.clone(),
+                revoking_key_id: rev_kid.clone(),
+                reason: Some("644 byte-exactness witness".to_owned()),
+                revoked_at: now,
+                effective_at: now,
+                revocation_envelope: awkward_envelope(&[(
+                    "revoked_key_id",
+                    serde_json::Value::String(rev_kid.clone()),
+                )]),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: rev_kid.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.to_owned(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        let rev_envelope = revocation.revocation_envelope.clone();
         dir.put_revocation(crate::federation::SignedRevocation { revocation })
             .await
             .expect("put_revocation admits the awkward envelope");

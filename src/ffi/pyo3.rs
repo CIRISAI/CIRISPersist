@@ -28785,7 +28785,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.11.0 (CIRISPersist#143) — verify-coord R1/Q1 admission
         // rejections are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::RegionRejected { .. }
-        | crate::federation::Error::RevocationRollback { .. } => PyValueError::new_err(kind),
+        | crate::federation::Error::RevocationRollback { .. }
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback CEILING. Caller-fault
+        // in the same way the floor is: the remedy is a scrub instant on this
+        // node's clock, which is a fix to the submitted row.
+        | crate::federation::Error::RevocationScrubSkew { .. } => PyValueError::new_err(kind),
         // v3.12.0 (CIRISPersist#153 Asks 1-2) — CEG 0.7
         // identity_occurrence + family admission rejections are
         // caller-fault malformed-content; ValueError (4xx).
@@ -29016,6 +29020,18 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::RevocationBoundInvalid { reason } => {
             PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
         }
+        // v31.0.0 (CIRISPersist#659) — a revocation whose typed columns are
+        // not inside the bytes its scrub signature covers is caller-fault:
+        // the remedy is to re-mint the envelope with the binding, which is
+        // exactly what the message says. Same class as
+        // `OperationalEnvelopeUnbound` → ValueError (4xx). The FIELD rides in
+        // the message rather than the bare `kind`, so a Python consumer can
+        // tell "you forgot the binding" from "you rewrote the subject".
+        crate::federation::Error::RevocationEnvelopeUnbound {
+            revocation_id,
+            field,
+            detail,
+        } => PyValueError::new_err(format!("{kind}: {revocation_id} `{field}` — {detail}")),
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a

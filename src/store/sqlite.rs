@@ -4617,6 +4617,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // the declared hash. Idempotent, therefore signature-transparent.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
 
+        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
+        // signature covers `revocation_envelope` and nothing else, so
+        // `revoked_key_id` / `revocation_id` / the instants were columns a
+        // relay could rewrite while the signature still verified — one
+        // conferred moderator's revocation, re-pasted at any key. Pure
+        // function of the row (AV-76 tier 1), run ahead of the trust gate and
+        // the authority resolution so the refusal never depends on roster,
+        // trust score or custody state.
+        crate::federation::admission::check_revocation_envelope_binding(&row)?;
+
         // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking
         // key is the attester.
         if !row.revoking_key_id.is_empty() {
@@ -4652,6 +4662,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // moderation act. Self-revocation passes untouched.
         crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
+        // monotonic latch on a key's whole de-admission history, and without a
+        // ceiling one self-signed revocation dated far enough forward makes its
+        // own subject immune to every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         check_revocation_anti_rollback_sqlite(&self.conn, &row.revoked_key_id, row.scrub_timestamp)
             .await?;
 
@@ -19580,6 +19600,45 @@ mod accord_tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
+    /// NAMED, at the real `put_revocation` chokepoint, on sqlite.
+    #[tokio::test]
+    async fn revocation_subject_binding_sqlite_659() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_node_key_id("rev659-node-sq");
+        crate::federation::admission::r2_test_support::exercise_revocation_subject_binding(
+            &backend,
+            "sq659r",
+            "rev659-node-sq",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on sqlite.
+    #[tokio::test]
+    async fn revocation_rollback_and_region_sqlite_659() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend, "sq659g",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
+    /// and the M is signed. On sqlite.
+    #[tokio::test]
+    async fn partner_threshold_floor_sqlite_659() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
+            &backend, "sq659p",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
     /// real `put_public_key` chokepoint, on sqlite.
     #[tokio::test]
@@ -22602,27 +22661,26 @@ mod tests {
         // deterministic hybrid key so it verifies against the pubkeys
         // `fed_key(revoking)` registers (`hybrid_pubkeys`). The admission
         // gate now verifies this by construction.
-        let envelope = serde_json::json!({"id": id});
-        let (och, sig_c, sig_p) =
-            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &envelope);
-        Revocation {
+        // v31.0.0 (#659) — and the typed columns are BOUND INTO those bytes,
+        // through the one shared producer.
+        crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sig_c,
-            scrub_signature_pqc: sig_p,
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
             revoked_after: None,
             persist_row_hash: String::new(),
-        }
+        })
     }
 
     #[tokio::test]
@@ -23500,6 +23558,11 @@ mod tests {
         let t0: chrono::DateTime<chrono::Utc> = "2026-06-03T12:00:00Z".parse().unwrap();
         let mut rev0 = fed_revocation("rev-0", "k-bad", "registry-steward", "registry-steward");
         rev0.scrub_timestamp = t0;
+        // v31.0.0 (#659) — `scrub_timestamp` is inside the signed bytes now, so
+        // moving the column after the seal means RE-SEALING. A fixture that
+        // mutates a bound column and does not re-sign is producing a row this
+        // substrate's own door refuses, which is the whole point of binding it.
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev0);
         grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation { revocation: rev0 })
@@ -23510,6 +23573,7 @@ mod tests {
         let mut rev_equal =
             fed_revocation("rev-equal", "k-bad", "registry-steward", "registry-steward");
         rev_equal.scrub_timestamp = t0;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_equal);
         let err = backend
             .put_revocation(SignedRevocation {
                 revocation: rev_equal,
@@ -23531,6 +23595,7 @@ mod tests {
             "registry-steward",
         );
         rev_earlier.scrub_timestamp = t_minus;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_earlier);
         let err = backend
             .put_revocation(SignedRevocation {
                 revocation: rev_earlier,
@@ -23547,6 +23612,7 @@ mod tests {
         let mut rev_later =
             fed_revocation("rev-later", "k-bad", "registry-steward", "registry-steward");
         rev_later.scrub_timestamp = t_plus;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_later);
         backend
             .put_revocation(SignedRevocation {
                 revocation: rev_later,

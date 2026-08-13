@@ -5478,6 +5478,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // the declared hash. Idempotent, therefore signature-transparent.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
 
+        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
+        // signature covers `revocation_envelope` and nothing else, so
+        // `revoked_key_id` / `revocation_id` / the instants were columns a
+        // relay could rewrite while the signature still verified — one
+        // conferred moderator's revocation, re-pasted at any key. Pure
+        // function of the row (AV-76 tier 1), run ahead of the trust gate and
+        // the authority resolution so the refusal never depends on roster,
+        // trust score or custody state.
+        crate::federation::admission::check_revocation_envelope_binding(&row)?;
+
         // v3.4.0 (CIRISPersist#123) — trust gate first.
         if !row.revoking_key_id.is_empty() {
             if let Some(gate) = self.admission_gate() {
@@ -5512,6 +5522,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // moderation act. Self-revocation passes untouched.
         crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
+        // monotonic latch on a key's whole de-admission history, and without a
+        // ceiling one self-signed revocation dated far enough forward makes its
+        // own subject immune to every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         let client = self
             .get_client()
             .await
@@ -20972,6 +20992,66 @@ mod tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
+    /// NAMED, at the real `put_revocation` chokepoint, on postgres. The tag
+    /// carries a uuid, which is exactly the condition that made the earlier
+    /// #659 witness vacuous on this backend — see the 32-byte seed note in the
+    /// exerciser.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn revocation_subject_binding_postgres_659() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let node = format!("rev659-node-pg-{}", uuid::Uuid::new_v4().simple());
+        backend.set_node_key_id(&node);
+        crate::federation::admission::r2_test_support::exercise_revocation_subject_binding(
+            &backend,
+            &format!("pg659r-{}", uuid::Uuid::new_v4().simple()),
+            &node,
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn revocation_rollback_and_region_postgres_659() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend,
+            &format!("pg659g-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
+    /// and the M is signed. On postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn partner_threshold_floor_postgres_659() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
+            &backend,
+            &format!("pg659p-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
     /// real `put_public_key` chokepoint, on postgres.
     #[tokio::test]
@@ -26239,30 +26319,28 @@ mod tests {
         // revocation_id column is `::uuid` cast in put_revocation —
         // must be a valid UUID string, not the uuid_like() hex token.
         let rev_id = uuid::Uuid::new_v4().to_string();
-        let __rev_env = serde_json::json!({"id": rev_id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&revoking_id, &__rev_env);
-        let rev = crate::federation::Revocation {
-            revocation_id: rev_id.clone(),
-            revoked_key_id: revoked_id.clone(),
-            revoking_key_id: revoking_id.clone(),
-            reason: Some("test".into()),
-            revoked_at: now,
-            effective_at: now,
-            revocation_envelope: __rev_env.clone(),
-            // sha256-shaped placeholder hex — persist's revocation
-            // path runs hex-decode on original_content_hash and rejects
-            // odd-length strings. Use a full 64-char hex string.
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
-            scrub_key_id: revoking_id.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            observed_region: crate::federation::verify_coord::region::US.into(),
-            revoked_after: None,
-            persist_row_hash: String::new(),
-        };
+        // v31.0.0 (#659) — the typed columns are BOUND INTO the bytes the
+        // scrub signature covers, through the one shared producer.
+        let rev = crate::federation::tier_ingest::test_support::seal_revocation(
+            crate::federation::Revocation {
+                revocation_id: rev_id.clone(),
+                revoked_key_id: revoked_id.clone(),
+                revoking_key_id: revoking_id.clone(),
+                reason: Some("test".into()),
+                revoked_at: now,
+                effective_at: now,
+                revocation_envelope: serde_json::json!({"id": rev_id}),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: revoking_id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.into(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            },
+        );
         grant_slash(&backend, &revoking_id).await;
         backend
             .put_revocation(crate::federation::SignedRevocation { revocation: rev })
@@ -30672,27 +30750,27 @@ mod tests {
         // original_content_hash — the revocation path hex-decodes it).
         let now = chrono::Utc::now();
         let rev_id = uuid::Uuid::new_v4().to_string();
-        let __rev_env = serde_json::json!({"id": rev_id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&steward, &__rev_env);
-        let rev = crate::federation::Revocation {
-            revocation_id: rev_id.clone(),
-            revoked_key_id: target.clone(),
-            revoking_key_id: steward.clone(),
-            reason: Some("test".into()),
-            revoked_at: now,
-            effective_at: now,
-            revocation_envelope: __rev_env.clone(),
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
-            scrub_key_id: steward.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            observed_region: crate::federation::verify_coord::region::US.into(),
-            revoked_after: None,
-            persist_row_hash: String::new(),
-        };
+        // v31.0.0 (#659) — sealed through the one shared producer.
+        let rev = crate::federation::tier_ingest::test_support::seal_revocation(
+            crate::federation::Revocation {
+                revocation_id: rev_id.clone(),
+                revoked_key_id: target.clone(),
+                revoking_key_id: steward.clone(),
+                reason: Some("test".into()),
+                revoked_at: now,
+                effective_at: now,
+                revocation_envelope: serde_json::json!({"id": rev_id}),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: steward.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.into(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            },
+        );
         grant_slash(&backend, &steward).await;
         backend
             .put_revocation(crate::federation::SignedRevocation { revocation: rev })
@@ -32275,30 +32353,30 @@ mod tests {
         // test-fixtures memory: must be a real UUID.
         let rev_id = uuid::Uuid::new_v4().to_string();
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking steward.
-        let __rev_env = serde_json::json!({"id": rev_id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(&steward, &__rev_env);
+        // v31.0.0 (#659) — over bytes that BIND the typed columns.
         grant_slash(&backend, &steward).await;
         backend
             .put_revocation(crate::federation::SignedRevocation {
-                revocation: crate::federation::Revocation {
-                    revocation_id: rev_id.clone(),
-                    revoked_key_id: target.clone(),
-                    revoking_key_id: steward.clone(),
-                    reason: Some("test".into()),
-                    revoked_at: chrono::Utc::now(),
-                    effective_at: chrono::Utc::now(),
-                    revocation_envelope: __rev_env.clone(),
-                    original_content_hash: __rev_och,
-                    scrub_signature_classical: __rev_sc,
-                    scrub_signature_pqc: __rev_sp,
-                    scrub_key_id: steward.clone(),
-                    scrub_timestamp: chrono::Utc::now(),
-                    pqc_completed_at: None,
-                    observed_region: crate::federation::verify_coord::region::US.into(),
-                    revoked_after: None,
-                    persist_row_hash: String::new(),
-                },
+                revocation: crate::federation::tier_ingest::test_support::seal_revocation(
+                    crate::federation::Revocation {
+                        revocation_id: rev_id.clone(),
+                        revoked_key_id: target.clone(),
+                        revoking_key_id: steward.clone(),
+                        reason: Some("test".into()),
+                        revoked_at: chrono::Utc::now(),
+                        effective_at: chrono::Utc::now(),
+                        revocation_envelope: serde_json::json!({"id": rev_id}),
+                        original_content_hash: String::new(),
+                        scrub_signature_classical: String::new(),
+                        scrub_signature_pqc: None,
+                        scrub_key_id: steward.clone(),
+                        scrub_timestamp: chrono::Utc::now(),
+                        pqc_completed_at: None,
+                        observed_region: crate::federation::verify_coord::region::US.into(),
+                        revoked_after: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
             })
             .await
             .unwrap();

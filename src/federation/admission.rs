@@ -6128,6 +6128,405 @@ pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
 /// chain longer than 5 cannot confer a moderation duty.
 pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 
+// ─────────────────────────────────────────────────────────────────────────
+//  #659 — the de-conferral plane binds its SUBJECT
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v31.0.0 (CIRISPersist#659) — **THE SUBJECT OF A DE-CONFERRAL, AS BOUND INTO
+/// THE SIGNED `revocation_envelope`.**
+///
+/// This is the ONE spelling of that projection. The PRODUCING side
+/// ([`bind_revocation_into_envelope`], which every ceremony that mints a
+/// revocation calls before it signs) and the CHECKING side
+/// ([`check_revocation_envelope_binding`], which every `put_revocation` runs
+/// before anything else) both derive the field set and its values from HERE,
+/// so the two can never drift apart. Two spellings of one projection is this
+/// release's signature defect — it produced #643, #598, #652 and #659 — and
+/// this is deliberately not a fifth.
+///
+/// # The seven members, and what each decides
+///
+/// | member | what it decides |
+/// |---|---|
+/// | `revocation_id` | **the row's IDENTITY** — same bytes ⇒ same id, so a re-paste collides with itself on the primary key instead of fanning out |
+/// | `revoked_key_id` | **WHICH KEY LOSES ITS STANDING** — the whole point of the act |
+/// | `revoking_key_id` | WHO took it away |
+/// | `reason` | the sentence a human adjudicator reads back; absent ⇔ the column is `None` |
+/// | `revoked_at` | when the act was issued |
+/// | `effective_at` | **when it BITES** — [`super::register::fold_key_statement_standing`] considers a revocation only once `effective_at <= now`, and [`super::check_revocation_bound`] measures the history bound against it |
+/// | `scrub_timestamp` | **the anti-rollback ordering key** — a MONOTONIC LATCH per `revoked_key_id` (see [`SCRUB_TIMESTAMP_ENVELOPE_FIELD`] for why this plane binds it where the attestation plane does not, and [`check_revocation_scrub_skew`] for the ceiling the latch also needed) |
+///
+/// The instants are emitted as RFC-3339 strings, which is the shape the
+/// neighbouring bindings already use (`asserted_at` / `expires_at` under
+/// CIRISPersist#598, `revoked_after` under #570 ask 4) and the shape a
+/// non-Rust producer can reproduce.
+///
+/// # What is deliberately NOT bound
+///
+/// - **`revoked_after`** — bound since v25.1.0 by [`super::check_revocation_bound`],
+///   which owns a whole typed refusal taxonomy
+///   ([`super::register::RevocationBoundRefusal`]) that downstreams key on.
+///   Re-binding it here would be the second spelling this module exists to
+///   avoid, and re-STAMPING it in the producer would silently repair exactly
+///   the divergence that gate exists to refuse.
+/// - **`observed_region`** — the RECEIVING node's fact ("which region first saw
+///   this"), not the revoker's claim. Binding it would make a peer's opinion
+///   about our own observation authoritative — the [`super::envelope::RowMirror`]
+///   "re-derived from our own verified state" exclusion, verbatim.
+/// - **`scrub_key_id` / `pqc_completed_at`** — signature
+///   metadata, legitimately rewritten by
+///   [`super::FederationDirectory::attach_revocation_pqc_signature`] when the
+///   PQC half is completed after the fact. Binding them would make that door
+///   mint rows that fail their own gate.
+/// - **`original_content_hash` / `scrub_signature_*`** — a signature and its
+///   digest cannot live inside the bytes they cover.
+/// - **`persist_row_hash`** — computed locally over the row including this
+///   envelope; binding it would be circular.
+/// # Why a `Vec` of pairs and not a `serde_json::Map`
+///
+/// So that BOTH sides can **iterate the projection itself**, which is what
+/// makes the binding exhaustive by construction rather than by anyone
+/// remembering. A seventh member added here extends the producer AND the check
+/// with no second edit, and it arrives carrying its own `&'static str` name for
+/// the typed refusal. The alternative — a check that walks a hand-maintained
+/// name list — is the shape that has cost this repo three separate findings
+/// this release; [`REVOCATION_BINDING_MEMBERS`] exists only as the PUBLISHED
+/// list and is pinned to this function by
+/// `revocation_binding_members_are_the_projection_659`.
+#[must_use]
+pub fn revocation_binding(row: &super::Revocation) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            REVOCATION_ID_ENVELOPE_FIELD,
+            serde_json::Value::from(row.revocation_id.as_str()),
+        ),
+        (
+            REVOKED_KEY_ID_ENVELOPE_FIELD,
+            serde_json::Value::from(row.revoked_key_id.as_str()),
+        ),
+        (
+            REVOKING_KEY_ID_ENVELOPE_FIELD,
+            serde_json::Value::from(row.revoking_key_id.as_str()),
+        ),
+        (
+            REASON_ENVELOPE_FIELD,
+            // ABSENCE IS AN ASSERTION, not a hole: a row with no reason binds
+            // JSON `null`, so an envelope carrying a reason the signer never
+            // wrote is refused exactly as a differing one is.
+            match row.reason.as_deref() {
+                Some(s) => serde_json::Value::from(s),
+                None => serde_json::Value::Null,
+            },
+        ),
+        (
+            REVOKED_AT_ENVELOPE_FIELD,
+            serde_json::Value::from(row.revoked_at.to_rfc3339()),
+        ),
+        (
+            EFFECTIVE_AT_ENVELOPE_FIELD,
+            serde_json::Value::from(row.effective_at.to_rfc3339()),
+        ),
+        (
+            SCRUB_TIMESTAMP_ENVELOPE_FIELD,
+            serde_json::Value::from(row.scrub_timestamp.to_rfc3339()),
+        ),
+    ]
+}
+
+/// [`revocation_binding`] member: the row's IDENTITY.
+pub const REVOCATION_ID_ENVELOPE_FIELD: &str = "revocation_id";
+/// [`revocation_binding`] member: **the SUBJECT** — which key loses standing.
+pub const REVOKED_KEY_ID_ENVELOPE_FIELD: &str = "revoked_key_id";
+/// [`revocation_binding`] member: who took the standing away.
+pub const REVOKING_KEY_ID_ENVELOPE_FIELD: &str = "revoking_key_id";
+/// [`revocation_binding`] member: the stated reason (absent ⇔ column `None`).
+pub const REASON_ENVELOPE_FIELD: &str = "reason";
+/// [`revocation_binding`] member: when the act was issued (RFC-3339).
+pub const REVOKED_AT_ENVELOPE_FIELD: &str = "revoked_at";
+/// [`revocation_binding`] member: when the act BITES (RFC-3339).
+pub const EFFECTIVE_AT_ENVELOPE_FIELD: &str = "effective_at";
+/// [`revocation_binding`] member: **the anti-rollback ordering key** (RFC-3339).
+///
+/// The one piece of "signature metadata" on this plane that is not metadata.
+/// [`super::envelope::RowMirror`] deliberately leaves `scrub_timestamp`
+/// unbound on the ATTESTATION plane, and its reason does not carry here: an
+/// attestation's scrub fields are legitimately rewritten when a promoting node
+/// re-scrubs the row, whereas a revocation is never promoted and never
+/// re-scrubbed (`attach_revocation_pqc_signature` writes
+/// `scrub_signature_pqc` and `pqc_completed_at` and nothing else). What this
+/// column IS, on this plane, is the key the per-`revoked_key_id` anti-rollback
+/// gate orders on — so an unbound one is an unsigned ordering key, which is
+/// the #598 criterion for binding, verbatim.
+pub const SCRUB_TIMESTAMP_ENVELOPE_FIELD: &str = "scrub_timestamp";
+
+/// The **PUBLISHED** [`revocation_binding`] member list — for producers, and
+/// for the witness that removes each member in turn. It is NOT what the gate
+/// walks: the gate iterates the projection, so this list can never be the
+/// thing that decides what is checked. `revocation_binding_members_are_the_projection_659`
+/// pins the two together, because #658 is the recorded cost of a published
+/// member set that disagrees with the enforced one during the release that
+/// forces every producer to re-mint against it.
+pub const REVOCATION_BINDING_MEMBERS: [&str; 7] = [
+    REVOCATION_ID_ENVELOPE_FIELD,
+    REVOKED_KEY_ID_ENVELOPE_FIELD,
+    REVOKING_KEY_ID_ENVELOPE_FIELD,
+    REASON_ENVELOPE_FIELD,
+    REVOKED_AT_ENVELOPE_FIELD,
+    EFFECTIVE_AT_ENVELOPE_FIELD,
+    SCRUB_TIMESTAMP_ENVELOPE_FIELD,
+];
+
+/// v31.0.0 (CIRISPersist#659) — the **PRODUCING** half of
+/// [`revocation_binding`]: stamp the revocation's identifying fields into its
+/// own `revocation_envelope` BEFORE the bytes are canonicalized and signed, so
+/// what the revoker signs names the key it de-admits.
+///
+/// Overwrites exactly the [`REVOCATION_BINDING_MEMBERS`] keys and leaves every
+/// other field of the caller's envelope untouched — including
+/// [`super::register::REVOKED_AFTER_ENVELOPE_FIELD`], which belongs to
+/// [`super::check_revocation_bound`] and is deliberately not re-stamped here
+/// (see [`revocation_binding`]: that gate owns the field AND its refusal
+/// taxonomy, and a producer that writes the bound into the envelope while
+/// leaving the column unset must still be REFUSED, not silently repaired).
+///
+/// **Truncates its own three instants to the substrate resolution first.** The
+/// envelope is stamped from the truncated columns, so a producer physically
+/// cannot mint a sub-microsecond binding that postgres would then refuse to
+/// store — the #598 `stamp_signed_instants` discipline, one plane over. See
+/// [`check_revocation_envelope_binding`] for why the checking side REFUSES
+/// rather than truncates. `revoked_after` gets the same treatment from
+/// [`super::check_revocation_bound`]'s own guard, at the producer's hand.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] if `revocation_envelope` is not a JSON object —
+/// there is nowhere to put the binding, and silently accepting that is how a
+/// subject-blind revocation gets minted.
+pub fn bind_revocation_into_envelope(row: &mut super::Revocation) -> Result<(), Error> {
+    row.revoked_at = truncate_to_substrate_resolution(row.revoked_at);
+    row.effective_at = truncate_to_substrate_resolution(row.effective_at);
+    row.scrub_timestamp = truncate_to_substrate_resolution(row.scrub_timestamp);
+    let binding = revocation_binding(row);
+    let revocation_id = row.revocation_id.clone();
+    let obj = row.revocation_envelope.as_object_mut().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "revocation {revocation_id:?}: revocation_envelope must be a JSON object to carry \
+             the signed subject binding (CIRISPersist#659)"
+        ))
+    })?;
+    for (field, value) in binding {
+        obj.insert(field.to_owned(), value);
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#659) — the **CHECKING** half of
+/// [`revocation_binding`]: does this revocation's signed envelope bind the row
+/// it arrived on?
+///
+/// # The defect
+///
+/// [`super::verify_revocation_admission`] hybrid-Strict verifies the scrub
+/// signature over `revocation_envelope`, and [`check_revocation_authority`]
+/// asks whether the SIGNER holds [`DELEGATION_SCOPE_SLASH`]. **Both are
+/// questions about the signer; neither was a question about the subject.** The
+/// only field of the row the signature reached was `revoked_after`
+/// ([`super::check_revocation_bound`], #570 ask 4). `revocation_id`,
+/// `revoked_key_id`, `revoking_key_id`, `reason`, `revoked_at`, `effective_at`
+/// and `scrub_timestamp` were plain columns.
+///
+/// So ONE validly-signed revocation envelope, minted by a legitimately
+/// slash-conferred moderator against some key it really did name, could be
+/// re-submitted with **any other `revoked_key_id`**, at **unboundedly many
+/// `revocation_id`s**, and every gate on the path returned `Ok(())` — the
+/// signature still verified, because those fields were never in the signed
+/// bytes. A single conferral bought an unbounded de-conferral primitive: the
+/// exact inverse of #659 on the conferral plane, on the plane nobody checked.
+///
+/// # REQUIRED, not checked-if-present
+///
+/// An absent member is a REFUSAL, not a tolerated legacy shape. An optional
+/// check is skippable by omission, which IS the attack. There is no legacy
+/// regime in v31 (the standing decision on #598, #640, #643 and #659); a fresh
+/// genesis re-mints every revocation against this preimage.
+///
+/// # Sub-microsecond instants are REFUSED, not truncated
+///
+/// `revoked_at`, `effective_at` and `scrub_timestamp` land in postgres
+/// `TIMESTAMPTZ`, which cannot hold finer than a microsecond. A nanosecond-precision instant would be
+/// admitted here, stored truncated, and then FAIL this very binding when a
+/// replicating peer read it back and re-submitted it — and `effective_at`
+/// additionally orders the standing fold, so the same op sequence would be a
+/// strict order on sqlite/memory and a TIE on postgres. Refusing keeps the
+/// property total across all three backends; the producer truncates
+/// ([`bind_revocation_into_envelope`]). This is
+/// [`check_instant_binding`]'s clause 3, and
+/// `operational::bind_instant_value`'s, on the de-conferral plane.
+///
+/// # Shape and placement
+///
+/// Pure function of `row` — no directory read, no crypto, no lock ⇒ AV-76
+/// TIER 1. Run FIRST at every `put_revocation` on all three backends, ahead of
+/// the trust gate, the signature verify and the slash-authority resolution, so
+/// the refusal is deterministic regardless of roster, trust score or custody
+/// state. That was the #659 ordering decision on the conferral plane and the
+/// reasoning transfers exactly. It is ALSO the first statement of
+/// [`super::verify_revocation_admission`], the shared verifier every backend
+/// routes through, so a future door cannot acquire the plane without it.
+///
+/// # Errors
+/// [`Error::RevocationEnvelopeUnbound`] on the first divergent member.
+pub fn check_revocation_envelope_binding(row: &super::Revocation) -> Result<(), Error> {
+    use chrono::Timelike as _;
+
+    let unbound = |field: &'static str, detail: String| Error::RevocationEnvelopeUnbound {
+        revocation_id: row.revocation_id.clone(),
+        field,
+        detail,
+    };
+
+    // THE ONE PROJECTION, ITERATED. Not a hand-maintained name list walked
+    // beside it: a member added to `revocation_binding` is checked here with
+    // no second edit, which is what makes this binding exhaustive by
+    // construction rather than by anyone remembering.
+    let binding = revocation_binding(row);
+
+    // ABSENCE OF THE WHOLE BINDING, named once and named completely, from the
+    // projection's OWN member names. A producer debugging against this message
+    // during the v31 re-mint must be able to build a conformant envelope from
+    // the message alone (#658) — so the message cannot be a second list.
+    if binding
+        .iter()
+        .all(|(field, _)| row.revocation_envelope.get(*field).is_none())
+    {
+        let members: Vec<&str> = binding.iter().map(|(field, _)| *field).collect();
+        return Err(unbound(
+            REVOKED_KEY_ID_ENVELOPE_FIELD,
+            format!(
+                "the signed `revocation_envelope` binds NONE of {members:?}. ALL of them are \
+                 REQUIRED (`reason` as JSON null when the column is unset), and no subset is \
+                 tolerated — an unbound revocation de-admits whichever key it is pasted onto"
+            ),
+        ));
+    }
+
+    for &(field, ref expected) in &binding {
+        match row.revocation_envelope.get(field) {
+            // The comparison is over the raw JSON values. `brief_json` below
+            // is DIAGNOSTIC ONLY and never a comparison input.
+            Some(bound) if bound == expected => {}
+            Some(bound) => {
+                return Err(unbound(
+                    field,
+                    format!(
+                        "column is {}, the signed envelope says {}",
+                        brief_json(expected),
+                        brief_json(bound)
+                    ),
+                ))
+            }
+            None => {
+                return Err(unbound(
+                    field,
+                    format!(
+                        "signed envelope carries no `{field}`. REQUIRED, not \
+                         check-if-present — an optional check is skippable by omission, which \
+                         is the whole attack"
+                    ),
+                ))
+            }
+        }
+    }
+
+    // The resolution floor, AFTER equality: an envelope that mirrors a
+    // sub-microsecond column exactly is still a row postgres cannot store
+    // byte-faithfully, so it would fail its own binding after a round-trip.
+    for (field, t) in [
+        (REVOKED_AT_ENVELOPE_FIELD, row.revoked_at),
+        (EFFECTIVE_AT_ENVELOPE_FIELD, row.effective_at),
+        (SCRUB_TIMESTAMP_ENVELOPE_FIELD, row.scrub_timestamp),
+    ] {
+        if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS != 0 {
+            return Err(unbound(
+                field,
+                format!(
+                    "signed instant {} carries sub-microsecond precision, which postgres \
+                     TIMESTAMPTZ cannot store — the row would fail its own binding after a \
+                     round-trip, and `effective_at` orders the standing fold, so the same \
+                     sequence would be a strict order on sqlite/memory and a TIE on postgres. \
+                     Truncate to microseconds at the producer",
+                    t.to_rfc3339()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v31.0.0 (CIRISPersist#659) — **the anti-rollback dual: a revocation cannot
+/// buy its subject IMMUNITY by dating its own scrub in the far future.**
+///
+/// # The defect binding alone does not close
+///
+/// Every backend's `put_revocation` runs a per-`revoked_key_id` anti-rollback:
+/// a submitted `scrub_timestamp` must STRICTLY EXCEED the newest already stored
+/// for that key, else [`Error::RevocationRollback`]. That is right — replaying
+/// an old revocation must not re-open a settled question — but it makes
+/// `scrub_timestamp` a **monotonic latch on a key's whole de-admission
+/// history**, and nothing bounded how high the first writer could set it.
+///
+/// Self-revocation is unconditionally allowed
+/// ([`check_revocation_authority`] — a compromised key must be retirable by
+/// its holder). So a key could revoke ITSELF with `effective_at` far in the
+/// future (a revocation the standing fold does not consider yet) and
+/// `scrub_timestamp` at, say, the year 9999. From that moment **no further
+/// revocation of that key can be stored on this node** — the latch refuses
+/// every one, including a legitimately slash-conferred moderator's. One
+/// self-signed row, and the key is immune to de-admission.
+///
+/// Binding `scrub_timestamp` (CIRISPersist#659, [`revocation_binding`]) closes
+/// the RELAY variant — a peer bumping the instant on someone else's honest
+/// revocation in transit — because the column is now inside the signed bytes.
+/// It cannot close this one: the attacker signs its own row. What closes it is
+/// the same **anti-rollback dual** [`check_instant_binding`] applies to
+/// `asserted_at`: a monotonic latch needs a ceiling as well as a floor, or a
+/// lying clock mints a value nothing later can exceed.
+///
+/// # Why `scrub_timestamp` and NOT `effective_at` / `revoked_at`
+///
+/// `effective_at` is documented as legitimately future-dated — *"may be
+/// retroactive or future"*
+/// ([`Revocation::effective_at`](super::types::Revocation::effective_at)) — and
+/// a scheduled de-admission is a real operational shape. A future
+/// `effective_at` also costs nothing: the standing fold simply does not
+/// consider the row yet. `revoked_at` is inert. Only `scrub_timestamp` is a
+/// latch, so only `scrub_timestamp` gets a ceiling; guarding the others would
+/// forbid a legitimate act to no purpose.
+///
+/// Reuses [`DEFAULT_MAX_TOUCH_SKEW`] rather than minting a second tolerance
+/// constant, exactly as CIRISPersist#598 did.
+///
+/// # Errors
+/// [`Error::RevocationScrubSkew`] — a DISTINCT variant from the floor's
+/// [`Error::RevocationRollback`], because the floor's message says *"not
+/// strictly later than existing …"* and reporting a ceiling through it would
+/// tell an operator the one thing that is not true: there is no existing
+/// revocation at that instant.
+pub fn check_revocation_scrub_skew(
+    row: &super::Revocation,
+    now: chrono::DateTime<chrono::Utc>,
+    max_skew: chrono::Duration,
+) -> Result<(), Error> {
+    if row.scrub_timestamp - now <= max_skew {
+        return Ok(());
+    }
+    Err(Error::RevocationScrubSkew {
+        revoked_key_id: row.revoked_key_id.clone(),
+        submitted_signed_timestamp: row.scrub_timestamp,
+        ahead_seconds: (row.scrub_timestamp - now).num_seconds(),
+        tolerance_seconds: max_skew.num_seconds(),
+    })
+}
+
 /// v30.8.0 (CIRISPersist#596 item 1 / CIRISServer#383) — **revoking SOMEONE
 /// ELSE'S key is a moderation act and needs moderation authority.**
 ///
@@ -10659,6 +11058,110 @@ mod tests {
 
     fn default_policy() -> DimensionAdmissionPolicy {
         DimensionAdmissionPolicy::default()
+    }
+
+    /// A revocation with placeholder crypto — enough to drive the PURE gate.
+    fn rev_659(reason: Option<&str>) -> super::super::Revocation {
+        let t: chrono::DateTime<chrono::Utc> = "2026-08-01T00:00:00Z".parse().expect("rfc3339");
+        super::super::Revocation {
+            revocation_id: "rid-1".to_owned(),
+            revoked_key_id: "k-subject".to_owned(),
+            revoking_key_id: "k-moderator".to_owned(),
+            reason: reason.map(str::to_owned),
+            revoked_at: t,
+            effective_at: t,
+            revocation_envelope: serde_json::json!({ "purpose": "de-conferral" }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k-moderator".to_owned(),
+            scrub_timestamp: t,
+            pqc_completed_at: None,
+            observed_region: "us".to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — **the published member list IS the
+    /// projection.**
+    ///
+    /// [`REVOCATION_BINDING_MEMBERS`] is what producers build against and what
+    /// the absence witness iterates; [`revocation_binding`] is what the gate
+    /// walks. #658 is the recorded cost of those two disagreeing during a
+    /// release that forces every producer to re-mint against the published one,
+    /// so they are pinned to each other here rather than to a count.
+    #[test]
+    fn revocation_binding_members_are_the_projection_659() {
+        let members: Vec<&str> = revocation_binding(&rev_659(None))
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(
+            members,
+            REVOCATION_BINDING_MEMBERS.to_vec(),
+            "the published member list and the enforced projection have DIVERGED — a member \
+             added to `revocation_binding` is checked automatically, but a producer following \
+             the published list would build an envelope the gate then refuses"
+        );
+        // Distinct names, or one member silently shadows another in the object.
+        let mut sorted = members.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), members.len(), "member names must be distinct");
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — **producing and checking are ONE
+    /// spelling**, and absence is asserted rather than omitted.
+    #[test]
+    fn revocation_binding_has_one_spelling_659() {
+        // The producer's output satisfies the checker, by construction, for a
+        // row that carries a reason and for one that does not.
+        for reason in [Some("compromise"), None] {
+            let mut row = rev_659(reason);
+            bind_revocation_into_envelope(&mut row).expect("the envelope is an object");
+            check_revocation_envelope_binding(&row)
+                .expect("what the producer stamps is exactly what the gate demands");
+        }
+        // ABSENCE IS AN ASSERTION: a row with no reason binds JSON null, and an
+        // envelope claiming a reason the signer never wrote is refused just as
+        // a differing one is.
+        let mut none = rev_659(None);
+        bind_revocation_into_envelope(&mut none).expect("object");
+        assert!(none.revocation_envelope[REASON_ENVELOPE_FIELD].is_null());
+        none.revocation_envelope[REASON_ENVELOPE_FIELD] = serde_json::json!("invented");
+        let err = check_revocation_envelope_binding(&none).expect_err("an invented reason");
+        assert_eq!(err.kind(), "federation_revocation_envelope_unbound");
+
+        // A non-object envelope has nowhere to put the binding, and is refused
+        // at the PRODUCER rather than silently replaced.
+        let mut scalar = rev_659(None);
+        scalar.revocation_envelope = serde_json::json!("not an object");
+        assert!(bind_revocation_into_envelope(&mut scalar).is_err());
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the producer TRUNCATES its two instants;
+    /// the gate REFUSES sub-microsecond ones. Both directions, because a
+    /// producer that admitted them would mint rows postgres cannot store and a
+    /// gate that truncated them would rewrite what the signer said.
+    #[test]
+    fn revocation_instants_sit_on_the_substrate_floor_659() {
+        let mut row = rev_659(None);
+        row.effective_at += chrono::Duration::nanoseconds(1);
+        row.revoked_at += chrono::Duration::nanoseconds(7);
+        bind_revocation_into_envelope(&mut row).expect("object");
+        check_revocation_envelope_binding(&row).expect("the producer truncated both");
+
+        // Now the divergence the producer cannot mint but a hostile relay can.
+        let ns = row.effective_at + chrono::Duration::nanoseconds(1);
+        row.effective_at = ns;
+        row.revocation_envelope[EFFECTIVE_AT_ENVELOPE_FIELD] =
+            serde_json::Value::from(ns.to_rfc3339());
+        let err = check_revocation_envelope_binding(&row).expect_err("sub-microsecond");
+        assert!(
+            format!("{err}").contains("sub-microsecond"),
+            "the refusal must say what postgres cannot store: {err}"
+        );
     }
 
     /// v26.0.0 (CIRISPersist#589 / AV-83) — **THE RESIDUAL, EXECUTED.**
@@ -16383,6 +16886,491 @@ pub(crate) mod r2_test_support {
                 Err(e) => panic!("conferral row must admit: {e}"),
             }
         }
+    }
+
+    /// **v31.0.0 (CIRISPersist#659) — THE RE-PASTE, at the real write
+    /// chokepoint, on every backend.**
+    ///
+    /// The de-conferral plane's version of the #659 defect. A key really is
+    /// slash-conferred here — no forgery, no stolen key, no broken signature.
+    /// The moderator revokes a key it genuinely has standing over, and that one
+    /// validly-signed `revocation_envelope` is then re-pasted:
+    ///
+    /// - **(b)** onto a DIFFERENT `revoked_key_id` — a key the moderator never
+    ///   named, which before this gate was de-admitted anyway, because the
+    ///   signature covered the envelope and the subject lived in a column;
+    /// - **(c)** at a FRESH `revocation_id` — the unbounded-fan-out half: one
+    ///   conferral, arbitrarily many revocation rows, each a valid row by every
+    ///   other gate on the path;
+    /// - **(d)** with `effective_at` moved — the instant the de-admission
+    ///   BITES, and the one the standing fold orders on;
+    /// - **(e)** with `reason` rewritten — the sentence a human adjudicator
+    ///   reads back off the row;
+    /// - **(f)** with each bound member removed in turn, and with the binding
+    ///   absent entirely, because an optional check is skippable by omission
+    ///   and that IS the attack;
+    /// - **(g)** at sub-microsecond precision, which postgres `TIMESTAMPTZ`
+    ///   cannot store — admitted, it would make the fold backend-dependent and
+    ///   the row fail its own binding after a round-trip.
+    ///
+    /// Leg **(a)** is the control: an honestly bound revocation must still
+    /// admit, because a gate that refuses everything proves nothing.
+    ///
+    /// Run on memory, sqlite AND postgres. Backend asymmetry in a write gate is
+    /// this repo's oldest recurring defect; a gate witnessed on one backend is
+    /// a gate shipped on one backend.
+    ///
+    /// The caller MUST have called `set_node_key_id(node)` on the concrete
+    /// backend first — [`check_revocation_authority`] resolves the moderator's
+    /// `slash` conferral against THIS NODE's own trust root, and a directory
+    /// with no identity cannot answer.
+    pub(crate) async fn exercise_revocation_subject_binding(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+        node: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::seal_revocation;
+        use crate::federation::{Revocation, SignedRevocation};
+
+        // The distinguishing part goes FIRST. `hybrid_pubkeys` seeds from the
+        // key_id TRUNCATED TO 32 BYTES and the postgres tag carries a uuid, so
+        // `{tag}-named` / `{tag}-unnamed` would seed IDENTICALLY and this
+        // witness would be vacuous on the one backend production runs (#659
+        // hit exactly that).
+        let moderator = format!("mod659r-{tag}");
+        let root = format!("root659r-{tag}");
+        let named = format!("named659r-{tag}");
+        let unnamed = format!("unnamed659r-{tag}");
+        assert_ne!(
+            hybrid_pubkeys(&named).0,
+            hybrid_pubkeys(&unnamed).0,
+            "({tag}) #659: the two subjects must be distinct identities, not one \
+             32-byte-truncated seed wearing two names"
+        );
+        for k in [&moderator, &named, &unnamed] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        // A REAL conferral: the moderator holds `slash` from a root this node
+        // accepts. Nothing in this witness depends on the moderator being
+        // dishonest — the whole finding is what ONE honest conferral bought.
+        confer_scope_from_trusted_root(dir, node, &root, &moderator, DELEGATION_SCOPE_SLASH).await;
+
+        let now = truncate_to_substrate_resolution(Utc::now());
+        let build = |revoked: &str, at: chrono::DateTime<Utc>| {
+            seal_revocation(Revocation {
+                revocation_id: uuid::Uuid::new_v4().to_string(),
+                revoked_key_id: revoked.to_owned(),
+                revoking_key_id: moderator.clone(),
+                reason: Some("the #659 slash the moderator really performed".to_owned()),
+                revoked_at: at,
+                effective_at: at,
+                revocation_envelope: serde_json::json!({ "purpose": "de-conferral" }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: moderator.clone(),
+                scrub_timestamp: at,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.to_owned(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            })
+        };
+
+        // (a) THE CONTROL — the act the moderator was actually conferred to
+        //     perform.
+        let honest = build(&named, now);
+        dir.put_revocation(SignedRevocation {
+            revocation: honest.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #659(a): a revocation whose envelope binds its own row must still \
+                 admit — a gate that refuses everything proves nothing: {e}"
+            )
+        });
+
+        let refused = |row: Revocation, leg: &'static str, needle: String| {
+            let tag = tag.to_owned();
+            async move {
+                let err = dir
+                    .put_revocation(SignedRevocation { revocation: row })
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "({tag}) #659{leg}: a signed revocation de-admits the key it NAMED, \
+                             not whatever row its signature is pasted onto"
+                        )
+                    });
+                assert_eq!(
+                    err.kind(),
+                    "federation_revocation_envelope_unbound",
+                    "({tag}) #659{leg}: refused by the binding gate and not by a neighbour: {err}"
+                );
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains(&needle) && msg.contains("CIRISPersist#659"),
+                    "({tag}) #659{leg}: the refusal must name the disagreeing member \
+                     {needle:?} and the gate: {msg}"
+                );
+            }
+        };
+
+        // (b) THE RE-PASTE — the moderator's own signature, over the moderator's
+        //     own preimage, pointed at a key it never named.
+        let mut lifted = honest.clone();
+        lifted.revoked_key_id.clone_from(&unnamed);
+        refused(lifted, "(b)", "revoked_key_id".to_owned()).await;
+
+        // (c) THE UNBOUNDED FAN-OUT — same subject, fresh identity. One
+        //     conferral, arbitrarily many rows.
+        let mut refreshed = honest.clone();
+        refreshed.revocation_id = uuid::Uuid::new_v4().to_string();
+        refused(refreshed, "(c)", "revocation_id".to_owned()).await;
+
+        // (d) THE INSTANT — when the de-admission bites.
+        let mut moved = honest.clone();
+        moved.effective_at = now + chrono::Duration::days(3650);
+        refused(moved, "(d)", "effective_at".to_owned()).await;
+
+        // (e) THE REASON — the sentence a human reads back off the row.
+        let mut relabelled = honest.clone();
+        relabelled.reason = Some("routine key rotation".to_owned());
+        refused(relabelled, "(e)", "reason".to_owned()).await;
+
+        // (f) ABSENCE IS A REFUSAL, per member, and for the binding entire.
+        for missing in REVOCATION_BINDING_MEMBERS {
+            let mut partial = build(&unnamed, now);
+            partial
+                .revocation_envelope
+                .as_object_mut()
+                .expect("the fixture envelope is an object")
+                .remove(missing);
+            refused(partial, "(f)", format!("carries no `{missing}`")).await;
+        }
+        let mut bare = build(&unnamed, now);
+        {
+            let obj = bare
+                .revocation_envelope
+                .as_object_mut()
+                .expect("the fixture envelope is an object");
+            for m in REVOCATION_BINDING_MEMBERS {
+                obj.remove(m);
+            }
+        }
+        refused(bare, "(f)", "binds NONE of".to_owned()).await;
+
+        // (g) THE RESOLUTION FLOOR — an envelope that mirrors the column
+        //     EXACTLY and still cannot survive a postgres round-trip. Built
+        //     after sealing, deliberately: a fixture that merely forgot to
+        //     truncate is indistinguishable from a stale one.
+        let mut sub_micro = build(&unnamed, now);
+        let ns = now + chrono::Duration::nanoseconds(1);
+        sub_micro.effective_at = ns;
+        sub_micro.revocation_envelope[EFFECTIVE_AT_ENVELOPE_FIELD] =
+            serde_json::Value::from(ns.to_rfc3339());
+        let (och, sc, sp) = sign_envelope(&moderator, &sub_micro.revocation_envelope);
+        sub_micro.original_content_hash = och;
+        sub_micro.scrub_signature_classical = sc;
+        sub_micro.scrub_signature_pqc = sp;
+        refused(sub_micro, "(g)", "sub-microsecond".to_owned()).await;
+
+        // (h) THE ORDER — the binding refuses BEFORE authority is resolved.
+        //
+        // This revoker holds no `slash` at all, so `check_revocation_authority`
+        // would refuse it too. The refusal must still be the BINDING's: the
+        // gate is a pure function of the row, and a producer debugging an
+        // unbound envelope must not be told its problem is a missing
+        // conferral. It is also what makes the door-level placement
+        // load-bearing rather than decorative — on memory the authority check
+        // runs BEFORE `verify_revocation_admission`, so without the check at
+        // the top of the door this leg reports `delegated_scope_unauthorized`
+        // and the ordering claim is false on one backend.
+        let outsider = format!("out659r-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &outsider).await;
+        let mut unconferred = seal_revocation(Revocation {
+            revoking_key_id: outsider.clone(),
+            scrub_key_id: outsider.clone(),
+            ..build(&unnamed, now)
+        });
+        // Strip the binding and RE-SIGN, so the ONLY defect is the absence.
+        {
+            let obj = unconferred
+                .revocation_envelope
+                .as_object_mut()
+                .expect("the fixture envelope is an object");
+            for m in REVOCATION_BINDING_MEMBERS {
+                obj.remove(m);
+            }
+        }
+        let (och, sc, sp) = sign_envelope(&outsider, &unconferred.revocation_envelope);
+        unconferred.original_content_hash = och;
+        unconferred.scrub_signature_classical = sc;
+        unconferred.scrub_signature_pqc = sp;
+        refused(unconferred, "(h)", "binds NONE of".to_owned()).await;
+
+        // VERIFY BEFORE MUTATION — not one of those refusals left a row.
+        assert!(
+            dir.revocations_for(&unnamed)
+                .await
+                .expect("revocations_for")
+                .is_empty(),
+            "({tag}) #659: every refusal ran before any write, so the key the moderator never \
+             named holds no revocation at all"
+        );
+        assert_eq!(
+            dir.revocations_for(&named)
+                .await
+                .expect("revocations_for")
+                .len(),
+            1,
+            "({tag}) #659: and the honest act it WAS conferred to perform stands"
+        );
+    }
+
+    /// **v31.0.0 (CIRISPersist#659) — the two gates MEMORY never ran, and the
+    /// anti-rollback CEILING none of the three had.**
+    ///
+    /// Three properties, one body, all three backends — because the first two
+    /// were shipped on sqlite and postgres and silently absent on memory, which
+    /// is exactly the asymmetry a per-backend witness cannot see:
+    ///
+    /// - **(a)** an `observed_region` outside the §3.11 closed set is REFUSED;
+    /// - **(b)** a `scrub_timestamp` that does not strictly advance for this
+    ///   `revoked_key_id` is REFUSED (the anti-rollback FLOOR);
+    /// - **(c)** a `scrub_timestamp` far in the FUTURE is REFUSED (the
+    ///   CEILING). Without it the floor is a monotonic latch with no upper
+    ///   bound: one self-signed revocation dated at the year 9999 — and
+    ///   self-revocation needs no conferral at all — makes its own subject
+    ///   immune to every later de-admission, including a slash-conferred
+    ///   moderator's. That leg is the sharpest of the three and no backend had
+    ///   it.
+    pub(crate) async fn exercise_revocation_rollback_and_region(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::seal_revocation;
+        use crate::federation::{Revocation, SignedRevocation};
+
+        // Self-revocation throughout: it needs no conferral, which is what
+        // makes leg (c) the cheap attack it is.
+        let holder = format!("self659g-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &holder).await;
+
+        let base = truncate_to_substrate_resolution(Utc::now()) - chrono::Duration::hours(1);
+        let build = |scrub_at: chrono::DateTime<Utc>, region: &str| {
+            seal_revocation(Revocation {
+                revocation_id: uuid::Uuid::new_v4().to_string(),
+                revoked_key_id: holder.clone(),
+                revoking_key_id: holder.clone(),
+                reason: Some("retiring my own key".to_owned()),
+                revoked_at: base,
+                effective_at: base,
+                revocation_envelope: serde_json::json!({ "purpose": "self-retirement" }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: holder.clone(),
+                scrub_timestamp: scrub_at,
+                pqc_completed_at: None,
+                observed_region: region.to_owned(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            })
+        };
+        let us = crate::federation::verify_coord::region::US;
+
+        // (a) THE CLOSED SET. Memory admitted anything at all here.
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: build(base, "mars"),
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("({tag}) #659(a): `mars` is not an observed region"));
+        assert_eq!(
+            err.kind(),
+            "federation_region_rejected",
+            "({tag}) #659(a): {err}"
+        );
+
+        // The control: a conformant self-revocation admits.
+        dir.put_revocation(SignedRevocation {
+            revocation: build(base, us),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #659: a conformant self-revocation must admit: {e}"));
+
+        // (b) THE FLOOR. Memory ran no anti-rollback at all.
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: build(base, us),
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("({tag}) #659(b): a scrub instant must STRICTLY advance for a target")
+            });
+        assert_eq!(
+            err.kind(),
+            "federation_revocation_rollback",
+            "({tag}) #659(b): {err}"
+        );
+
+        // (c) THE CEILING — the leg none of the three backends had. A latch
+        //     with no upper bound is an immunity primitive.
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: build(base + chrono::Duration::days(365_000), us),
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #659(c): a revocation cannot latch its subject's anti-rollback \
+                     counter beyond every future de-admission"
+                )
+            });
+        assert_eq!(
+            err.kind(),
+            "federation_revocation_scrub_skew",
+            "({tag}) #659(c): the CEILING has its own refusal — reporting it as the floor \
+             would name an existing revocation that does not exist: {err}"
+        );
+
+        // And a NORMAL later revocation still admits — so the ceiling refused
+        // the lying clock and nothing else.
+        dir.put_revocation(SignedRevocation {
+            revocation: build(base + chrono::Duration::seconds(1), us),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!("({tag}) #659: an honest later revocation of the same key must admit: {e}")
+        });
+
+        // (d) THE CEILING IS TIGHT, not merely present. A mutation widening it
+        //     to a CENTURY survived leg (c) — which only ever offered a
+        //     thousand-year instant — so the ceiling is measured against
+        //     `DEFAULT_MAX_TOUCH_SKEW` (5 minutes) rather than against
+        //     "obviously absurd". A latch an hour ahead already blocks every
+        //     de-admission for an hour, and clock skew is bounded by the same
+        //     constant everywhere else in this substrate.
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: build(Utc::now() + chrono::Duration::hours(1), us),
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #659(d): the ceiling is DEFAULT_MAX_TOUCH_SKEW, not a century — a \
+                     latch an hour ahead blocks every de-admission for an hour"
+                )
+            });
+        assert_eq!(
+            err.kind(),
+            "federation_revocation_scrub_skew",
+            "({tag}) #659(d): {err}"
+        );
+    }
+
+    /// **v31.0.0 (CIRISPersist#659) — `threshold` HAS A FLOOR, AND IS SIGNED.**
+    ///
+    /// `SignedPartnerRecord::threshold` is the M of the M-of-N on the plane
+    /// that grants `capabilities_granted` and `max_autonomy_tier`. It arrived
+    /// caller-supplied, unfloored and outside the signature. Legs:
+    ///
+    /// - **(a)** the control: a strict-majority record admits;
+    /// - **(b)** `threshold: 1` over a three-steward roster is REFUSED — the
+    ///   1-of-N capability grant this repo's own accord-ops invariant forbids;
+    /// - **(c)** a `threshold` rewritten in transit (envelope says 2, wrapper
+    ///   says 3) is REFUSED — a floor applied to a relay's number is no floor.
+    pub(crate) async fn exercise_partner_threshold_floor(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::operational::test_support as op;
+
+        let stewards: Vec<op::Identity> = (0..3)
+            .map(|i| op::Identity::new(&format!("s{i}659p-{tag}")))
+            .collect();
+        for s in &stewards {
+            dir.put_public_key(SignedKeyRecord {
+                record: s.steward_key_record(),
+            })
+            .await
+            .ok();
+        }
+        let refs: Vec<&op::Identity> = stewards.iter().collect();
+        let now = truncate_to_substrate_resolution(Utc::now());
+
+        // (a) THE CONTROL — 2 of 3 is a strict majority.
+        let ok_id = uuid::Uuid::new_v4().to_string();
+        dir.put_partner_record(op::signed_partner_record(
+            &ok_id,
+            &format!("lic-ok-{tag}"),
+            1,
+            "active",
+            now,
+            &refs[..2],
+            2,
+            false,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #659(a): a strict-majority licence must admit: {e}"));
+
+        // (b) ONE SIGNATURE FOR A LICENCE GRANT.
+        let solo = op::signed_partner_record(
+            &uuid::Uuid::new_v4().to_string(),
+            &format!("lic-solo-{tag}"),
+            1,
+            "active",
+            now,
+            &refs[..1],
+            1,
+            false,
+        );
+        let err = dir
+            .put_partner_record(solo)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("({tag}) #659(b): 1-of-3 must not grant a licence"));
+        assert_eq!(
+            err.kind(),
+            "federation_operational_authority",
+            "({tag}) #659(b): refused by the quorum policy: {err}"
+        );
+        assert!(
+            format!("{err}").contains("STRICT MAJORITY"),
+            "({tag}) #659(b): the refusal must say WHY one signature is not enough: {err}"
+        );
+
+        // (c) THE TRANSIT REWRITE — the stewards signed `threshold: 2`, the
+        //     wrapper claims 3. Bound, so the quorum never gets to count.
+        let mut rewritten = op::signed_partner_record(
+            &uuid::Uuid::new_v4().to_string(),
+            &format!("lic-rw-{tag}"),
+            1,
+            "active",
+            now,
+            &refs[..2],
+            2,
+            false,
+        );
+        rewritten.threshold = 3;
+        let err = dir
+            .put_partner_record(rewritten)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("({tag}) #659(c): an unsigned M is a relay's M"));
+        assert_eq!(
+            err.kind(),
+            "federation_operational_envelope_unbound",
+            "({tag}) #659(c): refused by the binding, before the floor: {err}"
+        );
+        assert!(
+            format!("{err}").contains("`threshold`"),
+            "({tag}) #659(c): the refusal must name the rewritten column: {err}"
+        );
     }
 
     /// v30.12.0 (CIRISPersist#634) — every ref

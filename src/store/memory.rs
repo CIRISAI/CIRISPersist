@@ -3561,6 +3561,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // `original_content_hash` cover, so the stored column sha256sums to
         // the declared hash. Idempotent, therefore signature-transparent.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
+        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
+        // signature covers `revocation_envelope` and nothing else, so
+        // `revoked_key_id` / `revocation_id` / the instants were columns a
+        // relay could rewrite while the signature still verified — one
+        // conferred moderator's revocation, re-pasted at any key. Pure
+        // function of the row (AV-76 tier 1), run ahead of the trust gate and
+        // the authority resolution so the refusal never depends on roster,
+        // trust score or custody state. Placed HERE on memory too, in the same
+        // position as sqlite/postgres: the backend-symmetry lesson has cost
+        // this repo seven releases.
+        crate::federation::admission::check_revocation_envelope_binding(&row)?;
         // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking key is
         // the attester. v22.0.0 (CIRISPersist#543 finding 4): backend-
         // symmetric with sqlite + postgres, which have gated this path
@@ -3593,12 +3604,45 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
         // moderation act. Self-revocation passes untouched.
         crate::federation::admission::check_revocation_authority(self, &row).await?;
-        // v3.11.0 (CIRISPersist#143) — the closed `{us, eu, apac}` region set.
-        // v31.0.0 (CIRISPersist#660): absent on this backend entirely. sqlite
-        // and postgres have run it since v3.11.0 AND carry the V058 CHECK
-        // constraint behind it; memory had neither, so an arbitrary
-        // `observed_region` string was accepted here and unwritable there.
+        // v31.0.0 (CIRISPersist#659) — THE TWO GATES MEMORY NEVER RAN. sqlite
+        // and postgres have gated this door with the §3.11 closed-set region
+        // check and the per-`revoked_key_id` anti-rollback since v3.11.0;
+        // memory ran NEITHER, so a region outside the closed set and a
+        // non-monotonic scrub instant were both admitted on the one backend the
+        // in-process deployments and half the fixture corpus use. That is this
+        // release's own theme — a write door that skips a gate its siblings run
+        // (#656) — and the recurring backend-asymmetry class it has cost seven
+        // releases to learn.
         crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: without a ceiling, one self-signed
+        // revocation dated far enough forward makes its own subject immune to
+        // every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        {
+            // The floor. Scoped so the lock is released before the gates below,
+            // keeping memory's gate ORDER identical to sqlite/postgres.
+            let state = self.state.lock().expect("memory backend lock");
+            let latest = state
+                .federation_revocations
+                .iter()
+                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .map(|r| r.scrub_timestamp)
+                .max();
+            if let Some(existing) = latest {
+                if row.scrub_timestamp <= existing {
+                    return Err(crate::federation::Error::RevocationRollback {
+                        revoked_key_id: row.revoked_key_id.clone(),
+                        existing_signed_timestamp: existing,
+                        submitted_signed_timestamp: row.scrub_timestamp,
+                    });
+                }
+            }
+        }
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the one
         // that was SIGNED, and must be coherent with `effective_at`. Runs
         // before persist_row_hash and before the push, so a refused bound
@@ -9179,27 +9223,27 @@ mod tests {
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
-        let __rev_env = serde_json::json!({"id": id});
-        let (__rev_och, __rev_sc, __rev_sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &__rev_env);
-        Revocation {
+        // v31.0.0 (#659) — and the typed columns are BOUND INTO the bytes that
+        // signature covers, through the one shared producer, so a fixture
+        // cannot certify a revocation this substrate's own put door refuses.
+        crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: __rev_env,
-            original_content_hash: __rev_och,
-            scrub_signature_classical: __rev_sc,
-            scrub_signature_pqc: __rev_sp,
+            revocation_envelope: serde_json::json!({"id": id}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
             revoked_after: None,
             persist_row_hash: String::new(),
-        }
+        })
     }
 
     // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
@@ -12533,6 +12577,46 @@ mod tests {
         )
         .await
         .expect("547 wire-index-follows-mutators exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
+    /// NAMED, at the real `put_revocation` chokepoint, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("rev659-node-mem");
+        crate::federation::admission::r2_test_support::exercise_revocation_subject_binding(
+            &backend,
+            "mem659r",
+            "rev659-node-mem",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on memory. The first two were
+    /// live on sqlite and postgres and ABSENT here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_rollback_and_region_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend, "mem659g",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
+    /// and the M is signed. On memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn partner_threshold_floor_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
+            &backend, "mem659p",
+        )
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the

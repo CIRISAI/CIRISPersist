@@ -581,6 +581,207 @@ It lands in this cut for the same reason as everything else in v31: the release
 already forces a mesh-wide re-mint and a fresh genesis ceremony, and once 31.1.0
 bakes the new portable trust root, changing this preimage costs a second ceremony
 against a live federation.
+### Fixed — BREAKING — one signed revocation de-admitted ANY key it was pasted onto — the DE-conferral plane never named its subject either (#659)
+
+The conferral plane's defect, on its mirror. Same shape, same release, opposite
+direction: `verify_revocation_admission` hybrid-Strict verified the scrub
+signature over `revocation_envelope`, and `check_revocation_authority` asked
+whether the SIGNER holds `slash`. **Both are questions about the signer. Neither
+was a question about the subject.**
+
+The only field of the row the signature ever reached was `revoked_after`
+(#570 ask 4 — added because an unsigned leniency field is an attacker's field).
+Everything that says WHAT THIS ROW DOES was a plain caller-supplied column:
+
+| column | what it decides | covered before? |
+|---|---|---|
+| `revocation_id` | **the row's IDENTITY** | no |
+| `revoked_key_id` | **WHICH KEY LOSES ITS STANDING** | no |
+| `revoking_key_id` | who took it away | only emergently, via the pubkey lookup |
+| `reason` | the sentence a human adjudicator reads back | no |
+| `revoked_at` | when the act was issued | no |
+| `effective_at` | **when it BITES** — the standing fold's ordering key | no |
+| `scrub_timestamp` | **the anti-rollback ordering key** — a monotonic latch per `revoked_key_id` | no |
+| `revoked_after` | the history bound | yes, since v25.1.0 |
+
+**So one validly-signed revocation was an unbounded de-conferral primitive.** A
+moderator legitimately conferred `slash` revokes a key it genuinely has standing
+over. That one envelope — the moderator's real signature over the moderator's
+real preimage, no forgery anywhere — could then be re-submitted with an
+**arbitrary `revoked_key_id`**, at **unboundedly many `revocation_id`s**. Every
+gate on the path returned `Ok(())`, because the fields the attacker changed were
+never in the signed bytes. #513 prices a conferral at three non-virtualizable
+humans and calls it costly-but-possible; unbound, that price bought an unbounded
+number of de-admissions.
+
+The same re-paste now, through the real `put_revocation` door on all three
+backends — the moderator's signature is still real and still verifies; what
+fails is the question nobody was asking:
+
+```
+revocation "…": typed column `revoked_key_id` is not bound to the signed
+`revocation_envelope` — column is "unnamed659r-…", the signed envelope says
+"named659r-…". The scrub signature covers that envelope only, so an unbound
+column is authored by whoever relayed the row, not by whoever signed it — and
+`revoked_key_id` unbound means one signed revocation de-admits ANY key it is
+pasted onto (CIRISPersist#659)
+```
+
+**The preimage change.** `revocation_envelope` now carries, at top level, the
+seven members of `admission::revocation_binding` — `revocation_id`,
+`revoked_key_id`, `revoking_key_id`, `reason`, `revoked_at`, `effective_at`,
+`scrub_timestamp` — in addition to whatever the ceremony wants to say and to the
+`revoked_after` the #570 gate already required. All seven are REQUIRED; `reason`
+binds JSON `null` when the column is unset, because absence has to be an
+ASSERTION rather than a hole or substituting a reason the signer never wrote
+would be free. There is no legacy regime (the standing decision on #598, #640,
+#643 and #659): a revocation that does not bind its subject is REFUSED, typed
+`federation_revocation_envelope_unbound`.
+
+`scrub_timestamp` is in the list even though `RowMirror` deliberately leaves the
+attestation plane's scrub metadata unbound, and the reason the exclusion does
+not carry is worth stating: an attestation's scrub fields are legitimately
+rewritten when a promoting node re-scrubs the row, whereas a revocation is never
+promoted and never re-scrubbed (`attach_revocation_pqc_signature` writes
+`scrub_signature_pqc` and `pqc_completed_at` and nothing else). On THIS plane
+that column is the key the per-`revoked_key_id` anti-rollback gate orders on —
+an unsigned ordering key, which is the #598 criterion for binding, verbatim.
+
+**One spelling, and the check IS the projection.** `revocation_binding(&row)`
+returns the members as an ordered list of `(name, value)`; the producing side
+(`bind_revocation_into_envelope`) inserts them and the checking side
+(`check_revocation_envelope_binding`) **iterates the same call**. A seventh
+member added there is produced AND checked with no second edit — exhaustive by
+construction, not by anyone remembering. The published
+`REVOCATION_BINDING_MEMBERS` list exists for producers only and is pinned to the
+projection by a test, because #658 is the recorded cost of a published member
+set that disagrees with the enforced one during the release that forces every
+producer to re-mint against it.
+
+**The check runs FIRST** — at the very top of `put_revocation` on memory,
+sqlite and postgres, ahead of the trust gate, the signature verify and the
+`slash` resolution, so the refusal is a pure function of the row and never
+depends on roster, trust score or custody state (the #659 ordering decision on
+the conferral plane, transferred). It is also the first statement of the shared
+`verify_revocation_admission`, so a future door cannot acquire this plane
+without it.
+
+**The instants are ordering-relevant, so they carry the microsecond floor.**
+`effective_at` decides whether a revocation is CONSIDERED at all
+(`fold_key_statement_standing`) and is what `revoked_after` is measured against;
+postgres `TIMESTAMPTZ` cannot store finer than a microsecond, so a
+sub-microsecond instant would make the same op sequence a strict order on
+sqlite/memory and a TIE on postgres — and would make the row fail its own
+binding after a round-trip. `revoked_at` gets the same floor for the round-trip
+reason. Producers truncate (`bind_revocation_into_envelope`); the gate REFUSES,
+because a substrate that silently rewrites a stored row no longer means what it
+says.
+
+### Fixed — SECURITY — one self-signed revocation made its own subject IMMUNE to every later de-admission (#659)
+
+Found while binding `scrub_timestamp`, and binding does not close it.
+
+Every backend's `put_revocation` runs a per-`revoked_key_id` anti-rollback: a
+submitted `scrub_timestamp` must STRICTLY EXCEED the newest already stored for
+that key, else `RevocationRollback`. That is right on its own — replaying an old
+revocation must not re-open a settled question — but it makes `scrub_timestamp`
+a **monotonic latch on a key's entire de-admission history**, and nothing
+bounded how high the first writer could set it.
+
+Self-revocation is unconditionally allowed, and correctly so: a compromised key
+must be retirable by its holder, and gating that would mean a leaked key can
+only be retired by someone else. So a key could revoke ITSELF with `effective_at`
+far in the future — a revocation the standing fold does not consider yet — and
+`scrub_timestamp` at, say, the year 9999. From that moment **no further
+revocation of that key can be stored on this node**, including a legitimately
+slash-conferred moderator's. One self-signed row, no conferral required, and the
+key is immune to de-admission. The exact inverse of the finding above, on the
+same gate.
+
+Binding `scrub_timestamp` closes the RELAY variant (a peer bumping the instant
+on someone else's honest revocation in transit). It cannot close this one — the
+attacker signs its own row. What closes it is the **anti-rollback dual** #598
+already applies to `asserted_at`: a monotonic latch needs a ceiling as well as a
+floor, or a lying clock mints a value nothing later can exceed.
+`check_revocation_scrub_skew` refuses a `scrub_timestamp` more than
+`DEFAULT_MAX_TOUCH_SKEW` ahead of now, on all three backends, immediately before
+the floor. Same tolerance constant as #598 rather than a second one; same typed
+`RevocationRollback` refusal as the floor, so a caller does not hold two
+taxonomies for one gate.
+
+`effective_at` and `revoked_at` are deliberately NOT ceilinged. `effective_at`
+is documented as legitimately future-dated (*"may be retroactive or future"*) and
+a scheduled de-admission is a real operational shape that costs nothing — the
+fold simply does not consider the row yet. `revoked_at` is inert. Only
+`scrub_timestamp` is a latch, so only `scrub_timestamp` gets a ceiling.
+
+### Fixed — SECURITY — the memory backend ran NEITHER of the two revocation gates its siblings have run since v3.11.0 (#659)
+
+This release's own theme, on the door this cut was already opening. sqlite and
+postgres have gated `put_revocation` with the §3.11 closed-set `observed_region`
+check and the per-`revoked_key_id` anti-rollback since v3.11.0. **Memory ran
+neither.** So an `observed_region` outside the closed set and a non-monotonic
+scrub instant were both admitted on the one backend the in-process deployments
+and a large part of the fixture corpus use — and the sqlite/postgres tests that
+prove those gates work could never have seen it, which is the recorded
+`TEST EVERY BACKEND` class in its purest form.
+
+Both now run on memory, in the same position in the door's gate order. The
+witness is one shared body driven from all three backends
+(`exercise_revocation_rollback_and_region`), covering the region gate, the
+anti-rollback floor, the new ceiling, and — as the control that keeps the gates
+from being a blanket refusal — an honest later revocation of the same key still
+admitting.
+
+### Fixed — the history bound had no resolution floor either, on the one plane where all three instants matter (#659)
+
+Found while binding the two instants beside it. `check_revocation_bound` has
+required `revoked_after` to be signed and coherent since v25.1.0, and never
+checked its RESOLUTION. A sub-microsecond bound agrees with itself in both
+directions and still cannot survive a postgres round-trip: admitted here, stored
+truncated, then refused by this gate's own `TypedBoundDiverges` branch when a
+replicating peer read it back — and meanwhile `suspects_statement_at` answers
+differently on sqlite and on postgres for the same statement.
+
+New append-only token `bound_sub_microsecond` on `RevocationBoundRefusal`. The
+#570 backend witness anchored its instants at `Utc::now()`, whose nanoseconds
+postgres was silently dropping under a `timestamp()`-coarse assertion; it now
+truncates at the source.
+
+### Fixed — BREAKING — a licence grant carrying capabilities and an autonomy tier admitted on ONE signature (#659)
+
+`SignedPartnerRecord.threshold` is the M of the M-of-N on the plane that grants
+`capabilities_granted` and `max_autonomy_tier`. It arrived **caller-supplied,
+unfloored, and outside the signature.** Two independent holes:
+
+1. **No floor.** `verify_partner_record_quorum` routes to
+   `verify_founder_quorum`, which rejects only `M == 0` and `M > N`.
+   `verify_quorum_policy` — the function that enforces the federation's one
+   quorum rule, a strict majority `2M > N`, with no `M == 1` escape hatch — was
+   **not on this path**. So `threshold: 1` admitted a licence on one steward
+   signature, contradicting this repo's own recorded accord-ops invariant
+   (`reverse_quorum.rs`: *m-of-n OR reverse quorum, never 1-of-N
+   capability-grant*). Every sibling m-of-n door already floors M; this one did
+   not. Note the N was ALREADY the live registered steward roster —
+   `verify_founder_quorum` has always enforced `M ≤ N` against it — so this is
+   the completion of a rule that was half-enforced, not a new reading.
+2. **Unsigned.** `threshold` lives on the WRAPPER, so it was covered neither by
+   the quorum's own bytes nor by `check_partner_record_binding`. A relay could
+   rewrite a `3` into a `1` in transit with all three stewards' signatures still
+   valid — and a floor applied to a relay's number is not a floor.
+
+Both halves land together and in this cut. Enforcing the floor is a pure
+tightening for a conformant producer; BINDING `threshold` is a **preimage
+change**, and `partner_record` bytes are signed by an M-of-N steward quorum
+before persist ever sees the row — one release later this would mean
+re-collecting M steward signatures across organizations in a second ceremony
+against a live federation. `check_partner_record_binding` therefore takes
+`&SignedPartnerRecord` rather than `&PartnerRecord`: `threshold` is the only
+security-relevant field of the submission that is not a column of the record,
+and minting a fourth binding helper for one field would have been the second
+spelling this release exists to stop. The floor itself is
+`QuorumPolicy::validate` — the SAME rule `verify_quorum_policy` applies — rather
+than `2 * m > n` re-spelled in persist.
 
 ### Fixed — BREAKING — one accord co-scrub conferred `canonical` on ANY key_id, carrying ANY pubkeys — the ceremony never named its subject (#659)
 
