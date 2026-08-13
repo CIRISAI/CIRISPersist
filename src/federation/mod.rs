@@ -5559,6 +5559,44 @@ pub enum Error {
         submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
     },
 
+    /// v31.0.0 (CIRISPersist#659) — **the anti-rollback CEILING**: the
+    /// submitted revocation's `scrub_timestamp` is further in the future than
+    /// this node will accept.
+    ///
+    /// [`Error::RevocationRollback`] is the FLOOR, and on its own it makes
+    /// `scrub_timestamp` a monotonic latch on a key's entire de-admission
+    /// history with no upper bound. Self-revocation needs no conferral
+    /// ([`admission::check_revocation_authority`] — a compromised key must be
+    /// retirable by its holder), so one self-signed revocation dated at the
+    /// year 9999 made its own subject **immune to every later de-admission**,
+    /// a slash-conferred moderator's included. Binding `scrub_timestamp` into
+    /// the signed envelope (#659) closes the relay variant and cannot close
+    /// this one, because the attacker signs its own row. A latch needs a
+    /// ceiling as well as a floor.
+    ///
+    /// A DISTINCT variant rather than a second meaning for the floor's: the
+    /// floor's message says *"not strictly later than existing …"*, and
+    /// reporting a ceiling through it would tell an operator the one thing
+    /// that is not true — there is no existing revocation at that instant.
+    /// See [`admission::check_revocation_scrub_skew`].
+    #[error(
+        "anti-rollback ceiling: revocation for {revoked_key_id:?} scrub_timestamp \
+         {submitted_signed_timestamp} is {ahead_seconds}s ahead of this node's clock, beyond \
+         the {tolerance_seconds}s tolerance. The scrub instant is a MONOTONIC LATCH per \
+         revoked_key_id, so a future-dated one blocks every later de-admission of this key \
+         (CIRISPersist#659)"
+    )]
+    RevocationScrubSkew {
+        /// The `revoked_key_id` the new revocation targets.
+        revoked_key_id: String,
+        /// The submitted (rejected) `scrub_timestamp`.
+        submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
+        /// How far ahead of this node's clock it sits.
+        ahead_seconds: i64,
+        /// The tolerance it exceeded ([`admission::DEFAULT_MAX_TOUCH_SKEW`]).
+        tolerance_seconds: i64,
+    },
+
     /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8). The submitted
     /// identity_occurrence's `device_class` is outside the closed set
     /// `{phone, laptop, server, embedded, agent, service}`. Rejected at
@@ -6397,6 +6435,7 @@ impl Error {
             Error::CohortScopeRejected { .. } => "federation_cohort_scope_rejected",
             Error::RegionRejected { .. } => "federation_region_rejected",
             Error::RevocationRollback { .. } => "federation_revocation_rollback",
+            Error::RevocationScrubSkew { .. } => "federation_revocation_scrub_skew",
             Error::DeviceClassRejected { .. } => "federation_device_class_rejected",
             Error::ConsensusProtocolMalformed { .. } => "federation_consensus_protocol_malformed",
             Error::WriteScopeRefused(_) => "federation_write_scope_refused",

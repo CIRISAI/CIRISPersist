@@ -4638,6 +4638,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // moderation act. Self-revocation passes untouched.
         crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
+        // monotonic latch on a key's whole de-admission history, and without a
+        // ceiling one self-signed revocation dated far enough forward makes its
+        // own subject immune to every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         check_revocation_anti_rollback_sqlite(&self.conn, &row.revoked_key_id, row.scrub_timestamp)
             .await?;
 
@@ -19566,6 +19576,18 @@ mod accord_tests {
         .await;
     }
 
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on sqlite.
+    #[tokio::test]
+    async fn revocation_rollback_and_region_sqlite_659() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend, "sq659g",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
     /// and the M is signed. On sqlite.
     #[tokio::test]
@@ -23411,6 +23433,11 @@ mod tests {
         let t0: chrono::DateTime<chrono::Utc> = "2026-06-03T12:00:00Z".parse().unwrap();
         let mut rev0 = fed_revocation("rev-0", "k-bad", "registry-steward", "registry-steward");
         rev0.scrub_timestamp = t0;
+        // v31.0.0 (#659) — `scrub_timestamp` is inside the signed bytes now, so
+        // moving the column after the seal means RE-SEALING. A fixture that
+        // mutates a bound column and does not re-sign is producing a row this
+        // substrate's own door refuses, which is the whole point of binding it.
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev0);
         grant_slash(&backend, "registry-steward").await;
         backend
             .put_revocation(SignedRevocation { revocation: rev0 })
@@ -23421,6 +23448,7 @@ mod tests {
         let mut rev_equal =
             fed_revocation("rev-equal", "k-bad", "registry-steward", "registry-steward");
         rev_equal.scrub_timestamp = t0;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_equal);
         let err = backend
             .put_revocation(SignedRevocation {
                 revocation: rev_equal,
@@ -23442,6 +23470,7 @@ mod tests {
             "registry-steward",
         );
         rev_earlier.scrub_timestamp = t_minus;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_earlier);
         let err = backend
             .put_revocation(SignedRevocation {
                 revocation: rev_earlier,
@@ -23458,6 +23487,7 @@ mod tests {
         let mut rev_later =
             fed_revocation("rev-later", "k-bad", "registry-steward", "registry-steward");
         rev_later.scrub_timestamp = t_plus;
+        crate::federation::tier_ingest::test_support::seal_revocation_in_place(&mut rev_later);
         backend
             .put_revocation(SignedRevocation {
                 revocation: rev_later,

@@ -5498,6 +5498,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // moderation act. Self-revocation passes untouched.
         crate::federation::admission::check_revocation_authority(self, &row).await?;
         crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
+        // monotonic latch on a key's whole de-admission history, and without a
+        // ceiling one self-signed revocation dated far enough forward makes its
+        // own subject immune to every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
         let client = self
             .get_client()
             .await
@@ -20957,6 +20967,24 @@ mod tests {
             &backend,
             &format!("pg659r-{}", uuid::Uuid::new_v4().simple()),
             &node,
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn revocation_rollback_and_region_postgres_659() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend,
+            &format!("pg659g-{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
     }

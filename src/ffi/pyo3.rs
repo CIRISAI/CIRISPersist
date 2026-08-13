@@ -28785,7 +28785,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.11.0 (CIRISPersist#143) — verify-coord R1/Q1 admission
         // rejections are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::RegionRejected { .. }
-        | crate::federation::Error::RevocationRollback { .. } => PyValueError::new_err(kind),
+        | crate::federation::Error::RevocationRollback { .. }
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback CEILING. Caller-fault
+        // in the same way the floor is: the remedy is a scrub instant on this
+        // node's clock, which is a fix to the submitted row.
+        | crate::federation::Error::RevocationScrubSkew { .. } => PyValueError::new_err(kind),
         // v3.12.0 (CIRISPersist#153 Asks 1-2) — CEG 0.7
         // identity_occurrence + family admission rejections are
         // caller-fault malformed-content; ValueError (4xx).

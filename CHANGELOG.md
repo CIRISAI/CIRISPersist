@@ -261,6 +261,7 @@ Everything that says WHAT THIS ROW DOES was a plain caller-supplied column:
 | `reason` | the sentence a human adjudicator reads back | no |
 | `revoked_at` | when the act was issued | no |
 | `effective_at` | **when it BITES** — the standing fold's ordering key | no |
+| `scrub_timestamp` | **the anti-rollback ordering key** — a monotonic latch per `revoked_key_id` | no |
 | `revoked_after` | the history bound | yes, since v25.1.0 |
 
 **So one validly-signed revocation was an unbounded de-conferral primitive.** A
@@ -287,15 +288,24 @@ pasted onto (CIRISPersist#659)
 ```
 
 **The preimage change.** `revocation_envelope` now carries, at top level, the
-six members of `admission::revocation_binding` — `revocation_id`,
-`revoked_key_id`, `revoking_key_id`, `reason`, `revoked_at`, `effective_at` —
-in addition to whatever the ceremony wants to say and to the `revoked_after` the
-#570 gate already required. All six are REQUIRED; `reason` binds JSON `null`
-when the column is unset, because absence has to be an ASSERTION rather than a
-hole or substituting a reason the signer never wrote would be free. There is no
-legacy regime (the standing decision on #598, #640, #643 and #659): a revocation
-that does not bind its subject is REFUSED, typed
+seven members of `admission::revocation_binding` — `revocation_id`,
+`revoked_key_id`, `revoking_key_id`, `reason`, `revoked_at`, `effective_at`,
+`scrub_timestamp` — in addition to whatever the ceremony wants to say and to the
+`revoked_after` the #570 gate already required. All seven are REQUIRED; `reason`
+binds JSON `null` when the column is unset, because absence has to be an
+ASSERTION rather than a hole or substituting a reason the signer never wrote
+would be free. There is no legacy regime (the standing decision on #598, #640,
+#643 and #659): a revocation that does not bind its subject is REFUSED, typed
 `federation_revocation_envelope_unbound`.
+
+`scrub_timestamp` is in the list even though `RowMirror` deliberately leaves the
+attestation plane's scrub metadata unbound, and the reason the exclusion does
+not carry is worth stating: an attestation's scrub fields are legitimately
+rewritten when a promoting node re-scrubs the row, whereas a revocation is never
+promoted and never re-scrubbed (`attach_revocation_pqc_signature` writes
+`scrub_signature_pqc` and `pqc_completed_at` and nothing else). On THIS plane
+that column is the key the per-`revoked_key_id` anti-rollback gate orders on —
+an unsigned ordering key, which is the #598 criterion for binding, verbatim.
 
 **One spelling, and the check IS the projection.** `revocation_binding(&row)`
 returns the members as an ordered list of `(name, value)`; the producing side
@@ -326,6 +336,62 @@ binding after a round-trip. `revoked_at` gets the same floor for the round-trip
 reason. Producers truncate (`bind_revocation_into_envelope`); the gate REFUSES,
 because a substrate that silently rewrites a stored row no longer means what it
 says.
+
+### Fixed — SECURITY — one self-signed revocation made its own subject IMMUNE to every later de-admission (#659)
+
+Found while binding `scrub_timestamp`, and binding does not close it.
+
+Every backend's `put_revocation` runs a per-`revoked_key_id` anti-rollback: a
+submitted `scrub_timestamp` must STRICTLY EXCEED the newest already stored for
+that key, else `RevocationRollback`. That is right on its own — replaying an old
+revocation must not re-open a settled question — but it makes `scrub_timestamp`
+a **monotonic latch on a key's entire de-admission history**, and nothing
+bounded how high the first writer could set it.
+
+Self-revocation is unconditionally allowed, and correctly so: a compromised key
+must be retirable by its holder, and gating that would mean a leaked key can
+only be retired by someone else. So a key could revoke ITSELF with `effective_at`
+far in the future — a revocation the standing fold does not consider yet — and
+`scrub_timestamp` at, say, the year 9999. From that moment **no further
+revocation of that key can be stored on this node**, including a legitimately
+slash-conferred moderator's. One self-signed row, no conferral required, and the
+key is immune to de-admission. The exact inverse of the finding above, on the
+same gate.
+
+Binding `scrub_timestamp` closes the RELAY variant (a peer bumping the instant
+on someone else's honest revocation in transit). It cannot close this one — the
+attacker signs its own row. What closes it is the **anti-rollback dual** #598
+already applies to `asserted_at`: a monotonic latch needs a ceiling as well as a
+floor, or a lying clock mints a value nothing later can exceed.
+`check_revocation_scrub_skew` refuses a `scrub_timestamp` more than
+`DEFAULT_MAX_TOUCH_SKEW` ahead of now, on all three backends, immediately before
+the floor. Same tolerance constant as #598 rather than a second one; same typed
+`RevocationRollback` refusal as the floor, so a caller does not hold two
+taxonomies for one gate.
+
+`effective_at` and `revoked_at` are deliberately NOT ceilinged. `effective_at`
+is documented as legitimately future-dated (*"may be retroactive or future"*) and
+a scheduled de-admission is a real operational shape that costs nothing — the
+fold simply does not consider the row yet. `revoked_at` is inert. Only
+`scrub_timestamp` is a latch, so only `scrub_timestamp` gets a ceiling.
+
+### Fixed — SECURITY — the memory backend ran NEITHER of the two revocation gates its siblings have run since v3.11.0 (#659)
+
+This release's own theme, on the door this cut was already opening. sqlite and
+postgres have gated `put_revocation` with the §3.11 closed-set `observed_region`
+check and the per-`revoked_key_id` anti-rollback since v3.11.0. **Memory ran
+neither.** So an `observed_region` outside the closed set and a non-monotonic
+scrub instant were both admitted on the one backend the in-process deployments
+and a large part of the fixture corpus use — and the sqlite/postgres tests that
+prove those gates work could never have seen it, which is the recorded
+`TEST EVERY BACKEND` class in its purest form.
+
+Both now run on memory, in the same position in the door's gate order. The
+witness is one shared body driven from all three backends
+(`exercise_revocation_rollback_and_region`), covering the region gate, the
+anti-rollback floor, the new ceiling, and — as the control that keeps the gates
+from being a blanket refusal — an honest later revocation of the same key still
+admitting.
 
 ### Fixed — the history bound had no resolution floor either, on the one plane where all three instants matter (#659)
 

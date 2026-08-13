@@ -3550,6 +3550,45 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // locks itself). Hybrid-Strict vs the revoking key's registered
         // pubkeys — was FK + trust-score only, forgeable de-peer DoS.
         crate::federation::verify_revocation_admission(self, &row).await?;
+        // v31.0.0 (CIRISPersist#659) — THE TWO GATES MEMORY NEVER RAN. sqlite
+        // and postgres have gated this door with the §3.11 closed-set region
+        // check and the per-`revoked_key_id` anti-rollback since v3.11.0;
+        // memory ran NEITHER, so a region outside the closed set and a
+        // non-monotonic scrub instant were both admitted on the one backend the
+        // in-process deployments and half the fixture corpus use. That is this
+        // release's own theme — a write door that skips a gate its siblings run
+        // (#656) — and the recurring backend-asymmetry class it has cost seven
+        // releases to learn.
+        crate::federation::check_observed_region(&row.observed_region)?;
+        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
+        // See `check_revocation_scrub_skew`: without a ceiling, one self-signed
+        // revocation dated far enough forward makes its own subject immune to
+        // every later de-admission.
+        crate::federation::admission::check_revocation_scrub_skew(
+            &row,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        {
+            // The floor. Scoped so the lock is released before the gates below,
+            // keeping memory's gate ORDER identical to sqlite/postgres.
+            let state = self.state.lock().expect("memory backend lock");
+            let latest = state
+                .federation_revocations
+                .iter()
+                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .map(|r| r.scrub_timestamp)
+                .max();
+            if let Some(existing) = latest {
+                if row.scrub_timestamp <= existing {
+                    return Err(crate::federation::Error::RevocationRollback {
+                        revoked_key_id: row.revoked_key_id.clone(),
+                        existing_signed_timestamp: existing,
+                        submitted_signed_timestamp: row.scrub_timestamp,
+                    });
+                }
+            }
+        }
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the one
         // that was SIGNED, and must be coherent with `effective_at`. Runs
         // before persist_row_hash and before the push, so a refused bound
@@ -12467,6 +12506,19 @@ mod tests {
             &backend,
             "mem659r",
             "rev659-node-mem",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
+    /// anti-rollback floor and its new ceiling, on memory. The first two were
+    /// live on sqlite and postgres and ABSENT here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_rollback_and_region_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
+            &backend, "mem659g",
         )
         .await;
     }
