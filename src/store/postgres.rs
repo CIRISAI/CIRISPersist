@@ -20946,6 +20946,25 @@ mod tests {
         .expect("659 subject-binding exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659, one plane wider) — a registration signature
+    /// admits only the key it names, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn registration_subject_binding_postgres_659() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::register::test_support::exercise_registration_subject_binding(
+            &backend,
+            &format!("pg659r-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("659 registration subject-binding exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]

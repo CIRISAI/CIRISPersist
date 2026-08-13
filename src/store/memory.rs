@@ -12457,6 +12457,18 @@ mod tests {
         .expect("659 subject-binding exercise");
     }
 
+    /// v31.0.0 (CIRISPersist#659, one plane wider) — a registration signature
+    /// admits only the key it names, on memory.
+    #[tokio::test]
+    async fn registration_subject_binding_memory_659() {
+        let backend = MemoryBackend::new();
+        crate::federation::register::test_support::exercise_registration_subject_binding(
+            &backend, "mem659r",
+        )
+        .await
+        .expect("659 registration subject-binding exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_memory_548() {
