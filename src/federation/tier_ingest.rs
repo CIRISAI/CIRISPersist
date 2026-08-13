@@ -771,8 +771,10 @@ pub(crate) mod test_support {
     ///
     /// The fixture corpus builds [`Attestation`] rows by hand and signs the
     /// envelope with [`sign_envelope`], which is exactly the producer shape the
-    /// binding gate now constrains: the five typed columns must appear inside
-    /// the SIGNED bytes. Doing that by hand at every call site would be ~200
+    /// binding gate now constrains: the SEVEN typed columns must appear inside
+    /// the SIGNED bytes (v31.0.0, CIRISPersist#658 — this said five; the
+    /// authority is [`crate::federation::envelope::row_paths::ALL`]).
+    /// Doing that by hand at every call site would be ~200
     /// copies of one projection, and a copy that drifts is a fixture certifying
     /// a row no host can write.
     ///
