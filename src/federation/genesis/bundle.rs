@@ -28,9 +28,49 @@
 //!
 //! The [`authorization_digest`] preimage is BYTE-IDENTICAL to CIRISServer
 //! `mesh_genesis::authorization_digest` (the producer): bundle identity +
-//! holder ids + serve ids + the whole delegation plane, canonicalized with
-//! the same JCS producer. A co-signer cannot be replayed onto a bundle
-//! with a swapped serve node or a widened charter.
+//! holder **ids** + serve **ids** + the whole delegation plane, canonicalized
+//! with the same JCS producer.
+//!
+//! # What that digest does and does not bind (CIRISPersist#660)
+//!
+//! This paragraph used to end *"a co-signer cannot be replayed onto a bundle
+//! with a swapped serve node or a widened charter."* Half of that was true and
+//! the half that was not is corrected here rather than deleted, because a
+//! comment claiming a property the code does not have is worse than no comment:
+//! it is the thing a reviewer trusts instead of reading the preimage.
+//!
+//! - **A widened charter: genuinely covered.** Each attestation contributes its
+//!   `attestation_id`, `attesting_key_id`, `attested_key_id`,
+//!   `attestation_type` AND its whole `attestation_envelope`, so the conferral
+//!   plane — the scopes, the subject, the verb — is bound byte-for-byte.
+//! - **A swapped serve node: covered only by IDENTITY.** `serve_nodes` and
+//!   `holders` contribute their `key_id`s and nothing else. Adding, removing or
+//!   renaming a serve node breaks every authorization; **substituting the
+//!   RECORD under an unchanged `key_id`** — a different `pubkey_ed25519_base64`,
+//!   `registration_envelope`, scrub set, `valid_from`, roles or custody
+//!   evidence — does not appear in the digest at all.
+//!
+//! What actually stops that substitution is not this digest, and a reader
+//! should know where to look: a serve-node record still has to pass
+//! `put_public_key`'s canonical-role admission (a 2-of-3 accord co-scrub
+//! re-verified against THIS node's pinned holder anchors), and
+//! [`bake_assembled_genesis`] additionally refuses a re-anchor whose pubkey
+//! differs from the anchored row or whose `valid_from` does not move forward.
+//! Those are real gates and they are why this gap has never been exploitable on
+//! its own — but they are a different mechanism, adjudicating a different
+//! question, and the digest should not be described as if it did their job.
+//!
+//! **Why the digest was not simply widened here.** The preimage is a
+//! cross-repo wire contract: it is declared byte-identical to the PRODUCER's
+//! (CIRISServer `mesh_genesis::authorization_digest`), and holder
+//! authorizations are computed over the producer's construction. Widening it in
+//! persist alone would make this node refuse every bundle CIRISServer emits,
+//! including the baked `canonical_seed.json` whose authorizations are already
+//! signed over the narrow preimage — a consumer-side break with no producer-side
+//! half. It is the right change and the v31 re-ceremony is the right window for
+//! it, so it is tracked as CIRISServer-side work rather than described as
+//! covered; when both halves land together the bullet above becomes obsolete
+//! and must be rewritten, not quietly dropped.
 
 use super::super::types::{SignedAttestation, SignedKeyRecord};
 use super::super::{Error, FederationDirectory};
@@ -79,6 +119,14 @@ pub struct GenesisBundle {
 /// producer's construction (CIRISServer `mesh_genesis`): bundle identity,
 /// holder ids, serve ids, and the whole delegation plane. Deliberately
 /// excludes `authorizations` (they are what is being accumulated).
+///
+/// # Read the preimage below, not a summary of it (CIRISPersist#660)
+///
+/// `holders` and `serve_nodes` contribute **`key_id` only** — the record
+/// content under an unchanged id is NOT in these bytes. `attestations`
+/// contribute their full `attestation_envelope` and so ARE bound. See this
+/// module's doc for what closes the serve-node gap instead, and for why the
+/// preimage is not widened unilaterally on the consumer side.
 pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
     let preimage = serde_json::json!({
         "version": bundle.version,

@@ -2820,6 +2820,87 @@ mod put_blob_binding_tests {
     }
 }
 
+/// v31.0.0 (CIRISPersist#660) — **`put_blob` states its `cohort_scope`**, the
+/// sibling of the #652 `tier` finding on the same INSERT.
+///
+/// `cohort_scope` was omitted from the `federation_attestations` column list on
+/// BOTH SQL backends and took the V056 schema default `'federation'`. That
+/// happened to equal what [`holds_bytes_attestation_row`] puts in the row the
+/// `persist_row_hash` is computed over — and, since #643, what the signed `row`
+/// MIRROR inside the envelope declares. Two values agreeing because nobody chose
+/// either is not a binding: change the builder or the schema default and the
+/// stored column silently stops matching the bytes that were signed.
+///
+/// # What gives this witness teeth
+///
+/// Not the equality — the default coincides, so a pin alone cannot tell "the
+/// door chose this" from "the column filled itself in" (the #652 witness says
+/// the same about `tier`, and is right to). The teeth are
+/// [`check_row_column_binding`](crate::federation::admission::check_row_column_binding):
+/// `cohort_scope` is one of the seven columns #643 binds into the signed
+/// envelope, so a stored value that diverges from the builder's is a row this
+/// substrate's own put door refuses. Asserted over the row **as read back from
+/// the table**, which is the only form that can see an INSERT's omission at all.
+///
+/// Two backends, not three: `put_blob` is [`BlobStorage`], which the memory
+/// backend does not implement. The parity set here is exactly the set of
+/// backends that have the door.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn exercise_put_blob_states_its_cohort_scope<B>(be: &B, tag: &str)
+where
+    B: BlobStorage + crate::federation::FederationDirectory,
+{
+    let holder = format!("{tag}-660-blobholder");
+    crate::federation::tier_ingest::test_support::register_hybrid_key(be, &holder).await;
+
+    let payload = format!("660-{tag}").into_bytes();
+    let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&payload).into();
+    let attestation_id = uuid::Uuid::new_v4().to_string();
+    let asserted_at =
+        crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    let envelope = holds_bytes_attestation_envelope(&sha, &holder, &attestation_id, asserted_at);
+    let (och, classical, pqc) =
+        crate::federation::tier_ingest::test_support::sign_envelope(&holder, &envelope);
+
+    be.put_blob(
+        &sha,
+        BlobBody::Inline(payload),
+        None,
+        PutBlobAttestation {
+            attesting_key_id: holder.clone(),
+            attestation_id: attestation_id.clone(),
+            original_content_hash_hex: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: holder.clone(),
+            scrub_timestamp: asserted_at,
+            asserted_at,
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] put_blob must admit an ordinary inline body: {e:?}"));
+
+    let stored = crate::federation::FederationDirectory::get_attestation(be, &attestation_id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the holds_bytes row must have been written"));
+
+    // THE ASSERTION WITH TEETH: the stored columns must match the signed mirror.
+    // An INSERT that omits `cohort_scope` and lets the default fill it in reds
+    // here the moment the builder and the default stop coinciding.
+    crate::federation::admission::check_row_column_binding(&stored).unwrap_or_else(|e| {
+        panic!(
+            "[{tag}] the STORED holds_bytes row must satisfy the #643 column binding — a \
+             column the INSERT never named cannot be one the signature covers: {e}"
+        )
+    });
+    assert_eq!(
+        stored.cohort_scope,
+        crate::federation::types::cohort_scope::FEDERATION,
+        "[{tag}] put_blob must STATE the cohort_scope it publishes at"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

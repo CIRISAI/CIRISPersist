@@ -5142,6 +5142,44 @@ pub enum Error {
         attesting_key_id: String,
     },
 
+    /// v31.0.0 (CIRISPersist#660) — **a baked genesis delegation id is
+    /// reserved.** An attestation write claimed `genesis-charter` /
+    /// `genesis-grant:…` / `genesis-lifecycle` with content that is not the
+    /// baked ceremony row.
+    ///
+    /// The attestation-plane twin of [`Self::ConstitutionalFamilyReserved`],
+    /// and the same finding: nothing reserved these ids, so one ordinary
+    /// `scores` row from any registered key could take the primary key the
+    /// ceremony needs. On the family plane the consequence was a 1-of-1
+    /// charter; here it was worse in one specific way — the squat also flipped
+    /// [`genesis_posture`](genesis::genesis_posture) to
+    /// [`Divergent`](genesis::GenesisPosture::Divergent), which
+    /// [`refuses_boot`](genesis::GenesisFault::refuses_boot), so a peer could
+    /// deny a node its boot AND make the denial permanent by holding the key.
+    ///
+    /// The rule is stated as AUTHORSHIP — federation-tier, attested by a seated
+    /// accord holder — rather than as a door, because unlike the family plane
+    /// the delegation plane has no second door: the ceremony, the host's boot
+    /// write and a peer's replication all arrive at `put_attestation`. See
+    /// [`check_genesis_attestation_reserved`](genesis::check_genesis_attestation_reserved),
+    /// including why pinning the baked CONTENT instead would have refused the
+    /// re-ceremony these ids exist for.
+    #[error(
+        "attestation_id {attestation_id:?} is a baked genesis delegation row and is reserved: \
+         it is installed by the genesis ceremony, never by an ordinary write — this one's \
+         {field} {detail} (attesting key {attesting_key_id:?})"
+    )]
+    GenesisAttestationReserved {
+        /// The reserved id the caller tried to claim.
+        attestation_id: String,
+        /// Who tried.
+        attesting_key_id: String,
+        /// The first field that diverged from the baked row.
+        field: String,
+        /// What diverged, for an operator.
+        detail: String,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -6328,6 +6366,7 @@ impl Error {
             Error::ConstitutionalFamilyReserved { .. } => {
                 "federation_constitutional_family_reserved"
             }
+            Error::GenesisAttestationReserved { .. } => "federation_genesis_attestation_reserved",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }

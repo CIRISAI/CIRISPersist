@@ -3487,6 +3487,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED. See
+        // the memory backend's put_attestation for the placement rationale;
+        // pure ⇒ TIER 1, backend-symmetric across memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
+        // STATED rather than left to the `hex::decode` at bind time. See the
+        // memory backend: binding nothing, it accepted what this refuses.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
@@ -4613,6 +4624,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
+
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
+        // STATED. The `hex::decode` at bind time refuses the same values but
+        // only as a side effect of binding a BLOB, which is why the memory
+        // backend — binding nothing — accepted them. Placed HERE, ahead of the
+        // signature verify, on all three backends: `verify_revocation_admission`
+        // also cross-checks the hash, so a hex check sitting behind it on one
+        // backend and ahead of it on another would give two different refusals
+        // for one row.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
 
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
         // revocation MUST be hybrid-Strict-signed by its declared revoking
@@ -10460,6 +10484,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let asserted_at_str = attestation_row.asserted_at.to_rfc3339();
         let scrub_timestamp_str = attestation.scrub_timestamp.to_rfc3339();
         let tier_owned = attestation_row.tier.clone();
+        // v31.0.0 (CIRISPersist#660) — and `cohort_scope` alongside it, for the
+        // identical #652 reason: it was omitted from the INSERT and took the
+        // V056 schema default `'federation'`, which happened to equal what
+        // `holds_bytes_attestation_row` puts in the row the persist_row_hash is
+        // computed over. Two values agreeing today because nobody chose either
+        // is not a binding — change the builder and the stored column silently
+        // stops matching the hash. The value nobody chose is the value that
+        // replicates.
+        let cohort_scope_owned = attestation_row.cohort_scope.clone();
         let attestation_id_owned = attestation.attestation_id.clone();
         let attesting_key_id_owned = attestation.attesting_key_id.clone();
         let scrub_signature_classical_owned = attestation.scrub_signature_classical.clone();
@@ -10501,8 +10534,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                    cohort_scope\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                    ?17)",
                 rusqlite::params![
                     attestation_id_owned,
                     attesting_key_id_owned,
@@ -10520,6 +10555,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     Option::<String>::None,
                     persist_row_hash,
                     tier_owned,
+                    cohort_scope_owned,
                 ],
             )?;
             tx.commit()?;
@@ -13954,6 +13990,11 @@ impl SqliteBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
+        // THIS DOOR TOO. See the memory backend's local door for why this one
+        // cannot defer to the promote gate the way `check_reserved_prefix_admission`
+        // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
         // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
         // decision and the transit exclusion. One helper, all three backends.
@@ -15214,17 +15255,15 @@ async fn check_revocation_anti_rollback_sqlite(
     })()
     .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
 
-    if let Some(latest_ts_str) = latest {
-        let existing = parse_rfc3339(&latest_ts_str);
-        if submitted_ts <= existing {
-            return Err(crate::federation::Error::RevocationRollback {
-                revoked_key_id: revoked_key_id.to_owned(),
-                existing_signed_timestamp: existing,
-                submitted_signed_timestamp: submitted_ts,
-            });
-        }
-    }
-    Ok(())
+    // v31.0.0 (CIRISPersist#660) — the LOOKUP is backend-specific, the RULE is
+    // not. See `admission::check_revocation_anti_rollback`: this comparison used
+    // to be written out here, again in the Postgres twin, and nowhere at all on
+    // the memory backend.
+    crate::federation::admission::check_revocation_anti_rollback(
+        revoked_key_id,
+        latest.as_deref().map(parse_rfc3339),
+        submitted_ts,
+    )
 }
 
 /// v2.10.0 (CIRISPersist#114) — SQLite row → `Goal` projection.
@@ -20817,6 +20856,76 @@ mod tests {
             .await
             .expect("holders seed");
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **revocation-door
+    /// parity** witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn revocation_door_parity_sqlite_660() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::backend_parity_test_support::exercise_revocation_parity(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **attestation
+    /// `original_content_hash` hex** parity witness.
+    #[tokio::test]
+    async fn attestation_hash_hex_parity_sqlite_660() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::backend_parity_test_support::exercise_attestation_hash_hex_parity(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **`put_blob` states
+    /// its `cohort_scope`** witness (see the postgres leg; memory has no
+    /// `BlobStorage` door).
+    #[tokio::test]
+    async fn put_blob_states_cohort_scope_sqlite_660() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::blobs::exercise_put_blob_states_its_cohort_scope(&backend, "sqlite")
+            .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **genesis-id squat**
+    /// witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn genesis_id_squat_refused_parity_sqlite_660() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::genesis::exercise_genesis_id_squat_refused(&backend, "sqlite").await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **injected-squat**
+    /// witness (see the memory + postgres legs). The injection is a raw
+    /// `UPDATE` that renames an ordinary admitted row onto a genesis id —
+    /// i.e. exactly the "beneath persist" case reservation cannot reach, and
+    /// the only route by which `Divergent` remains reachable at all.
+    #[tokio::test]
+    async fn injected_genesis_squat_is_divergent_sqlite_660() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let decoy = crate::federation::genesis::seed_decoy_attestation(&backend, "sqlite").await;
+        let target = crate::federation::genesis::genesis_delegation_ids()[0];
+        {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_attestations SET attestation_id = ?1 \
+                     WHERE attestation_id = ?2",
+                    rusqlite::params![target, decoy],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the injection must actually have moved a row");
+        }
+        crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "sqlite").await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the SQLITE leg of the **anti-fail-open**

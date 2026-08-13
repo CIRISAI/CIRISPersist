@@ -4463,6 +4463,65 @@ pub fn check_observed_region(observed_region: &str) -> Result<(), Error> {
     }
 }
 
+/// v31.0.0 (CIRISPersist#660) — **the revocation anti-rollback RULE**, lifted out
+/// of the two SQL helpers that each spelled it themselves.
+///
+/// A revocation for `revoked_key_id` whose signed `scrub_timestamp` is not
+/// strictly newer than the newest one already stored is a REPLAY: re-submitting
+/// an older, still-validly-signed revocation would otherwise re-assert a state
+/// its subject has already moved past.
+///
+/// # Why it is a free function and not three inline comparisons
+///
+/// It was three — `check_revocation_anti_rollback_sqlite`,
+/// `check_revocation_anti_rollback_postgres`, and on memory NOTHING AT ALL, so
+/// the memory backend accepted a rollback the SQL backends refused (#660,
+/// finding 3). Finding the newest stored row genuinely differs per backend (a
+/// `SELECT … ORDER BY … LIMIT 1` versus a `Vec` scan); the COMPARISON does not,
+/// and it is the comparison that is the security rule. Each backend now does its
+/// own lookup and hands the answer here, so a fix to the rule cannot land on two
+/// backends out of three.
+pub fn check_revocation_anti_rollback(
+    revoked_key_id: &str,
+    latest_stored: Option<chrono::DateTime<chrono::Utc>>,
+    submitted: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    match latest_stored {
+        Some(existing) if submitted <= existing => Err(Error::RevocationRollback {
+            revoked_key_id: revoked_key_id.to_owned(),
+            existing_signed_timestamp: existing,
+            submitted_signed_timestamp: submitted,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// v31.0.0 (CIRISPersist#660) — **`original_content_hash` must be hex**, stated
+/// rather than left to whichever backend happens to bind it as bytes.
+///
+/// The column is `BLOB` on SQLite and `BYTEA` on Postgres, so both backends had
+/// to `hex::decode` the string to bind it and therefore refused a non-hex value
+/// as a side effect. The memory backend never decodes anything, so it accepted
+/// `"nothex!"` and `"abcdef0"` — a row that is unwritable on the two backends
+/// production actually runs. That is the *memory tolerates what the SQL backends
+/// reject* class, on the field that names the signed content.
+///
+/// The rule is deliberately **exactly `hex::decode`'s** — an even-length string
+/// of ASCII hex digits — and NOT "64 characters". Widening it to a length rule
+/// here would refuse rows the SQL backends admit today (the `"deadbeef"`-shaped
+/// short digests that predate this) and would be a new rule wearing a parity
+/// fix's clothes. Parity means the same answer, not a better one.
+///
+/// The empty string passes, because `hex::decode("")` succeeds and because a
+/// local-tier row legitimately carries no content hash until it is sealed.
+pub fn check_content_hash_hex(field: &str, value: &str) -> Result<(), Error> {
+    hex::decode(value).map(|_| ()).map_err(|e| {
+        Error::InvalidArgument(format!(
+            "{field} must be hex (the SQL backends bind it as bytes and cannot store {value:?}): {e}"
+        ))
+    })
+}
+
 /// v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admission-gate
 /// validation of the producer-side `device_class` field on an
 /// `identity_occurrence` Contribution.
@@ -19877,5 +19936,184 @@ pub(crate) mod ungated_doors_test_support {
                  gate — that would make the assertion above vacuous: {e}"
             );
         }
+    }
+}
+
+/// v31.0.0 (CIRISPersist#660) — **the backend-parity witnesses for the three
+/// gaps this cut closed**, run against `&dyn FederationDirectory` so memory,
+/// sqlite and postgres answer with the same code.
+///
+/// *Memory tolerates what the SQL backends reject* is a named trap here, and it
+/// has recurred at least eight times in recent releases — most recently as
+/// `pg_resign`, where one of three sibling helpers was never redirected to the
+/// shared seal and hid 34 postgres failures behind two correct arms. A witness
+/// written into ONE backend's test module is how that comes back, so all three
+/// gaps are witnessed from one body.
+///
+/// `tag` scopes every fixture key so a run against a shared postgres test DB
+/// does not collide with a prior one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod backend_parity_test_support {
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::identity_type;
+    use crate::federation::{Error, FederationDirectory, Revocation, SignedRevocation};
+
+    /// A fresh `revocation_id`, as a **UUID**.
+    ///
+    /// Postgres types `federation_revocations.revocation_id` as `UUID`, so a
+    /// readable string id (`"postgres-rev-0"`) is refused by the DRIVER before
+    /// any persist logic runs — `revocation_id is not a valid UUID`. Memory and
+    /// sqlite accept any TEXT, so a string-id fixture is green on two backends
+    /// and red on the one production runs. That is the same shape as #622's
+    /// `attestation_id`, and it is why this helper exists rather than a
+    /// `format!("{tag}-rev-…")`.
+    ///
+    /// Uniqueness comes from the UUID, not from `tag`, which also keeps a run
+    /// against the SHARED postgres test DB from colliding with a prior one.
+    fn fresh_revocation_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// A **self**-revocation of `who`, signed by `who`. Self-revocation passes
+    /// `check_revocation_authority` untouched, so the harness needs no
+    /// `slash` conferral and stays generic over the trait.
+    fn self_revocation(id: &str, who: &str, at: chrono::DateTime<chrono::Utc>) -> Revocation {
+        let envelope = serde_json::json!({ "id": id });
+        let (och, sig_c, sig_p) = ts::sign_envelope(who, &envelope);
+        Revocation {
+            revocation_id: id.to_owned(),
+            revoked_key_id: who.to_owned(),
+            revoking_key_id: who.to_owned(),
+            reason: Some("660 parity".to_owned()),
+            revoked_at: at,
+            effective_at: at,
+            revocation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: sig_c,
+            scrub_signature_pqc: sig_p,
+            scrub_key_id: who.to_owned(),
+            scrub_timestamp: at,
+            pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// **Gap 1 + 2 on the revocation door**: `check_observed_region` and the
+    /// anti-rollback check ran on sqlite + postgres and NOWHERE on memory, and
+    /// `original_content_hash` was validated as hex only as a side effect of
+    /// binding a BLOB/BYTEA — so memory accepted all three shapes the SQL
+    /// backends refuse.
+    ///
+    /// Every assertion is on the TYPED `kind()`, and every one re-reads the
+    /// store afterwards: a gate that refuses AFTER writing is not a gate.
+    pub(crate) async fn exercise_revocation_parity(dir: &dyn FederationDirectory, tag: &str) {
+        // Distinguishing part FIRST — `seed_for` truncates key_ids at 32 bytes,
+        // so two ids sharing a 32-byte prefix are ONE identity.
+        let who = format!("{tag}-660-revoker");
+        ts::register_identity_key(dir, &who, identity_type::AGENT).await;
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-03T12:00:00Z".parse().unwrap();
+
+        // ── region: outside the closed `{us, eu, apac}` set.
+        let mut bad_region = self_revocation(&fresh_revocation_id(), &who, t0);
+        bad_region.observed_region = "us-east-1".to_owned();
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: bad_region,
+            })
+            .await
+            .expect_err("an out-of-set observed_region must be REFUSED on every backend");
+        assert_eq!(
+            err.kind(),
+            "federation_region_rejected",
+            "[{tag}] region: {err}"
+        );
+        assert!(
+            dir.revocations_for(&who).await.expect("read").is_empty(),
+            "[{tag}] a refused region writes NOTHING"
+        );
+
+        // ── hex: an ODD-length `original_content_hash`, which `hex::decode`
+        //    cannot take. Asserted as `InvalidArgument` (the shared token) and
+        //    NOT on a message, because the SQL backends have a second refusal
+        //    for the same bytes at bind time and the point is that neither
+        //    backend gets that far.
+        let mut bad_hex = self_revocation(&fresh_revocation_id(), &who, t0);
+        bad_hex.original_content_hash = "abcdef0".to_owned();
+        let err = dir
+            .put_revocation(SignedRevocation {
+                revocation: bad_hex,
+            })
+            .await
+            .expect_err("a non-hex original_content_hash must be REFUSED on every backend");
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "[{tag}] hex: expected InvalidArgument, got {err:?}"
+        );
+        assert!(
+            dir.revocations_for(&who).await.expect("read").is_empty(),
+            "[{tag}] a refused hash writes NOTHING"
+        );
+
+        // ── anti-rollback: T0 admits, then a REPLAY at T0 and an earlier T-1h
+        //    must both be refused. The replay is byte-valid and correctly
+        //    signed — that is what makes it a rollback rather than a forgery.
+        dir.put_revocation(SignedRevocation {
+            revocation: self_revocation(&fresh_revocation_id(), &who, t0),
+        })
+        .await
+        .expect("the first self-revocation is ordinary and must be admitted");
+
+        for (label, when) in [("equal", t0), ("earlier", t0 - chrono::Duration::hours(1))] {
+            let err = dir
+                .put_revocation(SignedRevocation {
+                    revocation: self_revocation(&fresh_revocation_id(), &who, when),
+                })
+                .await
+                .expect_err("a non-monotonic revocation must be REFUSED on every backend");
+            assert_eq!(
+                err.kind(),
+                "federation_revocation_rollback",
+                "[{tag}] anti-rollback ({label}): {err}"
+            );
+        }
+        assert_eq!(
+            dir.revocations_for(&who).await.expect("read").len(),
+            1,
+            "[{tag}] exactly the ONE admitted revocation is stored"
+        );
+    }
+
+    /// **Gap 2 on the attestation door**: the same non-hex
+    /// `original_content_hash`, refused before anything is written.
+    ///
+    /// The row is otherwise fully sealed, so the ONLY thing wrong with it is the
+    /// hash — a witness built from an otherwise-invalid row would pass against a
+    /// deleted check.
+    pub(crate) async fn exercise_attestation_hash_hex_parity(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let who = format!("{tag}-660-hasher");
+        ts::register_identity_key(dir, &who, identity_type::AGENT).await;
+        let id = format!("{tag}-660-badhash");
+        let mut row = crate::federation::genesis::ordinary_scores_row(&id, &who);
+        ts::seal_row_in_place(&who, &mut row);
+        // AFTER sealing — so this is a deliberate divergence, not a fixture
+        // that forgot to seal (those two are indistinguishable otherwise).
+        row.original_content_hash = "abcdef0".to_owned();
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect_err("a non-hex original_content_hash must be REFUSED on every backend");
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "[{tag}] attestation hex: expected InvalidArgument, got {err:?}"
+        );
+        assert!(
+            dir.get_attestation(&id).await.expect("read").is_none(),
+            "[{tag}] a refused hash writes NOTHING"
+        );
     }
 }

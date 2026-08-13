@@ -28991,6 +28991,20 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::ConstitutionalFamilyReserved { .. } => {
             PyValueError::new_err(kind)
         }
+        // v31.0.0 (CIRISPersist#660) — the attestation-plane twin of the arm
+        // above, and mapped identically for the identical reason: a baked
+        // genesis delegation id is installed by the ceremony, so the caller must
+        // stop rather than reshape its payload and retry.
+        //
+        // The `field` token rides in the message so a Python consumer can tell
+        // the two halves of the rule apart — a local-tier row (`tier`) from an
+        // unseated author (`attesting_key_id`) — without a second copy of the
+        // taxonomy, the same shape as `NoConstitutionalRootYet` above.
+        crate::federation::Error::GenesisAttestationReserved {
+            attestation_id,
+            field,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {attestation_id} ({field})")),
         // v25.1.0 (CIRISPersist#570 ask 3/4) — caller-fixable, and the typed
         // token rides in the message so a Python consumer can branch on WHICH
         // branch refused without a second copy of the taxonomy. Both are

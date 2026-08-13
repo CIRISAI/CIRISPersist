@@ -935,6 +935,27 @@ impl MemoryBackend {
             ),
             None => input.into_local_row(attestation_id.clone(), now),
         };
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
+        // THIS DOOR TOO, and this door is the one that actually mattered.
+        //
+        // `LocalAttestationInput::attestation_id` is caller-supplied (#473's
+        // deterministic-mint option), and the local door deliberately DEFERS
+        // `check_reserved_prefix_admission` to the promote gate — so a
+        // `genesis-charter` row could be staged here with no reservation check
+        // of any kind. Deferring THIS reservation the same way would not work,
+        // because the harm is not what the row says, it is that the row exists:
+        // `federation_attestations.attestation_id` is the primary key, and
+        // `get_attestation` — which `verify_delegation_plane_seeded` reads
+        // through — does not filter by tier. A local-tier squat is therefore
+        // fully sufficient to take the ceremony's key AND to flip the posture
+        // to `Divergent`, which refuses boot. Promotion never happens; it does
+        // not need to.
+        //
+        // Called on the assembled row, so it is the SAME predicate the
+        // federation door runs — one spelling. A local row can never equal the
+        // baked federation-tier ceremony row, so in practice this refuses every
+        // claim on those three ids, which is the intent.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
         // See `crate::federation::envelope::RowMirror::stamp_local_row` for
         // the decision and the transit exclusion. One helper, all three
@@ -2319,6 +2340,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED.
+        // Immediately behind the canonicalization so the envelope compare sees
+        // the bytes that will be stored, and ahead of the #598/#643 binding
+        // gates so a squat is named by the reservation rather than by whichever
+        // neighbouring gate the attacker's row happens to trip first. The baked
+        // rows themselves pass here unchanged, so the pre-v31 refusal those two
+        // gates produce — the inversion `bundle_delegation_plane_v31_shaped`
+        // drives — is untouched. Pure ⇒ TIER 1; backend-symmetric across
+        // memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
+        // SQL backends refused a non-hex value only as a side effect of binding
+        // a BLOB/BYTEA; memory binds nothing and accepted it. Stated on all
+        // three so the answer is the same answer, not the same accident.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
@@ -3531,14 +3570,35 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
-        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
-        // moderation act. Self-revocation passes untouched.
-        crate::federation::admission::check_revocation_authority(self, &row).await?;
+        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
+        // SQL backends bind this column as BLOB/BYTEA and so refused a non-hex
+        // value as a SIDE EFFECT of `hex::decode`; memory decodes nothing and
+        // accepted it. Stated here, and on both SQL backends, so all three give
+        // the same typed answer rather than two giving it by accident.
+        crate::federation::admission::check_content_hash_hex(
+            "original_content_hash",
+            &row.original_content_hash,
+        )?;
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Hybrid-Strict vs the revoking key's registered
         // pubkeys — was FK + trust-score only, forgeable de-peer DoS.
+        //
+        // v31.0.0 (CIRISPersist#660) — moved AHEAD of the authority walk, which
+        // is where sqlite + postgres have always had it. Memory ran the
+        // directory walk first, i.e. it spent unauthenticated reads on a
+        // revocation whose signature it had not yet checked — the AV-76 tier
+        // order inverted on one backend only.
         crate::federation::verify_revocation_admission(self, &row).await?;
+        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
+        // moderation act. Self-revocation passes untouched.
+        crate::federation::admission::check_revocation_authority(self, &row).await?;
+        // v3.11.0 (CIRISPersist#143) — the closed `{us, eu, apac}` region set.
+        // v31.0.0 (CIRISPersist#660): absent on this backend entirely. sqlite
+        // and postgres have run it since v3.11.0 AND carry the V058 CHECK
+        // constraint behind it; memory had neither, so an arbitrary
+        // `observed_region` string was accepted here and unwritable there.
+        crate::federation::check_observed_region(&row.observed_region)?;
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the one
         // that was SIGNED, and must be coherent with `effective_at`. Runs
         // before persist_row_hash and before the push, so a refused bound
@@ -3557,6 +3617,33 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "revoking_key_id {} does not exist in federation_keys",
                 row.revoking_key_id
             )));
+        }
+        // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
+        // (CIRISPersist#660): absent on this backend entirely, so an OLD,
+        // still-validly-signed revocation could be replayed here to re-assert a
+        // state its subject had already moved past — refused on sqlite and
+        // postgres since v3.11.0. The RULE is the shared
+        // `check_revocation_anti_rollback`; only the "find the newest stored
+        // row" half is per-backend, and here it is a scan under the lock the
+        // push already holds, so the check and the insert cannot race.
+        //
+        // Sits after the FK emulation rather than before `check_revocation_bound`
+        // (the sqlite/postgres position) for one reason: memory's lookup needs
+        // this lock. Both are refusals that mutate nothing, so the order between
+        // them is not observable in state — only in which message an operator
+        // sees when a row violates both.
+        {
+            let latest = state
+                .federation_revocations
+                .iter()
+                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .map(|r| r.scrub_timestamp)
+                .max();
+            crate::federation::admission::check_revocation_anti_rollback(
+                &row.revoked_key_id,
+                latest,
+                row.scrub_timestamp,
+            )?;
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         state.federation_revocations.push(row);
@@ -17129,6 +17216,66 @@ mod tests {
             .await
             .expect("holders seed");
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **revocation-door
+    /// parity** witness. This backend is the one that was wrong: it ran neither
+    /// `check_observed_region` nor the anti-rollback check, and it validated no
+    /// hex, so all three shapes sqlite + postgres refuse were accepted here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_door_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_revocation_parity(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **attestation
+    /// `original_content_hash` hex** parity witness.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn attestation_hash_hex_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_attestation_hash_hex_parity(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **genesis-id squat**
+    /// witness: a baked genesis `attestation_id` may not be claimed at either
+    /// write door, on any backend.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn genesis_id_squat_refused_parity_memory_660() {
+        let backend = MemoryBackend::new();
+        crate::federation::genesis::exercise_genesis_id_squat_refused(&backend, "memory").await;
+    }
+
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **injected-squat**
+    /// witness. Reservation closes the doors; this asks what the classifier says
+    /// about a row that got in anyway (a restored backup, a direct write, a
+    /// pre-#660 corpus). The injection bypasses `put_attestation` deliberately —
+    /// that is the whole point — by pushing straight into backend state, which
+    /// is this backend's equivalent of the SQL legs' raw INSERT.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn injected_genesis_squat_is_divergent_memory_660() {
+        let backend = MemoryBackend::new();
+        let baked = &crate::federation::genesis::canonical_genesis_bundle().attestations[0];
+        let mut squat = baked.attestation.clone();
+        // The ONE field `verify_delegation_plane_seeded` reads to reach its
+        // divergent arm — a substituted conferral row.
+        squat.original_content_hash = "00".repeat(32);
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_attestations
+            .push(squat);
+        crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "memory").await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the MEMORY leg of the **anti-fail-open**
