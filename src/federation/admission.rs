@@ -20970,10 +20970,31 @@ pub(crate) mod backend_parity_test_support {
     /// A **self**-revocation of `who`, signed by `who`. Self-revocation passes
     /// `check_revocation_authority` untouched, so the harness needs no
     /// `slash` conferral and stays generic over the trait.
+    ///
+    /// v31.0.0 (CIRISPersist#659/#660) — **SEALED**, not hand-signed. The
+    /// binding gate #659 added runs at the very top of `put_revocation`, ahead
+    /// of the region and anti-rollback gates this harness exists to exercise.
+    /// An unbound fixture is therefore refused for the wrong reason and the
+    /// gates under test are never reached — the parity witness would assert
+    /// `federation_region_rejected` and receive
+    /// `federation_revocation_envelope_unbound`.
+    ///
+    /// That is the same trap the `av76_*` gate-order trio and four genesis
+    /// witnesses hit this release: **a fixture built to die at gate N must be
+    /// well-formed enough to REACH gate N.** Sealing here is not a weakening —
+    /// the row becomes exactly what an honest producer emits, so the refusals
+    /// below are the ones the harness names.
+    ///
+    /// Callers may still mutate `observed_region` and `original_content_hash`
+    /// afterwards: neither is in the binding set
+    /// (`admission::revocation_binding`), so the seal survives. Mutating a
+    /// BOUND field — any of the seven, notably `scrub_timestamp` — requires a
+    /// re-seal, which is why the anti-rollback legs vary the instant through
+    /// this constructor rather than by editing a built row.
     fn self_revocation(id: &str, who: &str, at: chrono::DateTime<chrono::Utc>) -> Revocation {
         let envelope = serde_json::json!({ "id": id });
         let (och, sig_c, sig_p) = ts::sign_envelope(who, &envelope);
-        Revocation {
+        ts::seal_revocation(Revocation {
             revocation_id: id.to_owned(),
             revoked_key_id: who.to_owned(),
             revoking_key_id: who.to_owned(),
@@ -20990,7 +21011,7 @@ pub(crate) mod backend_parity_test_support {
             observed_region: crate::federation::verify_coord::region::US.to_owned(),
             revoked_after: None,
             persist_row_hash: String::new(),
-        }
+        })
     }
 
     /// **Gap 1 + 2 on the revocation door**: `check_observed_region` and the
