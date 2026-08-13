@@ -10685,7 +10685,7 @@ mod tests {
     /// the SHAs.
     #[cfg(feature = "sqlite")]
     async fn seed_proxy_blobs(engine: &Engine, peer_key: &str, n: usize) -> Vec<[u8; 32]> {
-        use crate::federation::{BlobBody, BlobStorage, FederationDirectory, PutBlobAttestation};
+        use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
         let sq = engine.sqlite_backend().expect("sqlite");
         // Peer key must exist (FK on the holds_bytes attestation).
         sq.put_public_key(sweeper_test_key(peer_key))
@@ -10701,21 +10701,17 @@ mod tests {
                 out.copy_from_slice(&Sha256::digest(&bytes));
                 out
             };
-            sq.put_blob(
-                &sha,
-                BlobBody::Inline(bytes),
-                None,
-                PutBlobAttestation {
-                    attesting_key_id: peer_key.to_string(),
-                    attestation_id: uuid::Uuid::new_v4().to_string(),
-                    original_content_hash_hex: "ab".repeat(32),
-                    scrub_signature_classical: "c2ln".to_string(),
-                    scrub_signature_pqc: None,
-                    scrub_key_id: peer_key.to_string(),
-                    scrub_timestamp: chrono::Utc::now(),
-                    asserted_at: chrono::Utc::now(),
-                },
-            )
+            sq.put_blob(&sha, BlobBody::Inline(bytes), None, {
+                let now = chrono::Utc::now();
+                crate::federation::blobs::sealed_put_blob_attestation(
+                    &sha,
+                    peer_key,
+                    peer_key,
+                    &uuid::Uuid::new_v4().to_string(),
+                    now,
+                    now,
+                )
+            })
             .await
             .expect("put_blob proxy");
             shas.push(sha);

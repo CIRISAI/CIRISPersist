@@ -32,6 +32,216 @@ column on postgres have already lost the producer's numeric literals
 release, and no migration recovers it — re-publish is the only remedy.
 
 
+### Fixed — SECURITY — six doors that wrote without the gates their siblings run (#656)
+
+The v31.0.0 pre-cut adversarial review found the same shape six more times, and
+it is the shape this whole release has been chasing: **a write door that skips a
+gate its siblings run.** #652 was found by counting doors rather than gates;
+these were found the same way. Every fix has a witness on memory, sqlite AND
+postgres, because four of the six were blind spots a single-backend test could
+not have seen.
+
+#### THE SEVENTH SITE — a transit row's typed columns were bound by nothing, and promotion laundered them
+
+`check_row_column_binding` (#643) is wired to `put_attestation`,
+`set_attestation_cohort_scope` and the promote door — and to **no local-write
+door on any backend**. For a durable local row that is harmless:
+`RowMirror::stamp_local_row` stamps the mirror. For a **transit** subject-side
+revocation (§10.1.3) it returns early BY DESIGN, because the caller hybrid-signed
+those bytes and stamping would invalidate the signature. So for that shape the
+five typed columns were checked by **no door anywhere**:
+
+- the local door verifies the SIGNATURE (`verify_local_transit_revocation`) and
+  never looked at the mirror;
+- the promote door **re-stamps** the mirror FROM the row's columns
+  (`RowMirror::restamp_for_scope` → `stamp_into`) *before*
+  `check_row_column_binding` reads it — so it validated the mirror against the
+  columns it had just derived it from, and then this node signed the result.
+
+**The attack, reproduced.** Subject S hybrid-signs a `consent:state:revoked:v1`
+envelope whose `row` mirror honestly binds `subject_key_ids: [S]`. A relay
+submits S's **untouched, still-valid** envelope with `subject_key_ids: [S,
+attacker]` in the typed COLUMN. It was admitted. On promotion the attacker's list
+was stamped into the bytes this node signs — and per #643 a canonical binding
+hash in `subject_key_ids` confers REVOCATION AUTHORITY
+(`resolve_withdraws_admission_rule` rule 2). `put_attestation` refuses the
+identical row, which is the control that says the gate existed and the door did
+not call it.
+
+Two fixes, because the hole has two halves:
+
+1. **`stamp_local_row` now CHECKS when it does not stamp.** The rule this release
+   established was always right — *the party that MINTS the bytes stamps; the
+   party that RECEIVES them checks* — and only half of it was implemented. Both
+   halves are now the same call, keyed off the same `caller_signed` question, in
+   the one helper all three backends already share, so the receiving half cannot
+   be forgotten at a door that remembered the stamping half.
+2. **`restamp_for_scope` refuses to launder.** Before overwriting, it compares
+   the mirror it is about to REPLACE against the row's typed columns with
+   `cohort_scope` — the one member a placement-touching write may move —
+   normalized away, using `check_row_column_binding` itself so there is still
+   exactly one comparison. A re-stamp narrows a placement; it never re-authors a
+   row.
+
+**Two false comments corrected rather than deleted,** so the reader learns the
+premise was inverted. `stamp_local_row` claimed the transit case was *"checked
+where the signature is (`put_attestation`, and the promote door)"*. Both halves
+were false: the signature is verified at the LOCAL door (a transit row never
+reaches `put_attestation`), and the promote door structurally could not catch it.
+
+**Producer contract change.** A transit revocation must now bind its mirror,
+which means the producer states its own `attestation_id` — one of the seven
+members #643 binds — instead of letting persist mint a fresh v4 it could not have
+signed over. That is the same rule every peer's `put_attestation` already applies
+to the same row.
+
+#### `reseal_attestation_v31` had no signature gate, and the instants could move (#650)
+
+The #650 re-seal door was the only write door into `federation_attestations` with
+no signature gate at all. Every sibling verifies the seal: `put_attestation` runs
+`verify_federation_tier_ingest`, promotion re-signs with this node's key, the
+local door runs `verify_local_transit_revocation` or writes the deferred
+sentinel. This one wrote `original_content_hash` and `scrub_signature_*` verbatim
+from its argument.
+
+And `asserted_at` was not in `check_reseal_admission`'s immutable set. So a
+caller could take an already-conformant row, move its consent-fold ordering key
+48 hours forward, hand over a signature that verifies against nothing, and have
+it written: **#598's replay executed in place**, plus #598's unsigned mute button
+via `expires_at`. Its own doc claimed *"a re-seal changes the SEAL, never the
+row's meaning"*; that described an intent the gate stack did not enforce.
+
+New `admission::check_reseal_seal_admission`, run by all three backends
+immediately after the shape gate:
+
+- **the instants are immutable modulo truncation.** Exact equality would refuse
+  the migration's own output — the re-stamp truncates to the substrate resolution
+  — so the rule is *"equal to the stored instant truncated"*, which permits that
+  and nothing else. A 48-hour jump is refused; so is a one-microsecond one.
+- **the seal must verify**, through the same `verify_row_hybrid_signature` every
+  other door uses (which also cross-checks `original_content_hash`) — or the row
+  carries the deferred empty sentinel AND the stored row carried it too, because
+  a re-seal RE-signs and never DE-signs.
+
+In-process only today, which capped the severity and did not excuse it.
+
+#### `put_blob` admitted an unbounded-future `asserted_at`, and never checked the caller's hash (#652)
+
+#652 fixed the row SHAPE through one deterministic builder and wired no gates.
+The two #598/#643 bindings hold by construction — but **the skew arm is not a
+binding property**. It compares `asserted_at` against wall-clock `now`, and
+`PutBlobAttestation::asserted_at` is caller-supplied and was unbounded, so this
+door minted a FEDERATION-tier row (served and replicated) whose consent-fold
+ordering key sat arbitrarily far in the future. Exactly the claim #598 exists to
+make false: *a lying clock cannot mint a row no later row can out-sort.*
+
+It also wrote the caller's `original_content_hash` and signature over an envelope
+persist **rebuilt**, with nothing checking the two described the same bytes. The
+reconstruction being deterministic is precisely what makes that cross-check
+possible — it is the property #652's own doc rests its *"the party that MINTS the
+bytes stamps, the party that RECEIVES them checks"* claim on — so it is now used
+rather than assumed.
+
+Both gates land in one shared `blobs::check_put_blob_admission`, run by sqlite
+and postgres. (`MemoryBackend` implements no `BlobStorage`; the witness says so
+out loud, because "the third leg is missing" and "the third door does not exist"
+look identical from a test list.)
+
+The blob fixtures were also carrying `original_content_hash_hex: "abcdef01"` /
+`"deadbeef"` — four bytes, in a column that holds a 32-byte digest. That is how a
+whole release of blob tests passed without the cross-check existing, so the
+fixtures now mint the hash the way `put_blob_signing` does.
+
+#### `postgres::supersede_canonical_record` ran FOUR fewer role gates than sqlite — on the backend production runs
+
+v22.0.0 (#543 H2) put four gates in front of `supersede_canonical_record` — the
+`accord_holder` hardware-attestation policy plus
+`check_infra_attest_role_admission`, `check_co_steward_role_admission` and
+`check_privileged_identity_type_admission` — with a comment naming the threat
+exactly: *"an already-canonical key could rotate in a successor claiming
+`infra:attest` / co-steward / any privileged type without their own conferral.
+Rotation must not be a role-laundering path."*
+
+**It landed on SQLite only.** Postgres went straight to
+`verify_canonical_supersede`, which tests `identity_type` for MEMBERSHIP of
+`canonical` and says nothing about any other token in that set or about
+`capability_roles` at all — and the pg UPDATE then wrote `roles` and
+`identity_type` verbatim. So a canonical key could rotate in a successor claiming
+`infra:attest` (the build-manifest signing root, #422) or `accord_holder`, with
+no conferral and no hardware attestation. Postgres's caller comment said
+*"Backend-symmetric with SQLite"*.
+
+Verified on a real postgres cluster before the fix: with the gates absent the
+refusal comes from `verify_canonical_supersede`'s own canonical check, proving
+control reached the supersede policy and the role gates never ran.
+
+The same #543 H2 omission is closed in postgres's `adopt_scrub_upgrade`, which
+also lacked the `accord_holder` hardware check its sqlite twin runs. Both false
+symmetry comments are corrected rather than deleted: a symmetry claim is a claim
+about two files, and it decays whenever either moves — which is what happened
+here, over nine minor versions, with no test on either side. It is a tested
+property now.
+
+Eighth-plus recurrence of the *memory tolerates what the SQL backends reject*
+class, wearing its inverted form: **sqlite enforced what postgres did not.**
+
+#### `add_peer_record` was an ungated `federation_keys` insert with a caller-supplied `identity_type`
+
+No role gates on any backend, `scrub_signature_classical: ""`, self-scrubbed, a
+fabricated registration envelope, an `original_content_hash` of 64 zeros — and
+**FFI-reachable twice over**: the PyO3 `Engine.add_peer_record_json` method
+present in every shipped wheel, and the always-compiled C-ABI
+`DirectoryOp::AddPeerRecord` capsule op. So `add_peer_record(k, pk, "canonical",
+None)` made `is_canonical_effective` answer `true` for an attacker-named key, and
+the invariant `is_canonical`'s own doc rests on — *"a stored row can carry
+`canonical` only if it earned it via anchor-scrub, so this simple set-membership
+read is sufficient"* — was false through this door.
+
+It is the **FIFTH** `federation_keys` admission path, and the error type's own
+enumeration of where the canonical role is gated names four (*"direct
+registration, self-registration, replication of a self-signed row, and the
+`adopt_scrub_upgrade` self→anchored path"*). A chokepoint inventory that is not
+exhaustive is the recurring shape of this entire release.
+
+New `admission::check_peer_record_admission`, run by all three backends before
+any lock: the four accord/anchor-conferred gates `put_public_key` runs, plus an
+outright refusal of `accord_holder` — a door that structurally cannot carry the
+evidence a claim requires must refuse the claim, not evaluate it against evidence
+it does not have. Ordinary operator peer adds are untouched, and the
+`DelegatedFromTrustRoot` claims (`trusted_publisher`, `lenscore_detector`) are
+deliberately still admitted here: every consumer re-derives them from a
+`delegates_to` chain at USE, and refusing them would fail closed on legitimate
+operators.
+
+#### `retracted_edge_ids` applied no attester check — an ordering-dependent authority bypass
+
+`check_withdraws_admission` returns `Ok(None)` — admit, no rule — when the target
+row is **not locally present**, deferring authority *"to the read side"* in its
+own words. The read side is `retracted_edge_ids`, and it applied **no attester
+check at all**: any row of the right TYPE naming an id killed that edge, whoever
+wrote it. So a foreign `withdraws` arriving BEFORE its target severed a
+delegation edge on arrival order alone.
+
+Worse, and not in the original report: `recants` reaches the same fold and there
+is **no `check_recants_admission` anywhere in the tree**, so a foreign `recants`
+needed no race at all.
+
+Both are authority DENIAL, which escalates — severing the incumbent's edge can
+leave the attacker the sole surviving consent-revocation proxy under
+`resolve_withdraws_admission_rule` rules 3/4, or leave a node with no `owner_of`.
+The two sibling folds both bind the attester by scoping their read
+(`list_attestations_by(granter)`); this one was handed a slice of everyone's rows
+and filtered only on type.
+
+The fold now answers with the slice it already has, adding no read: the retraction
+must name a target present in that slice (names it cannot resolve were already
+inert, so dropping them is behaviour-preserving), and the retracting key must be
+the target's own attester, or a member of the target's `subject_key_ids`, or one
+the write door already resolved authority for. The third arm is why this is not
+simply *"compare attesters like the siblings do"* — the siblings model §6.1
+self-retraction only, and narrowing this fold to that would drop the subject-side
+and proxy revocations it exists to see.
+
 ### Changed — BREAKING — persist stores the CANONICAL envelope now, not the producer's bytes (#647)
 
 Every signature and every `original_content_hash` in this fabric is taken over
