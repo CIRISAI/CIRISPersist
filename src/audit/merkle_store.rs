@@ -97,9 +97,47 @@ fn deserialize_signature(bytes: &[u8]) -> Result<ciris_crypto::HybridSignature, 
 }
 
 /// JSON-serialize witness signatures (PG JSONB / SQLite TEXT column).
+///
+/// v31.0.0 (CIRISPersist#657) — **REFUSES a non-empty witness set.** This is
+/// the "stop storing them" half of the same finding the stream-STH plane
+/// closes by verifying: a co-signature the substrate keeps and serves back
+/// (`latest_sth`) without ever checking is worse than one it never kept,
+/// because it LOOKS like the split-view evidence
+/// [`SignedTreeHead::witness_quorum_met`](ciris_verify_core::transparency::SignedTreeHead::witness_quorum_met)
+/// exists to provide. The #556 rule: the preserve set must equal the verified
+/// set.
+///
+/// The stream plane can verify instead of refusing because
+/// `put_stream_sth` runs inside a [`FederationDirectory`](crate::federation::FederationDirectory)
+/// and can resolve a `witness_id` to a PINNED key. This one cannot: a
+/// [`TransparencyStore`] is a bare storage trait with no directory in scope and
+/// no witness roster anywhere in the audit plane — the audit log's own tests
+/// have always asserted the field is empty, calling it "a Phase B reserved
+/// field … until the witness protocol lands". Reserved and empty is honest.
+/// Reserved and silently full of unchecked signatures is not, so an attempt to
+/// store one is refused rather than tolerated (fail closed on absence — the
+/// standing v31 decision).
+///
+/// **What lands with the witness protocol:** the audit plane needs a
+/// trusted-witness roster reachable from `store_sth` — either by giving the
+/// store a directory handle (so `witness_id` resolves in `federation_keys`, the
+/// spelling the stream plane already uses) or by a pinned
+/// [`TrustedWitness`](ciris_verify_core::transparency::TrustedWitness) set
+/// configured per tenant. Until one of those exists there is nothing here to
+/// verify AGAINST, and that is the precise gap, not a deferral of work that
+/// could have been done in this cut.
 fn serialize_witness_signatures(
     witnesses: &[WitnessSignature],
 ) -> Result<String, TransparencyError> {
+    if !witnesses.is_empty() {
+        return Err(TransparencyError::Storage(format!(
+            "merkle_sth_log refuses {n} witness cosignature(s): the audit plane has no \
+             trusted-witness roster to verify them against, and storing an unverified \
+             cosignature makes it look like evidence when it is only a claim \
+             (CIRISPersist#657)",
+            n = witnesses.len()
+        )));
+    }
     serde_json::to_string(witnesses)
         .map_err(|e| TransparencyError::Storage(format!("witness sigs serialize: {e}")))
 }

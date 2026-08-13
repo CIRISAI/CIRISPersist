@@ -4263,21 +4263,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         family_key_id: &str,
         member: crate::federation::types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let family = state
-            .federation_families
-            .get_mut(family_key_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "add_family_member names unknown family_key_id {family_key_id:?}"
-                ))
-            })?;
+        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
+        // mutation; see the sqlite twin. It MUST run before `self.state.lock()`
+        // (the verify resolves keys through the directory, which takes the same
+        // lock) — the ordering `put_family` on this backend already documents.
+        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "add_family_member names unknown family_key_id {family_key_id:?}"
+            ))
+        })?;
         if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        family.members.push(member);
-        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(family)?;
+        let grown =
+            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // v31.0.0 (CIRISPersist#654/#651) — the roster and the signature
+            // that authorizes it are written together, under one guard.
+            state
+                .federation_families
+                .insert(family_key_id.to_owned(), grown);
+            state.federation_family_authority_sigs.insert(
+                family_key_id.to_owned(),
+                (
+                    spec.authority_key_id.clone(),
+                    spec.scrub_signature_classical.clone(),
+                    spec.scrub_signature_pqc.clone(),
+                ),
+            );
+        }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -4295,21 +4318,43 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let community = state
-            .federation_communities
-            .get_mut(community_key_id)
+        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
+        let community = self
+            .lookup_community(community_key_id)
+            .await?
             .ok_or_else(|| {
                 crate::federation::Error::InvalidArgument(format!(
                     "add_community_member names unknown community_key_id {community_key_id:?}"
                 ))
             })?;
         if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        community.members.push(member);
-        community.persist_row_hash = crate::federation::types::compute_persist_row_hash(community)?;
+        let grown =
+            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
+                .await?;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            state
+                .federation_communities
+                .insert(community_key_id.to_owned(), grown);
+            state.federation_community_authority_sigs.insert(
+                community_key_id.to_owned(),
+                (
+                    spec.authority_key_id.clone(),
+                    spec.scrub_signature_classical.clone(),
+                    spec.scrub_signature_pqc.clone(),
+                ),
+            );
+        }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
+        self.index_stored_record(
+            "Community",
+            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -6270,6 +6315,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
+        // v31.0.0 (CIRISPersist#657) — verify-before-mutation over the row AS IT
+        // WOULD BE STORED; see the sqlite twin. It MUST run before
+        // `self.state.lock()`: the gate reads the directory through that same
+        // lock, so gating inside the critical section would deadlock this
+        // backend (the same ordering `promote_attestation` documents).
+        {
+            let current =
+                <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::federation::Error::InvalidArgument(format!(
+                            "federation_keys row {key_id} does not exist"
+                        ))
+                    })?;
+            if !current.is_pqc_complete() {
+                let mut post_attach = current;
+                post_attach.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+                post_attach.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+                crate::federation::admission::check_key_pqc_attachment(self, &post_attach).await?;
+            }
+        }
         {
             let mut state = self.state.lock().expect("memory backend lock");
             let row = state.federation_keys.get_mut(key_id).ok_or_else(|| {
@@ -6303,26 +6369,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state
-            .federation_attestations
-            .iter_mut()
-            .find(|a| a.attestation_id == attestation_id)
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} is already PQC-complete"
-            )));
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == attestation_id)
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_attestations row {attestation_id} does not exist"
+                    ))
+                })?;
+            if row.is_pqc_complete() {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "federation_attestations row {attestation_id} is already PQC-complete"
+                )));
+            }
+            row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+            row.pqc_completed_at = Some(chrono::Utc::now());
+            let mut for_hash = row.clone();
+            for_hash.persist_row_hash = String::new();
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
         }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        row.pqc_completed_at = Some(chrono::Utc::now());
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. Done
+        // AFTER the guard is released, the same shape `attach_key_pqc_signature`
+        // uses on this backend (the shared helper re-reads through the
+        // directory surface, which takes the same lock).
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -10384,10 +10461,17 @@ mod tests {
     #[tokio::test]
     async fn attach_pqc_completes_hybrid_pending_key() {
         let backend = MemoryBackend::new();
+        // v31.0.0 (CIRISPersist#657) — a row the cold path can LEGITIMATELY
+        // complete: self-scrubbed, with the ML-DSA pubkey bound into the signed
+        // registration envelope. The old fixture attached the strings
+        // "test-mldsa-pubkey" / "test-mldsa-sig" and passed, which is the defect
+        // demonstrated in our own test suite.
+        let (row, mldsa_pk, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-pending",
+            );
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key("k-pending", "primitive-a", "k-pending"),
-            })
+            .put_public_key(SignedKeyRecord { record: row })
             .await
             .unwrap();
         // Initially hybrid-pending.
@@ -10400,7 +10484,7 @@ mod tests {
 
         // Attach the PQC components.
         backend
-            .attach_key_pqc_signature("k-pending", "test-mldsa-pubkey", "test-mldsa-sig")
+            .attach_key_pqc_signature("k-pending", &mldsa_pk, &pqc_sig)
             .await
             .unwrap();
 
@@ -10409,32 +10493,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.is_pqc_complete());
-        assert_eq!(
-            row.pubkey_ml_dsa_65_base64.as_deref(),
-            Some("test-mldsa-pubkey")
-        );
-        assert_eq!(row.scrub_signature_pqc.as_deref(), Some("test-mldsa-sig"));
+        assert_eq!(row.pubkey_ml_dsa_65_base64.as_deref(), Some(&*mldsa_pk));
+        assert_eq!(row.scrub_signature_pqc.as_deref(), Some(&*pqc_sig));
         assert!(row.pqc_completed_at.is_some());
         // Hash recomputed.
         assert_eq!(row.persist_row_hash.len(), 64);
     }
 
+    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
+    /// memory. One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
+    #[tokio::test]
+    async fn attach_key_pqc_is_gated_memory_657() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
+            &backend, "mem657",
+        )
+        .await
+        .expect("657 attach-gate exercise");
+    }
+
     #[tokio::test]
     async fn attach_pqc_rejects_double_fill() {
         let backend = MemoryBackend::new();
+        let (row, mldsa_pk, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-double",
+            );
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key("k-double", "primitive-a", "k-double"),
-            })
+            .put_public_key(SignedKeyRecord { record: row })
             .await
             .unwrap();
         backend
-            .attach_key_pqc_signature("k-double", "mldsa-pk-1", "mldsa-sig-1")
+            .attach_key_pqc_signature("k-double", &mldsa_pk, &pqc_sig)
             .await
             .unwrap();
         // Second attach errors with Conflict.
         let err = backend
-            .attach_key_pqc_signature("k-double", "mldsa-pk-2", "mldsa-sig-2")
+            .attach_key_pqc_signature("k-double", &mldsa_pk, &pqc_sig)
             .await
             .unwrap_err();
         assert!(matches!(err, crate::federation::Error::Conflict(_)));
@@ -10515,7 +10611,19 @@ mod tests {
             })
             .await
             .unwrap();
-        for id in &["k-a", "k-b", "k-c"] {
+        // v31.0.0 (CIRISPersist#657) — `k-a` is the row this test COMPLETES, so
+        // it is minted in the shape a legitimate cold-path fill-in has:
+        // self-scrubbed, ML-DSA pubkey bound into the signed envelope. `k-b` /
+        // `k-c` stay ordinary pending rows (never completed here).
+        let (k_a, k_a_mldsa_pk, k_a_pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                "k-a",
+            );
+        backend
+            .put_public_key(SignedKeyRecord { record: k_a })
+            .await
+            .unwrap();
+        for id in &["k-b", "k-c"] {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fix_key(id, "primitive", "steward"),
@@ -10557,7 +10665,7 @@ mod tests {
 
         // Attach PQC to one row in each table. Filter excludes them.
         backend
-            .attach_key_pqc_signature("k-a", "mldsa-pk", "mldsa-sig")
+            .attach_key_pqc_signature("k-a", &k_a_mldsa_pk, &k_a_pqc_sig)
             .await
             .unwrap();
         backend
@@ -13982,16 +14090,22 @@ mod tests {
             .expect("affiliations group (community row) created");
 
         // ── add via the affiliations cohort ────────────────────────────────
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.
+        let joiner_row = RosterMember {
+            key_id: "ob-joiner".into(),
+            joined_at: chrono::Utc::now(),
+            role: Some("member".into()),
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            &backend,
+            "ob-owner",
+            Cohort::Affiliations,
+            group,
+            &joiner_row,
+        )
+        .await;
         let added = backend
-            .add_member(
-                Cohort::Affiliations,
-                group,
-                RosterMember {
-                    key_id: "ob-joiner".into(),
-                    joined_at: chrono::Utc::now(),
-                    role: Some("member".into()),
-                },
-            )
+            .add_member(Cohort::Affiliations, group, joiner_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added, "genuine add returns true");
@@ -15262,8 +15376,16 @@ mod tests {
             .await
             .unwrap();
         // Genuine add → true, appears in both lookup + active reader.
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
+        let admit = crate::federation::cohort::test_support::admit_community_via(
+            &backend,
+            &ids[0],
+            "addc-comm",
+            &member("addc-1"),
+        )
+        .await;
         assert!(backend
-            .add_community_member("addc-comm", member("addc-1"))
+            .add_community_member("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -15278,9 +15400,12 @@ mod tests {
             .members
             .iter()
             .any(|m| m.key_id == "addc-1"));
-        // Re-add same key → idempotent no-op (false), no duplicate.
+        // Re-add same key → idempotent no-op (false), no duplicate. The stale
+        // `admit` from the first add is deliberately reused: the no-op returns
+        // BEFORE the gate, because nothing is written and there is nothing to
+        // authorize (CIRISPersist#654).
         assert!(!backend
-            .add_community_member("addc-comm", member("addc-1"))
+            .add_community_member("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -15296,10 +15421,11 @@ mod tests {
             1,
             "no duplicate member row on re-add"
         );
-        // Unknown community → InvalidArgument.
+        // Unknown community → InvalidArgument (refused before the gate — there
+        // is no stored roster to have signed over).
         assert!(matches!(
             backend
-                .add_community_member("no-such-comm", member("addc-2"))
+                .add_community_member("no-such-comm", member("addc-2"), &admit)
                 .await
                 .unwrap_err(),
             crate::federation::Error::UnstewardedCommunityMember { .. }
@@ -19294,5 +19420,30 @@ mod tests {
             "and no role was laundered onto the row: {:?}",
             stored.capability_roles
         );
+    }
+
+    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on memory.
+    /// One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
+    #[tokio::test]
+    async fn roster_growth_is_authorized_memory_654() {
+        let backend = MemoryBackend::new();
+        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
+            &backend, "mem654",
+        )
+        .await
+        .expect("654 roster-growth authorization exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
+    /// #547/#640 stale-index class, on memory.
+    #[tokio::test]
+    async fn attestation_wire_index_follows_pqc_attach_memory_657() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
+            &backend, "mem657",
+        )
+        .await
+        .expect("657 attestation wire-index exercise");
     }
 }

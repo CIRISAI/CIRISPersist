@@ -6010,14 +6010,19 @@ impl Engine {
     /// #249 Cut B — incrementally add `member` to `community_key_id`'s
     /// roster (idempotent on `member.key_id`). See
     /// [`FederationDirectory::add_community_member`](crate::federation::FederationDirectory::add_community_member).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `spec` is the caller's authority signature
+    /// over the GROWN roster; roster growth is no longer an unauthenticated
+    /// write door.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn add_community_member(
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
         self.federation_directory()
-            .add_community_member(community_key_id, member)
+            .add_community_member(community_key_id, member, spec)
             .await
     }
 
@@ -15733,33 +15738,28 @@ mod tests {
                 "{tag} groups_of(founder) contains the group"
             );
 
+            // v31.0.0 (CIRISPersist#654) — the roster grow now carries the
+            // founder's authority signature over the GROWN group envelope.
+            let mem_b_row = RosterMember {
+                key_id: mem_b.clone(),
+                joined_at: joined,
+                role: None,
+            };
+            let admit_b = crate::federation::cohort::test_support::admit_roster_member_via(
+                d, &founder, cohort, group, &mem_b_row,
+            )
+            .await;
             assert!(
-                d.add_member(
-                    cohort,
-                    group,
-                    RosterMember {
-                        key_id: mem_b.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
-                )
-                .await
-                .expect("add_member"),
+                d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                    .await
+                    .expect("add_member"),
                 "{tag} add_member(mem_b) is a genuine add"
             );
             assert_eq!(d.active_members(cohort, group).await.unwrap().len(), 2);
             assert!(
-                !d.add_member(
-                    cohort,
-                    group,
-                    RosterMember {
-                        key_id: mem_b.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
-                )
-                .await
-                .expect("add_member idempotent"),
+                !d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                    .await
+                    .expect("add_member idempotent"),
                 "{tag} re-add(mem_b) is a no-op"
             );
 
@@ -15791,16 +15791,25 @@ mod tests {
                 "{tag} revoke drops mem_b"
             );
 
+            let mem_c_row = RosterMember {
+                key_id: mem_c.clone(),
+                joined_at: joined,
+                role: None,
+            };
+            // v31.0.0 (CIRISPersist#654) — the add half of the swap is signed
+            // over the roster as it stands when the add runs. The removal is
+            // append-only, so `members[]` still carries `founder` and the grown
+            // envelope contains both.
+            let admit_c = crate::federation::cohort::test_support::admit_roster_member_via(
+                d, &founder, cohort, group, &mem_c_row,
+            )
+            .await;
             assert!(
                 d.swap_member(
                     cohort,
                     group,
                     &founder,
-                    RosterMember {
-                        key_id: mem_c.clone(),
-                        joined_at: joined,
-                        role: None
-                    },
+                    mem_c_row,
                     crate::federation::tier_ingest::test_support::sign_revoke_spec(
                         cohort,
                         &founder,
@@ -15810,6 +15819,7 @@ mod tests {
                         None,
                         vec![],
                     ),
+                    &admit_c,
                 )
                 .await
                 .expect("swap_member"),
@@ -15899,6 +15909,11 @@ mod tests {
                     key_id: "nope".into(),
                     joined_at: joined,
                     role: None,
+                },
+                &crate::federation::cohort::AdmitSpec {
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
                 },
             )
             .await
@@ -16455,16 +16470,22 @@ mod tests {
         .expect("put_family");
 
         // add → §9 added event
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN family envelope.
+        let newcomer = RosterMember {
+            key_id: fmk[1].clone(),
+            joined_at: joined,
+            role: None,
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            d,
+            &fmk[0],
+            Cohort::Family,
+            &fam,
+            &newcomer,
+        )
+        .await;
         assert!(d
-            .add_member(
-                Cohort::Family,
-                &fam,
-                RosterMember {
-                    key_id: fmk[1].clone(),
-                    joined_at: joined,
-                    role: None
-                },
-            )
+            .add_member(Cohort::Family, &fam, newcomer, &admit)
             .await
             .expect("add_member"));
         // revoke → §9 removed event (family FS is inherent fresh-per-write)

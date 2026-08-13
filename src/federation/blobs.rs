@@ -2558,6 +2558,102 @@ where
     })
 }
 
+/// v31.0.0 (CIRISPersist#657) — **step 5b of the `put_stream_sth` gate**: the
+/// WITNESS cosignatures, verified with the same discipline as the producer's.
+///
+/// # The defect
+///
+/// `put_stream_sth` verified the producer signature and then stored
+/// `witness_signatures` verbatim, and NO verify call for them existed anywhere
+/// in `src/`. `latest_stream_sth` reads them back and hands them to callers, so
+/// the substrate was preserving and presenting co-signatures it had never
+/// checked. That is the #556 rule — the preserve set must equal the verified
+/// set — on the transparency plane, and it is worse than dropping them would
+/// be: an unchecked cosignature LOOKS like the split-view evidence
+/// [`SignedTreeHead::witness_quorum_met`](ciris_verify_core::transparency::SignedTreeHead::witness_quorum_met)
+/// is built to provide, and anyone can mint one by generating a keypair.
+///
+/// # The roster is `federation_keys` — the same one the producer resolves in
+///
+/// A witness is not a new kind of principal needing a new roster. It is a
+/// registered federation key that watched this log, so `witness_id` resolves
+/// through [`verify_hybrid_via_directory`](crate::verify::verify_hybrid_via_directory)
+/// exactly as `producer_key_id` does: authority re-derived from THIS node's own
+/// verified state, never from keys carried on the row (the #377 rule). Each
+/// cosignature must clear all four checks, and a failure REFUSES THE WHOLE PUT
+/// rather than silently not counting — "does not count" is the right answer
+/// when tallying a quorum, and the wrong one when the question is whether to
+/// durably store and later serve the thing:
+///
+/// 1. **distinct `witness_id`** — a repeat would inflate any count downstream;
+/// 2. **known witness** — an unregistered `witness_id` is refused (fail closed
+///    on absence, the standing v31 decision; there is no legacy regime in which
+///    an unknown cosigner is stored anyway);
+/// 3. **CEG 0.2 §10.3.1 consistency proof** verifies against
+///    `(tree_size, root_hash)` — without it a cosignature is "quorum on a
+///    string" rather than quorum on log consistency;
+/// 4. **hybrid-Strict signature** over the IDENTICAL
+///    [`signing_bytes_of`](ciris_verify_core::transparency::SignedTreeHead::signing_bytes_of)
+///    bytes the producer signed, against the witness's PINNED directory
+///    pubkeys.
+///
+/// An STH with no witnesses is `Ok(())` — the field is optional, and the
+/// refusal is for an unverifiable one, never for an absent one.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn verify_stream_sth_witnesses<F>(
+    directory: &F,
+    sth: &ciris_verify_core::transparency::SignedTreeHead,
+) -> Result<(), BlobError>
+where
+    F: crate::federation::FederationDirectory,
+{
+    if sth.witness_signatures.is_empty() {
+        return Ok(());
+    }
+    let signing_bytes = sth.signing_bytes_of();
+    let mut seen: Vec<&str> = Vec::with_capacity(sth.witness_signatures.len());
+    for ws in &sth.witness_signatures {
+        if seen.contains(&ws.witness_id.as_str()) {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_stream_sth: witness {witness_id:?} cosigned this STH twice — a duplicate \
+                 inflates every downstream witness count (CIRISPersist#657)",
+                witness_id = ws.witness_id
+            )));
+        }
+        seen.push(ws.witness_id.as_str());
+        ws.consistency_proof
+            .verify(sth.tree_size, &sth.root_hash)
+            .map_err(|e| {
+                BlobError::InvalidArgument(format!(
+                    "put_stream_sth: witness {witness_id:?} cosignature carries a §10.3.1 \
+                     consistency proof that does not chain to this STH: {e}",
+                    witness_id = ws.witness_id
+                ))
+            })?;
+        let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
+            crate::federation::stream_sth::hybrid_signature_b64_parts(&ws.signature);
+        crate::verify::verify_hybrid_via_directory(
+            directory,
+            &signing_bytes,
+            &ws.witness_id,
+            &ed25519_sig_b64,
+            ml_dsa_65_sig_b64.as_deref(),
+            crate::verify::HybridPolicy::Strict,
+            None,
+        )
+        .await
+        .map(|_outcome| ())
+        .map_err(|e| {
+            BlobError::InvalidArgument(format!(
+                "put_stream_sth: witness cosignature verification failed for \
+                 witness_id={witness_id}: {e}",
+                witness_id = ws.witness_id
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// v4.1 (CIRISPersist#142, Cut B) — validate a `put_blob_chunks`
 /// request and produce the ordered list of rows to insert in one txn
 /// (the N chunk rows followed by the manifest row last).

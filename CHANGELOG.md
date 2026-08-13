@@ -238,6 +238,154 @@ that memory, sqlite and postgres all run:
   only form that can see an INSERT's omission at all. Two backends, not three:
   `put_blob` is `BlobStorage`, which memory does not implement, so the parity set
   is exactly the set of backends that have the door.
+### Fixed — BREAKING — SECURITY — a stored signature nobody verifies, and a mutation nobody re-signs (#654, #657)
+
+Four findings, one class. Every one of them is a place where this substrate
+either KEPT a signature it never checked, or CHANGED bytes that a signature
+covers without producing a new one. That is the #556 rule —
+*the preserve set must equal the verified set* — and this cut closes its last
+four instances on the roster, key, attestation and transparency planes.
+
+#### BREAKING — roster growth mutated a signing preimage with no signature and no authority check (#654)
+
+`add_family_member` / `add_community_member` rewrote `members` and recomputed
+`persist_row_hash` on all three backends with **no authority check at all**, and
+`members` is INSIDE `Family::signing_envelope()` / `Community::signing_envelope()`
+(the whole record minus the server-computed hash). Since #651 taught
+`supersede_group_row` to move `authority_key_id` / `scrub_signature_*` in the
+same statement as the roster, the effect was a stored row whose signature
+columns described the roster that USED to be there — and the roster is both the
+numerator and the denominator of `family_quorum_over` and `wa_quorum_over_body`,
+so a free seat changes who can charter a trust root AND what threshold they must
+clear. Reachable from PyO3 with no signature of any kind.
+
+**The wire change.** `FederationDirectory::add_family_member` /
+`add_community_member` / `add_member` / `swap_member` now take a
+`cohort::AdmitSpec` — `authority_key_id` + `scrub_signature_classical` +
+`scrub_signature_pqc`, the exact mirror of the `RevokeSpec` `revoke_member` has
+taken since v21.0.0. Adding a seat and removing one are the same act in opposite
+directions; only one of them used to need proof. The signature covers
+`JCS(signing_envelope())` of the **GROWN** record, verified through the SAME
+`verify_family_admission` / `verify_community_admission` gate `put_*` and
+`supersede_*` run — byte-identical to what a supersede of that record would be
+signed over, because growing a roster is not a lesser act than replacing one.
+The PyO3 surface gains `admit_spec_json` on `cohort_add_member`,
+`cohort_swap_member` and `add_community_member`.
+
+**The design decision, and why the two obvious repairs are wrong.** The only
+production roster-mutator was `at_rest_cascade::rekey_family_member_add`, and it
+holds no key material — that is its entire point — so it could neither produce
+this signature nor relay one over a roster it grows with a `joined_at` it mints
+itself. Growing a roster from inside a key-less cascade orchestrator is not a
+thing that can be made safe. So the roster grow moved back OUT to the caller,
+which was the driver's ORIGINAL documented contract before v6.2.0 quietly
+falsified it, and the driver now REFUSES a newcomer the roster does not already
+name. Moving `members` out of the preimage was rejected: it would invalidate
+every stored family signature and *weaken* the property being fixed, since the
+family row would no longer bind its own roster. A separate signed delta plane
+applied by a fold was rejected on ONE SPELLING: it would be a third spelling of
+roster change alongside `supersede_family_with_quorum`, and `members` is read
+directly by callers no fold reaches (`group_prior_envelope`, the cascade's
+existing-cohort walk, `validate_family_members`), so it would have been a
+two-lists-that-disagree defect by construction.
+
+The membership test in the driver is the **revocation-folded ACTIVE** roster,
+which closes a second hole found on the way: under the old shape a REMOVED
+member could be handed back every past family blob simply by re-running the
+driver, because it re-added them to the roster and then re-keyed them. That is a
+forward-secrecy hole in the one direction forward secrecy is supposed to be
+automatic for the family tier.
+
+The roster grow also now re-indexes `signed_wire_index` — the third site of the
+#547/#640 stale-index class.
+
+#### SECURITY — `attach_key_pqc_signature` installed an unverified ML-DSA-65 PUBLIC KEY (#657)
+
+The cold-path PQC fill-in writes `pubkey_ml_dsa_65_base64` — a public KEY, not
+merely a signature — and checked nothing about it: no proof of possession, no
+cross-check against the signed `registration_envelope`. On a hybrid-pending row
+that is a permanent takeover of the PQC leg of somebody else's identity, and it
+is not something a downstream reader can catch later, because every subsequent
+hybrid verify resolves the attacker's key out of the directory and succeeds
+against it. The site's own comment declared this intentional — *"Persist does
+NOT verify the cryptographic validity of the PQC signature on attach"* — which
+is true of a SIGNATURE and false of a KEY. That comment is corrected in place.
+
+This was filed rather than fixed because proof-of-possession is only
+well-defined on the self-scrubbed path. #659 landed the missing half: the
+subject's ML-DSA pubkey is now bound into the co-scrubbed
+`registration_envelope`. `admission::check_key_pqc_attachment` composes that
+projection — not a parallel one — with the ordinary registration gate over the
+post-attach row: `verify_envelope_binds_subject` first (so the refusal is
+deterministic), then `register::verify_key_registration`, which under
+`HybridPolicy::Strict` now has both legs to check. Self-scrub ⇒ that IS the
+proof of possession; anchor-scrub ⇒ the anchor really signed with its PQC leg
+and the binding has already tied that envelope to this subject's key.
+
+**A row that bound `null` may not attach.** `pubkey_ml_dsa_65_base64` binds as
+JSON `null` when the row carries no PQC key, and #659 is explicit that this is
+an ASSERTION OF ABSENCE. A row that bound `null` and later attaches a key is
+asserting something no signer ever signed for, so it is REFUSED; the repair is
+to re-mint the registration with an envelope that binds the key, not to let the
+substrate quietly upgrade an absence into a presence. Fail-closed, no legacy
+regime.
+
+#### `attach_attestation_pqc_signature` moved hash-covered columns and never re-indexed (#657)
+
+Its twin `attach_key_pqc_signature` re-indexes `signed_wire_index`; this one did
+not, on any of the three backends. Three serialized columns move, so the wire
+content hash moves with them, and a federation-tier attestation that completed
+its PQC leg advertised a ref it could not serve — silently, because the peer's
+fetch is a `let … else { continue }`. This is #547 fixed at one site and not the
+other, four cuts after #640 made the remedy shared. `attach_revocation_pqc_signature`
+was checked for the same and deliberately does NOT re-index: `federation_revocations`
+has no `signed_wire_index` kind at all, so there is no stale index to fix — now
+stated in its doc rather than left to be rediscovered.
+
+#### SECURITY — STH witness co-signatures were stored and never verified (#657)
+
+`put_stream_sth` verified the producer's signature and then stored
+`witness_signatures` verbatim; **no verify call for them existed anywhere in
+`src/`**, and `latest_stream_sth` reads them back and hands them to callers. A
+co-signature the substrate keeps and presents but has never checked is worse
+than one it does not keep, because it LOOKS like the split-view evidence
+`witness_quorum_met` exists to provide — and anyone can mint one by generating a
+keypair.
+
+A witness is not a new kind of principal needing a new roster: it is a
+registered federation key that watched this log, so `blobs::verify_stream_sth_witnesses`
+resolves `witness_id` through the directory exactly as `producer_key_id` is
+resolved. Each co-signature must clear four checks — distinct `witness_id`, a
+KNOWN witness, a verifying CEG 0.2 §10.3.1 consistency proof, and a
+hybrid-Strict signature over the identical `signing_bytes_of` the producer
+signed — and a failure refuses the WHOLE put rather than silently not counting,
+because "does not count" is the right answer when tallying a quorum and the
+wrong one when the question is whether to durably store and later serve the
+thing. An unknown witness is refused: fail closed on absence.
+
+The **audit** transparency plane (`merkle_store`) takes the other branch of the
+same finding and REFUSES to store a non-empty witness set. A `TransparencyStore`
+is a bare storage trait with no directory in scope and no witness roster
+anywhere in the audit plane — its own tests have always asserted the field is
+empty, calling it a reserved field "until the witness protocol lands". Reserved
+and empty is honest; reserved and quietly full of unchecked signatures is not.
+**The precise gap, filed rather than hidden:** the audit plane needs a
+trusted-witness roster reachable from `store_sth` — either a directory handle
+(so `witness_id` resolves in `federation_keys`, the spelling the stream plane
+now uses) or a pinned per-tenant `TrustedWitness` set. Until one exists there is
+nothing there to verify AGAINST.
+
+**Witnesses.** Every fix has one on memory, sqlite AND postgres, through shared
+exercise bodies (`cohort::test_support::exercise_roster_growth_is_authorized`,
+`admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`,
+`operational::test_support::exercise_attestation_wire_index_follows_pqc_attach`)
+so the property cannot be fixed on one backend and left open on another. A
+20-mutation campaign — 14 sqlite/memory, 6 postgres — killed 20/20, each
+verified to have applied (anchor unique, patch differs, file re-read from disk
+equals the patch) and to have RUN (nextest's `Summary … N tests run` line, with
+a green-baseline precondition so a permanently-red test cannot vacuously "kill"
+anything).
+
 
 ### Fixed — SECURITY — six doors that wrote without the gates their siblings run (#656)
 

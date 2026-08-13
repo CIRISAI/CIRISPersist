@@ -20867,17 +20867,28 @@ impl PyEngine {
     /// (JSON) into a `family`/`community` roster. Returns `True` on a genuine
     /// add, `False` if already present. Raises `ValueError` for the `self`
     /// cohort (occurrences are added via `put_identity_occurrence`).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is a
+    /// [`crate::federation::cohort::AdmitSpec`]
+    /// (`{authority_key_id, scrub_signature_classical, scrub_signature_pqc?}`),
+    /// the authority signature over `JCS(signing_envelope())` of the GROWN
+    /// group record. This surface WAS the reachable half of #654: roster growth
+    /// with no authority check at all, on the list that is both numerator and
+    /// denominator of every family quorum.
     fn cohort_add_member(
         &self,
         py: Python<'_>,
         cohort: &str,
         group_key_id: &str,
         member_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         let cohort = cohort_from_token(cohort)?;
         let member: crate::federation::cohort::RosterMember = serde_json::from_str(member_json)
             .map_err(|e| PyValueError::new_err(format!("cohort_add_member member JSON: {e}")))?;
+        let spec: crate::federation::cohort::AdmitSpec = serde_json::from_str(admit_spec_json)
+            .map_err(|e| PyValueError::new_err(format!("cohort_add_member AdmitSpec JSON: {e}")))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let group_key_id = group_key_id.to_owned();
@@ -20887,7 +20898,7 @@ impl PyEngine {
                     macro_rules! dispatch {
                         ($backend:expr) => {{
                             let b = $backend.clone();
-                            b.add_member(cohort, &group_key_id, member.clone())
+                            b.add_member(cohort, &group_key_id, member.clone(), &spec)
                                 .await
                                 .map_err(federation_err_to_py)
                         }};
@@ -20949,6 +20960,15 @@ impl PyEngine {
     /// [`crate::federation::cohort::RosterMember`] in `in_member_json` (revoke
     /// then add) in a `family`/`community` roster. `revoke_spec_json` is a
     /// [`crate::federation::cohort::RevokeSpec`]. Returns the add result.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is the addition's own
+    /// authority signature ([`crate::federation::cohort::AdmitSpec`]); a swap is
+    /// two authorized acts and now carries two authorizations. That is the
+    /// eighth argument, and the eighth is the one that makes the removal and
+    /// the addition each carry its own proof — collapsing the pair back into
+    /// one blob to please an argument count would re-create exactly the
+    /// "one authorization covers two acts" shape this fix removes.
+    #[allow(clippy::too_many_arguments)]
     fn cohort_swap_member(
         &self,
         py: Python<'_>,
@@ -20957,6 +20977,7 @@ impl PyEngine {
         out_key_id: &str,
         in_member_json: &str,
         revoke_spec_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         let cohort = cohort_from_token(cohort)?;
@@ -20966,6 +20987,9 @@ impl PyEngine {
             })?;
         let spec: crate::federation::cohort::RevokeSpec = serde_json::from_str(revoke_spec_json)
             .map_err(|e| PyValueError::new_err(format!("revoke_spec_json: {e}")))?;
+        let admit_spec: crate::federation::cohort::AdmitSpec =
+            serde_json::from_str(admit_spec_json)
+                .map_err(|e| PyValueError::new_err(format!("admit_spec_json: {e}")))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let group_key_id = group_key_id.to_owned();
@@ -20982,6 +21006,7 @@ impl PyEngine {
                                 &out_key_id,
                                 in_member.clone(),
                                 spec.clone(),
+                                &admit_spec,
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -21772,11 +21797,15 @@ impl PyEngine {
     /// [`crate::federation::types::CommunityMember`]. Returns `true` on a
     /// genuine add, `false` if the member was already on the roster
     /// (idempotent).
+    ///
+    /// v31.0.0 (CIRISPersist#654) — `admit_spec_json` is a
+    /// [`crate::federation::cohort::AdmitSpec`]; see `cohort_add_member`.
     fn add_community_member(
         &self,
         py: Python<'_>,
         community_key_id: &str,
         member_json: &str,
+        admit_spec_json: &str,
     ) -> PyResult<bool> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -21785,6 +21814,8 @@ impl PyEngine {
             let member: crate::federation::types::CommunityMember =
                 serde_json::from_str(member_json)
                     .map_err(|e| PyValueError::new_err(format!("CommunityMember decode: {e}")))?;
+            let spec: crate::federation::cohort::AdmitSpec = serde_json::from_str(admit_spec_json)
+                .map_err(|e| PyValueError::new_err(format!("AdmitSpec decode: {e}")))?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -21792,7 +21823,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .add_community_member(&community_key_id, member)
+                            .add_community_member(&community_key_id, member, &spec)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -21803,7 +21834,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .add_community_member(&community_key_id, member)
+                            .add_community_member(&community_key_id, member, &spec)
                             .await
                             .map_err(federation_err_to_py)
                     })

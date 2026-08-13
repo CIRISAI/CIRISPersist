@@ -6023,23 +6023,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family_key_id: &str,
         member: crate::federation::types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
         // Idempotent roster-grow. The read-modify-write races a concurrent
         // add only if two members are admitted at the same instant; the
         // `WHERE persist_row_hash = $4` guard makes the UPDATE a no-op on a
         // stale read (0 rows affected → retry signalled), so we never lose
         // a member to a lost update.
-        let mut family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
                 "add_family_member names unknown family_key_id {family_key_id:?}"
             ))
         })?;
         if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
         let prior_hash = family.persist_row_hash.clone();
-        family.members.push(member);
-        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(&family)?;
+        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
+        // mutation; see the sqlite twin.
+        let family =
+            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
         let members_value = serde_json::to_value(&family.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let client = self
@@ -6048,14 +6051,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let affected = client
             .execute(
+                // v31.0.0 (CIRISPersist#654/#651) — the signature moves with the
+                // roster it authorizes, in the SAME statement.
                 "UPDATE cirislens.federation_families \
-                    SET members = $2, persist_row_hash = $3 \
+                    SET members = $2, persist_row_hash = $3, authority_key_id = $5, \
+                        scrub_signature_classical = $6, scrub_signature_pqc = $7 \
                   WHERE family_key_id = $1 AND persist_row_hash = $4",
                 &[
                     &family_key_id,
                     &members_value,
                     &family.persist_row_hash,
                     &prior_hash,
+                    &spec.authority_key_id,
+                    &spec.scrub_signature_classical,
+                    &spec.scrub_signature_pqc,
                 ],
             )
             .await
@@ -6065,6 +6074,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "add_family_member on {family_key_id:?} lost a concurrent update (roster changed under the read); retry"
             )));
         }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -6075,8 +6090,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut community = self
+        let community = self
             .lookup_community(community_key_id)
             .await?
             .ok_or_else(|| {
@@ -6085,12 +6101,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ))
             })?;
         if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
         let prior_hash = community.persist_row_hash.clone();
-        community.members.push(member);
-        community.persist_row_hash =
-            crate::federation::types::compute_persist_row_hash(&community)?;
+        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
+        let community =
+            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
+                .await?;
         let members_value = serde_json::to_value(&community.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let client = self
@@ -6100,13 +6117,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE cirislens.federation_communities \
-                    SET members = $2, persist_row_hash = $3 \
+                    SET members = $2, persist_row_hash = $3, authority_key_id = $5, \
+                        scrub_signature_classical = $6, scrub_signature_pqc = $7 \
                   WHERE community_key_id = $1 AND persist_row_hash = $4",
                 &[
                     &community_key_id,
                     &members_value,
                     &community.persist_row_hash,
                     &prior_hash,
+                    &spec.authority_key_id,
+                    &spec.scrub_signature_classical,
+                    &spec.scrub_signature_pqc,
                 ],
             )
             .await
@@ -6116,6 +6137,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "add_community_member on {community_key_id:?} lost a concurrent update (roster changed under the read); retry"
             )));
         }
+        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
+        self.index_stored_record(
+            "Community",
+            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -9277,6 +9304,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         }
         row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
         row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        // v31.0.0 (CIRISPersist#657) — verify-before-mutation over the row AS IT
+        // WOULD BE STORED; see the sqlite twin.
+        crate::federation::admission::check_key_pqc_attachment(self, &row).await?;
         let now = chrono::Utc::now();
         row.pqc_completed_at = Some(now);
         let mut for_hash = row.clone();
@@ -9393,6 +9423,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "federation_attestations row {attestation_id} was concurrently completed"
             )));
         }
+        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
+        // hybrid-completion write moves three serialized columns, so it moves
+        // the wire content hash. #547 fixed this at the key site and #640 made
+        // the remedy shared, but the attestation site was never redirected
+        // through it. Postgres rounds `pqc_completed_at` to microseconds, which
+        // is exactly why the shared helper re-reads the row rather than hashing
+        // the in-memory value.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -12441,6 +12483,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // Step 5: verify the producer's hybrid signature, resolving the
         // pinned key from federation_keys via producer_key_id.
         crate::federation::blobs::verify_stream_sth_signature(self, &sth, producer_key_id).await?;
+
+        // Step 5b (v31.0.0, CIRISPersist#657): verify the WITNESS
+        // cosignatures the same way; see the sqlite twin.
+        crate::federation::blobs::verify_stream_sth_witnesses(self, &sth).await?;
 
         // Step 6: INSERT. A (stream_id, tree_size) PK conflict with a
         // DIFFERENT root is an equivocation attempt → reject; identical
@@ -25879,16 +25925,22 @@ mod tests {
             .unwrap();
 
         // add via the affiliations cohort.
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.
+        let carol_row = RosterMember {
+            key_id: carol.clone(),
+            joined_at: now,
+            role: Some("member".into()),
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            &backend,
+            &coop,
+            Cohort::Affiliations,
+            &coop,
+            &carol_row,
+        )
+        .await;
         let added = backend
-            .add_member(
-                Cohort::Affiliations,
-                &coop,
-                RosterMember {
-                    key_id: carol.clone(),
-                    joined_at: now,
-                    role: Some("member".into()),
-                },
-            )
+            .add_member(Cohort::Affiliations, &coop, carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -26117,6 +26169,33 @@ mod tests {
             .put_identity_occurrence_local(keyed(&bob_p, &bob, 0x22))
             .await
             .unwrap();
+        // v31.0.0 (CIRISPersist#654) — PG parity for the ORDER: the key-less
+        // driver refuses a newcomer the roster does not name; the SIGNED
+        // admission door is what grows the roster.
+        let too_early = rekey_family_member_add(&backend, &fam, &bob, chrono::Utc::now())
+            .await
+            .expect_err("the driver must not grow the roster itself");
+        assert!(
+            too_early.to_string().contains("not an active member"),
+            "the refusal names the precondition: {too_early}"
+        );
+        let fam_before = backend.lookup_family(&fam).await.unwrap().unwrap();
+        assert!(
+            !fam_before.members.iter().any(|m| m.key_id == bob),
+            "the refused driver call left the roster alone"
+        );
+        let bob_row = crate::federation::FamilyMember {
+            key_id: bob.clone(),
+            joined_at: now,
+            role: None,
+        };
+        let admit =
+            crate::federation::cohort::test_support::admit_family(&fam, &fam_before, &bob_row);
+        assert!(backend
+            .add_family_member(&fam, bob_row, &admit)
+            .await
+            .expect("signed roster grow"));
+
         let rk = rekey_family_member_add(&backend, &fam, &bob, chrono::Utc::now())
             .await
             .unwrap();
@@ -26148,6 +26227,7 @@ mod tests {
                     joined_at: chrono::Utc::now(),
                     role: None,
                 },
+                &admit,
             )
             .await
             .unwrap());
@@ -34809,6 +34889,153 @@ mod tests {
             .await;
     }
 
+    /// v31.0.0 (CIRISPersist#657) — POSTGRES PARITY for the witness-cosignature
+    /// gate. `put_stream_sth` stored `witness_signatures` verbatim on both
+    /// backends and no verify call for them existed anywhere in `src/`; the
+    /// remedy has to be witnessed on the backend production runs, not only on
+    /// the one the unit tests reach for.
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn sth_witness_cosignatures_are_verified_at_the_door_pg() {
+        pg_run_big_stack(sth_witness_cosignatures_are_verified_at_the_door_pg_inner);
+    }
+
+    async fn sth_witness_cosignatures_are_verified_at_the_door_pg_inner() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobBody, BlobStorage};
+        use ciris_verify_core::transparency::WitnessConsistencyProof;
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let salt = uuid_like();
+        // The DISTINGUISHING part leads: key_ids are truncated at 32 bytes by
+        // the shared seed derivation, and a uuid-first tag would make the
+        // producer and the witness the same identity.
+        let producer = format!("producer-witness-{salt}");
+        let signer = pg_register_hybrid_producer(&backend, &producer).await;
+        let stream = format!("pg-sth-witness-{salt}");
+        let mut hashes = Vec::new();
+        for (seq, tag) in ["AAAA", "BBBB"].iter().enumerate() {
+            let body = format!("wit-{tag}-{salt}").into_bytes();
+            hashes.push(
+                backend
+                    .put_blob_chunk(&stream, seq as u64, BlobBody::Inline(body), 0)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let base = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
+
+        // (1) UNREGISTERED witness: nothing in the directory to verify against.
+        let unreg = format!("unregistered-witness-{salt}");
+        let stranger = pg_witness_signer();
+        let mut sth = base.clone();
+        let cosig = sth
+            .cosign(&unreg, &stranger, WitnessConsistencyProof::genesis())
+            .expect("cosign");
+        sth.witness_signatures.push(cosig);
+        let err = backend
+            .put_stream_sth(sth, &producer)
+            .await
+            .expect_err("an unregistered witness must not be stored");
+        assert!(
+            format!("{err}").contains("witness"),
+            "the refusal names the witness leg: {err}"
+        );
+        assert!(
+            backend.latest_stream_sth(&stream).await.unwrap().is_none(),
+            "a refused STH is not stored at all"
+        );
+
+        // (2) REGISTERED witness, signature over a DIFFERENT tree.
+        let wit = format!("registered-witness-{salt}");
+        let witness = pg_register_witness(&backend, &wit).await;
+        let other = pg_sign_stream_sth(&signer, &stream, &hashes, 1);
+        let cosig = other
+            .cosign(&wit, &witness, WitnessConsistencyProof::genesis())
+            .expect("cosign");
+        let mut sth = base.clone();
+        sth.witness_signatures.push(cosig);
+        backend
+            .put_stream_sth(sth, &producer)
+            .await
+            .expect_err("a cosignature over other bytes must not be stored");
+
+        // (3) The genuine cosignature is admitted and round-trips.
+        let mut sth = base.clone();
+        let cosig = sth
+            .cosign(&wit, &witness, WitnessConsistencyProof::genesis())
+            .expect("cosign");
+        sth.witness_signatures.push(cosig);
+        backend
+            .put_stream_sth(sth, &producer)
+            .await
+            .expect("a verified cosignature is admitted");
+        let stored = backend.latest_stream_sth(&stream).await.unwrap().unwrap();
+        assert_eq!(stored.witness_signatures.len(), 1);
+        assert_eq!(stored.witness_signatures[0].witness_id, wit);
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — a witness keypair distinct from
+    /// [`pg_register_hybrid_producer`]'s, NOT registered.
+    fn pg_witness_signer(
+    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x51; 32]).unwrap();
+        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x52; 32]).unwrap();
+        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — [`pg_witness_signer`]'s keypair, REGISTERED
+    /// under `key_id` so the directory can resolve its pinned pubkeys.
+    async fn pg_register_witness(
+        backend: &PostgresBackend,
+        key_id: &str,
+    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+        use crate::federation::FederationDirectory as _;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x51; 32]).unwrap();
+        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x52; 32]).unwrap();
+        let ed_pub_b64 = {
+            use ciris_crypto::ClassicalSigner as _;
+            B64.encode(ed.public_key().unwrap())
+        };
+        let mldsa_pub_b64 = {
+            use ciris_crypto::PqcSigner as _;
+            B64.encode(mldsa.public_key().unwrap())
+        };
+        let now = chrono::Utc::now();
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: ed_pub_b64,
+            pubkey_ml_dsa_65_base64: Some(mldsa_pub_b64),
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::AGENT.into(),
+            identity_ref: key_id.into(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: Some("c2ln".into()),
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+    }
+
     #[test]
     #[serial_test::serial(postgres)]
     fn pg_sth_security_gate_negatives() {
@@ -37799,17 +38026,26 @@ mod tests {
             2
         );
         // add u2 → roster grows, reader sees it.
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
+        let admit_u2 = crate::federation::cohort::test_support::admit_community_via(
+            &backend,
+            &comm,
+            &comm,
+            &member(&u2, None),
+        )
+        .await;
         assert!(backend
-            .add_community_member(&comm, member(&u2, None))
+            .add_community_member(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         assert_eq!(
             backend.active_community_members(&comm).await.unwrap().len(),
             3
         );
-        // idempotent re-add.
+        // idempotent re-add (the stale spec is reused deliberately — the no-op
+        // returns before the gate; nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member(&comm, member(&u2, None))
+            .add_community_member(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         assert_eq!(
@@ -39577,5 +39813,69 @@ mod tests {
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "postgres", a, b,
         );
+    }
+
+    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on postgres.
+    /// One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn roster_growth_is_authorized_postgres_654() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
+            &backend,
+            // The distinguishing part leads; `seed_for` truncates at 32 bytes.
+            &format!("{}-pg654", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("654 roster-growth authorization exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
+    /// postgres. One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn attach_key_pqc_is_gated_postgres_657() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
+            &backend,
+            // The distinguishing part leads; `seed_for` truncates at 32 bytes.
+            &format!("{}-pg657", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("657 attach-gate exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
+    /// #547/#640 stale-index class, on postgres. The tag leads with the
+    /// distinguishing part: `tier_ingest::test_support::seed_for` truncates
+    /// key_ids at 32 bytes, and a uuid-bearing suffix would collapse the
+    /// exercise's `owner-`/`node-` identities into ONE key.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn attestation_wire_index_follows_pqc_attach_postgres_657() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
+            &backend,
+            &format!("{}-pg657", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("657 attestation wire-index exercise");
     }
 }

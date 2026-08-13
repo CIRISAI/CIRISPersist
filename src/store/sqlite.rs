@@ -5159,35 +5159,63 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         family_key_id: &str,
         member: crate::federation::types::FamilyMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
         // Read-modify-write under the connection lock so a concurrent add
         // can't lose a member to a stale roster. Idempotent on key_id.
-        let mut family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
                 "add_family_member names unknown family_key_id {family_key_id:?}"
             ))
         })?;
         if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        family.members.push(member);
-        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(&family)?;
+        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
+        // mutation. `members` is inside `Family::signing_envelope()`, so an
+        // unsigned grow stored a roster no authority had signed while the
+        // row's own `authority_key_id` / `scrub_signature_*` kept describing
+        // the roster that used to be there.
+        let family =
+            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
         let members_json = serde_json::to_string(&family.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let conn = self.conn.clone();
         let key = family_key_id.to_owned();
         let hash = family.persist_row_hash.clone();
+        let authority_key_id = spec.authority_key_id.clone();
+        let sig_classical = spec.scrub_signature_classical.clone();
+        let sig_pqc = spec.scrub_signature_pqc.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
+                // v31.0.0 (CIRISPersist#654/#651) — the signature moves with the
+                // roster it authorizes, in the SAME statement, so a future edit
+                // cannot rewrite `members` and forget the authorship.
                 "UPDATE federation_families \
-                    SET members = ?2, persist_row_hash = ?3 \
+                    SET members = ?2, persist_row_hash = ?3, authority_key_id = ?4, \
+                        scrub_signature_classical = ?5, scrub_signature_pqc = ?6 \
                   WHERE family_key_id = ?1",
-                rusqlite::params![key, members_json, hash],
+                rusqlite::params![
+                    key,
+                    members_json,
+                    hash,
+                    authority_key_id,
+                    sig_classical,
+                    sig_pqc
+                ],
             )?;
             Ok(())
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("add_family_member: {e}")))?;
+        // v31.0.0 (CIRISPersist#654) — a roster grow moves every column
+        // `list_signed_families_since` re-serializes, so it moves the wire
+        // content hash. The third site of the #547/#640 stale-index class.
+        self.index_stored_record(
+            "Family",
+            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -5197,8 +5225,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         community_key_id: &str,
         member: crate::federation::types::CommunityMember,
+        spec: &crate::federation::cohort::AdmitSpec,
     ) -> Result<bool, crate::federation::Error> {
-        let mut community = self
+        let community = self
             .lookup_community(community_key_id)
             .await?
             .ok_or_else(|| {
@@ -5207,27 +5236,45 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 ))
             })?;
         if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op
+            return Ok(false); // already on the roster — no-op, nothing to authorize
         }
-        community.members.push(member);
-        community.persist_row_hash =
-            crate::federation::types::compute_persist_row_hash(&community)?;
+        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
+        let community =
+            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
+                .await?;
         let members_json = serde_json::to_string(&community.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let conn = self.conn.clone();
         let key = community_key_id.to_owned();
         let hash = community.persist_row_hash.clone();
+        let authority_key_id = spec.authority_key_id.clone();
+        let sig_classical = spec.scrub_signature_classical.clone();
+        let sig_pqc = spec.scrub_signature_pqc.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_communities \
-                    SET members = ?2, persist_row_hash = ?3 \
+                    SET members = ?2, persist_row_hash = ?3, authority_key_id = ?4, \
+                        scrub_signature_classical = ?5, scrub_signature_pqc = ?6 \
                   WHERE community_key_id = ?1",
-                rusqlite::params![key, members_json, hash],
+                rusqlite::params![
+                    key,
+                    members_json,
+                    hash,
+                    authority_key_id,
+                    sig_classical,
+                    sig_pqc
+                ],
             )?;
             Ok(())
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("add_community_member: {e}")))?;
+        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
+        self.index_stored_record(
+            "Community",
+            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -8351,6 +8398,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         }
         row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
         row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+        // v31.0.0 (CIRISPersist#657) — verify-before-mutation over the row AS IT
+        // WOULD BE STORED. Attaching a PQC leg installs a PUBLIC KEY; the shared
+        // gate proves the envelope the row's signer signed names THIS key (#659)
+        // and that the row verifies hybrid-Strict with it.
+        crate::federation::admission::check_key_pqc_attachment(self, &row).await?;
         let now = chrono::Utc::now();
         row.pqc_completed_at = Some(now);
         let mut for_hash = row.clone();
@@ -8437,7 +8489,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
 
         let conn = self.conn.clone();
-        let attestation_id = attestation_id.to_owned();
+        let attestation_id_for_exec = attestation_id.to_owned();
         let pqc_sig = scrub_signature_pqc.to_owned();
         let now_str = now.to_rfc3339();
         let n = (move || -> Result<usize, rusqlite::Error> {
@@ -8446,7 +8498,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "UPDATE federation_attestations \
                  SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
                  WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
-                rusqlite::params![pqc_sig, now_str, new_hash, attestation_id],
+                rusqlite::params![pqc_sig, now_str, new_hash, attestation_id_for_exec],
             )
         })()
         .map_err(|e| {
@@ -8457,6 +8509,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "federation_attestations row was concurrently completed".to_string(),
             ));
         }
+        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
+        // serialized columns of the attestation (`scrub_signature_pqc`,
+        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
+        // hash exactly as the key-plane twin above does. #547 fixed the key
+        // site and #640 made that remedy shared; this site was never redirected
+        // through it, so a federation-tier attestation that completed its PQC
+        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
+        // the point-read advertises one digest and the read surface returns
+        // another. Indexed from the row AS STORED (the shared helper re-reads),
+        // which is what makes the index agree with the read surface on a
+        // backend that rounds `pqc_completed_at`.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -11549,6 +11617,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // Step 5: verify the producer's hybrid signature (pinned key
         // resolved from federation_keys via producer_key_id).
         crate::federation::blobs::verify_stream_sth_signature(self, &sth, producer_key_id).await?;
+
+        // Step 5b (v31.0.0, CIRISPersist#657): verify the WITNESS
+        // cosignatures the same way. Before this they were stored verbatim
+        // and served back by `latest_stream_sth` with no verify call
+        // anywhere in the crate — the #556 preserve-set-equals-verified-set
+        // class, on the plane whose entire purpose is being evidence.
+        crate::federation::blobs::verify_stream_sth_witnesses(self, &sth).await?;
 
         // Step 6: INSERT. (stream_id, tree_size) PK conflict with a
         // DIFFERENT root → equivocation reject; identical → idempotent.
@@ -24759,16 +24834,22 @@ mod tests {
             .await
             .unwrap();
 
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.
+        let carol_row = RosterMember {
+            key_id: "carol".into(),
+            joined_at: chrono::Utc::now(),
+            role: Some("member".into()),
+        };
+        let admit = crate::federation::cohort::test_support::admit_roster_member_via(
+            &backend,
+            "comm",
+            Cohort::Affiliations,
+            "comm",
+            &carol_row,
+        )
+        .await;
         let added = backend
-            .add_member(
-                Cohort::Affiliations,
-                "comm",
-                RosterMember {
-                    key_id: "carol".into(),
-                    joined_at: chrono::Utc::now(),
-                    role: Some("member".into()),
-                },
-            )
+            .add_member(Cohort::Affiliations, "comm", carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -25983,9 +26064,14 @@ mod tests {
 
     /// v6.2.0 (#161 A4/A5) — the forward-path half of the keystone: a
     /// genuinely-new family member (NOT on the roster at write time) is
-    /// added to the roster by `rekey_family_member_add` and is then served
-    /// FUTURE family writes, not just re-keyed onto past blobs. This is the
-    /// gap the roster-grow primitive (`add_family_member`) closes.
+    /// added to the roster and is then served FUTURE family writes, not just
+    /// re-keyed onto past blobs.
+    ///
+    /// v31.0.0 (CIRISPersist#654) — the roster grow moved back OUT of
+    /// `rekey_family_member_add` and into the SIGNED `add_family_member` door,
+    /// so this now also witnesses the ORDER: the driver REFUSES a newcomer the
+    /// roster does not name, the signed admission puts them on it, and only
+    /// then does the backward-path re-key run.
     #[tokio::test]
     async fn rekey_family_member_add_grows_roster_and_serves_future_writes() {
         use crate::federation::at_rest_cascade::orchestrate::{
@@ -26032,6 +26118,91 @@ mod tests {
             .put_identity_occurrence_local(occ_signed("bob", "bob-phone", Some(keyed_enc(0x77))))
             .await
             .unwrap();
+        // v31.0.0 (CIRISPersist#654) — the driver REFUSES a newcomer the roster
+        // does not name. It holds no key material, so growing the roster from
+        // inside it was an unauthenticated write into the signing preimage.
+        let too_early = rekey_family_member_add(&backend, "fam", "bob", chrono::Utc::now())
+            .await
+            .expect_err("the driver must not grow the roster itself");
+        assert!(
+            too_early.to_string().contains("not an active member"),
+            "the refusal names the precondition, not something a neighbouring \
+             gate happens to say first: {too_early}"
+        );
+        let fam_before = backend.lookup_family("fam").await.unwrap().unwrap();
+        assert!(
+            !fam_before.members.iter().any(|m| m.key_id == "bob"),
+            "the refused driver call left the roster alone"
+        );
+
+        // The SIGNED admission door is what grows the roster — and only the
+        // signed one. An empty spec is what every pre-#654 caller effectively
+        // supplied, and a spec signed over a DIFFERENT grown roster must not
+        // admit this one; both are refused before any mutation.
+        let bob_row = crate::federation::types::FamilyMember {
+            key_id: "bob".into(),
+            joined_at: chrono::Utc::now(),
+            role: None,
+        };
+        let unsigned = crate::federation::cohort::AdmitSpec {
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+        };
+        let err = backend
+            .add_family_member("fam", bob_row.clone(), &unsigned)
+            .await
+            .expect_err("an unsigned family roster grow must be refused");
+        assert!(
+            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            "the refusal is about AUTHORSHIP: {err:?}"
+        );
+        let wrong = crate::federation::cohort::test_support::admit_family(
+            "fam",
+            &fam_before,
+            &crate::federation::types::FamilyMember {
+                key_id: "alice".into(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            },
+        );
+        backend
+            .add_family_member("fam", bob_row.clone(), &wrong)
+            .await
+            .expect_err("a signature over a different grown roster must not admit this one");
+        assert_eq!(
+            backend
+                .lookup_family("fam")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            1,
+            "verify-before-mutation: neither refusal touched the roster"
+        );
+
+        let admit =
+            crate::federation::cohort::test_support::admit_family("fam", &fam_before, &bob_row);
+        assert!(backend
+            .add_family_member("fam", bob_row, &admit)
+            .await
+            .expect("signed roster grow"));
+
+        // The STORED row verifies against the STORED signature — the roster and
+        // its authorization moved together (#654/#651).
+        let signed_fam = backend
+            .list_signed_families_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.family.family_key_id == "fam")
+            .expect("the grown family is served on the signed read surface");
+        assert_eq!(signed_fam.family.members.len(), 2);
+        crate::federation::verify_family_admission(&backend, &signed_fam)
+            .await
+            .expect("the stored family must verify against its own stored signature");
+
         let rk = rekey_family_member_add(&backend, "fam", "bob", chrono::Utc::now())
             .await
             .unwrap();
@@ -26072,6 +26243,7 @@ mod tests {
                         joined_at: chrono::Utc::now(),
                         role: None,
                     },
+                    &admit,
                 )
                 .await
                 .unwrap(),
@@ -38364,6 +38536,147 @@ mod tests {
         signer
     }
 
+    /// v31.0.0 (CIRISPersist#657) — a SECOND hybrid keypair, optionally
+    /// registered, for the witness-cosignature witnesses. Distinct seeds from
+    /// [`register_hybrid_producer`], and the same
+    /// build-the-signer-before-the-await discipline (a multi-KiB ML-DSA signer
+    /// across an await overflows the 2 MiB tokio test stack).
+    async fn hybrid_witness_signer(
+        backend: &SqliteBackend,
+        key_id: &str,
+        register: bool,
+    ) -> Box<ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer>>
+    {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x41; 32]).unwrap();
+        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x42; 32]).unwrap();
+        let ed_pub_b64 = {
+            use ciris_crypto::ClassicalSigner as _;
+            B64.encode(ed.public_key().unwrap())
+        };
+        let mldsa_pub_b64 = {
+            use ciris_crypto::PqcSigner as _;
+            B64.encode(mldsa.public_key().unwrap())
+        };
+        let signer = Box::new(ciris_crypto::HybridSigner::new(ed, mldsa).unwrap());
+        if register {
+            let record = crate::federation::KeyRecord {
+                key_id: key_id.into(),
+                pubkey_ed25519_base64: ed_pub_b64,
+                pubkey_ml_dsa_65_base64: Some(mldsa_pub_b64),
+                algorithm: crate::federation::types::algorithm::HYBRID.into(),
+                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+                identity_ref: key_id.into(),
+                valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".into(),
+                scrub_signature_classical: "c2lnbmF0dXJl".into(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.into(),
+                scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            };
+            backend
+                .put_public_key(SignedKeyRecord { record })
+                .await
+                .unwrap();
+        }
+        signer
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — **A STORED WITNESS COSIGNATURE IS A
+    /// VERIFIED ONE.**
+    ///
+    /// `put_stream_sth` stored `witness_signatures` verbatim and no verify call
+    /// for them existed anywhere in `src/` — so `latest_stream_sth` served back,
+    /// as if it were split-view evidence, anything a producer chose to attach.
+    /// Three arms, in the order they can go wrong:
+    /// 1. an UNREGISTERED witness_id is refused (fail closed on absence — the
+    ///    witness roster is `federation_keys`, the same one the producer
+    ///    resolves in);
+    /// 2. a registered witness whose signature is over DIFFERENT bytes is
+    ///    refused (the check is not "is there a signature-shaped blob here");
+    /// 3. a genuine cosignature is admitted and round-trips.
+    #[tokio::test]
+    async fn sth_witness_cosignatures_are_verified_at_the_door() {
+        use ciris_verify_core::transparency::WitnessConsistencyProof;
+        let backend = blob_test_backend().await;
+        let signer = register_hybrid_producer(&backend, "producer-key").await;
+        let stream = "sth-witness";
+        let hashes = append_chunks(&backend, stream, &[b"AAAA", b"BBBB"]).await;
+        let base = sign_stream_sth(&signer, stream, &hashes, 2);
+
+        // (1) An UNREGISTERED witness — nothing to verify against.
+        let stranger = hybrid_witness_signer(&backend, "witness-unregistered", false).await;
+        let mut sth = base.clone();
+        let cosig = sth
+            .cosign(
+                "witness-unregistered",
+                &stranger,
+                WitnessConsistencyProof::genesis(),
+            )
+            .expect("cosign");
+        sth.witness_signatures.push(cosig);
+        let err = backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .expect_err("an unregistered witness must not be stored");
+        assert!(
+            err.to_string().contains("witness"),
+            "the refusal names the witness leg: {err}"
+        );
+        assert!(
+            backend.latest_stream_sth(stream).await.unwrap().is_none(),
+            "a refused STH is not stored at all"
+        );
+
+        // (2) A REGISTERED witness whose signature is over a DIFFERENT tree.
+        let witness = hybrid_witness_signer(&backend, "witness-registered", true).await;
+        let other = sign_stream_sth(&signer, stream, &hashes, 1);
+        let wrong_bytes = other.clone();
+        let cosig = wrong_bytes
+            .cosign(
+                "witness-registered",
+                &witness,
+                WitnessConsistencyProof::genesis(),
+            )
+            .expect("cosign");
+        let mut sth = base.clone();
+        sth.witness_signatures.push(cosig);
+        backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .expect_err("a cosignature over other bytes must not be stored");
+
+        // (3) The genuine cosignature is admitted and round-trips.
+        let mut sth = base.clone();
+        let cosig = sth
+            .cosign(
+                "witness-registered",
+                &witness,
+                WitnessConsistencyProof::genesis(),
+            )
+            .expect("cosign");
+        sth.witness_signatures.push(cosig);
+        backend
+            .put_stream_sth(sth, "producer-key")
+            .await
+            .expect("a verified cosignature is admitted");
+        let stored = backend.latest_stream_sth(stream).await.unwrap().unwrap();
+        assert_eq!(stored.witness_signatures.len(), 1);
+        assert_eq!(
+            stored.witness_signatures[0].witness_id,
+            "witness-registered"
+        );
+    }
+
     /// Produce a producer-signed STH over a stream's recomputed root for
     /// `tree_size` leaves, signed by `signer`.
     fn sign_stream_sth(
@@ -39854,8 +40167,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
+        let admit = crate::federation::cohort::test_support::admit_community_via(
+            &backend,
+            "addc-comm",
+            "addc-comm",
+            &cm("addc-1"),
+        )
+        .await;
         assert!(backend
-            .add_community_member("addc-comm", cm("addc-1"))
+            .add_community_member("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -39870,9 +40191,10 @@ mod tests {
             .members
             .iter()
             .any(|m| m.key_id == "addc-1"));
-        // Idempotent re-add.
+        // Idempotent re-add (stale spec reused deliberately: the no-op returns
+        // before the gate — nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member("addc-comm", cm("addc-1"))
+            .add_community_member("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -39889,9 +40211,23 @@ mod tests {
         );
         // Unknown community.
         assert!(backend
-            .add_community_member("no-such", cm("addc-0"))
+            .add_community_member("no-such", cm("addc-0"), &admit)
             .await
             .is_err());
+    }
+
+    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on sqlite.
+    /// One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
+    #[tokio::test]
+    async fn roster_growth_is_authorized_sqlite_654() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
+            &backend, "sq654",
+        )
+        .await
+        .expect("654 roster-growth authorization exercise");
     }
 
     /// moderators_of: founder (authority root) + `delegates_to(moderate)`
@@ -40910,5 +41246,32 @@ mod tests {
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "sqlite", a, b,
         );
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the cold-path PQC fill-in is GATED, on
+    /// sqlite. One shared body across memory / sqlite / postgres; see
+    /// [`crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated`].
+    #[tokio::test]
+    async fn attach_key_pqc_is_gated_sqlite_657() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::pqc_attach_test_support::exercise_attach_key_pqc_is_gated(
+            &backend, "sq657",
+        )
+        .await
+        .expect("657 attach-gate exercise");
+    }
+
+    /// v31.0.0 (CIRISPersist#657) — the ATTESTATION plane's instance of the
+    /// #547/#640 stale-index class, on sqlite.
+    #[tokio::test]
+    async fn attestation_wire_index_follows_pqc_attach_sqlite_657() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_attestation_wire_index_follows_pqc_attach(
+            &backend, "sq657",
+        )
+        .await
+        .expect("657 attestation wire-index exercise");
     }
 }
