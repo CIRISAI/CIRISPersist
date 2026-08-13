@@ -1,11 +1,28 @@
 //! v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash index
 //! (`signed_wire_index`, V111): ONE table, `PRIMARY KEY (kind, content_hash)`,
 //! covering every kind CIRISEdge serves — the 5 primary signed planes (#507c),
-//! the 5 E4 keyless-declaration planes (#504), and the operational
-//! org/org_membership/partner_record trio. 13 of the 14
-//! [`super::replication_policy::EnvelopeKind`]s (`Revocation`, the key-level
-//! revocation plane, is out of #507's scope — see the trait doc on
-//! [`super::FederationDirectory::lookup_signed_record_by_content_hash`]).
+//! the 5 E4 keyless-declaration planes (#504), the operational
+//! org/org_membership/partner_record trio, and — since v31.1.0
+//! (CIRISPersist#655) — the key-level `Revocation` plane.
+//!
+//! # v31.1.0 (CIRISPersist#655/#662) — 14 of the 15, and the one exception
+//!
+//! `Revocation` was outside #507's scope, which is how #655 found an
+//! exclusion plane with no serve cursor and no point-read: destroyable, not
+//! rebuildable. It joins here on the same terms as every other plane, because
+//! a revocation row is self-authenticating (inline hybrid scrub signature,
+//! re-verified at `put_revocation` against the receiver's own directory).
+//!
+//! [`EnvelopeKind::AccordQuorumEvidence`](super::replication_policy::EnvelopeKind::AccordQuorumEvidence)
+//! is the one kind that stays OUT, by construction rather than by oversight.
+//! Every other kind indexes a ROW; that kind is an aggregate — a proposal
+//! plus however many participations have arrived — so its content hash is a
+//! moving target that changes each time a holder's vote lands, and an index
+//! entry written at one vote count is dangling at the next. A content-hash
+//! point-read is the wrong primitive for it; the plane is served by cursor
+//! only (`list_signed_accord_quorum_evidence_since`), and its receive gate
+//! re-tallies rather than fetching by hash, so nothing downstream needs the
+//! ref. Stated here so the gap is a decision and not the next #655.
 //!
 //! # The lockstep fact
 //!
@@ -241,6 +258,22 @@ pub async fn reload_record_bytes(
                     Some(serde_json::to_vec(&a).map_err(|e| to_bytes(e, "Attestation"))?)
                 }
                 _ => None,
+            }
+        }
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Reloads
+        // targeted through `revocations_for` (the subject read) and wraps in
+        // the SAME `SignedRevocation` shape `list_signed_revocations_since`
+        // returns, so both derivations hash identical bytes.
+        "Revocation" => {
+            let revoked_key_id = record_key_field(record_key_json, "revoked_key_id")?;
+            let revocation_id = record_key_field(record_key_json, "revocation_id")?;
+            let rows = dir.revocations_for(&revoked_key_id).await?;
+            match rows.into_iter().find(|r| r.revocation_id == revocation_id) {
+                Some(revocation) => Some(
+                    serde_json::to_vec(&super::SignedRevocation { revocation })
+                        .map_err(|e| to_bytes(e, "Revocation"))?,
+                ),
+                None => None,
             }
         }
         "IdentityOccurrence" => {
@@ -548,6 +581,14 @@ pub async fn all_kind_hash_keys(
     for a in dir.list_attestations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &a.attestation_id)]);
         out.push(("Attestation", content_hash_of(&a)?, rk));
+    }
+    // v31.1.0 (CIRISPersist#655) — the key-level revocation plane.
+    for r in dir.list_signed_revocations_since(None, u32::MAX).await? {
+        let rk = record_key(&[
+            ("revoked_key_id", &r.revocation.revoked_key_id),
+            ("revocation_id", &r.revocation.revocation_id),
+        ]);
+        out.push(("Revocation", content_hash_of(&r)?, rk));
     }
     for r in dir
         .list_signed_identity_occurrences_since(None, u32::MAX)

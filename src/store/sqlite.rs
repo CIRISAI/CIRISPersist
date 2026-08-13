@@ -4735,6 +4735,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let revocation_envelope_text = serde_json::to_string(&row.revocation_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
 
+        // v31.1.0 (CIRISPersist#655) — the wire-index locator, derived before
+        // the INSERT closure takes `row` by move.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("revoked_key_id", row.revoked_key_id.as_str()),
+            ("revocation_id", row.revocation_id.as_str()),
+        ]);
+
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -4777,6 +4784,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert revocation: {msg}"))
             }
         })?;
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
+        // shared `signed_wire_index`. Runs after the connection lock is
+        // released: `index_stored_record` reloads through the read path.
+        self.index_stored_record("Revocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -8220,6 +8232,78 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_signed_key_records_since: {e}"))
         })
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor. Every
+    /// row is signed (`scrub_signature_classical` is `NOT NULL`), so — as with
+    /// `list_signed_key_records_since` — no signed-only filter applies.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
+                        revoked_at, effective_at, revocation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                        revoked_after, persist_row_hash \
+                 FROM federation_revocations \
+                 WHERE (?1 IS NULL OR scrub_timestamp > ?1) \
+                 ORDER BY scrub_timestamp ASC, revocation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_revocation)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(crate::federation::SignedRevocation { revocation: r? });
+            }
+            Ok(out)
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_revocations_since: {e}"))
+        })
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. `limit`
+    /// pages PROPOSALS; the participation set for each is assembled by the
+    /// shared
+    /// [`accord_carriage::assemble_evidence_page`](crate::federation::accord_carriage::assemble_evidence_page),
+    /// which owns the `member_id` sort so all three backends serialize alike.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        let conn = self.conn.clone();
+        let since_s = since.map(|t| t.to_rfc3339());
+        let page = (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM accord_proposal \
+                 WHERE (?1 IS NULL OR created_at > ?1) \
+                 ORDER BY created_at ASC, proposal_digest ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_s, limit],
+                sqlite_row_to_stored_proposal,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_accord_quorum_evidence_since: {e}"
+            ))
+        })?;
+        crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 
     async fn list_signed_identity_occurrences_since(

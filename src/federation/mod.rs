@@ -32,6 +32,7 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+pub mod accord_carriage;
 pub mod accord_quorum;
 pub mod admission;
 pub mod age;
@@ -2297,14 +2298,84 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error>;
 
+    /// v31.1.0 (CIRISPersist#655) — bulk-list the full [`SignedRevocation`]
+    /// wrappers (one per `federation_revocations` row) since a cursor. `since`
+    /// filters on `scrub_timestamp > since` (`None` = from the start); rows
+    /// are ordered by `(scrub_timestamp ASC, revocation_id ASC)` so the cursor
+    /// is a stable resumption point, mirroring
+    /// [`Self::list_signed_key_records_since`]. `limit` caps the page.
+    ///
+    /// # Why this plane needed only a cursor
+    ///
+    /// #655 found an exclusion plane that could be destroyed and never
+    /// rebuilt — every other replicated plane had a `list_signed_*_since` and
+    /// this one did not, so a DSAR erasure, an operator repair or a restored
+    /// backup removed an exclusion permanently and silently.
+    ///
+    /// Unlike `federation_role_withdrawals` (whose remedy is the accord
+    /// EVIDENCE plane — see
+    /// [`accord_carriage`](crate::federation::accord_carriage)), a revocation
+    /// row is **self-authenticating**: it carries `revocation_envelope` plus
+    /// the hybrid `scrub_signature_classical` / `scrub_signature_pqc` /
+    /// `scrub_key_id`, and the receive side already re-verifies that
+    /// signature, the #659 subject binding and the #502 E1 authorship gate
+    /// against its OWN registered directory inside
+    /// [`Self::put_revocation`]. Serving the row therefore ships evidence, not
+    /// a verdict; no re-derivation step is needed because the receiver was
+    /// already re-deriving.
+    ///
+    /// **Every row qualifies.** `scrub_signature_classical` is `NOT NULL` —
+    /// a revocation cannot be admitted unsigned — so, exactly as with
+    /// [`Self::list_signed_key_records_since`], there is no legitimately-
+    /// unsigned shape to filter out. [`Revocation`] carries its scrub-
+    /// signature fields inline (it IS the signed wrapper for read purposes);
+    /// [`SignedRevocation`] exists so the write-input and bulk-read shapes
+    /// match.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedRevocation>, Error>;
+
+    /// v31.1.0 (CIRISPersist#662) — bulk-list the
+    /// [`accord_carriage::AccordQuorumEvidence`] bundles (V091
+    /// `accord_proposal` + its `accord_participation` set) since a cursor.
+    /// `since` filters on the proposal's local `created_at > since` (`None` =
+    /// from the start); bundles are ordered by `(created_at ASC,
+    /// proposal_digest ASC)`. `limit` caps the page (counted in PROPOSALS,
+    /// not participations).
+    ///
+    /// # This is the signed EVIDENCE plane, and it exists so a verdict plane
+    /// does not have to
+    ///
+    /// `federation_role_withdrawals` (V104) has no signature columns at all,
+    /// so a cursor on IT would hand a peer a derived verdict to trust — the
+    /// forgeable-decision-bool shape CIRISPersist#377 closed. The signatures
+    /// live here instead, on the participations, and a receiver admits a
+    /// bundle only by **re-tallying** it against a roster resolved from its
+    /// own directory
+    /// ([`accord_carriage::admit_replicated_accord_evidence`]), then
+    /// re-derives its own tombstones locally. See that module for the full
+    /// ordering argument.
+    ///
+    /// Participations are sorted by `member_id` within each bundle so the
+    /// serialization is deterministic across backends.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error>;
+
     // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
     //     index (V111 `signed_wire_index`). One shared table covers every
     //     kind edge serves: the 5 primary planes above, the 5 #504 E4
-    //     keyless planes, and the org/org_membership/partner_record trio —
-    //     13 of the 14 `EnvelopeKind`s (`Revocation`, the key-level
-    //     revocation plane, is out of #507's scope). See
-    //     [`super::wire_index`] for the shared hash/record-key helpers
-    //     backends call at each signed write chokepoint.
+    //     keyless planes, the org/org_membership/partner_record trio, and —
+    //     since v31.1.0 (CIRISPersist#655) — the key-level `Revocation`
+    //     plane, which #507 had left out of scope. 14 of the 15
+    //     `EnvelopeKind`s; `AccordQuorumEvidence` is the exception and stays
+    //     out by construction (see [`super::wire_index`]). That module also
+    //     holds the shared hash/record-key helpers backends call at each
+    //     signed write chokepoint.
 
     /// v21.1.0 (CIRISPersist#507b) — **the content-hash point-read.** The
     /// content hash of a signed record is the lowercase-hex sha256 over the
@@ -6317,6 +6388,31 @@ pub enum Error {
         reason: String,
     },
 
+    /// v31.1.0 (CIRISPersist#662) — a replicated **accord evidence bundle**
+    /// ([`accord_carriage::AccordQuorumEvidence`]) was REFUSED because the
+    /// receiver's own re-tally did not reach a strict majority of its accord
+    /// roster, or the bundle was outside the HUMANITY_ACCORD family scope.
+    ///
+    /// The distinction from [`Error::CanonicalWithdrawalAuthorityInvalid`] is
+    /// deliberate: that token means "a LOCAL destructive op named an
+    /// authority that does not hold"; this one means "a PEER offered evidence
+    /// and we re-derived its quorum ourselves and it did not hold". Both are
+    /// fail-closed (nothing is stored), but only this one tells an operator
+    /// that a carrier is supplying bundles that do not verify here — which is
+    /// either a partition, a stale roster, or a forgery attempt, and they
+    /// want to know which surface said so. Stable `kind()` token
+    /// `accord_evidence_unverified`.
+    #[error(
+        "replicated accord evidence for proposal {proposal_digest:?} refused — \
+         the receiver's own re-tally did not authorize it: {reason}"
+    )]
+    AccordEvidenceUnverified {
+        /// The content-derived digest of the refused proposal.
+        proposal_digest: String,
+        /// Why the receiver's re-derivation failed.
+        reason: String,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -6670,6 +6766,7 @@ impl Error {
             Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
                 "canonical_withdrawal_authority_invalid"
             }
+            Error::AccordEvidenceUnverified { .. } => "accord_evidence_unverified",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"

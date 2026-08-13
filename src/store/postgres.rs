@@ -5651,6 +5651,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert revocation: {msg}"))
                 }
             })?;
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
+        // shared `signed_wire_index`, reloaded through the read path so the
+        // indexed bytes are the ones this backend actually stores.
+        self.index_stored_record(
+            "Revocation",
+            &crate::federation::wire_index::record_key(&[
+                ("revoked_key_id", row.revoked_key_id.as_str()),
+                ("revocation_id", row.revocation_id.as_str()),
+            ]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -9119,6 +9130,85 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             });
         }
         Ok(out)
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor. Every
+    /// row is signed (`scrub_signature_classical` is `NOT NULL`), so — as with
+    /// `list_signed_key_records_since` — no signed-only filter applies.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                // `revocation_id` is a UUID column; the read type is String,
+                // so it is cast here exactly as `revocations_for` casts it.
+                "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
+                        revoked_at, effective_at, revocation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                        revoked_after, persist_row_hash \
+                 FROM cirislens.federation_revocations \
+                 WHERE ($1::timestamptz IS NULL OR scrub_timestamp > $1) \
+                 ORDER BY scrub_timestamp ASC, revocation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_revocations_since: {e}"))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::federation::SignedRevocation {
+                revocation: pg_row_to_revocation(row)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. `limit`
+    /// pages PROPOSALS; the participation set for each is assembled by the
+    /// shared
+    /// [`accord_carriage::assemble_evidence_page`](crate::federation::accord_carriage::assemble_evidence_page),
+    /// which owns the `member_id` sort so all three backends serialize alike.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit_i = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM cirislens.accord_proposal \
+                 WHERE ($1::timestamptz IS NULL OR created_at > $1) \
+                 ORDER BY created_at ASC, proposal_digest ASC LIMIT $2",
+                &[&since, &limit_i],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_accord_quorum_evidence_since: {e}"
+                ))
+            })?;
+        let page = rows
+            .into_iter()
+            .map(pg_row_to_stored_proposal)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 
     async fn list_signed_identity_occurrences_since(

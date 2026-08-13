@@ -3696,6 +3696,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // leaves no trace (AV-9) — and runs HERE, on memory, because the
         // backend-symmetry lesson has cost this repo seven releases.
         crate::federation::check_revocation_bound(&row)?;
+        // v31.1.0 (CIRISPersist#655) — the FK emulation, the anti-rollback
+        // scan and the push are scoped into one block so the `MutexGuard` is
+        // provably dropped before the wire-index reload awaits below (the
+        // reload takes this same lock, and a guard merely `drop`ped still
+        // counts as held across an await for auto-trait purposes).
+        let wire_index_key = {
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.revoked_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -3737,7 +3743,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )?;
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let key = crate::federation::wire_index::record_key(&[
+            ("revoked_key_id", row.revoked_key_id.as_str()),
+            ("revocation_id", row.revocation_id.as_str()),
+        ]);
         state.federation_revocations.push(row);
+        key
+        };
+        // The key-level revocation plane joins the shared `signed_wire_index`.
+        self.index_stored_record("Revocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -6138,6 +6153,66 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .into_iter()
             .map(|record| crate::federation::SignedKeyRecord { record })
             .collect())
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor.
+    /// Every row is signed (`scrub_signature_classical` is required at
+    /// admission), so — as with `list_signed_key_records_since` — no filter
+    /// applies.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_revocations
+            .iter()
+            .filter(|r| since.is_none_or(|s| r.scrub_timestamp > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.scrub_timestamp
+                .cmp(&b.scrub_timestamp)
+                .then_with(|| a.revocation_id.cmp(&b.revocation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows
+            .into_iter()
+            .map(|revocation| crate::federation::SignedRevocation { revocation })
+            .collect())
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. Page
+    /// selection is over PROPOSALS; the participation set for each is
+    /// assembled by the shared
+    /// [`accord_carriage::assemble_evidence_page`](crate::federation::accord_carriage::assemble_evidence_page)
+    /// so the `member_id` sort order is identical on all three backends.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        let page = {
+            let state = self.state.lock().expect("memory backend lock");
+            let mut rows: Vec<_> = state
+                .accord_proposals
+                .values()
+                .filter(|p| since.is_none_or(|s| p.created_at > s))
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
+            });
+            rows.truncate(limit as usize);
+            rows
+        };
+        crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 
     async fn list_signed_identity_occurrences_since(

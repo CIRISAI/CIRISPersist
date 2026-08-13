@@ -787,6 +787,34 @@ pub enum DirectoryOp {
         /// The candidate hop.
         peer_key_id: String,
     },
+    /// [`FederationDirectory::revocations_for`] (v31.1.0, CIRISPersist#655) —
+    /// the key-level revocation rows for a subject. Was the capsule's only
+    /// hard-`Unsupported` on an EXCLUSION plane: a host running behind the
+    /// capsule proxy could store a revocation and then not read it back, so
+    /// the plane it needs in order to exclude anything was invisible to it.
+    /// Result rides `Revocations`. APPEND-ONLY.
+    RevocationsFor {
+        /// The subject whose revocations to list.
+        revoked_key_id: String,
+    },
+    /// [`FederationDirectory::list_signed_revocations_since`] (v31.1.0,
+    /// CIRISPersist#655) — the exclusion plane's serve cursor. Result rides
+    /// `SignedRevocations`. APPEND-ONLY.
+    ListSignedRevocationsSince {
+        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`]
+    /// (v31.1.0, CIRISPersist#662) — the signed accord EVIDENCE cursor.
+    /// Result rides `AccordQuorumEvidence`. APPEND-ONLY.
+    ListSignedAccordQuorumEvidenceSince {
+        /// Cursor: proposals with `created_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap, counted in PROPOSALS.
+        limit: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -942,6 +970,14 @@ pub enum DirectoryOpResult {
     /// transport-hop verdict plus its authoritative cache TTL and the shared
     /// root that satisfied it. APPEND-ONLY.
     TransitEligibility(crate::federation::trust_root::TransitEligibility),
+    /// `revocations_for` (v31.1.0, CIRISPersist#655). APPEND-ONLY.
+    Revocations(Vec<Revocation>),
+    /// `list_signed_revocations_since` (v31.1.0, CIRISPersist#655).
+    /// APPEND-ONLY.
+    SignedRevocations(Vec<SignedRevocation>),
+    /// `list_signed_accord_quorum_evidence_since` (v31.1.0,
+    /// CIRISPersist#662). APPEND-ONLY.
+    AccordQuorumEvidence(Vec<crate::federation::accord_carriage::AccordQuorumEvidence>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1213,6 +1249,27 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::TransitEligibility(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::RevocationsFor { revoked_key_id } => {
+            match dir.revocations_for(&revoked_key_id).await {
+                Ok(v) => DirectoryOpResult::Revocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedRevocationsSince { since, limit } => {
+            match dir.list_signed_revocations_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedAccordQuorumEvidenceSince { since, limit } => {
+            match dir
+                .list_signed_accord_quorum_evidence_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AccordQuorumEvidence(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2544,10 +2601,22 @@ impl FederationDirectory for OpsDirectory {
             method: "attestations_binding_content",
         })
     }
+    /// v31.1.0 (CIRISPersist#655) — routed (was `Error::Unsupported`). An
+    /// exclusion plane a capsule host could write and never read back is the
+    /// same defect #655 found on the serve side, one surface over.
     async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
-        Err(Error::Unsupported {
-            method: "revocations_for",
-        })
+        match self
+            .run_op(&DirectoryOp::RevocationsFor {
+                revoked_key_id: revoked_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Revocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_identity_occurrences_for(
         &self,
@@ -3001,6 +3070,43 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedKeyRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor,
+    /// routed. Structural mirror of [`Self::list_signed_key_records_since`].
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedRevocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedRevocationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor, routed.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::accord_carriage::AccordQuorumEvidence>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedAccordQuorumEvidenceSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::AccordQuorumEvidence(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

@@ -153,7 +153,7 @@ pub enum Transferability {
 }
 
 /// The EXHAUSTIVE per-kind classification (CIRISPersist#510 P1). No
-/// wildcard arm — adding a 15th
+/// wildcard arm — adding a 16th
 /// [`EnvelopeKind`](super::replication_policy::EnvelopeKind) without
 /// extending this match is a **compile failure**, the same discipline
 /// [`super::replication_policy::policy_for`] uses for admission policy.
@@ -181,7 +181,13 @@ pub fn consent_transferability(
         | K::Organization
         | K::OrgMembership
         | K::PartnerRecord
-        | K::TransportDestination => Transferability::StructuralPlane,
+        | K::TransportDestination
+        // v31.1.0 (CIRISPersist#662) — the accord evidence bundle is
+        // constitutional machinery, not user data: naming it in a
+        // `payload.kinds` grant would let an end-user consent decision
+        // narrow (or purport to widen) the carriage of the quorum that
+        // governs the whole mesh.
+        | K::AccordQuorumEvidence => Transferability::StructuralPlane,
     }
 }
 
@@ -499,8 +505,16 @@ pub fn consent_grammar_sha256() -> String {
 /// re-pin, visible to every consumer (cross-repo drift is a build
 /// failure), exactly the [`super::replication_policy::REPLICATION_POLICY_HASH`]
 /// discipline.
+/// v31.1.0 (CIRISPersist#662) — re-pinned. The manifest carries
+/// `kind_transferability` over
+/// [`EnvelopeKind::ALL`](super::replication_policy::EnvelopeKind::ALL), so the
+/// 15th kind ([`AccordQuorumEvidence`](super::replication_policy::EnvelopeKind::AccordQuorumEvidence),
+/// classified `StructuralPlane`) moves this hash too. The GRAMMAR itself —
+/// principles, restriction ops, audiences — is unchanged; what changed is the
+/// closed set of kinds a grant may name. Previous value:
+/// `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05`.
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05";
+    "b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

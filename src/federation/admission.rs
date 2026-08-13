@@ -9207,6 +9207,39 @@ pub async fn verify_canonical_withdraw_authority(
     .await
 }
 
+/// v31.1.0 (CIRISPersist#662) — the **op-generic plain-WITHDRAW** form of the
+/// #377 authority core, exported for
+/// [`accord_carriage`](super::accord_carriage)'s local withdrawal projection.
+///
+/// Identical machinery to [`verify_canonical_withdraw_authority`] — stored
+/// proposal, HUMANITY_ACCORD family scope, persist-computed payload binding,
+/// a fresh `tally_live_quorum` over persist's OWN stored participations, and
+/// the strict-majority destructive threshold — parameterized on `op` so the
+/// projection can re-derive a `canonical`, an `infra:attest` or a generic
+/// [`op_withdraw_role`] tombstone through the SAME code the local destructive
+/// ops use. `successor_key_id` is fixed at `None`: this form is for plain
+/// withdrawals (see the scope note on
+/// [`accord_carriage::project_role_withdrawals_for_proposal`](super::accord_carriage::project_role_withdrawals_for_proposal)).
+///
+/// Exists so the projection cannot grow its own weaker copy of the tally.
+pub async fn verify_withdrawal_authority_over_roster(
+    directory: &dyn super::FederationDirectory,
+    proposal_digest: &str,
+    op: &str,
+    target_key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<String, Error> {
+    verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        op,
+        target_key_id,
+        None,
+        roster_key_ids,
+    )
+    .await
+}
+
 /// v13.1.0 (CIRISPersist#377) — verify a SUPERSEDE authority binds
 /// `old_key_id → new_key_id`, against the production accord-holder roster.
 /// Returns the authorizing proposal digest. See
