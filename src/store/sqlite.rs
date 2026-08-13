@@ -40048,6 +40048,18 @@ mod tests {
         .await;
     }
 
+    /// #658 — one signed operational envelope may not be installed at a
+    /// second primary key, on sqlite.
+    #[tokio::test]
+    async fn operational_id_replay_refused_sqlite_658() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_operational_id_replay_refused(
+            &backend, "sq658",
+        )
+        .await;
+    }
+
     /// #598 B10-b — two directories fed the SAME signed envelopes with the two
     /// `asserted_at` columns swapped fold to the SAME verdict, on sqlite.
     #[tokio::test]
