@@ -76,12 +76,14 @@ pub fn canonicalize(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
 /// [`assemble`] then READS both back out of the signed envelope. Signature,
 /// hash and row column are three views of one instant.
 ///
-/// # v31.0.0 (CIRISPersist#643) — and the five typed COLUMNS
+/// # v31.0.0 (CIRISPersist#643) — and the SEVEN typed COLUMNS
 ///
 /// The same treatment, for the same reason, applied to the columns that decide
-/// what the row MEANS: `attestation_type` (the verb), `subject_key_ids` (which
-/// grants revocation authority), `attested_key_id`, `cohort_scope` and
-/// `weight`. They are stamped into
+/// what the row IS and MEANS: `attestation_id` (the row's identity),
+/// `attesting_key_id` (who made the claim), `attestation_type` (the verb),
+/// `subject_key_ids` (which grants revocation authority), `attested_key_id`,
+/// `cohort_scope` and `weight` — the canonical list is
+/// [`crate::federation::envelope::row_paths::ALL`] (seven, not five: #658). They are stamped into
 /// [`envelope.row`](crate::federation::envelope::RowMirror) here, before the
 /// bytes exist, so
 /// [`check_row_column_binding`](crate::federation::admission::check_row_column_binding)
@@ -274,10 +276,9 @@ pub fn assemble(
         .map(|m| m.attestation_id.clone())
         .ok_or_else(|| {
             Error::InvalidArgument(
-                "emit_attestation: the envelope carries no `row` mirror — assemble reads the row \
-                 identity and the five typed columns OUT of the signed envelope. Build the \
-                 canonical bytes through `attestation_emit::stamp_and_canonicalize` \
-                 (CIRISPersist#643)"
+                "emit_attestation: the envelope carries no `row` mirror — assemble reads all \
+                 SEVEN mirrored columns OUT of the signed envelope. Build the canonical bytes \
+                 through `attestation_emit::stamp_and_canonicalize` (CIRISPersist#643/#658)"
                     .into(),
             )
         })?;

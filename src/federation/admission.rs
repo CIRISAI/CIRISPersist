@@ -3862,16 +3862,28 @@ pub fn check_instant_binding(
 /// [`crate::federation::tier_ingest::verify_federation_tier_ingest`] verifies
 /// the hybrid signature over `attestation_envelope` and cross-checks
 /// `original_content_hash` against that envelope's canonical SHA-256. **That
-/// is the entire coverage.** Five typed `federation_attestations` columns —
-/// the ones that decide what a row MEANS — had no envelope twin and no gate:
+/// is the entire coverage.** **SEVEN** typed `federation_attestations` columns
+/// — the ones that decide what a row MEANS — had no envelope twin and no gate:
 ///
 /// | column | what it decides |
 /// |---|---|
+/// | `attestation_id` | **the row's IDENTITY** — same bytes ⇒ same id, so replay is structurally impossible rather than merely refused |
+/// | `attesting_key_id` | WHO made the claim |
 /// | `attestation_type` | **the VERB** (`scores` / `withdraws` / `supersedes` / `recants` / `delegates_to`) |
 /// | `subject_key_ids` | **grants revocation authority** ([`resolve_withdraws_admission_rule`] rules 2/3/4) |
 /// | `attested_key_id` | who the claim is ABOUT |
 /// | `cohort_scope` | who may SEE it |
 /// | `weight` | how much it COUNTS |
+///
+/// Seven, not five: [`RowMirror`] has carried `attestation_id` and
+/// `attesting_key_id` since the mirror shipped, and this gate has always
+/// enforced them. The count in this doc and in the refusal message below said
+/// five for both — which matters more than a doc nit during the v31.0.0
+/// re-ceremony, because that message is what an external producer debugs
+/// against, [`RowMirror`] is `deny_unknown_fields`, and only
+/// `subject_key_ids` / `weight` default. A producer following the old message
+/// built a five-member mirror and was refused a second time, by a message that
+/// had told it the wrong thing (CIRISPersist#658).
 ///
 /// Two attacks, both **signature-preserving** — the relay changes a column,
 /// re-uses the producer's own untouched signature, and the row verifies:
@@ -3897,7 +3909,7 @@ pub fn check_instant_binding(
 ///    operator's standing decision on this break window (#598, #640, #643) is
 ///    to break NOW, before the first agent release on the mesh. There is no
 ///    grandfathering regime and no compatibility flag to find later.
-/// 2. **DIVERGENCE** of any of the five, each named individually so the
+/// 2. **DIVERGENCE** of any of the seven, each named individually so the
 ///    refusal says which column was rewritten.
 ///
 /// `subject_key_ids` is compared **ORDER-SENSITIVELY** — see [`RowMirror`] for
@@ -3922,32 +3934,40 @@ pub fn check_instant_binding(
 /// [`RowMirror`]: crate::federation::envelope::RowMirror
 pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
     use crate::federation::envelope::{paths, row_paths, RowMirror};
+    /// The mirror's member list, read from the ONE definition
+    /// ([`row_paths::ALL`]) rather than re-spelled per message.
+    const ROW_MIRROR_MEMBERS: [&str; 7] = row_paths::ALL;
 
     let Some(raw) = row.attestation_envelope.get(paths::ROW) else {
+        // v31.0.0 (CIRISPersist#658) — the member list here is the ONE
+        // spelled from `row_paths`, in the order the gate checks them, and it
+        // is SEVEN. It said five while the gate enforced seven, which during
+        // the v31.0.0 re-mint is what an external producer builds its mirror
+        // from — and `RowMirror` is `deny_unknown_fields` with only
+        // `subject_key_ids` / `weight` defaulted, so a five-member mirror is
+        // refused again by the very message that specified it.
         return Err(Error::InvalidArgument(format!(
             "attestation {} carries no signed `{}` object in its envelope. The signature covers \
-             `attestation_envelope` and NOTHING ELSE, so `attestation_type` (the verb), \
+             `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
+             `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
              `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
              `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
-             signature still verified. An unbound row is REFUSED (no legacy regime; \
-             CIRISPersist#643)",
+             signature still verified. The mirror's members are exactly {:?} — all seven, \
+             REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
+             column is NULL), and no others (the member set is closed). An unbound row is \
+             REFUSED (no legacy regime; CIRISPersist#643)",
             row.attestation_id,
             paths::ROW,
+            ROW_MIRROR_MEMBERS,
         )));
     };
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
         Error::InvalidArgument(format!(
             "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
-             (members are exactly {:?}; CIRISPersist#643)",
+             (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
             row.attestation_id,
             paths::ROW,
-            [
-                row_paths::ATTESTATION_TYPE,
-                row_paths::ATTESTED_KEY_ID,
-                row_paths::SUBJECT_KEY_IDS,
-                row_paths::COHORT_SCOPE,
-                row_paths::WEIGHT,
-            ],
+            ROW_MIRROR_MEMBERS,
         ))
     })?;
 

@@ -2175,6 +2175,22 @@ pub mod test_support {
             msg.contains(paths::ROW) && msg.contains("643"),
             "({tag}) B11-h: the refusal must name the missing mirror and the rule: {msg}"
         );
+        // v31.0.0 (CIRISPersist#658) — the message is a SPECIFICATION, not
+        // prose. This is the text an external producer builds its mirror from
+        // during the v31.0.0 re-mint, `RowMirror` is `deny_unknown_fields`,
+        // and only `subject_key_ids` / `weight` default — so a message that
+        // omits a required member refuses the producer a second time, by the
+        // very text that told it what to build. It named five while the gate
+        // enforced seven. Asserted EXHAUSTIVELY off `row_paths::ALL`, so a
+        // future eighth member cannot be added to the mirror and left out of
+        // the message.
+        for member in crate::federation::envelope::row_paths::ALL {
+            assert!(
+                msg.contains(member),
+                "({tag}) B11-h: the refusal must name every member a producer has to stamp — \
+                 `{member}` is missing from: {msg}"
+            );
+        }
         assert!(
             dir.get_attestation(&id).await.expect("get").is_none(),
             "({tag}) B11-h: a refused row must leave no trace"
@@ -2201,10 +2217,21 @@ pub mod test_support {
             })
             .await
             .expect_err("({tag}) B11-i: a mirror missing a member must be REFUSED");
+        let msg = format!("{err}");
         assert!(
-            format!("{err}").contains("643"),
-            "({tag}) B11-i: the refusal must name the rule: {err}"
+            msg.contains("643"),
+            "({tag}) B11-i: the refusal must name the rule: {msg}"
         );
+        // v31.0.0 (CIRISPersist#658) — same specification duty as (h): this is
+        // the message the producer sees when its mirror is one member short,
+        // so it must list the members in full.
+        for member in crate::federation::envelope::row_paths::ALL {
+            assert!(
+                msg.contains(member),
+                "({tag}) B11-i: the malformed-mirror refusal must name every member — \
+                 `{member}` is missing from: {msg}"
+            );
+        }
 
         // ── (j) NON-VACUITY OF THE CONTROL, at the end. The gate is a rule and
         //    not a lockdown: after seven refusals a fresh honest row still
