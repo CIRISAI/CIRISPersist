@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [31.2.0] - 2026-08-13
+## [31.3.0] - 2026-08-14
 
 ### Added — backend parity is an enforced invariant now, not a claim (#670)
 
@@ -78,6 +78,147 @@ One dead hand-rolled copy in `memory.rs` is removed: it called `sign_envelope`,
 assigned the hash and both signature halves, and then called `reseal`, which
 recomputed all three from the same signer. Dead is the lucky outcome of that
 shape; `pg_resign` is the same code that was not overwritten.
+## [31.2.0] - 2026-08-14
+
+### Changed — the re-minted genesis seed is baked (#660, CIRISServer#398)
+
+The ceremony's new artifact replaces `canonical_seed.json`: same family
+(`humanity-accord`), same holders A1/B1/C1, same serve node
+`ciris-canonical-1-d7bdeu223k`, same three delegation rows, `quorum:2/3` with
+A1+B1 authorizing over the widened, SHA-256'd digest. `accord_holder_seed.json`
+is unchanged — the holder records are byte-identical, so only the bundle moved.
+
+Three fixture corrections came with it, each a real gap the new artifact exposed:
+
+- **`bake_real_genesis_v2_artifact_490` now seeds the constitutional family
+  before baking.** The re-minted `genesis-charter` attests TO `humanity-accord`,
+  so the delegation plane cannot land on a node that has never heard of the
+  family. The #557 dry-run already seeded it in that order; this arm was
+  relying on the old fixture's shape.
+- **The #557 dry-run's `trust:accepts` row is now sealed through
+  `seal_row_in_place`** instead of hand-rolled. It was missing both the signed
+  instants (#598) and the seven-member row mirror (#643) — that helper exists
+  precisely so "re-sign after mutating" and "re-stamp the mirror" cannot be
+  half-done, and the fixture had been doing the half that omits both.
+- **#554's premise was made false by #660 and is corrected rather than
+  deleted.** It read *"`authorization_digest` covers holder `key_id`s only, not
+  their evidence — so tampering with a holder's custody attestation leaves the
+  2-of-3 quorum signatures perfectly valid."* The widened digest binds
+  `attestation_evidence`, so that tamper now breaks the hybrid signature
+  outright, before the install-time read. Strictly stronger — caught earlier and
+  by cryptography rather than a policy read — so the assertion accepts either
+  gate, and the "name the failing check" requirement is scoped to the
+  install-time arm, which is the only one that can know a field name.
+
+### Fixed — BREAKING — the digest bound the scrub set, so a 2-of-3 genesis could never complete (#683)
+
+**Found on a live ceremony**, persist v31.2.0-rc.2 / edge v16.1.0-rc.2 /
+CIRISServer 0.5.171: A1 signed, B1 signed, and the node reported
+`have=2 needed=2 complete=false`. `complete` is `verify_bundle(&bundle).is_ok()`,
+so the failure was in the hybrid-verify loop, not the quorum count — and asking
+for a third holder could not help.
+
+**The ceremony accumulates two things over one bundle, one pass per holder:**
+the `authorizations`, and the serve node's **scrub set** (each holder appends its
+scrub so the canonical reaches family quorum — persist's own baked-genesis test
+asserts `distinct_scrub_count() >= 2`, so a 1-scrub canonical is not a shippable
+seed). The record widening swept `scrub_key_id`, `scrub_signature_classical`,
+`scrub_signature_pqc`, `scrub_timestamp` and `additional_scrubs` into the
+preimage, which made those two accumulations **circular**: B1's co-scrub rewrote
+bytes A1 had already authorized, and A1's entirely honest signature stopped
+verifying.
+
+**The `attestations` arm always had this right**, and the two arms are now
+consistent — attestations project
+`{attestation_id, attesting_key_id, attested_key_id, attestation_type,
+attestation_envelope}` and have never carried scrub evidence, which is exactly
+what lets a 1-scrub and a 2-scrub attestation canonicalize identically.
+
+**Content is bound; evidence about content is not.** The #660 substitution this
+widening exists to stop — a swapped pubkey, `identity_type`, `roles` or envelope
+under an unchanged `key_id` — is still caught, because that is content. A forged
+scrub still does not survive `put_public_key`'s co-scrub admission against the
+node's pinned holder anchors.
+
+Two guard gaps closed with it. `additional_scrubs` is absent on A1/B1/C1 and
+present ONLY on the serve node, so the field-set guard — which sampled a single
+holder — could not see the field that broke the ceremony; it now unions every
+holder AND serve node. And a new witness drives the property directly: appending
+a co-scrub must not move the digest, with a counter-control asserting content
+still does. Mutation-tested — re-binding the scrub set reds both.
+
+### Fixed — BREAKING — `authorization_digest` returns a DIGEST, not the preimage (CIRISServer#398)
+
+**Found by CIRISServer during the ceremony, with measurements.** The widening
+above took the signed input from **1,976 bytes to 83,060** — 42x — because each
+`KeyRecord` carries a ~2.6 KB base64 ML-DSA-65 pubkey twice over (top level, and
+again inside `registration_envelope`). A YubiKey `C_Sign` then refused it:
+*"plaintext input data has a bad length... too long"*. PKCS#11 PureEdDSA will not
+take an input that size.
+
+The cause was a name that had been wrong for a long time and only became load-
+bearing when the bundle grew: `authorization_digest` returned
+`ceg_produce_canonicalize(&preimage)` — **the canonical bytes themselves** — and
+holders signed the whole preimage directly. It is called a digest; it behaved as
+a preimage; nothing noticed while it stayed around 2 KB.
+
+It now returns `SHA-256(canonical)`. **The security property is unchanged** — the
+hash covers exactly the same widened preimage, so record substitution is still
+detected — and 32 bytes signs on any token. Producer and verifier cannot drift,
+because `mesh_genesis` re-exports this function.
+
+A guard pins the property that actually broke: the output length must not depend
+on the bundle size. Growing the roster 256-fold must not grow the signed input.
+A revert to returning canonical bytes now fails the build rather than failing at
+a hardware token mid-ceremony.
+
+### Changed — BREAKING — SECURITY — the authorization digest binds the RECORD, not just the `key_id` (#660, CIRISServer#398 §5)
+
+**CONSUMER ACTION REQUIRED — a signing-preimage change, and it invalidates
+every existing genesis authorization.** That is the intent. It ships with a
+fresh genesis ceremony; the seed is re-minted, not re-authorized.
+
+**No CIRISServer code change.** `mesh_genesis` re-exports persist's
+`authorization_digest` rather than declaring one — *"two implementations
+drifting by a byte silently invalidates a ceremony's quorum"* — so widening it
+here widens the producer in the same act. Server bumps the pin and inherits.
+
+**The defect.** `holders` and `serve_nodes` contributed their `key_id`s **and
+nothing else**. Adding, removing or renaming one broke every authorization, but
+**substituting the RECORD under an unchanged `key_id`** — a different
+`pubkey_ed25519_base64`, PQC leg, `identity_type`, `identity_ref`,
+`registration_envelope`, `original_content_hash`, scrub set, `valid_from`,
+**roles** or **custody evidence** — did not appear in the digest at all.
+`attestations` were always bound in full; this closes the other half.
+
+It was never exploitable alone: a serve-node record still has to pass
+`put_public_key`'s canonical-role admission (a 2-of-3 accord co-scrub re-verified
+against the node's own pinned holder anchors), and `bake_assembled_genesis`
+refuses a re-anchor whose pubkey differs or whose `valid_from` does not advance.
+Those gates stand — but they adjudicate a different question, and the digest
+should not have been described as if it did their job.
+
+**What is bound now.** The whole `KeyRecord` minus exactly two node-local fields:
+
+| excluded | why |
+|---|---|
+| `persist_row_hash` | documented *"Server-computed"*, *"ignored on write — persist computes its own"*. Binding it would make producer and consumer disagree by construction. |
+| `pqc_completed_at` | a local telemetry instant stamped by `attach_pqc_signature`. A node-local instant inside a content hash is the class v31.1.0 removed from five replication positions (#655/#662). |
+
+The line is a **deny-list, not an include-list**: a field added to `KeyRecord`
+enters the preimage by DEFAULT and a reviewer must argue to exclude it. A guard
+test pins the record's field set, so that default is a reviewed act rather than a
+silent one — it failed on its first run naming `roles` and `attestation_evidence`,
+the two fields #660 itself called out, which a hand-written include-list had
+missed. An unbound `roles` means a serve node with widened capabilities under an
+unchanged `key_id` still verifies.
+
+**Why this could not land earlier.** The preimage is a cross-repo wire contract
+and holder authorizations are computed over the producer's construction, so
+widening persist alone would have made this node refuse every bundle the producer
+emits — a consumer-side break with no producer-side half. The module doc named
+the v31 re-ceremony as the right window. This is that window.
+
 ## [31.1.0] - 2026-08-13
 
 ### Added — SECURITY — two exclusion planes could be destroyed but never rebuilt (#655, #662)

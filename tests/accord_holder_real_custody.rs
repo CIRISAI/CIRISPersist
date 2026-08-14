@@ -243,11 +243,24 @@ async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
 /// #554 — the wiring, not merely the agreement: a bundle whose holder evidence
 /// would be REFUSED at install time must be refused by the VERIFIER.
 ///
-/// This is the sharp case. `authorization_digest` covers holder `key_id`s only,
-/// not their evidence — so tampering with a holder's custody attestation leaves
-/// the 2-of-3 quorum signatures perfectly valid. Pre-#554 such a bundle
-/// verified green and then failed at ingest. The verifier must now catch it,
-/// and say that it is an install-time refusal it is reporting.
+/// This was the sharp case. Pre-#554 such a bundle verified green and then
+/// failed at ingest; #554 made the verifier catch it and SAY it was reporting
+/// an install-time refusal.
+///
+/// **v31.2.0 (CIRISPersist#660) changed which gate fires first, and the old
+/// premise here is now false.** This comment used to read *"`authorization_digest`
+/// covers holder `key_id`s only, not their evidence — so tampering with a
+/// holder's custody attestation leaves the 2-of-3 quorum signatures perfectly
+/// valid."* The widened digest binds the whole record CONTENT including
+/// `attestation_evidence` — the custody evidence #660 named explicitly — so
+/// tampering with it now breaks the hybrid signature outright, before the
+/// install-time check is ever reached.
+///
+/// That is strictly stronger, not weaker: the tamper is caught earlier and by
+/// cryptography rather than by a policy read. So the assertion accepts EITHER
+/// refusal and requires only that the bundle does not verify. Pinning the
+/// install-time wording alone would fail here for the best possible reason —
+/// a neighbouring gate legitimately refusing first.
 #[tokio::test]
 async fn bundle_with_uninstallable_holder_evidence_is_refused_by_the_verifier_554() {
     use ciris_persist::federation::genesis::{
@@ -274,13 +287,23 @@ async fn bundle_with_uninstallable_holder_evidence_is_refused_by_the_verifier_55
         .await
         .expect_err("#554: a bundle carrying uninstallable holder evidence must not verify");
     let msg = err.to_string();
+    let install_time = msg.contains("would be REFUSED at install time");
+    let digest_bound = msg.contains("hybrid authorization failed to verify");
     assert!(
-        msg.contains("would be REFUSED at install time"),
-        "#554: the verifier must report this as an INSTALL-time refusal, got: {msg}"
+        install_time || digest_bound,
+        "#554/#660: a bundle carrying uninstallable holder evidence must be \
+         refused either by the install-time read (#554) or by the widened \
+         digest that now binds `attestation_evidence` (#660). Got neither: {msg}"
     );
+    // Naming the failing CHECK is a property of the install-time read: it
+    // inspects the evidence and can say which field failed. The digest arm
+    // cannot and should not — a signature check knows only that the bytes
+    // moved, which is exactly why it catches tampering the reader might not
+    // think to look for. So require the field name only on the arm that can
+    // produce it.
     assert!(
-        msg.contains("yubikey_piv_attestation_9c"),
-        "#554: and must name the failing check, got: {msg}"
+        !install_time || msg.contains("yubikey_piv_attestation_9c"),
+        "#554: the install-time refusal must name the failing check, got: {msg}"
     );
 }
 

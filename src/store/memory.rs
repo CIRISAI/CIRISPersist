@@ -12251,6 +12251,18 @@ mod tests {
             "fixture: prior anchor is dark (no infra:serve) — the #480 state"
         );
 
+        // v31.2.0 (CIRISPersist#660) — seed the constitutional family before
+        // baking. The re-minted ceremony's `genesis-charter` attests TO
+        // `humanity-accord`, so the delegation plane cannot land against a node
+        // that has never heard of the family: `put_attestation` refuses with
+        // "attested_key_id humanity-accord resolves as neither a registered
+        // federation_keys row nor a constitutional family known to this node".
+        // The #557 dry-run test already seeded it in the same order; this arm
+        // was relying on the old fixture's shape.
+        crate::federation::genesis::seed_accord_family(&backend)
+            .await
+            .expect("seed the constitutional family");
+
         // Bake the REAL artifact.
         let artifact = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
