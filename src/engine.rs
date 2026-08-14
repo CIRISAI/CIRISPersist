@@ -17197,7 +17197,7 @@ mod tests {
     // envelope so `put_contribution` admits them with no trust gate and
     // no registered author key (author_id == the signing pubkey).
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_pubkey_b64(key: &SigningKey) -> String {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -17206,7 +17206,7 @@ mod tests {
         B64.encode(vk.to_bytes())
     }
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_sign(
         env: &crate::cirisnode::ContributionEnvelope,
         key: &SigningKey,
@@ -17223,7 +17223,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_sha_hex(seed: u8) -> String {
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
@@ -17235,7 +17235,7 @@ mod tests {
     /// Build a signed `takedown_notice` Contribution with a chosen
     /// claimant + `submitted_at` (so the secondary-key / window / cursor
     /// axes are controllable).
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_build_takedown(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17288,7 +17288,7 @@ mod tests {
 
     /// Build a signed `key_grant` Contribution with a chosen recipient +
     /// content + `submitted_at`. The grant publisher is `author_key`.
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_build_key_grant(
         author_key: &SigningKey,
         sha_hex: &str,

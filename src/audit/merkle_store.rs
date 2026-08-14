@@ -142,6 +142,10 @@ fn serialize_witness_signatures(
         .map_err(|e| TransparencyError::Storage(format!("witness sigs serialize: {e}")))
 }
 
+// v31.3.0 (CIRISPersist#678) — both call sites are `#[cfg(feature = "sqlite")]`,
+// so a postgres-only build compiled this and used it nowhere. Invisible to
+// every leg, because every leg carries both backends.
+#[cfg(feature = "sqlite")]
 fn deserialize_witness_signatures(raw: &str) -> Result<Vec<WitnessSignature>, TransparencyError> {
     serde_json::from_str(raw)
         .map_err(|e| TransparencyError::Storage(format!("witness sigs deserialize: {e}")))

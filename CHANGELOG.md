@@ -25,8 +25,9 @@ than itself.
 catches them with no test run and no database; the question asked is *"does this
 configuration exist"*, not *"does it pass"*.
 
-It found a live one immediately — `cirisnode,postgres` was red with 7 errors, and
-all three causes were the same shape, an item gated broader than what it needs:
+It found live ones immediately. `cirisnode,postgres` was red, and **all five
+postgres-only configurations** were red under `-D warnings` — every cause the
+same shape, an item gated broader than what actually calls it:
 
 - a `NodeCoreDispatch` match whose **postgres arm was gated and whose sqlite arm
   was not**, so the postgres-only build referenced a variant that does not exist
@@ -35,7 +36,23 @@ all three causes were the same shape, an item gated broader than what it needs:
 - `node_core_service_sqlite_round_trip`, gated on the backend *union* while
   asserting the **sqlite** dispatch variant — the name was not decoration;
 - two postgres "PG twin" tests seeding through `media_seed*`, whose bodies match
-  `NodeCoreDispatch::Sqlite`, so they need sqlite as well.
+  `NodeCoreDispatch::Sqlite`, so they need sqlite as well;
+- `merkle_store::deserialize_witness_signatures`, ungated while both its call
+  sites are `#[cfg(feature = "sqlite")]`;
+- `blobs::exercise_put_blob_admission`, gated on the backend union while only the
+  sqlite backend calls it (its `_for_host` variant is the one both use);
+- five `media_*` helpers, which had been *widened* to the union that morning for
+  a postgres caller — and once that caller was correctly gated to require sqlite,
+  the union left them dead.
+
+**That last one is the lesson.** The correct gate is the union of the gates of
+the ACTUAL callers, and it moves when the callers move. Three passes over the
+same five helpers in one day — widened, then narrowed — because each time the
+gate was reasoned about instead of measured. The sweep measures it.
+
+`-D warnings` is deliberate here, not incidental: `dead_code` under a
+single-backend build IS the signal being hunted. An item nothing calls in a
+configuration is an item gated wider than its callers.
 
 ### Fixed — two migration citations named files that exist in neither tree (#680)
 
