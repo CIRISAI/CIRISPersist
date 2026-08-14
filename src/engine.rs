@@ -7650,12 +7650,19 @@ pub enum EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The top-level `SigningKey` users are all under a backend cfg
-    // (sqlite `test_signer_no_pqc`/`with_signer_*`; `any(sqlite,postgres)`
-    // `pqc_signer`/`self_login_signer`). Gate the import to that union so
-    // the no-backend `--features server` build (`-D warnings`) doesn't see
-    // it as unused, while postgres-only / pyo3+postgres builds (the
-    // pre-push hook is `postgres,pyo3,server`) still have it.
+    // Gate the import to the union of its users so the no-backend
+    // `--features server` build (`-D warnings`) doesn't see it as unused,
+    // while postgres-only / pyo3+postgres builds (the pre-push hook is
+    // `postgres,pyo3,server`) still have it.
+    //
+    // v31.1.0 — this deliberately no longer ENUMERATES its users. It used to
+    // ("sqlite `test_signer_no_pqc`/`with_signer_*`; `any(sqlite,postgres)`
+    // `pqc_signer`/`self_login_signer`"), and when the `cirisnode` media
+    // helpers below were added under a broader `cfg` than their own callers,
+    // `--features cirisnode` stopped compiling the test target entirely —
+    // invisible to every sqlite/postgres/default/pyo3 leg. The fix belonged
+    // on those helpers, not here. A comment that lists call sites is a claim
+    // that goes stale silently; the `cfg` is the only thing that must be right.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use ed25519_dalek::SigningKey;
 
@@ -8675,7 +8682,7 @@ mod tests {
     /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
     /// the SQLite dispatch variant and a `put_contribution` /
     /// `list_contributions` round-trips through it.
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     #[tokio::test]
     async fn node_core_service_sqlite_round_trip() {
         use crate::cirisnode::{
@@ -17162,7 +17169,7 @@ mod tests {
     // envelope so `put_contribution` admits them with no trust gate and
     // no registered author key (author_id == the signing pubkey).
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_pubkey_b64(key: &SigningKey) -> String {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -17171,7 +17178,7 @@ mod tests {
         B64.encode(vk.to_bytes())
     }
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_sign(
         env: &crate::cirisnode::ContributionEnvelope,
         key: &SigningKey,
@@ -17188,7 +17195,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_sha_hex(seed: u8) -> String {
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
@@ -17200,7 +17207,7 @@ mod tests {
     /// Build a signed `takedown_notice` Contribution with a chosen
     /// claimant + `submitted_at` (so the secondary-key / window / cursor
     /// axes are controllable).
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_build_takedown(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17253,7 +17260,7 @@ mod tests {
 
     /// Build a signed `key_grant` Contribution with a chosen recipient +
     /// content + `submitted_at`. The grant publisher is `author_key`.
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_build_key_grant(
         author_key: &SigningKey,
         sha_hex: &str,

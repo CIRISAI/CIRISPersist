@@ -3915,7 +3915,6 @@ fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
 ///
 /// v31.0.0 (CIRISPersist#646) — every instant in the hashed value is first
 /// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
-
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use sha2::{Digest, Sha256};
