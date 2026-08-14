@@ -28955,6 +28955,16 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         | crate::federation::Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
             PyValueError::new_err(kind)
         }
+        // v31.1.0 (CIRISPersist#662) — a replicated accord evidence bundle the
+        // RECEIVER's own re-tally did not authorize. ValueError (4xx) with the
+        // rest of the authority-refusal family: the input is what is wrong, and
+        // a carrier retrying the identical bundle will get the identical
+        // answer. Distinct `kind()` from
+        // `canonical_withdrawal_authority_invalid` so a host can tell "a peer
+        // offered evidence that does not verify here" from "a local op named an
+        // authority that does not hold" — a partition and a forgery attempt
+        // want different operator responses.
+        crate::federation::Error::AccordEvidenceUnverified { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root
