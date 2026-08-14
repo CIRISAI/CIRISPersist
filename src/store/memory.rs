@@ -151,6 +151,14 @@ struct State {
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
+    /// v31.1.0 (CIRISPersist#655) — the in-memory mirror of V123's
+    /// `federation_revocations.admitted_at`: when THIS node admitted each
+    /// revocation, keyed by `revocation_id`. A side map rather than a field on
+    /// the row because the instant is local metadata ABOUT the record, not part
+    /// of it — the same split the SQL backends make between the column and the
+    /// `Revocation` struct, and the reason one revocation hashes identically on
+    /// every node that holds it.
+    revocation_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
     /// to `federation_keys`. Keyed by `key_id`. Memory backend
     /// mirrors the V051 PG/SQLite shape: same fields, same soft-
@@ -412,6 +420,7 @@ impl Default for MemoryBackend {
                 subject_index: HashMap::new(),
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
+                revocation_admitted_at: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
@@ -2285,9 +2294,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // NEITHER — it had no `admission_gate` field at all, so the
         // v3.4.0 trust gate had never run on this backend, and the AV-76
         // quota would have shipped existing on two backends out of three.
+        // v31.1.0 (CIRISPersist#665) — THE BAKED GENESIS IDS ARE RESERVED, and
+        // this gate now runs AHEAD of the quota rather than in tier 1.
+        //
+        // It is pure (a compare against a 3-element set, then a membership test
+        // against the baked roster — no directory read), so it was always free
+        // to lead. It has to, now that the quota classifies these ids into the
+        // RESERVED budget: were the order reversed, a stranger could spend the
+        // budget that keeps constitutional traffic writable simply by claiming
+        // a genesis id on a row this gate is about to refuse. Refusing first
+        // means only a seated accord holder's row ever reaches that budget.
+        //
+        // Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+
         if !row.attesting_key_id.is_empty() {
-            // Per-peer write quota. It LEADS because it is the only check
-            // in the whole stack that consults no shared state, so it also
+            // Per-peer write quota. It LEADS the state-consulting checks because
+            // it is the only one that consults no shared state, so it also
             // bounds the recursive directory walk the trust scorer runs at
             // any threshold > 0. It answers "you are writing too fast",
             // never "that key exists" — strictly less leaky than the gate
@@ -2340,16 +2363,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
-        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED.
-        // Immediately behind the canonicalization so the envelope compare sees
-        // the bytes that will be stored, and ahead of the #598/#643 binding
-        // gates so a squat is named by the reservation rather than by whichever
-        // neighbouring gate the attacker's row happens to trip first. The baked
-        // rows themselves pass here unchanged, so the pre-v31 refusal those two
-        // gates produce — the inversion `bundle_delegation_plane_v31_shaped`
-        // drives — is untouched. Pure ⇒ TIER 1; backend-symmetric across
-        // memory / sqlite / postgres.
-        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — the baked genesis ids are RESERVED, and
+        // the gate that says so has run at the very top of this function since
+        // v31.1.0 (#665), ahead of the write quota — see the comment there for
+        // why the order is load-bearing. It used to sit here, behind the
+        // canonicalization; it does not read the envelope, so the move costs it
+        // nothing.
+        //
         // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
         // SQL backends refused a non-hex value only as a side effect of binding
         // a BLOB/BYTEA; memory binds nothing and accepted it. Stated on all
@@ -3457,6 +3477,42 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(true)
     }
 
+    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Structurally
+    /// identical to `purge_attestation_v31` above except for WHICH gate it
+    /// re-asks: the general exclusion gate refuses these rows (two of the three
+    /// are `delegates_to`), so this door carries the narrower
+    /// `check_genesis_rebake_purge_admission` — the id must be one the
+    /// compiled-in bundle carries — and nothing else can be reached through it.
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+        expected_persist_row_hash: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        // The door's own gate (AV-9), before the lock, so a refusal cannot
+        // interleave with a mutation.
+        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE, under the same
+        // lock as the removal so the compare cannot be overtaken between the two
+        // (the SQL backends get that from a single `DELETE … WHERE` statement).
+        // A row that changed since the caller classified it is LEFT ALONE.
+        let before = state.federation_attestations.len();
+        state.federation_attestations.retain(|a| {
+            a.attestation_id != attestation_id || a.persist_row_hash != expected_persist_row_hash
+        });
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        // The V106 subject projection follows the row, as it does on the purge
+        // path: the SQL backends get this from `ON DELETE CASCADE`, memory has
+        // to say it.
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
     /// validate against the closed cohort_scope set, stamp it alongside the
     /// re-signed envelope, and recompute `persist_row_hash`.
@@ -3666,48 +3722,81 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // leaves no trace (AV-9) — and runs HERE, on memory, because the
         // backend-symmetry lesson has cost this repo seven releases.
         crate::federation::check_revocation_bound(&row)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.revoked_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "revoked_key_id {} does not exist in federation_keys",
-                row.revoked_key_id
-            )));
-        }
-        if !state.federation_keys.contains_key(&row.revoking_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "revoking_key_id {} does not exist in federation_keys",
-                row.revoking_key_id
-            )));
-        }
-        // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
-        // (CIRISPersist#660): absent on this backend entirely, so an OLD,
-        // still-validly-signed revocation could be replayed here to re-assert a
-        // state its subject had already moved past — refused on sqlite and
-        // postgres since v3.11.0. The RULE is the shared
-        // `check_revocation_anti_rollback`; only the "find the newest stored
-        // row" half is per-backend, and here it is a scan under the lock the
-        // push already holds, so the check and the insert cannot race.
-        //
-        // Sits after the FK emulation rather than before `check_revocation_bound`
-        // (the sqlite/postgres position) for one reason: memory's lookup needs
-        // this lock. Both are refusals that mutate nothing, so the order between
-        // them is not observable in state — only in which message an operator
-        // sees when a row violates both.
-        {
-            let latest = state
-                .federation_revocations
-                .iter()
-                .filter(|r| r.revoked_key_id == row.revoked_key_id)
-                .map(|r| r.scrub_timestamp)
-                .max();
-            crate::federation::admission::check_revocation_anti_rollback(
-                &row.revoked_key_id,
-                latest,
-                row.scrub_timestamp,
-            )?;
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        state.federation_revocations.push(row);
+        // v31.1.0 (CIRISPersist#655) — the FK emulation, the anti-rollback
+        // scan and the push are scoped into one block so the `MutexGuard` is
+        // provably dropped before the wire-index reload awaits below (the
+        // reload takes this same lock, and a guard merely `drop`ped still
+        // counts as held across an await for auto-trait purposes).
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.revoked_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "revoked_key_id {} does not exist in federation_keys",
+                    row.revoked_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.revoking_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "revoking_key_id {} does not exist in federation_keys",
+                    row.revoking_key_id
+                )));
+            }
+            // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
+            // (CIRISPersist#660): absent on this backend entirely, so an OLD,
+            // still-validly-signed revocation could be replayed here to re-assert a
+            // state its subject had already moved past — refused on sqlite and
+            // postgres since v3.11.0. The RULE is the shared
+            // `check_revocation_anti_rollback`; only the "find the newest stored
+            // row" half is per-backend, and here it is a scan under the lock the
+            // push already holds, so the check and the insert cannot race.
+            //
+            // Sits after the FK emulation rather than before `check_revocation_bound`
+            // (the sqlite/postgres position) for one reason: memory's lookup needs
+            // this lock. Both are refusals that mutate nothing, so the order between
+            // them is not observable in state — only in which message an operator
+            // sees when a row violates both.
+            {
+                let latest = state
+                    .federation_revocations
+                    .iter()
+                    .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                    .map(|r| r.scrub_timestamp)
+                    .max();
+                crate::federation::admission::check_revocation_anti_rollback(
+                    &row.revoked_key_id,
+                    latest,
+                    row.scrub_timestamp,
+                )?;
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let key = crate::federation::wire_index::record_key(&[
+                ("revoked_key_id", row.revoked_key_id.as_str()),
+                ("revocation_id", row.revocation_id.as_str()),
+            ]);
+            // v31.1.0 (CIRISPersist#655) — THIS node's admission position,
+            // stamped here and never read from the wire. The serve cursor keys
+            // on it, so a late-replicated old revocation gets a LATE position
+            // and stays reachable by a consumer whose cursor has moved on.
+            //
+            // Allocated strictly after the last position handed out rather than
+            // read off the wall clock: a backward step would stamp a later row
+            // below a cursor a consumer already passed, and `> since` would
+            // skip it permanently. Computed under the state lock the insert
+            // holds, so this backend's allocation is strictly increasing.
+            let last_admitted = state.revocation_admitted_at.values().copied().max();
+            let admitted_at = crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last_admitted,
+            );
+            state
+                .revocation_admitted_at
+                .insert(row.revocation_id.clone(), admitted_at);
+            state.federation_revocations.push(row);
+            key
+        };
+        // The key-level revocation plane joins the shared `signed_wire_index`.
+        self.index_stored_record("Revocation", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -4694,10 +4783,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 proposal.nonce, proposal.family_key_id
             )));
         }
+        // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
+        // evidence cursor, so it is an allocated position, not a wall-clock read.
+        let created_at = {
+            let state = self.state.lock().expect("memory backend lock");
+            let last = state.accord_proposals.values().map(|p| p.created_at).max();
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::prepare_proposal(
             &proposal,
             authority_signature,
-            chrono::Utc::now(),
+            created_at,
         )?;
         let crate::federation::accord_quorum::PreparedProposal {
             proposal_digest,
@@ -4754,6 +4850,32 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v31.1.0 (CIRISPersist#662) — the payload-digest lookup the withdrawal
+    /// projection resolves with, so a role-claiming key offer costs one pass
+    /// instead of assembling every proposal's participation set.
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        // O(proposals) with no I/O and no per-proposal second read — this
+        // backend has no index to answer from, and the amplification that
+        // mattered was the per-hit round trip, not the filter.
+        let mut rows: Vec<_> = state
+            .accord_proposals
+            .values()
+            .filter(|p| p.proposal.payload_sha256 == payload_sha256)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
+        });
+        Ok(rows.into_iter().map(|s| s.proposal).collect())
+    }
+
     async fn put_accord_participation(
         &self,
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
@@ -4770,11 +4892,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     participation.proposal_digest
                 ))
             })?;
+        // `server_arrival_at` is the other half of the evidence cursor; same rule.
+        let arrival = {
+            let state = self.state.lock().expect("memory backend lock");
+            let last = state
+                .accord_participations
+                .iter()
+                .map(|r| r.server_arrival_at)
+                .max();
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
             &stored_proposal.proposal,
             &participation,
             standing_roster,
-            chrono::Utc::now(),
+            arrival,
         )?;
         let crate::federation::accord_quorum::PreparedParticipation {
             proposal_digest,
@@ -6114,6 +6246,109 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .into_iter()
             .map(|record| crate::federation::SignedKeyRecord { record })
             .collect())
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor.
+    /// Every row is signed (`scrub_signature_classical` is required at
+    /// admission), so — as with `list_signed_key_records_since` — no filter
+    /// applies.
+    /// v31.1.0 (CIRISPersist#655) — keyed on THIS node's admission order
+    /// (`admitted_at`, the V123 column on the SQL backends and the
+    /// `revocation_admitted_at` side map here), never the producer's
+    /// `scrub_timestamp`; see the trait doc for the late-replication case that
+    /// made the signed instant permanently hide a stored exclusion.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::federation::ServedRevocation> = state
+            .federation_revocations
+            .iter()
+            .filter_map(|r| {
+                // A row with no recorded admission instant predates the side
+                // map; fall back to its signed instant, exactly as the V123
+                // backfill does on the SQL backends.
+                let admitted_at = state
+                    .revocation_admitted_at
+                    .get(&r.revocation_id)
+                    .copied()
+                    .unwrap_or(r.scrub_timestamp);
+                since
+                    .is_none_or(|s| admitted_at > s)
+                    .then(|| crate::federation::ServedRevocation {
+                        revocation: r.clone(),
+                        admitted_at,
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| a.revocation.revocation_id.cmp(&b.revocation.revocation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. Page
+    /// selection is over PROPOSALS; the participation set for each is
+    /// assembled by the shared
+    /// [`accord_carriage::assemble_evidence_page`](crate::federation::accord_carriage::assemble_evidence_page)
+    /// so the `member_id` sort order is identical on all three backends.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        let page = {
+            let state = self.state.lock().expect("memory backend lock");
+            // v31.1.0 (CIRISPersist#662, PR review P1) — the cursor is the
+            // bundle's VISIBILITY instant: `max(created_at, latest
+            // server_arrival_at)`. The SQL backends spell the same expression
+            // in their `WHERE`/`ORDER BY`; `assemble_evidence_page` recomputes
+            // it for the returned struct, so all three agree by construction.
+            let evidence_at = |p: &crate::federation::accord_quorum::StoredProposal| {
+                let digest = p.proposal.digest();
+                state
+                    .accord_participations
+                    .iter()
+                    .filter(|r| r.participation.proposal_digest == digest)
+                    .map(|r| r.server_arrival_at)
+                    .max()
+                    .map_or(p.created_at, |latest| latest.max(p.created_at))
+            };
+            // v31.1.0 (PR review P1) — the SELECTED instant is carried out
+            // with each row, never recomputed at assembly time; see
+            // `assemble_evidence_page` for the torn read that would otherwise
+            // let a consumer's cursor skip a page-limited proposal.
+            let mut rows: Vec<_> = state
+                .accord_proposals
+                .values()
+                .map(|p| (p.clone(), evidence_at(p)))
+                .filter(|(_, at)| since.is_none_or(|s| *at > s))
+                .collect();
+            rows.sort_by(|(a, a_at), (b, b_at)| {
+                a_at.cmp(b_at)
+                    .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
+            });
+            rows.truncate(limit as usize);
+            rows
+        };
+        crate::federation::accord_carriage::assemble_evidence_page(self, page).await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — delegates to the shared re-tally body.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
     }
 
     async fn list_signed_identity_occurrences_since(
@@ -9319,6 +9554,62 @@ mod tests {
             crate::federation::admission::DELEGATION_SCOPE_SLASH,
         )
         .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
+    /// survives a backward clock step, on this backend's real write path.**
+    ///
+    /// Twin of the sqlite and postgres witnesses. The allocator's rule is
+    /// unit-tested in `federation::types`; this asserts it is WIRED into
+    /// `put_revocation` here. Two admissions under a forward clock would prove
+    /// nothing, so the post-step state is planted directly: the last position
+    /// handed out is moved an hour into the future — what a node looks like
+    /// after an NTP correction — and the next admission must still sort after
+    /// it, or it is invisible to every consumer already past that point.
+    #[tokio::test]
+    async fn admission_position_survives_a_backward_clock_step_memory_655() {
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+        for k in ["rvm-a", "rvm-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rvm-1", "rvm-a", "rvm-a", "rvm-a"),
+            })
+            .await
+            .expect("first revocation");
+
+        // THE BACKWARD STEP, as state.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for v in st.revocation_admitted_at.values_mut() {
+                *v = future;
+            }
+        }
+
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rvm-2", "rvm-b", "rvm-b", "rvm-b"),
+            })
+            .await
+            .expect("second revocation");
+
+        let served = backend
+            .list_signed_revocations_since(Some(future), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            served.iter().any(|r| r.revocation.revocation_id == "rvm-2"),
+            "a revocation admitted after a backward clock step must still be served to a \
+             consumer resuming from the pre-step cursor"
+        );
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
@@ -17471,6 +17762,19 @@ mod tests {
         .await;
     }
 
+    /// v31.1.0 (CIRISPersist#622) — the MEMORY leg of the **symbolic
+    /// `revocation_id`** witness. This backend never narrowed the column, which
+    /// is exactly why nobody could see that postgres did.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn symbolic_revocation_id_round_trips_memory_622() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_symbolic_revocation_id_round_trips(
+            &backend, "memory",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **attestation
     /// `original_content_hash` hex** parity witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -17515,6 +17819,292 @@ mod tests {
             .federation_attestations
             .push(squat);
         crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "memory").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg of the **upgrade** witness: a
+    /// node carrying the PREVIOUS ceremony's delegation rows boots, and ends up
+    /// entrenched on the re-baked root.
+    ///
+    /// The predecessor is installed beneath `put_attestation` on purpose. The
+    /// v30 rows carry no #643 `row` mirror, so the door refuses them — which is
+    /// correct and is exactly why a v30 corpus can only have been written by a
+    /// v30 binary. Pushing into backend state is this backend's equivalent of
+    /// the SQL legs' raw `UPDATE`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn rebake_supersedes_prior_ceremony_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        // Roll the plane BACK to the previous ceremony — the state every
+        // upgrading v30 node is actually in.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            for row in state.federation_attestations.iter_mut() {
+                if crate::federation::genesis::genesis_delegation_ids()
+                    .contains(&row.attestation_id.as_str())
+                {
+                    *row = crate::federation::genesis::prior_ceremony_row(&row.attestation_id);
+                }
+            }
+        }
+
+        crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the
+    /// **below-quorum** witness: a row with no baked comparand must still prove
+    /// it can confer.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn below_quorum_row_cannot_confer_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        // A holder-signed row that is NOT the baked artifact (so no comparand
+        // exists), damaged by dropping its co-signatures.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            for row in state.federation_attestations.iter_mut() {
+                if row.attestation_id == *target {
+                    *row = crate::federation::genesis::prior_ceremony_row(target);
+                    row.additional_scrubs.clear();
+                }
+            }
+        }
+        crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "memory").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **a refused
+    /// replacement must not delete the row it was replacing.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn refused_replacement_keeps_the_row_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_refused_replacement_keeps_the_row(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **re-running the
+    /// saved ceremony repairs the node's own ceremony row.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn saved_ceremony_repairs_its_own_row_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        // Thin the co-signature set beneath persist, leaving the signed
+        // envelope — and therefore the bound instants — byte-identical.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            for row in state.federation_attestations.iter_mut() {
+                if row.attestation_id == *target {
+                    row.additional_scrubs.clear();
+                }
+            }
+        }
+        crate::federation::genesis::assert_saved_ceremony_repairs_its_own_row(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **a lost bake race
+    /// must not be reported as success.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn lost_bake_race_is_not_reported_as_success_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("the winner installs the current plane");
+        crate::federation::genesis::assert_lost_bake_race_is_not_reported_as_success(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — **a forged holder claim must not
+    /// drain the reserve.** Backend-independent (the quota is shared code), so
+    /// it is asserted once rather than three times.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn forged_genesis_claim_spares_the_reserve_665() {
+        crate::federation::genesis::assert_forged_genesis_claim_spares_the_reserve("shared");
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg: **the genesis seed is not
+    /// peer traffic.** A fresh node must report zero observed peers.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn genesis_seed_is_not_peer_traffic_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_genesis_seed_is_not_peer_traffic(
+            &backend.peer_write_quota,
+            "memory",
+        );
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **refused
+    /// classes** table: rollback, a legacy row with a stamped `asserted_at`, and
+    /// a forged holder claim.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn refused_replacement_classes_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_refused_replacement_classes(&backend, "memory").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the
+    /// **rolling-deployment** witness: a stale initializer cannot delete the row
+    /// that overtook it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn stale_initializer_cannot_delete_the_winner_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("the winner installs the current plane");
+        crate::federation::genesis::assert_stale_initializer_cannot_delete_the_winner(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **successor**
+    /// witness: an authenticated re-ceremony supersedes the boot-seeded plane.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn ceremony_supersedes_boot_seeded_plane_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+        // Roll the plane back to the previous ceremony, so the bake has
+        // something real to supersede.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            for row in state.federation_attestations.iter_mut() {
+                if crate::federation::genesis::genesis_delegation_ids()
+                    .contains(&row.attestation_id.as_str())
+                {
+                    *row = crate::federation::genesis::prior_ceremony_row(&row.attestation_id);
+                }
+            }
+        }
+        crate::federation::genesis::assert_ceremony_supersedes_boot_seeded_plane(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **damage**
+    /// witness: a genesis row whose co-signature set was thinned beneath persist
+    /// is repaired, not reported entrenched.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn damaged_current_row_is_repaired_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        // Drop B1's co-signature from the charter, beneath the write doors,
+        // leaving the signed envelope and the content hash untouched.
+        let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+            .attestation
+            .attestation_id;
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|r| r.attestation_id == *target)
+                .expect("the charter must be installed");
+            assert!(
+                !row.additional_scrubs.is_empty(),
+                "the baked charter must carry a co-signature to drop"
+            );
+            row.additional_scrubs.clear();
+        }
+
+        crate::federation::genesis::assert_damaged_current_row_is_repaired(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg of the **seed-race** witness:
+    /// a duplicate insert leaves the node FULLY seeded, not half-seeded.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn duplicate_insert_leaves_plane_fully_seeded_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_key_plane_only(&backend, "memory").await;
+        crate::federation::genesis::exercise_duplicate_insert_leaves_plane_fully_seeded(
+            &backend, "memory",
+        )
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the MEMORY leg of the **anti-fail-open**

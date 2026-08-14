@@ -255,6 +255,58 @@ impl std::error::Error for GenesisFault {}
 pub enum GenesisPosture {
     /// Anchor, family and canonical all installed and non-divergent. The
     /// pre-#648 steady state.
+    ///
+    /// # v31.1.0 (CIRISPersist#665 review) — what this asserts about the
+    /// DELEGATION plane got STRONGER
+    ///
+    /// Consumers gate on [`Self::entrenched`] (CIRISServer gates agent mode on
+    /// it, CIRISAI/CIRISServer#398), so it is worth being exact about what
+    /// changed underneath them. **The direction of the gate is unchanged — this
+    /// arm is still the only green one — but what a node must be for it to hold
+    /// has narrowed.**
+    ///
+    /// Until this cut, a booted node reached `Entrenched` when each delegation
+    /// row's `original_content_hash` matched the baked artifact's. That digest
+    /// covers the ENVELOPE alone, and the ceremony's signature covers the
+    /// envelope and nothing else — so the columns AROUND it were unchecked by
+    /// anything on the boot path. A row whose `scrub_signature_classical`, PQC
+    /// half, or `additional_scrubs` quorum set had been rewritten beneath
+    /// persist read as current and the node reported `Entrenched` while holding
+    /// a `genesis-charter` that
+    /// [`family_quorum_over`](crate::federation::trust_root) could no longer
+    /// count to threshold — the trust root silently below quorum, the banner
+    /// green.
+    ///
+    /// Both the SEED and the READ path now compare the stored row to the baked
+    /// artifact WHOLE. The seed restores the compiled-in bytes when only the
+    /// unsigned material around a byte-identical signed envelope has been
+    /// altered; [`verify_delegation_plane_seeded`](super::verify_delegation_plane_seeded)
+    /// — which is what every LIVE query answers from, since
+    /// [`genesis_posture`](super::posture::genesis_posture) never calls the
+    /// seed — reports divergence when it has not been. Asking only on the seed
+    /// path would have closed this on the boot SEQUENCE and left it open on
+    /// every query after it, which matters precisely because the threat model
+    /// here is a writer with raw corpus access, who does not wait for a
+    /// restart.
+    ///
+    /// So `Entrenched` now additionally asserts: **every baked delegation row is
+    /// byte-whole against the artifact this binary carries, co-signatures
+    /// included** — as a property of the predicate, not of a boot that happened
+    /// earlier.
+    ///
+    /// # …and WIDENED, in one direction
+    ///
+    /// The same cut stopped requiring byte-equality with the compiled-in
+    /// artifact as the definition of soundness. A node whose delegation plane
+    /// carries a **verified accord-holder statement newer than this binary's
+    /// bundle** — it ran a re-ceremony, or replicated from a peer that did — is
+    /// now `Entrenched` rather than `Divergent`. It previously could not boot at
+    /// all, which made the trust root unable to recognise its own successor.
+    ///
+    /// Net for a consumer: `Entrenched` means *byte-whole against a real root of
+    /// at least the compiled-in vintage*. Everything that refused to serve
+    /// before still refuses — squats, renamed rows, forged holder claims,
+    /// corrupted signatures, and now rollback to an older root as well.
     Entrenched,
     /// **PRE-GENESIS** — a leg is simply not installed. The node runs, reports,
     /// and can host its own genesis ceremony; every root-requiring gate

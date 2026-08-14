@@ -78,6 +78,651 @@ One dead hand-rolled copy in `memory.rs` is removed: it called `sign_envelope`,
 assigned the hash and both signature halves, and then called `reseal`, which
 recomputed all three from the same signer. Dead is the lucky outcome of that
 shape; `pg_resign` is the same code that was not overwritten.
+## [31.1.0] - 2026-08-13
+
+### Added — SECURITY — two exclusion planes could be destroyed but never rebuilt (#655, #662)
+
+**CONSUMER ACTION REQUIRED — two pinned hashes move.** Both are deliberate
+re-pins in a coordinated cut, handled exactly the way the v20 envelope
+vocabulary re-pin was:
+
+| constant | was | now |
+|---|---|---|
+| `REPLICATION_POLICY_HASH` | `351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b` | `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef` |
+| `CONSENT_GRAMMAR_HASH` | `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05` | `b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f` |
+
+`EnvelopeKind` gains a 15th variant, `AccordQuorumEvidence`, **appended** (the
+order is hashed, so it is never inserted). CIRISEdge's `replication::protocol`
+enum must gain the same name in the same position; CIRISServer pins both
+hashes. The consent grammar moves only because its manifest carries
+`kind_transferability` over `EnvelopeKind::ALL` — the grammar itself
+(principles, restriction ops, audiences) is unchanged, and the new kind is
+classified `StructuralPlane`: constitutional machinery is not something an
+end-user consent grant may narrow. No re-mint, no ceremony, no data migration.
+
+**The defect.** `federation_revocations` (#655) and
+`federation_role_withdrawals` (#662's blocker) were both written, both
+consulted, and neither could reach a peer. Persist exposed 14 `list_*_since`
+cursors and served neither plane. Anything that deleted rows — a DSAR erasure,
+an operator repair, a backup restored from before the exclusion — removed it
+permanently and silently. For V104 that is not bookkeeping:
+`is_infra_attest_effective` folds withdrawals through `lookup_role_withdrawal`,
+so the **effective** `infra:attest` set — the build-signing trust root the
+manifest verifier asks about — depended on rows with no way home.
+
+**The two halves needed opposite remedies, and which one is settled by a single
+question: does the row carry a signature a peer could check?**
+
+`federation_revocations` does — `revocation_envelope` plus the hybrid
+`scrub_signature_*` / `scrub_key_id`, all of which `put_revocation` already
+re-verifies against the receiver's own directory. The receiver was already
+re-deriving; only serving was missing, so **a plain cursor is the whole fix**.
+
+`federation_role_withdrawals` does not. V104 is `role`, `key_id`,
+`withdrawn_at`, `authority_decision_digest`, `superseded_by`,
+`persist_row_hash` — no signature columns at all. `persist_row_hash` is
+recomputed locally so it binds nothing across nodes, and the authority lives
+entirely behind `authority_decision_digest`, a pointer into the accord decision
+plane (V091 / #302) where the signatures actually are. A cursor there would
+ship a **derived verdict** and ask the receiver to trust the sender — the
+forgeable-decision-bool bypass #377 closed, rebuilt on purpose and called
+replication.
+
+**So: replicate evidence, never verdicts.**
+
+- `list_signed_revocations_since` — the #655 cursor. `Revocation` also joins
+  the shared `signed_wire_index` (#507 had left the key-level plane out of
+  scope, which is how #655 found it) and is now advertised in
+  `wire_refs_for_subject`, because a plane a peer cannot discover is
+  rebuildable in principle and unreachable in practice.
+- `list_signed_accord_quorum_evidence_since` — the signed EVIDENCE plane: an
+  `AccordProposal` plus the holders' hybrid-signed participations, bundled per
+  proposal. The cursor is the bundle's visibility instant
+  (`max(created_at, max(server_arrival_at))`), not the proposal's immutable
+  `created_at`: a bundle is an aggregate, so a vote landing has to move it
+  forward in the stream or a peer that read it pre-quorum skips the
+  quorum-bearing version forever.
+- `apply_replicated_accord_evidence` — the receive half. It **re-tallies** with
+  `tally_live_quorum` against a roster resolved from the receiver's own
+  directory, at the same strict-majority threshold the local destructive ops
+  use. The sender's verdict is not an input to the function. Fail-closed with
+  the new `Error::AccordEvidenceUnverified` (`kind()` =
+  `accord_evidence_unverified`), kept distinct from
+  `canonical_withdrawal_authority_invalid` so an operator can tell "a peer
+  offered evidence that does not verify here" from "a local op named an
+  authority that does not hold".
+- Each node then re-derives its **own** V104/V095 projection. `payload_sha256`
+  is a digest, so a peer cannot say *which* key a withdrawal names; the
+  receiver can only ask, per key it already holds, whether the quorum voted on
+  the payload it would compute itself. V104 becomes a local materialization
+  rather than something on the wire. `rematerialize_role_withdrawals` is the
+  repair door, and the role-admission gates materialize before they consult, so
+  evidence arriving *before* its target key still excludes that key.
+
+That ordering is load-bearing: the local re-derivation is why replicating the
+evidence is safe.
+
+`revocations_for` is routed through the FFI directory capsule (was a hard
+`Unsupported` — a host could write an exclusion and never read it back), as is
+the evidence admission, which crosses as ONE op so the re-tally runs inside
+persist's own `.so`.
+
+Witnessed on memory, sqlite AND postgres, including the cross-node leg (two
+directories of the same backend: a withdrawal on node A excludes the key on
+node B without the withdrawal row ever crossing the wire). Seven mutations
+against the receive-side re-tally, seven caught — one (`skip-the-family-scope`)
+survived first and exposed a witness that could not fail, since
+`AccordParticipation::verify` binds `family_key_id` inside each signature and
+refuses out-of-family bundles by another route; that gate is load-bearing for
+DIAGNOSIS, not for safety, and both the code and the witness now say so.
+
+**Two schema additions (V123, V124), both additive and backfilled.** V123 adds
+`federation_revocations.admitted_at` — THIS node's admission instant — because
+the serve cursor first keyed on the producer's `scrub_timestamp` and that hid a
+whole class of exclusion: a revocation signed in January and replicated late is
+admitted in February, and a consumer whose cursor has passed January never sees
+it. Nothing prevented that (`check_revocation_scrub_skew` is a ceiling only;
+the anti-rollback latch is per-`revoked_key_id`), so it was #655's own defect
+re-entering through the cursor key. `scrub_timestamp` is unchanged and keeps
+every other job it had. The cursor read type is `ServedRevocation` (record plus
+this node's position), separate from the `SignedRevocation` write input so that
+a node-local instant never enters a content hash. V124 adds the
+`accord_proposal(payload_sha256)` index the withdrawal projection's lookup
+needs — it was documented as indexed and shipped without one, leaving an
+attacker-triggerable scan on the key-admission chokepoint.
+
+**Known limits, stated rather than left to be found.**
+`AccordQuorumEvidence` stays out of the content-hash wire index by
+construction: every other kind indexes a row, that kind is an aggregate whose
+hash changes as votes land, so an index entry written at one vote count dangles
+at the next. It is served by cursor only. SUPERSEDE tombstones are not
+re-derived — their payload commits to a `(target, successor)` pair, so the
+local search would be quadratic, and a supersede is a rotation link rather than
+an exclusion.
+
+**Upgrade note — no operator action.** On a database that already holds
+revocations, the v31 migration probes one revocation against the index on every
+boot and backfills only if the plane is unindexed, so pre-existing rows become
+point-readable by content hash without anyone running a repair. A node with no
+revocations does nothing; a backfilled node pays two point reads.
+
+Until the backfill completes, `wire_refs_for_subject` deliberately does NOT
+advertise those rows: advertising a ref that resolves to `None` would be a plane
+visible in principle and unreachable in practice, which is the defect #655
+exists to close. The advertise path checks the index and self-corrects the
+moment the backfill runs.
+
+`rebuild_signed_wire_index` remains available as the manual repair and is still
+what the purge path reuses — it is simply no longer something an upgrading
+operator has to know about.
+
+**Deferred, tracked in CIRISPersist#668.** All sixteen `list_signed_*_since`
+cursors resume on an instant alone while ordering by `(instant, id)`, so a tie
+larger than one page silently drops rows; and every signed-plane writer updates
+`signed_wire_index` after the primary row commits, so a failure there leaves a
+durable row unindexed. Both are family-wide properties, not new here, and both
+want one change with one witness rather than sixteen divergent patches.
+### Fixed — a revocation id the public type permits, that one backend refuses (#622)
+
+`Revocation::revocation_id` is a plain `String`. Nothing in the type, the wire
+contract, or `put_revocation`'s gates constrains it to UUID shape, and memory
+and SQLite have stored whatever they were handed since V004. Postgres typed the
+column `UUID PRIMARY KEY`, so a symbolic id was **admitted on two backends and
+refused at the driver on the one production runs**, before a single admission
+gate ran:
+
+```
+invalid argument: revocation_id is not a valid UUID
+```
+
+This is **V121 one table over** — that migration relaxed `attestation_id`
+because the genesis ceremony signs symbolic ids, and every Postgres node failed
+genesis while every SQLite node was immune. Same defect, same fix, same
+direction: removing a backend asymmetry rather than creating one. Found by the
+#670 schema-parity gate, which compares the two migration trees' resulting
+column types and classes `uuid` against `TEXT` as a **narrowing**, not an
+encoding.
+
+**V125** relaxes `federation_revocations.revocation_id` and its
+`federation_revocation_quorum_state` child in one migration — PostgreSQL
+requires a foreign key's type to match its referent, so altering the parent
+alone fails. Two code sites parsed the id before binding, and both were the
+same defect: the write door and `attach_revocation_pqc_signature`. Fixing only
+the write door would have stored rows that could never be PQC-completed.
+
+It also **repairs the revocation cursor**, which was already inconsistent with
+itself: `WHERE (revoked_at, revocation_id::text) < (…)` against `ORDER BY
+revoked_at DESC, revocation_id DESC`. On a `uuid` column the resume predicate
+compared text while the sort compared UUIDs, so the cursor could skip a row at
+a `revoked_at` tie and never serve it again — #668's class, live on Postgres
+and not on SQLite. The residual collation difference (Postgres default vs
+SQLite BINARY) is filed with #668.
+
+### Fixed — SECURITY — the delegation leg verified a proxy, not the property (#665 review)
+
+**The third time this leg reported `entrenched` on a plane that could not
+confer.** First it verified no signature at all; then it gained whole-row
+comparison, but only on the seed path; then on the read path too — but only
+where a baked comparand EXISTS. The floor rule above deliberately created a path
+where the stored row is legitimately *not* the baked row, and that path had no
+wholeness check at all, because there was nothing to compare against.
+
+The reachable case: a newer ceremony row, accepted correctly, then damaged
+beneath persist by dropping `additional_scrubs` entries. Its content differs
+from the baked row (expected — it is newer), its base holder signature still
+verifies, and its recency still passes. Every proxy said sound while
+`family_quorum_over` could not reach the threshold — the constitutional root
+below quorum with the agent-mode gate open over it.
+
+Byte-equality with a compiled-in artifact was never the property; it was a proxy
+that happened to imply it, and each new legitimate way for a row to differ
+removed the implication while the code went on looking careful. The leg now asks
+the property **directly and first**, ahead of every arm, via
+`family_quorum_over` — the same body the charter and mesh-config planes count
+with: *do the distinct verified seated-holder co-signatures on this row still
+reach the threshold?* It needs no comparand, so it holds for a baked row, a
+successor, and any row a future path accepts. A node with no accord family at
+all falls through to `verify_family_seeded`, which owns that report.
+
+Witnessed on memory, sqlite and postgres; mutation-tested (dropping the gate
+reds all three).
+
+### Fixed — SECURITY — equal `asserted_at` was one case and it is two (#665 review)
+
+Five findings across the bake and posture paths, all one missing distinction.
+Equal `asserted_at` was undifferentiated, and the two halves pull in **opposite**
+directions — which is the tell that the case was under-discriminated rather than
+mis-signed. The closed set is now:
+
+| stored vs candidate | verdict |
+|---|---|
+| whole row equal | already present |
+| same envelope, different UNSIGNED material | **repairable** |
+| same `asserted_at`, different envelope content | **ambiguous — never `Entrenched`** |
+| candidate strictly newer | replace |
+
+**Re-running the saved ceremony could not repair the node's own row.** A row
+whose signed envelope was byte-identical with only unsigned material damaged
+failed whole-row equality, then failed strict recency (the bound instants are
+identical), and fell into the bake's anti-rollback refusal. With that ceremony
+newer than the compiled-in artifact the boot seed could not help either, leaving
+another full ceremony as the only recovery — on the path an operator reaches for
+during an incident. There is no rollback risk: the signed bytes are identical,
+so restoring unsigned material is not a supersession.
+
+**Posture could reach `Entrenched` on an ambiguity.** The successor test asked
+*"the baked row is not newer"*, which is true of a tie, so a stored row of the
+same vintage with different content read as a successor. `Entrenched` is the
+strongest claim this plane makes; the successor has to win, not tie.
+
+**A refused replacement deleted the row it was replacing.** Delete-then-insert
+with the refusal after the delete, and the retry hitting the same refusal —
+stable, not transient. Trigger: a ceremony machine whose clock runs ahead of
+`DEFAULT_MAX_TOUCH_SKEW`, which `classify_shape` accepts at the row's own instant
+and the write door refuses against `Utc::now()`. The deterministic doors now run
+before anything is deleted, **including the wall-clock gate a shape-only
+preflight missed** — the seed path had the same hole.
+
+**The bake could purge the evidence of a substitution.** A corrupted row with an
+older bound instant passed recency and was deleted, destroying the only proof
+anything was wrong. The boot path deliberately leaves unverifiable statements in
+place so posture can report them; the bake now asks the same question with the
+same predicate before deleting.
+
+**A duplicate key proved someone won, not that your row is present.** The insert
+branch reported `AlreadyPresent` on the collision alone, so two concurrent bakes
+with different content both returned success. Both call sites now reclassify
+through one shared helper; `AlreadyPresent` is only ever said of a row this
+bundle would itself have written.
+
+### Fixed — SECURITY — a forged holder claim could drain the reserved quota (#665 review)
+
+The fix below routed rows carrying a baked genesis id to `WriteAdmissionClass::Reserved`,
+because that class opens no peer bucket. Correct about the symptom, **wrong
+about the budget.**
+
+The quota classifies at TIER 0, ahead of any signature check, so
+`attesting_key_id = "A1"` is a CLAIM and a claim is free. The reservation gate
+that runs before it does not help — it compares the *claimed* key against the
+roster and authenticates nothing. So an unauthenticated peer could repeatedly
+submit a baked genesis id with `tier = "federation"`, spend the budget that
+exists to keep accord objections writable, and have every row rejected moments
+later by `verify_federation_tier_ingest`. That is the same DoS this cut moved
+the reservation gate forward to close, re-opened one budget over.
+
+Rows claiming a genesis id are now their own class, `GenesisClaim`: charged
+against the node budget and the shared untracked tail — what any stranger
+already pays, so no new scarcity is exposed — and never promoted to a peer
+bucket. **Debit only what the claim is entitled to.** Being denied a bucket is
+strictly more restrictive for an attacker than being given one (the tail is
+shared and small), and it is exactly right for the node's own boot seed, which
+is not a peer.
+
+The genuine genesis rows lose the reserve's flood protection; that is the honest
+trade, stated rather than hidden. They are written once at boot, and a node
+whose node budget is exhausted at boot fails the seed to `Absent`, which boots
+and retries. A budget an unauthenticated claim can drain protects nothing.
+
+### Fixed — the node's own genesis seed was counted as peer traffic (#665)
+
+Boot installs the delegation plane through `put_attestation`, which charges the
+peer-write quota — so a **fresh engine came up having "observed" one peer**
+(`A1`), a peer no peer had ever spoken as. Caught by
+`tests/python/test_node_state_surface.py::test_the_zeroes_do_not_share_a_token`.
+
+Not cosmetic. `tracked_peers` is the token that separates *"nobody has talked to
+us"* from *"peers have, and none were denied"*, and `node_state` reads
+`tracked_peers > 0` as the condition that lifts the peer-quota band out of
+`unknown` into `green`. Every fresh node would have reported a TESTED quota on
+the strength of its own compiled-in artifact, and an operator would have lost
+exactly the distinction the typed standings exist to preserve.
+
+The baked delegation plane is now **reserved class**, which is charged against
+its own budget and opens no peer bucket — the same treatment `genesis-lifecycle`
+already received via its `accord:` dimension, extended to the two `delegates_to`
+rows that carry no dimension at all and were falling to `Ordinary`. These three
+rows are the constitutional root, which is precisely the traffic the reserved
+budget exists to keep writable under a flood.
+
+Not a metering hole: the writes are still charged, just not against a peer, and
+`check_genesis_attestation_reserved` — which is pure — **moved ahead of the
+quota** at all three write doors so a row claiming a baked genesis id from
+anyone but a seated accord holder is refused before any budget is touched.
+
+Also restated as a Rust witness on all three backends, because
+`tests/python/` is run by CI and **not** by `certify.sh full` — so the release
+gate was structurally blind to this class. A green certify is not a superset of
+CI until that is closed.
+
+### Changed — SECURITY — the compiled-in genesis bundle is the FLOOR, not the identity (#665 review)
+
+Three review P1s, all one gap: `seed_delegation_plane` and the delegation half
+of `bake_assembled_genesis` are two doors onto the same three reserved ids and
+neither knew the other existed. The serve-node half of the bake had solved this
+correctly years ago — identity must match, `valid_from` must advance, then
+re-anchor — and the delegation half got a bare `put_attestation`.
+
+**A boot could roll back a live re-ceremony.** The supersession predicate asked
+whether a stored row was a holder-signed self-consistent statement, and treated
+every such row as a supersedable predecessor. A legitimate newer ceremony row
+therefore got deleted and replaced with the binary's compiled-in bytes.
+
+**A re-ceremony could not land at all.** The bake's delegation loop only called
+`put_attestation`; since this release gave the boot seed the same three ids,
+every node that had ever booted collided on all three, reported them `Skipped`,
+and returned a partially applied bake while retaining the old plane. The
+documented candidate re-mint path was unusable fleet-wide.
+
+**One rule closes both**, and it is the serve-node half's rule: *a reserved
+genesis delegation row may be replaced only by a strictly newer row that is
+itself a verifiable statement by this node's seated accord holders — never by an
+older one, from either door.* Authenticity and recency are separate questions
+with separate names; fusing them is what let "real" be read as "prior".
+
+**`verify_delegation_plane_seeded`'s divergent arm changed, deliberately.** It
+compared the stored content hash to the compiled-in one, so a node running a
+newer ceremony failed by construction and could only reach `Divergent`, which
+refuses to boot — the check meant to notice a root altered beneath persist was
+also refusing every successor the root is designed to have. It now asks whether
+the row is a real holder statement at least as new as the compiled-in one.
+**This narrows soundness in every direction but one:** squats, renamed rows,
+forged holder claims, corrupted signatures and now *rollback* all still refuse
+to serve. Only a newer, quorum-verified, holder-signed root stops being called
+tampering.
+
+**Recency is `asserted_at`, but shape decides first.** On a v31 row that instant
+is inside the signed envelope and bound to the column; on a pre-v31 row it is
+not in the envelope at all, so raw corpus access could stamp 2030 and pin a node
+to the old root forever. A legacy row predates the signed-instant envelope by
+construction, so it never gets to assert its own recency.
+
+**And the write is now atomic.** Every decision is made from a read taken
+before it, so under a rolling deployment — two engine versions initializing one
+postgres database — another initializer can replace the row in between, and a
+stale one would delete the newer statement and install its older baked row: the
+same rollback, performed by the caller already told it could write. The
+destructive door is a compare-and-delete carrying the classified row's
+`persist_row_hash`; a changed row is reclassified, never removed. The
+non-destructive paths need no equivalent — an `INSERT` racing a newer row fails
+on the primary key and the newer row stands.
+
+`GenesisPosture::Entrenched` therefore also *widens*: a node whose root is ahead
+of its binary is now entrenched rather than divergent. Consumers gating on
+`entrenched()` (CIRISServer#398) are unchanged in direction; what satisfies them
+has widened.
+
+Witnessed on memory, sqlite and postgres — refused classes (rollback, a legacy
+row with a stamped `asserted_at`, a forged holder claim), the rolling-deployment
+race, and an authenticated re-ceremony superseding the boot-seeded plane, with
+the replacement matrix written at the `DelegationRowOutcome` definition site.
+Mutation-tested: dropping the recency gate reds the refused-class witnesses;
+reverting the compare-and-delete to delete-by-id reds the rolling-deployment
+witnesses.
+
+### Fixed — SECURITY — a corrupted signature on a genesis row read as `entrenched` (#665 review)
+
+Review finding against the fix below. Its `AlreadyCurrent` fast path compared
+`original_content_hash` — and that digest covers the **envelope alone**, while
+the ceremony's signature covers the envelope and nothing else. So every column
+*around* the signed bytes was unchecked by anything on the boot path: rewrite
+`scrub_signature_classical`, its PQC half, or the `additional_scrubs` quorum set
+beneath persist, leave the envelope and hash alone, and the row read as current.
+`verify_delegation_plane_seeded` behind it asks only for that same hash and the
+v31 shape — `classify_shape` is three pure column/envelope checks — so **nothing
+in the boot path verified a stored delegation row's signature at all.**
+
+Not cosmetic on `genesis-charter`: it IS the family charter, and
+`trust_root::family_quorum_over` counts DISTINCT VERIFIED co-signatures over its
+envelope. Drop B1's entry and the constitutional trust root falls from 2-of-3 to
+1 and stops validating, while the posture still reports `entrenched` and a
+server enables agent mode on it. A fail-OPEN banner — the exact class the
+delegation leg was added in #648 to catch, reintroduced one column over, and the
+same unsigned-column-beside-signed-bytes shape as the `original_content_hash`
+gap the fix below closed on the other branch.
+
+**The `AlreadyCurrent` test is now a whole-row comparison**, via
+`compute_persist_row_hash` recomputed from content on both sides and never
+trusting either stored column. That digest is taken over the entire row minus
+itself, so every column the ceremony fixes is covered in one comparison — and a
+column added to `Attestation` later is covered automatically, which the
+hand-picked single field was not. Digests rather than `==` on the struct
+deliberately: the hash truncates instants to microseconds (#646) precisely so
+the answer is reproducible where postgres stores microseconds and sqlite/memory
+store nanoseconds; a struct comparison would have failed on postgres alone.
+
+**A row whose signed envelope is byte-identical to the baked one is repaired,
+not refused.** The signature covers the envelope, so an identical canonical
+envelope means the holders said exactly this — restoring the compiled-in bytes
+destroys no constitutional statement, because it is the same statement. Logged
+at ERROR and reported as a distinct `Repaired` outcome so the repair is
+observable. Not a boot refusal: the damage is only reachable by a writer who
+already has raw corpus access (#660 reserves these ids at every write door), so
+refusing to serve would hand that writer a one-byte outage on a node whose own
+binary holds the correct row.
+
+`GenesisPosture::Entrenched` therefore asserts something **stronger** than
+before — every baked delegation row byte-whole against the artifact this binary
+carries, co-signatures included. Consumers gating on `entrenched()`
+(CIRISServer#398) are unaffected in direction; nothing green stops being green
+except a node that was already lying.
+
+Witnessed on memory, sqlite and postgres (`damaged_current_row_is_repaired_*`),
+each opening by proving the posture leg is blind to the damage before asserting
+the repair. Mutation-tested: reverting the fast path to the content-hash
+comparison reds all three.
+
+### Fixed — SECURITY — the re-bake bricked every upgrading node, and the seed stopped half-way on a lost race (#665)
+
+Two review findings against `seed_delegation_plane`, the boot routine 31.1.0
+added to install the baked bundle's conferral rows. Both were real.
+
+**A re-bake refused to boot the fleet it was for.** A node upgraded from v30
+already holds `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle` from
+the PREVIOUS ceremony — same ids, different content. The seed saw the id present
+and skipped it; `verify_delegation_plane_seeded` then compared the stored
+`original_content_hash` against the baked one, found a mismatch, and returned
+`Divergent` — the one posture arm that REFUSES TO BOOT. So shipping a re-baked
+seed would have taken down every upgrading node, on exactly the path v31.0.0
+went out of its way to keep survivable (a stale delegation plane was `Absent`,
+and `Absent` boots).
+
+The divergent arm was written when a hash mismatch had one possible cause: a
+SUBSTITUTED conferral row. A re-bake creates a second, legitimate cause, and the
+arm cannot separate them from the hash alone.
+
+**The chosen semantics: the baked artifact supersedes a PRIOR CEREMONY'S row,
+and only a prior ceremony's row.** A stored row under a baked genesis id whose
+content differs is replaced iff all three hold — (1) it passes the #660
+reservation re-asked against the corpus (federation-tier, attested by a seated
+accord holder on this node's roster); (2) its scrub signature verifies under
+`Strict` hybrid policy against that attester's REGISTERED pubkeys, over its own
+envelope; (3) the digest that verification returns is exactly the row's stored
+`original_content_hash`. Leg 3 is the one that is easy to miss:
+`original_content_hash` is a COLUMN and the signature covers the ENVELOPE, so a
+row can carry a valid holder signature and a content hash scribbled on
+afterwards. Taking `verify_envelope_hybrid_signature`'s return value rather than
+just its `Ok` binds the unsigned column back to the signed bytes.
+
+**Anything failing any leg is left exactly where it is, and still refuses to
+serve.** `Divergent` therefore still means substitution, and the delegation
+leg's arm was NOT weakened. Letting the baked artifact win over every mismatch
+was considered and rejected: it is safe in the narrow sense — the only bytes the
+seed can ever write are the compiled-in ones, so an overwrite is never a
+privilege gain — but it would have retired the one check in the substrate that
+notices a root altered beneath persist. Repairing damage silently and reporting
+nothing is how a compromise stays invisible.
+
+Replacement is a destructive boot-time write, so it goes through a new door
+narrow enough to justify it: `purge_genesis_delegation_row_v31`, gated by
+`check_genesis_rebake_purge_admission` — **the id must be one the compiled-in
+bundle carries** — re-asked inside all three backends (AV-9). The general
+`purge_attestation_v31` is unusable here and deliberately stays that way:
+`genesis-charter` and `genesis-grant:…` are `delegates_to`, which
+`check_purge_admission` refuses as exclusion-bearing, and weakening that gate to
+make a boot path convenient is the trade #650 exists to refuse. The new door's
+worst-case misuse leaves the plane `Absent` — which boots, and which the next
+start re-seeds.
+
+**A duplicate-key error is not `Error::Conflict`.** The seed matched
+`Err(Error::Conflict(_))` as "already present", but no backend reports a
+duplicate `attestation_id` that way: memory and sqlite render it
+`Backend("… UNIQUE constraint failed …")` and postgres's non-FK mapper renders
+it `Backend("SQLSTATE 23505: duplicate key value …")`. Two engines initializing
+one database therefore raced, the loser fell to the fault arm, returned `absent`
+and **abandoned the rest of the plane** — leaving a node permanently half-seeded
+if the winner exited after its first insert.
+
+No backend offers an atomic insert-if-absent on `put_attestation`, and re-typing
+the refusal would move `error_kind`, which `assert_parity` hard-asserts equal
+across backends. So the predicate stays a string test but now exists exactly
+once, as `Error::is_duplicate_key`, documenting all three renderings and what
+would have to change to make it typed. The chain had already been transcribed
+inline in `exercise_genesis_seed_installs` and not carried to the seed — the
+two-lists-that-disagree class — and that call site now uses the shared predicate.
+
+Witnessed on **memory, sqlite and postgres**: `rebake_supersedes_prior_ceremony_*`
+rolls the plane back to the REAL v30 artifact (the verbatim #557 bundle, vendored
+as `prior_ceremony_delegation_rows.json`, injected beneath the write doors
+because its rows carry no #643 mirror) and asserts the node boots, ends
+`entrenched` on the new root, and is idempotent on the next start;
+`duplicate_insert_leaves_plane_fully_seeded_*` writes the winner's row through
+the real door and hands the seed the stale `None` the loser was holding, then
+asserts the plane completes. Mutation-tested both: reverting to `continue` on a
+present row reds the three upgrade witnesses; reverting to `Conflict`-only
+matching reds the three race witnesses.
+### Added — SECURITY — persist's copy of verify's subject binding now FAILS THE BUILD when it diverges (#663)
+
+Pinning `ciris-verify-*` at `v13.1.0` freezes *which verify code runs*. It does
+not make persist's own reimplementation agree with it. Two implementations of
+one check live in the same binary — `ciris_verify_core::subject_binding` (used
+by verify's provenance walk, its transport binding, and
+`KeyRecord::check_subject_binding`) and `admission::subject_binding` (used by
+`put_public_key`, `apply_replicated_key_record` and the accord co-scrub quorum
+core) — and at 13.0.0 they bound **four** members and **three**. Persist omitted
+`identity_type`, which `is_canonical` reads off the row to decide canonical
+standing. Same process, same release, different answers: a row could pass
+persist's door and fail verify's check. Both suites were fully green. The only
+thing that caught it was a human reading both files (#659, #661).
+
+Deleting persist's copy is not available — its `KeyRecord` is a distinct type
+carrying a declaration-order contract against CIRISRegistry's vendored shape.
+So the goal is not deduplication. It is **detectability**, and
+`tests/verify_subject_binding_conformance.rs` is it.
+
+**The member set is read off verify's own behaviour, not restated.** Verify
+exposes `SubjectBinding::members()`, but `check_subject_binding` builds its
+projection inline and consumes it, so no handle exists to call that on.
+Rebuilding it here with our own `.require(…)` chain would mint a THIRD spelling
+that drifts exactly like the first two. Instead the test *probes*: starting from
+an empty `registration_envelope`, it feeds back every member verify's errors
+name (`Missing { member }` → plant a sentinel → `Mismatch { member, claimed }`,
+where `claimed` is the JSON of the value verify expected) until the check
+returns `Ok`. The loop converges on exactly the members verify projects and the
+values it expects. **Add a fifth member in verify and the probe finds it with no
+edit in persist** — it reds persist's suite instead of silently widening the gap.
+
+The `require_optional` disposition is recovered by difference: an expected
+`null` is satisfied by omission, so it never surfaces as `Missing`. Running the
+probe against a record whose `Option` fields are all `None` and again with them
+all `Some` makes the optional members exactly the set difference. A member
+optional on one side and required on the other is the same class of gap as a
+missing one — it admits on one door and refuses on the other — and it now reds.
+
+Compared as **sets, not order**: both sides carry a `BTreeMap`-backed
+`serde_json::Map`, so both are already lexicographic, which is what JCS emits
+and therefore the order the co-scrubbers actually signed over. Nothing here
+asserts an insertion order.
+
+**CEG §0.9 is now a pinned contract rather than an adopted comment.** The
+omit-vs-materialize table is asserted as data against *both* implementations
+in-process — envelope omits + row claims nothing ⇒ ADMIT; envelope omits + row
+claims a key ⇒ REFUSE; envelope declares + row claims nothing ⇒ REFUSE — with
+both controls (same key ⇒ admit, different keys ⇒ refuse) so the table cannot
+pass by refusing, or admitting, everything. A future "simplification" to flat
+fail-closed reds, and so does one to flat tolerance.
+
+A third test iterates the projection and asserts that a DIVERGING value and an
+OMITTED member produce the same verdict on both implementations, for every
+member, against a row both with and without its optional legs — and that
+persist's refusal names the member verify named.
+
+**Two of verify's three planes, and the third named rather than faked.** 13.1.0
+applies this projection on three planes. The PROVENANCE plane
+(`provenance.rs:420`) is probed the same way and is worth probing even though
+#465 routed persist's chain walk through verify: persist is still the PRODUCER
+of every `registration_envelope` that walk inspects, so a member verify starts
+requiring and `bind_subject_into_envelope` does not stamp means **every chain
+persist mints stops rooting** — a federation-wide outage delivered by a
+dependency bump. The same test also pins verify's two checker planes against
+each other, which nothing in verify does either.
+
+The TRANSPORT plane (`transport_binding.rs:353`, a different projection —
+`attesting_key_id` + `transport_destination` + `encryption_pubkeys`) is **not**
+covered, and deliberately not faked. `verify_transport_binding` catches the
+`SubjectBindingError`, returns `Ok(reject(SubjectMismatch))`, and drops the
+detail through `tracing::warn!`, so the member name never leaves the function
+and the probe cannot converge. Log-scraping would be a half-probe that certifies
+an agreement it never checked. Persist's exposure there is also structurally
+different — `verify_signed_identity_occurrence` parses the envelope rather than
+restating the projection, so there is no second spelling in shipped code; the
+residual risk is producer-side and unguarded. CIRISVerify#254 carries the ask.
+
+**The fixture asserts its own distinguishability.** The probe recovers verify's
+expectation by VALUE, so two fixture fields sharing a value are indistinguishable
+to it — a member persist bound off the WRONG COLUMN would report agreement.
+Caught in review on #666: `key_id`/`identity_ref`/`scrub_key_id` shared one
+value and three timestamps shared another. Every field now carries its own
+sentinel, and a witness derives the pairwise-distinctness check from the
+SERIALIZED fixtures, so a field added later cannot quietly reuse a value. The
+failure mode it closes is a test that keeps passing while measuring less.
+
+**A new verify error variant is a COMPILE error, not a fall-through.** The
+probes converge on "the error stopped being a binding failure" — and a new
+`SubjectBindingError` variant *is* still a binding failure, so under a `_`
+wildcard it read as successful convergence: the probe would stop early, report
+whatever subset it had found, and go green if that subset happened to match
+persist. The failure this test exists to prevent, triggered by the exact event
+it exists to detect, degrading toward agreement. Neither `SubjectBindingError`
+nor `ProvenanceError` is `#[non_exhaustive]`, so both matches are now exhaustive
+with no wildcard and a variant added upstream fails to compile here — verified
+by deleting one arm from each and getting `error[E0004]`.
+
+**Mutation-tested, 9 for 9**, scored on the full five-test `Summary` line:
+dropping `identity_type` (4 red); binding it off the `key_id` column (4 red);
+making the optional leg required (4 red); flattening §0.9 in each direction
+(2 red each); re-introducing the shared-sentinel blind spot (1 red); injecting
+an unmodelled binding error mid-probe (1 red); filtering the fixture walk back
+to strings only (1 red); and making verify's provenance plane alone require an
+optional leg (1 red).
+
+Three of those measure a green-to-red flip rather than asserting one. Against
+the wildcard originally shipped, an injected binding error gave
+`5 tests run: 5 passed, 0 skipped` — fully green while the binding was still
+failing. Against the pre-fix round trip, which compared only MATERIALIZED
+probes, a `require` / `require_optional` split between verify's two planes gave
+the same all-green. The string-only walk reds naming `is_self_signed`, the field
+it really was dropping.
+
+**This detector is a STOPGAP and the file says so.** Five real holes were found
+in it by review, every one in the direction of false confidence, none by the
+suite being green — the transport plane's coverage overstated; the fixture's
+fields mutually indistinguishable; a still-failing binding read as convergence;
+the collision walk dropping every non-string leaf; and the provenance round trip
+never exercising omission. Each is closed, but the pattern is the point:
+reconstructing a foreign implementation's contract by fault injection has an
+irreducible blind-spot problem, because the probe infers a projection from error
+messages and every reconstruction has edges the original does not. The real fix
+is CIRISVerify#254 ask 2 — export the projections as data — which collapses both
+probes into a direct comparison of two member maps. **When it lands the probes
+should be deleted, not ported.**
+
+Filed CIRISVerify#254 asking verify to export the member list as data
+(`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the
+probe to one call, and to document `Mismatch.claimed`'s encoding, which the
+probe currently leans on as a `Display` detail. The better fix is on the record;
+this ships the gate meanwhile.
+
+No production code changed. Test-only.
 
 ## [31.0.0] - 2026-08-12
 

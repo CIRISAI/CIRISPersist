@@ -787,6 +787,47 @@ pub enum DirectoryOp {
         /// The candidate hop.
         peer_key_id: String,
     },
+    /// [`FederationDirectory::revocations_for`] (v31.1.0, CIRISPersist#655) —
+    /// the key-level revocation rows for a subject. Was the capsule's only
+    /// hard-`Unsupported` on an EXCLUSION plane: a host running behind the
+    /// capsule proxy could store a revocation and then not read it back, so
+    /// the plane it needs in order to exclude anything was invisible to it.
+    /// Result rides `Revocations`. APPEND-ONLY.
+    RevocationsFor {
+        /// The subject whose revocations to list.
+        revoked_key_id: String,
+    },
+    /// [`FederationDirectory::list_signed_revocations_since`] (v31.1.0,
+    /// CIRISPersist#655) — the exclusion plane's serve cursor. Result rides
+    /// `SignedRevocations`. APPEND-ONLY.
+    ListSignedRevocationsSince {
+        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`]
+    /// (v31.1.0, CIRISPersist#662) — the signed accord EVIDENCE cursor.
+    /// Result rides `AccordQuorumEvidence`. APPEND-ONLY.
+    ListSignedAccordQuorumEvidenceSince {
+        /// Cursor: bundles with `evidence_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap, counted in PROPOSALS.
+        limit: u32,
+    },
+    /// [`FederationDirectory::apply_replicated_accord_evidence`] (v31.1.0,
+    /// CIRISPersist#662) — the RECEIVE half of the evidence plane, as ONE op.
+    ///
+    /// It has to be one op rather than the five primitives the free function
+    /// composes: those primitives are `Unsupported` on this proxy, so a
+    /// capsule-backed consumer could otherwise serve evidence and never apply
+    /// it. Routing the whole admission also keeps the re-tally inside
+    /// persist's `.so`, where a consumer cannot reassemble it differently.
+    /// Result rides `AccordEvidenceAdmitted`. APPEND-ONLY.
+    ApplyReplicatedAccordEvidence {
+        /// The bundle to re-tally and admit.
+        evidence: crate::federation::accord_carriage::AccordQuorumEvidence,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -942,6 +983,36 @@ pub enum DirectoryOpResult {
     /// transport-hop verdict plus its authoritative cache TTL and the shared
     /// root that satisfied it. APPEND-ONLY.
     TransitEligibility(crate::federation::trust_root::TransitEligibility),
+    /// `revocations_for` (v31.1.0, CIRISPersist#655). APPEND-ONLY.
+    Revocations(Vec<Revocation>),
+    /// `list_signed_revocations_since` (v31.1.0, CIRISPersist#655).
+    /// APPEND-ONLY.
+    SignedRevocations(Vec<crate::federation::ServedRevocation>),
+    /// `list_signed_accord_quorum_evidence_since` (v31.1.0,
+    /// CIRISPersist#662). APPEND-ONLY.
+    AccordQuorumEvidence(Vec<crate::federation::accord_carriage::AccordQuorumEvidence>),
+    /// `apply_replicated_accord_evidence` (v31.1.0, CIRISPersist#662) — what
+    /// the RECEIVER's own re-tally found. APPEND-ONLY.
+    AccordEvidenceAdmitted(crate::federation::accord_carriage::AccordEvidenceAdmission),
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-3) — a TYPED refusal of
+    /// replicated accord evidence, carried across the ABI as itself.
+    ///
+    /// [`DirectoryOpResult::Err`] flattens every failure to a string, which the
+    /// proxy rebuilds as `Error::Backend` — so a capsule-backed caller saw
+    /// `kind() == "federation_backend"` for a bundle its own node refused to
+    /// authorize. That erases the whole distinction
+    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified)
+    /// exists to draw: "a peer offered evidence that does not verify here"
+    /// (a partition, a stale roster, or a forgery) reads identically to "our
+    /// storage broke". One is a carrier decision, the other is an incident, and
+    /// a refusal that loses its kind crossing a door is a refusal nobody can
+    /// act on. APPEND-ONLY.
+    AccordEvidenceRefused {
+        /// The content-derived digest of the refused proposal.
+        proposal_digest: String,
+        /// Why the receiver's own re-derivation failed.
+        reason: String,
+    },
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1213,6 +1284,49 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::TransitEligibility(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::RevocationsFor { revoked_key_id } => {
+            match dir.revocations_for(&revoked_key_id).await {
+                Ok(v) => DirectoryOpResult::Revocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedRevocationsSince { since, limit } => {
+            match dir.list_signed_revocations_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedAccordQuorumEvidenceSince { since, limit } => {
+            match dir
+                .list_signed_accord_quorum_evidence_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AccordQuorumEvidence(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ApplyReplicatedAccordEvidence { evidence } => {
+            // The free function, not the trait method: `dir` here is the REAL
+            // backend inside persist's `.so`, so the whole re-tally + local
+            // projection runs on this side of the ABI.
+            match crate::federation::accord_carriage::admit_replicated_accord_evidence(
+                dir, &evidence,
+            )
+            .await
+            {
+                Ok(v) => DirectoryOpResult::AccordEvidenceAdmitted(v),
+                // The typed refusal crosses as itself; everything else
+                // flattens. See `AccordEvidenceRefused`.
+                Err(Error::AccordEvidenceUnverified {
+                    proposal_digest,
+                    reason,
+                }) => DirectoryOpResult::AccordEvidenceRefused {
+                    proposal_digest,
+                    reason,
+                },
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2544,10 +2658,22 @@ impl FederationDirectory for OpsDirectory {
             method: "attestations_binding_content",
         })
     }
+    /// v31.1.0 (CIRISPersist#655) — routed (was `Error::Unsupported`). An
+    /// exclusion plane a capsule host could write and never read back is the
+    /// same defect #655 found on the serve side, one surface over.
     async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
-        Err(Error::Unsupported {
-            method: "revocations_for",
-        })
+        match self
+            .run_op(&DirectoryOp::RevocationsFor {
+                revoked_key_id: revoked_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Revocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_identity_occurrences_for(
         &self,
@@ -3001,6 +3127,75 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedKeyRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor,
+    /// routed. Structural mirror of [`Self::list_signed_key_records_since`].
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedRevocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedRevocationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor, routed.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::accord_carriage::AccordQuorumEvidence>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedAccordQuorumEvidenceSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::AccordQuorumEvidence(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the RECEIVE half, routed as ONE op so the
+    /// re-tally runs inside persist's `.so`. The five primitives the free
+    /// function composes are `Unsupported` on this proxy; without this a
+    /// capsule host could serve evidence and never rebuild from it.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedAccordEvidence {
+                evidence: evidence.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AccordEvidenceAdmitted(v) => Ok(v),
+            // Reconstructed as the SAME typed error the far side raised, so
+            // `kind()` is `accord_evidence_unverified` on both sides of the
+            // ABI. A carrier keys its retry/quarantine decision on that token.
+            DirectoryOpResult::AccordEvidenceRefused {
+                proposal_digest,
+                reason,
+            } => Err(Error::AccordEvidenceUnverified {
+                proposal_digest,
+                reason,
+            }),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3532,6 +3727,141 @@ mod tests {
             }
             other => panic!("expected ComposedVerdict, got {other:?}"),
         }
+    }
+
+    /// v31.1.0 (CIRISPersist#655/#662, PR #667 review P1) — **both exclusion
+    /// planes cross the capsule ABI.**
+    ///
+    /// The capsule is a real door, and #652 was found by counting doors. Before
+    /// this cut the proxy could neither read a revocation back
+    /// (`revocations_for` was a hard `Unsupported`) nor apply accord evidence
+    /// — so a capsule-backed host could WRITE an exclusion and never read it,
+    /// and could SERVE evidence and never rebuild from it. Both are round-
+    /// tripped here through the real C-ABI, not through a direct trait call.
+    #[test]
+    fn exclusion_planes_route_through_the_capsule_655_662() {
+        let rt = test_runtime();
+        let (_dir, directory) = memory_directory();
+
+        // `revocations_for` — routed, and an unknown subject is an empty
+        // answer, not `Unsupported`. (An `Unsupported` here read as "this host
+        // has no exclusions", which is the wrong direction of failure.)
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::RevocationsFor {
+                revoked_key_id: "nobody".into(),
+            },
+        ) {
+            DirectoryOpResult::Revocations(v) => assert!(v.is_empty()),
+            other => panic!("expected Revocations, got {other:?}"),
+        }
+
+        // Both serve cursors.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListSignedRevocationsSince {
+                since: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::SignedRevocations(v) => assert!(v.is_empty()),
+            other => panic!("expected SignedRevocations, got {other:?}"),
+        }
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListSignedAccordQuorumEvidenceSince {
+                since: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::AccordQuorumEvidence(v) => assert!(v.is_empty()),
+            other => panic!("expected AccordQuorumEvidence, got {other:?}"),
+        }
+
+        // And the RECEIVE half. This directory has no seated accord roster, so
+        // the correct outcome is a REFUSAL that crossed the ABI as a refusal —
+        // which is exactly what distinguishes "the op ran and said no" from
+        // "the op is not routed". The refusal text is not asserted: the
+        // fail-closed roster chokepoint and the re-tally can each legitimately
+        // answer first on an empty node, and pinning one would make this a test
+        // of which gate is first rather than of whether the door exists.
+        let evidence = crate::federation::accord_carriage::AccordQuorumEvidence {
+            proposal: ciris_verify_core::accord_live_quorum::AccordProposal {
+                family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+                    .to_owned(),
+                action: ciris_verify_core::accord_live_quorum::AccordAction::RosterChange,
+                nonce: "capsule-nonce".into(),
+                window_until: "2031-01-01T00:00:00Z".into(),
+                prior_family_digest: "prior".into(),
+                payload_sha256: "00".repeat(32),
+            },
+            authority_signature: None,
+            participations: Vec::new(),
+            evidence_at: chrono::Utc::now(),
+        };
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedAccordEvidence { evidence },
+        ) {
+            // A TYPED refusal, not a flattened string. v31.1.0 (PR #667
+            // round-3): `DirectoryOpResult::Err` rebuilds as `Error::Backend`,
+            // so a bundle the receiving node declined to authorize used to
+            // reach a capsule host as `federation_backend` — indistinguishable
+            // from "our storage broke". A carrier decides retry vs quarantine
+            // on that token, so the distinction has to survive the ABI.
+            DirectoryOpResult::AccordEvidenceRefused { reason, .. } => assert!(
+                !reason.contains("Unsupported") && !reason.contains("not implemented"),
+                "the admission must RUN on the far side, not bounce: {reason}"
+            ),
+            // A node with no seated roster may also refuse at the fail-closed
+            // posture chokepoint before the re-tally is reached; that arm is a
+            // legitimate first answer and is not asserted against, only that
+            // the op ran.
+            DirectoryOpResult::Err(msg) => assert!(
+                !msg.contains("Unsupported") && !msg.contains("not implemented"),
+                "the admission must RUN on the far side, not bounce: {msg}"
+            ),
+            other => panic!("an unbacked bundle must be refused, got {other:?}"),
+        }
+    }
+
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-3) — **the accord refusal KIND
+    /// survives the ABI.**
+    ///
+    /// Separate from the routing witness above because it asserts a different
+    /// thing: not that the door exists, but that what comes back through it is
+    /// still typed. The proxy reconstructs `Error::AccordEvidenceUnverified`,
+    /// so `kind()` reads `accord_evidence_unverified` on the consumer side
+    /// rather than the `federation_backend` every flattened failure collapses
+    /// to.
+    #[test]
+    fn accord_refusal_kind_survives_the_capsule_662() {
+        let refused = DirectoryOpResult::AccordEvidenceRefused {
+            proposal_digest: "digest-abc".into(),
+            reason: "insufficient accord quorum on RE-TALLY".into(),
+        };
+        // The exact reconstruction the proxy arm performs.
+        let rebuilt = match refused {
+            DirectoryOpResult::AccordEvidenceRefused {
+                proposal_digest,
+                reason,
+            } => Error::AccordEvidenceUnverified {
+                proposal_digest,
+                reason,
+            },
+            other => panic!("expected AccordEvidenceRefused, got {other:?}"),
+        };
+        assert_eq!(
+            rebuilt.kind(),
+            "accord_evidence_unverified",
+            "a carrier keys retry-vs-quarantine on this token; `federation_backend` is a \
+             different decision"
+        );
+        assert!(format!("{rebuilt}").contains("digest-abc"));
     }
 
     #[test]

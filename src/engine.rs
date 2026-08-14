@@ -6434,6 +6434,107 @@ impl Engine {
         directory.list_canonical_withdrawals().await
     }
 
+    // ── v31.1.0 (CIRISPersist#655 / CIRISPersist#662) — the exclusion
+    //    planes' carriage, host-reachable.
+    //
+    //    A capability that exists only on the `FederationDirectory` trait is
+    //    not shipped: #542's lesson was a full {gate}×{backend} matrix passing
+    //    while NO host could enable the thing. These four are the doors an
+    //    operator or a carrier actually calls.
+
+    /// v31.1.0 (CIRISPersist#655) — **serve** the key-level revocation plane:
+    /// bulk-list [`ServedRevocation`](crate::federation::ServedRevocation)s
+    /// since a cursor (`admitted_at > since`, ordered `(admitted_at ASC,
+    /// revocation_id ASC)`).
+    ///
+    /// The cursor is THIS node's admission order, not the producer's
+    /// `scrub_timestamp`; resume from the last element's `admitted_at`. Keying
+    /// on the signed instant hid a revocation signed before a consumer's
+    /// cursor and replicated after it — stored, and permanently unservable.
+    ///
+    /// The plane could be destroyed and never rebuilt before this: every
+    /// other replicated plane had a `list_signed_*_since` and this one did
+    /// not, so a DSAR erasure, an operator repair or a restored backup
+    /// removed an exclusion permanently and silently. A revocation row is
+    /// self-authenticating, so serving it ships evidence — the receiver
+    /// re-verifies the hybrid scrub signature against its own directory
+    /// inside [`Self::deregister_federation_key`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
+        self.federation_directory()
+            .list_signed_revocations_since(since, limit)
+            .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **serve** the signed accord EVIDENCE
+    /// plane: the proposal + its hybrid-signed participation set, bundled per
+    /// proposal, since a cursor on the proposal's local `created_at`.
+    ///
+    /// This is what a peer needs in order to reconstruct the exclusion half
+    /// of the `infra:attest` closure. The withdrawal tombstones themselves are
+    /// NOT served and never will be — see
+    /// [`accord_carriage`](crate::federation::accord_carriage) for why a plane
+    /// with no signature of its own must not be replicated.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        self.federation_directory()
+            .list_signed_accord_quorum_evidence_since(since, limit)
+            .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **apply** a replicated accord evidence
+    /// bundle by re-deriving its quorum against this node's own accord roster,
+    /// then re-deriving this node's own withdrawal tombstones.
+    ///
+    /// The receive-axis counterpart of
+    /// [`Self::list_signed_accord_quorum_evidence_since`], and the reason the
+    /// serve side is safe: nothing is stored that this node has not re-tallied
+    /// itself. Returns what the re-tally found, so a carrier logs a supply
+    /// decision rather than inferring one from `Ok(())`. Fail-closed with
+    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_accord_quorum_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        let directory = self.federation_directory();
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(
+            directory.as_ref(),
+            evidence,
+        )
+        .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **the repair door**: re-derive every
+    /// role-withdrawal tombstone this node's stored accord evidence supports,
+    /// returning the `(role, key_id)` pairs projected.
+    ///
+    /// This is what makes the exclusion plane genuinely rebuildable rather
+    /// than merely re-fetchable — after a purge, a restore from an older
+    /// backup, or a fresh node catching up through the evidence cursor, the
+    /// tombstones are RECOMPUTED from signed evidence rather than accepted
+    /// from a peer. Idempotent; O(|proposals| × |keys|) digest computations,
+    /// the same backfill shape as `rebuild_signed_wire_index`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rematerialize_role_withdrawals(
+        &self,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::accord_carriage::rematerialize_role_withdrawals(directory.as_ref()).await
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.
@@ -7549,12 +7650,19 @@ pub enum EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The top-level `SigningKey` users are all under a backend cfg
-    // (sqlite `test_signer_no_pqc`/`with_signer_*`; `any(sqlite,postgres)`
-    // `pqc_signer`/`self_login_signer`). Gate the import to that union so
-    // the no-backend `--features server` build (`-D warnings`) doesn't see
-    // it as unused, while postgres-only / pyo3+postgres builds (the
-    // pre-push hook is `postgres,pyo3,server`) still have it.
+    // Gate the import to the union of its users so the no-backend
+    // `--features server` build (`-D warnings`) doesn't see it as unused,
+    // while postgres-only / pyo3+postgres builds (the pre-push hook is
+    // `postgres,pyo3,server`) still have it.
+    //
+    // v31.1.0 — this deliberately no longer ENUMERATES its users. It used to
+    // ("sqlite `test_signer_no_pqc`/`with_signer_*`; `any(sqlite,postgres)`
+    // `pqc_signer`/`self_login_signer`"), and when the `cirisnode` media
+    // helpers below were added under a broader `cfg` than their own callers,
+    // `--features cirisnode` stopped compiling the test target entirely —
+    // invisible to every sqlite/postgres/default/pyo3 leg. The fix belonged
+    // on those helpers, not here. A comment that lists call sites is a claim
+    // that goes stale silently; the `cfg` is the only thing that must be right.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use ed25519_dalek::SigningKey;
 
@@ -8574,7 +8682,7 @@ mod tests {
     /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
     /// the SQLite dispatch variant and a `put_contribution` /
     /// `list_contributions` round-trips through it.
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     #[tokio::test]
     async fn node_core_service_sqlite_round_trip() {
         use crate::cirisnode::{
@@ -17061,7 +17169,7 @@ mod tests {
     // envelope so `put_contribution` admits them with no trust gate and
     // no registered author key (author_id == the signing pubkey).
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_pubkey_b64(key: &SigningKey) -> String {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -17070,7 +17178,7 @@ mod tests {
         B64.encode(vk.to_bytes())
     }
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_sign(
         env: &crate::cirisnode::ContributionEnvelope,
         key: &SigningKey,
@@ -17087,7 +17195,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_sha_hex(seed: u8) -> String {
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
@@ -17099,7 +17207,7 @@ mod tests {
     /// Build a signed `takedown_notice` Contribution with a chosen
     /// claimant + `submitted_at` (so the secondary-key / window / cursor
     /// axes are controllable).
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_build_takedown(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17152,7 +17260,7 @@ mod tests {
 
     /// Build a signed `key_grant` Contribution with a chosen recipient +
     /// content + `submitted_at`. The grant publisher is `author_key`.
-    #[cfg(feature = "cirisnode")]
+    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
     fn media_build_key_grant(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17548,7 +17656,27 @@ mod tests {
             )
             .await
             .expect("list_attestations facade");
-        assert!(page.items.is_empty());
+        // v31.1.0 — boot now installs the baked bundle's DELEGATION PLANE
+        // (`genesis::seed_delegation_plane`), so a booted directory is no
+        // longer empty. What this test holds is that the facade DISPATCHES to
+        // the backend, and returning exactly the seeded genesis rows shows
+        // that better than an empty page did: an empty page is also what a
+        // facade that dispatched nowhere would return.
+        let ids: std::collections::BTreeSet<&str> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let baked: std::collections::BTreeSet<&str> =
+            crate::federation::genesis::canonical_genesis_bundle()
+                .attestations
+                .iter()
+                .map(|sa| sa.attestation.attestation_id.as_str())
+                .collect();
+        assert_eq!(
+            ids, baked,
+            "the facade returns exactly the baked delegation plane"
+        );
         assert!(page.next_cursor.is_none());
     }
 

@@ -33,13 +33,21 @@
 //! Persist is the **admission authority** (APPLY gate; edge does no
 //! verification), so persist owns the admission-side [`EnvelopeKind`]. Its
 //! correspondence with edge's wire enum (`ciris_edge::replication::protocol`,
-//! same 14 names/order) is pinned by [`REPLICATION_POLICY_HASH`], not by a
+//! same 15 names/order) is pinned by [`REPLICATION_POLICY_HASH`], not by a
 //! shared crate — resolving the ownership question without a synchronous
 //! cross-repo enum move.
+//!
+//! # v31.1.0 (CIRISPersist#655 / CIRISPersist#662) — the 15th kind
+//!
+//! [`EnvelopeKind::AccordQuorumEvidence`] is appended (never inserted — the
+//! order is hashed), moving [`REPLICATION_POLICY_HASH`]. That re-pin is
+//! consumer-visible and deliberate; see the variant's own doc for why the
+//! ACCORD EVIDENCE replicates and the withdrawal tombstone it authorizes
+//! does not.
 
 use serde::{Deserialize, Serialize};
 
-/// The 14 replicated wire kinds (mirror of edge's
+/// The 15 replicated wire kinds (mirror of edge's
 /// `replication::protocol::EnvelopeKind`, pinned by
 /// [`REPLICATION_POLICY_HASH`]). Persist owns this as the APPLY authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,11 +82,36 @@ pub enum EnvelopeKind {
     PartnerRecord,
     /// `federation_transport_destinations`.
     TransportDestination,
+    /// v31.1.0 (CIRISPersist#662) — `accord_proposal` + its
+    /// `accord_participation` set (V091), carried as ONE bundle: the signed
+    /// EVIDENCE behind an accord live-quorum decision.
+    ///
+    /// # Why the evidence and not the verdict
+    ///
+    /// `federation_role_withdrawals` (V104) — the tombstone plane
+    /// [`is_infra_attest_effective`](crate::federation::admission::is_infra_attest_effective)
+    /// folds — has **no signature columns at all**: `role`, `key_id`,
+    /// `withdrawn_at`, `authority_decision_digest`, `superseded_by`,
+    /// `persist_row_hash`. `persist_row_hash` is recomputed locally, so it
+    /// binds nothing across nodes, and the authority lives entirely behind
+    /// `authority_decision_digest` — a pointer into THIS plane. A cursor on
+    /// the tombstone table would therefore ship a derived verdict and ask the
+    /// receiver to trust the sender: the forgeable-decision-bool bypass
+    /// CIRISPersist#377 closed, rebuilt on purpose and called replication.
+    ///
+    /// So the wire carries the proposal + the holders' hybrid-signed
+    /// participations, and
+    /// [`accord_carriage::admit_replicated_accord_evidence`](crate::federation::accord_carriage::admit_replicated_accord_evidence)
+    /// **re-tallies** them against a roster resolved from the receiver's OWN
+    /// directory before anything lands. Each node then re-derives its own
+    /// V104/V095 projection ([`Projection::RoleWithdrawals`]), which is what
+    /// makes carrying the evidence safe.
+    AccordQuorumEvidence,
 }
 
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order.
-    pub const ALL: [EnvelopeKind; 14] = [
+    pub const ALL: [EnvelopeKind; 15] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -93,6 +126,7 @@ impl EnvelopeKind {
         EnvelopeKind::OrgMembership,
         EnvelopeKind::PartnerRecord,
         EnvelopeKind::TransportDestination,
+        EnvelopeKind::AccordQuorumEvidence,
     ];
 
     /// The stable wire token (must match edge's `as_str`; pinned by hash).
@@ -113,6 +147,7 @@ impl EnvelopeKind {
             EnvelopeKind::OrgMembership => "OrgMembership",
             EnvelopeKind::PartnerRecord => "PartnerRecord",
             EnvelopeKind::TransportDestination => "TransportDestination",
+            EnvelopeKind::AccordQuorumEvidence => "AccordQuorumEvidence",
         }
     }
 }
@@ -185,6 +220,14 @@ pub enum Projection {
     ConsentPeerSet,
     /// The V106 `attestation_subjects` subject index (existing).
     AttestationSubjects,
+    /// v31.1.0 (CIRISPersist#662) — the V104/V095 role-withdrawal tombstones,
+    /// re-derived LOCALLY from admitted accord evidence. This is the
+    /// projection that lets the tombstone planes stay off the wire: the
+    /// receiver recomputes each candidate `(op, key_id)` payload digest
+    /// against its OWN key directory and re-runs the #377 authority core, so
+    /// a tombstone exists on a node only because that node re-tallied the
+    /// quorum itself.
+    RoleWithdrawals,
 }
 
 /// The admission policy for one [`EnvelopeKind`] — persist's half of the
@@ -273,6 +316,17 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             PopOnInsert::NotApplicable,
             &[],
         ),
+        // v31.1.0 (#662): the accord evidence bundle. The roster is the
+        // accord holders resolved from OUR baked genesis records, and the
+        // admit gate IS a `tally_live_quorum` re-tally at the strict-majority
+        // threshold — the receiver never reads the sender's verdict. The
+        // withdrawal tombstones are re-derived in the same admit.
+        K::AccordQuorumEvidence => (
+            S::QuorumFromOwnDirectory,
+            B::StewardRosterFromDirectory,
+            PopOnInsert::NotApplicable,
+            &[P::RoleWithdrawals],
+        ),
     };
     KindPolicy {
         kind,
@@ -312,8 +366,13 @@ pub fn replication_policy_sha256() -> String {
 /// the `replication_policy_hash_is_pinned` witness asserts computed ==
 /// pinned. Any admission-policy change is a deliberate re-pin, visible to
 /// every consumer — cross-repo drift is a build failure.
+/// v31.1.0 (CIRISPersist#655/#662) — re-pinned for the 15th kind
+/// ([`EnvelopeKind::AccordQuorumEvidence`]) and the
+/// [`Projection::RoleWithdrawals`] fan-out it declares. Previous value:
+/// `351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b`
+/// (v21.0.0 – v31.0.0, the 14-kind era).
 pub const REPLICATION_POLICY_HASH: &str =
-    "351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b";
+    "3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef";
 
 #[cfg(test)]
 mod tests {
@@ -340,6 +399,6 @@ mod tests {
             // E5: NO wire kind may admit at local tier.
             assert_eq!(p.tier, WireTier::FederationOnly);
         }
-        assert_eq!(EnvelopeKind::ALL.len(), 14, "the wire-kind count is pinned");
+        assert_eq!(EnvelopeKind::ALL.len(), 15, "the wire-kind count is pinned");
     }
 }

@@ -7,7 +7,7 @@
 # persist's half of the #519 item-6 field_processor_matrix → CLM-nsproc citation loop.
 # Columns: decimal_id, claim_id, repo, path#symbol, crate@version
 decimal_id	claim_id	repo	path#symbol	crate@version
-3.1.1	CLM-nsproc-family-roster-membership-change-via-entr-accord	CIRISPersist	ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope	ciris-persist@31.2.0
+3.1.1	CLM-nsproc-family-roster-membership-change-via-entr-accord	CIRISPersist	ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope	ciris-persist@31.0.0
 3.1.1	CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target	CIRISPersist	src/federation/blobs.rs#holds_bytes_attestation_envelope	ciris-persist@31.2.0
 3.1.1	CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target	CIRISPersist	src/federation/schema_resolver.rs#BlobBackedSchemaResolver	ciris-persist@31.2.0
 3.1.2	CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@31.2.0
@@ -18,7 +18,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.5	CLM-nsproc-trace-xor-manifest-shape-trace-manifest	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@31.2.0
 3.1.5	CLM-nsproc-cohort-scope-trace-manifest	CIRISPersist	src/federation/types.rs#LocalAttestationInput	ciris-persist@31.2.0
 3.1.5.1	CLM-nsproc-raw-chain-of-thought-dma-csdma	CIRISPersist	src/federation/schema_resolver.rs#BlobBackedSchemaResolver	ciris-persist@31.2.0
-3.1.8	CLM-nsproc-cohort-operational-definition-calibratio-manifold-conformity-cohort	CIRISPersist	signing/event.rs#CohortDelineation	ciris-persist@31.2.0
+3.1.8	CLM-nsproc-cohort-operational-definition-calibratio-manifold-conformity-cohort	CIRISPersist	signing/event.rs#CohortDelineation	ciris-persist@31.0.0
 3.1.8.2	CLM-nsproc-lens-core-version-detection-intra-agent-consistency	CIRISPersist	src/derived/types.rs#DetectionEvent	ciris-persist@31.2.0
 3.1.8.5	CLM-nsproc-cross-attestation-prefix-distinctness-detection-distributive-access-resource-t	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@31.2.0
 3.1.9.2	CLM-nsproc-community-id-moderation-allegation-type	CIRISPersist	src/federation/admission.rs#check_delegated_duty_scores_admission	ciris-persist@31.2.0
