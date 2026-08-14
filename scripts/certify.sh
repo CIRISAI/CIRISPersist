@@ -267,6 +267,7 @@ run_bg fmt        cargo fmt --all --check
 run_bg pyi        python3 scripts/pyi_surface.py check
 run_bg featmatrix python3 scripts/ci_feature_matrix.py check
 run_bg docver     python3 scripts/doc_version_refs.py
+run_bg dirdouble  python3 scripts/gen_directory_double.py --check
 # v30.4.1 (CIRISPersist#618) — the SUBSET compile leg: `_pyffi` WITHOUT `pyo3`.
 # `--all-features` is totality by union and structurally cannot omit a feature,
 # so it is blind to "A without B". v30.4.0 shipped a `#[cfg(feature = "pyo3")]`

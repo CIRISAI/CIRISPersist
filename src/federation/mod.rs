@@ -233,6 +233,10 @@ pub mod substrate_machine;
 // pubkeys at the bulk store/replicate path, BEFORE persist. Local-tier
 // rows are exempt (CC 5.3.2.2 deferred signature). Sibling of
 // `register::verify_key_registration`; same verify contract.
+/// v31.4.0 (CIRISPersist#603/#604) — the fault-injecting `FederationDirectory`
+/// double. Test-only, and `pub` because consumers need it.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod directory_double;
 pub mod tier_ingest;
 pub mod topology;
 // v21.6.0 (CIRISPersist#519 item 2a-ii) — the closed, total (terminating)
