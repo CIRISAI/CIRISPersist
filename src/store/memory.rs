@@ -9546,6 +9546,14 @@ mod tests {
     /// moved past the cursor, which is what a node looks like after an NTP
     /// correction. Two proposals under a forward clock would pass with
     /// `Utc::now()` and prove nothing.
+    ///
+    /// Gated to the backend union because `carriage_tests` is
+    /// (`#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]`).
+    /// The MemoryBackend itself compiles under the default feature set, so a
+    /// bare `#[tokio::test]` here compiles the test without its helper module
+    /// and the `default` leg fails to build — invisible to every backend leg,
+    /// which is exactly what certification is for.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn quorum_bundle_survives_backward_clock_memory_662() {
         use crate::federation::accord_carriage::carriage_tests as ts;
