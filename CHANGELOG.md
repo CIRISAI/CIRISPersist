@@ -5,6 +5,88 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.1.0] - 2026-08-13
+
+### Fixed — SECURITY — the re-bake bricked every upgrading node, and the seed stopped half-way on a lost race (#665)
+
+Two review findings against `seed_delegation_plane`, the boot routine 31.1.0
+added to install the baked bundle's conferral rows. Both were real.
+
+**A re-bake refused to boot the fleet it was for.** A node upgraded from v30
+already holds `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle` from
+the PREVIOUS ceremony — same ids, different content. The seed saw the id present
+and skipped it; `verify_delegation_plane_seeded` then compared the stored
+`original_content_hash` against the baked one, found a mismatch, and returned
+`Divergent` — the one posture arm that REFUSES TO BOOT. So shipping a re-baked
+seed would have taken down every upgrading node, on exactly the path v31.0.0
+went out of its way to keep survivable (a stale delegation plane was `Absent`,
+and `Absent` boots).
+
+The divergent arm was written when a hash mismatch had one possible cause: a
+SUBSTITUTED conferral row. A re-bake creates a second, legitimate cause, and the
+arm cannot separate them from the hash alone.
+
+**The chosen semantics: the baked artifact supersedes a PRIOR CEREMONY'S row,
+and only a prior ceremony's row.** A stored row under a baked genesis id whose
+content differs is replaced iff all three hold — (1) it passes the #660
+reservation re-asked against the corpus (federation-tier, attested by a seated
+accord holder on this node's roster); (2) its scrub signature verifies under
+`Strict` hybrid policy against that attester's REGISTERED pubkeys, over its own
+envelope; (3) the digest that verification returns is exactly the row's stored
+`original_content_hash`. Leg 3 is the one that is easy to miss:
+`original_content_hash` is a COLUMN and the signature covers the ENVELOPE, so a
+row can carry a valid holder signature and a content hash scribbled on
+afterwards. Taking `verify_envelope_hybrid_signature`'s return value rather than
+just its `Ok` binds the unsigned column back to the signed bytes.
+
+**Anything failing any leg is left exactly where it is, and still refuses to
+serve.** `Divergent` therefore still means substitution, and the delegation
+leg's arm was NOT weakened. Letting the baked artifact win over every mismatch
+was considered and rejected: it is safe in the narrow sense — the only bytes the
+seed can ever write are the compiled-in ones, so an overwrite is never a
+privilege gain — but it would have retired the one check in the substrate that
+notices a root altered beneath persist. Repairing damage silently and reporting
+nothing is how a compromise stays invisible.
+
+Replacement is a destructive boot-time write, so it goes through a new door
+narrow enough to justify it: `purge_genesis_delegation_row_v31`, gated by
+`check_genesis_rebake_purge_admission` — **the id must be one the compiled-in
+bundle carries** — re-asked inside all three backends (AV-9). The general
+`purge_attestation_v31` is unusable here and deliberately stays that way:
+`genesis-charter` and `genesis-grant:…` are `delegates_to`, which
+`check_purge_admission` refuses as exclusion-bearing, and weakening that gate to
+make a boot path convenient is the trade #650 exists to refuse. The new door's
+worst-case misuse leaves the plane `Absent` — which boots, and which the next
+start re-seeds.
+
+**A duplicate-key error is not `Error::Conflict`.** The seed matched
+`Err(Error::Conflict(_))` as "already present", but no backend reports a
+duplicate `attestation_id` that way: memory and sqlite render it
+`Backend("… UNIQUE constraint failed …")` and postgres's non-FK mapper renders
+it `Backend("SQLSTATE 23505: duplicate key value …")`. Two engines initializing
+one database therefore raced, the loser fell to the fault arm, returned `absent`
+and **abandoned the rest of the plane** — leaving a node permanently half-seeded
+if the winner exited after its first insert.
+
+No backend offers an atomic insert-if-absent on `put_attestation`, and re-typing
+the refusal would move `error_kind`, which `assert_parity` hard-asserts equal
+across backends. So the predicate stays a string test but now exists exactly
+once, as `Error::is_duplicate_key`, documenting all three renderings and what
+would have to change to make it typed. The chain had already been transcribed
+inline in `exercise_genesis_seed_installs` and not carried to the seed — the
+two-lists-that-disagree class — and that call site now uses the shared predicate.
+
+Witnessed on **memory, sqlite and postgres**: `rebake_supersedes_prior_ceremony_*`
+rolls the plane back to the REAL v30 artifact (the verbatim #557 bundle, vendored
+as `prior_ceremony_delegation_rows.json`, injected beneath the write doors
+because its rows carry no #643 mirror) and asserts the node boots, ends
+`entrenched` on the new root, and is idempotent on the next start;
+`duplicate_insert_leaves_plane_fully_seeded_*` writes the winner's row through
+the real door and hands the seed the stale `None` the loser was holding, then
+asserts the plane completes. Mutation-tested both: reverting to `continue` on a
+present row reds the three upgrade witnesses; reverting to `Conflict`-only
+matching reds the three race witnesses.
+
 ## [31.0.0] - 2026-08-12
 
 ### BREAKING — this release requires a FRESH GENESIS. The baked seed will not load.

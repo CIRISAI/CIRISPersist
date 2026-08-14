@@ -3440,6 +3440,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(true)
     }
 
+    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Structurally
+    /// identical to `purge_attestation_v31` above except for WHICH gate it
+    /// re-asks: the general exclusion gate refuses these rows (two of the three
+    /// are `delegates_to`), so this door carries the narrower
+    /// `check_genesis_rebake_purge_admission` — the id must be one the
+    /// compiled-in bundle carries — and nothing else can be reached through it.
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        // The door's own gate (AV-9), before the lock, so a refusal cannot
+        // interleave with a mutation.
+        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.federation_attestations.len();
+        state
+            .federation_attestations
+            .retain(|a| a.attestation_id != attestation_id);
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        // The V106 subject projection follows the row, as it does on the purge
+        // path: the SQL backends get this from `ON DELETE CASCADE`, memory has
+        // to say it.
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
     /// validate against the closed cohort_scope set, stamp it alongside the
     /// re-signed envelope, and recompute `persist_row_hash`.
@@ -17492,6 +17523,61 @@ mod tests {
             .federation_attestations
             .push(squat);
         crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "memory").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg of the **upgrade** witness: a
+    /// node carrying the PREVIOUS ceremony's delegation rows boots, and ends up
+    /// entrenched on the re-baked root.
+    ///
+    /// The predecessor is installed beneath `put_attestation` on purpose. The
+    /// v30 rows carry no #643 `row` mirror, so the door refuses them — which is
+    /// correct and is exactly why a v30 corpus can only have been written by a
+    /// v30 binary. Pushing into backend state is this backend's equivalent of
+    /// the SQL legs' raw `UPDATE`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn rebake_supersedes_prior_ceremony_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        // Roll the plane BACK to the previous ceremony — the state every
+        // upgrading v30 node is actually in.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            for row in state.federation_attestations.iter_mut() {
+                if crate::federation::genesis::genesis_delegation_ids()
+                    .contains(&row.attestation_id.as_str())
+                {
+                    *row = crate::federation::genesis::prior_ceremony_row(&row.attestation_id);
+                }
+            }
+        }
+
+        crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg of the **seed-race** witness:
+    /// a duplicate insert leaves the node FULLY seeded, not half-seeded.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn duplicate_insert_leaves_plane_fully_seeded_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_key_plane_only(&backend, "memory").await;
+        crate::federation::genesis::exercise_duplicate_insert_leaves_plane_fully_seeded(
+            &backend, "memory",
+        )
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the MEMORY leg of the **anti-fail-open**

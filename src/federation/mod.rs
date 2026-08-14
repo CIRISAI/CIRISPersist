@@ -1130,6 +1130,59 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v31.1.0 (CIRISPersist#665) — **the re-bake's replacement half**: remove
+    /// ONE baked genesis delegation row so
+    /// [`seed_delegation_plane`](genesis::seed_delegation_plane) can install the
+    /// current ceremony's version of it under the same id.
+    ///
+    /// # Why this is not [`purge_attestation_v31`]
+    ///
+    /// It cannot be. Two of the three genesis delegation rows are
+    /// `delegates_to`, which
+    /// [`migration::is_exclusion_bearing`](migration::is_exclusion_bearing)
+    /// classifies `ExclusionClass::Delegation`, so
+    /// [`migration::check_purge_admission`](migration::check_purge_admission)
+    /// refuses them — correctly, and that gate must not be weakened: deleting a
+    /// delegation edge on the general purge path is unrecoverable, which is the
+    /// whole of CIRISPersist#650.
+    ///
+    /// # What authorizes it instead
+    ///
+    /// A far narrower rule, re-asked inside every implementation (AV-9,
+    /// verify-before-mutation) via
+    /// [`genesis::check_genesis_rebake_purge_admission`]:
+    ///
+    /// > `attestation_id` MUST be one of the ids the COMPILED-IN bundle carries.
+    ///
+    /// The door therefore cannot address any row that this binary is not
+    /// holding a replacement for. Its worst-case misuse — deleting a genesis
+    /// row and never re-inserting — leaves the delegation plane `Absent`, which
+    /// BOOTS and which the next start re-seeds; it can never remove a
+    /// conferral this node cannot re-create from its own artifact. That bounded
+    /// blast radius is what makes bypassing the exclusion gate defensible here
+    /// and nowhere else.
+    ///
+    /// The re-insert deliberately does NOT live in this door: the caller
+    /// follows it with an ordinary [`put_attestation`](Self::put_attestation),
+    /// so the replacement row pays the full admission stack — canonical-at-rest,
+    /// the #660 reservation, `persist_row_hash`, the V106 subject projection —
+    /// exactly as a first-boot install does. A second write path for genesis
+    /// rows would be a second thing to keep in step with the first.
+    ///
+    /// Returns whether a row was actually removed. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if `attestation_id` is not a baked genesis
+    /// delegation id; [`Error::Backend`] on a backend failure.
+    async fn purge_genesis_delegation_row_v31(&self, attestation_id: &str) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_genesis_delegation_row_v31",
+        })
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
     /// an EXISTING attestation row: the second placement door, driven by
     /// [`crate::Engine::repair_stranded_scope_backlog`] (CIRISPersist#530),
@@ -6596,5 +6649,61 @@ impl Error {
             Error::Backend(_) => "federation_backend",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
         }
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — **did this write lose a primary-key race?**
+    ///
+    /// The one predicate for *"the row is already there, written by somebody
+    /// else"*, so that every caller which must treat a duplicate as SUCCESS
+    /// asks the same question in the same words.
+    ///
+    /// # Why a string predicate and not a typed variant
+    ///
+    /// A duplicate `attestation_id` does **not** surface as [`Error::Conflict`]
+    /// on any backend. All three funnel it into [`Error::Backend`]:
+    ///
+    /// - **memory** — the AV-79 uniqueness emulation returns
+    ///   `Backend("insert attestation: UNIQUE constraint failed: …")`,
+    ///   deliberately byte-identical to sqlite's;
+    /// - **sqlite** — `map`s every non-FK `rusqlite` insert failure through
+    ///   `Backend(format!("insert attestation: {msg}"))`, and `msg` for a PK
+    ///   collision is `UNIQUE constraint failed: …`;
+    /// - **postgres** — `map_attestation_pg_err` classifies only SQLSTATE 23503
+    ///   (FK) specially; a 23505 unique violation falls through to
+    ///   `Backend(pg_error_detail(..))`, which renders as
+    ///   `SQLSTATE 23505: duplicate key value violates unique constraint …`.
+    ///
+    /// The *right* fix would be a typed `Error::Conflict` from all three, or an
+    /// `INSERT … ON CONFLICT DO NOTHING` insert-if-absent primitive. Neither is
+    /// available to this cut: no backend offers an atomic insert-if-absent on
+    /// `put_attestation` (all three do a plain `INSERT` behind the full
+    /// admission stack), and re-typing the refusal would move
+    /// `error_kind` — which `assert_parity` hard-asserts equal across backends,
+    /// and which the memory backend's uniqueness emulation was written
+    /// specifically to match. That is a public-contract change, not a fix to
+    /// this finding.
+    ///
+    /// So the predicate stays a string test, and the point of putting it HERE
+    /// is that there is exactly one of it. It was previously transcribed inline
+    /// in `exercise_genesis_seed_installs` and NOT in
+    /// [`seed_delegation_plane`](super::federation::genesis::seed_delegation_plane) —
+    /// a second copy would have been the two-lists-that-disagree class, which is
+    /// how the seed path came to treat a lost race as "still absent" and stop
+    /// seeding half-way.
+    ///
+    /// Both the SQLSTATE token and the human phrase are matched for postgres:
+    /// the code is the machine fact, the phrase survives a locale or
+    /// driver-rendering change of the other.
+    #[must_use]
+    pub fn is_duplicate_key(&self) -> bool {
+        if matches!(self, Error::Conflict(_)) {
+            return true;
+        }
+        let Error::Backend(msg) = self else {
+            return false;
+        };
+        msg.contains("UNIQUE constraint")
+            || msg.contains("duplicate key")
+            || msg.contains("SQLSTATE 23505")
     }
 }

@@ -4440,6 +4440,33 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(n > 0)
     }
 
+    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Same statement
+    /// as `purge_attestation_v31` above, a different and much narrower gate: the
+    /// general exclusion gate refuses these rows (two of the three are
+    /// `delegates_to`), so this door asks only whether the id is one the
+    /// compiled-in bundle carries. `attestation_subjects` follows via `ON DELETE
+    /// CASCADE` (V106).
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        // The door's own gate, before any statement runs (AV-9).
+        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                rusqlite::params![id],
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_genesis_delegation_row_v31: {e}"))
+        })?;
+        Ok(n > 0)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back: stamp a new `cohort_scope` onto an existing row
     /// (validated against the closed set) and recompute
@@ -21063,6 +21090,80 @@ mod tests {
             assert_eq!(n, 1, "the injection must actually have moved a row");
         }
         crate::federation::genesis::assert_injected_squat_is_divergent(&backend, "sqlite").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the SQLITE leg of the **upgrade** witness: a
+    /// node carrying the PREVIOUS ceremony's delegation rows boots, and ends up
+    /// entrenched on the re-baked root.
+    ///
+    /// The predecessor is rolled in with a raw `UPDATE`, beneath
+    /// `put_attestation`, because the v30 rows carry no #643 `row` mirror and
+    /// the door refuses them — which is precisely why a v30 corpus can only
+    /// have been written by a v30 binary.
+    #[tokio::test]
+    async fn rebake_supersedes_prior_ceremony_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        for id in crate::federation::genesis::genesis_delegation_ids() {
+            let prior = crate::federation::genesis::prior_ceremony_row(id);
+            let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
+            let scrubs = serde_json::to_string(&prior.additional_scrubs).unwrap();
+            // BLOB, as `put_attestation` writes it.
+            let och = hex::decode(&prior.original_content_hash).unwrap();
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_attestations SET \
+                        attestation_envelope = ?1, original_content_hash = ?2, \
+                        scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
+                        additional_scrubs = ?5, asserted_at = ?6, scrub_timestamp = ?7, \
+                        pqc_completed_at = ?8, persist_row_hash = ?9 \
+                     WHERE attestation_id = ?10",
+                    rusqlite::params![
+                        envelope,
+                        och,
+                        prior.scrub_signature_classical,
+                        prior.scrub_signature_pqc,
+                        scrubs,
+                        prior.asserted_at.to_rfc3339(),
+                        prior.scrub_timestamp.to_rfc3339(),
+                        prior.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        prior.persist_row_hash,
+                        id,
+                    ],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the roll-back must actually have moved row {id}");
+        }
+
+        crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "sqlite")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the SQLITE leg of the **seed-race** witness:
+    /// a duplicate insert leaves the node FULLY seeded, not half-seeded.
+    #[tokio::test]
+    async fn duplicate_insert_leaves_plane_fully_seeded_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_key_plane_only(&backend, "sqlite").await;
+        crate::federation::genesis::exercise_duplicate_insert_leaves_plane_fully_seeded(
+            &backend, "sqlite",
+        )
+        .await;
     }
 
     /// v31.0.0 (CIRISPersist#648) — the SQLITE leg of the **anti-fail-open**

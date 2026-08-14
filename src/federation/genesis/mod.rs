@@ -580,6 +580,50 @@ fn baked_delegation_row(id: &str) -> Option<&'static super::Attestation> {
         .find(|a| a.attestation_id == id)
 }
 
+/// v31.1.0 (CIRISPersist#665) — **the re-bake replacement door's own gate.**
+///
+/// [`FederationDirectory::purge_genesis_delegation_row_v31`](super::FederationDirectory::purge_genesis_delegation_row_v31)
+/// exists because the general purge door cannot serve the re-bake: two of the
+/// three genesis delegation rows are `delegates_to`, which
+/// [`check_purge_admission`](crate::federation::migration::check_purge_admission)
+/// refuses as exclusion-bearing. That refusal is right and stays; this is a
+/// different door with a different, much smaller authority, and this is the
+/// sentence that draws it:
+///
+/// > the id must be one the COMPILED-IN bundle carries.
+///
+/// Everything that makes the bypass defensible follows from that one bound. The
+/// door can only ever address a row this binary is holding a replacement for,
+/// so the worst a wrong caller achieves is a delegation plane that reads
+/// `Absent` — which BOOTS, and which the next start re-seeds. It can never
+/// remove a conferral the node cannot re-create from its own artifact.
+///
+/// Asked INSIDE every backend implementation, not just at the call site: a
+/// delete door whose safety lives entirely in its caller is the shape
+/// CIRISPersist#652 had.
+///
+/// # Tier 1
+///
+/// Pure — a membership test against the 3-element baked set. No directory read.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`](super::Error::InvalidArgument) if `attestation_id`
+/// is not a baked genesis delegation id.
+pub fn check_genesis_rebake_purge_admission(attestation_id: &str) -> Result<(), super::Error> {
+    if baked_delegation_row(attestation_id).is_some() {
+        return Ok(());
+    }
+    Err(super::Error::InvalidArgument(format!(
+        "refusing to purge attestation {attestation_id} through the genesis re-bake door \
+         (CIRISPersist#665): it is not one of the baked genesis delegation ids {:?}. This door \
+         exists only to let the compiled-in bundle replace its OWN previous ceremony's rows — \
+         the general purge path is `purge_attestation_v31`, and it refuses exclusion-bearing \
+         rows on purpose",
+        genesis_delegation_ids(),
+    )))
+}
+
 /// v31.0.0 (CIRISPersist#660) — **the genesis delegation ids are RESERVED** to
 /// the accord holders, at every write door.
 ///
@@ -1121,12 +1165,17 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
                 // property #622 holds is "this bundle is installable on every
                 // backend", and a primary-key conflict is that property having
                 // already been satisfied — not a backend that refused it.
+                //
+                // v31.1.0 (CIRISPersist#665) — through the SHARED predicate. The
+                // three-backend duplicate-key test was first written HERE, as an
+                // inline `Conflict || "UNIQUE constraint" || "duplicate key"`
+                // chain, and was not carried to `seed_delegation_plane` — which
+                // matched `Conflict` alone and therefore treated a lost seed race
+                // as "still absent". One transcription of a predicate is a
+                // predicate; two are a disagreement waiting to happen.
                 match dir.put_attestation(att.clone()).await {
                     Ok(()) => {}
-                    Err(e)
-                        if matches!(e, crate::federation::Error::Conflict(_))
-                            || e.to_string().contains("UNIQUE constraint")
-                            || e.to_string().contains("duplicate key") => {}
+                    Err(e) if e.is_duplicate_key() => {}
                     Err(e) => {
                         panic!("genesis attestation {id:?} must install on EVERY backend: {e}")
                     }
@@ -1470,6 +1519,306 @@ pub(crate) async fn assert_injected_squat_is_divergent(
     );
 }
 
+/// v31.1.0 (CIRISPersist#665) — **the PREVIOUS ceremony's delegation rows, as
+/// the ceremony actually produced them.**
+///
+/// Not synthesized. This is the verbatim `attestations` array of the bundle
+/// baked at CIRISPersist#557 (`git show a718fb5 -- canonical_seed.json`) — the
+/// artifact every v30 node in the fleet is holding right now: same three ids,
+/// A1-attested with B1 co-scrubbing, and a different envelope and
+/// `original_content_hash` from the 31.1.0 re-bake.
+///
+/// Vendoring the real predecessor rather than hand-rolling a "looks previous"
+/// row is the point. The upgrade this fix has to survive is a fact about two
+/// specific artifacts, and a fabricated stand-in would prove a property of the
+/// fabrication: it would be trivial to build one that happens to satisfy the
+/// three legs of [`stored_row_is_prior_ceremony`] while the real v30 rows do
+/// not. These verify against the seeded A1 anchor because A1 signed them.
+///
+/// # Panics
+///
+/// If the vendored JSON stops parsing as `[Attestation]`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) fn prior_ceremony_delegation_rows() -> Vec<super::Attestation> {
+    let rows: Vec<super::Attestation> =
+        serde_json::from_str(include_str!("prior_ceremony_delegation_rows.json"))
+            .expect("the vendored v30 ceremony rows must parse as [Attestation]");
+    assert_eq!(
+        rows.len(),
+        canonical_genesis_bundle().attestations.len(),
+        "the vendored predecessor must cover the same plane the baked bundle does"
+    );
+    rows
+}
+
+/// v31.1.0 (CIRISPersist#665) — the vendored PREVIOUS ceremony's row for `id`.
+///
+/// # Panics
+///
+/// If `id` is not one of the ids the predecessor bundle carried.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) fn prior_ceremony_row(id: &str) -> super::Attestation {
+    prior_ceremony_delegation_rows()
+        .into_iter()
+        .find(|r| r.attestation_id == id)
+        .unwrap_or_else(|| panic!("the v30 ceremony carried no row {id}"))
+}
+
+/// v31.1.0 (CIRISPersist#665) — seed the KEY plane and stop: holders, the
+/// accord family, the canonical serve nodes — everything
+/// [`seed_family_and_canonical`] does EXCEPT the delegation plane.
+///
+/// The race witness needs a directory where `put_attestation` of a genesis row
+/// will be admitted (so the attester, the family and the canonical subject all
+/// have to be live) but where the plane itself is still empty, because
+/// "half-seeded" is only observable against rows that have not been installed
+/// yet.
+///
+/// The caller seeds the accord holders first — that is a backend method, not a
+/// [`FederationDirectory`](super::FederationDirectory) one, so it cannot be
+/// reached from here.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn seed_key_plane_only(dir: &dyn super::FederationDirectory, tag: &str) {
+    verify_anchor_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] anchors: {e}"));
+    seed_accord_family(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] accord family: {e}"));
+    verify_family_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] family verify: {e}"));
+    seed_canonical_servers(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] canonical servers: {e}"));
+    verify_canonical_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] canonical verify: {e}"));
+    for sa in &canonical_genesis_bundle().attestations {
+        assert!(
+            dir.get_attestation(&sa.attestation.attestation_id)
+                .await
+                .expect("read back")
+                .is_none(),
+            "[{tag}] the KEY plane seed must not have installed the delegation plane"
+        );
+    }
+}
+
+/// v31.1.0 (CIRISPersist#665) — **THE UPGRADE WITNESS: a node holding the
+/// PREVIOUS ceremony's delegation rows must boot, and must end up entrenched on
+/// the NEW root.**
+///
+/// This is the P1 finding stated as an assertion. Before the fix,
+/// [`seed_delegation_plane`] skipped any id it found present, so an upgraded
+/// node kept its v30 rows, [`verify_delegation_plane_seeded`] saw content
+/// hashes that are not the baked ones, and returned `Divergent` — the one
+/// posture arm that REFUSES TO BOOT. A re-bake would have bricked the entire
+/// upgrading fleet, on precisely the path v31.0.0 built the `Absent`-boots
+/// discipline to keep alive.
+///
+/// The caller installs the predecessor beneath the write doors (each backend's
+/// own bypass — the v30 rows carry no #643 `row` mirror, so `put_attestation`
+/// refuses them, exactly as it would refuse them today on a fresh node). The
+/// assertions are shared so the three legs cannot disagree about what surviving
+/// an upgrade means.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_rebake_supersedes_prior_ceremony(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    // Precondition — the injection really did leave this node on the old root.
+    // Without this the witness could pass on a node that was never upgraded.
+    for baked in canonical_genesis_bundle().attestations.iter() {
+        let id = &baked.attestation.attestation_id;
+        let row = dir
+            .get_attestation(id)
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| panic!("[{tag}] the predecessor row {id} must be installed"));
+        assert_ne!(
+            row.original_content_hash, baked.attestation.original_content_hash,
+            "[{tag}] the fixture must start on the PREVIOUS ceremony's content for {id}, \
+             otherwise this witness proves nothing"
+        );
+    }
+
+    // (1) BOOT. This is the assertion that was false: the seed must not fail,
+    // and — the part that matters — must not leave the old rows in place.
+    seed_delegation_plane(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] an upgrading node must seed, not fault: {e}"));
+
+    // (2) ENTRENCHED ON THE NEW ROOT. `verify_delegation_plane_seeded` is
+    // deliberately unchanged by this fix — it still calls a stored hash that is
+    // not the baked one `Divergent`. It passing here is the whole proof that
+    // the rows were REPLACED rather than tolerated.
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("[{tag}] after the re-bake the plane must verify against the NEW root: {e}")
+        });
+    for baked in canonical_genesis_bundle().attestations.iter() {
+        let id = &baked.attestation.attestation_id;
+        let row = dir
+            .get_attestation(id)
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| panic!("[{tag}] {id} vanished across the replacement"));
+        assert_eq!(
+            row.original_content_hash, baked.attestation.original_content_hash,
+            "[{tag}] {id} must now carry the BAKED content hash"
+        );
+        assert_eq!(
+            row.attestation_id, *id,
+            "[{tag}] the id the ceremony SIGNED must round-trip unchanged"
+        );
+    }
+    let posture = posture::genesis_posture(dir).await;
+    assert_eq!(
+        posture.as_str(),
+        "entrenched",
+        "[{tag}] an upgraded node ends entrenched, not divergent and not pre-genesis"
+    );
+
+    // (3) IDEMPOTENT. Boot runs every start; the second pass must find the
+    // plane current and touch nothing. A replacement arm that re-fired every
+    // boot would be deleting and re-inserting the constitutional root forever.
+    for sa in &canonical_genesis_bundle().attestations {
+        let stored = dir
+            .get_attestation(&sa.attestation.attestation_id)
+            .await
+            .expect("read back");
+        assert_eq!(
+            install_or_supersede_delegation_row(dir, sa, stored)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] the second boot must be a no-op: {e}")),
+            DelegationRowOutcome::AlreadyCurrent,
+            "[{tag}] a settled plane is AlreadyCurrent on every later boot"
+        );
+    }
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] and it still verifies after a second pass: {e}"));
+}
+
+/// v31.1.0 (CIRISPersist#665) — **THE RACE WITNESS: a duplicate insert leaves
+/// the node FULLY seeded, not half-seeded.**
+///
+/// The P2 finding stated as an assertion. Two engines initializing one database
+/// both read a missing row and both write it; the loser's `put_attestation`
+/// comes back with a primary-key collision. That collision is
+/// [`Error::Backend`](super::Error::Backend) on all three backends — memory and
+/// sqlite render it `UNIQUE constraint failed: …`, postgres `SQLSTATE 23505:
+/// duplicate key value …` — and NEVER `Error::Conflict`, which is all the
+/// original code matched. So the loser fell through to the fault arm, returned
+/// `absent`, and **abandoned the rest of the plane**. If the winner then exited
+/// after its first insert, the node was left permanently half-seeded until
+/// somebody restarted it.
+///
+/// # Why this drives the seam instead of racing two tasks
+///
+/// A timing race is not a witness. Memory and sqlite do no I/O in
+/// `put_attestation`, so their futures never yield and two joined seeders run
+/// strictly one after the other — the collision would simply never occur, and
+/// the test would pass while proving nothing (and a MUTANT would pass with it).
+///
+/// The loser's position is fully described by one fact: **it acts on a `None`
+/// read while the row exists.** [`install_or_supersede_delegation_row`] takes
+/// that read as a parameter, so the witness can put the directory in the real
+/// post-race state — the winner's row genuinely written through the real door,
+/// by the real backend — and hand the seed the stale `None` the loser was
+/// holding. The error the seed then sees is the backend's own, not a fixture's.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn exercise_duplicate_insert_leaves_plane_fully_seeded(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let bundle = canonical_genesis_bundle();
+    let first = &bundle.attestations[0];
+
+    // THE WINNER. A real write, through the real door, on the real backend.
+    dir.put_attestation(first.clone())
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the winning engine's insert must land: {e}"));
+
+    // THE LOSER, acting on the read it took before that write. This call is the
+    // regression: it must absorb the collision and report the plane seeded.
+    let outcome = install_or_supersede_delegation_row(dir, first, None)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "[{tag}] losing a primary-key race is boot NORMALITY — the row is present, which \
+                 is what the seed wanted. Reporting a fault here is what abandoned the rest of \
+                 the plane and left nodes half-seeded: {e}"
+            )
+        });
+    assert_eq!(
+        outcome,
+        DelegationRowOutcome::Raced,
+        "[{tag}] and it is named as a race, not silently conflated with a fresh install"
+    );
+
+    // AND THE PLANE COMPLETES. The half-seeding is the actual harm: the loser
+    // must go on to install the rows the winner never reached.
+    for sa in bundle.attestations.iter().skip(1) {
+        assert!(
+            dir.get_attestation(&sa.attestation.attestation_id)
+                .await
+                .expect("read back")
+                .is_none(),
+            "[{tag}] the fixture must start with the rest of the plane UNSEEDED, or the \
+             half-seeding claim is untested"
+        );
+    }
+    seed_delegation_plane(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the loser must finish seeding the plane: {e}"));
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("[{tag}] and the plane must verify, not be half-installed: {e}")
+        });
+    for sa in &bundle.attestations {
+        let id = &sa.attestation.attestation_id;
+        let row = dir
+            .get_attestation(id)
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| {
+                panic!("[{tag}] {id} was never installed — the node is half-seeded")
+            });
+        assert_eq!(
+            row.original_content_hash, sa.attestation.original_content_hash,
+            "[{tag}] {id} carries the baked content"
+        );
+    }
+    assert_eq!(
+        posture::genesis_posture(dir).await.as_str(),
+        "entrenched",
+        "[{tag}] a node that lost a seed race still boots entrenched"
+    );
+
+    // The duplicate-key predicate is measured against THIS backend's real
+    // error, not assumed: the whole finding was that it is not `Conflict`.
+    let dup = dir
+        .put_attestation(first.clone())
+        .await
+        .expect_err("a second insert of a present id must fail");
+    assert!(
+        dup.is_duplicate_key(),
+        "[{tag}] this backend's duplicate-key error must be recognized by the ONE shared \
+         predicate (kind={}, err={dup})",
+        dup.kind()
+    );
+    assert_eq!(
+        dup.kind(),
+        "federation_backend",
+        "[{tag}] and it is `Backend`, not `Conflict` — which is exactly why matching \
+         `Error::Conflict` alone silently never fired"
+    );
+}
+
 /// v13.4.1 (CIRISPersist#392) — the **single shared genesis-seed routine** run
 /// by BOTH engine constructors ([`Engine::with_signer`](crate::engine::Engine::with_signer)
 /// AND the pyo3 `PyEngine::new`), so they are **seed-identical by construction**
@@ -1532,12 +1881,99 @@ where
 /// the exact fail-open the fourth posture leg exists to catch.
 ///
 /// Discipline matches [`seed_canonical_servers`] deliberately:
-/// - **already present ⇒ no-op.** `put_attestation` is idempotent on the
-///   primary key, and a `Conflict` here is boot NORMALITY on a seeded fleet.
+/// - **already present and byte-current ⇒ no-op.** A row whose
+///   `original_content_hash` is the baked one is this ceremony's row, already
+///   entrenched; boot NORMALITY on a seeded fleet.
 /// - **refused ⇒ `absent`, never `divergent`.** A refusal means this node is
 ///   awaiting its ceremony, and it must BOOT. `divergent` refuses to serve, and
 ///   an artifact that cannot install is not evidence of tampering — that
 ///   distinction is what keeps 31.0.0's seedless boot working.
+///
+/// # v31.1.0 (CIRISPersist#665) — the UPGRADE path: a re-bake SUPERSEDES
+///
+/// The first form of this routine skipped any id it found present, and that
+/// bricked every upgrading node. The chain is short and entirely mechanical: a
+/// v30 node already holds `genesis-charter` / `genesis-grant:…` /
+/// `genesis-lifecycle` from the PREVIOUS ceremony — **same ids, different
+/// content** — so the skip fired, [`verify_delegation_plane_seeded`] ran next,
+/// found a stored `original_content_hash` that is not the baked one, and
+/// returned `Divergent`. `Divergent` is the one posture arm that REFUSES TO
+/// BOOT. A re-bake would therefore have taken down exactly the fleet that
+/// v31.0.0 went out of its way to keep bootable, where a stale delegation plane
+/// was `Absent` and `Absent` boots.
+///
+/// The divergent arm was written when a hash mismatch had exactly one cause: a
+/// SUBSTITUTED conferral row. A re-bake produces a second, entirely legitimate
+/// cause, and the arm cannot tell them apart from the hash alone — so the
+/// separation has to happen HERE, before verification, and the baked bundle has
+/// to win where it is entitled to.
+///
+/// ## Which mismatches are replaced, and which are still refused
+///
+/// **Chosen semantics: the baked artifact supersedes a PRIOR CEREMONY'S row,
+/// and only a prior ceremony's row.** A mismatch is replaceable iff the STORED
+/// row is a complete, self-consistent statement by the accord holders — which
+/// is to say, all three of:
+///
+/// 1. it passes [`check_genesis_attestation_reserved`] — federation-tier, and
+///    attested by a seated accord holder on THIS node's effective roster (the
+///    #660 reservation, re-asked against a row that is already in the corpus
+///    rather than one arriving at a door);
+/// 2. its scrub signature verifies, under `Strict` hybrid policy, against that
+///    attester's REGISTERED pubkeys, over its OWN envelope;
+/// 3. the digest that verification returns — `SHA-256` of the canonical
+///    envelope — is exactly the row's stored `original_content_hash`.
+///
+/// Leg 3 is not redundant with leg 2 and is the reason this is not merely a
+/// signature check. `original_content_hash` is a COLUMN, and the ceremony's
+/// signature is taken over the ENVELOPE, so the column is not covered by it —
+/// a row can carry a perfectly valid holder signature and a content hash that
+/// was scribbled on afterwards. Asking `verify_envelope_hybrid_signature` for
+/// its return value rather than just its `Ok` binds the two back together: the
+/// pairing (envelope, digest) is checked, not just the envelope.
+///
+/// Anything that fails any leg is LEFT EXACTLY WHERE IT IS and not written to.
+/// [`verify_delegation_plane_seeded`] runs immediately after and classifies it
+/// `Divergent`, boot refuses, and the operator gets the banner. **This is the
+/// stated decision the finding asked for: a genuinely substituted row is still
+/// detected, not silently overwritten.** The alternative — let the baked
+/// artifact win over every mismatch — was rejected. It is safe in the narrow
+/// sense (the only bytes this routine can ever write are the compiled-in ones,
+/// so overwriting is never a privilege gain) but it would have retired the
+/// delegation leg's `Divergent` arm entirely, and that arm is the only thing in
+/// the substrate that notices a root altered beneath persist. Repairing damage
+/// silently and reporting nothing is how a compromise stays invisible.
+///
+/// What an attacker cannot do, concretely: forge leg 2 without a seated
+/// holder's key. A row renamed onto a genesis id beneath persist carries a
+/// signature over its own former envelope and fails; a fabricated row claiming
+/// `attesting_key_id: "A1"` fails; the baked row with a rewritten content hash
+/// fails leg 3. All three stay `Divergent` — witnessed in
+/// `assert_injected_squat_is_divergent` on all three backends.
+///
+/// ## The write
+///
+/// Replacement is a destructive boot-time write, so it goes through the one
+/// door narrow enough to justify it —
+/// [`purge_genesis_delegation_row_v31`](super::FederationDirectory::purge_genesis_delegation_row_v31),
+/// which can only address ids the compiled-in bundle carries (see
+/// [`check_genesis_rebake_purge_admission`]) — and is immediately followed by
+/// an ordinary `put_attestation` of the baked row, so the replacement pays the
+/// full admission stack exactly as a first-boot install does. The general purge
+/// door is unusable here and deliberately so: `genesis-charter` and
+/// `genesis-grant:…` are `delegates_to`, which `check_purge_admission` refuses
+/// as exclusion-bearing, and weakening that gate to make a boot path convenient
+/// is the trade CIRISPersist#650 exists to refuse.
+///
+/// A crash between the delete and the insert leaves the row missing, which is
+/// `Absent` — it boots, and the next start re-installs it. There is no
+/// interleaving that yields a worse state than "awaiting its ceremony".
+///
+/// # Idempotence
+///
+/// Boot runs every start. Second and later starts find the baked hash already
+/// stored and take the no-op arm; the replacement arm is reachable only while a
+/// prior ceremony's row is still present, and it removes its own precondition.
 pub async fn seed_delegation_plane<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
@@ -1545,28 +1981,193 @@ where
     const LEG: GenesisLeg = GenesisLeg::Delegation;
     for sa in &canonical_genesis_bundle().attestations {
         let id = &sa.attestation.attestation_id;
-        match dir.get_attestation(id).await {
-            Ok(Some(_)) => continue,
-            Ok(None) => {}
-            Err(e) => {
-                return Err(GenesisFault::unreadable(
+        // READ, then decide, then act. The read is separated from the decision
+        // deliberately — see `install_or_supersede_delegation_row`, which takes
+        // this value as an argument precisely so that the STALE read a lost
+        // primary-key race produces is expressible as data.
+        let stored = dir.get_attestation(id).await.map_err(|e| {
+            GenesisFault::unreadable(LEG, format!("lookup delegation row {id}: {e}"))
+        })?;
+        install_or_supersede_delegation_row(dir, sa, stored).await?;
+    }
+    Ok(())
+}
+
+/// v31.1.0 (CIRISPersist#665) — **what [`seed_delegation_plane`] did about one
+/// row**, so that a seed pass can be asserted on rather than inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationRowOutcome {
+    /// The plane did not hold this id; the baked row was installed.
+    Installed,
+    /// The baked row was already stored, byte-current. Boot normality.
+    AlreadyCurrent,
+    /// A PREVIOUS ceremony's row was removed and the baked row installed over
+    /// it. The upgrade path — see [`seed_delegation_plane`].
+    Superseded,
+    /// The install lost a primary-key race: somebody else wrote this id between
+    /// the read and the write. The row is present, so the plane is seeded;
+    /// nothing more to do, and emphatically not a reason to stop seeding.
+    Raced,
+    /// A row is present that is neither the baked one nor a verifiable
+    /// statement by a seated accord holder. It was LEFT UNTOUCHED;
+    /// [`verify_delegation_plane_seeded`] will classify it `Divergent` and boot
+    /// will refuse.
+    LeftAsSubstituted,
+}
+
+/// v31.1.0 (CIRISPersist#665) — the per-row body of [`seed_delegation_plane`],
+/// which owns the whole install/supersede/refuse decision for ONE baked row.
+///
+/// `stored` is what the caller's [`get_attestation`](super::FederationDirectory::get_attestation)
+/// returned. It is a PARAMETER rather than a read taken here, and that is the
+/// load-bearing part of this signature: between a boot's read and its write,
+/// another engine initializing the same database can install the row, and the
+/// only faithful expression of the loser's position is *"acted on `None` while
+/// the row exists"*. Passing the read in makes that state reachable by a
+/// witness without a timing-dependent harness, and it costs the production path
+/// nothing — the caller reads once and hands the value over.
+///
+/// The decision rules, and the reasoning for every arm, live in
+/// [`seed_delegation_plane`]'s documentation.
+///
+/// # Errors
+///
+/// [`GenesisFault::absent`] if the row could not be installed or a previous
+/// ceremony's row could not be removed. Never [`GenesisFault::divergent`]: an
+/// artifact that will not install is a node awaiting its ceremony, and it must
+/// BOOT. Divergence is [`verify_delegation_plane_seeded`]'s verdict to reach,
+/// over the corpus, after seeding has done what it can.
+pub async fn install_or_supersede_delegation_row<D>(
+    dir: &D,
+    sa: &super::SignedAttestation,
+    stored: Option<super::Attestation>,
+) -> Result<DelegationRowOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Delegation;
+    let baked = &sa.attestation;
+    let id = &baked.attestation_id;
+
+    if let Some(stored) = stored {
+        // Already this ceremony's row. The overwhelmingly common path on every
+        // start after the first.
+        if stored.original_content_hash == baked.original_content_hash {
+            return Ok(DelegationRowOutcome::AlreadyCurrent);
+        }
+        // A mismatch. Only a prior ceremony's row may be superseded; see the
+        // three legs in `seed_delegation_plane`'s docs.
+        if !stored_row_is_prior_ceremony(dir, &stored).await {
+            tracing::error!(
+                attestation_id = %id,
+                stored_content_hash = %stored.original_content_hash,
+                baked_content_hash = %baked.original_content_hash,
+                "genesis delegation seed: a row under this baked id is present, does NOT match \
+                 the baked artifact, and is NOT a verifiable statement by a seated accord \
+                 holder — leaving it untouched. This is a SUBSTITUTED conferral row; the posture \
+                 check that runs next will refuse to serve"
+            );
+            return Ok(DelegationRowOutcome::LeftAsSubstituted);
+        }
+        tracing::warn!(
+            attestation_id = %id,
+            superseded_content_hash = %stored.original_content_hash,
+            baked_content_hash = %baked.original_content_hash,
+            "genesis delegation seed: replacing a PREVIOUS ceremony's row with the baked \
+             artifact (CIRISPersist#665)"
+        );
+        match dir.purge_genesis_delegation_row_v31(id).await {
+            Ok(_) => {}
+            // A directory with no replacement door cannot be upgraded in place.
+            // `absent` BOOTS — and it short-circuits ahead of
+            // `verify_delegation_plane_seeded`, so such a node comes up awaiting
+            // its ceremony rather than bricked by a fault it cannot clear.
+            Err(e @ super::Error::Unsupported { .. }) => {
+                return Err(GenesisFault::absent(
                     LEG,
-                    format!("lookup delegation row {id}: {e}"),
+                    format!(
+                        "delegation row {id} is a previous ceremony's and this directory has no \
+                         re-bake replacement door: {e}"
+                    ),
                 ))
             }
-        }
-        match dir.put_attestation(sa.clone()).await {
-            Ok(()) => {}
-            Err(super::Error::Conflict(_)) => {}
             Err(e) => {
                 return Err(GenesisFault::absent(
                     LEG,
-                    format!("delegation row {id} could not be installed: {e}"),
+                    format!("previous delegation row {id} could not be removed: {e}"),
                 ))
             }
         }
+        return match dir.put_attestation(sa.clone()).await {
+            Ok(()) => Ok(DelegationRowOutcome::Superseded),
+            // Somebody else completed the same upgrade first. Still superseded,
+            // just not by us.
+            Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
+            Err(e) => Err(GenesisFault::absent(
+                LEG,
+                format!("baked delegation row {id} could not replace its predecessor: {e}"),
+            )),
+        };
     }
-    Ok(())
+
+    match dir.put_attestation(sa.clone()).await {
+        Ok(()) => Ok(DelegationRowOutcome::Installed),
+        // v31.1.0 (CIRISPersist#665) — A LOST PRIMARY-KEY RACE IS SUCCESS.
+        //
+        // Two engines initializing one database both read `None` above and both
+        // write; one loses. The loser previously fell to the arm below and
+        // returned `absent`, which ABANDONS THE REST OF THE PLANE — so if the
+        // winner exited after its first insert, the node stayed permanently
+        // half-seeded until somebody restarted it.
+        //
+        // The reason the old `Conflict`-only match never fired is that NO
+        // backend reports a duplicate `attestation_id` as `Conflict`: all three
+        // render it as `Error::Backend`. That predicate now lives in exactly one
+        // place — see `Error::is_duplicate_key`, which also records why it is a
+        // string test and what would have to change to make it a typed one.
+        Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
+        Err(e) => Err(GenesisFault::absent(
+            LEG,
+            format!("delegation row {id} could not be installed: {e}"),
+        )),
+    }
+}
+
+/// v31.1.0 (CIRISPersist#665) — **is this stored row a PREVIOUS CEREMONY's, and
+/// therefore superseded by the baked artifact?**
+///
+/// The predicate [`seed_delegation_plane`] keys its replacement arm on; its
+/// three legs and the reasoning behind them are documented there. Split out so
+/// the question has a name, and so the mutation that reverts the fix — skipping
+/// a present row outright — is a visible deletion of a call rather than an
+/// edit inside a loop.
+///
+/// Returns `false` on ANY doubt, including a directory error while resolving
+/// the attester: this gates a destructive write, so an unanswerable question
+/// must not authorize one.
+async fn stored_row_is_prior_ceremony<D>(dir: &D, stored: &super::Attestation) -> bool
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    // Leg 1 — federation-tier, authored by a seated accord holder. Pure, and
+    // cheapest, so it leads: no signature work is spent on a row that could
+    // never have been a ceremony row in the first place.
+    if check_genesis_attestation_reserved(stored).is_err() {
+        return false;
+    }
+    // Legs 2 and 3 — the signature verifies over this row's OWN envelope, AND
+    // the digest it returns is the row's stored `original_content_hash`. The
+    // return value is what binds the unsigned column to the signed bytes; see
+    // `seed_delegation_plane` for why leg 3 is not redundant.
+    let verified = crate::federation::tier_ingest::verify_envelope_hybrid_signature(
+        dir,
+        &stored.attesting_key_id,
+        &stored.attestation_envelope,
+        &stored.scrub_signature_classical,
+        stored.scrub_signature_pqc.as_deref(),
+    )
+    .await;
+    matches!(verified, Ok(digest) if digest == stored.original_content_hash)
 }
 
 #[cfg(test)]
