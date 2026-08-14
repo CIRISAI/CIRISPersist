@@ -3362,6 +3362,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             else {
                 return Ok(false);
             };
+            // v31.2.0 (CIRISPersist#670) — the PURE shape gate leads, the AV-76
+            // tier order its two siblings already ran and this backend did not.
+            // It used to be asked only under the lock, so a re-seal whose shape
+            // was wrong still paid for the signature arm's directory walk
+            // first: the #660 inversion, one door over. Asking it here does not
+            // remove the ask under the lock — see there for why both are needed.
+            crate::federation::migration::check_reseal_admission(
+                &stored,
+                resealed,
+                chrono::Utc::now(),
+            )?;
             crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed)
                 .await?;
         }
@@ -3374,6 +3385,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             else {
                 return Ok(false);
             };
+            // Asked a SECOND time, on the row this backend actually found under
+            // the lock. The pre-lock ask above gated the copy a separate
+            // `get_attestation` returned after taking and releasing this lock;
+            // the SQL backends get the two answers from one transaction, and
+            // memory does not, so without this the door would gate one row and
+            // mutate another. Declared in `store::parity` (CIRISPersist#670).
             crate::federation::migration::check_reseal_admission(
                 row,
                 resealed,
@@ -5056,6 +5073,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // indistinguishable from a real one.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
+        // CEG §7.7 (CIRISPersist#161 Ask 5) — the removal-direction
+        // membership-change hard_case (`change_kind: "removed"`), keyed on the
+        // re-key epoch (`effective_at`). Built before the lock; RECORDED after
+        // it, through `record_hard_case`.
+        let removal_event = crate::federation::hard_case::membership_removed_event(
+            crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+            &row.family_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        );
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             for k in [&row.family_key_id, &row.removed_identity_key_id] {
@@ -5066,19 +5093,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 }
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
-            // membership-change hard_case (`change_kind: "removed"`), keyed on
-            // the re-key epoch (`effective_at`). Idempotent on the event_id.
-            let event = crate::federation::hard_case::membership_removed_event(
-                crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
-                &row.family_key_id,
-                &row.removed_identity_key_id,
-                row.effective_at,
-            );
-            state
-                .federation_hard_case_events
-                .entry(event.event_id.clone())
-                .or_insert(event);
             let revocation_key = (
                 row.family_key_id.clone(),
                 row.removed_identity_key_id.clone(),
@@ -5109,6 +5123,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         };
         self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
             .await?;
+        // v31.2.0 (CIRISPersist#670) — through `record_hard_case`, which is
+        // where `check_admin_action_attribution` lives, and NOT by reaching
+        // into `federation_hard_case_events` directly. The direct insert this
+        // replaces was behaviourally identical *today* — the attribution gate
+        // short-circuits for a kind that is not `admin_action:*`, and the
+        // `.entry().or_insert()` matched the SQL backends' idempotent upsert —
+        // which is exactly what made it invisible. It was one gate away from a
+        // hole, permanently, on the arm nobody watches.
+        crate::federation::FederationDirectory::record_hard_case(self, removal_event).await?;
         Ok(())
     }
 
@@ -17688,16 +17711,18 @@ mod tests {
                     .expect("commitment"));
             }
             let envelope = envelope;
-            let (och, sc_sig, sp_sig) =
-                crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
             let mut a = fix_attestation(id, from, to, from);
             a.attestation_type =
                 crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
             a.attestation_envelope = envelope;
-            a.original_content_hash = och;
-            a.scrub_signature_classical = sc_sig;
-            a.scrub_signature_pqc = sp_sig;
             a.scrub_key_id = from.to_owned();
+            // v31.2.0 (CIRISPersist#670) — the seal has ONE home. This used to
+            // call `sign_envelope` and assign the hash and both signature
+            // halves by hand, and then call `reseal`, which recomputed all
+            // three from the same signer — the hand-rolled copy was dead the
+            // moment it was written. Dead is the lucky outcome of that shape;
+            // #643's `pg_resign` is the same code that was NOT overwritten,
+            // and it signed every postgres fixture without its instants.
             crate::federation::tier_ingest::test_support::reseal(&mut a);
             match backend
                 .put_attestation(crate::federation::SignedAttestation { attestation: a })

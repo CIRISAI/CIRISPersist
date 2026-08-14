@@ -5,6 +5,80 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.2.0] - 2026-08-13
+
+### Added — backend parity is an enforced invariant now, not a claim (#670)
+
+`README.md` has said for some time that persist behaves the same on postgres,
+sqlite and memory *"as an enforced invariant."* It was not enforced. It was
+convention plus per-case witnesses, and v31 alone found five divergences of one
+shape — **a gate, an order, or a type that one backend has and its siblings do
+not**. The cost is always the same: the memory and sqlite arms are correct, so
+nobody can see it, and it surfaces on the one backend production runs.
+
+`store::parity` reads `src/store/{memory,sqlite,postgres}.rs` **from disk as
+text** and, for every method of `FederationDirectory` / `BlobStorage` /
+`Backend`, extracts the **ordered sequence of gate calls**. All three backends
+must produce the same sequence. Order is compared, not just membership, because
+#660 was an *ordering* bug with every right gate present.
+
+Reading source text rather than reflecting over the compiled crate is
+load-bearing: **the postgres arm is scanned under `--features sqlite`, and
+under no features at all.** A conformance check that only runs when the backend
+it checks is compiled goes dark exactly where this class of defect lives.
+
+The door set is **derived** from the impl blocks — there is no list anyone has
+to remember to extend. `DECLARED_DIVERGENCES` is subtractive over that derived
+set, and each entry **pins the exact sequence** its backend may have, so an
+exemption authorises one shape rather than "anything goes"; an exemption whose
+door has since been fixed goes stale and fails.
+
+### Fixed — the four live divergences the gate found on its first run (#670)
+
+None of these admitted a row that should have been refused. All four change
+**which typed refusal a caller receives** when a row violates more than one
+gate, which is consumer-visible (see #624) and is the reason they are fixed
+rather than filed.
+
+- **`attestation_upsert_local` / `attestation_insert_local`** — sqlite and
+  postgres ran `check_attested_subject_admission`, a directory walk, *ahead* of
+  three pure predicates. Memory had the AV-76 order and the two SQL backends
+  did not, so a row failing a free predicate paid for a directory resolution
+  first on the backends production runs. Moved behind the pure gates on both.
+- **`put_public_key`** — the same shape. `consent_role::check_admissible` is a
+  pure predicate over a closed vocabulary and ran on the SQL backends only
+  after four accord-conferral directory walks *and* the conflict-check read.
+  Moved to the head of the door on both, matching memory.
+- **`put_family_membership_revocation`** — memory wrote into
+  `federation_hard_case_events` directly where its siblings go through
+  `record_hard_case`, which is where `check_admin_action_attribution` lives.
+  Behaviourally identical *today* — the gate short-circuits for a kind that is
+  not `admin_action:*`, and the idempotent insert matched — which is exactly
+  what made it invisible. It was one gate away from a hole, permanently, on the
+  arm nobody watches.
+- **`reseal_attestation_v31`** — memory ran the signature gate before the pure
+  shape gate, the #660 tier inversion one door over. The pure gate leads now;
+  the second ask under the lock stays, and is declared, because memory's
+  read-then-write is not one transaction the way the SQL backends' is.
+
+`put_goal` (memory does not compute the write-only `goal_text_canonical`
+projection, which no reader reads) and `put_revocation` (memory's anti-rollback
+lookup needs the state lock the insert holds — stronger than the SQL position,
+not weaker) are **declared** rather than changed.
+
+### Fixed — the seal has one home, and now a gate says so (#670, #643)
+
+`no_backend_file_hand_rolls_the_seal` is #643 turned into a check. `pg_resign`
+was the only one of three sibling re-sign helpers never redirected to the
+shared seal, so **every** postgres attestation fixture signed without its
+instants — 34 of 46 postgres reds, 14 of them matching the *wrong* refusal,
+which is green-adjacent noise sitting over real typed-variant regressions.
+
+One dead hand-rolled copy in `memory.rs` is removed: it called `sign_envelope`,
+assigned the hash and both signature halves, and then called `reseal`, which
+recomputed all three from the same signer. Dead is the lucky outcome of that
+shape; `pg_resign` is the same code that was not overwritten.
+
 ## [31.0.0] - 2026-08-12
 
 ### BREAKING — this release requires a FRESH GENESIS. The baked seed will not load.

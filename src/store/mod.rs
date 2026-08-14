@@ -17,6 +17,15 @@ pub mod memory;
 // references `refinery::Report`.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod migration_timing;
+/// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**
+///
+/// Test-only, and deliberately so: it reads the three backend sources from
+/// DISK as text and compares the ordered gate sequence of every door, which
+/// means the postgres arm is scanned under `--features sqlite` and under no
+/// features at all. A conformance check that only runs when the backend it
+/// checks is compiled goes dark exactly where this class of defect lives.
+#[cfg(test)]
+mod parity;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
