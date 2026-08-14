@@ -6,7 +6,11 @@
 //!
 //! - **CIRISPersist#622** — postgres typed `federation_revocations.revocation_id`
 //!   as `UUID` while memory and sqlite took any `TEXT`. A witness was green on
-//!   two backends and red on the one production runs.
+//!   two backends and red on the one production runs. **This gate found it, and
+//!   it is now fixed** — migration V125 relaxed the column and its
+//!   quorum-state child, which is why neither appears in
+//!   [`PG_NARROWED_ID_COLUMNS`]. It is kept here as the worked example because
+//!   it is the reason the module exists, not because it is still live.
 //! - **CIRISPersist#656** — postgres omitted `last_accessed_at` / `access_count`
 //!   from blob inserts where sqlite binds both. Benign only because postgres
 //!   declares `DEFAULT NOW()`; sqlite's default is a **1970 epoch sentinel**
@@ -134,6 +138,17 @@ pub(crate) const DIALECT_ENCODINGS: &[Encoding] = &[
 /// The pin is bidirectional: a **new** `UUID` column fails until someone adds
 /// it here deliberately, and an entry whose column stopped being `UUID` fails
 /// until it is deleted.
+///
+/// **`federation_revocations.revocation_id` and its
+/// `federation_revocation_quorum_state` child are deliberately ABSENT.** They
+/// were the finding that motivated this list, and CIRISPersist#622 fixed them:
+/// migration V125 relaxed both to `TEXT`, the same relaxation V121 applied to
+/// `attestation_id`. Recorded here because their absence looks like an
+/// oversight — the module docs above still cite them as the worked example, and
+/// the next person to read this list should not "restore" a pin describing a
+/// narrowing that no longer exists. If they ever reappear as `UUID`, this gate
+/// fails, which is the correct outcome and the reason not to pre-emptively pin
+/// them.
 pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ("cirisgraph.edges", "edge_id"),
     ("cirisgraph.telemetry_metrics", "metric_id"),
@@ -149,11 +164,6 @@ pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ),
     ("cirislens.edge_detection_events", "detection_id"),
     ("cirislens.edge_outbound_queue", "queue_id"),
-    (
-        "cirislens.federation_revocation_quorum_state",
-        "revocation_id",
-    ),
-    ("cirislens.federation_revocations", "revocation_id"),
     ("cirislens.federation_trust_grants", "grant_id"),
     ("cirislens.goals", "goal_id"),
     ("cirislens.incident_records", "incident_id"),
