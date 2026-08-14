@@ -639,9 +639,19 @@ async fn try_record_withdrawal(
 /// key reached storage through a gate.
 ///
 /// So the invariant is not a count, it is: *no `federation_keys` row claiming
-/// an accord-conferred role is admitted without this call running for that
-/// `(role, key_id)` first.* The write gates that must keep it, in
-/// `admission.rs`:
+/// an accord-conferred role is admitted **through a role-admission gate**
+/// without this call running for that `(role, key_id)` first.*
+///
+/// The qualifier is load-bearing and is stated rather than assumed. The
+/// genesis-trusted seed paths (`seed_genesis_accord_holders` and the reanchor
+/// door) insert directly and run no role gate at all — deliberately, since
+/// those rows ARE the baked constitutional root, and the roster they
+/// constitute is what authorizes withdrawals in the first place. A withdrawal
+/// of a genesis accord holder is therefore not a case this projection covers,
+/// and pretending otherwise here would be a doc that reads as a guarantee
+/// while the code offers none.
+///
+/// The write gates that must keep it, in `admission.rs`:
 ///
 /// 1. `check_canonical_role_admission_over_roster` — the production canonical gate.
 /// 2. `check_canonical_role_admission_over_roster_with_custody_root` — the
