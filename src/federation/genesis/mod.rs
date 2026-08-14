@@ -4054,37 +4054,40 @@ mod tests {
             "dimension": TRUST_ACCEPTS_DIMENSION,
             "scope": ["infra:serve", "infra:attest", "infra:store", "infra:transport"],
         });
-        let (och, sc, sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(node, &envelope);
+        // v31.2.0 — build the row, then SEAL it through the substrate's own
+        // helper rather than hand-rolling the signature. `seal_row_in_place`
+        // stamps the signed instants (#598), stamps the seven-member row mirror
+        // (#643) and signs, as one step — its own doc says re-signing and
+        // re-stamping "cannot be half-done", and this fixture had been doing
+        // exactly the half that omits both.
         let now = chrono::Utc::now();
-        sq.put_attestation(SignedAttestation {
-            attestation: crate::federation::Attestation {
-                attestation_id: edge_id.clone(),
-                attesting_key_id: node.to_owned(),
-                attested_key_id: FAMILY.to_owned(),
-                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
-                    .to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: och,
-                scrub_signature_classical: sc,
-                scrub_signature_pqc: sp,
-                scrub_key_id: node.to_owned(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            },
-        })
-        .await
-        .expect("node trust:accepts -> family admits");
+        let mut att = crate::federation::Attestation {
+            attestation_id: edge_id.clone(),
+            attesting_key_id: node.to_owned(),
+            attested_key_id: FAMILY.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::DELEGATES_TO.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: node.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(node, &mut att);
+        sq.put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect("node trust:accepts -> family admits");
 
         let verdict = trust_root_valid(&sq, node, FAMILY).await.expect("verdict");
         eprintln!("DRYRUN verdict: {verdict:?}");

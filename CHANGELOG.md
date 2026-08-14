@@ -7,6 +7,36 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.2.0] - 2026-08-14
 
+### Changed — the re-minted genesis seed is baked (#660, CIRISServer#398)
+
+The ceremony's new artifact replaces `canonical_seed.json`: same family
+(`humanity-accord`), same holders A1/B1/C1, same serve node
+`ciris-canonical-1-d7bdeu223k`, same three delegation rows, `quorum:2/3` with
+A1+B1 authorizing over the widened, SHA-256'd digest. `accord_holder_seed.json`
+is unchanged — the holder records are byte-identical, so only the bundle moved.
+
+Three fixture corrections came with it, each a real gap the new artifact exposed:
+
+- **`bake_real_genesis_v2_artifact_490` now seeds the constitutional family
+  before baking.** The re-minted `genesis-charter` attests TO `humanity-accord`,
+  so the delegation plane cannot land on a node that has never heard of the
+  family. The #557 dry-run already seeded it in that order; this arm was
+  relying on the old fixture's shape.
+- **The #557 dry-run's `trust:accepts` row is now sealed through
+  `seal_row_in_place`** instead of hand-rolled. It was missing both the signed
+  instants (#598) and the seven-member row mirror (#643) — that helper exists
+  precisely so "re-sign after mutating" and "re-stamp the mirror" cannot be
+  half-done, and the fixture had been doing the half that omits both.
+- **#554's premise was made false by #660 and is corrected rather than
+  deleted.** It read *"`authorization_digest` covers holder `key_id`s only, not
+  their evidence — so tampering with a holder's custody attestation leaves the
+  2-of-3 quorum signatures perfectly valid."* The widened digest binds
+  `attestation_evidence`, so that tamper now breaks the hybrid signature
+  outright, before the install-time read. Strictly stronger — caught earlier and
+  by cryptography rather than a policy read — so the assertion accepts either
+  gate, and the "name the failing check" requirement is scoped to the
+  install-time arm, which is the only one that can know a field name.
+
 ### Fixed — BREAKING — the digest bound the scrub set, so a 2-of-3 genesis could never complete (#683)
 
 **Found on a live ceremony**, persist v31.2.0-rc.2 / edge v16.1.0-rc.2 /
