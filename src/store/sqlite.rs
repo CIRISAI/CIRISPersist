@@ -4741,10 +4741,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("revoked_key_id", row.revoked_key_id.as_str()),
             ("revocation_id", row.revocation_id.as_str()),
         ]);
-        // THIS node's admission instant (V123). Read from the local clock, not
-        // from the row: `scrub_timestamp` is the producer's assertion and a
-        // late-replicated old one would sort behind every consumer's cursor.
-        let admitted_at = chrono::Utc::now();
+        // THIS node's admission position (V123). Not the producer's clock —
+        // `scrub_timestamp` is their assertion, and a late-replicated old one
+        // would sort behind every consumer's cursor — and not the local wall
+        // clock either: a backward step would stamp a later row below a cursor
+        // a consumer already passed, and `> since` would skip it forever. The
+        // position is allocated strictly after the last one handed out; see
+        // `monotonic_admission_instant`. Read under the same connection lock
+        // as the INSERT, which serializes writers on this backend.
+        let admitted_at = {
+            let conn = self.conn.clone();
+            let conn = conn.lock();
+            let last: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(admitted_at) FROM federation_revocations",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
+                .flatten();
+            crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last.as_deref().map(parse_rfc3339),
+            )
+        };
 
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
@@ -5999,11 +6020,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     participation.proposal_digest
                 ))
             })?;
+        // The other half of the evidence cursor; same rule.
+        let arrival = {
+            let conn = self.conn.clone();
+            let conn = conn.lock();
+            let last: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(server_arrival_at) FROM accord_participation",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| Error::Backend(format!("last server_arrival_at: {e}")))?
+                .flatten();
+            crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last.as_deref().map(parse_rfc3339),
+            )
+        };
         let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
             &stored.proposal,
             &participation,
             standing_roster,
-            chrono::Utc::now(),
+            arrival,
         )?;
         let participation_json = serde_json::to_string(&prep.participation_json)
             .map_err(|e| Error::Backend(format!("participation_json encode: {e}")))?;
@@ -24046,6 +24085,72 @@ mod tests {
     /// Region outside the closed-set `{us, eu, apac}` is rejected at
     /// admission with the typed `RegionRejected` error + stable kind
     /// token; the row is not stored.
+    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
+    /// survives a backward clock step, on this backend's real write path.**
+    ///
+    /// The allocator's rule is unit-tested in `federation::types`; this asserts
+    /// it is actually WIRED into `put_revocation` here, which a unit test
+    /// cannot say. Two admissions on a forward clock would prove nothing —
+    /// `Utc::now()` passes that trivially. So the post-step state is planted
+    /// directly: an existing row is given a position an hour in the FUTURE,
+    /// which is exactly what a node looks like after an NTP correction or a VM
+    /// restore, and the next admission must still sort after it.
+    ///
+    /// If it does not, the row is invisible to every consumer whose cursor had
+    /// passed that point — a durable exclusion that never propagates.
+    #[tokio::test]
+    async fn admission_position_survives_a_backward_clock_step_sqlite_655() {
+        use crate::federation::FederationDirectory as _;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["rv-a", "rv-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Self-revocations: the moderation-authority plane has its own
+        // witnesses and would only add scaffolding here.
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fed_revocation("rv-1", "rv-a", "rv-a", "rv-a"),
+            })
+            .await
+            .expect("first revocation");
+
+        // THE BACKWARD STEP, as state: the last position handed out is now an
+        // hour ahead of the wall clock.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_revocations SET admitted_at = ?1",
+                rusqlite::params![future.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fed_revocation("rv-2", "rv-b", "rv-b", "rv-b"),
+            })
+            .await
+            .expect("second revocation");
+
+        let served = backend
+            .list_signed_revocations_since(Some(future), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            served.iter().any(|r| r.revocation.revocation_id == "rv-2"),
+            "a revocation admitted after a backward clock step must still be served to a \
+             consumer resuming from the pre-step cursor — otherwise the exclusion is stored \
+             and permanently invisible"
+        );
+    }
+
     #[tokio::test]
     async fn put_revocation_rejects_out_of_closed_set_region() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

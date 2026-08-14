@@ -3756,13 +3756,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 ("revoked_key_id", row.revoked_key_id.as_str()),
                 ("revocation_id", row.revocation_id.as_str()),
             ]);
-            // v31.1.0 (CIRISPersist#655) — THIS node's admission instant,
+            // v31.1.0 (CIRISPersist#655) — THIS node's admission position,
             // stamped here and never read from the wire. The serve cursor keys
             // on it, so a late-replicated old revocation gets a LATE position
             // and stays reachable by a consumer whose cursor has moved on.
+            //
+            // Allocated strictly after the last position handed out rather than
+            // read off the wall clock: a backward step would stamp a later row
+            // below a cursor a consumer already passed, and `> since` would
+            // skip it permanently. Computed under the state lock the insert
+            // holds, so this backend's allocation is strictly increasing.
+            let last_admitted = state.revocation_admitted_at.values().copied().max();
+            let admitted_at = crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last_admitted,
+            );
             state
                 .revocation_admitted_at
-                .insert(row.revocation_id.clone(), chrono::Utc::now());
+                .insert(row.revocation_id.clone(), admitted_at);
             state.federation_revocations.push(row);
             key
         };
@@ -4755,10 +4766,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 proposal.nonce, proposal.family_key_id
             )));
         }
+        // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
+        // evidence cursor, so it is an allocated position, not a wall-clock read.
+        let created_at = {
+            let state = self.state.lock().expect("memory backend lock");
+            let last = state.accord_proposals.values().map(|p| p.created_at).max();
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::prepare_proposal(
             &proposal,
             authority_signature,
-            chrono::Utc::now(),
+            created_at,
         )?;
         let crate::federation::accord_quorum::PreparedProposal {
             proposal_digest,
@@ -4857,11 +4875,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     participation.proposal_digest
                 ))
             })?;
+        // `server_arrival_at` is the other half of the evidence cursor; same rule.
+        let arrival = {
+            let state = self.state.lock().expect("memory backend lock");
+            let last = state
+                .accord_participations
+                .iter()
+                .map(|r| r.server_arrival_at)
+                .max();
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
             &stored_proposal.proposal,
             &participation,
             standing_roster,
-            chrono::Utc::now(),
+            arrival,
         )?;
         let crate::federation::accord_quorum::PreparedParticipation {
             proposal_digest,
@@ -9503,6 +9531,62 @@ mod tests {
             crate::federation::admission::DELEGATION_SCOPE_SLASH,
         )
         .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
+    /// survives a backward clock step, on this backend's real write path.**
+    ///
+    /// Twin of the sqlite and postgres witnesses. The allocator's rule is
+    /// unit-tested in `federation::types`; this asserts it is WIRED into
+    /// `put_revocation` here. Two admissions under a forward clock would prove
+    /// nothing, so the post-step state is planted directly: the last position
+    /// handed out is moved an hour into the future — what a node looks like
+    /// after an NTP correction — and the next admission must still sort after
+    /// it, or it is invisible to every consumer already past that point.
+    #[tokio::test]
+    async fn admission_position_survives_a_backward_clock_step_memory_655() {
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+        for k in ["rvm-a", "rvm-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rvm-1", "rvm-a", "rvm-a", "rvm-a"),
+            })
+            .await
+            .expect("first revocation");
+
+        // THE BACKWARD STEP, as state.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for v in st.revocation_admitted_at.values_mut() {
+                *v = future;
+            }
+        }
+
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rvm-2", "rvm-b", "rvm-b", "rvm-b"),
+            })
+            .await
+            .expect("second revocation");
+
+        let served = backend
+            .list_signed_revocations_since(Some(future), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            served.iter().any(|r| r.revocation.revocation_id == "rvm-2"),
+            "a revocation admitted after a backward clock step must still be served to a \
+             consumer resuming from the pre-step cursor"
+        );
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {

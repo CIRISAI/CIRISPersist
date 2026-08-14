@@ -2051,7 +2051,7 @@ class Engine:
         """(derived) testimonial — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
 
     def list_signed_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) epistemic — v31.1.0 (CIRISPersist#655) — bulk-list SignedRevocation wrappers since a cursor, as a JSON array, ordered (scrub_timestamp ASC, revocation_id ASC)...."""
+        """(derived) epistemic — v31.1.0 (CIRISPersist#655) — bulk-list ServedRevocations since a cursor, as a JSON array, ordered (admitted_at ASC, revocation_id ASC). The key-lev..."""
 
     def list_signed_transport_destinations_since(self, since_rfc3339: str | None, limit: int) -> str:
         """(derived) testimonial — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""

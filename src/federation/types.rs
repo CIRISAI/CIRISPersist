@@ -3915,6 +3915,7 @@ fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
 ///
 /// v31.0.0 (CIRISPersist#646) — every instant in the hashed value is first
 /// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
+
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use sha2::{Digest, Sha256};
@@ -3945,6 +3946,120 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
         .map_err(|e| super::Error::Backend(format!("canonicalize for hash: {e}")))?;
     let digest = Sha256::digest(&bytes);
     Ok(hex::encode(digest))
+}
+
+/// v31.1.0 (CIRISPersist#655/#662, PR #667 round-4) — **the next local
+/// admission position: strictly after every position already handed out.**
+///
+/// # Why a wall clock cannot be a replication cursor
+///
+/// Every `*_since` read filters strictly `> since`, so a consumer's saved
+/// cursor is a floor it never goes back below. If a position is `Utc::now()`
+/// and the clock steps BACKWARD — a VM snapshot restore, an NTP correction, a
+/// container resumed from an image, all ordinary in a mesh — then a row
+/// admitted *later* is stamped at or below a cursor a consumer already passed.
+/// That row is not served late. It is **never served to that consumer again**.
+///
+/// On `federation_revocations` that is a durable exclusion that never
+/// propagates: the revoked key stays trusted on every peer whose cursor had
+/// moved past the step. It is the same failure #655 exists to close, reached
+/// through the clock instead of through a missing cursor — and a consumer
+/// cannot compensate, because nothing tells it about a row it never saw.
+///
+/// # The rule
+///
+/// `max(now, last + 1µs)`. It keeps the column a timestamp (so the `> since`
+/// filter, the type and every consumer contract are unchanged), it needs no
+/// per-backend sequence object — a postgres sequence, a sqlite rowid and an
+/// in-process counter would be three mechanisms and therefore three chances to
+/// diverge — and under a forward-running clock it is exactly `now`.
+///
+/// The microsecond step is the floor `compute_persist_row_hash` and
+/// [`crate::federation::wire_index::locator_instant`] already round every
+/// instant to, so an allocation cannot be erased by the same truncation
+/// downstream.
+///
+/// # What this does NOT solve
+///
+/// Two writers racing can still read the same `last` and allocate the same
+/// value. That is a TIE, not a reversal: it needs the composite
+/// `(instant, id)` resume token tracked in CIRISPersist#668, and it is a
+/// different failure (one row skipped at a page boundary) from the one here
+/// (every row after a backward step skipped, permanently). Stated so the next
+/// reader does not take this for more than it is.
+#[must_use]
+pub fn monotonic_admission_instant(
+    now: chrono::DateTime<chrono::Utc>,
+    last: Option<chrono::DateTime<chrono::Utc>>,
+) -> chrono::DateTime<chrono::Utc> {
+    match last {
+        Some(prev) if prev >= now => prev + chrono::Duration::microseconds(1),
+        _ => now,
+    }
+}
+
+#[cfg(test)]
+mod monotonic_admission_tests {
+    use super::monotonic_admission_instant as alloc;
+
+    fn t(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    /// **THE BACKWARD STEP.** The whole point: a clock that goes backwards must
+    /// not hand out a position at or below one already issued, because every
+    /// `*_since` read filters strictly `> since` and a consumer's cursor never
+    /// goes back below its floor.
+    #[test]
+    fn a_backward_clock_still_advances_the_position_655() {
+        let last = t("2026-06-01T12:00:00Z");
+        // NTP correction / VM restore: `now` is an hour BEHIND the last
+        // position already handed to a consumer.
+        let stepped_back = t("2026-06-01T11:00:00Z");
+        let got = alloc(stepped_back, Some(last));
+        assert!(
+            got > last,
+            "a row admitted after a backward step must still sort after every row \
+             admitted before it — got {got}, last {last}"
+        );
+        // And it is the smallest such value: this is a cursor position, not a
+        // fabricated wall-clock reading, so it must not invent an hour.
+        assert_eq!(got, last + chrono::Duration::microseconds(1));
+    }
+
+    /// Equal is not greater. A same-instant re-read must still advance, or two
+    /// rows tie and `> since` drops the second at a page boundary.
+    #[test]
+    fn an_identical_clock_reading_still_advances_655() {
+        let last = t("2026-06-01T12:00:00Z");
+        assert!(alloc(last, Some(last)) > last);
+    }
+
+    /// Under a forward-running clock the allocator is exactly the clock — it
+    /// must not drift ahead of real time, or `admitted_at` stops meaning
+    /// "roughly when this node admitted it".
+    #[test]
+    fn a_forward_clock_is_passed_through_unchanged_655() {
+        let last = t("2026-06-01T12:00:00Z");
+        let now = t("2026-06-01T12:00:05Z");
+        assert_eq!(alloc(now, Some(last)), now);
+        assert_eq!(alloc(now, None), now);
+    }
+
+    /// The step is a microsecond because that is the floor every instant is
+    /// truncated to downstream (#646). A smaller step would be erased by the
+    /// truncation and two positions would collapse into one.
+    #[test]
+    fn the_step_survives_microsecond_truncation_646() {
+        let last = t("2026-06-01T12:00:00Z");
+        let got = alloc(last, Some(last));
+        let mut v = serde_json::json!({ "a": last, "b": got });
+        super::truncate_instants_to_microseconds(&mut v);
+        assert_ne!(
+            v["a"], v["b"],
+            "the allocated step must survive the microsecond floor, or two rows share a position"
+        );
+    }
 }
 
 #[cfg(test)]
