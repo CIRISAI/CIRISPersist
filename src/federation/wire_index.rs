@@ -531,7 +531,10 @@ pub async fn wire_refs_for_subject(
         //
         // `signed_wire_index` is populated by the per-put hook, so on a
         // database upgraded from before this cut the pre-existing revocations
-        // are not in it until an operator runs `rebuild_signed_wire_index`.
+        // are not in it until the v31 migration's boot-time probe backfills
+        // them (see `migration.rs` — no operator action; this comment used to
+        // say "until an operator runs `rebuild_signed_wire_index`" and went
+        // stale when that became automatic).
         // Advertising their hashes anyway hands a peer refs that resolve to
         // `None` — a plane visible in principle and unreachable in practice,
         // which is #655's own defect arriving through DEPLOYMENT ORDER rather

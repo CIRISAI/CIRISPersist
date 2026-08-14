@@ -127,12 +127,21 @@ re-derived — their payload commits to a `(target, successor)` pair, so the
 local search would be quadratic, and a supersede is a rotation link rather than
 an exclusion.
 
-**Upgrade note.** On a database that already holds revocations, run
-`rebuild_signed_wire_index` once to make them point-readable by content hash.
-Until it runs, `wire_refs_for_subject` deliberately does NOT advertise them:
-advertising a ref that resolves to `None` would be a plane visible in principle
-and unreachable in practice, which is the defect #655 exists to close. The
-advertise path checks the index and self-corrects the moment the backfill runs.
+**Upgrade note — no operator action.** On a database that already holds
+revocations, the v31 migration probes one revocation against the index on every
+boot and backfills only if the plane is unindexed, so pre-existing rows become
+point-readable by content hash without anyone running a repair. A node with no
+revocations does nothing; a backfilled node pays two point reads.
+
+Until the backfill completes, `wire_refs_for_subject` deliberately does NOT
+advertise those rows: advertising a ref that resolves to `None` would be a plane
+visible in principle and unreachable in practice, which is the defect #655
+exists to close. The advertise path checks the index and self-corrects the
+moment the backfill runs.
+
+`rebuild_signed_wire_index` remains available as the manual repair and is still
+what the purge path reuses — it is simply no longer something an upgrading
+operator has to know about.
 
 **Deferred, tracked in CIRISPersist#668.** All sixteen `list_signed_*_since`
 cursors resume on an instant alone while ordering by `(instant, id)`, so a tie
