@@ -7272,6 +7272,22 @@ pub async fn check_canonical_role_admission_over_roster(
     )
     .await?;
 
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING, the
+    // twin of the `infra:attest` gate's step (1c). The tombstone is a local
+    // projection of replicated accord evidence, and the evidence plane and the
+    // key plane replicate independently: evidence authorizing this key's
+    // withdrawal can arrive first, and then step (2) would consult an empty
+    // table and re-confer `canonical`. Derived here from a proposal already in
+    // our own state, re-tallied by us. See
+    // [`accord_carriage::project_role_withdrawal_for_key`](super::accord_carriage::project_role_withdrawal_for_key).
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
     // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
     // successor whose tombstone names THIS key_id is exempt (rotate-in).
@@ -7350,6 +7366,16 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -7393,6 +7419,16 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -8429,6 +8465,22 @@ pub async fn check_infra_attest_role_admission_over_roster(
     )
     .await?;
 
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING. The
+    // tombstone is a LOCAL projection of replicated accord evidence, and the
+    // two planes replicate independently: the evidence authorizing this key's
+    // withdrawal can arrive before the key itself. If it did, step (2) below
+    // would consult an empty table and confer a withdrawn role — the exclusion
+    // lost to ORDERING rather than to trust. Deriving it here, from a proposal
+    // already in our own state and re-tallied by us, is what makes step (2)
+    // order-independent.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        super::types::roles::INFRA_ATTEST,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#424, the #377 rule generalized): a quorum-withdrawn
     // key stays refused EVEN with a valid co-scrub set — the ADD gate is
     // monotonic and anti-entropy re-runs it, so without this consult a peer
@@ -8724,6 +8776,41 @@ pub async fn check_accord_role_admission_over_roster(
     super::genesis::posture::require_seated_accord_roster(
         directory,
         super::genesis::posture::ACCORD_ROLE_ADMISSION,
+        roster_key_ids,
+    )
+    .await?;
+
+    // (1c) v31.1.0 (CIRISPersist#662, PR #667 review P1) — MATERIALIZE BEFORE
+    // CONSULTING, against the roster THIS CALL WAS GIVEN.
+    //
+    // Round-3 review: these five calls first passed `accord_holder_roster_key_ids()`
+    // — the production roster — inside `_over_roster` gates whose entire
+    // contract is that the caller supplies the roster. That is broken in both
+    // directions. With no production keys present, a simulation's otherwise
+    // valid admission fails on a projection it never asked for; with both
+    // rosters present, withdrawal evidence signed by the INJECTED roster
+    // projects no tombstone and the injected-roster co-scrub then admits the
+    // withdrawn role. The second is the sharp one: the gate would re-derive
+    // against different state than the evidence was admitted under, which is
+    // the re-tally discipline inverted.
+    //
+    // The third instance of this gate shape needed the third copy
+    // of this call, and not having it was a real hole: `withdraw_role:{role}`
+    // evidence for a co-steward role or an accord-co-scrubbed identity_type
+    // could arrive before its target key, and step (2) would then consult an
+    // empty table and re-confer the withdrawn role.
+    //
+    // The invariant, stated where a fourth gate would be written: NO
+    // `federation_keys` row claiming an accord-conferred role is admitted
+    // without this call running for that `(role, key_id)` first. The three
+    // pure reads of the projection (`has_accord_conferred_role`,
+    // `is_infra_attest_effective`, `is_canonical_effective`) are correct only
+    // because of it. See `accord_carriage::project_role_withdrawal_for_key`
+    // for the enumerated gate set.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        role,
+        &row.key_id,
         roster_key_ids,
     )
     .await?;
@@ -9203,6 +9290,39 @@ pub async fn verify_canonical_withdraw_authority(
         key_id,
         None,
         &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v31.1.0 (CIRISPersist#662) — the **op-generic plain-WITHDRAW** form of the
+/// #377 authority core, exported for
+/// [`accord_carriage`](super::accord_carriage)'s local withdrawal projection.
+///
+/// Identical machinery to [`verify_canonical_withdraw_authority`] — stored
+/// proposal, HUMANITY_ACCORD family scope, persist-computed payload binding,
+/// a fresh `tally_live_quorum` over persist's OWN stored participations, and
+/// the strict-majority destructive threshold — parameterized on `op` so the
+/// projection can re-derive a `canonical`, an `infra:attest` or a generic
+/// [`op_withdraw_role`] tombstone through the SAME code the local destructive
+/// ops use. `successor_key_id` is fixed at `None`: this form is for plain
+/// withdrawals (see the scope note on
+/// [`accord_carriage::project_role_withdrawals_for_proposal`](super::accord_carriage::project_role_withdrawals_for_proposal)).
+///
+/// Exists so the projection cannot grow its own weaker copy of the tally.
+pub async fn verify_withdrawal_authority_over_roster(
+    directory: &dyn super::FederationDirectory,
+    proposal_digest: &str,
+    op: &str,
+    target_key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<String, Error> {
+    verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        op,
+        target_key_id,
+        None,
+        roster_key_ids,
     )
     .await
 }
@@ -21547,6 +21667,82 @@ pub(crate) mod backend_parity_test_support {
             dir.revocations_for(&who).await.expect("read").len(),
             1,
             "[{tag}] exactly the ONE admitted revocation is stored"
+        );
+    }
+
+    /// **CIRISPersist#622 on the revocation door** — a `revocation_id` that is
+    /// not a UUID round-trips on **every** backend.
+    ///
+    /// `Revocation::revocation_id` is a `String`, and nothing in the type, the
+    /// wire contract, or `put_revocation`'s gates constrains it to UUID shape.
+    /// Memory and SQLite have always stored whatever they were handed. Postgres
+    /// typed the column `UUID PRIMARY KEY` (V004) and parsed the id before
+    /// binding, so a symbolic id was admitted on two backends and refused at the
+    /// DRIVER on the one production runs — before a single admission gate ran:
+    ///
+    /// ```text
+    /// invalid argument: revocation_id is not a valid UUID
+    /// ```
+    ///
+    /// V123 relaxes the column exactly as V121 relaxed `attestation_id` for the
+    /// genesis ceremony's symbolic ids.
+    ///
+    /// **The shape of this witness is the point.** The pre-existing parity body
+    /// above mints its ids with `fresh_revocation_id()` — a UUID — precisely
+    /// *because* postgres refused anything else. A witness that keeps doing that
+    /// would pass today, would have passed before V123, and would prove nothing.
+    /// So this one uses an id that could not previously be written, and it
+    /// **re-reads the row** rather than trusting the `Ok(())`: a door that
+    /// accepts and stores something else is the failure mode a write-only
+    /// assertion cannot see.
+    pub(crate) async fn exercise_symbolic_revocation_id_round_trips(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let who = format!("{tag}-622-subject");
+        ts::register_identity_key(dir, &who, identity_type::AGENT).await;
+        let at = chrono::Utc::now();
+
+        // Deliberately NOT a UUID, and deliberately in the shape the genesis
+        // ceremony uses for attestation ids (#622 / V121): a stable, readable,
+        // colon-scoped name. `tag` keeps a run against the SHARED postgres test
+        // DB from colliding with a prior one.
+        let symbolic = format!("revocation:{tag}:622-not-a-uuid");
+        assert!(
+            uuid::Uuid::parse_str(&symbolic).is_err(),
+            "[{tag}] the fixture id must NOT parse as a UUID, or this witness is \
+             indistinguishable from the parity body above"
+        );
+
+        dir.put_revocation(SignedRevocation {
+            revocation: self_revocation(&symbolic, &who, at),
+        })
+        .await
+        .expect("a non-UUID revocation_id must be admitted on EVERY backend (#622)");
+
+        let stored = dir.revocations_for(&who).await.expect("read");
+        assert_eq!(
+            stored.len(),
+            1,
+            "[{tag}] exactly one revocation is stored for the subject"
+        );
+        assert_eq!(
+            stored[0].revocation_id, symbolic,
+            "[{tag}] the id must round-trip BYTE-FOR-BYTE. A backend that stores a \
+             normalized or re-minted id is a backend a consumer cannot address rows on."
+        );
+
+        // And the SECOND site of the same defect: the PQC-completion door looked
+        // the row up by a parsed UUID too, so fixing only the write door would
+        // have left a stored row permanently unreachable for hybrid completion.
+        dir.attach_revocation_pqc_signature(&symbolic, "AAAA")
+            .await
+            .expect("the PQC-attach door must find a row by its non-UUID id (#622)");
+        let after = dir.revocations_for(&who).await.expect("read");
+        assert_eq!(
+            after[0].scrub_signature_pqc.as_deref(),
+            Some("AAAA"),
+            "[{tag}] the attach applied to the row addressed by the symbolic id"
         );
     }
 

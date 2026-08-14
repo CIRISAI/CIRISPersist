@@ -1,0 +1,32 @@
+-- V124 — the index the withdrawal projection's payload lookup needs, SQLite dialect
+-- v31.1.0 (CIRISPersist#662, PR #667 round-3 review)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V124__accord_proposal_payload_index.sql
+--
+-- WHAT AND WHY
+-- ------------
+-- `list_accord_proposals_by_payload` was added to stop the withdrawal
+-- projection scanning the whole accord history on every role-claiming key
+-- offer — a path an ATTACKER chooses, by presenting a key that claims
+-- `canonical` or `infra:attest`, and which runs BEFORE the co-scrub gate can
+-- reject the row. The replacement was documented as an indexed query and
+-- shipped without the index, so the amplification it was written to remove was
+-- still there, one layer down: V091 indexes `accord_proposal` on
+-- `(action, prior_family_digest)` and `family_key_id` only.
+--
+-- A doc comment claiming a property the schema does not provide is worse than
+-- the original scan, because the next reader stops looking.
+--
+--     payload_sha256 — the persist-computed digest of `{op, target_key_id}`
+--                      that a withdraw proposal must commit to. The projection
+--                      computes it locally from `(op, key_id)` and looks it up;
+--                      this is what makes that lookup O(matches) rather than
+--                      O(ceremony history).
+--
+-- Not UNIQUE: two distinct proposals may legitimately commit to the same
+-- payload — an operator retrying a ceremony with a fresh nonce is exactly that,
+-- and the projection is written to tolerate it (first authorized withdrawal
+-- wins).
+
+CREATE INDEX IF NOT EXISTS accord_proposal_by_payload
+    ON accord_proposal (payload_sha256);

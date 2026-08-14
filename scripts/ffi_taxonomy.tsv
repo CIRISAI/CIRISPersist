@@ -120,8 +120,9 @@ Engine	aggregate_scoring_factors	axiotic
 Engine	aggregate_scoring_factors_batch	axiotic	
 Engine	aggregate_scoring_factors_stream	axiotic	
 Engine	aggregate_scrub_stats	axiotic	
-Engine	apply_replicated_key_record	deontic	
-Engine	attach_attestation_pqc_signature	ontological	
+Engine	apply_replicated_accord_evidence	deontic
+Engine	apply_replicated_key_record	deontic
+Engine	attach_attestation_pqc_signature	ontological
 Engine	attach_key_pqc_signature	ontological	
 Engine	attach_revocation_pqc_signature	ontological	
 Engine	attestation_insert_local	empirical	
@@ -367,8 +368,10 @@ Engine	list_signed_identity_occurrences_for_json	epistemic
 Engine	list_signed_identity_occurrences_since	epistemic	
 Engine	list_signed_key_records_since	epistemic	
 Engine	list_signed_location_proofs_since	epistemic	
-Engine	list_signed_partner_records_since	epistemic	
-Engine	list_signed_transport_destinations_since	epistemic	
+Engine	list_signed_accord_quorum_evidence_since	epistemic
+Engine	list_signed_partner_records_since	epistemic
+Engine	list_signed_revocations_since	epistemic
+Engine	list_signed_transport_destinations_since	epistemic
 Engine	list_subscriptions	structural	
 Engine	list_tasks	empirical	
 Engine	list_trace_summaries	empirical	
@@ -450,6 +453,7 @@ Engine	put_wholeness_witness_json	testimonial	equivocation_evidence
 Engine	reachable_under_scope	deontic	
 Engine	reachable_under_scope_with_reasons	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
+Engine	rematerialize_role_withdrawals	deontic
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	
 Engine	register_federation_key	deontic	
