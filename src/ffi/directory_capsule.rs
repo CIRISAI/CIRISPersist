@@ -717,8 +717,15 @@ pub enum DirectoryOp {
     /// cursor, for the edge advertise/serve responder. Result rides
     /// `SignedKeyRecords`. APPEND-ONLY.
     ListSignedKeyRecordsSince {
-        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Cursor: rows strictly after `(admitted_at, key_id)` (None ⇒ from
+        /// start).
+        ///
+        /// v31.4.0 (#682/#668) — the PAIR, and THIS node's admission position
+        /// rather than the producer's `scrub_timestamp`. A record signed in
+        /// January, replicated late and admitted in February, sorted under
+        /// January and was never served past it; and a resume on the instant
+        /// alone skips the remainder of any tie larger than one page.
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -962,7 +969,7 @@ pub enum DirectoryOpResult {
     SignedCommunityMembershipRevocations(Vec<SignedCommunityMembershipRevocation>),
     /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
-    SignedKeyRecords(Vec<SignedKeyRecord>),
+    SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
     /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
     SignedIdentityOccurrencesSince(Vec<SignedIdentityOccurrence>),
@@ -3119,9 +3126,9 @@ impl FederationDirectory for OpsDirectory {
     /// the capsule, for the edge advertise/serve responder.
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedKeyRecord>, Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedKeyRecordsSince { since, limit })
             .await?

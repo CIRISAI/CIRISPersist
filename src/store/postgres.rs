@@ -9202,20 +9202,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let limit = i64::from(limit);
+        // v31.4.0 (#682/#668) — the bare column, because V126 sets NOT NULL on
+        // this dialect, and the PAIR, so a tie larger than one page resumes.
+        // Row-value comparison `(a, b) > (c, d)` is exactly the index order.
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
         let rows = client
             .query(
-                "SELECT * FROM cirislens.federation_keys \
-                 WHERE ($1::timestamptz IS NULL OR scrub_timestamp > $1) \
-                 ORDER BY scrub_timestamp ASC, key_id ASC LIMIT $2",
-                &[&since, &limit],
+                "SELECT *, admitted_at AS _pos FROM cirislens.federation_keys \
+                 WHERE ($1::timestamptz IS NULL OR (admitted_at, key_id) > ($1, $2)) \
+                 ORDER BY admitted_at ASC, key_id ASC LIMIT $3",
+                &[&since_at, &since_id, &limit],
             )
             .await
             .map_err(|e| {
@@ -9223,8 +9228,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(crate::federation::SignedKeyRecord {
+            let admitted_at: chrono::DateTime<chrono::Utc> = row.try_get("_pos").map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_key_records_since: admitted_at: {e}"
+                ))
+            })?;
+            out.push(crate::federation::ServedKeyRecord {
                 record: pg_row_to_key_record(row)?,
+                admitted_at,
             });
         }
         Ok(out)

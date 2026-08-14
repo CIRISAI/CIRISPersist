@@ -159,6 +159,13 @@ struct State {
     /// `Revocation` struct, and the reason one revocation hashes identically on
     /// every node that holds it.
     revocation_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+
+    /// `federation_keys.admitted_at` (V126): when THIS node admitted each key
+    /// record. Keyed by `key_id`. A side map rather than a field on `KeyRecord`,
+    /// because the record's bytes must hash identically on every node while each
+    /// node keeps its own arrival order — the same separation `ServedRevocation`
+    /// makes (#682).
+    key_record_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
     /// to `federation_keys`. Keyed by `key_id`. Memory backend
     /// mirrors the V051 PG/SQLite shape: same fields, same soft-
@@ -421,6 +428,7 @@ impl Default for MemoryBackend {
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
                 revocation_admitted_at: HashMap::new(),
+                key_record_admitted_at: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
@@ -6224,27 +6232,51 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         // Every `federation_keys` row is signed — `scrub_signature_classical`
         // is required at admission, so there is no filter to apply here.
+        //
+        // v31.4.0 (#682) — keyed on THIS node's `admitted_at`, not the
+        // producer's `scrub_timestamp`. A record signed in January, replicated
+        // late and admitted in February, sorted under January and was never
+        // served to a consumer past it. The side map is the memory analogue of
+        // the V126 column; a row without an entry falls back to
+        // `scrub_timestamp`, matching the sqlite dialect's
+        // `COALESCE(admitted_at, scrub_timestamp)`.
+        let position = |k: &crate::federation::KeyRecord| {
+            state
+                .key_record_admitted_at
+                .get(&k.key_id)
+                .copied()
+                .unwrap_or(k.scrub_timestamp)
+        };
+        // v31.4.0 (#668) — compare the PAIR. Resuming on the instant alone
+        // skips the remainder of any tie larger than one page, silently.
         let mut rows: Vec<_> = state
             .federation_keys
             .values()
-            .filter(|k| since.is_none_or(|s| k.scrub_timestamp > s))
+            .filter(|k| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(k), &k.key_id) > (*s_at, s_id)
+                })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
-            a.scrub_timestamp
-                .cmp(&b.scrub_timestamp)
+            position(a)
+                .cmp(&position(b))
                 .then_with(|| a.key_id.cmp(&b.key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows
             .into_iter()
-            .map(|record| crate::federation::SignedKeyRecord { record })
+            .map(|record| crate::federation::ServedKeyRecord {
+                admitted_at: position(&record),
+                record,
+            })
             .collect())
     }
 

@@ -8325,28 +8325,50 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
         let conn = self.conn.clone();
-        let since = since.map(|t| t.to_rfc3339());
+        // v31.4.0 (#682/#668) — `COALESCE(admitted_at, scrub_timestamp)` matches
+        // the V126 index expression exactly, and covers the row this dialect
+        // cannot force NOT NULL. The resume compares the PAIR, so a tie larger
+        // than one page continues instead of losing its remainder.
+        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
         (move || -> Result<Vec<_>, rusqlite::Error> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT * FROM federation_keys \
-                 WHERE (?1 IS NULL OR scrub_timestamp > ?1) \
-                 ORDER BY scrub_timestamp ASC, key_id ASC LIMIT ?2",
+                "SELECT *, COALESCE(admitted_at, scrub_timestamp) AS _pos FROM federation_keys \
+                 WHERE (?1 IS NULL OR \
+                        COALESCE(admitted_at, scrub_timestamp) > ?1 OR \
+                        (COALESCE(admitted_at, scrub_timestamp) = ?1 AND key_id > ?2)) \
+                 ORDER BY COALESCE(admitted_at, scrub_timestamp) ASC, key_id ASC LIMIT ?3",
             )?;
-            let rows = stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_key_record)?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_at, since_id, limit],
+                |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok((sqlite_row_to_key_record(row)?, pos))
+                },
+            )?;
             let mut out = Vec::new();
             for r in rows {
-                out.push(crate::federation::SignedKeyRecord { record: r? });
+                let (record, pos) = r?;
+                out.push((record, pos));
             }
             Ok(out)
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_signed_key_records_since: {e}"))
+        })?
+        .into_iter()
+        .map(|(record, pos)| {
+            Ok(crate::federation::ServedKeyRecord {
+                admitted_at: parse_rfc3339(&pos),
+                record,
+            })
         })
+        .collect()
     }
 
     /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor. Every
