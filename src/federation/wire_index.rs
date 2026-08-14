@@ -1,11 +1,28 @@
 //! v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash index
 //! (`signed_wire_index`, V111): ONE table, `PRIMARY KEY (kind, content_hash)`,
 //! covering every kind CIRISEdge serves — the 5 primary signed planes (#507c),
-//! the 5 E4 keyless-declaration planes (#504), and the operational
-//! org/org_membership/partner_record trio. 13 of the 14
-//! [`super::replication_policy::EnvelopeKind`]s (`Revocation`, the key-level
-//! revocation plane, is out of #507's scope — see the trait doc on
-//! [`super::FederationDirectory::lookup_signed_record_by_content_hash`]).
+//! the 5 E4 keyless-declaration planes (#504), the operational
+//! org/org_membership/partner_record trio, and — since v31.1.0
+//! (CIRISPersist#655) — the key-level `Revocation` plane.
+//!
+//! # v31.1.0 (CIRISPersist#655/#662) — 14 of the 15, and the one exception
+//!
+//! `Revocation` was outside #507's scope, which is how #655 found an
+//! exclusion plane with no serve cursor and no point-read: destroyable, not
+//! rebuildable. It joins here on the same terms as every other plane, because
+//! a revocation row is self-authenticating (inline hybrid scrub signature,
+//! re-verified at `put_revocation` against the receiver's own directory).
+//!
+//! [`EnvelopeKind::AccordQuorumEvidence`](super::replication_policy::EnvelopeKind::AccordQuorumEvidence)
+//! is the one kind that stays OUT, by construction rather than by oversight.
+//! Every other kind indexes a ROW; that kind is an aggregate — a proposal
+//! plus however many participations have arrived — so its content hash is a
+//! moving target that changes each time a holder's vote lands, and an index
+//! entry written at one vote count is dangling at the next. A content-hash
+//! point-read is the wrong primitive for it; the plane is served by cursor
+//! only (`list_signed_accord_quorum_evidence_since`), and its receive gate
+//! re-tallies rather than fetching by hash, so nothing downstream needs the
+//! ref. Stated here so the gap is a decision and not the next #655.
 //!
 //! # The lockstep fact
 //!
@@ -243,6 +260,22 @@ pub async fn reload_record_bytes(
                 _ => None,
             }
         }
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Reloads
+        // targeted through `revocations_for` (the subject read) and wraps in
+        // the SAME `SignedRevocation` shape `list_signed_revocations_since`
+        // returns, so both derivations hash identical bytes.
+        "Revocation" => {
+            let revoked_key_id = record_key_field(record_key_json, "revoked_key_id")?;
+            let revocation_id = record_key_field(record_key_json, "revocation_id")?;
+            let rows = dir.revocations_for(&revoked_key_id).await?;
+            match rows.into_iter().find(|r| r.revocation_id == revocation_id) {
+                Some(revocation) => Some(
+                    serde_json::to_vec(&super::SignedRevocation { revocation })
+                        .map_err(|e| to_bytes(e, "Revocation"))?,
+                ),
+                None => None,
+            }
+        }
         "IdentityOccurrence" => {
             let identity_key_id = record_key_field(record_key_json, "identity_key_id")?;
             let occurrence_key_id = record_key_field(record_key_json, "occurrence_key_id")?;
@@ -477,6 +510,55 @@ pub async fn wire_refs_for_subject(
         let rk = record_key(&[("attestation_id", &a.attestation_id)]);
         out.push(("Attestation", content_hash_of(&a)?, rk));
     }
+    // v31.1.0 (CIRISPersist#655, PR review P1) — the key-level revocation
+    // plane. Indexing it made a revocation FETCHABLE by content hash; without
+    // a ref here it stayed UNDISCOVERABLE, because the subject-scoped pull is
+    // how a peer learns which hashes to ask for. #655 is only closed when both
+    // are true — a plane that replicates but that nobody asks for is
+    // rebuildable in principle and unreachable in practice.
+    //
+    // A revocation OF a key is squarely "what is about me", which is the axis
+    // this read answers.
+    for revocation in dir.revocations_for(subject_key_id).await? {
+        let rk = record_key(&[
+            ("revoked_key_id", &revocation.revoked_key_id),
+            ("revocation_id", &revocation.revocation_id),
+        ]);
+        let wrapped = super::SignedRevocation { revocation };
+        let hash = content_hash_of(&wrapped)?;
+        // v31.1.0 (CIRISPersist#655, PR #667 round-3) — ADVERTISE ONLY WHAT
+        // THIS NODE CAN SERVE.
+        //
+        // `signed_wire_index` is populated by the per-put hook, so on a
+        // database upgraded from before this cut the pre-existing revocations
+        // are not in it until an operator runs `rebuild_signed_wire_index`.
+        // Advertising their hashes anyway hands a peer refs that resolve to
+        // `None` — a plane visible in principle and unreachable in practice,
+        // which is #655's own defect arriving through DEPLOYMENT ORDER rather
+        // than through a missing cursor.
+        //
+        // The check is the point-read itself, so "can I serve this?" is
+        // answered by the thing that would have to serve it rather than by a
+        // second rule that could disagree, and it self-corrects the moment the
+        // backfill runs.
+        //
+        // Cost, stated honestly rather than as "one indexed lookup": the point
+        // read is an indexed `signed_wire_index` hit AND a reload of the record
+        // through `reload_record_bytes`, whose `Revocation` arm re-reads the
+        // subject's revocations. So a subject holding n revocations pays n
+        // subject-reads here. n is 0 or 1 for essentially every key, and the
+        // alternative — advertising refs that resolve to nothing — is the
+        // defect. If a subject with many revocations ever becomes ordinary,
+        // this wants a batch "which of these hashes are indexed" read rather
+        // than a loop.
+        if dir
+            .lookup_signed_record_by_content_hash("Revocation", &hash)
+            .await?
+            .is_some()
+        {
+            out.push(("Revocation", hash, rk));
+        }
+    }
     for r in dir
         .list_signed_identity_occurrences_for(subject_key_id)
         .await?
@@ -548,6 +630,21 @@ pub async fn all_kind_hash_keys(
     for a in dir.list_attestations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &a.attestation_id)]);
         out.push(("Attestation", content_hash_of(&a)?, rk));
+    }
+    // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Hashed as
+    // the `SignedRevocation` wrapper, NOT as the `ServedRevocation` the cursor
+    // returns: `admitted_at` is this node's position on the record and must
+    // stay out of a content hash, or one revocation would hash differently on
+    // every node holding it.
+    for r in dir.list_signed_revocations_since(None, u32::MAX).await? {
+        let rk = record_key(&[
+            ("revoked_key_id", &r.revocation.revoked_key_id),
+            ("revocation_id", &r.revocation.revocation_id),
+        ]);
+        let wrapped = super::SignedRevocation {
+            revocation: r.revocation,
+        };
+        out.push(("Revocation", content_hash_of(&wrapped)?, rk));
     }
     for r in dir
         .list_signed_identity_occurrences_since(None, u32::MAX)

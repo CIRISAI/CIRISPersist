@@ -65,10 +65,17 @@
 //!    for a key's right to exist. Trust roots also CO-EXIST — a new ceremony
 //!    ADDS one — so a re-seed re-establishes who may confer privilege, not who
 //!    exists.
-//! 2. `federation_revocations` has **no replication serve cursor at all**
-//!    (there is no `list_signed_revocations_since`; the key-level revocation
-//!    plane is explicitly out of CIRISPersist#507's scope). Purge it and
-//!    anti-entropy cannot refill it — the exclusion is gone permanently.
+//! 2. `federation_revocations` had **no replication serve cursor at all** —
+//!    purge it and anti-entropy could not refill it, so the exclusion was gone
+//!    permanently. v31.1.0 (CIRISPersist#655) added
+//!    `list_signed_revocations_since`, which changes the blast radius but NOT
+//!    this conclusion: a refill needs some peer to still hold the row, so the
+//!    cursor helps a single node that lost state and does nothing for a purge
+//!    that ran everywhere or for a plane no peer retained. The same is now true
+//!    of `federation_role_withdrawals`, whose rebuild path (CIRISPersist#662)
+//!    is a LOCAL re-derivation from replicated accord evidence — it needs the
+//!    evidence to have survived somewhere too. "Recoverable in principle" is
+//!    not "safe to delete".
 //! 3. The exclusions that DO live in `federation_attestations` — peer
 //!    de-admission ([`PEER_DEADMISSION_DIMENSION`]), quarantine markers,
 //!    moderation / reconsideration / slashing / objection reports, and the
@@ -1564,7 +1571,71 @@ pub async fn run_v31_migration(
         }
     }
 
+    // v31.1.0 (CIRISPersist#655, PR #667 round-4) — **BACKFILL THE NEW INDEXED
+    // KIND, HERE, RATHER THAN ASKING AN OPERATOR TO.**
+    //
+    // v31.1.0 adds `Revocation` to the V111 signed wire index. Only future
+    // `put_revocation` calls populate it, so on EVERY database that already
+    // holds revocations the pre-existing rows are absent from the index — and
+    // `wire_refs_for_subject` would advertise content hashes that resolve to
+    // `None`. A plane visible in principle and unreachable in practice is the
+    // exact defect #655 exists to close, arriving through deployment order.
+    //
+    // The standing directive is that recovery is automatable inside persist and
+    // consumers never know, so this is not a release note telling an operator
+    // to run the repair: the migration runs on every boot and detects the state
+    // itself.
+    //
+    // Cheap to check and paid once: read ONE revocation, ask the index for it,
+    // and rebuild only if the plane is unindexed. A node with no revocations
+    // does nothing; a backfilled node does two point reads per boot.
+    if !options.dry_run {
+        backfill_revocation_wire_index(directory).await?;
+    }
+
     Ok(outcome)
+}
+
+/// v31.1.0 (CIRISPersist#655) — rebuild the signed wire index iff the
+/// `Revocation` plane is present but unindexed. See the call site.
+///
+/// Fail-soft on `Unsupported`: a directory without these reads (the FFI
+/// capsule) has no index to backfill, and that is not a migration failure.
+async fn backfill_revocation_wire_index(
+    directory: &dyn super::FederationDirectory,
+) -> Result<(), Error> {
+    let probe = match directory.list_signed_revocations_since(None, 1).await {
+        Ok(rows) => rows,
+        Err(Error::Unsupported { .. }) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Some(first) = probe.into_iter().next() else {
+        return Ok(()); // no revocations: nothing to index
+    };
+    // Hashed as the wrapper the index stores, NOT the served view — the
+    // cursor's `admitted_at` is this node's position and is deliberately
+    // outside the content hash.
+    let wrapped = super::SignedRevocation {
+        revocation: first.revocation,
+    };
+    let hash = super::wire_index::content_hash_of(&wrapped)?;
+    match directory
+        .lookup_signed_record_by_content_hash("Revocation", &hash)
+        .await
+    {
+        Ok(Some(_)) => return Ok(()), // already backfilled
+        Ok(None) => {}
+        Err(Error::Unsupported { .. }) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    tracing::info!(
+        "v31.1.0 (CIRISPersist#655): the Revocation plane is not in the signed wire index; \
+         backfilling so a peer following a subject-scoped ref can actually fetch it"
+    );
+    match directory.rebuild_signed_wire_index().await {
+        Ok(_) | Err(Error::Unsupported { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -7,6 +7,140 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.1.0] - 2026-08-13
 
+### Added — SECURITY — two exclusion planes could be destroyed but never rebuilt (#655, #662)
+
+**CONSUMER ACTION REQUIRED — two pinned hashes move.** Both are deliberate
+re-pins in a coordinated cut, handled exactly the way the v20 envelope
+vocabulary re-pin was:
+
+| constant | was | now |
+|---|---|---|
+| `REPLICATION_POLICY_HASH` | `351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b` | `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef` |
+| `CONSENT_GRAMMAR_HASH` | `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05` | `b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f` |
+
+`EnvelopeKind` gains a 15th variant, `AccordQuorumEvidence`, **appended** (the
+order is hashed, so it is never inserted). CIRISEdge's `replication::protocol`
+enum must gain the same name in the same position; CIRISServer pins both
+hashes. The consent grammar moves only because its manifest carries
+`kind_transferability` over `EnvelopeKind::ALL` — the grammar itself
+(principles, restriction ops, audiences) is unchanged, and the new kind is
+classified `StructuralPlane`: constitutional machinery is not something an
+end-user consent grant may narrow. No re-mint, no ceremony, no data migration.
+
+**The defect.** `federation_revocations` (#655) and
+`federation_role_withdrawals` (#662's blocker) were both written, both
+consulted, and neither could reach a peer. Persist exposed 14 `list_*_since`
+cursors and served neither plane. Anything that deleted rows — a DSAR erasure,
+an operator repair, a backup restored from before the exclusion — removed it
+permanently and silently. For V104 that is not bookkeeping:
+`is_infra_attest_effective` folds withdrawals through `lookup_role_withdrawal`,
+so the **effective** `infra:attest` set — the build-signing trust root the
+manifest verifier asks about — depended on rows with no way home.
+
+**The two halves needed opposite remedies, and which one is settled by a single
+question: does the row carry a signature a peer could check?**
+
+`federation_revocations` does — `revocation_envelope` plus the hybrid
+`scrub_signature_*` / `scrub_key_id`, all of which `put_revocation` already
+re-verifies against the receiver's own directory. The receiver was already
+re-deriving; only serving was missing, so **a plain cursor is the whole fix**.
+
+`federation_role_withdrawals` does not. V104 is `role`, `key_id`,
+`withdrawn_at`, `authority_decision_digest`, `superseded_by`,
+`persist_row_hash` — no signature columns at all. `persist_row_hash` is
+recomputed locally so it binds nothing across nodes, and the authority lives
+entirely behind `authority_decision_digest`, a pointer into the accord decision
+plane (V091 / #302) where the signatures actually are. A cursor there would
+ship a **derived verdict** and ask the receiver to trust the sender — the
+forgeable-decision-bool bypass #377 closed, rebuilt on purpose and called
+replication.
+
+**So: replicate evidence, never verdicts.**
+
+- `list_signed_revocations_since` — the #655 cursor. `Revocation` also joins
+  the shared `signed_wire_index` (#507 had left the key-level plane out of
+  scope, which is how #655 found it) and is now advertised in
+  `wire_refs_for_subject`, because a plane a peer cannot discover is
+  rebuildable in principle and unreachable in practice.
+- `list_signed_accord_quorum_evidence_since` — the signed EVIDENCE plane: an
+  `AccordProposal` plus the holders' hybrid-signed participations, bundled per
+  proposal. The cursor is the bundle's visibility instant
+  (`max(created_at, max(server_arrival_at))`), not the proposal's immutable
+  `created_at`: a bundle is an aggregate, so a vote landing has to move it
+  forward in the stream or a peer that read it pre-quorum skips the
+  quorum-bearing version forever.
+- `apply_replicated_accord_evidence` — the receive half. It **re-tallies** with
+  `tally_live_quorum` against a roster resolved from the receiver's own
+  directory, at the same strict-majority threshold the local destructive ops
+  use. The sender's verdict is not an input to the function. Fail-closed with
+  the new `Error::AccordEvidenceUnverified` (`kind()` =
+  `accord_evidence_unverified`), kept distinct from
+  `canonical_withdrawal_authority_invalid` so an operator can tell "a peer
+  offered evidence that does not verify here" from "a local op named an
+  authority that does not hold".
+- Each node then re-derives its **own** V104/V095 projection. `payload_sha256`
+  is a digest, so a peer cannot say *which* key a withdrawal names; the
+  receiver can only ask, per key it already holds, whether the quorum voted on
+  the payload it would compute itself. V104 becomes a local materialization
+  rather than something on the wire. `rematerialize_role_withdrawals` is the
+  repair door, and the role-admission gates materialize before they consult, so
+  evidence arriving *before* its target key still excludes that key.
+
+That ordering is load-bearing: the local re-derivation is why replicating the
+evidence is safe.
+
+`revocations_for` is routed through the FFI directory capsule (was a hard
+`Unsupported` — a host could write an exclusion and never read it back), as is
+the evidence admission, which crosses as ONE op so the re-tally runs inside
+persist's own `.so`.
+
+Witnessed on memory, sqlite AND postgres, including the cross-node leg (two
+directories of the same backend: a withdrawal on node A excludes the key on
+node B without the withdrawal row ever crossing the wire). Seven mutations
+against the receive-side re-tally, seven caught — one (`skip-the-family-scope`)
+survived first and exposed a witness that could not fail, since
+`AccordParticipation::verify` binds `family_key_id` inside each signature and
+refuses out-of-family bundles by another route; that gate is load-bearing for
+DIAGNOSIS, not for safety, and both the code and the witness now say so.
+
+**Two schema additions (V123, V124), both additive and backfilled.** V123 adds
+`federation_revocations.admitted_at` — THIS node's admission instant — because
+the serve cursor first keyed on the producer's `scrub_timestamp` and that hid a
+whole class of exclusion: a revocation signed in January and replicated late is
+admitted in February, and a consumer whose cursor has passed January never sees
+it. Nothing prevented that (`check_revocation_scrub_skew` is a ceiling only;
+the anti-rollback latch is per-`revoked_key_id`), so it was #655's own defect
+re-entering through the cursor key. `scrub_timestamp` is unchanged and keeps
+every other job it had. The cursor read type is `ServedRevocation` (record plus
+this node's position), separate from the `SignedRevocation` write input so that
+a node-local instant never enters a content hash. V124 adds the
+`accord_proposal(payload_sha256)` index the withdrawal projection's lookup
+needs — it was documented as indexed and shipped without one, leaving an
+attacker-triggerable scan on the key-admission chokepoint.
+
+**Known limits, stated rather than left to be found.**
+`AccordQuorumEvidence` stays out of the content-hash wire index by
+construction: every other kind indexes a row, that kind is an aggregate whose
+hash changes as votes land, so an index entry written at one vote count dangles
+at the next. It is served by cursor only. SUPERSEDE tombstones are not
+re-derived — their payload commits to a `(target, successor)` pair, so the
+local search would be quadratic, and a supersede is a rotation link rather than
+an exclusion.
+
+**Upgrade note.** On a database that already holds revocations, run
+`rebuild_signed_wire_index` once to make them point-readable by content hash.
+Until it runs, `wire_refs_for_subject` deliberately does NOT advertise them:
+advertising a ref that resolves to `None` would be a plane visible in principle
+and unreachable in practice, which is the defect #655 exists to close. The
+advertise path checks the index and self-corrects the moment the backfill runs.
+
+**Deferred, tracked in CIRISPersist#668.** All sixteen `list_signed_*_since`
+cursors resume on an instant alone while ordering by `(instant, id)`, so a tie
+larger than one page silently drops rows; and every signed-plane writer updates
+`signed_wire_index` after the primary row commits, so a failure there leaves a
+durable row unindexed. Both are family-wide properties, not new here, and both
+want one change with one witness rather than sixteen divergent patches.
+
 ### Fixed — SECURITY — the delegation leg verified a proxy, not the property (#665 review)
 
 **The third time this leg reported `entrenched` on a plane that could not

@@ -5612,15 +5612,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v31.0.0 (#644) — revocation_envelope is TEXT since V122.
         let revocation_envelope_text =
             pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
+        // v31.1.0 (CIRISPersist#655) — THIS node's admission position (V123).
+        // Not the producer's clock — `scrub_timestamp` is their assertion, and
+        // a late-replicated old one would sort behind every consumer's cursor —
+        // and not the local wall clock either: a backward step (VM restore, NTP
+        // correction) would stamp a later row below a cursor a consumer already
+        // passed, and `> since` would skip it permanently. Allocated strictly
+        // after the last position handed out; see
+        // `monotonic_admission_instant`.
+        //
+        // Two writers racing can still read the same MAX and tie. That is the
+        // composite-cursor question tracked in CIRISPersist#668, and it is a
+        // different failure (one row at a page boundary) from the reversal this
+        // closes (every row after the step, permanently).
+        let last_admitted: Option<chrono::DateTime<chrono::Utc>> = client
+            .query_one(
+                "SELECT MAX(admitted_at) FROM cirislens.federation_revocations",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
+            .get(0);
+        let admitted_at = crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last_admitted,
+        );
         client
             .execute(
+                // v31.1.0 (CIRISPersist#655) — `admitted_at` (V123) is THIS
+                // node's position in its own stream, stamped here and never
+                // read from the wire. The serve cursor keys on it.
                 "INSERT INTO cirislens.federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                    revoked_after, persist_row_hash, admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                    $16, $17)",
                 &[
                     &revocation_uuid,
                     &row.revoked_key_id,
@@ -5638,6 +5667,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.observed_region,
                     &row.revoked_after,
                     &row.persist_row_hash,
+                    &admitted_at,
                 ],
             )
             .await
@@ -5651,6 +5681,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert revocation: {msg}"))
                 }
             })?;
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
+        // shared `signed_wire_index`, reloaded through the read path so the
+        // indexed bytes are the ones this backend actually stores.
+        self.index_stored_record(
+            "Revocation",
+            &crate::federation::wire_index::record_key(&[
+                ("revoked_key_id", row.revoked_key_id.as_str()),
+                ("revocation_id", row.revocation_id.as_str()),
+            ]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -6689,10 +6730,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 proposal.nonce, proposal.family_key_id
             )));
         }
+        // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
+        // evidence cursor, so it is an allocated position rather than a
+        // wall-clock read; see `monotonic_admission_instant`.
+        let created_at = {
+            let c = self
+                .get_client()
+                .await
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            let last: Option<chrono::DateTime<chrono::Utc>> = c
+                .query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
+                .await
+                .map_err(|e| Error::Backend(format!("last accord created_at: {e}")))?
+                .get(0);
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::prepare_proposal(
             &proposal,
             authority_signature,
-            chrono::Utc::now(),
+            created_at,
         )?;
         let client = self
             .get_client()
@@ -6769,6 +6825,35 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_stored_proposal).collect()
     }
 
+    /// v31.1.0 (CIRISPersist#662) — the payload-digest lookup the withdrawal
+    /// projection resolves with, so a role-claiming key offer costs one query
+    /// instead of a scan of the whole ceremony log.
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Answered from the V124 `accord_proposal(payload_sha256)` index.
+        let rows = client
+            .query(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM cirislens.accord_proposal WHERE payload_sha256 = $1 \
+                 ORDER BY created_at ASC, proposal_digest ASC",
+                &[&payload_sha256],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_accord_proposals_by_payload: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|r| pg_row_to_stored_proposal(r).map(|s| s.proposal))
+            .collect()
+    }
+
     async fn put_accord_participation(
         &self,
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
@@ -6784,11 +6869,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     participation.proposal_digest
                 ))
             })?;
+        // The other half of the evidence cursor; same rule.
+        let arrival = {
+            let c = self
+                .get_client()
+                .await
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            let last: Option<chrono::DateTime<chrono::Utc>> = c
+                .query_one(
+                    "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
+                    &[],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("last server_arrival_at: {e}")))?
+                .get(0);
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+        };
         let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
             &stored.proposal,
             &participation,
             standing_roster,
-            chrono::Utc::now(),
+            arrival,
         )?;
         let client = self
             .get_client()
@@ -9119,6 +9220,127 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             });
         }
         Ok(out)
+    }
+
+    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor. Every
+    /// row is signed (`scrub_signature_classical` is `NOT NULL`), so — as with
+    /// `list_signed_key_records_since` — no signed-only filter applies.
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                // `revocation_id` is a UUID column; the read type is String,
+                // so it is cast here exactly as `revocations_for` casts it.
+                //
+                // v31.1.0 (CIRISPersist#655) — keyed on `admitted_at` (V123),
+                // THIS node's admission order, never the producer's
+                // `scrub_timestamp`. V123 backfills and sets NOT NULL, so no
+                // COALESCE is needed on this dialect.
+                "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
+                        revoked_at, effective_at, revocation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                        revoked_after, persist_row_hash, admitted_at \
+                 FROM cirislens.federation_revocations \
+                 WHERE ($1::timestamptz IS NULL OR admitted_at > $1) \
+                 ORDER BY admitted_at ASC, revocation_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_revocations_since: {e}"))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let admitted_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("admitted_at")
+                .map_err(|e| crate::federation::Error::Backend(format!("admitted_at: {e}")))?;
+            out.push(crate::federation::ServedRevocation {
+                revocation: pg_row_to_revocation(row)?,
+                admitted_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. `limit`
+    /// pages PROPOSALS; the participation set for each is assembled by the
+    /// shared
+    /// [`accord_carriage::assemble_evidence_page`](crate::federation::accord_carriage::assemble_evidence_page),
+    /// which owns the `member_id` sort so all three backends serialize alike.
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit_i = i64::from(limit);
+        let rows = client
+            .query(
+                // v31.1.0 (CIRISPersist#662, PR review P1) — the cursor is the
+                // bundle's VISIBILITY instant, not the proposal's immutable
+                // `created_at`: a vote landing must move the bundle forward in
+                // the stream, or a peer that read it pre-quorum never sees the
+                // version that carries one.
+                // v31.1.0 (PR review P1) — `evidence_at` is SELECTED and
+                // carried out with the row, never recomputed at assembly time:
+                // a vote landing in between would otherwise return an instant
+                // later than the one the page was chosen with, and a consumer
+                // resuming from it would skip the proposals cut by `LIMIT` in
+                // that gap.
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                        evidence_at \
+                 FROM ( \
+                   SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                          proposal_digest, \
+                          GREATEST(created_at, COALESCE(( \
+                              SELECT MAX(server_arrival_at) \
+                              FROM cirislens.accord_participation ap \
+                              WHERE ap.proposal_digest = p.proposal_digest \
+                          ), created_at)) AS evidence_at \
+                   FROM cirislens.accord_proposal p \
+                 ) AS bundles \
+                 WHERE ($1::timestamptz IS NULL OR evidence_at > $1) \
+                 ORDER BY evidence_at ASC, proposal_digest ASC LIMIT $2",
+                &[&since, &limit_i],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_accord_quorum_evidence_since: {e}"
+                ))
+            })?;
+        let mut page = Vec::with_capacity(rows.len());
+        for row in rows {
+            let evidence_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("evidence_at")
+                .map_err(|e| crate::federation::Error::Backend(format!("evidence_at: {e}")))?;
+            page.push((pg_row_to_stored_proposal(row)?, evidence_at));
+        }
+        crate::federation::accord_carriage::assemble_evidence_page(self, page).await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — delegates to the shared re-tally body.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
     }
 
     async fn list_signed_identity_occurrences_since(
@@ -25445,6 +25667,99 @@ mod tests {
     }
 
     // ─── ReadEngine §I tests (v0.5.5, CIRISPersist#23) ──────────────
+
+    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
+    /// survives a backward clock step, on this backend's real write path.**
+    ///
+    /// Twin of the sqlite and memory witnesses, and the one that matters most:
+    /// postgres reads its `MAX(admitted_at)` over a connection pool rather than
+    /// under a process-local lock, so "the rule is unit-tested" says least
+    /// here. The post-step state is planted directly — the last position handed
+    /// out is moved an hour into the future, what a node looks like after an
+    /// NTP correction — and the next admission must still sort after it.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn admission_position_survives_a_backward_clock_step_pg_655() {
+        use crate::federation::FederationDirectory as _;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let a = format!("rvp-a-{tag}");
+        let b = format!("rvp-b-{tag}");
+        for k in [&a, &b] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(k, k, now - chrono::Duration::minutes(1), false),
+                })
+                .await
+                .unwrap();
+        }
+        let mk = |subject: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::federation::tier_ingest::test_support::seal_revocation(
+                crate::federation::Revocation {
+                    revocation_id: id.clone(),
+                    revoked_key_id: subject.to_owned(),
+                    revoking_key_id: subject.to_owned(),
+                    reason: Some("test".into()),
+                    revoked_at: now,
+                    effective_at: now,
+                    revocation_envelope: serde_json::json!({ "id": id }),
+                    original_content_hash: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: subject.to_owned(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    observed_region: crate::federation::verify_coord::region::US.into(),
+                    revoked_after: None,
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: mk(&a) })
+            .await
+            .expect("first revocation");
+
+        // THE BACKWARD STEP, as state.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE cirislens.federation_revocations SET admitted_at = $1 \
+                     WHERE revoked_key_id = $2",
+                    &[&future, &a],
+                )
+                .await
+                .unwrap();
+        }
+
+        let second = mk(&b);
+        let second_id = second.revocation_id.clone();
+        backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: second })
+            .await
+            .expect("second revocation");
+
+        let served = backend
+            .list_signed_revocations_since(Some(future), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            served
+                .iter()
+                .any(|r| r.revocation.revocation_id == second_id),
+            "a revocation admitted after a backward clock step must still be served to a \
+             consumer resuming from the pre-step cursor"
+        );
+    }
 
     /// Build a federation KeyRecord with controllable valid_from /
     /// pqc_completed.

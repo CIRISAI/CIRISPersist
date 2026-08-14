@@ -7272,6 +7272,22 @@ pub async fn check_canonical_role_admission_over_roster(
     )
     .await?;
 
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING, the
+    // twin of the `infra:attest` gate's step (1c). The tombstone is a local
+    // projection of replicated accord evidence, and the evidence plane and the
+    // key plane replicate independently: evidence authorizing this key's
+    // withdrawal can arrive first, and then step (2) would consult an empty
+    // table and re-confer `canonical`. Derived here from a proposal already in
+    // our own state, re-tallied by us. See
+    // [`accord_carriage::project_role_withdrawal_for_key`](super::accord_carriage::project_role_withdrawal_for_key).
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
     // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
     // successor whose tombstone names THIS key_id is exempt (rotate-in).
@@ -7350,6 +7366,16 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -7393,6 +7419,16 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -8429,6 +8465,22 @@ pub async fn check_infra_attest_role_admission_over_roster(
     )
     .await?;
 
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING. The
+    // tombstone is a LOCAL projection of replicated accord evidence, and the
+    // two planes replicate independently: the evidence authorizing this key's
+    // withdrawal can arrive before the key itself. If it did, step (2) below
+    // would consult an empty table and confer a withdrawn role — the exclusion
+    // lost to ORDERING rather than to trust. Deriving it here, from a proposal
+    // already in our own state and re-tallied by us, is what makes step (2)
+    // order-independent.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        super::types::roles::INFRA_ATTEST,
+        &row.key_id,
+        roster_key_ids,
+    )
+    .await?;
+
     // (2) Revocation-wins (#424, the #377 rule generalized): a quorum-withdrawn
     // key stays refused EVEN with a valid co-scrub set — the ADD gate is
     // monotonic and anti-entropy re-runs it, so without this consult a peer
@@ -8724,6 +8776,41 @@ pub async fn check_accord_role_admission_over_roster(
     super::genesis::posture::require_seated_accord_roster(
         directory,
         super::genesis::posture::ACCORD_ROLE_ADMISSION,
+        roster_key_ids,
+    )
+    .await?;
+
+    // (1c) v31.1.0 (CIRISPersist#662, PR #667 review P1) — MATERIALIZE BEFORE
+    // CONSULTING, against the roster THIS CALL WAS GIVEN.
+    //
+    // Round-3 review: these five calls first passed `accord_holder_roster_key_ids()`
+    // — the production roster — inside `_over_roster` gates whose entire
+    // contract is that the caller supplies the roster. That is broken in both
+    // directions. With no production keys present, a simulation's otherwise
+    // valid admission fails on a projection it never asked for; with both
+    // rosters present, withdrawal evidence signed by the INJECTED roster
+    // projects no tombstone and the injected-roster co-scrub then admits the
+    // withdrawn role. The second is the sharp one: the gate would re-derive
+    // against different state than the evidence was admitted under, which is
+    // the re-tally discipline inverted.
+    //
+    // The third instance of this gate shape needed the third copy
+    // of this call, and not having it was a real hole: `withdraw_role:{role}`
+    // evidence for a co-steward role or an accord-co-scrubbed identity_type
+    // could arrive before its target key, and step (2) would then consult an
+    // empty table and re-confer the withdrawn role.
+    //
+    // The invariant, stated where a fourth gate would be written: NO
+    // `federation_keys` row claiming an accord-conferred role is admitted
+    // without this call running for that `(role, key_id)` first. The three
+    // pure reads of the projection (`has_accord_conferred_role`,
+    // `is_infra_attest_effective`, `is_canonical_effective`) are correct only
+    // because of it. See `accord_carriage::project_role_withdrawal_for_key`
+    // for the enumerated gate set.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        role,
+        &row.key_id,
         roster_key_ids,
     )
     .await?;
@@ -9203,6 +9290,39 @@ pub async fn verify_canonical_withdraw_authority(
         key_id,
         None,
         &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v31.1.0 (CIRISPersist#662) — the **op-generic plain-WITHDRAW** form of the
+/// #377 authority core, exported for
+/// [`accord_carriage`](super::accord_carriage)'s local withdrawal projection.
+///
+/// Identical machinery to [`verify_canonical_withdraw_authority`] — stored
+/// proposal, HUMANITY_ACCORD family scope, persist-computed payload binding,
+/// a fresh `tally_live_quorum` over persist's OWN stored participations, and
+/// the strict-majority destructive threshold — parameterized on `op` so the
+/// projection can re-derive a `canonical`, an `infra:attest` or a generic
+/// [`op_withdraw_role`] tombstone through the SAME code the local destructive
+/// ops use. `successor_key_id` is fixed at `None`: this form is for plain
+/// withdrawals (see the scope note on
+/// [`accord_carriage::project_role_withdrawals_for_proposal`](super::accord_carriage::project_role_withdrawals_for_proposal)).
+///
+/// Exists so the projection cannot grow its own weaker copy of the tally.
+pub async fn verify_withdrawal_authority_over_roster(
+    directory: &dyn super::FederationDirectory,
+    proposal_digest: &str,
+    op: &str,
+    target_key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<String, Error> {
+    verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        op,
+        target_key_id,
+        None,
+        roster_key_ids,
     )
     .await
 }

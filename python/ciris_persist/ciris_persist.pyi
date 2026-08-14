@@ -526,7 +526,7 @@ class Engine:
     def accord_nonce_issued(self, family_key_id: str, nonce: str) -> bool:
         """(derived) deontic — #302 (M4) — has (family_key_id, nonce) been issued?"""
 
-    def add_community_member(self, community_key_id: str, member_json: str) -> bool:
+    def add_community_member(self, community_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut B — incrementally add one member to a community roster (mirror of add_family_member). member_json is a [crate::federation::types::Communit..."""
 
     def add_moderator(self, community_id: str, moderator_key_id: str, duty: str) -> str:
@@ -557,6 +557,9 @@ class Engine:
                 change, anchored-to-a-different-record, or missing row.
             RuntimeError: backend / IO error.
         """
+
+    def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
+        """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
 
     def apply_replicated_key_record(
         self,
@@ -666,7 +669,7 @@ class Engine:
     def clear_active_halt(self, family_key_id: str, active_halt_id: str) -> None:
         """(derived) deontic — #302 (H2) — clear the active halt iff it matches (a resume)."""
 
-    def cohort_add_member(self, cohort: str, group_key_id: str, member_json: str) -> bool:
+    def cohort_add_member(self, cohort: str, group_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut G1 (§1) — admit a [crate::federation::cohort::RosterMember] (JSON) into a family/community roster. Returns True on a genuine add, False if..."""
 
     def cohort_build_membership_change_envelope(self, cohort: str, group_key_id: str, new_member_key_ids_json: str, entrenched: bool, consensus_protocol: str | None = None) -> str:
@@ -681,7 +684,7 @@ class Engine:
     def cohort_supersede_group_with_quorum(self, cohort: str, new_group_json: str, change_envelope_json: str, signatures_json: str) -> int:
         """(derived) deontic — #249 Cut G3 (§3/§4/§5) — quorum-gated supersede: verify the current roster's strict-majority quorum cosigned change_envelope_json, then supersede n..."""
 
-    def cohort_swap_member(self, cohort: str, group_key_id: str, out_key_id: str, in_member_json: str, revoke_spec_json: str) -> bool:
+    def cohort_swap_member(self, cohort: str, group_key_id: str, out_key_id: str, in_member_json: str, revoke_spec_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut G1 (§6) — atomically swap out_key_id for the [crate::federation::cohort::RosterMember] in in_member_json (revoke then add) in a family/com..."""
 
     def cohort_verify_membership_quorum(self, cohort: str, group_key_id: str, change_envelope_json: str, signatures_json: str) -> None:
@@ -1021,6 +1024,9 @@ class Engine:
         a different key for an existing key id raises).
         """
 
+    def rematerialize_role_withdrawals(self) -> str:
+        """(derived) deontic — v31.1.0 (CIRISPersist#662) — the repair door: re-derive every role-withdrawal tombstone this node's stored accord evidence supports, returning the..."""
+
     def remove_moderator(self, community_id: str, target_attestation_id: str, moderator_key_id: str, duty: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10) — remove a named moderator: withdraws against the appointment edge target_attestation_id. moderator_key_id keys the retractio..."""
 
@@ -1055,36 +1061,6 @@ class Engine:
         current instant. **Clock-dependent** on ``now``: a revocation whose
         ``effective_at`` has not arrived is not counted yet, so this transitions
         on elapsed time with no new row. Read-only.
-        """
-
-    def resolve_quarantine_json(self, key_id: str, now: str | None = None) -> str:
-        """CIRISServer#356 — **is this key withheld from serving?**
-
-        Returns the fold as JSON: ``{key_id, state, marker_id?, decided_by?,
-        delegation_id?, effective_at?, grounds?, marker_ids}``. ``state`` is
-        one of three stable tokens, and the third one is the point:
-
-        * ``"not_quarantined"`` -- no marker about this key has taken effect
-          here.
-        * ``"withheld"`` -- the governing marker withholds; the serve paths skip
-          this key's rows.
-        * ``"released"`` -- a quarantine was raised and lifted. **Serving, and
-          it was not always.** Deliberately distinct from ``"not_quarantined"``:
-          "never withheld" and "withheld and released" are different facts, and
-          an operator reviewing a key deserves the second one.
-
-        The serve decision is ``state == "withheld"`` and nothing else --
-        ``"released"`` does **not** withhold. ``marker_ids`` names the whole
-        evidence set, not only the winner; that enumeration is what a
-        compromised-authority review reads.
-
-        **Every arm is a truthy string.** ``json.loads`` it and read
-        ``["state"]``; ``if engine.resolve_quarantine_json(k)`` is ``True`` for
-        a key this node is refusing to serve.
-
-        ``now`` is RFC 3339, defaulting to the current instant.
-        **Clock-dependent**: a marker whose ``effective_at`` has not arrived
-        does not count yet. Read-only -- this never records a marker.
         """
 
     def resolve_mesh_config_json(self, node_key_id: str, baseline_json: str | None = None, now: str | None = None) -> str:
@@ -1138,6 +1114,36 @@ class Engine:
         and read ``["effective"]``.
 
         Read-only -- this never records a row.
+        """
+
+    def resolve_quarantine_json(self, key_id: str, now: str | None = None) -> str:
+        """CIRISServer#356 — **is this key withheld from serving?**
+
+        Returns the fold as JSON: ``{key_id, state, marker_id?, decided_by?,
+        delegation_id?, effective_at?, grounds?, marker_ids}``. ``state`` is
+        one of three stable tokens, and the third one is the point:
+
+        * ``"not_quarantined"`` -- no marker about this key has taken effect
+          here.
+        * ``"withheld"`` -- the governing marker withholds; the serve paths skip
+          this key's rows.
+        * ``"released"`` -- a quarantine was raised and lifted. **Serving, and
+          it was not always.** Deliberately distinct from ``"not_quarantined"``:
+          "never withheld" and "withheld and released" are different facts, and
+          an operator reviewing a key deserves the second one.
+
+        The serve decision is ``state == "withheld"`` and nothing else --
+        ``"released"`` does **not** withhold. ``marker_ids`` names the whole
+        evidence set, not only the winner; that enumeration is what a
+        compromised-authority review reads.
+
+        **Every arm is a truthy string.** ``json.loads`` it and read
+        ``["state"]``; ``if engine.resolve_quarantine_json(k)`` is ``True`` for
+        a key this node is refusing to serve.
+
+        ``now`` is RFC 3339, defaulting to the current instant.
+        **Clock-dependent**: a marker whose ``effective_at`` has not arrived
+        does not count yet. Read-only -- this never records a marker.
         """
 
     def resolve_reverse_quorum_json(self, cohort: str, cohort_key_id: str, action_attestation_id: str, now: str | None = None) -> str:
@@ -1595,39 +1601,6 @@ class Engine:
     def list_delivery_receipts_for(self, stream_id: str, limit: int) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts for stream_id, ascending (k, subscriber_key_id), bounded by limit. Returns a JSON a..."""
 
-    def list_signed_communities_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunity wrappers since a cursor, as a JSON array. Same contract as [list_signed_famil..."""
-
-    def list_signed_community_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunityMembershipRevocation wrappers since a cursor, as a JSON array. Same contract a..."""
-
-    def list_signed_families_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) — bulk-list the full SignedFamily wrappers (row + the V110 authority signature put_fa..."""
-
-    def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedFamilyMembershipRevocation wrappers since a cursor, as a JSON array. Same contract as [..."""
-
-    def list_signed_identity_occurrence_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrenceRevocation wrappers since a cursor, as a JSON array. Signed rows only; ord..."""
-
-    def list_signed_identity_occurrences_for_json(self, identity_key_id: str) -> str:
-        """(derived) testimonial — v14.1.0 (CIRISPersist#418, replication read) — the signed-put occurrences of identity_key_id, each as a full SignedIdentityOccurrence JSON object (..."""
-
-    def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
-
-    def list_signed_key_records_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) — bulk-list SignedKeyRecord wrappers since a cursor, as a JSON array, ordered (scrub_times..."""
-
-    def list_signed_location_proofs_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
-
-    def list_signed_partner_records_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
-
-    def list_signed_transport_destinations_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) testimonial — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""
-
     def list_witness_equivocations_json(self, peer_id: str) -> str:
         """(derived) testimonial — v16 (CIRISPersist#431, N4 read-back) — the non-repudiable equivocations visible for peer_id: a JSON array of records each carrying the proof scalar..."""
 
@@ -1749,9 +1722,6 @@ class Engine:
 
     def verify_locale_inclusion_json(self, leaf_json: str, proof_json: str, expected_root_hex: str) -> str:
         """(derived) testimonial — v3.8.0 — verify a LocaleInclusionProof against the expected per-target Merkle root. Returns JSON {"valid": true, ...} on success; raises with the s..."""
-
-    def verify_trace(self, complete_trace_json: str) -> dict[str, Any]:
-        """(derived) testimonial — v0.4.0 — Verify a CompleteTrace envelope end-to-end. Looks up signature_key_id via the federation directory, reconstructs canonical bytes per trace..."""
 
 
     # ==============================================================
@@ -2047,6 +2017,45 @@ class Engine:
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
 
+    def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE bundles (proposal + its hybrid-signed participations) since a cursor, as a JSON a..."""
+
+    def list_signed_communities_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunity wrappers since a cursor, as a JSON array. Same contract as [list_signed_famil..."""
+
+    def list_signed_community_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunityMembershipRevocation wrappers since a cursor, as a JSON array. Same contract a..."""
+
+    def list_signed_families_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) — bulk-list the full SignedFamily wrappers (row + the V110 authority signature put_fa..."""
+
+    def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedFamilyMembershipRevocation wrappers since a cursor, as a JSON array. Same contract as [..."""
+
+    def list_signed_identity_occurrence_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrenceRevocation wrappers since a cursor, as a JSON array. Signed rows only; ord..."""
+
+    def list_signed_identity_occurrences_for_json(self, identity_key_id: str) -> str:
+        """(derived) epistemic — v14.1.0 (CIRISPersist#418, replication read) — the signed-put occurrences of identity_key_id, each as a full SignedIdentityOccurrence JSON object (..."""
+
+    def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
+
+    def list_signed_key_records_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) — bulk-list SignedKeyRecord wrappers since a cursor, as a JSON array, ordered (scrub_times..."""
+
+    def list_signed_location_proofs_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
+
+    def list_signed_partner_records_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
+
+    def list_signed_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v31.1.0 (CIRISPersist#655) — bulk-list ServedRevocations since a cursor, as a JSON array, ordered (admitted_at ASC, revocation_id ASC). The key-lev..."""
+
+    def list_signed_transport_destinations_since(self, since_rfc3339: str | None, limit: int) -> str:
+        """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""
+
     def node_state_json(self, self_key_id: str | None = None, root_key_id: str | None = None, now: str | None = None, sla_seconds: int | None = None) -> str:
         """CIRISServer#356 — **how is this node?**, in one call.
 
@@ -2193,6 +2202,9 @@ class Engine:
 
     def temporal_drift(self, agent_id_hash: str, baseline_json: str, comparison_json: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Temporal drift between two windows for one agent. Returns JSON array of TemporalDriftRow."""
+
+    def verify_trace(self, complete_trace_json: str) -> dict[str, Any]:
+        """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end. Looks up signature_key_id via the federation directory, reconstructs canonical bytes per trace..."""
 
 
     # ==============================================================
@@ -3277,10 +3289,10 @@ class Engine:
         """
 
     def update_peer_alias(self, key_id: str, alias_json: str) -> None:
-        """(derived) empirical — Federation directory: set peer alias. alias_json is the JSON-encoded value (e.g. "null", "\"my-peer\"") so None can be distinguished from empty-str..."""
+        """(derived) empirical — Federation directory: set peer alias. alias_json is the JSON-encoded value (e.g. "null", "\\"my-peer\\"") so None can be distinguished from empty-s..."""
 
     def update_peer_notes(self, key_id: str, notes_json: str) -> None:
-        """(derived) empirical — Federation directory: set peer notes. notes_json is the JSON-encoded value (e.g. "null", "\"contact ops\"")."""
+        """(derived) empirical — Federation directory: set peer notes. notes_json is the JSON-encoded value (e.g. "null", "\\"contact ops\\"")."""
 
     def wa_cert_get(self, wa_id: str) -> str | None:
         """v1.5.19 — Point lookup by ``wa_id``. Returns JSON-encoded
