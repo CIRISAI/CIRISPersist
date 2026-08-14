@@ -51,13 +51,25 @@
 //!   `attestation_id`, `attesting_key_id`, `attested_key_id`,
 //!   `attestation_type` AND its whole `attestation_envelope`, so the conferral
 //!   plane — the scopes, the subject, the verb — is bound byte-for-byte.
-//! - **A swapped serve node: covered by RECORD, as of v31.2.0.** `holders` and
-//!   `serve_nodes` contribute the whole `KeyRecord` minus two node-local fields
-//!   (see [`NODE_LOCAL_RECORD_FIELDS`]), so `pubkey_ed25519_base64`, the PQC
-//!   leg, `identity_type`, `identity_ref`, `valid_from`/`valid_until`,
-//!   `registration_envelope`, `original_content_hash` and the whole scrub set
-//!   are all bound byte-for-byte. Substituting the record under an unchanged
-//!   `key_id` now breaks every authorization.
+//! - **A swapped serve node: covered by RECORD CONTENT, as of v31.2.0.**
+//!   `holders` and `serve_nodes` contribute the whole `KeyRecord` minus
+//!   [`NODE_LOCAL_RECORD_FIELDS`] and [`CEREMONY_MUTATED_RECORD_FIELDS`], so
+//!   `pubkey_ed25519_base64`, the PQC leg, `identity_type`, `identity_ref`,
+//!   `valid_from`/`valid_until`, `registration_envelope`,
+//!   `original_content_hash`, `roles` and `attestation_evidence` are bound
+//!   byte-for-byte. Substituting the record under an unchanged `key_id` breaks
+//!   every authorization.
+//!
+//!   The **scrub set is deliberately NOT bound** — and that is not a gap, it is
+//!   the same rule the `attestations` arm has always followed. The scrub set is
+//!   quorum evidence *about* the record which the CEREMONY ITSELF accumulates
+//!   between holder signatures; binding it makes the ceremony circular and a
+//!   2-of-3 genesis impossible to complete (CIRISPersist#683, measured on a live
+//!   ceremony: `have=2 needed=2 complete=false`). Each scrub remains
+//!   independently verifiable against this node's pinned holder anchors, and the
+//!   record's content is still bound through every content field plus
+//!   `original_content_hash`. **Content is bound; evidence about content is
+//!   not.**
 //!
 //! Until v31.2.0 that was NOT true: holders and serve nodes contributed their
 //! `key_id`s and nothing else, so a record substituted under an unchanged id was
@@ -146,6 +158,46 @@ pub struct GenesisBundle {
 ///   positions (#655/#662); it does not get to reappear here.
 const NODE_LOCAL_RECORD_FIELDS: [&str; 2] = ["persist_row_hash", "pqc_completed_at"];
 
+/// The record fields the CEREMONY ITSELF mutates after a holder has signed —
+/// the accumulating scrub set.
+///
+/// v31.2.0 (CIRISPersist#683) — **this is not an aesthetic exclusion; binding
+/// these makes a 2-of-3 genesis impossible to complete.** The ceremony
+/// accumulates two things over one bundle, one pass per holder: the
+/// `authorizations`, and the serve node's scrub set (each holder appends its
+/// scrub so the canonical reaches family quorum — persist's own baked-genesis
+/// test asserts `distinct_scrub_count() >= 2`, so a 1-scrub canonical is not a
+/// shippable seed).
+///
+/// If the digest binds the scrub set, those two accumulations are **circular**:
+/// A1 signs, B1's co-scrub rewrites bytes A1 authorized, and A1's entirely
+/// honest signature stops verifying. Measured on a live ceremony: `have=2
+/// needed=2 complete=false`, with a third holder unable to help because every
+/// new signature is taken over bytes the next co-scrub moves again.
+///
+/// **The `attestations` arm already had this right**, and this makes the two
+/// arms consistent: attestations project
+/// `{attestation_id, attesting_key_id, attested_key_id, attestation_type,
+/// attestation_envelope}` and have never carried scrub evidence — which is
+/// exactly what lets CIRISServer's cosign path work, since a 1-scrub and a
+/// 2-scrub attestation canonicalize identically.
+///
+/// **Excluding them costs nothing.** The scrub set is accumulating quorum
+/// evidence *about* the record, each scrub signed over the record's own
+/// canonical bytes — which the digest still binds through every content field
+/// plus `original_content_hash`. A forged scrub does not survive
+/// `put_public_key`'s co-scrub admission against this node's pinned holder
+/// anchors. The #660 substitution this widening exists to stop — a swapped
+/// pubkey, `identity_type`, `roles` or envelope under an unchanged `key_id` —
+/// is still caught, because that is CONTENT, not evidence.
+const CEREMONY_MUTATED_RECORD_FIELDS: [&str; 5] = [
+    "scrub_key_id",
+    "scrub_signature_classical",
+    "scrub_signature_pqc",
+    "scrub_timestamp",
+    "additional_scrubs",
+];
+
 /// One holder's or serve node's contribution to [`authorization_digest`]:
 /// the whole record MINUS [`NODE_LOCAL_RECORD_FIELDS`].
 ///
@@ -182,8 +234,11 @@ fn authorized_record_projection(
                 record.key_id
             ),
         })?;
-    for field in NODE_LOCAL_RECORD_FIELDS {
-        map.remove(field);
+    for field in NODE_LOCAL_RECORD_FIELDS
+        .iter()
+        .chain(CEREMONY_MUTATED_RECORD_FIELDS.iter())
+    {
+        map.remove(*field);
     }
     Ok(value)
 }
@@ -834,19 +889,32 @@ mod authorization_digest_tests {
     #[test]
     fn authorized_record_projection_binds_every_producer_field() {
         let bundle = crate::federation::genesis::canonical_genesis_bundle();
-        let record = &bundle
-            .holders
-            .first()
-            .expect("the canonical bundle carries holders")
-            .record;
 
-        let full = serde_json::to_value(record).expect("record serializes");
-        let full_keys: std::collections::BTreeSet<&str> = full
-            .as_object()
-            .expect("record is an object")
-            .keys()
+        // UNION over every record, holders AND serve nodes. Sampling one record
+        // is how this guard missed `additional_scrubs` (CIRISPersist#683): it is
+        // absent on A1/B1/C1 and present ONLY on the serve node — the very
+        // record the ceremony co-scrubs. A `skip_serializing_if` field hides on
+        // any record that does not happen to carry it.
+        let all: Vec<serde_json::Value> = bundle
+            .holders
+            .iter()
+            .chain(bundle.serve_nodes.iter())
+            .map(|r| serde_json::to_value(&r.record).expect("record serializes"))
+            .collect();
+        assert!(
+            all.len() >= 2,
+            "need holders AND serve nodes to see the whole field space"
+        );
+        let full_keys: std::collections::BTreeSet<&str> = all
+            .iter()
+            .flat_map(|v| v.as_object().expect("record is an object").keys())
             .map(String::as_str)
             .collect();
+        let record = &bundle
+            .serve_nodes
+            .first()
+            .expect("the canonical bundle carries a serve node")
+            .record;
 
         // Every field the record actually carries, as of v31.2.0. `Option`
         // fields with `skip_serializing_if` only appear when populated, so this
@@ -874,6 +942,10 @@ mod authorization_digest_tests {
             // Producer-authored, both bound.
             "roles",
             "attestation_evidence",
+            // Present ONLY on the serve node, which is why a one-record sample
+            // never saw it — and it is the field that made the ceremony
+            // circular (#683).
+            "additional_scrubs",
             "pqc_completed_at",
             "persist_row_hash",
         ]
@@ -903,14 +975,13 @@ mod authorization_digest_tests {
                 "{field} is node-local and must never enter the preimage"
             );
         }
-        let dropped: Vec<_> = full_keys.difference(&projected_keys).collect();
-        assert_eq!(
-            dropped.len(),
-            NODE_LOCAL_RECORD_FIELDS.len(),
-            "the projection dropped {dropped:?}; it must drop ONLY \
-             {NODE_LOCAL_RECORD_FIELDS:?} — a silently narrowed preimage is the \
-             #660 defect returning"
-        );
+        for field in CEREMONY_MUTATED_RECORD_FIELDS {
+            assert!(
+                !projected_keys.contains(field),
+                "{field} is mutated BY THE CEREMONY after a holder signs; \
+                 binding it makes a 2-of-3 genesis impossible to complete (#683)"
+            );
+        }
     }
 
     /// v31.2.0 (CIRISServer#398) — **the output is a FIXED-SIZE digest, and
@@ -956,6 +1027,63 @@ mod authorization_digest_tests {
         assert!(
             !canonical.starts_with(&small[..4.min(small.len())]),
             "the digest looks like a canonical-bytes prefix rather than a hash"
+        );
+    }
+
+    /// v31.2.0 (CIRISPersist#683) — **the ceremony's own co-scrub must not move
+    /// the digest.** This is the property that failed on a live 2-of-3.
+    ///
+    /// The ceremony accumulates authorizations AND the serve node's scrub set
+    /// over one bundle, one pass per holder. If the digest binds the scrub set,
+    /// those two accumulations are circular: B1's co-scrub rewrites bytes A1
+    /// already signed, A1's honest authorization stops verifying, and the node
+    /// reports `have=2 needed=2 complete=false`. A third holder cannot help —
+    /// every new signature is over bytes the next co-scrub moves again.
+    ///
+    /// Driven by mutating the scrub set exactly as a co-scrub does, rather than
+    /// by asserting the projection's key list: a key-list assertion would pass
+    /// against a projection that dropped the right names for the wrong reason.
+    #[test]
+    fn appending_a_co_scrub_does_not_move_the_digest() {
+        let base = crate::federation::genesis::canonical_genesis_bundle().clone();
+        let baseline = authorization_digest(&base).expect("digest");
+
+        let mut cosigned = base.clone();
+        let sn = &mut cosigned
+            .serve_nodes
+            .first_mut()
+            .expect("the canonical bundle carries a serve node")
+            .record;
+
+        // B1 appends its scrub, and the primary scrub fields move with it.
+        sn.additional_scrubs
+            .push(crate::federation::types::ScrubSig {
+                scrub_key_id: "B1".to_owned(),
+                scrub_signature_classical: "B".repeat(88),
+                scrub_signature_pqc: Some("B".repeat(4412)),
+            });
+        sn.scrub_key_id = "B1".to_owned();
+        sn.scrub_signature_classical = "C".repeat(88);
+        sn.scrub_signature_pqc = Some("C".repeat(4412));
+        sn.scrub_timestamp =
+            base.serve_nodes[0].record.scrub_timestamp + chrono::Duration::seconds(90);
+
+        assert_eq!(
+            authorization_digest(&cosigned).expect("digest"),
+            baseline,
+            "a co-scrub moved the digest — A1's authorization would stop \
+             verifying and a 2-of-3 genesis could never complete (#683)"
+        );
+
+        // The counter-control: CONTENT must still move it, or this test would
+        // pass against a projection that bound nothing at all.
+        let mut swapped = cosigned.clone();
+        swapped.serve_nodes[0].record.pubkey_ed25519_base64 = "Z".repeat(44);
+        assert_ne!(
+            authorization_digest(&swapped).expect("digest"),
+            baseline,
+            "content stopped moving the digest — the exclusion went too far and \
+             #660 is back"
         );
     }
 

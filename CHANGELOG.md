@@ -7,6 +7,43 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.2.0] - 2026-08-14
 
+### Fixed — BREAKING — the digest bound the scrub set, so a 2-of-3 genesis could never complete (#683)
+
+**Found on a live ceremony**, persist v31.2.0-rc.2 / edge v16.1.0-rc.2 /
+CIRISServer 0.5.171: A1 signed, B1 signed, and the node reported
+`have=2 needed=2 complete=false`. `complete` is `verify_bundle(&bundle).is_ok()`,
+so the failure was in the hybrid-verify loop, not the quorum count — and asking
+for a third holder could not help.
+
+**The ceremony accumulates two things over one bundle, one pass per holder:**
+the `authorizations`, and the serve node's **scrub set** (each holder appends its
+scrub so the canonical reaches family quorum — persist's own baked-genesis test
+asserts `distinct_scrub_count() >= 2`, so a 1-scrub canonical is not a shippable
+seed). The record widening swept `scrub_key_id`, `scrub_signature_classical`,
+`scrub_signature_pqc`, `scrub_timestamp` and `additional_scrubs` into the
+preimage, which made those two accumulations **circular**: B1's co-scrub rewrote
+bytes A1 had already authorized, and A1's entirely honest signature stopped
+verifying.
+
+**The `attestations` arm always had this right**, and the two arms are now
+consistent — attestations project
+`{attestation_id, attesting_key_id, attested_key_id, attestation_type,
+attestation_envelope}` and have never carried scrub evidence, which is exactly
+what lets a 1-scrub and a 2-scrub attestation canonicalize identically.
+
+**Content is bound; evidence about content is not.** The #660 substitution this
+widening exists to stop — a swapped pubkey, `identity_type`, `roles` or envelope
+under an unchanged `key_id` — is still caught, because that is content. A forged
+scrub still does not survive `put_public_key`'s co-scrub admission against the
+node's pinned holder anchors.
+
+Two guard gaps closed with it. `additional_scrubs` is absent on A1/B1/C1 and
+present ONLY on the serve node, so the field-set guard — which sampled a single
+holder — could not see the field that broke the ceremony; it now unions every
+holder AND serve node. And a new witness drives the property directly: appending
+a co-scrub must not move the digest, with a counter-control asserting content
+still does. Mutation-tested — re-binding the scrub set reds both.
+
 ### Fixed — BREAKING — `authorization_digest` returns a DIGEST, not the preimage (CIRISServer#398)
 
 **Found by CIRISServer during the ceremony, with measurements.** The widening
