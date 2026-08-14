@@ -28,6 +28,12 @@ pub mod migration_timing;
 mod parity;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+/// v31.2.0 (CIRISPersist#670) — **the schema-parity gate.** The sibling of
+/// [`parity`], for the half a Rust scan cannot see: it replays
+/// `migrations/{postgres,sqlite}/lens/V*.sql` and compares the table, column,
+/// type, nullability and write-column shape the two dialects end up with.
+#[cfg(test)]
+mod schema_parity;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod scope_bind;
 #[cfg(feature = "sqlite")]
