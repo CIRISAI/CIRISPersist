@@ -234,6 +234,139 @@ the real door and hands the seed the stale `None` the loser was holding, then
 asserts the plane completes. Mutation-tested both: reverting to `continue` on a
 present row reds the three upgrade witnesses; reverting to `Conflict`-only
 matching reds the three race witnesses.
+### Added — SECURITY — persist's copy of verify's subject binding now FAILS THE BUILD when it diverges (#663)
+
+Pinning `ciris-verify-*` at `v13.1.0` freezes *which verify code runs*. It does
+not make persist's own reimplementation agree with it. Two implementations of
+one check live in the same binary — `ciris_verify_core::subject_binding` (used
+by verify's provenance walk, its transport binding, and
+`KeyRecord::check_subject_binding`) and `admission::subject_binding` (used by
+`put_public_key`, `apply_replicated_key_record` and the accord co-scrub quorum
+core) — and at 13.0.0 they bound **four** members and **three**. Persist omitted
+`identity_type`, which `is_canonical` reads off the row to decide canonical
+standing. Same process, same release, different answers: a row could pass
+persist's door and fail verify's check. Both suites were fully green. The only
+thing that caught it was a human reading both files (#659, #661).
+
+Deleting persist's copy is not available — its `KeyRecord` is a distinct type
+carrying a declaration-order contract against CIRISRegistry's vendored shape.
+So the goal is not deduplication. It is **detectability**, and
+`tests/verify_subject_binding_conformance.rs` is it.
+
+**The member set is read off verify's own behaviour, not restated.** Verify
+exposes `SubjectBinding::members()`, but `check_subject_binding` builds its
+projection inline and consumes it, so no handle exists to call that on.
+Rebuilding it here with our own `.require(…)` chain would mint a THIRD spelling
+that drifts exactly like the first two. Instead the test *probes*: starting from
+an empty `registration_envelope`, it feeds back every member verify's errors
+name (`Missing { member }` → plant a sentinel → `Mismatch { member, claimed }`,
+where `claimed` is the JSON of the value verify expected) until the check
+returns `Ok`. The loop converges on exactly the members verify projects and the
+values it expects. **Add a fifth member in verify and the probe finds it with no
+edit in persist** — it reds persist's suite instead of silently widening the gap.
+
+The `require_optional` disposition is recovered by difference: an expected
+`null` is satisfied by omission, so it never surfaces as `Missing`. Running the
+probe against a record whose `Option` fields are all `None` and again with them
+all `Some` makes the optional members exactly the set difference. A member
+optional on one side and required on the other is the same class of gap as a
+missing one — it admits on one door and refuses on the other — and it now reds.
+
+Compared as **sets, not order**: both sides carry a `BTreeMap`-backed
+`serde_json::Map`, so both are already lexicographic, which is what JCS emits
+and therefore the order the co-scrubbers actually signed over. Nothing here
+asserts an insertion order.
+
+**CEG §0.9 is now a pinned contract rather than an adopted comment.** The
+omit-vs-materialize table is asserted as data against *both* implementations
+in-process — envelope omits + row claims nothing ⇒ ADMIT; envelope omits + row
+claims a key ⇒ REFUSE; envelope declares + row claims nothing ⇒ REFUSE — with
+both controls (same key ⇒ admit, different keys ⇒ refuse) so the table cannot
+pass by refusing, or admitting, everything. A future "simplification" to flat
+fail-closed reds, and so does one to flat tolerance.
+
+A third test iterates the projection and asserts that a DIVERGING value and an
+OMITTED member produce the same verdict on both implementations, for every
+member, against a row both with and without its optional legs — and that
+persist's refusal names the member verify named.
+
+**Two of verify's three planes, and the third named rather than faked.** 13.1.0
+applies this projection on three planes. The PROVENANCE plane
+(`provenance.rs:420`) is probed the same way and is worth probing even though
+#465 routed persist's chain walk through verify: persist is still the PRODUCER
+of every `registration_envelope` that walk inspects, so a member verify starts
+requiring and `bind_subject_into_envelope` does not stamp means **every chain
+persist mints stops rooting** — a federation-wide outage delivered by a
+dependency bump. The same test also pins verify's two checker planes against
+each other, which nothing in verify does either.
+
+The TRANSPORT plane (`transport_binding.rs:353`, a different projection —
+`attesting_key_id` + `transport_destination` + `encryption_pubkeys`) is **not**
+covered, and deliberately not faked. `verify_transport_binding` catches the
+`SubjectBindingError`, returns `Ok(reject(SubjectMismatch))`, and drops the
+detail through `tracing::warn!`, so the member name never leaves the function
+and the probe cannot converge. Log-scraping would be a half-probe that certifies
+an agreement it never checked. Persist's exposure there is also structurally
+different — `verify_signed_identity_occurrence` parses the envelope rather than
+restating the projection, so there is no second spelling in shipped code; the
+residual risk is producer-side and unguarded. CIRISVerify#254 carries the ask.
+
+**The fixture asserts its own distinguishability.** The probe recovers verify's
+expectation by VALUE, so two fixture fields sharing a value are indistinguishable
+to it — a member persist bound off the WRONG COLUMN would report agreement.
+Caught in review on #666: `key_id`/`identity_ref`/`scrub_key_id` shared one
+value and three timestamps shared another. Every field now carries its own
+sentinel, and a witness derives the pairwise-distinctness check from the
+SERIALIZED fixtures, so a field added later cannot quietly reuse a value. The
+failure mode it closes is a test that keeps passing while measuring less.
+
+**A new verify error variant is a COMPILE error, not a fall-through.** The
+probes converge on "the error stopped being a binding failure" — and a new
+`SubjectBindingError` variant *is* still a binding failure, so under a `_`
+wildcard it read as successful convergence: the probe would stop early, report
+whatever subset it had found, and go green if that subset happened to match
+persist. The failure this test exists to prevent, triggered by the exact event
+it exists to detect, degrading toward agreement. Neither `SubjectBindingError`
+nor `ProvenanceError` is `#[non_exhaustive]`, so both matches are now exhaustive
+with no wildcard and a variant added upstream fails to compile here — verified
+by deleting one arm from each and getting `error[E0004]`.
+
+**Mutation-tested, 9 for 9**, scored on the full five-test `Summary` line:
+dropping `identity_type` (4 red); binding it off the `key_id` column (4 red);
+making the optional leg required (4 red); flattening §0.9 in each direction
+(2 red each); re-introducing the shared-sentinel blind spot (1 red); injecting
+an unmodelled binding error mid-probe (1 red); filtering the fixture walk back
+to strings only (1 red); and making verify's provenance plane alone require an
+optional leg (1 red).
+
+Three of those measure a green-to-red flip rather than asserting one. Against
+the wildcard originally shipped, an injected binding error gave
+`5 tests run: 5 passed, 0 skipped` — fully green while the binding was still
+failing. Against the pre-fix round trip, which compared only MATERIALIZED
+probes, a `require` / `require_optional` split between verify's two planes gave
+the same all-green. The string-only walk reds naming `is_self_signed`, the field
+it really was dropping.
+
+**This detector is a STOPGAP and the file says so.** Five real holes were found
+in it by review, every one in the direction of false confidence, none by the
+suite being green — the transport plane's coverage overstated; the fixture's
+fields mutually indistinguishable; a still-failing binding read as convergence;
+the collision walk dropping every non-string leaf; and the provenance round trip
+never exercising omission. Each is closed, but the pattern is the point:
+reconstructing a foreign implementation's contract by fault injection has an
+irreducible blind-spot problem, because the probe infers a projection from error
+messages and every reconstruction has edges the original does not. The real fix
+is CIRISVerify#254 ask 2 — export the projections as data — which collapses both
+probes into a direct comparison of two member maps. **When it lands the probes
+should be deleted, not ported.**
+
+Filed CIRISVerify#254 asking verify to export the member list as data
+(`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the
+probe to one call, and to document `Mismatch.claimed`'s encoding, which the
+probe currently leans on as a `Display` detail. The better fix is on the record;
+this ships the gate meanwhile.
+
+No production code changed. Test-only.
 
 ## [31.0.0] - 2026-08-12
 
