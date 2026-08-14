@@ -104,21 +104,34 @@ nor `ProvenanceError` is `#[non_exhaustive]`, so both matches are now exhaustive
 with no wildcard and a variant added upstream fails to compile here — verified
 by deleting one arm from each and getting `error[E0004]`.
 
-**Mutation-tested, 7 for 7**, scored on the full five-test `Summary` line:
+**Mutation-tested, 9 for 9**, scored on the full five-test `Summary` line:
 dropping `identity_type` (4 red); binding it off the `key_id` column (4 red);
 making the optional leg required (4 red); flattening §0.9 in each direction
-(2 red each); re-introducing the shared-sentinel blind spot (1 red); and
-injecting an unmodelled binding error mid-probe (1 red). That last one is the
-one worth reading: against the wildcard this file originally shipped, the
-identical injection gave `5 tests run: 5 passed, 0 skipped` — fully green while
-the binding was still failing. The first also proves neither probe is vacuous —
-it reports `only ciris_verify_core binds: ["identity_type"]`, so both really did
-discover all four members off verify's own behaviour.
+(2 red each); re-introducing the shared-sentinel blind spot (1 red); injecting
+an unmodelled binding error mid-probe (1 red); filtering the fixture walk back
+to strings only (1 red); and making verify's provenance plane alone require an
+optional leg (1 red).
 
-Three real holes were found in this detector by review, all in the direction of
-false confidence, none by the suite being green. It is now **well attacked**,
-which is a weaker claim than obviously right, and the mutation table is the only
-evidence here that does not rest on the author's own reasoning.
+Three of those measure a green-to-red flip rather than asserting one. Against
+the wildcard originally shipped, an injected binding error gave
+`5 tests run: 5 passed, 0 skipped` — fully green while the binding was still
+failing. Against the pre-fix round trip, which compared only MATERIALIZED
+probes, a `require` / `require_optional` split between verify's two planes gave
+the same all-green. The string-only walk reds naming `is_self_signed`, the field
+it really was dropping.
+
+**This detector is a STOPGAP and the file says so.** Five real holes were found
+in it by review, every one in the direction of false confidence, none by the
+suite being green — the transport plane's coverage overstated; the fixture's
+fields mutually indistinguishable; a still-failing binding read as convergence;
+the collision walk dropping every non-string leaf; and the provenance round trip
+never exercising omission. Each is closed, but the pattern is the point:
+reconstructing a foreign implementation's contract by fault injection has an
+irreducible blind-spot problem, because the probe infers a projection from error
+messages and every reconstruction has edges the original does not. The real fix
+is CIRISVerify#254 ask 2 — export the projections as data — which collapses both
+probes into a direct comparison of two member maps. **When it lands the probes
+should be deleted, not ported.**
 
 Filed CIRISVerify#254 asking verify to export the member list as data
 (`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the

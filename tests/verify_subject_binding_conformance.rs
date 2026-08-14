@@ -85,7 +85,7 @@
 //! ([`probe_advance`]) that both planes route through, so that is one compile
 //! error to resolve rather than two.
 //!
-//! # MUTATION-TESTED — 7 mutations, 7 killed
+//! # MUTATION-TESTED — 9 mutations, 9 killed
 //!
 //! A conformance test that passes under divergence is worse than none, because
 //! it certifies an agreement that does not exist. So the detector was checked
@@ -100,37 +100,71 @@
 //! | bind the absent PQC leg as `""` instead of `null` (optional ⇒ required) | **4 red** |
 //! | flatten §0.9 to unconditional refusal (fail-closed "simplification") | **2 red** |
 //! | flatten §0.9 to unconditional tolerance (the other direction) | **2 red** |
-//! | give two fixture fields one value again (blind spot #2) | **1 red** |
-//! | inject an unmodelled binding error mid-probe (blind spot #3) | **1 red** |
+//! | give two fixture fields one value again (hole 2) | **1 red** |
+//! | inject an unmodelled binding error mid-probe (hole 3) | **1 red** |
+//! | filter the fixture walk back to strings only (hole 4) | **1 red** |
+//! | make the provenance plane alone require an optional leg (hole 5) | **1 red** |
 //!
-//! The first five mutate `src/federation/admission.rs`; the last two mutate this
-//! file, because what they prove is that its own guards work. The §0.9 pair
+//! The first five mutate `src/federation/admission.rs`; the last four mutate
+//! this file, because what they prove is that its own guards work. The §0.9 pair
 //! legitimately leaves three green — they change absence handling, not the
 //! projection.
 //!
-//! **Mutation 7 is the one worth reading.** It injects a `NotAnObject` binding
-//! failure *after* the full member set is discovered — the faithful silent-green
-//! scenario. Against the shipped code the probe panics and the test reds.
-//! Against the wildcard this file originally shipped, the identical injection
-//! gave `5 tests run: 5 passed, 0 skipped` — **fully green while the binding was
-//! still failing.** That is the measured difference the exhaustive match buys.
+//! **Three of them are worth reading, because each measures a green-to-red
+//! flip rather than asserting one:**
 //!
-//! The first mutation also proves neither probe is vacuous: the key-record one
-//! reports `only ciris_verify_core binds: ["identity_type"]`, and the
-//! provenance one reds on the same missing member — so both really did discover
-//! all four of verify's members off verify's own behaviour, rather than off a
-//! list written in this file.
+//! * **7** injects a `NotAnObject` binding failure *after* the full member set
+//!   is discovered — the faithful silent-green scenario. Shipped code: the probe
+//!   panics, test reds. Against the wildcard this file originally shipped, the
+//!   identical injection gave `5 tests run: 5 passed, 0 skipped` — **fully green
+//!   while the binding was still failing.**
+//! * **8** restores the string-only walk and reds naming `is_self_signed`, the
+//!   field that really was being silently dropped.
+//! * **9** makes verify's provenance plane alone require a leg the key-record
+//!   plane treats as optional — codex's exact scenario. Shipped code reds on the
+//!   disposition comparison. Against the pre-fix test, which compared only
+//!   MATERIALIZED probes, the identical divergence gave `5 tests run: 5 passed,
+//!   0 skipped`.
 //!
-//! # How much to trust this file
+//! Mutation 1 also proves neither probe is vacuous: the key-record one reports
+//! `only ciris_verify_core binds: ["identity_type"]`, and the provenance one
+//! reds on the same missing member — so both really did discover all four of
+//! verify's members off verify's own behaviour, rather than off a list written
+//! in this file.
 //!
-//! Three real holes have been found in it by review, all by codex, **all in the
-//! direction of false confidence**: a fixture whose fields were mutually
-//! indistinguishable, and this wildcard, plus the transport plane's coverage
-//! being overstated before the table below was written. None was found by the
-//! suite being green. The honest characterisation is that this detector is now
-//! **well attacked**, which is a different and weaker claim than obviously
-//! right — and the reason the mutation table above exists is that it is the only
-//! evidence here that does not rest on the author's own reasoning.
+//! # THIS FILE IS A STOPGAP. DELETE IT WHEN CIRISVerify#254 LANDS.
+//!
+//! Five real holes have now been found here by review, **every one in the
+//! direction of false confidence**, and none by the suite being green:
+//!
+//! 1. the transport plane's coverage was overstated;
+//! 2. the fixture's fields were mutually indistinguishable;
+//! 3. a still-failing binding read as successful convergence;
+//! 4. the collision walk silently dropped every non-string leaf;
+//! 5. the provenance round trip never exercised omission, so the `require` /
+//!    `require_optional` split went unpinned across verify's two planes.
+//!
+//! Each was subtle and each is closed. But the pattern is the point, and it is
+//! not carelessness: **reconstructing a foreign implementation's contract by
+//! fault injection has an irreducible blind-spot problem.** The probe infers a
+//! projection from error messages, and every such reconstruction has edges the
+//! original does not — so the holes appear at the edges of the *reconstruction*,
+//! which is exactly where nobody thinks to look, and they fail toward agreement
+//! because a probe that stops early reports a subset that usually still matches.
+//!
+//! Expect a sixth. This detector is **well attacked**, which is a real property
+//! and a weaker one than correct.
+//!
+//! The actual fix is not more hardening here. It is
+//! [CIRISVerify#254](https://github.com/CIRISAI/CIRISVerify/issues/254) ask 2 —
+//! **export the projections as data** (`KeyRecord::subject_binding() ->
+//! SubjectBinding` and the provenance / transport equivalents). With that, this
+//! file's two probes and every guard protecting them collapse into a direct
+//! comparison of two member maps, with no inference and therefore no edges.
+//!
+//! **When #254 lands, delete the probes rather than porting them.** A workaround
+//! documented as a workaround is fine; one that accretes authority because it
+//! survived review is not.
 //!
 //! # Three planes, and the two this file reaches
 //!
@@ -440,14 +474,31 @@ fn persist_optional_members() -> BTreeSet<String> {
 
 // ── 0. The fixture's own invariant ──────────────────────────────────────────
 
-/// Collect every string leaf in a serialized fixture, paired with its JSON
-/// path, EXCLUDING the `registration_envelope` subtree — that is the probe's
+/// Collect **every leaf** of a serialized fixture, paired with its JSON path
+/// and keyed by the leaf's SERIALIZED form.
+///
+/// Excludes the `registration_envelope` subtree — that is the probe's
 /// workspace, not a fixture field, and it legitimately repeats the values it
 /// binds.
-fn string_leaves(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+///
+/// # Why every leaf, not just the strings
+///
+/// Codex finding on #666, and the same blind spot as the sentinel one, one
+/// type-domain over: this walk used to record `Value::String` only, silently
+/// discarding nulls, booleans, numbers and empty containers. A non-string member
+/// derived from the wrong field with the same serialized value stayed green —
+/// and `ProvenanceLink::is_self_signed` was in fact already being dropped. The
+/// under-specified thing was the WALK, not the sentinels, so it is fixed at the
+/// walk.
+///
+/// Keyed on the serialized form rather than the Rust value so a cross-type
+/// coincidence is judged correctly in both directions: the string `"1"` and the
+/// number `1` serialize as `"1"` and `1`, are distinguishable in
+/// `Mismatch.claimed`, and so are NOT a collision; two fields carrying the same
+/// JSON value collide whatever their Rust types were.
+fn leaves(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
     match value {
-        Value::String(s) => out.push((path.to_string(), s.clone())),
-        Value::Object(map) => {
+        Value::Object(map) if !map.is_empty() => {
             for (k, v) in map {
                 if path.is_empty() && k == "registration_envelope" {
                     continue;
@@ -457,15 +508,17 @@ fn string_leaves(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
                 } else {
                     format!("{path}.{k}")
                 };
-                string_leaves(v, &child, out);
+                leaves(v, &child, out);
             }
         }
-        Value::Array(items) => {
+        Value::Array(items) if !items.is_empty() => {
             for (i, v) in items.iter().enumerate() {
-                string_leaves(v, &format!("{path}[{i}]"), out);
+                leaves(v, &format!("{path}[{i}]"), out);
             }
         }
-        _ => {}
+        // Every terminal: scalars of all types AND empty containers, which are
+        // values a projection can legitimately expect.
+        terminal => out.push((path.to_string(), terminal.to_string())),
     }
 }
 
@@ -506,7 +559,6 @@ fn every_fixture_field_carries_its_own_sentinel() {
     ];
 
     for (what, fixture) in fixtures {
-        let mut leaves = Vec::new();
         // `ProvenanceChain` nests the fields under `chain[0]`, and its own
         // `key_id` is REQUIRED to equal `chain[0].key_id` — verify refuses with
         // `QueriedKeyMismatch` otherwise. That is a structural equality the
@@ -514,21 +566,51 @@ fn every_fixture_field_carries_its_own_sentinel() {
         // the link. (Walking from the link's own object also keeps the
         // `registration_envelope` skip working, which is keyed on the top
         // level.)
-        if what.ends_with("ProvenanceChain") {
-            string_leaves(&fixture["chain"][0], "", &mut leaves);
+        let root = if what.ends_with("ProvenanceChain") {
+            &fixture["chain"][0]
         } else {
-            string_leaves(&fixture, "", &mut leaves);
-        }
+            &fixture
+        };
+        let mut found = Vec::new();
+        leaves(root, "", &mut found);
 
         assert!(
-            leaves.len() > 5,
-            "#663: {what} yielded only {} string leaves — the walk is not reaching the fixture's \
-             fields, which would make this witness decorative",
-            leaves.len()
+            found.len() > 5,
+            "#663: {what} yielded only {} leaves — the walk is not reaching the fixture's fields, \
+             which would make this witness decorative",
+            found.len()
         );
 
+        // THE WALK MUST BE TOTAL, and this is the guard that holds it total.
+        //
+        // Codex finding on #666: the walk recorded `Value::String` only,
+        // silently dropping nulls, booleans, numbers and empty containers —
+        // `ProvenanceLink::is_self_signed` was being dropped in exactly that
+        // way. A field the walk never visits is a field this witness does not
+        // guard, and nothing said so.
+        //
+        // Every serialized field must therefore contribute at least one
+        // recorded leaf. This fails under a type-filtered walk rather than
+        // merely measuring less, which is the difference between a fix and a
+        // fix that stays fixed.
+        for key in root
+            .as_object()
+            .unwrap_or_else(|| panic!("#663: {what} must serialize to a JSON object"))
+            .keys()
+            .filter(|k| k.as_str() != "registration_envelope")
+        {
+            assert!(
+                found.iter().any(|(path, _)| path == key
+                    || path.starts_with(&format!("{key}."))
+                    || path.starts_with(&format!("{key}["))),
+                "#663: {what}'s field `{key}` contributed NO leaf, so this witness does not guard \
+                 it. The walk is dropping a value shape (a null, boolean, number or empty \
+                 container) — record every terminal, not just the strings."
+            );
+        }
+
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
-        for (path, value) in &leaves {
+        for (path, value) in &found {
             if let Some(first) = seen.insert(value.as_str(), path.as_str()) {
                 panic!(
                     "#663: {what} gives `{first}` and `{path}` the SAME value {value:?}. The probe \
@@ -897,51 +979,94 @@ fn probe_verify_provenance_projection(materialize_optionals: bool) -> BTreeMap<S
 
     for _ in 0..128 {
         let chain = verify_provenance_chain(materialize_optionals, Value::Object(envelope.clone()));
-        // No trusted bootstrap keys: the binding is checked long before any
-        // anchor resolution, which is the property rule 4 exists to give.
-        match ciris_verify_core::provenance::verify_provenance_chain(&chain, &[]) {
-            // STILL a binding failure — never convergence, whatever the source
-            // variant is. `probe_advance` matches the source EXHAUSTIVELY, so a
-            // new `SubjectBindingError` variant is a compile error there rather
-            // than a silent fall-through here.
-            Err(ProvenanceError::SubjectBindingFailed { source, .. }) => {
+        match provenance_binding_verdict(&chain) {
+            Ok(()) => return discovered,
+            Err(source) => {
                 if let Some((member, expected)) = probe_advance(source, &mut envelope) {
                     discovered.insert(member, expected);
                 }
             }
-            // Convergence: the binding for link 0 PASSED and some later check
-            // (hash, linkage, terminus, signature) is speaking instead.
-            //
-            // Listed EXHAUSTIVELY rather than as a `_` wildcard — `ProvenanceError`
-            // is not `#[non_exhaustive]`, so a variant added in a future
-            // CIRISVerify is a COMPILE ERROR here, forcing whoever bumps the pin
-            // to classify it as "binding failure" or "later check". A wildcard
-            // would classify it silently, as convergence, which is the direction
-            // that goes green.
-            Ok(())
-            | Err(
-                ProvenanceError::EmptyChain
-                | ProvenanceError::OverDepth { .. }
-                | ProvenanceError::QueriedKeyMismatch
-                | ProvenanceError::BrokenLink { .. }
-                | ProvenanceError::SelfSignedMidChain { .. }
-                | ProvenanceError::TerminusNotSelfSigned
-                | ProvenanceError::TerminusNotSteward { .. }
-                | ProvenanceError::BadContentHash { .. }
-                | ProvenanceError::ContentHashMismatch { .. }
-                | ProvenanceError::BadSignatureEncoding { .. }
-                | ProvenanceError::BadKeyEncoding { .. }
-                | ProvenanceError::ParentMissingPqcKey { .. }
-                | ProvenanceError::ScrubSignatureInvalid { .. }
-                | ProvenanceError::UntrustedAnchor { .. }
-                | ProvenanceError::LinkNotHybrid { .. },
-            ) => return discovered,
         }
     }
     panic!(
         "#663: verify's provenance subject-binding probe did not converge in 128 steps — read \
          `ciris_verify_core::provenance` before touching this bound."
     )
+}
+
+/// **The SUBJECT-BINDING verdict from a provenance walk**, isolated from every
+/// later check.
+///
+/// `Err(source)` iff the walk refused on the binding; `Ok(())` for every other
+/// outcome, which means the binding for link 0 PASSED and some later check
+/// (hash, linkage, terminus, signature) is speaking instead. The fixture
+/// deliberately cannot satisfy those — it carries no real signature — and they
+/// are not this file's business.
+///
+/// No trusted bootstrap keys are passed: the binding is checked long before any
+/// anchor resolution, which is the property verify's rule 4 exists to give.
+///
+/// # Exhaustive on purpose
+///
+/// The convergence side lists all fifteen non-binding variants rather than `_`.
+/// `ProvenanceError` is not `#[non_exhaustive]`, so a variant added in a future
+/// CIRISVerify is a **compile error here**, forcing whoever bumps the pin to
+/// classify it as "binding failure" or "later check". A wildcard would classify
+/// it silently, as convergence, which is the direction that goes green. This is
+/// the ONLY place that list appears, so it is one compile error to resolve.
+fn provenance_binding_verdict(chain: &ProvenanceChain) -> Result<(), SubjectBindingError> {
+    match ciris_verify_core::provenance::verify_provenance_chain(chain, &[]) {
+        Err(ProvenanceError::SubjectBindingFailed { source, .. }) => Err(source),
+        Ok(())
+        | Err(
+            ProvenanceError::EmptyChain
+            | ProvenanceError::OverDepth { .. }
+            | ProvenanceError::QueriedKeyMismatch
+            | ProvenanceError::BrokenLink { .. }
+            | ProvenanceError::SelfSignedMidChain { .. }
+            | ProvenanceError::TerminusNotSelfSigned
+            | ProvenanceError::TerminusNotSteward { .. }
+            | ProvenanceError::BadContentHash { .. }
+            | ProvenanceError::ContentHashMismatch { .. }
+            | ProvenanceError::BadSignatureEncoding { .. }
+            | ProvenanceError::BadKeyEncoding { .. }
+            | ProvenanceError::ParentMissingPqcKey { .. }
+            | ProvenanceError::ScrubSignatureInvalid { .. }
+            | ProvenanceError::UntrustedAnchor { .. }
+            | ProvenanceError::LinkNotHybrid { .. },
+        ) => Ok(()),
+    }
+}
+
+/// The members verify's PROVENANCE walk treats as **optional** — recovered by
+/// the same difference [`verify_optional_members`] uses on the key-record
+/// plane.
+fn provenance_optional_members() -> BTreeSet<String> {
+    let all: BTreeSet<String> = probe_verify_provenance_projection(true)
+        .into_keys()
+        .collect();
+    let required: BTreeSet<String> = probe_verify_provenance_projection(false)
+        .into_keys()
+        .collect();
+    assert!(
+        required.is_subset(&all),
+        "#663: a member the provenance walk enforces with NO optional legs materialized must \
+         still be enforced when they are. required={required:?} all={all:?}"
+    );
+    all.difference(&required).cloned().collect()
+}
+
+/// A persist-produced envelope with `member` **OMITTED** rather than
+/// materialized as `null` — the distinction CEG §0.9 is entirely about, and the
+/// one [`bound_envelope`] cannot express because persist's producer always
+/// materializes.
+fn envelope_omitting(pqc: Option<&str>, member: &str) -> Value {
+    let mut envelope = bound_envelope(pqc);
+    envelope
+        .as_object_mut()
+        .expect("bound_envelope is an object")
+        .remove(member);
+    envelope
 }
 
 /// **The provenance plane binds what persist produces.**
@@ -985,24 +1110,91 @@ fn verify_provenance_plane_binds_exactly_what_persist_produces() {
          each other — and persist produces ONE envelope that must satisfy both."
     );
 
+    // ...and they must agree on DISPOSITION, not only on the member set.
+    //
+    // Codex finding on #666: comparing only the MATERIALIZED probes leaves the
+    // `require` / `require_optional` split unpinned across planes. If the
+    // provenance chain alone spelled a leg `.require(...)`, both materialized
+    // probes still converge identically and this test passes — while an
+    // envelope that OMITS that member is admitted by the key-record check and
+    // REFUSED by the provenance walk. That is a live divergence between
+    // verify's two planes, and pinning them against each other is exactly what
+    // this test claims to do.
+    assert_eq!(
+        probe_verify_provenance_projection(false),
+        probe_verify_projection(false),
+        "#663: verify's two planes REQUIRE different members once the record's optional legs are \
+         absent. The materialized sets agree, so this is a `require` vs `require_optional` split \
+         between `federation_self_record` and `provenance.rs` — an envelope omitting the member \
+         would pass one plane and fail the other."
+    );
+    assert_eq!(
+        provenance_optional_members(),
+        persist_optional_members(),
+        "#663: the provenance walk and persist's producer disagree on which members are OPTIONAL. \
+         Persist materializes `null` for its optional legs, so a member the walk REQUIRES while \
+         persist calls it optional is not caught by the member-set comparison above — it is \
+         caught here."
+    );
+
     // The round trip: what persist's producer actually emits satisfies the
     // walk's binding, for a row with and without its optional leg.
     for row_pqc in [None, Some(MLDSA)] {
-        let chain = verify_provenance_chain(false, bound_envelope(row_pqc));
-        let mut chain = chain;
-        chain.chain[0].pubkey_ml_dsa_65_base64 = row_pqc.map(str::to_string);
-        // Everything OTHER than a binding failure is a later check the fixture
-        // deliberately cannot satisfy (no real signature) — not this gate's
-        // business, so only the binding arm is examined.
-        if let Err(ProvenanceError::SubjectBindingFailed { source, .. }) =
-            ciris_verify_core::provenance::verify_provenance_chain(&chain, &[])
-        {
+        let chain = provenance_chain_for(row_pqc, bound_envelope(row_pqc));
+        if let Err(source) = provenance_binding_verdict(&chain) {
             panic!(
                 "#663: an envelope built by persist's OWN producer must satisfy verify's \
                  provenance-link binding (row_pqc={row_pqc:?}): {source}"
             );
         }
     }
+
+    // CEG §0.9 ON THE PROVENANCE PLANE — the case `bound_envelope` structurally
+    // cannot produce.
+    //
+    // Codex finding on #666: persist's producer ALWAYS materializes, so
+    // `bound_envelope(None)` emits `pubkey_ml_dsa_65_base64: null` and the round
+    // trip above never drives OMISSION. Omission is the only thing that
+    // distinguishes `require_optional` from `require`, so without these legs the
+    // round trip cannot tell the two apart.
+    //
+    // Driven off `persist_optional_members()` rather than a hard-coded name, so
+    // a second optional member is covered the day it exists.
+    for member in persist_optional_members() {
+        // (a) envelope omits + row claims nothing ⇒ ADMIT. Both say nothing,
+        //     which is agreement, and it is the ONE tolerated absence.
+        let chain = provenance_chain_for(None, envelope_omitting(None, &member));
+        if let Err(source) = provenance_binding_verdict(&chain) {
+            panic!(
+                "#663/§0.9: the provenance walk must ADMIT an envelope that OMITS `{member}` when \
+                 the link claims nothing either — a legitimate JCS producer omits rather than \
+                 materializes a null. Refusing here diverges from the key-record plane, which \
+                 admits it: {source}"
+            );
+        }
+
+        // (b) envelope omits + row claims a key ⇒ REFUSE. The downgrade
+        //     direction: a leg the chain never signed for, attached outside the
+        //     signed bytes.
+        let chain = provenance_chain_for(Some(MLDSA), envelope_omitting(Some(MLDSA), &member));
+        let source = provenance_binding_verdict(&chain).expect_err(
+            "#663/§0.9: the provenance walk must REFUSE an envelope that omits a leg the link \
+             CLAIMS — tolerating that is the skippable-by-omission hole",
+        );
+        assert!(
+            matches!(&source, SubjectBindingError::Missing { member: m, .. } if *m == member),
+            "#663/§0.9: the provenance refusal must name the absent member `{member}`: {source}"
+        );
+    }
+}
+
+/// A provenance chain whose link carries `pqc` as its ML-DSA leg and `envelope`
+/// as its registration envelope — the link's own claim and the signed bytes set
+/// independently, which is what every §0.9 case needs.
+fn provenance_chain_for(pqc: Option<&str>, envelope: Value) -> ProvenanceChain {
+    let mut chain = verify_provenance_chain(false, envelope);
+    chain.chain[0].pubkey_ml_dsa_65_base64 = pqc.map(str::to_string);
+    chain
 }
 
 /// An envelope that binds every projected member for this subject, built
