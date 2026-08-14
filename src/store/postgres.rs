@@ -25685,6 +25685,48 @@ mod tests {
 
     // ─── ReadEngine §I tests (v0.5.5, CIRISPersist#23) ──────────────
 
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-5) — **a quorum-bearing bundle
+    /// survives a backward clock step behind a VOTE-LESS proposal.**
+    ///
+    /// The case the participation allocator cannot cover: with no votes on the
+    /// leading proposal there is no `MAX(server_arrival_at)` to clamp against,
+    /// so `created_at` must be allocated or the later quorum-bearing bundle
+    /// sorts below the consumer's cursor and is never served. `put_accord_proposal`
+    /// on THIS backend was the site that missed the allocator.
+    ///
+    /// The post-step state is planted directly — every stored `created_at`
+    /// moved past the cursor, which is what a node looks like after an NTP
+    /// correction. Two proposals under a forward clock would pass with
+    /// `Utc::now()` and prove nothing.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn quorum_bundle_survives_backward_clock_pg_662() {
+        use crate::federation::accord_carriage::carriage_tests as ts;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            let (node, cursor) = ts::zero_participation_cursor(&backend, "pg").await;
+
+            // THE BACKWARD STEP, as state.
+            let future = cursor + chrono::Duration::hours(1);
+            {
+                let client = backend.get_client().await.unwrap();
+                client
+                    .execute(
+                        "UPDATE cirislens.accord_proposal SET created_at = $1",
+                        &[&future],
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            ts::assert_quorum_bundle_survives_backward_clock(&backend, &node, "pg", future).await;
+        })
+        .await;
+    }
+
     /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
     /// survives a backward clock step, on this backend's real write path.**
     ///

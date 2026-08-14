@@ -2358,10 +2358,21 @@ pub trait FederationDirectory: Send + Sync {
     /// v31.1.0 (CIRISPersist#662) — bulk-list the
     /// [`accord_carriage::AccordQuorumEvidence`] bundles (V091
     /// `accord_proposal` + its `accord_participation` set) since a cursor.
-    /// `since` filters on the proposal's local `created_at > since` (`None` =
-    /// from the start); bundles are ordered by `(created_at ASC,
-    /// proposal_digest ASC)`. `limit` caps the page (counted in PROPOSALS,
-    /// not participations).
+    /// `since` filters on
+    /// [`AccordQuorumEvidence::evidence_at`](accord_carriage::AccordQuorumEvidence)
+    /// `> since` (`None` = from the start); bundles are ordered by
+    /// `(evidence_at ASC, proposal_digest ASC)`. `limit` caps the page
+    /// (counted in PROPOSALS, not participations). **Resume from the last
+    /// element's `evidence_at`** — it is the only field a caller can resume
+    /// from, and the only one that is correct.
+    ///
+    /// It is emphatically NOT the proposal's `created_at`: that value is not
+    /// on the bundle at all, and cursoring on it would pin a bundle at the
+    /// moment it had no votes, so a consumer reading pre-quorum would advance
+    /// past it and never be offered the quorum-bearing version. `evidence_at`
+    /// is `max(created_at, max(server_arrival_at))`, so a vote's arrival moves
+    /// the bundle forward and it is re-offered exactly when it has something
+    /// new to say.
     ///
     /// # This is the signed EVIDENCE plane, and it exists so a verdict plane
     /// does not have to
