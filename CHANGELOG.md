@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.2.0] - 2026-08-14
+
+### Changed — BREAKING — SECURITY — the authorization digest binds the RECORD, not just the `key_id` (#660, CIRISServer#398 §5)
+
+**CONSUMER ACTION REQUIRED — a signing-preimage change, and it invalidates
+every existing genesis authorization.** That is the intent. It ships with a
+fresh genesis ceremony; the seed is re-minted, not re-authorized.
+
+**No CIRISServer code change.** `mesh_genesis` re-exports persist's
+`authorization_digest` rather than declaring one — *"two implementations
+drifting by a byte silently invalidates a ceremony's quorum"* — so widening it
+here widens the producer in the same act. Server bumps the pin and inherits.
+
+**The defect.** `holders` and `serve_nodes` contributed their `key_id`s **and
+nothing else**. Adding, removing or renaming one broke every authorization, but
+**substituting the RECORD under an unchanged `key_id`** — a different
+`pubkey_ed25519_base64`, PQC leg, `identity_type`, `identity_ref`,
+`registration_envelope`, `original_content_hash`, scrub set, `valid_from`,
+**roles** or **custody evidence** — did not appear in the digest at all.
+`attestations` were always bound in full; this closes the other half.
+
+It was never exploitable alone: a serve-node record still has to pass
+`put_public_key`'s canonical-role admission (a 2-of-3 accord co-scrub re-verified
+against the node's own pinned holder anchors), and `bake_assembled_genesis`
+refuses a re-anchor whose pubkey differs or whose `valid_from` does not advance.
+Those gates stand — but they adjudicate a different question, and the digest
+should not have been described as if it did their job.
+
+**What is bound now.** The whole `KeyRecord` minus exactly two node-local fields:
+
+| excluded | why |
+|---|---|
+| `persist_row_hash` | documented *"Server-computed"*, *"ignored on write — persist computes its own"*. Binding it would make producer and consumer disagree by construction. |
+| `pqc_completed_at` | a local telemetry instant stamped by `attach_pqc_signature`. A node-local instant inside a content hash is the class v31.1.0 removed from five replication positions (#655/#662). |
+
+The line is a **deny-list, not an include-list**: a field added to `KeyRecord`
+enters the preimage by DEFAULT and a reviewer must argue to exclude it. A guard
+test pins the record's field set, so that default is a reviewed act rather than a
+silent one — it failed on its first run naming `roles` and `attestation_evidence`,
+the two fields #660 itself called out, which a hand-written include-list had
+missed. An unbound `roles` means a serve node with widened capabilities under an
+unchanged `key_id` still verifies.
+
+**Why this could not land earlier.** The preimage is a cross-repo wire contract
+and holder authorizations are computed over the producer's construction, so
+widening persist alone would have made this node refuse every bundle the producer
+emits — a consumer-side break with no producer-side half. The module doc named
+the v31 re-ceremony as the right window. This is that window.
+
 ## [31.1.0] - 2026-08-13
 
 ### Added — SECURITY — two exclusion planes could be destroyed but never rebuilt (#655, #662)

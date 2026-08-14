@@ -43,34 +43,40 @@
 //!   `attestation_id`, `attesting_key_id`, `attested_key_id`,
 //!   `attestation_type` AND its whole `attestation_envelope`, so the conferral
 //!   plane — the scopes, the subject, the verb — is bound byte-for-byte.
-//! - **A swapped serve node: covered only by IDENTITY.** `serve_nodes` and
-//!   `holders` contribute their `key_id`s and nothing else. Adding, removing or
-//!   renaming a serve node breaks every authorization; **substituting the
-//!   RECORD under an unchanged `key_id`** — a different `pubkey_ed25519_base64`,
-//!   `registration_envelope`, scrub set, `valid_from`, roles or custody
-//!   evidence — does not appear in the digest at all.
+//! - **A swapped serve node: covered by RECORD, as of v31.2.0.** `holders` and
+//!   `serve_nodes` contribute the whole `KeyRecord` minus two node-local fields
+//!   (see [`NODE_LOCAL_RECORD_FIELDS`]), so `pubkey_ed25519_base64`, the PQC
+//!   leg, `identity_type`, `identity_ref`, `valid_from`/`valid_until`,
+//!   `registration_envelope`, `original_content_hash` and the whole scrub set
+//!   are all bound byte-for-byte. Substituting the record under an unchanged
+//!   `key_id` now breaks every authorization.
 //!
-//! What actually stops that substitution is not this digest, and a reader
-//! should know where to look: a serve-node record still has to pass
-//! `put_public_key`'s canonical-role admission (a 2-of-3 accord co-scrub
-//! re-verified against THIS node's pinned holder anchors), and
-//! [`bake_assembled_genesis`] additionally refuses a re-anchor whose pubkey
-//! differs from the anchored row or whose `valid_from` does not move forward.
-//! Those are real gates and they are why this gap has never been exploitable on
-//! its own — but they are a different mechanism, adjudicating a different
-//! question, and the digest should not be described as if it did their job.
+//! Until v31.2.0 that was NOT true: holders and serve nodes contributed their
+//! `key_id`s and nothing else, so a record substituted under an unchanged id was
+//! invisible to the digest (CIRISPersist#660). It was never exploitable on its
+//! own, because a serve-node record still has to pass `put_public_key`'s
+//! canonical-role admission (a 2-of-3 accord co-scrub re-verified against THIS
+//! node's pinned holder anchors), and [`bake_assembled_genesis`] refuses a
+//! re-anchor whose pubkey differs from the anchored row or whose `valid_from`
+//! does not move forward. Those gates still stand — but they adjudicate a
+//! different question, and the digest is no longer described as if it did their
+//! job because it now genuinely does.
 //!
-//! **Why the digest was not simply widened here.** The preimage is a
-//! cross-repo wire contract: it is declared byte-identical to the PRODUCER's
-//! (CIRISServer `mesh_genesis::authorization_digest`), and holder
-//! authorizations are computed over the producer's construction. Widening it in
-//! persist alone would make this node refuse every bundle CIRISServer emits,
-//! including the baked `canonical_seed.json` whose authorizations are already
-//! signed over the narrow preimage — a consumer-side break with no producer-side
-//! half. It is the right change and the v31 re-ceremony is the right window for
-//! it, so it is tracked as CIRISServer-side work rather than described as
-//! covered; when both halves land together the bullet above becomes obsolete
-//! and must be rewritten, not quietly dropped.
+//! **Why this could not be widened earlier, and why it could now.** The preimage
+//! is a cross-repo wire contract, declared byte-identical to the PRODUCER's, and
+//! holder authorizations are computed over the producer's construction. Widening
+//! it in persist alone would have made this node refuse every bundle CIRISServer
+//! emits — including a baked seed already signed over the narrow preimage — a
+//! consumer-side break with no producer-side half.
+//!
+//! Two things closed that gap. CIRISServer `mesh_genesis` **re-exports this
+//! function** rather than declaring its own (*"two implementations drifting by a
+//! byte silently invalidates a ceremony's quorum"*), so widening here widens the
+//! producer in the same act, with no server code change. And the seed is
+//! **re-minted by a fresh genesis ceremony** on this cut, so no existing
+//! authorization has to survive the change. That is the window this comment said
+//! to wait for (CIRISServer#398 §5); it is here, and the bullet above has been
+//! rewritten rather than dropped.
 
 use super::super::types::{SignedAttestation, SignedKeyRecord};
 use super::super::{Error, FederationDirectory};
@@ -115,26 +121,99 @@ pub struct GenesisBundle {
     pub produced_at: String,
 }
 
+/// The fields of [`KeyRecord`] that are **node-local** and therefore must
+/// never enter the authorization preimage.
+///
+/// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — the line is *"producer
+/// authors it"* versus *"this node computes it"*, and it is drawn here rather
+/// than by listing what to INCLUDE, so a field added to `KeyRecord` is bound by
+/// default and a reviewer has to argue for excluding it.
+///
+/// - `persist_row_hash` is documented **"Server-computed"** and *"ignored on
+///   write — persist computes its own"*. Binding it would make the producer and
+///   every consumer disagree by construction.
+/// - `pqc_completed_at` is a *"telemetry + observability signal"* stamped
+///   locally by `attach_pqc_signature`. A node-local instant inside a content
+///   hash is the exact defect class v31.1.0 removed from five replication
+///   positions (#655/#662); it does not get to reappear here.
+const NODE_LOCAL_RECORD_FIELDS: [&str; 2] = ["persist_row_hash", "pqc_completed_at"];
+
+/// One holder's or serve node's contribution to [`authorization_digest`]:
+/// the whole record MINUS [`NODE_LOCAL_RECORD_FIELDS`].
+///
+/// v31.2.0 — this used to be `&record.key_id` and nothing else, which is why
+/// **substituting the RECORD under an unchanged `key_id`** — a different
+/// `pubkey_ed25519_base64`, `registration_envelope`, scrub set, `valid_from`,
+/// `identity_type`, roles or custody evidence — did not appear in the digest at
+/// all (CIRISPersist#660).
+///
+/// `identity_type` deserves its own mention: `is_canonical` reads it off the row
+/// to decide canonical standing, and it was the member persist's subject binding
+/// omitted in the v31.0.0 alignment (#659/#661). A projection that binds a
+/// pubkey but not the type that decides what the pubkey is ALLOWED to do closes
+/// half a door.
+///
+/// Serialization is by `serde`, so a field ADDED to `KeyRecord` is bound
+/// automatically; `authorized_record_projection_binds_every_producer_field`
+/// fails the build if the field set changes, so "bound automatically" is a
+/// reviewed act rather than a silent one.
+fn authorized_record_projection(
+    record: &super::super::types::KeyRecord,
+) -> Result<serde_json::Value, Error> {
+    let mut value = serde_json::to_value(record).map_err(|e| Error::GenesisBundleInvalid {
+        detail: format!(
+            "authorization_digest: could not project key record {}: {e}",
+            record.key_id
+        ),
+    })?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| Error::GenesisBundleInvalid {
+            detail: format!(
+                "authorization_digest: key record {} did not serialize to an object",
+                record.key_id
+            ),
+        })?;
+    for field in NODE_LOCAL_RECORD_FIELDS {
+        map.remove(field);
+    }
+    Ok(value)
+}
+
 /// The bytes every holder authorization signs — BYTE-IDENTICAL to the
-/// producer's construction (CIRISServer `mesh_genesis`): bundle identity,
-/// holder ids, serve ids, and the whole delegation plane. Deliberately
-/// excludes `authorizations` (they are what is being accumulated).
+/// producer's construction, because CIRISServer `mesh_genesis` **re-exports
+/// this function** rather than declaring one. Bundle identity, the holder and
+/// serve-node RECORDS, and the whole delegation plane. Deliberately excludes
+/// `authorizations` (they are what is being accumulated).
 ///
 /// # Read the preimage below, not a summary of it (CIRISPersist#660)
 ///
-/// `holders` and `serve_nodes` contribute **`key_id` only** — the record
-/// content under an unchanged id is NOT in these bytes. `attestations`
-/// contribute their full `attestation_envelope` and so ARE bound. See this
-/// module's doc for what closes the serve-node gap instead, and for why the
-/// preimage is not widened unilaterally on the consumer side.
+/// v31.2.0 (CIRISServer#398 §5) — `holders` and `serve_nodes` now contribute
+/// their whole [`KeyRecord`] minus [`NODE_LOCAL_RECORD_FIELDS`], not `key_id`
+/// alone, so a record substituted under an unchanged id breaks every
+/// authorization. `attestations` contribute their full `attestation_envelope`
+/// and were always bound.
+///
+/// **This is a signing-preimage change and it is deliberately breaking.** Every
+/// authorization taken over the narrow preimage is invalid against these bytes —
+/// which is the point, and why it lands with a fresh genesis ceremony rather
+/// than alone. See this module's doc for the full before/after.
 pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
     let preimage = serde_json::json!({
         "version": bundle.version,
         "family_key_id": bundle.family_key_id,
         "consensus_protocol": bundle.consensus_protocol,
         "produced_at": bundle.produced_at,
-        "holders": bundle.holders.iter().map(|h| &h.record.key_id).collect::<Vec<_>>(),
-        "serve_nodes": bundle.serve_nodes.iter().map(|n| &n.record.key_id).collect::<Vec<_>>(),
+        "holders": bundle
+            .holders
+            .iter()
+            .map(|h| authorized_record_projection(&h.record))
+            .collect::<Result<Vec<_>, Error>>()?,
+        "serve_nodes": bundle
+            .serve_nodes
+            .iter()
+            .map(|n| authorized_record_projection(&n.record))
+            .collect::<Result<Vec<_>, Error>>()?,
         "attestations": bundle
             .attestations
             .iter()
@@ -692,4 +771,157 @@ where
         serve_nodes: serve_outcomes,
         attestations: att_outcomes,
     })
+}
+
+#[cfg(test)]
+mod authorization_digest_tests {
+    use super::*;
+
+    /// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — **the field set of
+    /// `KeyRecord` is pinned, so widening the record widens the digest as a
+    /// REVIEWED act.**
+    ///
+    /// `authorized_record_projection` serializes the whole record and removes
+    /// only [`NODE_LOCAL_RECORD_FIELDS`], which means a field added to
+    /// `KeyRecord` enters the signing preimage automatically. That is the right
+    /// default — a new producer-authored field SHOULD be bound — but it must not
+    /// happen silently, because it changes the bytes every holder signs.
+    ///
+    /// So this test fails on ANY change to the record's shape. Adding a field:
+    /// decide whether it is producer-authored (leave it bound, add it here) or
+    /// node-local (add it to `NODE_LOCAL_RECORD_FIELDS`, add it here). Either
+    /// way the decision is made by a human and shows up in a diff.
+    #[test]
+    fn authorized_record_projection_binds_every_producer_field() {
+        let bundle = crate::federation::genesis::canonical_genesis_bundle();
+        let record = &bundle
+            .holders
+            .first()
+            .expect("the canonical bundle carries holders")
+            .record;
+
+        let full = serde_json::to_value(record).expect("record serializes");
+        let full_keys: std::collections::BTreeSet<&str> = full
+            .as_object()
+            .expect("record is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        // Every field the record actually carries, as of v31.2.0. `Option`
+        // fields with `skip_serializing_if` only appear when populated, so this
+        // is the set for a fully-populated hybrid holder record.
+        let expected: std::collections::BTreeSet<&str> = [
+            "key_id",
+            "pubkey_ed25519_base64",
+            "pubkey_ml_dsa_65_base64",
+            "algorithm",
+            "identity_type",
+            "identity_ref",
+            "valid_from",
+            "valid_until",
+            "registration_envelope",
+            "original_content_hash",
+            "scrub_signature_classical",
+            "scrub_signature_pqc",
+            "scrub_key_id",
+            "scrub_timestamp",
+            // Both named explicitly by #660 as things the narrow preimage did
+            // NOT bind — "roles or custody evidence". `roles` is the capability
+            // set (a serve node with widened roles under an unchanged key_id is
+            // the substitution this whole change prevents); `attestation_evidence`
+            // is the hardware custody blob (TPM / Secure Enclave / StrongBox).
+            // Producer-authored, both bound.
+            "roles",
+            "attestation_evidence",
+            "pqc_completed_at",
+            "persist_row_hash",
+        ]
+        .into_iter()
+        .collect();
+
+        let unexpected: Vec<_> = full_keys.difference(&expected).collect();
+        assert!(
+            unexpected.is_empty(),
+            "KeyRecord grew {unexpected:?}. These are now in the AUTHORIZATION \
+             PREIMAGE that every genesis holder signs. Decide deliberately: \
+             producer-authored (leave bound) or node-local (add to \
+             NODE_LOCAL_RECORD_FIELDS) — then update this list."
+        );
+
+        // The projection must drop exactly the node-local pair, nothing else.
+        let projected = authorized_record_projection(record).expect("projects");
+        let projected_keys: std::collections::BTreeSet<&str> = projected
+            .as_object()
+            .expect("projection is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for field in NODE_LOCAL_RECORD_FIELDS {
+            assert!(
+                !projected_keys.contains(field),
+                "{field} is node-local and must never enter the preimage"
+            );
+        }
+        let dropped: Vec<_> = full_keys.difference(&projected_keys).collect();
+        assert_eq!(
+            dropped.len(),
+            NODE_LOCAL_RECORD_FIELDS.len(),
+            "the projection dropped {dropped:?}; it must drop ONLY \
+             {NODE_LOCAL_RECORD_FIELDS:?} — a silently narrowed preimage is the \
+             #660 defect returning"
+        );
+    }
+
+    /// **The property #660 existed to fix, driven directly.**
+    ///
+    /// Substituting the RECORD under an unchanged `key_id` — the case the old
+    /// `key_id`-only preimage could not see — must change the digest. Asserted
+    /// per node-local field too: those must NOT change it, or the producer and
+    /// every consumer disagree by construction.
+    #[test]
+    fn substituting_a_record_under_an_unchanged_key_id_moves_the_digest() {
+        let base = crate::federation::genesis::canonical_genesis_bundle().clone();
+        let baseline = authorization_digest(&base).expect("digest");
+
+        // A swapped pubkey under the SAME key_id. Pre-v31.2.0 this was
+        // invisible: `holders` contributed `key_id` and nothing else.
+        let mut swapped = base.clone();
+        let target = &mut swapped.holders[0].record;
+        let original_key_id = target.key_id.clone();
+        target.pubkey_ed25519_base64 = "A".repeat(44);
+        assert_eq!(
+            target.key_id, original_key_id,
+            "the whole point is that the id is UNCHANGED"
+        );
+        assert_ne!(
+            authorization_digest(&swapped).expect("digest"),
+            baseline,
+            "a substituted holder pubkey under an unchanged key_id did not move \
+             the digest — this is CIRISPersist#660 exactly"
+        );
+
+        // identity_type decides canonical standing (`is_canonical` reads it off
+        // the row) and was the member persist's subject binding omitted in
+        // v31.0.0 (#659/#661). Binding a pubkey but not the type that governs
+        // what it may do closes half a door.
+        let mut retyped = base.clone();
+        retyped.serve_nodes[0].record.identity_type = "definitely-not-the-real-type".to_owned();
+        assert_ne!(
+            authorization_digest(&retyped).expect("digest"),
+            baseline,
+            "a swapped serve-node identity_type did not move the digest"
+        );
+
+        // And the other direction: a node-local field must NOT move it.
+        let mut local = base.clone();
+        local.holders[0].record.persist_row_hash = "deadbeef".repeat(8);
+        local.holders[0].record.pqc_completed_at = Some(chrono::Utc::now());
+        assert_eq!(
+            authorization_digest(&local).expect("digest"),
+            baseline,
+            "a node-local field moved the digest — the producer and every \
+             consumer would disagree by construction"
+        );
+    }
 }
