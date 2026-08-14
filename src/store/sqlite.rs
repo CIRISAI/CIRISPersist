@@ -5960,10 +5960,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<
-        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
-        crate::federation::Error,
-    > {
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    {
         let conn = self.conn.clone();
         let key = payload_sha256.to_owned();
         (move || -> Result<Vec<_>, rusqlite::Error> {

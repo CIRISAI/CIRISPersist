@@ -4821,10 +4821,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<
-        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
-        crate::federation::Error,
-    > {
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    {
         let state = self.state.lock().expect("memory backend lock");
         // O(proposals) with no I/O and no per-proposal second read — this
         // backend has no index to answer from, and the amplification that
@@ -6235,11 +6233,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
-                a.revocation
-                    .revocation_id
-                    .cmp(&b.revocation.revocation_id)
-            })
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| a.revocation.revocation_id.cmp(&b.revocation.revocation_id))
         });
         rows.truncate(limit as usize);
         Ok(rows)

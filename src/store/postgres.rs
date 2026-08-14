@@ -6796,10 +6796,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<
-        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
-        crate::federation::Error,
-    > {
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    {
         let client = self
             .get_client()
             .await

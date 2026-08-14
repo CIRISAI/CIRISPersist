@@ -394,12 +394,11 @@ pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
     EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
-    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
-    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
-    SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, ServedRevocation,
-    TrustClass, TrustFilter,
-    TrustGrant, TrustRelationship, TrustRow, TrustType,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedRevocation, SignedAttestation,
+    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
+    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
+    SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm,
+    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
