@@ -5612,15 +5612,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v31.0.0 (#644) — revocation_envelope is TEXT since V122.
         let revocation_envelope_text =
             pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
+        // v31.1.0 (CIRISPersist#655) — THIS node's admission instant (V123).
+        // Read from the local clock, not from the row: `scrub_timestamp` is the
+        // producer's assertion, and a late-replicated old one would sort behind
+        // every consumer's cursor and never be served again.
+        let admitted_at = chrono::Utc::now();
         client
             .execute(
+                // v31.1.0 (CIRISPersist#655) — `admitted_at` (V123) is THIS
+                // node's position in its own stream, stamped here and never
+                // read from the wire. The serve cursor keys on it.
                 "INSERT INTO cirislens.federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                    revoked_after, persist_row_hash, admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                    $16, $17)",
                 &[
                     &revocation_uuid,
                     &row.revoked_key_id,
@@ -5638,6 +5647,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.observed_region,
                     &row.revoked_after,
                     &row.persist_row_hash,
+                    &admitted_at,
                 ],
             )
             .await
@@ -6786,12 +6796,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
-    {
+    ) -> Result<
+        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
+        crate::federation::Error,
+    > {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Answered from the V124 `accord_proposal(payload_sha256)` index.
         let rows = client
             .query(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
@@ -6803,7 +6816,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_accord_proposals_by_payload: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_stored_proposal).collect()
+        rows.into_iter()
+            .map(|r| pg_row_to_stored_proposal(r).map(|s| s.proposal))
+            .collect()
     }
 
     async fn put_accord_participation(
@@ -9165,7 +9180,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         let client = self
             .get_client()
             .await
@@ -9175,14 +9190,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 // `revocation_id` is a UUID column; the read type is String,
                 // so it is cast here exactly as `revocations_for` casts it.
+                //
+                // v31.1.0 (CIRISPersist#655) — keyed on `admitted_at` (V123),
+                // THIS node's admission order, never the producer's
+                // `scrub_timestamp`. V123 backfills and sets NOT NULL, so no
+                // COALESCE is needed on this dialect.
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash \
+                        revoked_after, persist_row_hash, admitted_at \
                  FROM cirislens.federation_revocations \
-                 WHERE ($1::timestamptz IS NULL OR scrub_timestamp > $1) \
-                 ORDER BY scrub_timestamp ASC, revocation_id ASC LIMIT $2",
+                 WHERE ($1::timestamptz IS NULL OR admitted_at > $1) \
+                 ORDER BY admitted_at ASC, revocation_id ASC LIMIT $2",
                 &[&since, &limit],
             )
             .await
@@ -9191,8 +9211,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(crate::federation::SignedRevocation {
+            let admitted_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("admitted_at")
+                .map_err(|e| crate::federation::Error::Backend(format!("admitted_at: {e}")))?;
+            out.push(crate::federation::ServedRevocation {
                 revocation: pg_row_to_revocation(row)?,
+                admitted_at,
             });
         }
         Ok(out)

@@ -701,13 +701,13 @@ pub async fn project_role_withdrawal_for_key(
     // of the whole accord history plus one participation query per proposal.
     let expected = canonical_withdrawal_payload_sha256(&op, key_id, None)?;
 
-    for stored in directory
+    for proposal in directory
         .list_accord_proposals_by_payload(&expected)
         .await?
     {
         if try_record_withdrawal(
             directory,
-            &stored.proposal.digest(),
+            &proposal.digest(),
             &op,
             role,
             key_id,
@@ -1429,6 +1429,95 @@ mod carriage_tests {
         assert!(!is_infra_attest_effective(b, &ci).await.unwrap());
     }
 
+    /// PR #667 round-3 review P2 — **an `_over_roster` gate projects against
+    /// the roster it was GIVEN.**
+    ///
+    /// The late projection first re-derived against `accord_holder_roster_key_ids()`
+    /// — the production roster — inside gates whose whole contract is that the
+    /// caller supplies one. With both rosters present that is a live hole:
+    /// withdrawal evidence signed by the INJECTED roster projects no tombstone,
+    /// and the injected-roster co-scrub then admits the withdrawn role.
+    ///
+    /// So this uses a roster that is genuinely NOT the production one. A
+    /// fixture whose injected roster happens to equal the ambient one cannot
+    /// tell the two apart — which is exactly why the first version of the
+    /// identity-type witness passed against a broken enumeration.
+    async fn run_injected_roster_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let holders: Vec<Identity> = (0..3)
+            .map(|i| Identity::new(&format!("ir{i}-{tag}")))
+            .collect();
+        for h in &holders {
+            register_accord_holder(dir, h)
+                .await
+                .expect("register injected holder");
+        }
+        let roster: Vec<ThresholdMember> = holders.iter().map(|h| h.member()).collect();
+        let roster_key_ids: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        // The difference this witness turns on.
+        assert_ne!(
+            roster_key_ids,
+            accord_holder_roster_key_ids(),
+            "the injected roster must NOT be the production one, or this proves nothing"
+        );
+
+        let node = Node {
+            holders,
+            roster,
+            roster_key_ids: roster_key_ids.clone(),
+        };
+        let role = identity_type::REGISTRY;
+        let subject = format!("ir-sub-{tag}");
+        let offer = signed_canonical_record_with_roles(
+            &subject,
+            role,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            Vec::new(),
+            serde_json::json!({ "key_id": subject }),
+            &[&node.holders[0], &node.holders[1]],
+        );
+
+        // Un-withdrawn: the injected-roster co-scrub admits it.
+        crate::federation::admission::check_accord_role_admission_over_roster(
+            dir,
+            &offer,
+            role,
+            &roster_key_ids,
+        )
+        .await
+        .expect("a co-scrub by the INJECTED roster must admit while un-withdrawn");
+
+        // Evidence signed by the INJECTED roster withdraws the role.
+        seed_quorum(
+            dir,
+            &node,
+            &crate::federation::admission::op_withdraw_role(role),
+            &subject,
+            &[0, 1],
+            &format!("ir-{tag}"),
+        )
+        .await;
+
+        // The gate must now refuse — which it can only do by having projected
+        // against the roster it was handed.
+        let err = crate::federation::admission::check_accord_role_admission_over_roster(
+            dir,
+            &offer,
+            role,
+            &roster_key_ids,
+        )
+        .await
+        .expect_err("evidence signed by the injected roster must exclude under that roster");
+        assert_eq!(err.kind(), "role_withdrawn", "{err}");
+        assert!(
+            dir.lookup_role_withdrawal(role, &subject)
+                .await
+                .unwrap()
+                .is_some(),
+            "and the tombstone was materialized from the injected roster's own quorum"
+        );
+    }
+
     /// PR #667 review P1 — **the cursor must advance when a vote lands.**
     ///
     /// A bundle is an aggregate, so a cursor pinned to the proposal's
@@ -1557,7 +1646,6 @@ mod carriage_tests {
             revoked_after: None,
             persist_row_hash: String::new(),
         });
-        let stored_scrub_timestamp = row.scrub_timestamp;
         dir.put_revocation(crate::federation::SignedRevocation { revocation: row })
             .await
             .expect("the self-revocation must be admitted");
@@ -1573,23 +1661,137 @@ mod carriage_tests {
             .expect("the stored revocation must be served");
         assert_eq!(served.revocation.revoked_key_id, subject);
 
-        // ── The cursor is a cursor: `since` at the row's own instant excludes
+        // ── The cursor is a cursor: `since` at the row's own position excludes
         //    it, so a caller resuming from its last page does not re-read. ──
+        let position = served.admitted_at;
         let after = dir
-            .list_signed_revocations_since(Some(stored_scrub_timestamp), u32::MAX)
+            .list_signed_revocations_since(Some(position), u32::MAX)
             .await
             .unwrap();
         assert!(
             !after
                 .iter()
                 .any(|r| r.revocation.revocation_id == revocation_id),
-            "`since` is exclusive on scrub_timestamp"
+            "`since` is exclusive on the admission position"
+        );
+
+        // ── PR #667 round-3 P1 — **THE LATE-REPLICATED OLD REVOCATION.**
+        //
+        //   A revocation SIGNED well before the consumer's cursor, admitted
+        //   after it. Keyed on the producer's `scrub_timestamp` this row sorts
+        //   behind the cursor and is never served again — stored, and
+        //   permanently invisible. That is #655's own defect (an exclusion that
+        //   cannot reach a peer) re-entering through the cursor KEY.
+        //
+        //   Nothing else stops it: `check_revocation_scrub_skew` is a ceiling
+        //   only, so an old signed instant is admissible, and the anti-rollback
+        //   latch is per-`revoked_key_id`, so it is silent about a first
+        //   revocation for a subject this node has not seen. Both are asserted
+        //   here, so if either ever grows a floor this witness says so rather
+        //   than passing for a new reason. ──
+        let late_subject = format!("rv{tag}-late");
+        let (late_ed, late_mldsa) = hybrid_pubkeys(&late_subject);
+        let old_instant = now - chrono::Duration::days(60);
+        dir.put_public_key(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: late_subject.clone(),
+                pubkey_ed25519_base64: late_ed,
+                pubkey_ml_dsa_65_base64: late_mldsa,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::USER.to_owned(),
+                identity_ref: late_subject.clone(),
+                valid_from: old_instant,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": late_subject }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: late_subject.clone(),
+                scrub_timestamp: old_instant,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register the late subject");
+
+        let late_id = uuid::Uuid::new_v4().to_string();
+        let late_row = seal_revocation(crate::federation::types::Revocation {
+            revocation_id: late_id.clone(),
+            revoked_key_id: late_subject.clone(),
+            revoking_key_id: late_subject.clone(),
+            reason: Some("compromise".to_owned()),
+            revoked_at: old_instant,
+            effective_at: old_instant,
+            revocation_envelope: serde_json::json!({ "revoked_key_id": late_subject }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: late_subject.clone(),
+            // SIGNED 60 days ago — before `position`, which is now.
+            scrub_timestamp: old_instant,
+            pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        });
+        assert!(
+            late_row.scrub_timestamp < position,
+            "the fixture must be signed BEFORE the consumer's cursor, or it proves nothing"
+        );
+        // The instant AS SEALED, not the one this fixture started from: the
+        // producer seal floors instants to microseconds (CIRISPersist#646), so
+        // comparing the served row against the pre-seal nanoseconds would fail
+        // on a difference the cursor change has nothing to do with.
+        let late_signed = late_row.scrub_timestamp;
+        dir.put_revocation(crate::federation::SignedRevocation {
+            revocation: late_row,
+        })
+        .await
+        .expect(
+            "an old signed instant is admissible — the skew gate is a ceiling and the \
+             anti-rollback latch is per-subject",
+        );
+
+        let resumed = dir
+            .list_signed_revocations_since(Some(position), u32::MAX)
+            .await
+            .unwrap();
+        let late_served = resumed
+            .iter()
+            .find(|r| r.revocation.revocation_id == late_id)
+            .expect(
+                "a revocation admitted AFTER the cursor must be served past it, however old \
+                 its signature — keying on the producer's clock hides it forever",
+            );
+        assert!(
+            late_served.admitted_at > position,
+            "and its position is THIS node's admission order, not the producer's instant"
+        );
+        assert_eq!(
+            late_served.revocation.scrub_timestamp, late_signed,
+            "while the signed instant is untouched — it is still the anti-rollback latch and \
+             still envelope-bound"
         );
 
         // ── And it is point-readable through the shared wire index, which is
-        //    what makes it symmetric with the other fourteen kinds. ──
+        //    what makes it symmetric with the other fourteen kinds.
+        //
+        //    Hashed as the `SignedRevocation` WRAPPER, not as the
+        //    `ServedRevocation` the cursor returns: `admitted_at` is this
+        //    node's position on the record, and folding a node-local instant
+        //    into a content hash would make one revocation hash differently on
+        //    every node holding it. A content hash covers the record; the
+        //    cursor covers this node's view of it. ──
+        let wrapped = crate::federation::SignedRevocation {
+            revocation: served.revocation.clone(),
+        };
         let content_hash =
-            crate::federation::wire_index::content_hash_of(served).expect("hash the served bytes");
+            crate::federation::wire_index::content_hash_of(&wrapped).expect("hash the record");
         let bytes = dir
             .lookup_signed_record_by_content_hash("Revocation", &content_hash)
             .await
@@ -1597,8 +1799,8 @@ mod carriage_tests {
             .expect("the put path must have indexed the row");
         assert_eq!(
             bytes,
-            serde_json::to_vec(served).unwrap(),
-            "the index resolves to the exact bytes the serve cursor returns"
+            serde_json::to_vec(&wrapped).unwrap(),
+            "the index resolves to the exact record bytes, cursor position excluded"
         );
 
         // ── PR #667 review P1 — DISCOVERABLE, not merely fetchable. The
@@ -1639,6 +1841,7 @@ mod carriage_tests {
         let c = SqliteBackend::open_in_memory().await.unwrap();
         c.run_migrations().await.unwrap();
         run_cursor_advance_matrix(&c, "sq").await;
+        run_injected_roster_matrix(&c, "sq").await;
     }
 
     #[tokio::test]
@@ -1649,6 +1852,7 @@ mod carriage_tests {
         run_carriage_matrix(&a, &b, "mem").await;
         run_revocation_cursor_matrix(&a, "mem").await;
         run_cursor_advance_matrix(&MemoryBackend::new(), "mem").await;
+        run_injected_roster_matrix(&MemoryBackend::new(), "mem").await;
     }
 
     /// Two ISOLATED postgres databases — the cross-node property needs two
@@ -1668,6 +1872,7 @@ mod carriage_tests {
                 run_carriage_matrix(&a, &b, "pg").await;
                 run_revocation_cursor_matrix(&a, "pg").await;
                 run_cursor_advance_matrix(&b, "pg").await;
+                run_injected_roster_matrix(&b, "pg").await;
             })
             .await;
         })

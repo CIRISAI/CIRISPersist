@@ -3297,6 +3297,54 @@ pub struct SignedRevocation {
     pub revocation: Revocation,
 }
 
+/// v31.1.0 (CIRISPersist#655, PR #667 round-3 review) — **one revocation as the
+/// SERVE cursor returns it**: the record, plus this node's own position on it.
+///
+/// # Why the cursor cannot be `scrub_timestamp`
+///
+/// `scrub_timestamp` is when the PRODUCER signed. A revocation signed in
+/// January and replicated late is admitted in February, and a consumer whose
+/// cursor has already passed January asks for `> February` and never sees it —
+/// the row stored, the exclusion invisible, permanently.
+///
+/// Nothing existing prevents that.
+/// [`check_revocation_scrub_skew`](crate::federation::admission::check_revocation_scrub_skew)
+/// is a CEILING only (`scrub_timestamp - now <= max_skew`), so an arbitrarily
+/// OLD signed instant is admissible; and `check_revocation_anti_rollback` is
+/// per-`revoked_key_id`, so it is silent about a first revocation for a subject
+/// this node has not seen. Delayed replication of a revocation for a new
+/// subject is the everyday case.
+///
+/// That is CIRISPersist#655's own defect — an exclusion that cannot reach a
+/// peer — re-entering through the cursor KEY rather than through a missing
+/// method. The remedy is the one the accord evidence plane needed one plane
+/// over ([`AccordQuorumEvidence::evidence_at`](crate::federation::accord_carriage::AccordQuorumEvidence)):
+/// **the receiver re-derives rather than trusts**, and that rule covers time as
+/// much as it covers authority.
+///
+/// # Why a separate type instead of a field on [`SignedRevocation`]
+///
+/// `SignedRevocation` is the WRITE input — what a producer submits. This
+/// instant is not something a producer can submit; it is what the admitting
+/// node stamps. Folding it into the write type would also fold a node-specific
+/// value into `compute_persist_row_hash` and into the signed-wire content hash,
+/// so one revocation would hash differently on every node holding it. Keeping
+/// them apart is what lets the content hash stay a fact about the RECORD while
+/// the cursor stays a fact about THIS NODE. Same split, same reason, as the
+/// accord plane's `AccordQuorumEvidence`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedRevocation {
+    /// The revocation row itself, unchanged — the same value
+    /// [`SignedRevocation`] carries and the same bytes the signed-wire content
+    /// hash is taken over.
+    pub revocation: Revocation,
+    /// When THIS node admitted the row — receiver-stamped, never read from the
+    /// wire, monotonic in this node's own arrival order. The value a caller
+    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
+    /// from.
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── Freshness floor (v21.6.0, CIRISPersist#519 item 2a-iii) ───────
 //
 // `namespace_supersets.json` § `freshness_floor`: a SIGNED temporal LOWER

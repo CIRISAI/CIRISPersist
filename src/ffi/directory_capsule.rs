@@ -987,13 +987,32 @@ pub enum DirectoryOpResult {
     Revocations(Vec<Revocation>),
     /// `list_signed_revocations_since` (v31.1.0, CIRISPersist#655).
     /// APPEND-ONLY.
-    SignedRevocations(Vec<SignedRevocation>),
+    SignedRevocations(Vec<crate::federation::ServedRevocation>),
     /// `list_signed_accord_quorum_evidence_since` (v31.1.0,
     /// CIRISPersist#662). APPEND-ONLY.
     AccordQuorumEvidence(Vec<crate::federation::accord_carriage::AccordQuorumEvidence>),
     /// `apply_replicated_accord_evidence` (v31.1.0, CIRISPersist#662) — what
     /// the RECEIVER's own re-tally found. APPEND-ONLY.
     AccordEvidenceAdmitted(crate::federation::accord_carriage::AccordEvidenceAdmission),
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-3) — a TYPED refusal of
+    /// replicated accord evidence, carried across the ABI as itself.
+    ///
+    /// [`DirectoryOpResult::Err`] flattens every failure to a string, which the
+    /// proxy rebuilds as `Error::Backend` — so a capsule-backed caller saw
+    /// `kind() == "federation_backend"` for a bundle its own node refused to
+    /// authorize. That erases the whole distinction
+    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified)
+    /// exists to draw: "a peer offered evidence that does not verify here"
+    /// (a partition, a stale roster, or a forgery) reads identically to "our
+    /// storage broke". One is a carrier decision, the other is an incident, and
+    /// a refusal that loses its kind crossing a door is a refusal nobody can
+    /// act on. APPEND-ONLY.
+    AccordEvidenceRefused {
+        /// The content-derived digest of the refused proposal.
+        proposal_digest: String,
+        /// Why the receiver's own re-derivation failed.
+        reason: String,
+    },
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1296,6 +1315,15 @@ pub async fn dispatch_directory_op(
             .await
             {
                 Ok(v) => DirectoryOpResult::AccordEvidenceAdmitted(v),
+                // The typed refusal crosses as itself; everything else
+                // flattens. See `AccordEvidenceRefused`.
+                Err(Error::AccordEvidenceUnverified {
+                    proposal_digest,
+                    reason,
+                }) => DirectoryOpResult::AccordEvidenceRefused {
+                    proposal_digest,
+                    reason,
+                },
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3112,7 +3140,7 @@ impl FederationDirectory for OpsDirectory {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<SignedRevocation>, Error> {
+    ) -> Result<Vec<crate::federation::ServedRevocation>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedRevocationsSince { since, limit })
             .await?
@@ -3158,6 +3186,16 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::AccordEvidenceAdmitted(v) => Ok(v),
+            // Reconstructed as the SAME typed error the far side raised, so
+            // `kind()` is `accord_evidence_unverified` on both sides of the
+            // ABI. A carrier keys its retry/quarantine decision on that token.
+            DirectoryOpResult::AccordEvidenceRefused {
+                proposal_digest,
+                reason,
+            } => Err(Error::AccordEvidenceUnverified {
+                proposal_digest,
+                reason,
+            }),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3769,12 +3807,61 @@ mod tests {
             &directory,
             &DirectoryOp::ApplyReplicatedAccordEvidence { evidence },
         ) {
+            // A TYPED refusal, not a flattened string. v31.1.0 (PR #667
+            // round-3): `DirectoryOpResult::Err` rebuilds as `Error::Backend`,
+            // so a bundle the receiving node declined to authorize used to
+            // reach a capsule host as `federation_backend` — indistinguishable
+            // from "our storage broke". A carrier decides retry vs quarantine
+            // on that token, so the distinction has to survive the ABI.
+            DirectoryOpResult::AccordEvidenceRefused { reason, .. } => assert!(
+                !reason.contains("Unsupported") && !reason.contains("not implemented"),
+                "the admission must RUN on the far side, not bounce: {reason}"
+            ),
+            // A node with no seated roster may also refuse at the fail-closed
+            // posture chokepoint before the re-tally is reached; that arm is a
+            // legitimate first answer and is not asserted against, only that
+            // the op ran.
             DirectoryOpResult::Err(msg) => assert!(
                 !msg.contains("Unsupported") && !msg.contains("not implemented"),
                 "the admission must RUN on the far side, not bounce: {msg}"
             ),
             other => panic!("an unbacked bundle must be refused, got {other:?}"),
         }
+    }
+
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-3) — **the accord refusal KIND
+    /// survives the ABI.**
+    ///
+    /// Separate from the routing witness above because it asserts a different
+    /// thing: not that the door exists, but that what comes back through it is
+    /// still typed. The proxy reconstructs `Error::AccordEvidenceUnverified`,
+    /// so `kind()` reads `accord_evidence_unverified` on the consumer side
+    /// rather than the `federation_backend` every flattened failure collapses
+    /// to.
+    #[test]
+    fn accord_refusal_kind_survives_the_capsule_662() {
+        let refused = DirectoryOpResult::AccordEvidenceRefused {
+            proposal_digest: "digest-abc".into(),
+            reason: "insufficient accord quorum on RE-TALLY".into(),
+        };
+        // The exact reconstruction the proxy arm performs.
+        let rebuilt = match refused {
+            DirectoryOpResult::AccordEvidenceRefused {
+                proposal_digest,
+                reason,
+            } => Error::AccordEvidenceUnverified {
+                proposal_digest,
+                reason,
+            },
+            other => panic!("expected AccordEvidenceRefused, got {other:?}"),
+        };
+        assert_eq!(
+            rebuilt.kind(),
+            "accord_evidence_unverified",
+            "a carrier keys retry-vs-quarantine on this token; `federation_backend` is a \
+             different decision"
+        );
+        assert!(format!("{rebuilt}").contains("digest-abc"));
     }
 
     #[test]

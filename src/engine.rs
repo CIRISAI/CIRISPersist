@@ -6443,9 +6443,14 @@ impl Engine {
     //    operator or a carrier actually calls.
 
     /// v31.1.0 (CIRISPersist#655) — **serve** the key-level revocation plane:
-    /// bulk-list [`SignedRevocation`](crate::federation::SignedRevocation)
-    /// wrappers since a cursor (`scrub_timestamp > since`, ordered
-    /// `(scrub_timestamp ASC, revocation_id ASC)`).
+    /// bulk-list [`ServedRevocation`](crate::federation::ServedRevocation)s
+    /// since a cursor (`admitted_at > since`, ordered `(admitted_at ASC,
+    /// revocation_id ASC)`).
+    ///
+    /// The cursor is THIS node's admission order, not the producer's
+    /// `scrub_timestamp`; resume from the last element's `admitted_at`. Keying
+    /// on the signed instant hid a revocation signed before a consumer's
+    /// cursor and replicated after it — stored, and permanently unservable.
     ///
     /// The plane could be destroyed and never rebuilt before this: every
     /// other replicated plane had a `list_signed_*_since` and this one did
@@ -6459,7 +6464,7 @@ impl Engine {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         self.federation_directory()
             .list_signed_revocations_since(since, limit)
             .await

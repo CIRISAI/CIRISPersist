@@ -103,6 +103,21 @@ survived first and exposed a witness that could not fail, since
 refuses out-of-family bundles by another route; that gate is load-bearing for
 DIAGNOSIS, not for safety, and both the code and the witness now say so.
 
+**Two schema additions (V123, V124), both additive and backfilled.** V123 adds
+`federation_revocations.admitted_at` — THIS node's admission instant — because
+the serve cursor first keyed on the producer's `scrub_timestamp` and that hid a
+whole class of exclusion: a revocation signed in January and replicated late is
+admitted in February, and a consumer whose cursor has passed January never sees
+it. Nothing prevented that (`check_revocation_scrub_skew` is a ceiling only;
+the anti-rollback latch is per-`revoked_key_id`), so it was #655's own defect
+re-entering through the cursor key. `scrub_timestamp` is unchanged and keeps
+every other job it had. The cursor read type is `ServedRevocation` (record plus
+this node's position), separate from the `SignedRevocation` write input so that
+a node-local instant never enters a content hash. V124 adds the
+`accord_proposal(payload_sha256)` index the withdrawal projection's lookup
+needs — it was documented as indexed and shipped without one, leaving an
+attacker-triggerable scan on the key-admission chokepoint.
+
 **Known limits, stated rather than left to be found.**
 `AccordQuorumEvidence` stays out of the content-hash wire index by
 construction: every other kind indexes a row, that kind is an aggregate whose
@@ -111,6 +126,20 @@ at the next. It is served by cursor only. SUPERSEDE tombstones are not
 re-derived — their payload commits to a `(target, successor)` pair, so the
 local search would be quadratic, and a supersede is a rotation link rather than
 an exclusion.
+
+**Upgrade note.** On a database that already holds revocations, run
+`rebuild_signed_wire_index` once to make them point-readable by content hash.
+Until it runs, `wire_refs_for_subject` deliberately does NOT advertise them:
+advertising a ref that resolves to `None` would be a plane visible in principle
+and unreachable in practice, which is the defect #655 exists to close. The
+advertise path checks the index and self-corrects the moment the backfill runs.
+
+**Deferred, tracked in CIRISPersist#668.** All sixteen `list_signed_*_since`
+cursors resume on an instant alone while ordering by `(instant, id)`, so a tie
+larger than one page silently drops rows; and every signed-plane writer updates
+`signed_wire_index` after the primary row commits, so a failure there leaves a
+durable row unindexed. Both are family-wide properties, not new here, and both
+want one change with one witness rather than sixteen divergent patches.
 
 ### Fixed — SECURITY — the delegation leg verified a proxy, not the property (#665 review)
 

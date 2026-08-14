@@ -397,7 +397,8 @@ pub use types::{
     PeerMetadataRow, PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
     SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
     SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
-    SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, TrustClass, TrustFilter,
+    SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, ServedRevocation,
+    TrustClass, TrustFilter,
     TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
@@ -2298,12 +2299,30 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error>;
 
-    /// v31.1.0 (CIRISPersist#655) — bulk-list the full [`SignedRevocation`]
-    /// wrappers (one per `federation_revocations` row) since a cursor. `since`
-    /// filters on `scrub_timestamp > since` (`None` = from the start); rows
-    /// are ordered by `(scrub_timestamp ASC, revocation_id ASC)` so the cursor
-    /// is a stable resumption point, mirroring
-    /// [`Self::list_signed_key_records_since`]. `limit` caps the page.
+    /// v31.1.0 (CIRISPersist#655) — bulk-list [`ServedRevocation`]s (one per
+    /// `federation_revocations` row) since a cursor. `since` filters on
+    /// `admitted_at > since` (`None` = from the start); rows are ordered by
+    /// `(admitted_at ASC, revocation_id ASC)`. `limit` caps the page.
+    ///
+    /// # The cursor is THIS NODE's admission order, not the producer's clock
+    ///
+    /// It shipped keyed on `scrub_timestamp` and that was wrong, in the
+    /// ordinary case rather than the adversarial one: a revocation signed in
+    /// January and replicated late is admitted in February, and a consumer
+    /// whose cursor has passed January asks for `> February` and never sees it.
+    /// `check_revocation_scrub_skew` is a ceiling only, so an arbitrarily old
+    /// signed instant is admissible, and `check_revocation_anti_rollback` is
+    /// per-`revoked_key_id`, so it is silent about a first revocation for an
+    /// unseen subject. The exclusion is stored and permanently invisible —
+    /// #655's own defect, arriving through the cursor key.
+    ///
+    /// So the key is [`ServedRevocation::admitted_at`] (V123), which this node
+    /// stamps on admission. Same correction, same reason, as
+    /// [`Self::list_signed_accord_quorum_evidence_since`]'s `evidence_at`: the
+    /// receiver re-derives rather than trusts, for time as well as authority.
+    /// `scrub_timestamp` is unchanged and keeps every other job it had — it is
+    /// envelope-bound (#659) and it is the anti-rollback latch; it is simply
+    /// not this node's position in its own stream.
     ///
     /// # Why this plane needed only a cursor
     ///
@@ -2335,7 +2354,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<SignedRevocation>, Error>;
+    ) -> Result<Vec<ServedRevocation>, Error>;
 
     /// v31.1.0 (CIRISPersist#662) — bulk-list the
     /// [`accord_carriage::AccordQuorumEvidence`] bundles (V091
@@ -5142,41 +5161,46 @@ pub trait FederationDirectory: Send + Sync {
         prior_family_digest: &str,
     ) -> Result<Vec<accord_quorum::StoredProposal>, Error>;
 
-    /// v31.1.0 (CIRISPersist#662, PR review P2) — stored proposals whose
+    /// v31.1.0 (CIRISPersist#662, PR review P2) — the stored proposals whose
     /// `payload_sha256` equals `payload_sha256`.
     ///
-    /// The lookup
-    /// [`accord_carriage::project_role_withdrawal_for_key`] resolves a
-    /// withdrawal candidate with. That path runs inside the role-admission
-    /// gates, so an ATTACKER chooses when it runs — by offering a key that
-    /// claims `canonical` or `infra:attest`, before the co-scrub gate has had
-    /// a chance to reject the row. Resolving it by scanning the evidence plane
-    /// would make every such attempt read all of accord history plus one
-    /// participation query per proposal: a request-amplification path on the
-    /// key write chokepoint that grows with the ceremony log.
+    /// The lookup [`accord_carriage::project_role_withdrawal_for_key`]
+    /// resolves a withdrawal candidate with. That path runs inside the
+    /// role-admission gates, so an ATTACKER chooses when it runs — by offering
+    /// a key that claims `canonical` or `infra:attest`, before the co-scrub
+    /// gate has had a chance to reject the row. Resolving it by scanning the
+    /// evidence plane would make every such attempt read all of accord history
+    /// plus one participation query per proposal: a request-amplification path
+    /// on the key write chokepoint that grows with the ceremony log.
     ///
-    /// The default implementation filters the evidence cursor, so a backend
-    /// that has not specialized it is correct but not fast; the three real
-    /// backends override it with a single indexed query. (Nothing takes the
-    /// default in practice — the FFI capsule routes the whole admission as one
-    /// op, so the projection runs against a real backend on the far side.)
+    /// # Cost, per backend, stated exactly
+    ///
+    /// `sqlite` and `postgres` answer from the V124
+    /// `accord_proposal(payload_sha256)` index. The memory backend filters its
+    /// proposal map in memory — O(proposals) but with no I/O and no
+    /// per-proposal second read, which is the amplification that mattered. The
+    /// default implementation filters the evidence cursor and is correct on any
+    /// directory, including one whose accord primitives are not routed: it
+    /// reads ONLY the cursor and never calls back into `get_accord_proposal`.
+    ///
+    /// That last property is the reason this returns the verify-core
+    /// [`AccordProposal`](ciris_verify_core::accord_live_quorum::AccordProposal)
+    /// rather than a `StoredProposal`. The caller needs the digest and nothing
+    /// else, and the wider type forced the default to re-read each hit through
+    /// a method the FFI capsule surfaces as `Unsupported` — a default that
+    /// could not run on the one directory that would ever reach it, behind a
+    /// doc comment claiming it was merely slower.
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<accord_quorum::StoredProposal>, Error> {
-        let mut out = Vec::new();
-        for bundle in self
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, Error> {
+        Ok(self
             .list_signed_accord_quorum_evidence_since(None, u32::MAX)
             .await?
-        {
-            if bundle.proposal.payload_sha256 != payload_sha256 {
-                continue;
-            }
-            if let Some(stored) = self.get_accord_proposal(&bundle.proposal.digest()).await? {
-                out.push(stored);
-            }
-        }
-        Ok(out)
+            .into_iter()
+            .filter(|b| b.proposal.payload_sha256 == payload_sha256)
+            .map(|b| b.proposal)
+            .collect())
     }
 
     /// #302 — admit an `accord_participation`. Verify-before-mutation: the

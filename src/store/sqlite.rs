@@ -4741,18 +4741,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("revoked_key_id", row.revoked_key_id.as_str()),
             ("revocation_id", row.revocation_id.as_str()),
         ]);
+        // THIS node's admission instant (V123). Read from the local clock, not
+        // from the row: `scrub_timestamp` is the producer's assertion and a
+        // late-replicated old one would sort behind every consumer's cursor.
+        let admitted_at = chrono::Utc::now();
 
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
+                // v31.1.0 (CIRISPersist#655) — `admitted_at` (V123) is THIS
+                // node's position in its own stream, stamped here and never
+                // read from the wire. The serve cursor keys on it.
                 "INSERT INTO federation_revocations (\
                     revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    revoked_after, persist_row_hash, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                    ?16, ?17)",
                 rusqlite::params![
                     row.revocation_id,
                     row.revoked_key_id,
@@ -4770,6 +4778,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.observed_region,
                     row.revoked_after.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    admitted_at.to_rfc3339(),
                 ],
             )?;
             Ok(())
@@ -5951,18 +5960,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
-    {
+    ) -> Result<
+        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
+        crate::federation::Error,
+    > {
         let conn = self.conn.clone();
         let key = payload_sha256.to_owned();
         (move || -> Result<Vec<_>, rusqlite::Error> {
             let conn = conn.lock();
+            // Answered from the V124 `accord_proposal(payload_sha256)` index.
             let mut stmt = conn.prepare(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
                  FROM accord_proposal WHERE payload_sha256 = ?1 \
                  ORDER BY created_at ASC, proposal_digest ASC",
             )?;
-            let rows = stmt.query_map([&key], sqlite_row_to_stored_proposal)?;
+            let rows = stmt.query_map([&key], |row| {
+                Ok(sqlite_row_to_stored_proposal(row)?.proposal)
+            })?;
             rows.collect()
         })()
         .map_err(|e| {
@@ -8266,25 +8280,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         let conn = self.conn.clone();
         let since = since.map(|t| t.to_rfc3339());
         (move || -> Result<Vec<_>, rusqlite::Error> {
             let conn = conn.lock();
+            // v31.1.0 (CIRISPersist#655) — keyed on `admitted_at` (V123), THIS
+            // node's admission order, never the producer's `scrub_timestamp`.
+            // `COALESCE` covers a row written before the column existed — the
+            // same fallback the V123 backfill applies.
             let mut stmt = conn.prepare(
                 "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash \
+                        revoked_after, persist_row_hash, \
+                        COALESCE(admitted_at, scrub_timestamp) AS admitted_at \
                  FROM federation_revocations \
-                 WHERE (?1 IS NULL OR scrub_timestamp > ?1) \
-                 ORDER BY scrub_timestamp ASC, revocation_id ASC LIMIT ?2",
+                 WHERE (?1 IS NULL OR COALESCE(admitted_at, scrub_timestamp) > ?1) \
+                 ORDER BY COALESCE(admitted_at, scrub_timestamp) ASC, revocation_id ASC \
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_revocation)?;
+            let rows = stmt.query_map(rusqlite::params![since, limit], |row| {
+                let admitted_at: String = row.get("admitted_at")?;
+                Ok(crate::federation::ServedRevocation {
+                    revocation: sqlite_row_to_revocation(row)?,
+                    admitted_at: parse_rfc3339(&admitted_at),
+                })
+            })?;
             let mut out = Vec::new();
             for r in rows {
-                out.push(crate::federation::SignedRevocation { revocation: r? });
+                out.push(r?);
             }
             Ok(out)
         })()

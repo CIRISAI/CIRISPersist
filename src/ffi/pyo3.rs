@@ -7735,12 +7735,16 @@ impl PyEngine {
         self.operational_list_since(py, since_rfc3339, limit, OperationalKind::PartnerRecord)
     }
 
-    /// v31.1.0 (CIRISPersist#655) — bulk-list `SignedRevocation` wrappers
-    /// since a cursor, as a JSON array, ordered `(scrub_timestamp ASC,
-    /// revocation_id ASC)`. The key-level exclusion plane's serve cursor:
-    /// before this, the plane could be destroyed and never rebuilt because
-    /// nothing could serve it. Every row qualifies (a revocation cannot be
-    /// admitted unsigned).
+    /// v31.1.0 (CIRISPersist#655) — bulk-list `ServedRevocation`s since a
+    /// cursor, as a JSON array, ordered `(admitted_at ASC, revocation_id ASC)`.
+    /// The key-level exclusion plane's serve cursor: before this, the plane
+    /// could be destroyed and never rebuilt because nothing could serve it.
+    /// Every row qualifies (a revocation cannot be admitted unsigned).
+    ///
+    /// `since` and each element's `admitted_at` are THIS node's admission
+    /// order, not the producer's `scrub_timestamp` — resume from the last
+    /// element's `admitted_at`. Keying on the signed instant would hide a
+    /// revocation that was signed before your cursor and replicated after it.
     #[pyo3(signature = (since_rfc3339, limit))]
     fn list_signed_revocations_since(
         &self,

@@ -7284,7 +7284,7 @@ pub async fn check_canonical_role_admission_over_roster(
         directory,
         identity_type::CANONICAL,
         &row.key_id,
-        &accord_holder_roster_key_ids(),
+        roster_key_ids,
     )
     .await?;
 
@@ -7373,7 +7373,7 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
         directory,
         identity_type::CANONICAL,
         &row.key_id,
-        &accord_holder_roster_key_ids(),
+        roster_key_ids,
     )
     .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
@@ -7426,7 +7426,7 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
         directory,
         identity_type::CANONICAL,
         &row.key_id,
-        &accord_holder_roster_key_ids(),
+        roster_key_ids,
     )
     .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
@@ -8477,7 +8477,7 @@ pub async fn check_infra_attest_role_admission_over_roster(
         directory,
         super::types::roles::INFRA_ATTEST,
         &row.key_id,
-        &accord_holder_roster_key_ids(),
+        roster_key_ids,
     )
     .await?;
 
@@ -8781,7 +8781,20 @@ pub async fn check_accord_role_admission_over_roster(
     .await?;
 
     // (1c) v31.1.0 (CIRISPersist#662, PR #667 review P1) — MATERIALIZE BEFORE
-    // CONSULTING. The third instance of this gate shape needed the third copy
+    // CONSULTING, against the roster THIS CALL WAS GIVEN.
+    //
+    // Round-3 review: these five calls first passed `accord_holder_roster_key_ids()`
+    // — the production roster — inside `_over_roster` gates whose entire
+    // contract is that the caller supplies the roster. That is broken in both
+    // directions. With no production keys present, a simulation's otherwise
+    // valid admission fails on a projection it never asked for; with both
+    // rosters present, withdrawal evidence signed by the INJECTED roster
+    // projects no tombstone and the injected-roster co-scrub then admits the
+    // withdrawn role. The second is the sharp one: the gate would re-derive
+    // against different state than the evidence was admitted under, which is
+    // the re-tally discipline inverted.
+    //
+    // The third instance of this gate shape needed the third copy
     // of this call, and not having it was a real hole: `withdraw_role:{role}`
     // evidence for a co-steward role or an accord-co-scrubbed identity_type
     // could arrive before its target key, and step (2) would then consult an
@@ -8798,7 +8811,7 @@ pub async fn check_accord_role_admission_over_roster(
         directory,
         role,
         &row.key_id,
-        &accord_holder_roster_key_ids(),
+        roster_key_ids,
     )
     .await?;
 

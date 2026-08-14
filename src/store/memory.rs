@@ -151,6 +151,14 @@ struct State {
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
+    /// v31.1.0 (CIRISPersist#655) — the in-memory mirror of V123's
+    /// `federation_revocations.admitted_at`: when THIS node admitted each
+    /// revocation, keyed by `revocation_id`. A side map rather than a field on
+    /// the row because the instant is local metadata ABOUT the record, not part
+    /// of it — the same split the SQL backends make between the column and the
+    /// `Revocation` struct, and the reason one revocation hashes identically on
+    /// every node that holds it.
+    revocation_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
     /// to `federation_keys`. Keyed by `key_id`. Memory backend
     /// mirrors the V051 PG/SQLite shape: same fields, same soft-
@@ -412,6 +420,7 @@ impl Default for MemoryBackend {
                 subject_index: HashMap::new(),
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
+                revocation_admitted_at: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
@@ -3747,6 +3756,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 ("revoked_key_id", row.revoked_key_id.as_str()),
                 ("revocation_id", row.revocation_id.as_str()),
             ]);
+            // v31.1.0 (CIRISPersist#655) — THIS node's admission instant,
+            // stamped here and never read from the wire. The serve cursor keys
+            // on it, so a late-replicated old revocation gets a LATE position
+            // and stays reachable by a consumer whose cursor has moved on.
+            state
+                .revocation_admitted_at
+                .insert(row.revocation_id.clone(), chrono::Utc::now());
             state.federation_revocations.push(row);
             key
         };
@@ -4805,9 +4821,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
-    {
+    ) -> Result<
+        Vec<ciris_verify_core::accord_live_quorum::AccordProposal>,
+        crate::federation::Error,
+    > {
         let state = self.state.lock().expect("memory backend lock");
+        // O(proposals) with no I/O and no per-proposal second read — this
+        // backend has no index to answer from, and the amplification that
+        // mattered was the per-hit round trip, not the filter.
         let mut rows: Vec<_> = state
             .accord_proposals
             .values()
@@ -4819,7 +4840,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&b.created_at)
                 .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
         });
-        Ok(rows)
+        Ok(rows.into_iter().map(|s| s.proposal).collect())
     }
 
     async fn put_accord_participation(
@@ -6182,28 +6203,46 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// Every row is signed (`scrub_signature_classical` is required at
     /// admission), so — as with `list_signed_key_records_since` — no filter
     /// applies.
+    /// v31.1.0 (CIRISPersist#655) — keyed on THIS node's admission order
+    /// (`admitted_at`, the V123 column on the SQL backends and the
+    /// `revocation_admitted_at` side map here), never the producer's
+    /// `scrub_timestamp`; see the trait doc for the late-replication case that
+    /// made the signed instant permanently hide a stored exclusion.
     async fn list_signed_revocations_since(
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
+        let mut rows: Vec<crate::federation::ServedRevocation> = state
             .federation_revocations
             .iter()
-            .filter(|r| since.is_none_or(|s| r.scrub_timestamp > s))
-            .cloned()
+            .filter_map(|r| {
+                // A row with no recorded admission instant predates the side
+                // map; fall back to its signed instant, exactly as the V123
+                // backfill does on the SQL backends.
+                let admitted_at = state
+                    .revocation_admitted_at
+                    .get(&r.revocation_id)
+                    .copied()
+                    .unwrap_or(r.scrub_timestamp);
+                since
+                    .is_none_or(|s| admitted_at > s)
+                    .then(|| crate::federation::ServedRevocation {
+                        revocation: r.clone(),
+                        admitted_at,
+                    })
+            })
             .collect();
         rows.sort_by(|a, b| {
-            a.scrub_timestamp
-                .cmp(&b.scrub_timestamp)
-                .then_with(|| a.revocation_id.cmp(&b.revocation_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.revocation
+                    .revocation_id
+                    .cmp(&b.revocation.revocation_id)
+            })
         });
         rows.truncate(limit as usize);
-        Ok(rows
-            .into_iter()
-            .map(|revocation| crate::federation::SignedRevocation { revocation })
-            .collect())
+        Ok(rows)
     }
 
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. Page
