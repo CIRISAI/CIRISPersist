@@ -940,15 +940,115 @@ where
             })?;
         // Content FIRST: a substituted conferral row is the case that must not
         // serve, and the signed digest alone separates it from a merely stale one.
-        if row.original_content_hash != want.original_content_hash {
-            return Err(GenesisFault::divergent(
-                LEG,
-                format!(
-                    "delegation row {id} is present with a content hash that is not the baked \
-                     one (stored {}, baked {}) — a substituted conferral row",
-                    row.original_content_hash, want.original_content_hash,
-                ),
-            ));
+        //
+        // v31.1.0 (CIRISPersist#665 review) — **THE COMPILED-IN BUNDLE IS THE
+        // FLOOR, NOT THE IDENTITY.** This arm used to be a bare equality against
+        // the baked content hash, and that made a legitimately NEWER root
+        // indistinguishable from an attack: a node that had run a re-ceremony
+        // — or replicated from a peer that had — fails a byte-equality against
+        // its own binary's artifact BY CONSTRUCTION, so the only posture it
+        // could reach was `Divergent`, which refuses to boot. The check that
+        // exists to notice a root altered beneath persist was also refusing
+        // every successor the root is designed to have.
+        //
+        // A portable trust root whose whole purpose is that it can be RE-CUT
+        // must be able to recognise its own successor. So the question is no
+        // longer *"is this byte-equal to what I shipped with"* but:
+        //
+        //   is this a REAL statement by my seated accord holders, and is it at
+        //   least as new as the one I shipped with?
+        //
+        // **This is a narrowing of what counts as sound in every direction
+        // except one.** Still `Divergent`, still refusing to serve: an injected
+        // squat, a row renamed onto a genesis id, a fabricated row claiming a
+        // holder's `key_id`, a corrupted signature — and now ROLLBACK, a
+        // holder-signed row OLDER than the compiled-in one, which the old
+        // equality check accepted or rejected purely by accident of hashing.
+        // The single thing that stops being called tampering is a newer,
+        // quorum-verified, holder-signed root.
+        //
+        // Ordered cheapest-first: the byte comparison is pure and is the
+        // overwhelmingly common answer, so the crypto below runs only on a node
+        // that has genuinely moved ahead of its binary.
+        //
+        // # v31.1.0 (CIRISPersist#665 review) — BYTE-WHOLENESS IS ASKED HERE TOO
+        //
+        // The previous cut taught the SEED to compare the whole row rather than
+        // its content hash, and stopped there. That closed the fail-open on the
+        // boot SEQUENCE and left it wide open on the read PATH: `genesis_posture`
+        // never calls the seed, so `Engine::genesis_posture`, `NodeState::genesis`
+        // → `StateBand::Green` and CIRISServer's agent-mode gate all answered
+        // from this function alone — and this function compared only the content
+        // hash. Damage landing AFTER boot was therefore invisible to every live
+        // query, on a threat model whose whole premise is a writer with raw
+        // corpus access, i.e. one who does not wait for a restart.
+        //
+        // The tell was in our own witness: `assert_damaged_current_row_is_repaired`
+        // asserted that this leg PASSES on a row whose co-signature set had been
+        // thinned below quorum, labelled "that blindness is the finding". It was
+        // identified and then fixed in only one of the two places that had it.
+        // The witness now asserts the opposite, which is what makes this a fix
+        // rather than a comment.
+        //
+        // Narrowing `GenesisPosture::Entrenched`'s doc instead was the available
+        // alternative and is the weaker one: CIRISServer#398 consumes that
+        // sentence as a cross-repo contract, so the predicate is what has to be
+        // true.
+        let whole = baked_row_matches_stored(&row, want)
+            .map_err(|e| GenesisFault::unreadable(LEG, format!("compare {id} to the bake: {e}")))?;
+        if !whole {
+            if row.original_content_hash == want.original_content_hash {
+                // Same signed statement, altered around it. The holders' bytes
+                // are intact but the material carrying them is not — a charter
+                // whose `additional_scrubs` were thinned still hashes the same
+                // and still fails `family_quorum_over`. Fail-secure: the seed
+                // repairs this when it runs, and a node that reaches here
+                // without the seed having repaired it must not report green.
+                return Err(GenesisFault::divergent(
+                    LEG,
+                    format!(
+                        "delegation row {id} carries the baked content hash but does not match \
+                         the baked artifact — the unsigned material around the signed envelope \
+                         (signature columns, or the co-signature quorum set) was altered beneath \
+                         persist. The signed statement is intact; what carries it is not"
+                    ),
+                ));
+            }
+            let real = stored_row_is_verifiable_holder_statement(dir, &row).await;
+            let rolled_back = candidate_is_strictly_newer(want, &row);
+            if !real || rolled_back {
+                return Err(GenesisFault::divergent(
+                    LEG,
+                    format!(
+                        "delegation row {id} is present with a content hash that is not the baked \
+                         one (stored {}, baked {}) and is {} — a substituted conferral row",
+                        row.original_content_hash,
+                        want.original_content_hash,
+                        if real {
+                            "OLDER than the compiled-in artifact (a rollback)"
+                        } else {
+                            "not a verifiable statement by a seated accord holder"
+                        },
+                    ),
+                ));
+            }
+            // A verified holder statement at least as new as ours. The mesh's
+            // root is ahead of this binary; that is allowed, and the remaining
+            // shape check below still applies to it.
+            //
+            // Its co-signature set is NOT checked against a baked artifact, and
+            // cannot be: this node does not hold the newer ceremony's bundle to
+            // compare against. Leg 2/3 of the authenticity check cover the base
+            // scrub and bind the content hash to the signed envelope; a thinned
+            // `additional_scrubs` on a NEWER row is caught where it has always
+            // been caught, by the quorum readers that count it.
+            tracing::info!(
+                attestation_id = %id,
+                stored_asserted_at = %row.asserted_at,
+                baked_asserted_at = %want.asserted_at,
+                "genesis delegation posture: serving on an accord-holder statement newer than \
+                 the compiled-in artifact (CIRISPersist#665)"
+            );
         }
         // Then SHAPE: a row installed under the pre-v31 envelope is the state
         // 31.0.0 ships in, so it is `absent` — awaiting the re-ceremony.
@@ -1532,7 +1632,7 @@ pub(crate) async fn assert_injected_squat_is_divergent(
 /// row is the point. The upgrade this fix has to survive is a fact about two
 /// specific artifacts, and a fabricated stand-in would prove a property of the
 /// fabrication: it would be trivial to build one that happens to satisfy the
-/// three legs of [`stored_row_is_prior_ceremony`] while the real v30 rows do
+/// three legs of [`stored_row_is_verifiable_holder_statement`] while the real v30 rows do
 /// not. These verify against the seeded A1 anchor because A1 signed them.
 ///
 /// # Panics
@@ -1702,6 +1802,276 @@ pub(crate) async fn assert_rebake_supersedes_prior_ceremony(
         .unwrap_or_else(|e| panic!("[{tag}] and it still verifies after a second pass: {e}"));
 }
 
+/// v31.1.0 (CIRISPersist#665 review) — **THE REFUSED CLASSES, as one table.**
+///
+/// The replacement rule is only as good as what it still says no to, so every
+/// class that must NOT be able to replace a delegation row is asserted here
+/// rather than argued in prose. The caller has a plane seeded with the baked
+/// artifact; each case is evaluated through the real
+/// [`install_or_supersede_delegation_row`] and the real
+/// [`verify_delegation_plane_seeded`].
+///
+/// The classes, and why each is here:
+///
+/// - **rollback by an older holder statement** — the v30 artifact offered as
+///   the candidate against the installed v31 row. Real signatures, real
+///   holders, genuinely older; the case a bare "is it holder-signed" test would
+///   wave through, and the reason recency is a separate question.
+/// - **a legacy row with a stamped `asserted_at`** — the subtle one. On a
+///   pre-v31 row `asserted_at` is NOT in the signed envelope, so raw corpus
+///   access can set it to 2030; if recency read that column the row would pin
+///   the node to the old root forever. Shape decides instead, so the stamp is
+///   ignored. This must not rest on reasoning alone.
+/// - **a fabricated row claiming a seated holder** — `A1` in
+///   `attesting_key_id`, federation tier, plausible envelope, signature that
+///   verifies against nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_refused_replacement_classes(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let baked = &canonical_genesis_bundle().attestations[0];
+    let id = &baked.attestation.attestation_id;
+    let installed = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the baked plane must be seeded first"));
+
+    // ── ROLLBACK: the v30 artifact offered against the installed v31 row ──
+    // Real ceremony, real holders, real signatures — and older. Offered the way
+    // an older binary would offer it: as the thing to install.
+    let older = super::SignedAttestation {
+        attestation: prior_ceremony_row(id),
+    };
+    assert!(
+        !candidate_is_strictly_newer(&older.attestation, &installed),
+        "[{tag}] the v30 artifact must not read as newer than the installed v31 row"
+    );
+    let outcome = install_or_supersede_delegation_row(dir, &older, Some(installed.clone()))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a rollback attempt must not fault the boot: {e}"));
+    assert_eq!(
+        outcome,
+        DelegationRowOutcome::LeftAsNewerCeremony,
+        "[{tag}] an OLDER holder statement must never replace a newer one — that is the \
+         downgrade an old binary would otherwise force on an upgraded node"
+    );
+    let after = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] {id} vanished"));
+    assert_eq!(
+        after.original_content_hash, baked.attestation.original_content_hash,
+        "[{tag}] and the installed row is untouched"
+    );
+
+    // ── LEGACY ROW WITH A STAMPED `asserted_at` ──
+    // The pre-v31 envelope carries no signed instant, so this column is
+    // unsigned material. Stamped far into the future it must STILL lose to a
+    // v31-shaped candidate: shape decides, not the stamp.
+    let mut stamped = prior_ceremony_row(id);
+    stamped.asserted_at = "2030-01-01T00:00:00Z".parse().expect("fixed instant");
+    assert!(
+        stamped.asserted_at > baked.attestation.asserted_at,
+        "[{tag}] the fixture must actually claim to be newer, or it proves nothing"
+    );
+    assert!(
+        candidate_is_strictly_newer(&baked.attestation, &stamped),
+        "[{tag}] a LEGACY row must not be able to pin the node with an unsigned `asserted_at`: \
+         it predates the signed-instant envelope by construction, so shape decides and the \
+         baked v31 artifact still supersedes it"
+    );
+
+    // ── FABRICATED ROW CLAIMING A SEATED HOLDER ──
+    // `A1`, federation tier, everything a pure gate can check — and a signature
+    // over nothing. Reservation cannot stop this (it is written beneath the
+    // doors); authenticity must.
+    let mut forged = baked.attestation.clone();
+    // A DIFFERENT STATEMENT, not the baked one with broken signatures — that
+    // would be the damage case, which is repaired rather than refused. What an
+    // attacker actually wants is to change what the root CONFERS, so the
+    // envelope is what moves.
+    forged.attestation_envelope["scope"] = serde_json::json!(["infra:attest", "infra:everything"]);
+    forged.original_content_hash = "11".repeat(32);
+    forged.scrub_signature_classical = "AA".repeat(32);
+    forged.scrub_signature_pqc = None;
+    forged.additional_scrubs = Vec::new();
+    assert!(
+        envelope_matches_baked(&forged, &baked.attestation)
+            .map(|m| !m)
+            .unwrap_or(true),
+        "[{tag}] the forgery must be a DIFFERENT statement, or it is the damage case"
+    );
+    assert!(
+        check_genesis_attestation_reserved(&forged).is_ok(),
+        "[{tag}] the forgery must pass every PURE gate — otherwise this witnesses the pure gate, \
+         not the signature check"
+    );
+    assert!(
+        !stored_row_is_verifiable_holder_statement(dir, &forged).await,
+        "[{tag}] a row claiming a seated holder without that holder's signature is NOT a \
+         verifiable statement, whatever its columns say"
+    );
+    let outcome = install_or_supersede_delegation_row(dir, baked, Some(forged))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a forgery must be classified, not faulted: {e}"));
+    assert_eq!(
+        outcome,
+        DelegationRowOutcome::LeftAsSubstituted,
+        "[{tag}] a forged row is left in place for the posture leg to refuse, never silently \
+         overwritten — overwriting it would repair the damage and report nothing"
+    );
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **THE ROLLING-DEPLOYMENT WITNESS: a
+/// stale initializer must not delete the row that overtook it.**
+///
+/// Two engine versions initializing one database is what a fleet upgrade IS, so
+/// this is the ordinary case, not an exotic one. The old engine reads the plane,
+/// classifies a row as supersedable, and then — between that read and its
+/// write — the new engine installs a newer ceremony row. Deleting by id alone,
+/// the stale initializer removed a NEWER constitutional statement and installed
+/// its own older baked one: the exact rollback the floor rule refuses, performed
+/// by the one caller that had already decided it was entitled to write.
+///
+/// The window is reproduced exactly, and deterministically, the same way the
+/// seed race is: [`install_or_supersede_delegation_row`] takes the classifying
+/// read as a PARAMETER, so the witness hands it the STALE row while the corpus
+/// holds the row that overtook it. No timing dependence, and the compare runs
+/// against the real backend's real stored state.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_stale_initializer_cannot_delete_the_winner(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let baked = &canonical_genesis_bundle().attestations[0];
+    let id = &baked.attestation.attestation_id;
+
+    // What the STALE initializer read: the previous ceremony's row, which it
+    // correctly classified as supersedable.
+    let stale_read = prior_ceremony_row(id);
+
+    // What is ACTUALLY stored by now: the winner's row — the current baked
+    // artifact, installed by the newer engine after that read.
+    let winner = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the winner's row must be installed"));
+    assert_ne!(
+        winner.persist_row_hash, stale_read.persist_row_hash,
+        "[{tag}] the fixture must have the corpus genuinely AHEAD of the stale read"
+    );
+
+    // The stale initializer acts on its obsolete classification.
+    let outcome = install_or_supersede_delegation_row(dir, baked, Some(stale_read))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a lost classification race must not fault boot: {e}"));
+    assert_eq!(
+        outcome,
+        DelegationRowOutcome::RaceLostReclassify,
+        "[{tag}] the compare-and-delete must DECLINE — the row it was told to replace is not the \
+         row that is there"
+    );
+
+    // And nothing was destroyed.
+    let after = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the winner's row was DELETED by a stale initializer"));
+    assert_eq!(
+        after.persist_row_hash, winner.persist_row_hash,
+        "[{tag}] the winner's row must be byte-untouched — reclassify, never remove"
+    );
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] and the plane still verifies: {e}"));
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **THE SUCCESSOR WITNESS: an authenticated
+/// re-ceremony supersedes the boot-seeded plane, and a rollback bundle does
+/// not.**
+///
+/// Both halves of the second review P1, through the real
+/// [`bake_assembled_genesis`](bundle::bake_assembled_genesis) with two REAL
+/// artifacts — no synthesized bundle, because a fabricated one would prove a
+/// property of the fabrication and the whole question here is whether real
+/// quorum-verified ceremony bytes can land.
+///
+/// The caller arrives with a plane holding the PREVIOUS ceremony's rows.
+///
+/// Before this cut the bake's delegation loop was a bare `put_attestation`, and
+/// #665 gave the boot seed the same three ids — so on any node that had ever
+/// booted, every re-ceremony collided on all three, reported `Skipped`, and
+/// returned a partially applied bake while retaining the old plane. The
+/// documented candidate re-mint path was unusable on every node in the fleet.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_ceremony_supersedes_boot_seeded_plane(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    // The v31 bundle offered as a CEREMONY over the v30 plane — the upgrade a
+    // real re-mint performs.
+    let report = bundle::bake_assembled_genesis(dir, CANONICAL_SEED_JSON)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a quorum-verified re-ceremony must land: {e}"));
+    for (id, outcome) in &report.attestations {
+        assert!(
+            matches!(
+                outcome,
+                bundle::BakeItemOutcome::ReAnchored
+                    | bundle::BakeItemOutcome::Anchored
+                    | bundle::BakeItemOutcome::AlreadyPresent
+            ),
+            "[{tag}] the ceremony must APPLY to {id}, not report it skipped: {outcome:?}. A bake \
+             that returns success while retaining the old delegation plane is the finding"
+        );
+    }
+    for sa in &canonical_genesis_bundle().attestations {
+        let id = &sa.attestation.attestation_id;
+        let row = dir
+            .get_attestation(id)
+            .await
+            .expect("read back")
+            .unwrap_or_else(|| panic!("[{tag}] {id} missing after the ceremony"));
+        assert_eq!(
+            row.original_content_hash, sa.attestation.original_content_hash,
+            "[{tag}] {id} must carry the CEREMONY's content, not the superseded plane's"
+        );
+    }
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] and the plane verifies after the ceremony: {e}"));
+
+    // The bake is IDEMPOTENT on a plane it has already applied — the second run
+    // must not re-anchor, or a re-ceremony would delete and re-install the
+    // constitutional root every time it ran.
+    let again = bundle::bake_assembled_genesis(dir, CANONICAL_SEED_JSON)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a repeated ceremony must be a no-op: {e}"));
+    for (id, outcome) in &again.attestations {
+        assert_eq!(
+            *outcome,
+            bundle::BakeItemOutcome::AlreadyPresent,
+            "[{tag}] {id} is already the ceremony's own row on the second pass"
+        );
+    }
+
+    // NOTE — the delegation loop's ANTI-ROLLBACK half is deliberately NOT
+    // witnessed through `bake_assembled_genesis` here. Offering the v30 bundle
+    // over a current plane is refused by the SERVE-NODE loop's `valid_from`
+    // check before the delegation loop is ever reached, so an assertion here
+    // would pass while testing the wrong loop — and the only way to reach the
+    // delegation loop with an older attestation is a bundle assembled to do it,
+    // which is a fabricated artifact proving a property of the fabrication.
+    // Delegation anti-rollback is witnessed where it can be witnessed honestly:
+    // on the predicate (`candidate_is_strictly_newer`) and on the boot path
+    // (`LeftAsNewerCeremony`), both in `assert_refused_replacement_classes`.
+}
+
 /// v31.1.0 (CIRISPersist#665 review) — **THE DAMAGE WITNESS: a stored genesis
 /// row whose signatures were altered beneath persist is repaired, not reported
 /// entrenched.**
@@ -1731,9 +2101,18 @@ pub(crate) async fn assert_damaged_current_row_is_repaired(
     let baked = &canonical_genesis_bundle().attestations[0];
     let id = &baked.attestation.attestation_id;
 
-    // (0) THE FAIL-OPEN, STATED. The damage is real and the posture leg cannot
-    // see it. If this ever starts failing, the leg grew a signature check of
-    // its own and this witness should be re-read, not deleted.
+    // (0) THE DAMAGE IS REAL, AND THE READ PATH CATCHES IT.
+    //
+    // This assertion is INVERTED from its first form, and the inversion is the
+    // point. It used to assert that the posture leg PASSES here, labelled "that
+    // blindness is the finding" — correctly identifying a fail-open and then
+    // leaving it standing on the READ path while fixing only the SEED path.
+    // `genesis_posture` never calls the seed, so every live query
+    // (`Engine::genesis_posture`, `NodeState::genesis` → `StateBand::Green`,
+    // CIRISServer's agent-mode gate) answered from this leg alone, and damage
+    // landing after boot was invisible to all of them — on a threat model whose
+    // premise is a writer with raw corpus access, who does not wait for a
+    // restart.
     let damaged = dir
         .get_attestation(id)
         .await
@@ -1746,17 +2125,22 @@ pub(crate) async fn assert_damaged_current_row_is_repaired(
     assert_eq!(
         damaged.original_content_hash, baked.attestation.original_content_hash,
         "[{tag}] and must have left the ENVELOPE digest intact — that is the whole point: the \
-         damage is invisible to a content-hash check"
+         damage is invisible to a content-hash check, so only a whole-row comparison finds it"
     );
-    verify_delegation_plane_seeded(dir)
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "[{tag}] the posture leg is expected to be BLIND to this damage (it checks the \
-             content hash and the v31 shape, never a signature) — that blindness is the finding: \
-             {e}"
-            )
-        });
+    let fault = verify_delegation_plane_seeded(dir).await.expect_err(
+        "a row whose co-signature set was thinned below quorum must NOT read as sound — this is \
+         the live-query fail-open, and it is what CIRISServer#398 gates agent mode on",
+    );
+    assert_eq!(
+        fault.as_str(),
+        "divergent",
+        "[{tag}] and it is divergence — a root altered beneath persist: {fault}"
+    );
+    assert_eq!(
+        posture::genesis_posture(dir).await.as_str(),
+        "divergent",
+        "[{tag}] the posture a LIVE QUERY sees says so too — that is the half that was missing"
+    );
 
     // (1) THE SEED REPAIRS IT.
     seed_delegation_plane(dir)
@@ -2091,16 +2475,103 @@ where
         // deliberately — see `install_or_supersede_delegation_row`, which takes
         // this value as an argument precisely so that the STALE read a lost
         // primary-key race produces is expressible as data.
-        let stored = dir.get_attestation(id).await.map_err(|e| {
-            GenesisFault::unreadable(LEG, format!("lookup delegation row {id}: {e}"))
-        })?;
-        install_or_supersede_delegation_row(dir, sa, stored).await?;
+        // v31.1.0 (CIRISPersist#665 review) — RE-READ AND RE-DECIDE on a lost
+        // compare-and-delete. The decision is made from a read, and under a
+        // rolling deployment another initializer can replace this row in
+        // between; the destructive door then declines to fire and reports
+        // `RaceLostReclassify`, having written nothing. Re-reading converges
+        // immediately in practice — the competing writer has by then installed a
+        // row this pass will classify as current or newer, both of which are
+        // terminal — so the bound is small and exists only so a pathological
+        // flapper cannot spin the boot.
+        const RECLASSIFY_ATTEMPTS: usize = 4;
+        for attempt in 1..=RECLASSIFY_ATTEMPTS {
+            let stored = dir.get_attestation(id).await.map_err(|e| {
+                GenesisFault::unreadable(LEG, format!("lookup delegation row {id}: {e}"))
+            })?;
+            match install_or_supersede_delegation_row(dir, sa, stored).await? {
+                DelegationRowOutcome::RaceLostReclassify => {
+                    tracing::info!(
+                        attestation_id = %id,
+                        attempt,
+                        "genesis delegation seed: the row changed under our classification — \
+                         re-reading and deciding again (CIRISPersist#665)"
+                    );
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        // Deliberately NOT a fault when the attempts are exhausted. Something
+        // else is actively writing this id, so the plane is not this pass's to
+        // settle; whatever that writer lands is subject to the same rules, and
+        // `verify_delegation_plane_seeded` below judges the result on its
+        // merits rather than on who got there last.
     }
     Ok(())
 }
 
 /// v31.1.0 (CIRISPersist#665) — **what [`seed_delegation_plane`] did about one
 /// row**, so that a seed pass can be asserted on rather than inferred.
+///
+/// # THE REPLACEMENT MATRIX — who may replace what
+///
+/// Two doors write this plane: the BOOT SEED, which installs the compiled-in
+/// baked bundle, and
+/// [`bake_assembled_genesis`](super::genesis::bundle::bake_assembled_genesis),
+/// which installs a quorum-verified ceremony bundle. Until the #665 review they
+/// did not know the other existed, and every P1 raised against this file was
+/// that gap seen from a different side. The closed set, so the next person to
+/// touch either door has it at the definition site:
+///
+/// | stored | boot seed (installs the BAKED bundle) | authenticated bake (installs a CEREMONY bundle) |
+/// |---|---|---|
+/// | *nothing* | install → [`Installed`](Self::Installed) | install |
+/// | a PRIOR ceremony's row (older) | replace → [`Superseded`](Self::Superseded) | replace if newer |
+/// | the baked row, byte-whole | no-op → [`AlreadyCurrent`](Self::AlreadyCurrent) | no-op |
+/// | this ceremony's row, unsigned material damaged | repair → [`Repaired`](Self::Repaired) | repair |
+/// | a NEWER ceremony's row | **leave** → [`LeftAsNewerCeremony`](Self::LeftAsNewerCeremony) | replace if strictly newer |
+/// | anything not a verifiable holder statement | **leave** → [`LeftAsSubstituted`](Self::LeftAsSubstituted), and refuse to serve | refuse |
+///
+/// One rule generates every row of it:
+///
+/// > **A reserved genesis delegation row may be replaced only by a STRICTLY
+/// > NEWER row that is itself a verifiable statement by this node's seated
+/// > accord holders — never by an older one, from either door.**
+///
+/// Authenticity is [`stored_row_is_verifiable_holder_statement`]; recency is
+/// [`candidate_is_strictly_newer`]. Both must pass before anything is deleted.
+/// The two questions are separate on purpose: fusing them is what let a
+/// legitimate newer ceremony be read as a supersedable predecessor, because
+/// "real" was being taken to mean "prior".
+///
+/// Note the asymmetry in the newer-ceremony row, and that it is deliberate: the
+/// boot seed may never overwrite a newer statement, while the bake may — a
+/// ceremony is the accord holders acting, and a binary's compiled-in bundle is
+/// just the oldest thing in the room.
+///
+/// # And the rule is not enough on its own: the WRITE has to be atomic
+///
+/// Every decision above is made from a `get_attestation` taken before the write,
+/// so the authority answer can be correct and the write still wrong. Under a
+/// rolling deployment — two engine versions initializing one postgres database,
+/// which is simply what a fleet upgrade is — another initializer can replace the
+/// row between the classifying read and the write. A stale initializer then
+/// deletes a NEWER constitutional statement and installs its own older baked
+/// one: the exact rollback this table refuses, performed by the caller that had
+/// already been told it was allowed to write.
+///
+/// So the destructive door is a COMPARE-AND-DELETE. It carries the
+/// `persist_row_hash` of the row that was classified and fires only if that is
+/// still the row that is there; otherwise it writes nothing and the caller
+/// re-reads and decides again ([`RaceLostReclassify`](Self::RaceLostReclassify)).
+/// **Reclassify, never remove.**
+///
+/// The non-destructive paths need no equivalent, and it is worth saying why
+/// rather than leaving it to be rediscovered: an `INSERT` that races a newer row
+/// fails on the primary key and is reported as [`Raced`](Self::Raced), so the
+/// newer row stands untouched. Only a delete can destroy something, so only the
+/// delete carries the compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationRowOutcome {
     /// The plane did not hold this id; the baked row was installed.
@@ -2124,6 +2595,25 @@ pub enum DelegationRowOutcome {
     /// the read and the write. The row is present, so the plane is seeded;
     /// nothing more to do, and emphatically not a reason to stop seeding.
     Raced,
+    /// The compare-and-delete found a different row than the one classified —
+    /// somebody wrote this id between the caller's read and its write. **Nothing
+    /// was written**, and the caller should re-read and decide again.
+    ///
+    /// Reached in a rolling deployment, where two engine versions initialize one
+    /// database. Forcing the install instead would let a stale initializer roll
+    /// a newer ceremony back to its own compiled-in bytes — the exact rollback
+    /// [`candidate_is_strictly_newer`] refuses, performed by the one caller that
+    /// had already decided it was entitled to write.
+    RaceLostReclassify,
+    /// A verified accord-holder statement is present that is **not older** than
+    /// the compiled-in one. It was LEFT UNTOUCHED and the node serves on it.
+    ///
+    /// This node's root is ahead of its binary — a re-ceremony ran here, or on
+    /// a peer this node replicated from — which is the entire point of a trust
+    /// root that can be re-cut. The boot seed has no authority to roll it back:
+    /// the compiled-in bundle is the oldest statement in the room, not the
+    /// definitive one.
+    LeftAsNewerCeremony,
     /// A row is present that is neither the baked one nor a verifiable
     /// statement by a seated accord holder. It was LEFT UNTOUCHED;
     /// [`verify_delegation_plane_seeded`] will classify it `Divergent` and boot
@@ -2187,7 +2677,7 @@ where
         // says `entrenched`. A fail-OPEN banner — precisely the class the
         // delegation leg was added (#648) to catch, reintroduced one column
         // over. Same unsigned-column-beside-signed-bytes shape as the
-        // `original_content_hash` gap closed in `stored_row_is_prior_ceremony`.
+        // `original_content_hash` gap closed in `stored_row_is_verifiable_holder_statement`.
         match baked_row_matches_stored(&stored, baked) {
             Ok(true) => return Ok(DelegationRowOutcome::AlreadyCurrent),
             Ok(false) => {}
@@ -2230,7 +2720,13 @@ where
                      artifact. The corpus was modified by something that is not a write door — \
                      investigate the host (CIRISPersist#665)"
                 );
-                return replace_with_baked(dir, sa, DelegationRowOutcome::Repaired).await;
+                return replace_with_baked(
+                    dir,
+                    sa,
+                    &stored.persist_row_hash,
+                    DelegationRowOutcome::Repaired,
+                )
+                .await;
             }
             Ok(false) => {}
             Err(e) => {
@@ -2241,9 +2737,9 @@ where
             }
         }
 
-        // A different statement entirely. Only a prior ceremony's row may be
-        // superseded; see the three legs in `seed_delegation_plane`'s docs.
-        if !stored_row_is_prior_ceremony(dir, &stored).await {
+        // A different statement entirely. Two questions, in this order, and both
+        // must pass before anything is deleted: is it REAL, and are we NEWER?
+        if !stored_row_is_verifiable_holder_statement(dir, &stored).await {
             tracing::error!(
                 attestation_id = %id,
                 stored_content_hash = %stored.original_content_hash,
@@ -2255,6 +2751,23 @@ where
             );
             return Ok(DelegationRowOutcome::LeftAsSubstituted);
         }
+        // It is real. **A real statement newer than ours is our SUCCESSOR, not
+        // our problem** — this node is running a ceremony that postdates the
+        // binary, which is the entire point of a trust root that can be re-cut.
+        // Rolling it back to the compiled-in bytes would destroy a newer
+        // constitutional statement and pin the mesh to whatever its oldest
+        // binary happens to carry.
+        if !candidate_is_strictly_newer(baked, &stored) {
+            tracing::info!(
+                attestation_id = %id,
+                stored_asserted_at = %stored.asserted_at,
+                baked_asserted_at = %baked.asserted_at,
+                "genesis delegation seed: this node holds a verified accord-holder statement \
+                 that is not older than the compiled-in one — leaving it in place. The mesh's \
+                 root is ahead of this binary, which is allowed (CIRISPersist#665)"
+            );
+            return Ok(DelegationRowOutcome::LeftAsNewerCeremony);
+        }
         tracing::warn!(
             attestation_id = %id,
             superseded_content_hash = %stored.original_content_hash,
@@ -2262,7 +2775,13 @@ where
             "genesis delegation seed: replacing a PREVIOUS ceremony's row with the baked \
              artifact (CIRISPersist#665)"
         );
-        return replace_with_baked(dir, sa, DelegationRowOutcome::Superseded).await;
+        return replace_with_baked(
+            dir,
+            sa,
+            &stored.persist_row_hash,
+            DelegationRowOutcome::Superseded,
+        )
+        .await;
     }
 
     match dir.put_attestation(sa.clone()).await {
@@ -2375,6 +2894,7 @@ fn envelope_matches_baked(
 async fn replace_with_baked<D>(
     dir: &D,
     sa: &super::SignedAttestation,
+    expected_persist_row_hash: &str,
     outcome: DelegationRowOutcome,
 ) -> Result<DelegationRowOutcome, GenesisFault>
 where
@@ -2382,8 +2902,76 @@ where
 {
     const LEG: GenesisLeg = GenesisLeg::Delegation;
     let id = &sa.attestation.attestation_id;
-    match dir.purge_genesis_delegation_row_v31(id).await {
-        Ok(_) => {}
+
+    // v31.1.0 (CIRISPersist#665 review) — **PRE-FLIGHT THE DETERMINISTIC DOORS
+    // BEFORE DELETING ANYTHING.**
+    //
+    // The recovery story for this routine was "a crash between the delete and
+    // the insert leaves the row missing, which is `Absent`, which boots and
+    // re-installs next start". That covers a CRASH. It does not cover a
+    // REFUSAL: if `put_attestation` returns a non-duplicate `Err`, the old row
+    // is already gone and the next start re-reads `None`, takes the insert
+    // branch, and hits the very same refusal. Stable, not transient — the node
+    // is permanently out of `Entrenched` with no row at all.
+    //
+    // `put_attestation` is a full admission door (envelope size, reserved
+    // prefix, the #643/#598 bindings, quota), and #653 is exactly the class
+    // where one artifact is admitted at one door and refused at another. The
+    // severity is worst on the REPAIR arm, where the row being deleted still
+    // carries a byte-identical SIGNED ENVELOPE — the holders' actual statement
+    // — and a failed insert trades a partially-damaged constitutional row for
+    // no constitutional row.
+    //
+    // So the checks that are PURE and DETERMINISTIC — the ones whose refusal
+    // would simply recur — run here, while the old row is still present. A
+    // refusal now costs nothing: nothing has been deleted. Rate limiting is
+    // deliberately not pre-flighted; it is neither pure nor deterministic, and
+    // a door that could refuse for a transient reason is exactly the one whose
+    // retry the next boot fixes.
+    if let Err(e) = check_genesis_attestation_reserved(&sa.attestation) {
+        return Err(GenesisFault::absent(
+            LEG,
+            format!(
+                "refusing to remove the installed delegation row {id}: the replacement would be \
+                 refused at the write door anyway ({e}) — nothing deleted"
+            ),
+        ));
+    }
+    if !candidate_is_v31_conformant_as_stored(&sa.attestation) {
+        return Err(GenesisFault::absent(
+            LEG,
+            format!(
+                "refusing to remove the installed delegation row {id}: the replacement is not \
+                 v31-shaped and `put_attestation` would refuse it deterministically — nothing \
+                 deleted"
+            ),
+        ));
+    }
+    if let Err(e) =
+        super::admission::check_envelope_size_admission(&sa.attestation.attestation_envelope)
+    {
+        return Err(GenesisFault::absent(
+            LEG,
+            format!(
+                "refusing to remove the installed delegation row {id}: the replacement envelope \
+                 would be refused at the write door ({e}) — nothing deleted"
+            ),
+        ));
+    }
+
+    match dir
+        .purge_genesis_delegation_row_v31(id, expected_persist_row_hash)
+        .await
+    {
+        // v31.1.0 (CIRISPersist#665 review) — the compare-and-delete found a
+        // DIFFERENT row than the one that was classified. Somebody else wrote
+        // this id between our read and this call — a rolling deployment, most
+        // likely — so the decision that authorized this write was made against a
+        // corpus that no longer exists. Write NOTHING and tell the caller to
+        // re-decide; forcing the install here is precisely how a stale
+        // initializer would roll a newer ceremony back.
+        Ok(false) => return Ok(DelegationRowOutcome::RaceLostReclassify),
+        Ok(true) => {}
         // A directory with no replacement door cannot be repaired or upgraded
         // in place. `absent` BOOTS — and it short-circuits ahead of
         // `verify_delegation_plane_seeded`, so such a node comes up awaiting its
@@ -2416,19 +3004,137 @@ where
     }
 }
 
-/// v31.1.0 (CIRISPersist#665) — **is this stored row a PREVIOUS CEREMONY's, and
-/// therefore superseded by the baked artifact?**
+/// v31.1.0 (CIRISPersist#665 review) — **is `candidate` strictly newer than
+/// `stored`?** The anti-rollback half of the replacement rule.
 ///
-/// The predicate [`seed_delegation_plane`] keys its replacement arm on; its
-/// three legs and the reasoning behind them are documented there. Split out so
-/// the question has a name, and so the mutation that reverts the fix — skipping
-/// a present row outright — is a visible deletion of a call rather than an
-/// edit inside a loop.
+/// Both doors onto this plane ask it, and neither may write an older statement
+/// over a newer one. It is the same discipline the SERVE-NODE half of
+/// [`bake_assembled_genesis`](super::genesis::bundle::bake_assembled_genesis)
+/// has always had (`valid_from` must advance), finally applied to the
+/// delegation half — which had no recency check of any kind, which is how the
+/// boot seed came to roll a live re-ceremony back to the compiled-in bytes.
+///
+/// # The clock, and why it is not simply `asserted_at`
+///
+/// On a **v31-shaped** row `asserted_at` is inside the signed envelope and
+/// [`check_instant_binding`](crate::federation::admission::check_instant_binding)
+/// requires the column to equal it, so the column is as trustworthy as the
+/// signature. On a **pre-v31** row it is not in the envelope at all — the whole
+/// reason #598 bound it — so the column is unsigned material that anything with
+/// raw corpus access can stamp. Reading it as a clock would hand that writer a
+/// permanent pin: set a legacy row's `asserted_at` to 2030 and no future
+/// binary could ever supersede it.
+///
+/// So **shape is the version signal, and it is consulted first**: a legacy row
+/// predates the v31 envelope by construction — that is what makes it legacy —
+/// and therefore never gets to assert its own recency. Only once both rows are
+/// v31-conformant, and both instants are consequently signed, does the
+/// comparison become a timestamp comparison.
+///
+/// A legacy CANDIDATE is never newer than anything. Neither door has a reason
+/// to install one: the compiled-in bundle of any binary carrying this code is
+/// v31-shaped, and a bundle that is not cannot pass `put_attestation` anyway.
+///
+/// # Tier 1
+///
+/// Pure — two shape classifications and a timestamp compare. No directory read,
+/// no crypto. Authenticity is a separate question, asked by
+/// [`stored_row_is_verifiable_holder_statement`]; this one asks only "which came
+/// later", and the caller must satisfy BOTH before replacing anything.
+fn candidate_is_strictly_newer(
+    candidate: &super::Attestation,
+    stored: &super::Attestation,
+) -> bool {
+    use crate::federation::migration::{classify_shape, RowShape};
+    // Evaluated at each row's OWN instant — the #650 rule. `classify_shape`
+    // discards the argument today, but passing the wall clock would be the
+    // wrong argument to pass to a question about a stored artifact.
+    //
+    // **The two sides are normalized differently, and that asymmetry is
+    // load-bearing.** A CANDIDATE arrives from a bundle and has not been through
+    // `put_attestation` yet, so its envelope is not canonical at rest (#647) —
+    // classifying it raw reports `Legacy` for every bundle row ever written,
+    // including the compiled-in one, and a candidate that cannot establish its
+    // own shape can never supersede anything. Measured, not reasoned: this is
+    // what the upgrade witness caught, and without the normalization the v30
+    // rows survive a re-bake untouched.
+    //
+    // A STORED row gets no such courtesy. It has already been through a door,
+    // so a non-canonical envelope on it is a genuine #647 violation rather than
+    // a not-yet-normalized artifact — and normalizing it here would let an
+    // injected row launder itself into looking v31-shaped. Judged as it lies:
+    // fail-secure.
+    let candidate_v31 = candidate_is_v31_conformant_as_stored(candidate);
+    let stored_v31 = matches!(
+        classify_shape(stored, stored.asserted_at),
+        RowShape::V31Conformant
+    );
+    match (candidate_v31, stored_v31) {
+        // Both instants are signed and bound. Now a clock is meaningful.
+        (true, true) => candidate.asserted_at > stored.asserted_at,
+        // The stored row predates the signed-instant envelope by construction,
+        // so it loses without its unsigned column being consulted at all.
+        (true, false) => true,
+        // Never install an older-shaped row over anything, and never let one
+        // claim to be newer.
+        (false, _) => false,
+    }
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — is `row` v31-conformant **in the form it
+/// would be stored**, i.e. with its envelope canonicalized as
+/// `put_attestation` canonicalizes it (#647)?
+///
+/// Only ever asked of a CANDIDATE — a row from a bundle that has not been
+/// through a write door. See [`candidate_is_strictly_newer`] for why a stored
+/// row must never be normalized before being classified.
+///
+/// A row that cannot be canonicalized at all is not conformant.
+fn candidate_is_v31_conformant_as_stored(row: &super::Attestation) -> bool {
+    use crate::federation::migration::{classify_shape, RowShape};
+    let Ok(normalized) = baked_row_as_stored(row) else {
+        return false;
+    };
+    matches!(
+        classify_shape(&normalized, normalized.asserted_at),
+        RowShape::V31Conformant
+    )
+}
+
+/// v31.1.0 (CIRISPersist#665) — **is this stored row a real statement by this
+/// node's seated accord holders?**
+///
+/// The authenticity half of the replacement rule — *"is it REAL"*, asked before
+/// *"are we NEWER"* ([`candidate_is_strictly_newer`]). Both must pass before any
+/// row is deleted, and this one must pass before the plane is allowed to serve
+/// on the row at all.
+///
+/// Three legs, and the third is the one that is easy to miss:
+///
+/// 1. [`check_genesis_attestation_reserved`] — federation-tier, and attested by
+///    a seated accord holder on THIS node's effective roster (the #660
+///    reservation, re-asked against a row already in the corpus rather than one
+///    arriving at a door);
+/// 2. the scrub signature verifies, under `Strict` hybrid policy, against that
+///    attester's REGISTERED pubkeys, over the row's OWN envelope;
+/// 3. the digest that verification RETURNS — `SHA-256` of the canonical
+///    envelope — is exactly the row's stored `original_content_hash`.
+///
+/// Leg 3 is not redundant with leg 2. `original_content_hash` is a COLUMN and
+/// the signature covers the ENVELOPE, so a row can carry a perfectly valid
+/// holder signature beside a content hash that was rewritten afterwards. Taking
+/// the return value rather than just the `Ok` binds the unsigned column back to
+/// the signed bytes.
+///
+/// Renamed from `stored_row_is_prior_ceremony` in the #665 review: it never
+/// established "prior", only "real", and reading it as the former is exactly
+/// how a legitimate NEWER ceremony came to be treated as a supersedable
+/// predecessor. Recency is now a separate question with its own name.
 ///
 /// Returns `false` on ANY doubt, including a directory error while resolving
 /// the attester: this gates a destructive write, so an unanswerable question
 /// must not authorize one.
-async fn stored_row_is_prior_ceremony<D>(dir: &D, stored: &super::Attestation) -> bool
+async fn stored_row_is_verifiable_holder_statement<D>(dir: &D, stored: &super::Attestation) -> bool
 where
     D: super::FederationDirectory + ?Sized,
 {

@@ -4449,16 +4449,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
+        expected_persist_row_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate, before any statement runs (AV-9).
         crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
         let conn = self.conn.clone();
         let id = attestation_id.to_owned();
+        let expected = expected_persist_row_hash.to_owned();
+        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE in ONE
+        // statement: the row must still be the one the caller classified. A row
+        // replaced by a concurrent initializer between that read and this call
+        // does not match and is left alone.
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
-                "DELETE FROM federation_attestations WHERE attestation_id = ?1",
-                rusqlite::params![id],
+                "DELETE FROM federation_attestations \
+                 WHERE attestation_id = ?1 AND persist_row_hash = ?2",
+                rusqlite::params![id, expected],
             )
         })()
         .map_err(|e| {
@@ -21147,6 +21154,91 @@ mod tests {
 
         crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "sqlite")
             .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the **refused
+    /// classes** table: rollback, a legacy row with a stamped `asserted_at`, and
+    /// a forged holder claim.
+    #[tokio::test]
+    async fn refused_replacement_classes_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_refused_replacement_classes(&backend, "sqlite").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the
+    /// **rolling-deployment** witness: a stale initializer cannot delete the row
+    /// that overtook it.
+    #[tokio::test]
+    async fn stale_initializer_cannot_delete_the_winner_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("the winner installs the current plane");
+        crate::federation::genesis::assert_stale_initializer_cannot_delete_the_winner(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the **successor**
+    /// witness: an authenticated re-ceremony supersedes the boot-seeded plane.
+    #[tokio::test]
+    async fn ceremony_supersedes_boot_seeded_plane_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+        for id in crate::federation::genesis::genesis_delegation_ids() {
+            let prior = crate::federation::genesis::prior_ceremony_row(id);
+            let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
+            let scrubs = serde_json::to_string(&prior.additional_scrubs).unwrap();
+            let och = hex::decode(&prior.original_content_hash).unwrap();
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET \
+                    attestation_envelope = ?1, original_content_hash = ?2, \
+                    scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
+                    additional_scrubs = ?5, asserted_at = ?6, scrub_timestamp = ?7, \
+                    pqc_completed_at = ?8, persist_row_hash = ?9 \
+                 WHERE attestation_id = ?10",
+                rusqlite::params![
+                    envelope,
+                    och,
+                    prior.scrub_signature_classical,
+                    prior.scrub_signature_pqc,
+                    scrubs,
+                    prior.asserted_at.to_rfc3339(),
+                    prior.scrub_timestamp.to_rfc3339(),
+                    prior.pqc_completed_at.map(|t| t.to_rfc3339()),
+                    prior.persist_row_hash,
+                    id,
+                ],
+            )
+            .unwrap();
+        }
+        crate::federation::genesis::assert_ceremony_supersedes_boot_seeded_plane(
+            &backend, "sqlite",
+        )
+        .await;
     }
 
     /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the **damage**

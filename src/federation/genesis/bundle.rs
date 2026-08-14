@@ -434,13 +434,88 @@ where
     // admission incl. pre-rotation commitment, envelope size, tier-ingest
     // signature verify). Duplicates are idempotent; a refused row is
     // reported, not silently dropped.
+    //
+    // v31.1.0 (CIRISPersist#665 review) — **THE RE-CEREMONY PATH, WHICH THIS
+    // LOOP DID NOT HAVE.** It was a bare `put_attestation`, and that was
+    // survivable only while nothing else installed these ids: the bake was the
+    // sole writer of the delegation plane, so it never collided. #665 gave the
+    // BOOT SEED the same three ids, and after every normal startup they are all
+    // occupied by the compiled-in rows — so a later authenticated re-ceremony
+    // collided on all three, reported them as `Skipped`, and returned a
+    // PARTIALLY APPLIED bake while quietly retaining the old delegation plane.
+    // The documented candidate re-mint path became unusable on any entrenched
+    // node, which is every node.
+    //
+    // The fix is not new policy; it is the discipline the SERVE-NODE loop above
+    // has always had, finally applied to its sibling. Compare them side by
+    // side: identity is fixed by the reserved id (`check_genesis_attestation_reserved`
+    // already refuses anything not attested by a seated holder), and time must
+    // move forward — `candidate_is_strictly_newer`, the same predicate the boot
+    // seed uses, so the two doors cannot hold two opinions of which statement
+    // is later. A bundle row that is NOT newer is refused outright rather than
+    // reported: a rollback offered under verified quorum is still a rollback,
+    // and the serve-node half errors on exactly this, so this half does too.
     let mut att_outcomes = Vec::with_capacity(bundle.attestations.len());
     for sa in &bundle.attestations {
         let id = sa.attestation.attestation_id.clone();
-        let outcome = match directory.put_attestation(sa.clone()).await {
-            Ok(()) => BakeItemOutcome::Anchored,
-            Err(Error::Conflict(_)) => BakeItemOutcome::AlreadyPresent,
-            Err(e) => BakeItemOutcome::Skipped(format!("{}: {e}", e.kind())),
+        let stored = directory.get_attestation(&id).await?;
+        let outcome = match stored {
+            // Nothing there, or a row this bundle does not own: the ordinary
+            // insert, with every gate running.
+            None => match directory.put_attestation(sa.clone()).await {
+                Ok(()) => BakeItemOutcome::Anchored,
+                // A concurrent writer got there first. See
+                // `Error::is_duplicate_key` — a PK collision is `Backend` on
+                // every backend, never `Conflict`, which is why the old arm
+                // below never fired and duplicates fell through to `Skipped`.
+                Err(e) if e.is_duplicate_key() => BakeItemOutcome::AlreadyPresent,
+                Err(e) => BakeItemOutcome::Skipped(format!("{}: {e}", e.kind())),
+            },
+            Some(existing) => {
+                if super::baked_row_matches_stored(&existing, &sa.attestation).unwrap_or(false) {
+                    BakeItemOutcome::AlreadyPresent
+                } else if !super::candidate_is_strictly_newer(&sa.attestation, &existing) {
+                    // Anti-rollback, mirroring the serve-node half's
+                    // `valid_from` refusal exactly.
+                    return Err(Error::GenesisBundleInvalid {
+                        detail: format!(
+                            "delegation row {id}: bundle asserted_at {} is not newer than the \
+                             installed {} — rollback refused",
+                            sa.attestation.asserted_at, existing.asserted_at
+                        ),
+                    });
+                } else {
+                    // A genuinely newer ceremony statement under a reserved id.
+                    // Replace through the narrow door (`check_genesis_rebake_purge_admission`
+                    // bounds it to ids the bundle actually carries), then insert
+                    // through the ordinary one so the row pays the full
+                    // admission stack — canonical-at-rest, the #660 reservation,
+                    // `persist_row_hash`, the V106 subject projection — exactly
+                    // as a first install does.
+                    // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE
+                    // against the row this loop actually classified. The same
+                    // read-then-write window the boot seed has: a concurrent
+                    // initializer replacing this row between the
+                    // `get_attestation` above and here must not have its
+                    // statement deleted by a decision taken before it existed.
+                    // `Ok(false)` ⇒ the corpus moved, so REPORT rather than
+                    // force — the operator re-runs the bake against the state
+                    // that now exists.
+                    if directory
+                        .purge_genesis_delegation_row_v31(&id, &existing.persist_row_hash)
+                        .await?
+                    {
+                        directory.put_attestation(sa.clone()).await?;
+                        BakeItemOutcome::ReAnchored
+                    } else {
+                        BakeItemOutcome::Skipped(
+                            "the installed row changed while this bake was classifying it; \
+                             nothing was written — re-run against the current state"
+                                .to_owned(),
+                        )
+                    }
+                }
+            }
         };
         att_outcomes.push((id, outcome));
     }

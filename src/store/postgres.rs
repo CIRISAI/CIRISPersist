@@ -5321,6 +5321,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
+        expected_persist_row_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate, before any statement runs (AV-9).
         crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
@@ -5328,10 +5329,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE in ONE
+        // statement. This is the backend the finding is about: two engine
+        // versions initializing one database is what a rolling deployment IS,
+        // and deleting by id alone let a stale initializer remove a newer
+        // ceremony row that landed after its own classifying read.
         let n = client
             .execute(
-                "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
-                &[&attestation_id],
+                "DELETE FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 AND persist_row_hash = $2",
+                &[&attestation_id, &expected_persist_row_hash],
             )
             .await
             .map_err(|e| {
@@ -22246,6 +22253,121 @@ mod tests {
             drop(client);
 
             crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(
+                &backend, "postgres",
+            )
+            .await;
+        })
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the POSTGRES leg of the **refused
+    /// classes** table: rollback, a legacy row with a stamped `asserted_at`, and
+    /// a forged holder claim.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn refused_replacement_classes_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("seed the baked plane");
+            crate::federation::genesis::assert_refused_replacement_classes(&backend, "postgres")
+                .await;
+        })
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the POSTGRES leg of the
+    /// **rolling-deployment** witness. This is the backend the finding is
+    /// about: two engine versions initializing one database is what a fleet
+    /// upgrade looks like, and deleting by id alone let the stale one destroy
+    /// the newer constitutional statement.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn stale_initializer_cannot_delete_the_winner_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("the winner installs the current plane");
+            crate::federation::genesis::assert_stale_initializer_cannot_delete_the_winner(
+                &backend, "postgres",
+            )
+            .await;
+        })
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the POSTGRES leg of the **successor**
+    /// witness: an authenticated re-ceremony supersedes the boot-seeded plane.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn ceremony_supersedes_boot_seeded_plane_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("a fresh node seeds the baked plane");
+            {
+                let client = backend.pool().get().await.expect("client");
+                for id in crate::federation::genesis::genesis_delegation_ids() {
+                    let prior = crate::federation::genesis::prior_ceremony_row(id);
+                    let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
+                    let scrubs = serde_json::to_string(&prior.additional_scrubs).unwrap();
+                    let och = hex::decode(&prior.original_content_hash).unwrap();
+                    client
+                        .execute(
+                            "UPDATE cirislens.federation_attestations SET \
+                                attestation_envelope = $1, original_content_hash = $2, \
+                                scrub_signature_classical = $3, scrub_signature_pqc = $4, \
+                                additional_scrubs = $5, asserted_at = $6, scrub_timestamp = $7, \
+                                pqc_completed_at = $8, persist_row_hash = $9 \
+                             WHERE attestation_id = $10",
+                            &[
+                                &envelope,
+                                &och,
+                                &prior.scrub_signature_classical,
+                                &prior.scrub_signature_pqc,
+                                &scrubs,
+                                &prior.asserted_at,
+                                &prior.scrub_timestamp,
+                                &prior.pqc_completed_at,
+                                &prior.persist_row_hash,
+                                &id,
+                            ],
+                        )
+                        .await
+                        .expect("roll back to the previous ceremony");
+                }
+            }
+            crate::federation::genesis::assert_ceremony_supersedes_boot_seeded_plane(
                 &backend, "postgres",
             )
             .await;

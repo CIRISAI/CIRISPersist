@@ -3449,15 +3449,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
+        expected_persist_row_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate (AV-9), before the lock, so a refusal cannot
         // interleave with a mutation.
         crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
         let mut state = self.state.lock().expect("memory backend lock");
+        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE, under the same
+        // lock as the removal so the compare cannot be overtaken between the two
+        // (the SQL backends get that from a single `DELETE … WHERE` statement).
+        // A row that changed since the caller classified it is LEFT ALONE.
         let before = state.federation_attestations.len();
-        state
-            .federation_attestations
-            .retain(|a| a.attestation_id != attestation_id);
+        state.federation_attestations.retain(|a| {
+            a.attestation_id != attestation_id || a.persist_row_hash != expected_persist_row_hash
+        });
         if state.federation_attestations.len() == before {
             return Ok(false);
         }
@@ -17561,6 +17566,74 @@ mod tests {
 
         crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "memory")
             .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **refused
+    /// classes** table: rollback, a legacy row with a stamped `asserted_at`, and
+    /// a forged holder claim.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn refused_replacement_classes_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_refused_replacement_classes(&backend, "memory").await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the
+    /// **rolling-deployment** witness: a stale initializer cannot delete the row
+    /// that overtook it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn stale_initializer_cannot_delete_the_winner_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("the winner installs the current plane");
+        crate::federation::genesis::assert_stale_initializer_cannot_delete_the_winner(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **successor**
+    /// witness: an authenticated re-ceremony supersedes the boot-seeded plane.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn ceremony_supersedes_boot_seeded_plane_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+        // Roll the plane back to the previous ceremony, so the bake has
+        // something real to supersede.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            for row in state.federation_attestations.iter_mut() {
+                if crate::federation::genesis::genesis_delegation_ids()
+                    .contains(&row.attestation_id.as_str())
+                {
+                    *row = crate::federation::genesis::prior_ceremony_row(&row.attestation_id);
+                }
+            }
+        }
+        crate::federation::genesis::assert_ceremony_supersedes_boot_seeded_plane(
+            &backend, "memory",
+        )
+        .await;
     }
 
     /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **damage**

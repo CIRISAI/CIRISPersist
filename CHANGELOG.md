@@ -7,6 +7,71 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.1.0] - 2026-08-13
 
+### Changed — SECURITY — the compiled-in genesis bundle is the FLOOR, not the identity (#665 review)
+
+Three review P1s, all one gap: `seed_delegation_plane` and the delegation half
+of `bake_assembled_genesis` are two doors onto the same three reserved ids and
+neither knew the other existed. The serve-node half of the bake had solved this
+correctly years ago — identity must match, `valid_from` must advance, then
+re-anchor — and the delegation half got a bare `put_attestation`.
+
+**A boot could roll back a live re-ceremony.** The supersession predicate asked
+whether a stored row was a holder-signed self-consistent statement, and treated
+every such row as a supersedable predecessor. A legitimate newer ceremony row
+therefore got deleted and replaced with the binary's compiled-in bytes.
+
+**A re-ceremony could not land at all.** The bake's delegation loop only called
+`put_attestation`; since this release gave the boot seed the same three ids,
+every node that had ever booted collided on all three, reported them `Skipped`,
+and returned a partially applied bake while retaining the old plane. The
+documented candidate re-mint path was unusable fleet-wide.
+
+**One rule closes both**, and it is the serve-node half's rule: *a reserved
+genesis delegation row may be replaced only by a strictly newer row that is
+itself a verifiable statement by this node's seated accord holders — never by an
+older one, from either door.* Authenticity and recency are separate questions
+with separate names; fusing them is what let "real" be read as "prior".
+
+**`verify_delegation_plane_seeded`'s divergent arm changed, deliberately.** It
+compared the stored content hash to the compiled-in one, so a node running a
+newer ceremony failed by construction and could only reach `Divergent`, which
+refuses to boot — the check meant to notice a root altered beneath persist was
+also refusing every successor the root is designed to have. It now asks whether
+the row is a real holder statement at least as new as the compiled-in one.
+**This narrows soundness in every direction but one:** squats, renamed rows,
+forged holder claims, corrupted signatures and now *rollback* all still refuse
+to serve. Only a newer, quorum-verified, holder-signed root stops being called
+tampering.
+
+**Recency is `asserted_at`, but shape decides first.** On a v31 row that instant
+is inside the signed envelope and bound to the column; on a pre-v31 row it is
+not in the envelope at all, so raw corpus access could stamp 2030 and pin a node
+to the old root forever. A legacy row predates the signed-instant envelope by
+construction, so it never gets to assert its own recency.
+
+**And the write is now atomic.** Every decision is made from a read taken
+before it, so under a rolling deployment — two engine versions initializing one
+postgres database — another initializer can replace the row in between, and a
+stale one would delete the newer statement and install its older baked row: the
+same rollback, performed by the caller already told it could write. The
+destructive door is a compare-and-delete carrying the classified row's
+`persist_row_hash`; a changed row is reclassified, never removed. The
+non-destructive paths need no equivalent — an `INSERT` racing a newer row fails
+on the primary key and the newer row stands.
+
+`GenesisPosture::Entrenched` therefore also *widens*: a node whose root is ahead
+of its binary is now entrenched rather than divergent. Consumers gating on
+`entrenched()` (CIRISServer#398) are unchanged in direction; what satisfies them
+has widened.
+
+Witnessed on memory, sqlite and postgres — refused classes (rollback, a legacy
+row with a stamped `asserted_at`, a forged holder claim), the rolling-deployment
+race, and an authenticated re-ceremony superseding the boot-seeded plane, with
+the replacement matrix written at the `DelegationRowOutcome` definition site.
+Mutation-tested: dropping the recency gate reds the refused-class witnesses;
+reverting the compare-and-delete to delete-by-id reds the rolling-deployment
+witnesses.
+
 ### Fixed — SECURITY — a corrupted signature on a genesis row read as `entrenched` (#665 review)
 
 Review finding against the fix below. Its `AlreadyCurrent` fast path compared

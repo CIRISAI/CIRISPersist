@@ -1169,15 +1169,47 @@ pub trait FederationDirectory: Send + Sync {
     /// exactly as a first-boot install does. A second write path for genesis
     /// rows would be a second thing to keep in step with the first.
     ///
-    /// Returns whether a row was actually removed. Default `Unsupported`;
-    /// sqlite/postgres/memory override.
+    /// # COMPARE-AND-DELETE, because the decision was made against an earlier read
+    ///
+    /// v31.1.0 (CIRISPersist#665 review) — `expected_persist_row_hash` is the
+    /// `persist_row_hash` of the row the caller CLASSIFIED, and the delete only
+    /// fires if the stored row still carries it. Deleting by id alone was a
+    /// rolling-deployment hazard and the sharpest kind: the replacement decision
+    /// is made from a `get_attestation` taken earlier, so when two engine
+    /// versions initialize one postgres database — which is simply what a fleet
+    /// upgrade looks like — a stale initializer could delete a NEWER ceremony
+    /// row that landed in between and install its own older baked one. That is
+    /// exactly the rollback
+    /// [`candidate_is_strictly_newer`](genesis::candidate_is_strictly_newer)
+    /// exists to refuse, performed by the one caller that had already decided it
+    /// was allowed to write.
+    ///
+    /// The window is only dangerous on THIS door. The non-destructive paths
+    /// close it for free: an `INSERT` that races a newer row fails on the
+    /// primary key and is reported as
+    /// [`Raced`](genesis::DelegationRowOutcome::Raced), so the newer row stands.
+    /// Only the delete could destroy something, so only the delete needs the
+    /// compare.
+    ///
+    /// **The failure direction is RECLASSIFY, NEVER REMOVE.** `Ok(false)` means
+    /// the corpus moved under the caller's decision, and the honest response is
+    /// to re-read and decide again rather than to force a write derived from a
+    /// state that no longer exists.
+    ///
+    /// Returns whether a row was actually removed — `false` both when the id is
+    /// absent and when it is present with a different `persist_row_hash`.
+    /// Default `Unsupported`; sqlite/postgres/memory override.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] if `attestation_id` is not a baked genesis
     /// delegation id; [`Error::Backend`] on a backend failure.
-    async fn purge_genesis_delegation_row_v31(&self, attestation_id: &str) -> Result<bool, Error> {
-        let _ = attestation_id;
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+        expected_persist_row_hash: &str,
+    ) -> Result<bool, Error> {
+        let _ = (attestation_id, expected_persist_row_hash);
         Err(Error::Unsupported {
             method: "purge_genesis_delegation_row_v31",
         })
