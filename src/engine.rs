@@ -6472,7 +6472,27 @@ impl Engine {
 
     /// v31.1.0 (CIRISPersist#662) — **serve** the signed accord EVIDENCE
     /// plane: the proposal + its hybrid-signed participation set, bundled per
-    /// proposal, since a cursor on the proposal's local `created_at`.
+    /// proposal.
+    ///
+    /// # Resume from `evidence_at`, which is the ONLY field that works
+    ///
+    /// `since` filters on
+    /// [`AccordQuorumEvidence::evidence_at`](crate::federation::accord_carriage::AccordQuorumEvidence)
+    /// — the bundle's visibility instant,
+    /// `max(created_at, max(server_arrival_at))` — and bundles are ordered
+    /// `(evidence_at ASC, proposal_digest ASC)`. **Resume from the last
+    /// element's `evidence_at` and nothing else.**
+    ///
+    /// This doc previously said the cursor was "the proposal's local
+    /// `created_at`", which a carrier cannot even obtain — the bundle does not
+    /// carry the proposal table's `created_at` — and which is wrong in the
+    /// direction that costs evidence. A bundle is an AGGREGATE: its content
+    /// changes every time a holder's vote lands. Cursoring on the proposal's
+    /// creation instant pins a bundle at the moment it had NO votes, so a
+    /// consumer that read it pre-quorum advances past it and is never offered
+    /// the quorum-bearing version again. `evidence_at` moves forward when a
+    /// vote arrives, which is what re-offers the bundle exactly when it has
+    /// something new to say.
     ///
     /// This is what a peer needs in order to reconstruct the exclusion half
     /// of the `infra:attest` closure. The withdrawal tombstones themselves are

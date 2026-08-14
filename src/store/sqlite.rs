@@ -5894,10 +5894,38 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 proposal.nonce, proposal.family_key_id
             )));
         }
+        // v31.1.0 (CIRISPersist#662, PR #667 round-5) — `created_at` is half the
+        // evidence cursor (`max(created_at, max(server_arrival_at))`), so it is
+        // an allocated position, not a wall-clock read.
+        //
+        // THIS SITE WAS MISSED while memory and postgres got it, and the gap
+        // was not benign on the one path where the participation allocator has
+        // nothing to work with: a consumer advances its cursor to a
+        // ZERO-PARTICIPATION proposal at T, the clock steps back, and a later
+        // proposal plus its first votes all land at or below T. There is no
+        // post-T participation for `MAX(server_arrival_at)` to rescue the
+        // bundle with, so the quorum-bearing evidence is never served — the
+        // permanent skip this whole change exists to remove, reintroduced on
+        // one backend.
+        let created_at = {
+            let conn = self.conn.clone();
+            let conn = conn.lock();
+            let last: Option<String> = conn
+                .query_row("SELECT MAX(created_at) FROM accord_proposal", [], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(|e| Error::Backend(format!("last accord created_at: {e}")))?
+                .flatten();
+            crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last.as_deref().map(parse_rfc3339),
+            )
+        };
         let prep = crate::federation::accord_quorum::prepare_proposal(
             &proposal,
             authority_signature,
-            chrono::Utc::now(),
+            created_at,
         )?;
         let proposal_json = serde_json::to_string(&prep.proposal_json)
             .map_err(|e| Error::Backend(format!("proposal_json encode: {e}")))?;
@@ -24117,6 +24145,40 @@ mod tests {
     /// Region outside the closed-set `{us, eu, apac}` is rejected at
     /// admission with the typed `RegionRejected` error + stable kind
     /// token; the row is not stored.
+    /// v31.1.0 (CIRISPersist#662, PR #667 round-5) — **a quorum-bearing bundle
+    /// survives a backward clock step behind a VOTE-LESS proposal.**
+    ///
+    /// The case the participation allocator cannot cover: with no votes on the
+    /// leading proposal there is no `MAX(server_arrival_at)` to clamp against,
+    /// so `created_at` must be allocated or the later quorum-bearing bundle
+    /// sorts below the consumer's cursor and is never served. `put_accord_proposal`
+    /// on THIS backend was the site that missed the allocator.
+    ///
+    /// The post-step state is planted directly — every stored `created_at`
+    /// moved past the cursor, which is what a node looks like after an NTP
+    /// correction. Two proposals under a forward clock would pass with
+    /// `Utc::now()` and prove nothing.
+    #[tokio::test]
+    async fn quorum_bundle_survives_backward_clock_sqlite_662() {
+        use crate::federation::accord_carriage::carriage_tests as ts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let (node, cursor) = ts::zero_participation_cursor(&backend, "sq").await;
+
+        // THE BACKWARD STEP, as state.
+        let future = cursor + chrono::Duration::hours(1);
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE accord_proposal SET created_at = ?1",
+                rusqlite::params![future.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        ts::assert_quorum_bundle_survives_backward_clock(&backend, &node, "sq", future).await;
+    }
+
     /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
     /// survives a backward clock step, on this backend's real write path.**
     ///

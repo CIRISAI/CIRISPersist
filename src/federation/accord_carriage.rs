@@ -828,7 +828,7 @@ pub async fn assemble_evidence_page(
 // weaker on the one that matters.
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-mod carriage_tests {
+pub(crate) mod carriage_tests {
     use super::*;
     use crate::federation::accord_quorum::test_fixtures::signed_participation;
     use crate::federation::admission::{
@@ -851,7 +851,7 @@ mod carriage_tests {
     /// invoke resolves its roster from `accord_holder_roster_key_ids()` (as
     /// production does), so a fixture with a side roster would leave the
     /// ordering leg below silently unexercised.
-    struct Node {
+    pub(crate) struct Node {
         holders: Vec<Identity>,
         roster: Vec<ThresholdMember>,
         roster_key_ids: Vec<String>,
@@ -1516,6 +1516,96 @@ mod carriage_tests {
                 .is_some(),
             "and the tombstone was materialized from the injected roster's own quorum"
         );
+    }
+
+    /// PR #667 round-5 — **the zero-participation proposal is where the
+    /// participation allocator cannot help.** Split in two so the per-backend
+    /// tests can PLANT the post-backward-step state between the halves; the
+    /// scenario itself lives here once.
+    ///
+    /// Part one: a proposal with NO votes, which is a legitimate and common
+    /// state (a proposal is stored the moment it is issued, before anyone has
+    /// voted). Its `evidence_at` is therefore exactly its `created_at` —
+    /// `max(created_at, MAX(server_arrival_at))` with an empty participation
+    /// set. A consumer reads it and advances its cursor to that instant.
+    ///
+    /// Returns `(node, cursor)`: the cursor a consumer would now hold.
+    pub(crate) async fn zero_participation_cursor(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) -> (Node, chrono::DateTime<chrono::Utc>) {
+        let node = seed_node(dir).await;
+        let target = format!("zp-{tag}");
+        confer_infra_attest(dir, &node, &target).await;
+        let digest = seed_quorum(
+            dir,
+            &node,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &target,
+            &[], // ZERO participations — the whole point
+            &format!("zp0-{tag}"),
+        )
+        .await;
+        let bundle = dir
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == digest)
+            .expect("a vote-less proposal is still servable evidence");
+        assert!(
+            bundle.participations.is_empty(),
+            "the fixture must carry NO votes, or the participation allocator can rescue it \
+             and this proves nothing"
+        );
+        (node, bundle.evidence_at)
+    }
+
+    /// Part two, run AFTER the caller has planted the backward step (every
+    /// stored `created_at` moved past `cursor`).
+    ///
+    /// A second proposal arrives and reaches quorum. Its `created_at` and its
+    /// votes' `server_arrival_at` are all read from a clock that is now BEHIND
+    /// the consumer's cursor. `MAX(server_arrival_at)` cannot rescue it —
+    /// there is no post-cursor participation to clamp against, because the
+    /// only prior proposal has none. So unless `created_at` is itself
+    /// allocated, the quorum-bearing bundle sorts at or below the saved cursor
+    /// and is **never served**.
+    ///
+    /// That is the permanent skip the whole cut exists to remove, reachable on
+    /// exactly the one path where the other allocator has nothing to work with.
+    pub(crate) async fn assert_quorum_bundle_survives_backward_clock(
+        dir: &dyn FederationDirectory,
+        node: &Node,
+        tag: &str,
+        cursor: chrono::DateTime<chrono::Utc>,
+    ) {
+        let target = format!("zpq-{tag}");
+        confer_infra_attest(dir, node, &target).await;
+        let digest = seed_quorum(
+            dir,
+            node,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &target,
+            &[0, 1], // a real strict-majority quorum
+            &format!("zpq-{tag}"),
+        )
+        .await;
+
+        let resumed = dir
+            .list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+            .await
+            .unwrap();
+        let served = resumed
+            .iter()
+            .find(|e| e.proposal.digest() == digest)
+            .expect(
+                "a quorum-bearing bundle admitted after a backward clock step must be served \
+                 past the consumer's cursor — with a vote-less proposal ahead of it, nothing \
+                 else can carry it forward",
+            );
+        assert_eq!(served.participations.len(), 2, "and it carries its votes");
+        assert!(served.evidence_at > cursor);
     }
 
     /// PR #667 review P1 — **the cursor must advance when a vote lands.**
