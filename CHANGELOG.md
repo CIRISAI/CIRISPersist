@@ -7,6 +7,31 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.2.0] - 2026-08-14
 
+### Fixed — BREAKING — `authorization_digest` returns a DIGEST, not the preimage (CIRISServer#398)
+
+**Found by CIRISServer during the ceremony, with measurements.** The widening
+above took the signed input from **1,976 bytes to 83,060** — 42x — because each
+`KeyRecord` carries a ~2.6 KB base64 ML-DSA-65 pubkey twice over (top level, and
+again inside `registration_envelope`). A YubiKey `C_Sign` then refused it:
+*"plaintext input data has a bad length... too long"*. PKCS#11 PureEdDSA will not
+take an input that size.
+
+The cause was a name that had been wrong for a long time and only became load-
+bearing when the bundle grew: `authorization_digest` returned
+`ceg_produce_canonicalize(&preimage)` — **the canonical bytes themselves** — and
+holders signed the whole preimage directly. It is called a digest; it behaved as
+a preimage; nothing noticed while it stayed around 2 KB.
+
+It now returns `SHA-256(canonical)`. **The security property is unchanged** — the
+hash covers exactly the same widened preimage, so record substitution is still
+detected — and 32 bytes signs on any token. Producer and verifier cannot drift,
+because `mesh_genesis` re-exports this function.
+
+A guard pins the property that actually broke: the output length must not depend
+on the bundle size. Growing the roster 256-fold must not grow the signed input.
+A revert to returning canonical bytes now fails the build rather than failing at
+a hardware token mid-ceremony.
+
 ### Changed — BREAKING — SECURITY — the authorization digest binds the RECORD, not just the `key_id` (#660, CIRISServer#398 §5)
 
 **CONSUMER ACTION REQUIRED — a signing-preimage change, and it invalidates

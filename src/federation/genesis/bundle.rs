@@ -27,9 +27,17 @@
 //!   re-running the ceremony.
 //!
 //! The [`authorization_digest`] preimage is BYTE-IDENTICAL to CIRISServer
-//! `mesh_genesis::authorization_digest` (the producer): bundle identity +
-//! holder **ids** + serve **ids** + the whole delegation plane, canonicalized
-//! with the same JCS producer.
+//! `mesh_genesis::authorization_digest` — which is guaranteed rather than
+//! asserted, because that module **re-exports this function**: bundle identity,
+//! the holder and serve-node RECORDS, and the whole delegation plane,
+//! canonicalized with the same JCS producer and then **SHA-256'd**.
+//!
+//! v31.2.0 — that final hash is new, and it is not cosmetic. This function used
+//! to return the canonical bytes themselves, so holders signed a preimage whose
+//! size grew with the bundle: 1,976 bytes narrow, **83,060 bytes** once it bound
+//! full `KeyRecord`s. PKCS#11 PureEdDSA refuses an input that large and a
+//! YubiKey failed mid-ceremony. It is called a digest and now behaves as one
+//! (CIRISServer#398).
 //!
 //! # What that digest does and does not bind (CIRISPersist#660)
 //!
@@ -198,6 +206,33 @@ fn authorized_record_projection(
 /// authorization taken over the narrow preimage is invalid against these bytes —
 /// which is the point, and why it lands with a fresh genesis ceremony rather
 /// than alone. See this module's doc for the full before/after.
+///
+/// # It returns a DIGEST now, and did not before (CIRISServer#398)
+///
+/// Until v31.2.0 this returned `ceg_produce_canonicalize(&preimage)` — the
+/// **canonical bytes themselves**. The name said digest; the behaviour was
+/// preimage; holders signed the whole preimage directly. That was survivable
+/// only while it stayed small: the narrow preimage was **1,976 bytes**.
+///
+/// Widening it to bind full `KeyRecord`s took it to **83,060 bytes** — 42×
+/// larger, because each record carries a ~2.6 KB base64 ML-DSA-65 pubkey twice
+/// over (top level, and again inside `registration_envelope`). PKCS#11
+/// PureEdDSA refuses an input that size, so a YubiKey `C_Sign` failed with
+/// *"plaintext input data has a bad length… too long"* and the ceremony could
+/// not complete. Measured by CIRISServer, not inferred.
+///
+/// So this now returns `SHA-256(canonical)` — 32 bytes, signable on any token.
+/// **The security property is unchanged**: the hash covers exactly the same
+/// widened preimage, so record substitution is still detected. What changed is
+/// only how much the holder's key has to swallow.
+///
+/// Producer and verifier cannot drift apart on this, because CIRISServer
+/// `mesh_genesis` re-exports this function rather than declaring its own — the
+/// same property that let the widening land with no server code change.
+///
+/// `authorization_digest_returns_a_fixed_size_digest` pins the 32-byte output,
+/// so a future change back to returning a variable-length preimage fails the
+/// build instead of failing at a hardware token during a ceremony.
 pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
     let preimage = serde_json::json!({
         "version": bundle.version,
@@ -228,8 +263,13 @@ pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
             })
             .collect::<Vec<_>>(),
     });
-    crate::verify::canonical::ceg_produce_canonicalize(&preimage)
-        .map_err(|e| Error::InvalidArgument(format!("genesis digest canonicalize: {e}")))
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&preimage)
+        .map_err(|e| Error::InvalidArgument(format!("genesis digest canonicalize: {e}")))?;
+    // v31.2.0 — HASH the canonical bytes. See this function's doc: until now it
+    // returned the canonical bytes themselves, so holders signed a preimage
+    // whose size grew with the bundle. Signing 32 bytes is what the name always
+    // claimed and what every token can actually do.
+    Ok(<sha2::Sha256 as sha2::Digest>::digest(&canonical).to_vec())
 }
 
 /// v23.0.0 (CIRISPersist#551 item 1) — the **single door** every genesis
@@ -870,6 +910,52 @@ mod authorization_digest_tests {
             "the projection dropped {dropped:?}; it must drop ONLY \
              {NODE_LOCAL_RECORD_FIELDS:?} — a silently narrowed preimage is the \
              #660 defect returning"
+        );
+    }
+
+    /// v31.2.0 (CIRISServer#398) — **the output is a FIXED-SIZE digest, and
+    /// stays fixed as the bundle grows.**
+    ///
+    /// This function used to return the canonical preimage itself, so what
+    /// holders signed grew with the bundle. Nobody noticed while it was ~2 KB;
+    /// binding full `KeyRecord`s took it to ~83 KB and a YubiKey refused to sign
+    /// it — *"plaintext input data has a bad length… too long"* — mid-ceremony.
+    ///
+    /// So the assertion is not merely "32 bytes for this bundle". It is **the
+    /// length does not depend on the bundle**, which is the property that was
+    /// actually violated. A revert to returning canonical bytes reds here rather
+    /// than at a hardware token during a ceremony.
+    #[test]
+    fn authorization_digest_returns_a_fixed_size_digest() {
+        let base = crate::federation::genesis::canonical_genesis_bundle().clone();
+        let small = authorization_digest(&base).expect("digest");
+        assert_eq!(small.len(), 32, "SHA-256 is 32 bytes; got {}", small.len());
+
+        // Grow the bundle substantially — duplicate the holder roster several
+        // times over. The PREIMAGE gets much bigger; the DIGEST must not.
+        let mut grown = base.clone();
+        for _ in 0..8 {
+            let more = grown.holders.clone();
+            grown.holders.extend(more);
+        }
+        let big = authorization_digest(&grown).expect("digest");
+        assert_eq!(
+            big.len(),
+            small.len(),
+            "the signed output grew with the bundle — this is CIRISServer#398 \
+             exactly: a preimage wearing the name `digest`, which no hardware \
+             token will sign once the bundle is real"
+        );
+        assert_ne!(big, small, "a bigger roster must still change the digest");
+
+        // And prove it is HASHED, not merely truncated canonical bytes.
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&serde_json::json!({
+            "version": base.version,
+        }))
+        .expect("canonicalize");
+        assert!(
+            !canonical.starts_with(&small[..4.min(small.len())]),
+            "the digest looks like a canonical-bytes prefix rather than a hash"
         );
     }
 
