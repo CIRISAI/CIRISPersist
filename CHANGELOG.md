@@ -93,13 +93,32 @@ sentinel, and a witness derives the pairwise-distinctness check from the
 SERIALIZED fixtures, so a field added later cannot quietly reuse a value. The
 failure mode it closes is a test that keeps passing while measuring less.
 
-**Mutation-tested, 6 for 6**, scored on the full five-test `Summary` line:
+**A new verify error variant is a COMPILE error, not a fall-through.** The
+probes converge on "the error stopped being a binding failure" — and a new
+`SubjectBindingError` variant *is* still a binding failure, so under a `_`
+wildcard it read as successful convergence: the probe would stop early, report
+whatever subset it had found, and go green if that subset happened to match
+persist. The failure this test exists to prevent, triggered by the exact event
+it exists to detect, degrading toward agreement. Neither `SubjectBindingError`
+nor `ProvenanceError` is `#[non_exhaustive]`, so both matches are now exhaustive
+with no wildcard and a variant added upstream fails to compile here — verified
+by deleting one arm from each and getting `error[E0004]`.
+
+**Mutation-tested, 7 for 7**, scored on the full five-test `Summary` line:
 dropping `identity_type` (4 red); binding it off the `key_id` column (4 red);
 making the optional leg required (4 red); flattening §0.9 in each direction
-(2 red each); and re-introducing the shared-sentinel blind spot (1 red). The
-first also proves neither probe is vacuous — it reports
-`only ciris_verify_core binds: ["identity_type"]`, so both really did discover
-all four members off verify's own behaviour.
+(2 red each); re-introducing the shared-sentinel blind spot (1 red); and
+injecting an unmodelled binding error mid-probe (1 red). That last one is the
+one worth reading: against the wildcard this file originally shipped, the
+identical injection gave `5 tests run: 5 passed, 0 skipped` — fully green while
+the binding was still failing. The first also proves neither probe is vacuous —
+it reports `only ciris_verify_core binds: ["identity_type"]`, so both really did
+discover all four members off verify's own behaviour.
+
+Three real holes were found in this detector by review, all in the direction of
+false confidence, none by the suite being green. It is now **well attacked**,
+which is a weaker claim than obviously right, and the mutation table is the only
+evidence here that does not rest on the author's own reasoning.
 
 Filed CIRISVerify#254 asking verify to export the member list as data
 (`KeyRecord::subject_binding() -> SubjectBinding`), which would collapse the

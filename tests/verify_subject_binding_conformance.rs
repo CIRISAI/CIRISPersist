@@ -64,7 +64,28 @@
 //! construction); nothing here asserts an insertion order, which would be a
 //! false failure waiting to happen.
 //!
-//! # MUTATION-TESTED — 6 mutations, 6 killed
+//! # A new verify error variant is a COMPILE error here, not a fall-through
+//!
+//! The probes' convergence signal is *"the error stopped being a binding
+//! failure"*. Spelled as a `_` wildcard, that is wrong in the worst possible
+//! direction: a **new `SubjectBindingError` variant is still a binding
+//! failure**, but falls through the wildcard and reads as successful
+//! convergence. The probe then stops early, reports whatever subset it had
+//! found, and the whole conformance test goes GREEN if that subset happens to
+//! match persist's projection — the failure this file exists to prevent,
+//! triggered by the exact event it exists to detect, degrading toward agreement,
+//! which is the direction nobody investigates.
+//!
+//! Neither `SubjectBindingError` nor `ProvenanceError` is `#[non_exhaustive]`,
+//! so the guard is **structural rather than defensive**: both matches carry no
+//! wildcard, and a variant added in a future CIRISVerify fails to compile here.
+//! Checked, not assumed — deleting one arm from each yields
+//! `error[E0004]: non-exhaustive patterns … not covered`. The
+//! `SubjectBindingError` match lives in exactly one function
+//! ([`probe_advance`]) that both planes route through, so that is one compile
+//! error to resolve rather than two.
+//!
+//! # MUTATION-TESTED — 7 mutations, 7 killed
 //!
 //! A conformance test that passes under divergence is worse than none, because
 //! it certifies an agreement that does not exist. So the detector was checked
@@ -79,19 +100,37 @@
 //! | bind the absent PQC leg as `""` instead of `null` (optional ⇒ required) | **4 red** |
 //! | flatten §0.9 to unconditional refusal (fail-closed "simplification") | **2 red** |
 //! | flatten §0.9 to unconditional tolerance (the other direction) | **2 red** |
-//! | give two fixture fields one value again (the codex blind spot) | **1 red** |
+//! | give two fixture fields one value again (blind spot #2) | **1 red** |
+//! | inject an unmodelled binding error mid-probe (blind spot #3) | **1 red** |
 //!
-//! The first five mutate `src/federation/admission.rs`; the sixth mutates this
-//! file's own fixture, because the thing it proves is that
-//! [`every_fixture_field_carries_its_own_sentinel`] actually guards the
-//! distinguishability the other four depend on. The §0.9 pair legitimately
-//! leaves three tests green — they change absence handling, not the projection.
+//! The first five mutate `src/federation/admission.rs`; the last two mutate this
+//! file, because what they prove is that its own guards work. The §0.9 pair
+//! legitimately leaves three green — they change absence handling, not the
+//! projection.
+//!
+//! **Mutation 7 is the one worth reading.** It injects a `NotAnObject` binding
+//! failure *after* the full member set is discovered — the faithful silent-green
+//! scenario. Against the shipped code the probe panics and the test reds.
+//! Against the wildcard this file originally shipped, the identical injection
+//! gave `5 tests run: 5 passed, 0 skipped` — **fully green while the binding was
+//! still failing.** That is the measured difference the exhaustive match buys.
 //!
 //! The first mutation also proves neither probe is vacuous: the key-record one
 //! reports `only ciris_verify_core binds: ["identity_type"]`, and the
 //! provenance one reds on the same missing member — so both really did discover
 //! all four of verify's members off verify's own behaviour, rather than off a
 //! list written in this file.
+//!
+//! # How much to trust this file
+//!
+//! Three real holes have been found in it by review, all by codex, **all in the
+//! direction of false confidence**: a fixture whose fields were mutually
+//! indistinguishable, and this wildcard, plus the transport plane's coverage
+//! being overstated before the table below was written. None was found by the
+//! suite being green. The honest characterisation is that this detector is now
+//! **well attacked**, which is a different and weaker claim than obviously
+//! right — and the reason the mutation table above exists is that it is the only
+//! evidence here that does not rest on the author's own reasoning.
 //!
 //! # Three planes, and the two this file reaches
 //!
@@ -289,30 +328,14 @@ fn probe_verify_projection(materialize_optionals: bool) -> BTreeMap<String, Valu
     for _ in 0..128 {
         let record = verify_record(materialize_optionals, Value::Object(envelope.clone()));
         match record.check_subject_binding() {
+            // Ok is the ONLY convergence signal on this plane: the binding
+            // held, so every member has been discovered.
             Ok(()) => return discovered,
-            Err(SubjectBindingError::Missing { member, .. }) => {
-                // Non-null expectation (a null one would have been tolerated).
-                // Plant a value it cannot equal so the next pass reports WHAT
-                // it wanted.
-                envelope.insert(member, Value::String(PROBE_SENTINEL.to_string()));
+            Err(source) => {
+                if let Some((member, expected)) = probe_advance(source, &mut envelope) {
+                    discovered.insert(member, expected);
+                }
             }
-            Err(SubjectBindingError::Mismatch {
-                member, claimed, ..
-            }) => {
-                let expected: Value = serde_json::from_str(&claimed).unwrap_or_else(|e| {
-                    panic!(
-                        "#663: verify reported the value it expects for `{member}` as {claimed:?}, \
-                         which is not JSON ({e}). The probe reads verify's expectation out of this \
-                         field; if its encoding changed, this file must follow."
-                    )
-                });
-                envelope.insert(member.clone(), expected.clone());
-                discovered.insert(member, expected);
-            }
-            Err(other) => panic!(
-                "#663: the probe feeds verify a JSON object and every member it asks for, so the \
-                 only outcomes are Missing, Mismatch and Ok. Got: {other}"
-            ),
         }
     }
     panic!(
@@ -320,6 +343,74 @@ fn probe_verify_projection(materialize_optionals: bool) -> BTreeMap<String, Valu
          projection grew past 64 members or `check` no longer reports one failing member per \
          call — read `ciris_verify_core::subject_binding` before touching this bound."
     )
+}
+
+/// **Advance the probe by one reported binding failure — the single place this
+/// file interprets a [`SubjectBindingError`].**
+///
+/// Returns `Some((member, expected))` when verify has just revealed what it
+/// expects for a member, `None` when the step only planted a sentinel.
+///
+/// # This match is EXHAUSTIVE on purpose (CIRISPersist#666, third codex finding)
+///
+/// The provenance probe used to converge on "the error stopped being a binding
+/// failure", spelled as a `_` wildcard. But a **new `SubjectBindingError`
+/// variant is still a binding failure** — it would have fallen through that
+/// wildcard and read as successful convergence. The probe would then stop
+/// early, report whatever subset it had found, and the conformance test would
+/// go GREEN if that subset happened to match persist's projection.
+///
+/// That is the failure this file exists to prevent, triggered by the exact
+/// event it exists to detect — verify changing its projection — and it degrades
+/// **in the direction of agreement**, which is the direction nobody
+/// investigates.
+///
+/// `ciris_verify_core::subject_binding::SubjectBindingError` is **not**
+/// `#[non_exhaustive]`, so the fix is structural rather than defensive: this
+/// match carries no wildcard, and a variant added in a future CIRISVerify is a
+/// **compile error right here** instead of a silent fall-through. Both planes
+/// route through this one function, so that is one compile error to resolve,
+/// not two — and resolving it forces whoever bumps the pin to decide what the
+/// new variant means for the probe.
+///
+/// If verify ever marks the enum `#[non_exhaustive]`, this stops compiling
+/// without a wildcard; the replacement is a wildcard arm that **panics**, never
+/// one that converges.
+fn probe_advance(
+    source: SubjectBindingError,
+    envelope: &mut Map<String, Value>,
+) -> Option<(String, Value)> {
+    match source {
+        SubjectBindingError::Missing { member, .. } => {
+            // Non-null expectation (a null one would have been tolerated).
+            // Plant a value it cannot equal so the next pass reports WHAT it
+            // wanted.
+            envelope.insert(member, Value::String(PROBE_SENTINEL.to_string()));
+            None
+        }
+        SubjectBindingError::Mismatch {
+            member, claimed, ..
+        } => {
+            let expected: Value = serde_json::from_str(&claimed).unwrap_or_else(|e| {
+                panic!(
+                    "#663: verify reported the value it expects for `{member}` as {claimed:?}, \
+                     which is not JSON ({e}). The probe reads verify's expectation out of this \
+                     field; if its encoding changed, this file must follow."
+                )
+            });
+            envelope.insert(member.clone(), expected.clone());
+            Some((member, expected))
+        }
+        // The probe always feeds a JSON object, so this is unreachable for a
+        // correct probe — and it is a BINDING FAILURE, so it must never be
+        // mistaken for convergence. Loud, not silent.
+        SubjectBindingError::NotAnObject { context } => panic!(
+            "#663: verify reported NotAnObject ({context}) — the binding is still FAILING, but \
+             the probe feeds a JSON object at every step, so this cannot happen unless the probe \
+             itself is broken. Refusing to treat a live binding failure as convergence: doing so \
+             would report whatever subset had been discovered and go green on it."
+        ),
+    }
 }
 
 /// The members verify projects as **optional** — expected `null` when the
@@ -809,31 +900,42 @@ fn probe_verify_provenance_projection(materialize_optionals: bool) -> BTreeMap<S
         // No trusted bootstrap keys: the binding is checked long before any
         // anchor resolution, which is the property rule 4 exists to give.
         match ciris_verify_core::provenance::verify_provenance_chain(&chain, &[]) {
-            Err(ProvenanceError::SubjectBindingFailed {
-                source: SubjectBindingError::Missing { member, .. },
-                ..
-            }) => {
-                envelope.insert(member, Value::String(PROBE_SENTINEL.to_string()));
+            // STILL a binding failure — never convergence, whatever the source
+            // variant is. `probe_advance` matches the source EXHAUSTIVELY, so a
+            // new `SubjectBindingError` variant is a compile error there rather
+            // than a silent fall-through here.
+            Err(ProvenanceError::SubjectBindingFailed { source, .. }) => {
+                if let Some((member, expected)) = probe_advance(source, &mut envelope) {
+                    discovered.insert(member, expected);
+                }
             }
-            Err(ProvenanceError::SubjectBindingFailed {
-                source:
-                    SubjectBindingError::Mismatch {
-                        member, claimed, ..
-                    },
-                ..
-            }) => {
-                let expected: Value = serde_json::from_str(&claimed).unwrap_or_else(|e| {
-                    panic!(
-                        "#663: verify's provenance walk reported the value it expects for \
-                         `{member}` as {claimed:?}, which is not JSON ({e})."
-                    )
-                });
-                envelope.insert(member.clone(), expected.clone());
-                discovered.insert(member, expected);
-            }
-            // Any other outcome means the SUBJECT BINDING passed and a later
-            // check is speaking. That is the probe's convergence signal.
-            _ => return discovered,
+            // Convergence: the binding for link 0 PASSED and some later check
+            // (hash, linkage, terminus, signature) is speaking instead.
+            //
+            // Listed EXHAUSTIVELY rather than as a `_` wildcard — `ProvenanceError`
+            // is not `#[non_exhaustive]`, so a variant added in a future
+            // CIRISVerify is a COMPILE ERROR here, forcing whoever bumps the pin
+            // to classify it as "binding failure" or "later check". A wildcard
+            // would classify it silently, as convergence, which is the direction
+            // that goes green.
+            Ok(())
+            | Err(
+                ProvenanceError::EmptyChain
+                | ProvenanceError::OverDepth { .. }
+                | ProvenanceError::QueriedKeyMismatch
+                | ProvenanceError::BrokenLink { .. }
+                | ProvenanceError::SelfSignedMidChain { .. }
+                | ProvenanceError::TerminusNotSelfSigned
+                | ProvenanceError::TerminusNotSteward { .. }
+                | ProvenanceError::BadContentHash { .. }
+                | ProvenanceError::ContentHashMismatch { .. }
+                | ProvenanceError::BadSignatureEncoding { .. }
+                | ProvenanceError::BadKeyEncoding { .. }
+                | ProvenanceError::ParentMissingPqcKey { .. }
+                | ProvenanceError::ScrubSignatureInvalid { .. }
+                | ProvenanceError::UntrustedAnchor { .. }
+                | ProvenanceError::LinkNotHybrid { .. },
+            ) => return discovered,
         }
     }
     panic!(
