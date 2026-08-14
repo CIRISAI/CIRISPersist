@@ -20,7 +20,9 @@
 //! 5. CIRISCore returns the signature (64-byte Ed25519 sig, base64
 //!    standard).
 //! 6. Replace the `__SCRUB_SIGNATURE_BASE64__` placeholder in
-//!    `migrations/postgres/lens/V005__persist_steward_bootstrap.sql`
+//!    the persist-steward bootstrap record (constructed in code — there is no
+//!    `V005__persist_steward_bootstrap.sql` in either migration tree; see
+//!    CIRISPersist#680)
 //!    (and the SQLite mirror) with the returned signature; commit.
 //! 7. Publish the persist-steward fingerprint
 //!    (hex SHA-256 of pubkey raw bytes) in `CHANGELOG.md` v0.2.0 entry
@@ -161,9 +163,17 @@ fn main() {
             "step_5_received_from_ciriscore": [
                 "scrub_signature_base64 (Ed25519 signature over signing_input_base64)",
             ],
+            // v31.3.0 (CIRISPersist#680) — these two paths named files that
+            // exist in NEITHER migration tree, and never did: nothing under
+            // `migrations/` mentions `persist_steward` at all. V005 is
+            // `V005__readonly_role.sql` on postgres and has no sqlite twin.
+            // The list described a plan that was not executed the way it was
+            // written, and a citation to a phantom file is worse than no
+            // citation — it is the thing a reader trusts instead of looking.
             "step_6_baked_into_persist_repo": [
-                "migrations/postgres/lens/V005__persist_steward_bootstrap.sql",
-                "migrations/sqlite/lens/V005__persist_steward_bootstrap.sql",
+                "NOTE (#680): no migration carries this row. The bootstrap \
+                 record is constructed in code, not baked into DDL — see \
+                 `federation::types` and the `persist-steward` fixtures.",
                 "CHANGELOG.md v0.2.0 entry (publishing fingerprint_hex)",
                 "docs/FEDERATION_DIRECTORY.md §\"Bootstrap\" pinning section",
             ],

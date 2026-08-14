@@ -7,6 +7,47 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.3.0] - 2026-08-14
 
+### Added — the matrix was a union on the backend axis, and it cost two build breaks in one day (#678)
+
+Every test leg is `BASE + axis`, and `BASE = (postgres, server, pyo3, sqlite)` —
+**both backends, always**. So no leg had ever built an axis feature without a
+backend, or with only one, and `LINT_SHIPPED` has the same shape. The matrix was
+itself a union on the backend axis: the exact blindness it exists to prevent,
+one level up.
+
+v31.1.0 paid for it twice in a single day, both green on every backend leg:
+`--features cirisnode` alone could not compile the test target at all, and the
+`default` leg died `exit=101` on a witness importing a module gated narrower
+than itself.
+
+`certify.sh` now sweeps **axis × {none, sqlite, postgres}** — 15 configurations,
+**compile-only on purpose**. Both breaks were compile errors, so `cargo check`
+catches them with no test run and no database; the question asked is *"does this
+configuration exist"*, not *"does it pass"*.
+
+It found a live one immediately — `cirisnode,postgres` was red with 7 errors, and
+all three causes were the same shape, an item gated broader than what it needs:
+
+- a `NodeCoreDispatch` match whose **postgres arm was gated and whose sqlite arm
+  was not**, so the postgres-only build referenced a variant that does not exist
+  there — asymmetric gating on two arms of one match, invisible to any build
+  carrying both;
+- `node_core_service_sqlite_round_trip`, gated on the backend *union* while
+  asserting the **sqlite** dispatch variant — the name was not decoration;
+- two postgres "PG twin" tests seeding through `media_seed*`, whose bodies match
+  `NodeCoreDispatch::Sqlite`, so they need sqlite as well.
+
+### Fixed — two migration citations named files that exist in neither tree (#680)
+
+`derive_persist_steward_bootstrap.rs` cited
+`migrations/{postgres,sqlite}/lens/V005__persist_steward_bootstrap.sql` in both
+its module doc and its `_handoff` output. Neither exists, and nothing under
+`migrations/` mentions `persist_steward` at all — V005 is `V005__readonly_role.sql`
+on postgres with no sqlite twin. The list described a plan that was not executed
+the way it was written. **A citation to a phantom file is worse than no citation:
+it is the thing a reader trusts instead of looking.** Replaced with what is
+actually true — the bootstrap record is constructed in code, not baked into DDL.
+
 ### Added — backend parity is an enforced invariant now, not a claim (#670)
 
 `README.md` has said for some time that persist behaves the same on postgres,
