@@ -2366,6 +2366,31 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error>;
 
+    /// v31.1.0 (CIRISPersist#662) — the RECEIVE half of the evidence plane:
+    /// admit a bundle by re-tallying it against this node's own accord roster,
+    /// then re-derive this node's own withdrawal tombstones. Fail-closed with
+    /// [`Error::AccordEvidenceUnverified`]; idempotent on replay. See
+    /// [`accord_carriage::admit_replicated_accord_evidence`], which is the
+    /// shared body every backend delegates to.
+    ///
+    /// # Why this is on the trait and not only a free function
+    ///
+    /// The free function composes five directory calls
+    /// (`issue_accord_nonce`, `put_accord_proposal`, `put_accord_participation`,
+    /// `list_accord_participations`, plus the projection's reads), which is
+    /// fine against a real backend and useless across the FFI directory
+    /// capsule, where those primitives are `Unsupported`. A capsule-backed
+    /// consumer could then SERVE evidence and never apply it — the plane
+    /// admitted through one door and not another, which is the class
+    /// CIRISPersist#652 was found by counting. As a trait method the capsule
+    /// routes it as ONE op that runs the whole re-tally inside persist's own
+    /// `.so`, which is also where it belongs: the re-derivation must not be
+    /// something a consumer can reassemble differently.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &accord_carriage::AccordQuorumEvidence,
+    ) -> Result<accord_carriage::AccordEvidenceAdmission, Error>;
+
     // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
     //     index (V111 `signed_wire_index`). One shared table covers every
     //     kind edge serves: the 5 primary planes above, the 5 #504 E4

@@ -510,6 +510,23 @@ pub async fn wire_refs_for_subject(
         let rk = record_key(&[("attestation_id", &a.attestation_id)]);
         out.push(("Attestation", content_hash_of(&a)?, rk));
     }
+    // v31.1.0 (CIRISPersist#655, PR review P1) — the key-level revocation
+    // plane. Indexing it made a revocation FETCHABLE by content hash; without
+    // a ref here it stayed UNDISCOVERABLE, because the subject-scoped pull is
+    // how a peer learns which hashes to ask for. #655 is only closed when both
+    // are true — a plane that replicates but that nobody asks for is
+    // rebuildable in principle and unreachable in practice.
+    //
+    // A revocation OF a key is squarely "what is about me", which is the axis
+    // this read answers.
+    for revocation in dir.revocations_for(subject_key_id).await? {
+        let rk = record_key(&[
+            ("revoked_key_id", &revocation.revoked_key_id),
+            ("revocation_id", &revocation.revocation_id),
+        ]);
+        let wrapped = super::SignedRevocation { revocation };
+        out.push(("Revocation", content_hash_of(&wrapped)?, rk));
+    }
     for r in dir
         .list_signed_identity_occurrences_for(subject_key_id)
         .await?

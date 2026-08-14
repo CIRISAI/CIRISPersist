@@ -116,15 +116,32 @@ pub struct AccordQuorumEvidence {
     /// Each carries the holder's hybrid threshold signature over the
     /// proposal digest + seat + vote, which is what the receiver re-verifies.
     pub participations: Vec<AccordParticipation>,
-    /// When THIS node admitted the proposal — the cursor field for
-    /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`](super::FederationDirectory::list_signed_accord_quorum_evidence_since),
-    /// so a caller can resume from the last element of a page.
+    /// v31.1.0 (CIRISPersist#662, PR review P1) — **the bundle's visibility
+    /// instant**: `max(proposal.created_at, max(participation.server_arrival_at))`,
+    /// and the cursor field for
+    /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`](super::FederationDirectory::list_signed_accord_quorum_evidence_since).
     ///
-    /// Local admission metadata, deliberately: it is NOT part of the evidence
-    /// and nothing verifies against it. A receiver stamps its own on admit
-    /// rather than adopting the sender's, so a peer cannot backdate a bundle
-    /// past another node's cursor.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// # Why not the proposal's `created_at`
+    ///
+    /// A bundle is an AGGREGATE — its content changes every time a holder's
+    /// vote lands — so an immutable per-proposal cursor is unsound in both
+    /// directions. A peer that read a proposal at one YES and advanced past
+    /// its `created_at` would permanently skip the quorum-bearing version that
+    /// arrives minutes later; a peer that refused to advance would wedge its
+    /// cursor behind a proposal it can never admit. Neither is recoverable
+    /// without a full re-scan, on the one plane whose entire purpose is that
+    /// exclusion state converges.
+    ///
+    /// Keying on the latest evidence instead makes a vote's arrival move the
+    /// bundle forward in the stream, so it is re-offered exactly when it has
+    /// something new to say. This is the same "visibility timestamp" shape
+    /// [`list_attestations_since`](super::FederationDirectory::list_attestations_since)
+    /// uses (`COALESCE(promoted_at, asserted_at)`) and for the same reason.
+    ///
+    /// Local metadata, deliberately: nothing verifies against it, and a
+    /// receiver stamps its own rather than adopting the sender's, so a peer
+    /// cannot backdate a bundle past another node's cursor.
+    pub evidence_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// v31.1.0 (CIRISPersist#662) — what an [`admit_replicated_accord_evidence`]
@@ -261,6 +278,19 @@ pub async fn admit_replicated_accord_evidence_over_roster(
     .await?;
 
     // (1) Family scope.
+    //
+    // NOT the only thing keeping out-of-family evidence out, and the mutation
+    // harness proved it: deleting this branch leaves the bundle refused anyway,
+    // because `AccordParticipation::verify` binds `family_key_id` inside each
+    // holder's signature, so re-pointing a proposal at another family
+    // invalidates every vote and the step-(3) tally reaches zero.
+    //
+    // It stays because the two refusals say different things. Without it an
+    // operator reads "insufficient accord quorum: 0 YES votes" for a bundle
+    // whose votes are all present and valid — a true statement that sends them
+    // hunting a partition. The enumerated check names the actual fault. Kept as
+    // the LEGIBLE layer over a safety property enforced one level down, and
+    // labelled so, rather than left to look load-bearing.
     if evidence.proposal.family_key_id
         != ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
     {
@@ -306,7 +336,10 @@ pub async fn admit_replicated_accord_evidence_over_roster(
             evidence.authority_signature.clone(),
         )
         .await?;
-    let before = directory.list_accord_participations(&proposal_digest).await?.len();
+    let before = directory
+        .list_accord_participations(&proposal_digest)
+        .await?
+        .len();
     for participation in &evidence.participations {
         // Re-verified a second time, per row, as it lands: the member must be
         // in the roster and `AccordParticipation::verify` must pass.
@@ -314,7 +347,10 @@ pub async fn admit_replicated_accord_evidence_over_roster(
             .put_accord_participation(participation.clone(), &roster)
             .await?;
     }
-    let after = directory.list_accord_participations(&proposal_digest).await?.len();
+    let after = directory
+        .list_accord_participations(&proposal_digest)
+        .await?
+        .len();
 
     // (5) Re-derive OUR OWN withdrawal projection. This is why (4) is safe.
     let withdrawals_projected =
@@ -416,34 +452,154 @@ pub async fn project_role_withdrawals_for_proposal(
     proposal: &AccordProposal,
     roster_key_ids: &[String],
 ) -> Result<Vec<(String, String)>, Error> {
-    let candidates = directory.list_signed_key_records_since(None, u32::MAX).await?;
+    let candidates = directory
+        .list_signed_key_records_since(None, u32::MAX)
+        .await?;
     let proposal_digest = proposal.digest();
     let mut projected: Vec<(String, String)> = Vec::new();
     for candidate in &candidates {
         let key_id = &candidate.record.key_id;
         for (op, role) in withdrawal_ops_for(&candidate.record) {
-            let expected = canonical_withdrawal_payload_sha256(&op, key_id, None)?;
-            if expected != proposal.payload_sha256 {
+            if canonical_withdrawal_payload_sha256(&op, key_id, None)? != proposal.payload_sha256 {
                 continue;
             }
-            // The FULL authority core, re-run: stored proposal, family scope,
-            // payload binding, and a fresh `tally_live_quorum` over our own
-            // stored participations at the strict-majority threshold.
-            let authority_digest = super::admission::verify_withdrawal_authority_over_roster(
+            if try_record_withdrawal(
                 directory,
                 &proposal_digest,
                 &op,
+                &role,
                 key_id,
                 roster_key_ids,
             )
-            .await?;
-            record_projected_withdrawal(directory, &role, key_id, &authority_digest).await?;
-            projected.push((role, key_id.clone()));
+            .await?
+            {
+                projected.push((role, key_id.clone()));
+            }
         }
     }
     projected.sort();
     projected.dedup();
     Ok(projected)
+}
+
+/// Re-run the FULL #377 authority core for one `(proposal, op, key_id)` and,
+/// if it holds, record the tombstone. `Ok(true)` iff a withdrawal was
+/// authorized.
+///
+/// **A payload MATCH is not authority.** `accord_proposal` also holds
+/// proposals this node accepted through its own local server-issued door —
+/// including ones that never reached quorum, or have not yet — so the tally
+/// runs here even when [`admit_replicated_accord_evidence`] already ran one.
+///
+/// A `canonical_withdrawal_authority_invalid` refusal means "this proposal
+/// does not authorize this withdrawal", which is an ordinary state (a
+/// rejected or in-flight proposal), so it returns `Ok(false)` rather than
+/// failing the sweep. Any other error propagates: a backend fault must never
+/// read as "nothing to project".
+async fn try_record_withdrawal(
+    directory: &dyn FederationDirectory,
+    proposal_digest: &str,
+    op: &str,
+    role: &str,
+    key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    let authority_digest = match super::admission::verify_withdrawal_authority_over_roster(
+        directory,
+        proposal_digest,
+        op,
+        key_id,
+        roster_key_ids,
+    )
+    .await
+    {
+        Ok(digest) => digest,
+        Err(e) if e.kind() == "canonical_withdrawal_authority_invalid" => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    record_projected_withdrawal(directory, role, key_id, &authority_digest).await?;
+    Ok(true)
+}
+
+/// v31.1.0 (CIRISPersist#662, PR review P1) — **the ordering fix: project the
+/// withdrawal for ONE key, from evidence this node already holds.**
+///
+/// # The gap this closes
+///
+/// [`project_role_withdrawals_for_proposal`] searches the keys the receiver
+/// has *at that moment*. Planes replicate independently, so the accord
+/// evidence for a withdrawal can legitimately arrive BEFORE the key it
+/// withdraws — a fresh node catching up, or any anti-entropy round that
+/// happens to order the `AccordQuorumEvidence` page ahead of the `Key` page.
+/// The evidence then projects nothing, and when the key later lands its
+/// admission gate consults `lookup_role_withdrawal`, finds nothing, and
+/// confers the withdrawn role.
+///
+/// That is the design's own failure mode arriving through ORDERING rather
+/// than through trust: the evidence is present, the derived state is silently
+/// missing, and only an operator running
+/// [`rematerialize_role_withdrawals`] would ever notice.
+///
+/// So the role-admission gates call this for the key in front of them, before
+/// they consult the tombstone. It is a derivation, not an admission: it writes
+/// only a tombstone the node re-tallied itself, from a proposal already in its
+/// own state. `Ok(true)` iff a tombstone was materialized by this call.
+///
+/// Cheap where it runs: the gates fast-path out unless the row actually claims
+/// the gated role, so this is on the accord-conferral path only, never on
+/// ordinary key registration.
+pub async fn project_role_withdrawal_for_key(
+    directory: &dyn FederationDirectory,
+    role: &str,
+    key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    // Already materialized — the common case, and the cheapest exit.
+    let existing = if role == identity_type::CANONICAL {
+        directory
+            .lookup_canonical_withdrawal(key_id)
+            .await?
+            .map(|_| ())
+    } else {
+        directory
+            .lookup_role_withdrawal(role, key_id)
+            .await?
+            .map(|_| ())
+    };
+    if existing.is_some() {
+        return Ok(false);
+    }
+
+    let op = if role == identity_type::CANONICAL {
+        OP_WITHDRAW_CANONICAL.to_owned()
+    } else if role == roles::INFRA_ATTEST {
+        OP_WITHDRAW_INFRA_ATTEST.to_owned()
+    } else {
+        op_withdraw_role(role)
+    };
+    let expected = canonical_withdrawal_payload_sha256(&op, key_id, None)?;
+
+    for bundle in directory
+        .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+        .await?
+    {
+        if bundle.proposal.payload_sha256 != expected {
+            continue;
+        }
+        if try_record_withdrawal(
+            directory,
+            &bundle.proposal.digest(),
+            &op,
+            role,
+            key_id,
+            roster_key_ids,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v31.1.0 (CIRISPersist#662) — **the repair door: re-derive every withdrawal
@@ -492,9 +648,16 @@ pub async fn rematerialize_role_withdrawals_over_roster(
 /// calls once it has selected its page of proposals.
 ///
 /// Written against `&dyn FederationDirectory` so the "sorted by `member_id`"
-/// determinism rule lives in ONE place: three backends each sorting their own
-/// way is exactly the preserve-set ≢ verified-set shape CIRISPersist#541 paid
-/// for, one plane over.
+/// determinism rule AND the [`AccordQuorumEvidence::evidence_at`] derivation
+/// live in ONE place: three backends each spelling those their own way is
+/// exactly the preserve-set ≢ verified-set shape CIRISPersist#541 paid for,
+/// one plane over.
+///
+/// Each backend's `WHERE`/`ORDER BY` computes the same
+/// `max(created_at, max(server_arrival_at))` in SQL so the page can be limited
+/// server-side; this recomputes it from the participations it has just loaded,
+/// which is what keeps the value a caller resumes from equal to the value the
+/// query filtered on.
 pub async fn assemble_evidence_page(
     directory: &dyn FederationDirectory,
     proposals: Vec<super::accord_quorum::StoredProposal>,
@@ -502,19 +665,691 @@ pub async fn assemble_evidence_page(
     let mut out = Vec::with_capacity(proposals.len());
     for stored in proposals {
         let digest = stored.proposal.digest();
-        let mut participations: Vec<AccordParticipation> = directory
-            .list_accord_participations(&digest)
-            .await?
-            .into_iter()
-            .map(|s| s.participation)
-            .collect();
+        let rows = directory.list_accord_participations(&digest).await?;
+        let evidence_at = rows
+            .iter()
+            .map(|r| r.server_arrival_at)
+            .max()
+            .map_or(stored.created_at, |latest| latest.max(stored.created_at));
+        let mut participations: Vec<AccordParticipation> =
+            rows.into_iter().map(|s| s.participation).collect();
         participations.sort_by(|a, b| a.member_id.cmp(&b.member_id));
         out.push(AccordQuorumEvidence {
             proposal: stored.proposal,
             authority_signature: stored.authority_signature,
             participations,
-            created_at: stored.created_at,
+            evidence_at,
         });
     }
     Ok(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v31.1.0 (CIRISPersist#655 / CIRISPersist#662) — the carriage witnesses.
+//
+// Run against `&dyn FederationDirectory` on memory, sqlite AND postgres. The
+// cross-node legs need TWO directories of the SAME backend: the property under
+// test is "a node that never saw the tombstone rebuilds it", and a fixture
+// that stood node B up on a different backend would be proving something
+// weaker on the one that matters.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod carriage_tests {
+    use super::*;
+    use crate::federation::accord_quorum::test_fixtures::signed_participation;
+    use crate::federation::admission::{
+        is_infra_attest, is_infra_attest_effective, withdraw_infra_attest_role_over_roster,
+    };
+    use crate::federation::operational::test_support::{
+        register_accord_holder, signed_canonical_record_with_roles, Identity,
+        PLACEHOLDER_SUBJECT_ED25519_BASE64,
+    };
+    use crate::federation::SignedKeyRecord;
+    use ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    use ciris_verify_core::accord_live_quorum::{AccordAction, Vote};
+
+    /// One node's fixture state. Both nodes in a pair resolve the SAME roster
+    /// — the PRODUCTION accord holders (A1/B1/C1), registered under
+    /// deterministic test hybrid keys.
+    ///
+    /// Using the real roster rather than a synthetic one is load-bearing here,
+    /// not tidiness: the withdrawal projection that the role-admission gates
+    /// invoke resolves its roster from `accord_holder_roster_key_ids()` (as
+    /// production does), so a fixture with a side roster would leave the
+    /// ordering leg below silently unexercised.
+    struct Node {
+        holders: Vec<Identity>,
+        roster: Vec<ThresholdMember>,
+        roster_key_ids: Vec<String>,
+    }
+
+    /// Seed the accord family (A1/B1/C1 under test hybrid keys) — one roster
+    /// for both the `infra:attest` ADD co-scrub and the destructive quorum,
+    /// exactly as production has it.
+    async fn seed_node(dir: &dyn FederationDirectory) -> Node {
+        let holders: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for h in &holders {
+            register_accord_holder(dir, h)
+                .await
+                .expect("register accord holder");
+        }
+        let roster: Vec<ThresholdMember> = holders.iter().map(|h| h.member()).collect();
+        Node {
+            holders,
+            roster,
+            roster_key_ids: accord_holder_roster_key_ids(),
+        }
+    }
+
+    /// A 2-of-3 co-scrubbed pipeline record carrying `infra:attest`.
+    fn infra_attest_record(node: &Node, key_id: &str) -> SignedKeyRecord {
+        SignedKeyRecord {
+            record: signed_canonical_record_with_roles(
+                key_id,
+                identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                vec![roles::INFRA_ATTEST.to_owned()],
+                serde_json::json!({ "key_id": key_id }),
+                &[&node.holders[0], &node.holders[1]],
+            ),
+        }
+    }
+
+    /// Admit a 2-of-3 co-scrubbed pipeline key carrying `infra:attest`.
+    async fn confer_infra_attest(dir: &dyn FederationDirectory, node: &Node, key_id: &str) {
+        dir.put_public_key(infra_attest_record(node, key_id))
+            .await
+            .expect("2-of-3 co-scrubbed infra:attest pipeline must be ADMITTED");
+    }
+
+    /// Seed a STORED proposal committing to `(op, target)` plus one signed YES
+    /// per holder index in `yes_voters`. Returns the proposal digest.
+    async fn seed_quorum(
+        dir: &dyn FederationDirectory,
+        node: &Node,
+        op: &str,
+        target: &str,
+        yes_voters: &[usize],
+        nonce: &str,
+    ) -> String {
+        let payload_sha256 =
+            canonical_withdrawal_payload_sha256(op, target, None).expect("payload sha256");
+        let proposal = AccordProposal {
+            family_key_id: HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+            action: AccordAction::RosterChange,
+            nonce: nonce.to_owned(),
+            window_until: "2031-01-01T00:00:00Z".to_owned(),
+            prior_family_digest: "prior-family-digest".to_owned(),
+            payload_sha256,
+        };
+        dir.issue_accord_nonce(HUMANITY_ACCORD_FAMILY_KEY_ID, nonce)
+            .await
+            .expect("issue nonce");
+        dir.put_accord_proposal(proposal.clone(), None)
+            .await
+            .expect("put proposal");
+        for &i in yes_voters {
+            dir.put_accord_participation(
+                signed_participation(&node.holders[i], &proposal, Vote::Yes),
+                &node.roster,
+            )
+            .await
+            .expect("put participation");
+        }
+        proposal.digest()
+    }
+
+    /// **THE WITNESS.** A withdrawal that exists on node A reaches node B
+    /// without the withdrawal row ever crossing the wire — because B re-tallies
+    /// the evidence and re-derives its own tombstone.
+    async fn run_carriage_matrix(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let na = seed_node(a).await;
+        let nb = seed_node(b).await;
+        // Both nodes resolve the production roster from their OWN state. If
+        // this ever stopped holding, every "B re-derived it" assertion below
+        // would be measuring a roster mismatch instead.
+        assert_eq!(na.roster_key_ids, nb.roster_key_ids);
+
+        let ci = format!("ci-{tag}");
+        confer_infra_attest(a, &na, &ci).await;
+        confer_infra_attest(b, &nb, &ci).await;
+        assert!(is_infra_attest_effective(a, &ci).await.unwrap());
+        assert!(is_infra_attest_effective(b, &ci).await.unwrap());
+
+        // ── A withdraws locally, through the existing #424 destructive op. ──
+        let digest = seed_quorum(
+            a,
+            &na,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci,
+            &[0, 1],
+            &format!("nw-{tag}"),
+        )
+        .await;
+        withdraw_infra_attest_role_over_roster(a, &ci, &digest, &na.roster_key_ids)
+            .await
+            .expect("a genuine strict-majority withdraw must succeed on A");
+        assert!(!is_infra_attest_effective(a, &ci).await.unwrap());
+
+        // ── (1) THE DEFECT, stated as state: B holds the key, holds the role,
+        //        and has no way to learn it was withdrawn. ──
+        assert!(
+            b.lookup_role_withdrawal(roles::INFRA_ATTEST, &ci)
+                .await
+                .unwrap()
+                .is_none(),
+            "(1) B must start with no tombstone — that IS the defect"
+        );
+        assert!(
+            is_infra_attest_effective(b, &ci).await.unwrap(),
+            "(1) so B still treats a withdrawn build-signing key as a trust root"
+        );
+
+        // ── (2) SERVE the evidence from A. ──
+        let page = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap();
+        let bundle = page
+            .iter()
+            .find(|e| e.proposal.digest() == digest)
+            .expect("(2) the withdrawal's evidence must be servable")
+            .clone();
+        assert_eq!(bundle.participations.len(), 2, "(2) both YES votes ride");
+        // The bundle is EVIDENCE. Nothing derived travels with it: no verdict
+        // bool, no tombstone columns. A reader that wanted the answer without
+        // computing it would find nothing to read.
+        let wire = serde_json::to_string(&bundle).expect("bundle serializes");
+        for verdict_field in ["withdrawn_at", "authorized", "authority_decision_digest"] {
+            assert!(
+                !wire.contains(verdict_field),
+                "(2) {verdict_field:?} must NOT ride the wire — the receiver derives it: {wire}"
+            );
+        }
+        // Deterministic ordering, so two backends serving the same bundle
+        // serialize the same bytes.
+        let members: Vec<&str> = bundle
+            .participations
+            .iter()
+            .map(|p| p.member_id.as_str())
+            .collect();
+        let mut sorted = members.clone();
+        sorted.sort_unstable();
+        assert_eq!(members, sorted, "(2) participations are member_id-ordered");
+
+        // ── (3) ADMIT on B. The re-tally is the gate. ──
+        let admission =
+            admit_replicated_accord_evidence_over_roster(b, &bundle, &nb.roster_key_ids)
+                .await
+                .expect("(3) a strict-majority bundle must be admitted");
+        assert_eq!(admission.proposal_digest, digest);
+        assert_eq!(admission.yes, 2, "(3) B counted the votes itself");
+        assert_eq!(admission.threshold, 2, "(3) strict majority of 3");
+        assert_eq!(admission.roster_size, 3);
+        assert_eq!(
+            admission.withdrawals_projected,
+            vec![(roles::INFRA_ATTEST.to_owned(), ci.clone())],
+            "(3) the admit re-derived exactly the one tombstone its evidence supports"
+        );
+
+        // ── (4) B re-derived its OWN tombstone, and it points at the same
+        //        authority A's does. ──
+        let w = b
+            .lookup_role_withdrawal(roles::INFRA_ATTEST, &ci)
+            .await
+            .unwrap()
+            .expect("(4) B must now hold a locally-derived tombstone");
+        assert_eq!(
+            w.authority_decision_digest, digest,
+            "(4) anchored to the proposal B re-tallied"
+        );
+        assert!(
+            is_infra_attest(b, &ci).await.unwrap(),
+            "(4) the stored row is untouched — tombstones never mutate rows"
+        );
+        assert!(
+            !is_infra_attest_effective(b, &ci).await.unwrap(),
+            "(4) but the EFFECTIVE read flips false, which is the whole point"
+        );
+
+        // ── (5) Idempotent replay: a carrier re-offering the same bundle
+        //        changes nothing. ──
+        let again = admit_replicated_accord_evidence_over_roster(b, &bundle, &nb.roster_key_ids)
+            .await
+            .expect("(5) replay must be idempotent");
+        assert_eq!(again.participations_admitted, 0, "(5) nothing new landed");
+        assert_eq!(again.withdrawals_projected.len(), 1);
+
+        // ── (6) THE REPAIR DOOR. The exclusion is rebuildable from evidence
+        //        alone — this is the property #655/#662 are about. ──
+        let rebuilt = rematerialize_role_withdrawals_over_roster(b, &nb.roster_key_ids)
+            .await
+            .expect("(6) the repair sweep must run");
+        assert!(
+            rebuilt.contains(&(roles::INFRA_ATTEST.to_owned(), ci.clone())),
+            "(6) the sweep re-derives the tombstone from stored evidence: {rebuilt:?}"
+        );
+
+        // ── (7) BELOW QUORUM IS REFUSED, and nothing lands. ──
+        let ci_weak = format!("weak-{tag}");
+        confer_infra_attest(a, &na, &ci_weak).await;
+        confer_infra_attest(b, &nb, &ci_weak).await;
+        let weak_digest = seed_quorum(
+            a,
+            &na,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci_weak,
+            &[0],
+            &format!("wk-{tag}"),
+        )
+        .await;
+        let weak = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == weak_digest)
+            .expect("(7) a 1-of-3 bundle is still servable");
+        let err = admit_replicated_accord_evidence_over_roster(b, &weak, &nb.roster_key_ids)
+            .await
+            .expect_err("(7) one YES is below a strict majority of three");
+        assert_eq!(err.kind(), "accord_evidence_unverified", "{err}");
+        assert!(
+            b.get_accord_proposal(&weak_digest).await.unwrap().is_none(),
+            "(7) fail-closed: a refused bundle stores no proposal"
+        );
+        assert!(
+            b.lookup_role_withdrawal(roles::INFRA_ATTEST, &ci_weak)
+                .await
+                .unwrap()
+                .is_none(),
+            "(7) and projects no tombstone"
+        );
+        assert!(is_infra_attest_effective(b, &ci_weak).await.unwrap());
+
+        // ── (8) STRIPPED SIGNATURES ARE NOT A SHORTCUT. A bundle that ASSERTS
+        //        authority — `authority_signature: {"authorized": true}` — and
+        //        carries no verifiable votes. A receiver that trusted the
+        //        sender would see a well-formed accord decision; one that
+        //        re-tallies sees zero. ──
+        let ci_forge = format!("forge-{tag}");
+        confer_infra_attest(b, &nb, &ci_forge).await;
+        let forged = AccordQuorumEvidence {
+            proposal: AccordProposal {
+                family_key_id: HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+                action: AccordAction::RosterChange,
+                nonce: format!("fg-{tag}"),
+                window_until: "2031-01-01T00:00:00Z".to_owned(),
+                prior_family_digest: "prior-family-digest".to_owned(),
+                payload_sha256: canonical_withdrawal_payload_sha256(
+                    OP_WITHDRAW_INFRA_ATTEST,
+                    &ci_forge,
+                    None,
+                )
+                .unwrap(),
+            },
+            authority_signature: Some(serde_json::json!({ "authorized": true })),
+            participations: Vec::new(),
+            evidence_at: chrono::Utc::now(),
+        };
+        let ferr = admit_replicated_accord_evidence_over_roster(b, &forged, &nb.roster_key_ids)
+            .await
+            .expect_err("(8) an unsigned assertion of authority must be REFUSED");
+        assert_eq!(ferr.kind(), "accord_evidence_unverified", "{ferr}");
+        assert!(
+            is_infra_attest_effective(b, &ci_forge).await.unwrap(),
+            "(8) and the forged withdrawal excluded nothing"
+        );
+
+        // ── (9) OUT-OF-FAMILY EVIDENCE IS REFUSED, **and says so**.
+        //
+        //   The refusal alone is not the property. Mutation testing showed that
+        //   deleting the family check leaves this bundle refused regardless:
+        //   `AccordParticipation::verify` binds `family_key_id` inside each
+        //   signature, so re-pointing the proposal invalidates every vote and
+        //   the tally reaches zero by another route. An `assert_eq!(kind, ..)`
+        //   here passed with the gate removed — a check that could not fail.
+        //
+        //   So this pins the DIAGNOSIS, which is the only thing the enumerated
+        //   gate actually adds: an operator must not be told "0 YES votes"
+        //   about a bundle whose votes are all present and valid.
+        let mut off_family = bundle.clone();
+        off_family.proposal.family_key_id = "not-the-humanity-accord".to_owned();
+        let oerr = admit_replicated_accord_evidence_over_roster(b, &off_family, &nb.roster_key_ids)
+            .await
+            .expect_err("(9) only the HUMANITY_ACCORD family may authorize");
+        assert_eq!(oerr.kind(), "accord_evidence_unverified", "{oerr}");
+        let omsg = format!("{oerr}");
+        assert!(
+            omsg.contains("not the HUMANITY_ACCORD family"),
+            "(9) the refusal must name the family fault, not report an empty tally: {omsg}"
+        );
+
+        // ── (10) A STORED PROPOSAL IS NOT AUTHORITY. A proposal that reached
+        //        this node through its own local server-issued door, committing
+        //        to a withdrawal but carrying NO votes, must project nothing.
+        //        Without the inner re-tally, a payload MATCH alone would write
+        //        the tombstone — authority by coincidence of digest. ──
+        let ci_bare = format!("bare-{tag}");
+        confer_infra_attest(b, &nb, &ci_bare).await;
+        seed_quorum(
+            b,
+            &nb,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci_bare,
+            &[],
+            &format!("br-{tag}"),
+        )
+        .await;
+        let swept = rematerialize_role_withdrawals_over_roster(b, &nb.roster_key_ids)
+            .await
+            .expect("(10) the sweep must skip an unauthorized proposal, not fail on it");
+        assert!(
+            !swept.contains(&(roles::INFRA_ATTEST.to_owned(), ci_bare.clone())),
+            "(10) a quorum-less proposal must project NOTHING: {swept:?}"
+        );
+        assert!(
+            is_infra_attest_effective(b, &ci_bare).await.unwrap(),
+            "(10) and the key keeps its role"
+        );
+
+        // ── (11) THE ORDERING LEG (PR #667 review P1). Evidence can arrive
+        //        BEFORE the key it withdraws — the planes replicate
+        //        independently. The projection then matches no candidate, and
+        //        a design that only projects at admit-time would confer the
+        //        withdrawn role when the key finally lands. ──
+        let ci_late = format!("late-{tag}");
+        let late_digest = seed_quorum(
+            a,
+            &na,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci_late,
+            &[0, 1],
+            &format!("lt-{tag}"),
+        )
+        .await;
+        let late_bundle = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == late_digest)
+            .expect("(11) evidence for a key nobody holds is still servable");
+        let late_admission =
+            admit_replicated_accord_evidence_over_roster(b, &late_bundle, &nb.roster_key_ids)
+                .await
+                .expect("(11) the bundle is quorum-bearing regardless of who holds the key");
+        assert!(
+            late_admission.withdrawals_projected.is_empty(),
+            "(11) nothing to project yet — B has never seen this key"
+        );
+        // ...and NOW the key arrives, fully co-scrubbed, exactly as anti-entropy
+        // would deliver it.
+        let err_late = b
+            .put_public_key(infra_attest_record(&nb, &ci_late))
+            .await
+            .expect_err("(11) a key whose withdrawal we already hold evidence for must be REFUSED");
+        assert_eq!(
+            err_late.kind(),
+            "infra_attest_role_withdrawn",
+            "(11) the gate must materialize the tombstone before consulting it: {err_late}"
+        );
+        assert!(
+            !is_infra_attest_effective(b, &ci_late).await.unwrap(),
+            "(11) and the role is not effective by any route"
+        );
+    }
+
+    /// PR #667 review P1 — **the cursor must advance when a vote lands.**
+    ///
+    /// A bundle is an aggregate, so a cursor pinned to the proposal's
+    /// immutable `created_at` would let a peer that read it pre-quorum skip the
+    /// quorum-bearing version forever.
+    async fn run_cursor_advance_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let node = seed_node(dir).await;
+        let target = format!("adv-{tag}");
+        confer_infra_attest(dir, &node, &target).await;
+
+        // One vote — below quorum, but stored and servable.
+        let digest = seed_quorum(
+            dir,
+            &node,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &target,
+            &[0],
+            &format!("ad-{tag}"),
+        )
+        .await;
+        let first = dir
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == digest)
+            .expect("the one-vote bundle is servable");
+        assert_eq!(first.participations.len(), 1);
+
+        // A peer reads to here and pins its cursor — the ordinary thing to do.
+        let cursor = first.evidence_at;
+        assert!(
+            !dir.list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.proposal.digest() == digest),
+            "a bundle with nothing new must not be re-offered"
+        );
+
+        // The second vote lands. The bundle now says something it did not say
+        // before, so it must reappear PAST the peer's cursor.
+        let proposal = dir
+            .get_accord_proposal(&digest)
+            .await
+            .unwrap()
+            .expect("stored")
+            .proposal;
+        dir.put_accord_participation(
+            signed_participation(&node.holders[1], &proposal, Vote::Yes),
+            &node.roster,
+        )
+        .await
+        .expect("the second YES lands");
+
+        let resumed = dir
+            .list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+            .await
+            .unwrap();
+        let again = resumed
+            .iter()
+            .find(|e| e.proposal.digest() == digest)
+            .expect("the quorum-bearing version must be re-offered past the old cursor");
+        assert_eq!(again.participations.len(), 2, "and it carries both votes");
+        assert!(
+            again.evidence_at > cursor,
+            "the bundle's visibility instant advanced with the vote"
+        );
+    }
+
+    /// CIRISPersist#655 — the revocation plane's serve cursor and its
+    /// wire-index entry, on one directory (the receive side of this plane was
+    /// already correct; only serving was missing).
+    async fn run_revocation_cursor_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, seal_revocation};
+
+        let subject = format!("rv{tag}-subject");
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(&subject);
+        let now = chrono::Utc::now();
+        dir.put_public_key(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: subject.clone(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::USER.to_owned(),
+                identity_ref: subject.clone(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": subject }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: subject.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register the revocation subject");
+
+        // A SELF-revocation: `check_revocation_authority` passes it untouched,
+        // so this witness measures the carriage rather than the moderation
+        // authority plane (which has its own witnesses).
+        let revocation_id = uuid::Uuid::new_v4().to_string();
+        let row = seal_revocation(crate::federation::types::Revocation {
+            revocation_id: revocation_id.clone(),
+            revoked_key_id: subject.clone(),
+            revoking_key_id: subject.clone(),
+            reason: Some("compromise".to_owned()),
+            revoked_at: now,
+            effective_at: now,
+            revocation_envelope: serde_json::json!({ "revoked_key_id": subject }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: subject.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        });
+        let stored_scrub_timestamp = row.scrub_timestamp;
+        dir.put_revocation(crate::federation::SignedRevocation { revocation: row })
+            .await
+            .expect("the self-revocation must be admitted");
+
+        // ── The cursor exists and finds the row. ──
+        let all = dir
+            .list_signed_revocations_since(None, u32::MAX)
+            .await
+            .expect("the exclusion plane must be servable");
+        let served = all
+            .iter()
+            .find(|r| r.revocation.revocation_id == revocation_id)
+            .expect("the stored revocation must be served");
+        assert_eq!(served.revocation.revoked_key_id, subject);
+
+        // ── The cursor is a cursor: `since` at the row's own instant excludes
+        //    it, so a caller resuming from its last page does not re-read. ──
+        let after = dir
+            .list_signed_revocations_since(Some(stored_scrub_timestamp), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|r| r.revocation.revocation_id == revocation_id),
+            "`since` is exclusive on scrub_timestamp"
+        );
+
+        // ── And it is point-readable through the shared wire index, which is
+        //    what makes it symmetric with the other fourteen kinds. ──
+        let content_hash =
+            crate::federation::wire_index::content_hash_of(served).expect("hash the served bytes");
+        let bytes = dir
+            .lookup_signed_record_by_content_hash("Revocation", &content_hash)
+            .await
+            .expect("the point read must be wired for this kind")
+            .expect("the put path must have indexed the row");
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(served).unwrap(),
+            "the index resolves to the exact bytes the serve cursor returns"
+        );
+
+        // ── PR #667 review P1 — DISCOVERABLE, not merely fetchable. The
+        //    subject-scoped receive-axis pull is how a peer learns which
+        //    hashes to ask for; a revocation that is indexed but absent from
+        //    that ref set leaves #655 half-closed — rebuildable in principle,
+        //    unreachable in practice. A revocation OF a key is squarely "what
+        //    is about me", which is the axis this read answers. ──
+        let refs = crate::federation::wire_index::wire_refs_for_subject(dir, &subject)
+            .await
+            .expect("subject-scoped refs");
+        let revocation_ref = refs
+            .iter()
+            .find(|(kind, _, _)| *kind == "Revocation")
+            .expect("the subject's revocation must be advertised");
+        assert_eq!(
+            revocation_ref.1, content_hash,
+            "the advertised hash must be the one the point read resolves"
+        );
+        assert_eq!(
+            crate::federation::wire_index::record_key_field(&revocation_ref.2, "revocation_id")
+                .unwrap(),
+            revocation_id
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn exclusion_carriage_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let a = SqliteBackend::open_in_memory().await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        run_carriage_matrix(&a, &b, "sq").await;
+        run_revocation_cursor_matrix(&a, "sq").await;
+        let c = SqliteBackend::open_in_memory().await.unwrap();
+        c.run_migrations().await.unwrap();
+        run_cursor_advance_matrix(&c, "sq").await;
+    }
+
+    #[tokio::test]
+    async fn exclusion_carriage_memory() {
+        use crate::store::memory::MemoryBackend;
+        let a = MemoryBackend::new();
+        let b = MemoryBackend::new();
+        run_carriage_matrix(&a, &b, "mem").await;
+        run_revocation_cursor_matrix(&a, "mem").await;
+        run_cursor_advance_matrix(&MemoryBackend::new(), "mem").await;
+    }
+
+    /// Two ISOLATED postgres databases — the cross-node property needs two
+    /// directories, and the fixture seeds the genesis accord ids (A1/B1/C1)
+    /// with test keys, which on the shared test DB would squat the real anchor.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn exclusion_carriage_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping exclusion_carriage_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let dsn2 = dsn.clone();
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
+            crate::federation::admission::run_in_isolated_pg_db(&dsn2, |b| async move {
+                run_carriage_matrix(&a, &b, "pg").await;
+                run_revocation_cursor_matrix(&a, "pg").await;
+                run_cursor_advance_matrix(&b, "pg").await;
+            })
+            .await;
+        })
+        .await;
+    }
 }

@@ -6434,6 +6434,102 @@ impl Engine {
         directory.list_canonical_withdrawals().await
     }
 
+    // ── v31.1.0 (CIRISPersist#655 / CIRISPersist#662) — the exclusion
+    //    planes' carriage, host-reachable.
+    //
+    //    A capability that exists only on the `FederationDirectory` trait is
+    //    not shipped: #542's lesson was a full {gate}×{backend} matrix passing
+    //    while NO host could enable the thing. These four are the doors an
+    //    operator or a carrier actually calls.
+
+    /// v31.1.0 (CIRISPersist#655) — **serve** the key-level revocation plane:
+    /// bulk-list [`SignedRevocation`](crate::federation::SignedRevocation)
+    /// wrappers since a cursor (`scrub_timestamp > since`, ordered
+    /// `(scrub_timestamp ASC, revocation_id ASC)`).
+    ///
+    /// The plane could be destroyed and never rebuilt before this: every
+    /// other replicated plane had a `list_signed_*_since` and this one did
+    /// not, so a DSAR erasure, an operator repair or a restored backup
+    /// removed an exclusion permanently and silently. A revocation row is
+    /// self-authenticating, so serving it ships evidence — the receiver
+    /// re-verifies the hybrid scrub signature against its own directory
+    /// inside [`Self::deregister_federation_key`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_signed_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedRevocation>, crate::federation::Error> {
+        self.federation_directory()
+            .list_signed_revocations_since(since, limit)
+            .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **serve** the signed accord EVIDENCE
+    /// plane: the proposal + its hybrid-signed participation set, bundled per
+    /// proposal, since a cursor on the proposal's local `created_at`.
+    ///
+    /// This is what a peer needs in order to reconstruct the exclusion half
+    /// of the `infra:attest` closure. The withdrawal tombstones themselves are
+    /// NOT served and never will be — see
+    /// [`accord_carriage`](crate::federation::accord_carriage) for why a plane
+    /// with no signature of its own must not be replicated.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<
+        Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
+        crate::federation::Error,
+    > {
+        self.federation_directory()
+            .list_signed_accord_quorum_evidence_since(since, limit)
+            .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **apply** a replicated accord evidence
+    /// bundle by re-deriving its quorum against this node's own accord roster,
+    /// then re-deriving this node's own withdrawal tombstones.
+    ///
+    /// The receive-axis counterpart of
+    /// [`Self::list_signed_accord_quorum_evidence_since`], and the reason the
+    /// serve side is safe: nothing is stored that this node has not re-tallied
+    /// itself. Returns what the re-tally found, so a carrier logs a supply
+    /// decision rather than inferring one from `Ok(())`. Fail-closed with
+    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_accord_quorum_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        let directory = self.federation_directory();
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(
+            directory.as_ref(),
+            evidence,
+        )
+        .await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **the repair door**: re-derive every
+    /// role-withdrawal tombstone this node's stored accord evidence supports,
+    /// returning the `(role, key_id)` pairs projected.
+    ///
+    /// This is what makes the exclusion plane genuinely rebuildable rather
+    /// than merely re-fetchable — after a purge, a restore from an older
+    /// backup, or a fresh node catching up through the evidence cursor, the
+    /// tombstones are RECOMPUTED from signed evidence rather than accepted
+    /// from a peer. Idempotent; O(|proposals| × |keys|) digest computations,
+    /// the same backfill shape as `rebuild_signed_wire_index`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rematerialize_role_withdrawals(
+        &self,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::accord_carriage::rematerialize_role_withdrawals(directory.as_ref()).await
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.

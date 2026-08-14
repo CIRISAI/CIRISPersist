@@ -7272,6 +7272,22 @@ pub async fn check_canonical_role_admission_over_roster(
     )
     .await?;
 
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING, the
+    // twin of the `infra:attest` gate's step (1c). The tombstone is a local
+    // projection of replicated accord evidence, and the evidence plane and the
+    // key plane replicate independently: evidence authorizing this key's
+    // withdrawal can arrive first, and then step (2) would consult an empty
+    // table and re-confer `canonical`. Derived here from a proposal already in
+    // our own state, re-tallied by us. See
+    // [`accord_carriage::project_role_withdrawal_for_key`](super::accord_carriage::project_role_withdrawal_for_key).
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        &accord_holder_roster_key_ids(),
+    )
+    .await?;
+
     // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
     // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
     // successor whose tombstone names THIS key_id is exempt (rotate-in).
@@ -8426,6 +8442,22 @@ pub async fn check_infra_attest_role_admission_over_roster(
         directory,
         super::genesis::posture::INFRA_ATTEST_ROLE_ADMISSION,
         roster_key_ids,
+    )
+    .await?;
+
+    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING. The
+    // tombstone is a LOCAL projection of replicated accord evidence, and the
+    // two planes replicate independently: the evidence authorizing this key's
+    // withdrawal can arrive before the key itself. If it did, step (2) below
+    // would consult an empty table and confer a withdrawn role — the exclusion
+    // lost to ORDERING rather than to trust. Deriving it here, from a proposal
+    // already in our own state and re-tallied by us, is what makes step (2)
+    // order-independent.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        super::types::roles::INFRA_ATTEST,
+        &row.key_id,
+        &accord_holder_roster_key_ids(),
     )
     .await?;
 

@@ -9192,10 +9192,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let limit_i = i64::from(limit);
         let rows = client
             .query(
+                // v31.1.0 (CIRISPersist#662, PR review P1) — the cursor is the
+                // bundle's VISIBILITY instant, not the proposal's immutable
+                // `created_at`: a vote landing must move the bundle forward in
+                // the stream, or a peer that read it pre-quorum never sees the
+                // version that carries one.
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
-                 FROM cirislens.accord_proposal \
-                 WHERE ($1::timestamptz IS NULL OR created_at > $1) \
-                 ORDER BY created_at ASC, proposal_digest ASC LIMIT $2",
+                 FROM ( \
+                   SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                          proposal_digest, \
+                          GREATEST(created_at, COALESCE(( \
+                              SELECT MAX(server_arrival_at) \
+                              FROM cirislens.accord_participation ap \
+                              WHERE ap.proposal_digest = p.proposal_digest \
+                          ), created_at)) AS evidence_at \
+                   FROM cirislens.accord_proposal p \
+                 ) AS bundles \
+                 WHERE ($1::timestamptz IS NULL OR evidence_at > $1) \
+                 ORDER BY evidence_at ASC, proposal_digest ASC LIMIT $2",
                 &[&since, &limit_i],
             )
             .await
@@ -9209,6 +9223,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map(pg_row_to_stored_proposal)
             .collect::<Result<Vec<_>, _>>()?;
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — delegates to the shared re-tally body.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
     }
 
     async fn list_signed_identity_occurrences_since(

@@ -3702,53 +3702,53 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // reload takes this same lock, and a guard merely `drop`ped still
         // counts as held across an await for auto-trait purposes).
         let wire_index_key = {
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.revoked_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "revoked_key_id {} does not exist in federation_keys",
-                row.revoked_key_id
-            )));
-        }
-        if !state.federation_keys.contains_key(&row.revoking_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "revoking_key_id {} does not exist in federation_keys",
-                row.revoking_key_id
-            )));
-        }
-        // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
-        // (CIRISPersist#660): absent on this backend entirely, so an OLD,
-        // still-validly-signed revocation could be replayed here to re-assert a
-        // state its subject had already moved past — refused on sqlite and
-        // postgres since v3.11.0. The RULE is the shared
-        // `check_revocation_anti_rollback`; only the "find the newest stored
-        // row" half is per-backend, and here it is a scan under the lock the
-        // push already holds, so the check and the insert cannot race.
-        //
-        // Sits after the FK emulation rather than before `check_revocation_bound`
-        // (the sqlite/postgres position) for one reason: memory's lookup needs
-        // this lock. Both are refusals that mutate nothing, so the order between
-        // them is not observable in state — only in which message an operator
-        // sees when a row violates both.
-        {
-            let latest = state
-                .federation_revocations
-                .iter()
-                .filter(|r| r.revoked_key_id == row.revoked_key_id)
-                .map(|r| r.scrub_timestamp)
-                .max();
-            crate::federation::admission::check_revocation_anti_rollback(
-                &row.revoked_key_id,
-                latest,
-                row.scrub_timestamp,
-            )?;
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let key = crate::federation::wire_index::record_key(&[
-            ("revoked_key_id", row.revoked_key_id.as_str()),
-            ("revocation_id", row.revocation_id.as_str()),
-        ]);
-        state.federation_revocations.push(row);
-        key
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.revoked_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "revoked_key_id {} does not exist in federation_keys",
+                    row.revoked_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.revoking_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "revoking_key_id {} does not exist in federation_keys",
+                    row.revoking_key_id
+                )));
+            }
+            // v3.11.0 (CIRISPersist#143) — ANTI-ROLLBACK. v31.1.0
+            // (CIRISPersist#660): absent on this backend entirely, so an OLD,
+            // still-validly-signed revocation could be replayed here to re-assert a
+            // state its subject had already moved past — refused on sqlite and
+            // postgres since v3.11.0. The RULE is the shared
+            // `check_revocation_anti_rollback`; only the "find the newest stored
+            // row" half is per-backend, and here it is a scan under the lock the
+            // push already holds, so the check and the insert cannot race.
+            //
+            // Sits after the FK emulation rather than before `check_revocation_bound`
+            // (the sqlite/postgres position) for one reason: memory's lookup needs
+            // this lock. Both are refusals that mutate nothing, so the order between
+            // them is not observable in state — only in which message an operator
+            // sees when a row violates both.
+            {
+                let latest = state
+                    .federation_revocations
+                    .iter()
+                    .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                    .map(|r| r.scrub_timestamp)
+                    .max();
+                crate::federation::admission::check_revocation_anti_rollback(
+                    &row.revoked_key_id,
+                    latest,
+                    row.scrub_timestamp,
+                )?;
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let key = crate::federation::wire_index::record_key(&[
+                ("revoked_key_id", row.revoked_key_id.as_str()),
+                ("revocation_id", row.revocation_id.as_str()),
+            ]);
+            state.federation_revocations.push(row);
+            key
         };
         // The key-level revocation plane joins the shared `signed_wire_index`.
         self.index_stored_record("Revocation", &wire_index_key)
@@ -6198,21 +6198,45 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     > {
         let page = {
             let state = self.state.lock().expect("memory backend lock");
+            // v31.1.0 (CIRISPersist#662, PR review P1) — the cursor is the
+            // bundle's VISIBILITY instant: `max(created_at, latest
+            // server_arrival_at)`. The SQL backends spell the same expression
+            // in their `WHERE`/`ORDER BY`; `assemble_evidence_page` recomputes
+            // it for the returned struct, so all three agree by construction.
+            let evidence_at = |p: &crate::federation::accord_quorum::StoredProposal| {
+                let digest = p.proposal.digest();
+                state
+                    .accord_participations
+                    .iter()
+                    .filter(|r| r.participation.proposal_digest == digest)
+                    .map(|r| r.server_arrival_at)
+                    .max()
+                    .map_or(p.created_at, |latest| latest.max(p.created_at))
+            };
             let mut rows: Vec<_> = state
                 .accord_proposals
                 .values()
-                .filter(|p| since.is_none_or(|s| p.created_at > s))
+                .filter(|p| since.is_none_or(|s| evidence_at(p) > s))
                 .cloned()
                 .collect();
             rows.sort_by(|a, b| {
-                a.created_at
-                    .cmp(&b.created_at)
+                evidence_at(a)
+                    .cmp(&evidence_at(b))
                     .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
             });
             rows.truncate(limit as usize);
             rows
         };
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — delegates to the shared re-tally body.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
     }
 
     async fn list_signed_identity_occurrences_since(

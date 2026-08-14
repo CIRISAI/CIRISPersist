@@ -8256,8 +8256,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  WHERE (?1 IS NULL OR scrub_timestamp > ?1) \
                  ORDER BY scrub_timestamp ASC, revocation_id ASC LIMIT ?2",
             )?;
-            let rows =
-                stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_revocation)?;
+            let rows = stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_revocation)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(crate::federation::SignedRevocation { revocation: r? });
@@ -8286,11 +8285,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let since_s = since.map(|t| t.to_rfc3339());
         let page = (move || -> Result<Vec<_>, rusqlite::Error> {
             let conn = conn.lock();
+            // v31.1.0 (CIRISPersist#662, PR review P1) — the cursor is the
+            // bundle's VISIBILITY instant, not the proposal's immutable
+            // `created_at`: a vote landing must move the bundle forward in the
+            // stream, or a peer that read it pre-quorum never sees the version
+            // that carries one. `MAX(a, b)` here is SQLite's SCALAR max (two
+            // args), and the timestamps are `to_rfc3339()` UTC text, which
+            // orders lexicographically the same way it orders in time.
             let mut stmt = conn.prepare(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
-                 FROM accord_proposal \
-                 WHERE (?1 IS NULL OR created_at > ?1) \
-                 ORDER BY created_at ASC, proposal_digest ASC LIMIT ?2",
+                 FROM ( \
+                   SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                          proposal_digest, \
+                          MAX(created_at, COALESCE(( \
+                              SELECT MAX(server_arrival_at) FROM accord_participation ap \
+                              WHERE ap.proposal_digest = p.proposal_digest \
+                          ), created_at)) AS evidence_at \
+                   FROM accord_proposal p \
+                 ) \
+                 WHERE (?1 IS NULL OR evidence_at > ?1) \
+                 ORDER BY evidence_at ASC, proposal_digest ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(
                 rusqlite::params![since_s, limit],
@@ -8304,6 +8318,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ))
         })?;
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — delegates to the shared re-tally body.
+    async fn apply_replicated_accord_evidence(
+        &self,
+        evidence: &crate::federation::accord_carriage::AccordQuorumEvidence,
+    ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
+    {
+        crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
     }
 
     async fn list_signed_identity_occurrences_since(
