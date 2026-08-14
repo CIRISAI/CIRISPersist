@@ -7,6 +7,58 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.1.0] - 2026-08-13
 
+### Fixed — SECURITY — a corrupted signature on a genesis row read as `entrenched` (#665 review)
+
+Review finding against the fix below. Its `AlreadyCurrent` fast path compared
+`original_content_hash` — and that digest covers the **envelope alone**, while
+the ceremony's signature covers the envelope and nothing else. So every column
+*around* the signed bytes was unchecked by anything on the boot path: rewrite
+`scrub_signature_classical`, its PQC half, or the `additional_scrubs` quorum set
+beneath persist, leave the envelope and hash alone, and the row read as current.
+`verify_delegation_plane_seeded` behind it asks only for that same hash and the
+v31 shape — `classify_shape` is three pure column/envelope checks — so **nothing
+in the boot path verified a stored delegation row's signature at all.**
+
+Not cosmetic on `genesis-charter`: it IS the family charter, and
+`trust_root::family_quorum_over` counts DISTINCT VERIFIED co-signatures over its
+envelope. Drop B1's entry and the constitutional trust root falls from 2-of-3 to
+1 and stops validating, while the posture still reports `entrenched` and a
+server enables agent mode on it. A fail-OPEN banner — the exact class the
+delegation leg was added in #648 to catch, reintroduced one column over, and the
+same unsigned-column-beside-signed-bytes shape as the `original_content_hash`
+gap the fix below closed on the other branch.
+
+**The `AlreadyCurrent` test is now a whole-row comparison**, via
+`compute_persist_row_hash` recomputed from content on both sides and never
+trusting either stored column. That digest is taken over the entire row minus
+itself, so every column the ceremony fixes is covered in one comparison — and a
+column added to `Attestation` later is covered automatically, which the
+hand-picked single field was not. Digests rather than `==` on the struct
+deliberately: the hash truncates instants to microseconds (#646) precisely so
+the answer is reproducible where postgres stores microseconds and sqlite/memory
+store nanoseconds; a struct comparison would have failed on postgres alone.
+
+**A row whose signed envelope is byte-identical to the baked one is repaired,
+not refused.** The signature covers the envelope, so an identical canonical
+envelope means the holders said exactly this — restoring the compiled-in bytes
+destroys no constitutional statement, because it is the same statement. Logged
+at ERROR and reported as a distinct `Repaired` outcome so the repair is
+observable. Not a boot refusal: the damage is only reachable by a writer who
+already has raw corpus access (#660 reserves these ids at every write door), so
+refusing to serve would hand that writer a one-byte outage on a node whose own
+binary holds the correct row.
+
+`GenesisPosture::Entrenched` therefore asserts something **stronger** than
+before — every baked delegation row byte-whole against the artifact this binary
+carries, co-signatures included. Consumers gating on `entrenched()`
+(CIRISServer#398) are unaffected in direction; nothing green stops being green
+except a node that was already lying.
+
+Witnessed on memory, sqlite and postgres (`damaged_current_row_is_repaired_*`),
+each opening by proving the posture leg is blind to the damage before asserting
+the repair. Mutation-tested: reverting the fast path to the content-hash
+comparison reds all three.
+
 ### Fixed — SECURITY — the re-bake bricked every upgrading node, and the seed stopped half-way on a lost race (#665)
 
 Two review findings against `seed_delegation_plane`, the boot routine 31.1.0

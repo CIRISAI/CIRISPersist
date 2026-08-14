@@ -22253,6 +22253,54 @@ mod tests {
         .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the POSTGRES leg of the **damage**
+    /// witness: a genesis row whose co-signature set was thinned beneath persist
+    /// is repaired, not reported entrenched.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn damaged_current_row_is_repaired_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("a fresh node seeds the baked plane");
+
+            // Drop B1's co-signature from the charter with a raw UPDATE,
+            // leaving the signed envelope and the content hash untouched.
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            {
+                let client = backend.pool().get().await.expect("client");
+                let empty = "[]".to_string();
+                let n = client
+                    .execute(
+                        "UPDATE cirislens.federation_attestations SET additional_scrubs = $1 \
+                         WHERE attestation_id = $2",
+                        &[&empty, &target],
+                    )
+                    .await
+                    .expect("damage");
+                assert_eq!(n, 1, "the damage must actually have landed");
+            }
+
+            crate::federation::genesis::assert_damaged_current_row_is_repaired(
+                &backend, "postgres",
+            )
+            .await;
+        })
+        .await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the POSTGRES leg of the **seed-race**
     /// witness: a duplicate insert leaves the node FULLY seeded, not
     /// half-seeded. This is the leg where the race is not hypothetical — two

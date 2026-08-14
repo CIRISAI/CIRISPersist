@@ -1702,6 +1702,108 @@ pub(crate) async fn assert_rebake_supersedes_prior_ceremony(
         .unwrap_or_else(|e| panic!("[{tag}] and it still verifies after a second pass: {e}"));
 }
 
+/// v31.1.0 (CIRISPersist#665 review) — **THE DAMAGE WITNESS: a stored genesis
+/// row whose signatures were altered beneath persist is repaired, not reported
+/// entrenched.**
+///
+/// The caller has already seeded the baked plane and then damaged
+/// `genesis-charter` in the sharpest way available: it emptied
+/// `additional_scrubs`, dropping B1's co-signature, while leaving the signed
+/// envelope and `original_content_hash` untouched.
+///
+/// That row is not a cosmetic problem. `genesis-charter` IS the family charter,
+/// and [`family_quorum_over`](crate::federation::trust_root) counts DISTINCT
+/// VERIFIED co-signatures over its envelope — so a thinned scrub set takes the
+/// constitutional trust root from 2-of-3 to 1 and it stops validating, while
+/// nothing on the boot path notices: the old `AlreadyCurrent` test compared
+/// `original_content_hash` (a digest of the ENVELOPE alone) and
+/// `verify_delegation_plane_seeded` asks only for that same hash and the v31
+/// shape. Neither verifies a signature. The node reported `entrenched` on a root
+/// that could no longer be accepted by a peer — a fail-OPEN banner, which is
+/// the exact class the delegation leg was added to catch.
+///
+/// The witness opens by proving the blindness rather than assuming it.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_damaged_current_row_is_repaired(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let baked = &canonical_genesis_bundle().attestations[0];
+    let id = &baked.attestation.attestation_id;
+
+    // (0) THE FAIL-OPEN, STATED. The damage is real and the posture leg cannot
+    // see it. If this ever starts failing, the leg grew a signature check of
+    // its own and this witness should be re-read, not deleted.
+    let damaged = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the damaged row {id} must be installed"));
+    assert!(
+        damaged.additional_scrubs.is_empty(),
+        "[{tag}] the fixture must actually have dropped the co-signature, or this proves nothing"
+    );
+    assert_eq!(
+        damaged.original_content_hash, baked.attestation.original_content_hash,
+        "[{tag}] and must have left the ENVELOPE digest intact — that is the whole point: the \
+         damage is invisible to a content-hash check"
+    );
+    verify_delegation_plane_seeded(dir)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "[{tag}] the posture leg is expected to be BLIND to this damage (it checks the \
+             content hash and the v31 shape, never a signature) — that blindness is the finding: \
+             {e}"
+            )
+        });
+
+    // (1) THE SEED REPAIRS IT.
+    seed_delegation_plane(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the seed must repair the row, not fault: {e}"));
+
+    let repaired = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] {id} vanished across the repair"));
+    assert_eq!(
+        repaired.additional_scrubs.len(),
+        baked.attestation.additional_scrubs.len(),
+        "[{tag}] the co-signature set must be restored from the baked artifact — a charter \
+         missing a scrub is a trust root that silently stops reaching its threshold"
+    );
+    assert_eq!(
+        repaired.additional_scrubs, baked.attestation.additional_scrubs,
+        "[{tag}] and restored EXACTLY, not merely to the right length"
+    );
+    assert_eq!(
+        repaired.scrub_signature_classical, baked.attestation.scrub_signature_classical,
+        "[{tag}] the base scrub is the baked one"
+    );
+    assert_eq!(
+        repaired.original_content_hash, baked.attestation.original_content_hash,
+        "[{tag}] and the row still carries the baked content"
+    );
+    assert_eq!(
+        posture::genesis_posture(dir).await.as_str(),
+        "entrenched",
+        "[{tag}] and the node serves on a root that is now whole"
+    );
+
+    // (2) IDEMPOTENT. The repaired row must read as current on the next boot;
+    // if it does not, every start would delete and re-install the trust root.
+    let stored = dir.get_attestation(id).await.expect("read back");
+    assert_eq!(
+        install_or_supersede_delegation_row(dir, baked, stored)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the boot after a repair must be a no-op: {e}")),
+        DelegationRowOutcome::AlreadyCurrent,
+        "[{tag}] a repaired row is AlreadyCurrent, not repaired again"
+    );
+}
+
 /// v31.1.0 (CIRISPersist#665) — **THE RACE WITNESS: a duplicate insert leaves
 /// the node FULLY seeded, not half-seeded.**
 ///
@@ -1881,9 +1983,13 @@ where
 /// the exact fail-open the fourth posture leg exists to catch.
 ///
 /// Discipline matches [`seed_canonical_servers`] deliberately:
-/// - **already present and byte-current ⇒ no-op.** A row whose
-///   `original_content_hash` is the baked one is this ceremony's row, already
-///   entrenched; boot NORMALITY on a seeded fleet.
+/// - **already present and byte-current ⇒ no-op.** A row that matches the baked
+///   artifact WHOLE — every column, via
+///   [`baked_row_matches_stored`] — is this ceremony's row, already entrenched;
+///   boot NORMALITY on a seeded fleet. Matching on `original_content_hash`
+///   alone was not enough: that digest covers the envelope only, so corrupted
+///   signature columns read as current. See
+///   [`baked_row_matches_stored`] and `DelegationRowOutcome::Repaired`.
 /// - **refused ⇒ `absent`, never `divergent`.** A refusal means this node is
 ///   awaiting its ceremony, and it must BOOT. `divergent` refuses to serve, and
 ///   an artifact that cannot install is not evidence of tampering — that
@@ -2004,6 +2110,16 @@ pub enum DelegationRowOutcome {
     /// A PREVIOUS ceremony's row was removed and the baked row installed over
     /// it. The upgrade path — see [`seed_delegation_plane`].
     Superseded,
+    /// THIS ceremony's row was present with its signed envelope intact but the
+    /// unsigned material around it altered beneath persist — a corrupted
+    /// signature column, a thinned `additional_scrubs` quorum set, a scribbled
+    /// content hash — and the baked artifact was restored over it.
+    ///
+    /// Distinct from [`Superseded`](Self::Superseded) on purpose: nothing
+    /// constitutional changed (the holders' statement is byte-identical), but
+    /// something that is NOT a write door wrote to the corpus, and an operator
+    /// should be told which of those two happened.
+    Repaired,
     /// The install lost a primary-key race: somebody else wrote this id between
     /// the read and the write. The row is present, so the plane is seeded;
     /// nothing more to do, and emphatically not a reason to stop seeding.
@@ -2050,13 +2166,83 @@ where
     let id = &baked.attestation_id;
 
     if let Some(stored) = stored {
-        // Already this ceremony's row. The overwhelmingly common path on every
-        // start after the first.
-        if stored.original_content_hash == baked.original_content_hash {
-            return Ok(DelegationRowOutcome::AlreadyCurrent);
+        // Already this ceremony's row, WHOLE. The overwhelmingly common path on
+        // every start after the first.
+        //
+        // v31.1.0 (CIRISPersist#665 review) — this compares the ROW, not its
+        // content hash. `original_content_hash` is the digest of the ENVELOPE
+        // alone, so a row whose envelope and hash are untouched while its
+        // `scrub_signature_classical`, its PQC half or its `additional_scrubs`
+        // were rewritten beneath persist passed this check — and passed
+        // `verify_delegation_plane_seeded` behind it, which asks only for the
+        // content hash and the v31 shape and never verifies a signature. The
+        // node then reported `entrenched` while holding a constitutional row
+        // that can no longer pass federation ingest.
+        //
+        // That is not theoretical on `genesis-charter`. It is the FAMILY
+        // CHARTER, and [`family_quorum_over`](crate::federation::trust_root)
+        // counts DISTINCT VERIFIED co-signatures over its envelope: drop B1's
+        // entry from `additional_scrubs` and the charter falls from 2-of-3 to 1,
+        // the constitutional trust root stops validating, and the posture still
+        // says `entrenched`. A fail-OPEN banner — precisely the class the
+        // delegation leg was added (#648) to catch, reintroduced one column
+        // over. Same unsigned-column-beside-signed-bytes shape as the
+        // `original_content_hash` gap closed in `stored_row_is_prior_ceremony`.
+        match baked_row_matches_stored(&stored, baked) {
+            Ok(true) => return Ok(DelegationRowOutcome::AlreadyCurrent),
+            Ok(false) => {}
+            // Unanswerable ⇒ NOT current. Fail-secure: never report a root
+            // entrenched on the strength of a question that could not be asked.
+            Err(e) => {
+                return Err(GenesisFault::unreadable(
+                    LEG,
+                    format!("delegation row {id} could not be compared to the baked artifact: {e}"),
+                ))
+            }
         }
-        // A mismatch. Only a prior ceremony's row may be superseded; see the
-        // three legs in `seed_delegation_plane`'s docs.
+
+        // Not the baked row. Before asking whether it is somebody ELSE'S
+        // statement, ask whether it is THIS one, damaged.
+        //
+        // The signed envelope is the ceremony's entire statement — the
+        // signature covers `attestation_envelope` and nothing else. So a stored
+        // row whose canonical envelope is byte-identical to the baked one IS
+        // this ceremony's row, with the unsigned material around it altered:
+        // a corrupted signature column, a thinned co-signature set, a scribbled
+        // content hash. Restoring the compiled-in bytes destroys no
+        // constitutional statement, because the statement is the same one — the
+        // node is putting back exactly what the holders signed.
+        //
+        // Deliberately NOT silent, and deliberately not a boot refusal. The
+        // damage is only reachable by a writer who already has raw access to
+        // the corpus (the write doors cannot produce it — #660 reserves these
+        // ids), so refusing to serve would hand that writer a one-byte outage
+        // on a node whose own binary is holding the correct row. It is logged
+        // at ERROR and reported as a distinct outcome so the repair is
+        // observable rather than invisible.
+        match envelope_matches_baked(&stored, baked) {
+            Ok(true) => {
+                tracing::error!(
+                    attestation_id = %id,
+                    "genesis delegation seed: this ceremony's row is present with its SIGNED \
+                     ENVELOPE intact but the material around it altered beneath persist \
+                     (signature columns, co-signature set, or content hash). Restoring the baked \
+                     artifact. The corpus was modified by something that is not a write door — \
+                     investigate the host (CIRISPersist#665)"
+                );
+                return replace_with_baked(dir, sa, DelegationRowOutcome::Repaired).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(GenesisFault::unreadable(
+                    LEG,
+                    format!("delegation row {id} envelope could not be canonicalized: {e}"),
+                ))
+            }
+        }
+
+        // A different statement entirely. Only a prior ceremony's row may be
+        // superseded; see the three legs in `seed_delegation_plane`'s docs.
         if !stored_row_is_prior_ceremony(dir, &stored).await {
             tracing::error!(
                 attestation_id = %id,
@@ -2076,38 +2262,7 @@ where
             "genesis delegation seed: replacing a PREVIOUS ceremony's row with the baked \
              artifact (CIRISPersist#665)"
         );
-        match dir.purge_genesis_delegation_row_v31(id).await {
-            Ok(_) => {}
-            // A directory with no replacement door cannot be upgraded in place.
-            // `absent` BOOTS — and it short-circuits ahead of
-            // `verify_delegation_plane_seeded`, so such a node comes up awaiting
-            // its ceremony rather than bricked by a fault it cannot clear.
-            Err(e @ super::Error::Unsupported { .. }) => {
-                return Err(GenesisFault::absent(
-                    LEG,
-                    format!(
-                        "delegation row {id} is a previous ceremony's and this directory has no \
-                         re-bake replacement door: {e}"
-                    ),
-                ))
-            }
-            Err(e) => {
-                return Err(GenesisFault::absent(
-                    LEG,
-                    format!("previous delegation row {id} could not be removed: {e}"),
-                ))
-            }
-        }
-        return match dir.put_attestation(sa.clone()).await {
-            Ok(()) => Ok(DelegationRowOutcome::Superseded),
-            // Somebody else completed the same upgrade first. Still superseded,
-            // just not by us.
-            Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
-            Err(e) => Err(GenesisFault::absent(
-                LEG,
-                format!("baked delegation row {id} could not replace its predecessor: {e}"),
-            )),
-        };
+        return replace_with_baked(dir, sa, DelegationRowOutcome::Superseded).await;
     }
 
     match dir.put_attestation(sa.clone()).await {
@@ -2129,6 +2284,134 @@ where
         Err(e) => Err(GenesisFault::absent(
             LEG,
             format!("delegation row {id} could not be installed: {e}"),
+        )),
+    }
+}
+
+/// v31.1.0 (CIRISPersist#665) — the row `put_attestation` WOULD have stored for
+/// this baked artifact: envelope canonical at rest (#647), `persist_row_hash`
+/// stamped. Comparing a stored row against the raw bundle row instead would
+/// report a false mismatch on both counts.
+fn baked_row_as_stored(baked: &super::Attestation) -> Result<super::Attestation, super::Error> {
+    let mut expected = baked.clone();
+    super::canonical_at_rest::canonicalize_in_place(&mut expected.attestation_envelope)?;
+    expected.persist_row_hash = super::types::compute_persist_row_hash(&expected)?;
+    Ok(expected)
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **is the stored row the baked row, whole?**
+///
+/// The `AlreadyCurrent` test. Compares the two rows' `persist_row_hash`
+/// DIGESTS — recomputed from content on both sides, never trusting either
+/// stored column — because that digest is taken over the entire row minus
+/// itself. Every column the ceremony fixes is therefore covered in one
+/// comparison: the scrub signature, its PQC half, the `additional_scrubs`
+/// quorum set, the envelope, the content hash, the endpoints, the tier. **A
+/// column added to `Attestation` in future is covered automatically**, which a
+/// hand-listed field-by-field comparison would not be — and this check exists
+/// because a hand-picked single field (`original_content_hash`) was what let
+/// corrupted signatures read as current.
+///
+/// Digests rather than `==` on the struct, deliberately:
+/// [`compute_persist_row_hash`](crate::federation::types::compute_persist_row_hash)
+/// truncates every instant to microseconds before hashing (#646) precisely so
+/// the answer is reproducible across backends. Postgres stores microseconds
+/// where sqlite and memory store nanoseconds, so a struct comparison would
+/// report a false mismatch on postgres alone — the "memory tolerates what
+/// postgres rejects" trap, inverted.
+///
+/// What it does NOT cover: the stored `persist_row_hash` COLUMN itself, which
+/// the digest drops by construction. That column is persist-computed
+/// bookkeeping rather than ceremony content and is not authority-bearing on
+/// this plane; the row's substance is fully covered.
+///
+/// # Errors
+///
+/// If either row cannot be canonicalized or hashed. The caller treats that as
+/// NOT current — never report a root entrenched on a question that could not be
+/// asked.
+fn baked_row_matches_stored(
+    stored: &super::Attestation,
+    baked: &super::Attestation,
+) -> Result<bool, super::Error> {
+    let expected = baked_row_as_stored(baked)?;
+    let want = super::types::compute_persist_row_hash(&expected)?;
+    let got = super::types::compute_persist_row_hash(stored)?;
+    Ok(want == got)
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **is the stored row's SIGNED STATEMENT
+/// the baked one, whatever state the unsigned material around it is in?**
+///
+/// The signature covers `attestation_envelope` and nothing else, so a canonical
+/// envelope equal to the baked canonical envelope means the holders said exactly
+/// this. Used to separate *this ceremony's row, damaged* from *somebody else's
+/// statement* — the first is repairable from the compiled-in artifact without
+/// destroying anything, the second is not.
+///
+/// Compared canonically on both sides so a difference in key order or number
+/// rendering — which the producer's signature is indifferent to — is not read as
+/// a different statement.
+fn envelope_matches_baked(
+    stored: &super::Attestation,
+    baked: &super::Attestation,
+) -> Result<bool, super::Error> {
+    let want = super::canonical_at_rest::canonical_bytes(&baked.attestation_envelope)?;
+    let got = super::canonical_at_rest::canonical_bytes(&stored.attestation_envelope)?;
+    Ok(want == got)
+}
+
+/// v31.1.0 (CIRISPersist#665) — remove the row under this baked id and install
+/// the baked artifact over it, reporting `outcome` on success.
+///
+/// The one place the destructive half happens, shared by the SUPERSEDE arm (a
+/// previous ceremony's row) and the REPAIR arm (this ceremony's row with the
+/// unsigned material around it altered). Both write the same bytes through the
+/// same doors; only the reason differs, and the reason is the caller's to log.
+///
+/// A crash between the delete and the insert leaves the row missing, which is
+/// `Absent` — it boots, and the next start re-installs it. There is no
+/// interleaving that yields a worse state than "awaiting its ceremony".
+async fn replace_with_baked<D>(
+    dir: &D,
+    sa: &super::SignedAttestation,
+    outcome: DelegationRowOutcome,
+) -> Result<DelegationRowOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Delegation;
+    let id = &sa.attestation.attestation_id;
+    match dir.purge_genesis_delegation_row_v31(id).await {
+        Ok(_) => {}
+        // A directory with no replacement door cannot be repaired or upgraded
+        // in place. `absent` BOOTS — and it short-circuits ahead of
+        // `verify_delegation_plane_seeded`, so such a node comes up awaiting its
+        // ceremony rather than bricked by a fault it cannot clear.
+        Err(e @ super::Error::Unsupported { .. }) => {
+            return Err(GenesisFault::absent(
+                LEG,
+                format!(
+                    "delegation row {id} needs replacing and this directory has no re-bake \
+                     replacement door: {e}"
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err(GenesisFault::absent(
+                LEG,
+                format!("delegation row {id} could not be removed for replacement: {e}"),
+            ))
+        }
+    }
+    match dir.put_attestation(sa.clone()).await {
+        Ok(()) => Ok(outcome),
+        // Somebody else completed the same replacement first. The plane holds
+        // the baked row either way, which is what this was for.
+        Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
+        Err(e) => Err(GenesisFault::absent(
+            LEG,
+            format!("baked delegation row {id} could not be installed over its predecessor: {e}"),
         )),
     }
 }

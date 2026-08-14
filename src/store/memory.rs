@@ -17563,6 +17563,44 @@ mod tests {
             .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **damage**
+    /// witness: a genesis row whose co-signature set was thinned beneath persist
+    /// is repaired, not reported entrenched.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn damaged_current_row_is_repaired_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        // Drop B1's co-signature from the charter, beneath the write doors,
+        // leaving the signed envelope and the content hash untouched.
+        let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+            .attestation
+            .attestation_id;
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let row = state
+                .federation_attestations
+                .iter_mut()
+                .find(|r| r.attestation_id == *target)
+                .expect("the charter must be installed");
+            assert!(
+                !row.additional_scrubs.is_empty(),
+                "the baked charter must carry a co-signature to drop"
+            );
+            row.additional_scrubs.clear();
+        }
+
+        crate::federation::genesis::assert_damaged_current_row_is_repaired(&backend, "memory")
+            .await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the MEMORY leg of the **seed-race** witness:
     /// a duplicate insert leaves the node FULLY seeded, not half-seeded.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

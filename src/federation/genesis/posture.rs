@@ -255,6 +255,35 @@ impl std::error::Error for GenesisFault {}
 pub enum GenesisPosture {
     /// Anchor, family and canonical all installed and non-divergent. The
     /// pre-#648 steady state.
+    ///
+    /// # v31.1.0 (CIRISPersist#665 review) — what this asserts about the
+    /// DELEGATION plane got STRONGER
+    ///
+    /// Consumers gate on [`Self::entrenched`] (CIRISServer gates agent mode on
+    /// it, CIRISAI/CIRISServer#398), so it is worth being exact about what
+    /// changed underneath them. **The direction of the gate is unchanged — this
+    /// arm is still the only green one — but what a node must be for it to hold
+    /// has narrowed.**
+    ///
+    /// Until this cut, a booted node reached `Entrenched` when each delegation
+    /// row's `original_content_hash` matched the baked artifact's. That digest
+    /// covers the ENVELOPE alone, and the ceremony's signature covers the
+    /// envelope and nothing else — so the columns AROUND it were unchecked by
+    /// anything on the boot path. A row whose `scrub_signature_classical`, PQC
+    /// half, or `additional_scrubs` quorum set had been rewritten beneath
+    /// persist read as current and the node reported `Entrenched` while holding
+    /// a `genesis-charter` that
+    /// [`family_quorum_over`](crate::federation::trust_root) could no longer
+    /// count to threshold — the trust root silently below quorum, the banner
+    /// green.
+    ///
+    /// `seed_delegation_plane` now compares the stored row to the baked
+    /// artifact WHOLE and restores the compiled-in bytes when only the unsigned
+    /// material around a byte-identical signed envelope has been altered. So
+    /// `Entrenched` now additionally asserts: **every baked delegation row is
+    /// byte-whole against the artifact this binary carries, co-signatures
+    /// included.** Strictly more than it asserted before, and nothing that was
+    /// green stops being green except a node that was already lying.
     Entrenched,
     /// **PRE-GENESIS** — a leg is simply not installed. The node runs, reports,
     /// and can host its own genesis ceremony; every root-requiring gate

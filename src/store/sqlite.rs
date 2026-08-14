@@ -21149,6 +21149,43 @@ mod tests {
             .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the **damage**
+    /// witness: a genesis row whose co-signature set was thinned beneath persist
+    /// is repaired, not reported entrenched.
+    #[tokio::test]
+    async fn damaged_current_row_is_repaired_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+
+        // Drop B1's co-signature from the charter with a raw UPDATE, leaving the
+        // signed envelope and the content hash untouched.
+        let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+            .attestation
+            .attestation_id;
+        {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_attestations SET additional_scrubs = '[]' \
+                     WHERE attestation_id = ?1",
+                    rusqlite::params![target],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the damage must actually have landed");
+        }
+
+        crate::federation::genesis::assert_damaged_current_row_is_repaired(&backend, "sqlite")
+            .await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the SQLITE leg of the **seed-race** witness:
     /// a duplicate insert leaves the node FULLY seeded, not half-seeded.
     #[tokio::test]
