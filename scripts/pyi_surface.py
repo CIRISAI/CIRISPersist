@@ -701,9 +701,28 @@ def emit() -> int:
     # Class-QUALIFIED, not name-keyed: `__init__` exists on Engine and on
     # ReconsiderDosGuard, and a name-keyed map lets the generated one shadow —
     # and then silently destroy — the hand-written one.
+    # v31.1.0 (CIRISPersist#676) — the marker is searched over the WHOLE block.
+    #
+    # It used to be searched over `b.split("\n", 2)[-1][:400]` — everything
+    # after the SECOND newline. A generated entry is `def` + a one-line
+    # docstring, so that slice is the EMPTY STRING and the marker was never
+    # found: 359 of 522 blocks were misclassified as hand-written and had
+    # never regenerated since the day they were first emitted. The three the
+    # old test did catch were the `@staticmethod` ones, which are three lines
+    # because of the decorator — the bug hid behind its own exceptions.
+    #
+    # `check` cannot see this: it verifies coverage and classification, not
+    # whether a docstring still matches its source. So the stub could promise
+    # a contract the code had stopped honouring, which is what CIRISPersist#667
+    # shipped into review — a resume field that had changed underneath it.
+    #
+    # Safe as a whole-block search: every block carrying the marker is the
+    # generated shape (`def` + `"""(derived) ..."""`, optionally decorated),
+    # verified by census before this changed. A hand-written block would have
+    # to quote the marker itself to be caught.
     kept = {
         k: b for k, b in _qualified_defs(region).items()
-        if GEN_MARK not in b.split("\n", 2)[-1][:400]
+        if GEN_MARK not in b
     }
     pin, syms = pinned(), exported()
     by_owner: dict[str, list[Symbol]] = collections.defaultdict(list)
