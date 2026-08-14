@@ -22269,6 +22269,66 @@ mod tests {
         .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the POSTGRES leg of the
+    /// **below-quorum** witness: a row with no baked comparand must still prove
+    /// it can confer.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn below_quorum_row_cannot_confer_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("seed the baked plane");
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            let prior = crate::federation::genesis::prior_ceremony_row(target);
+            let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
+            let och = hex::decode(&prior.original_content_hash).unwrap();
+            let empty = "[]".to_string();
+            {
+                let client = backend.pool().get().await.expect("client");
+                let n = client
+                    .execute(
+                        "UPDATE cirislens.federation_attestations SET \
+                            attestation_envelope = $1, original_content_hash = $2, \
+                            scrub_signature_classical = $3, scrub_signature_pqc = $4, \
+                            additional_scrubs = $5, asserted_at = $6, scrub_timestamp = $7, \
+                            pqc_completed_at = $8, persist_row_hash = $9 \
+                         WHERE attestation_id = $10",
+                        &[
+                            &envelope,
+                            &och,
+                            &prior.scrub_signature_classical,
+                            &prior.scrub_signature_pqc,
+                            &empty,
+                            &prior.asserted_at,
+                            &prior.scrub_timestamp,
+                            &prior.pqc_completed_at,
+                            &prior.persist_row_hash,
+                            &target,
+                        ],
+                    )
+                    .await
+                    .expect("damage");
+                assert_eq!(n, 1, "the damage must actually have landed");
+            }
+            crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "postgres")
+                .await;
+        })
+        .await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the POSTGRES leg: **the genesis seed is not
     /// peer traffic.** A fresh node must report zero observed peers.
     #[tokio::test]

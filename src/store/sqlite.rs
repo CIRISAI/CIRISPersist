@@ -21166,6 +21166,55 @@ mod tests {
             .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the SQLITE leg of the
+    /// **below-quorum** witness: a row with no baked comparand must still prove
+    /// it can confer.
+    #[tokio::test]
+    async fn below_quorum_row_cannot_confer_sqlite_665() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+            .attestation
+            .attestation_id;
+        let prior = crate::federation::genesis::prior_ceremony_row(target);
+        let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
+        let och = hex::decode(&prior.original_content_hash).unwrap();
+        {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_attestations SET \
+                        attestation_envelope = ?1, original_content_hash = ?2, \
+                        scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
+                        additional_scrubs = '[]', asserted_at = ?5, scrub_timestamp = ?6, \
+                        pqc_completed_at = ?7, persist_row_hash = ?8 \
+                     WHERE attestation_id = ?9",
+                    rusqlite::params![
+                        envelope,
+                        och,
+                        prior.scrub_signature_classical,
+                        prior.scrub_signature_pqc,
+                        prior.asserted_at.to_rfc3339(),
+                        prior.scrub_timestamp.to_rfc3339(),
+                        prior.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        prior.persist_row_hash,
+                        target,
+                    ],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the damage must actually have landed");
+        }
+        crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "sqlite").await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the SQLITE leg: **the genesis seed is not
     /// peer traffic.** A fresh node must report zero observed peers.
     #[tokio::test]

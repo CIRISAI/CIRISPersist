@@ -967,9 +967,59 @@ where
         // The single thing that stops being called tampering is a newer,
         // quorum-verified, holder-signed root.
         //
-        // Ordered cheapest-first: the byte comparison is pure and is the
-        // overwhelmingly common answer, so the crypto below runs only on a node
-        // that has genuinely moved ahead of its binary.
+        // ── THE PROPERTY, ASKED FIRST: CAN THIS PLANE CONFER RIGHT NOW? ──
+        //
+        // v31.1.0 (CIRISPersist#665 review) — this leg reported `Entrenched` on
+        // a plane that could not confer THREE times, and every fix was correct
+        // for the case in front of it and wrong as a rule: no signature check at
+        // all; then whole-row comparison but only on the seed path; then on the
+        // read path too, but only where a baked comparand EXISTS. The floor rule
+        // then deliberately created a path where the stored row is legitimately
+        // NOT the baked row — and that path had no wholeness check at all,
+        // because there was nothing to compare against.
+        //
+        // Byte-equality with a compiled-in artifact was never the property. It
+        // was a PROXY that happened to imply it, and each new legitimate way for
+        // a row to differ removed the implication while the code went on looking
+        // careful. So the property is asked DIRECTLY, and asked FIRST — ahead of
+        // every arm below, so that no arm can accept a row the plane cannot
+        // actually confer with, and so a path added later inherits the check
+        // instead of having to remember it.
+        //
+        // See `delegation_row_accord_quorum`. The cost is real crypto on the
+        // common path, and it is worth it: three rows, once per boot, to answer
+        // the only question this leg exists to answer.
+        match delegation_row_accord_quorum(dir, &row).await {
+            Ok(Some(quorum)) if !quorum.met() => {
+                return Err(GenesisFault::divergent(
+                    LEG,
+                    format!(
+                        "delegation row {id} no longer reaches the accord quorum that confers it \
+                         — {}. The row is present and its base signature may still verify, but \
+                         the distinct seated-holder co-signatures have fallen below the \
+                         threshold, so this plane CANNOT CONFER. Serving on it would report a \
+                         constitutional root no peer would accept",
+                        quorum.describe(),
+                    ),
+                ))
+            }
+            Ok(Some(_)) => {}
+            // No accord family on this node at all: PRE-GENESIS, and
+            // `verify_family_seeded` is the leg that reports it. Fall through
+            // rather than double-report — the arms below still classify this
+            // row, and on the boot path the family leg has already run.
+            Ok(None) => {}
+            Err(e) => {
+                return Err(GenesisFault::unreadable(
+                    LEG,
+                    format!("delegation row {id}: the accord quorum could not be counted: {e}"),
+                ))
+            }
+        }
+
+        // The arms below decide WHICH acceptable-row story this is — the baked
+        // artifact, this ceremony's row damaged around its signed envelope, or a
+        // successor. They no longer carry the burden of implying quorum.
         //
         // # v31.1.0 (CIRISPersist#665 review) — BYTE-WHOLENESS IS ASKED HERE TOO
         //
@@ -1922,6 +1972,78 @@ pub(crate) async fn assert_refused_replacement_classes(
         DelegationRowOutcome::LeftAsSubstituted,
         "[{tag}] a forged row is left in place for the posture leg to refuse, never silently \
          overwritten — overwriting it would repair the damage and report nothing"
+    );
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **THE BELOW-QUORUM WITNESS: a row with no
+/// baked comparand must still prove it can confer.**
+///
+/// The case that forced the invariant to be stated directly rather than
+/// inferred. A row that is legitimately NOT the compiled-in artifact — the floor
+/// rule accepts those on purpose — has nothing to be byte-compared against, so
+/// every wholeness proxy silently stops applying to it. Drop its
+/// `additional_scrubs` beneath persist and: its base holder signature still
+/// verifies, its content still differs from the baked row exactly as a newer
+/// ceremony's would, and its recency still passes. Three green proxies over a
+/// trust root that `family_quorum_over` cannot bring to threshold.
+///
+/// The fixture uses the vendored v30 row as the stand-in for "a real
+/// holder-signed row that is not the baked one", damaged the same way. It is the
+/// shape of the hole that matters — no comparand, base signature intact, quorum
+/// gone — not which side of the baked artifact it sits on.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn assert_below_quorum_row_cannot_confer(
+    dir: &dyn super::FederationDirectory,
+    tag: &str,
+) {
+    let id = &canonical_genesis_bundle().attestations[0]
+        .attestation
+        .attestation_id;
+    let stored = dir
+        .get_attestation(id)
+        .await
+        .expect("read back")
+        .unwrap_or_else(|| panic!("[{tag}] the damaged row {id} must be installed"));
+
+    // The proxies the old code trusted all still say "sound".
+    assert!(
+        stored.additional_scrubs.is_empty(),
+        "[{tag}] the fixture must have dropped the co-signatures"
+    );
+    assert!(
+        stored_row_is_verifiable_holder_statement(dir, &stored).await,
+        "[{tag}] and the BASE holder signature must still verify — that is precisely why the \
+         authenticity legs were not enough on their own"
+    );
+
+    // The property does not.
+    let quorum = delegation_row_accord_quorum(dir, &stored)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the quorum must be countable: {e}"))
+        .unwrap_or_else(|| panic!("[{tag}] the accord family must be seeded for this witness"));
+    assert!(
+        !quorum.met(),
+        "[{tag}] the fixture must actually be below threshold, or this proves nothing: {}",
+        quorum.describe()
+    );
+
+    let fault = verify_delegation_plane_seeded(dir).await.expect_err(
+        "a delegation plane that cannot reach its accord quorum must NOT read as sound — the \
+         agent-mode gate is open over whatever this reports",
+    );
+    assert_eq!(
+        fault.as_str(),
+        "divergent",
+        "[{tag}] a root below quorum is divergence: {fault}"
+    );
+    assert!(
+        fault.to_string().contains("CANNOT CONFER"),
+        "[{tag}] and the refusal names the property that failed, not a proxy: {fault}"
+    );
+    assert_eq!(
+        posture::genesis_posture(dir).await.as_str(),
+        "divergent",
+        "[{tag}] and a live query agrees"
     );
 }
 
@@ -3127,6 +3249,72 @@ fn candidate_is_strictly_newer(
         // claim to be newer.
         (false, _) => false,
     }
+}
+
+/// v31.1.0 (CIRISPersist#665 review) — **THE INVARIANT THIS PLANE ACTUALLY
+/// OWES: can it meet quorum RIGHT NOW?**
+///
+/// Counts the DISTINCT SEATED HOLDERS whose scrub over this row's own envelope
+/// verifies against the node's directory-pinned pubkeys, and compares that to
+/// the threshold re-derived from the node's own revocation-folded roster —
+/// [`family_quorum_over`](crate::federation::trust_root::family_quorum_over),
+/// the same body the charter plane and the mesh-config plane count with. One
+/// implementation of m-of-n-over-a-row; this is a third caller, not a third
+/// opinion.
+///
+/// # Why this exists, and why it is not a fourth special case
+///
+/// [`verify_delegation_plane_seeded`] has now reported `Entrenched` on a plane
+/// that could not confer THREE times, and each time the fix was correct for the
+/// case in front of it and wrong as a rule:
+///
+/// 1. it verified no signature at all — any stored bytes with the right content
+///    hash passed;
+/// 2. it gained whole-row comparison, but only on the SEED path, so damage
+///    landing after boot was invisible to every live query;
+/// 3. it gained whole-row comparison on the read path too — but only where a
+///    baked comparand EXISTS. The floor rule then deliberately introduced a
+///    path where the stored row is legitimately *not* the baked row, and that
+///    path had no wholeness check at all, because there was nothing to compare
+///    against.
+///
+/// The through-line is that byte-equality against a compiled-in artifact was
+/// never the property. It was a PROXY that happened to imply the property, and
+/// each new legitimate way for a row to differ from the artifact silently
+/// removed the implication while leaving the code looking careful.
+///
+/// The property is this: **every conferral row on this plane still carries at
+/// least the threshold of distinct verified seated-holder signatures.** That is
+/// what `family_quorum_over` answers, it needs no comparand, and it holds for a
+/// baked row, a newer ceremony's row, and any row a future path decides to
+/// accept. Anyone adding such a path should preserve THIS, not copy whichever
+/// comparison happens to be nearby.
+///
+/// # Errors
+///
+/// [`Error`](super::Error) if the accord family or the roster cannot be read.
+/// A node that cannot answer must not be told its root is sound.
+/// `Ok(None)` means this node has no accord family at all. That is a
+/// PRE-GENESIS fact and [`verify_family_seeded`] is the leg that owns it — it
+/// runs ahead of this one in the boot sequence — so this leg neither
+/// double-reports it nor pretends to have counted a quorum without a roster.
+async fn delegation_row_accord_quorum<D>(
+    dir: &D,
+    row: &super::Attestation,
+) -> Result<Option<crate::federation::trust_root::CharterQuorum>, super::Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    // The authority behind EVERY genesis delegation row is the accord holders'
+    // quorum — that is what the ceremony is — so all three are counted against
+    // the humanity-accord family regardless of which subject they attest.
+    let family_key_id = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let Some(family) = dir.lookup_family(family_key_id).await? else {
+        return Ok(None);
+    };
+    crate::federation::trust_root::family_quorum_over(dir, row, &family)
+        .await
+        .map(Some)
 }
 
 /// v31.1.0 (CIRISPersist#665 review) — is `row` v31-conformant **in the form it

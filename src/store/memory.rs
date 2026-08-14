@@ -17579,6 +17579,37 @@ mod tests {
             .await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the
+    /// **below-quorum** witness: a row with no baked comparand must still prove
+    /// it can confer.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn below_quorum_row_cannot_confer_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        // A holder-signed row that is NOT the baked artifact (so no comparand
+        // exists), damaged by dropping its co-signatures.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            for row in state.federation_attestations.iter_mut() {
+                if row.attestation_id == *target {
+                    *row = crate::federation::genesis::prior_ceremony_row(target);
+                    row.additional_scrubs.clear();
+                }
+            }
+        }
+        crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "memory").await;
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the MEMORY leg: **the genesis seed is not
     /// peer traffic.** A fresh node must report zero observed peers.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
