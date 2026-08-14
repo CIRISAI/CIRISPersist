@@ -36,6 +36,34 @@ all falls through to `verify_family_seeded`, which owns that report.
 Witnessed on memory, sqlite and postgres; mutation-tested (dropping the gate
 reds all three).
 
+### Fixed — SECURITY — a forged holder claim could drain the reserved quota (#665 review)
+
+The fix below routed rows carrying a baked genesis id to `WriteAdmissionClass::Reserved`,
+because that class opens no peer bucket. Correct about the symptom, **wrong
+about the budget.**
+
+The quota classifies at TIER 0, ahead of any signature check, so
+`attesting_key_id = "A1"` is a CLAIM and a claim is free. The reservation gate
+that runs before it does not help — it compares the *claimed* key against the
+roster and authenticates nothing. So an unauthenticated peer could repeatedly
+submit a baked genesis id with `tier = "federation"`, spend the budget that
+exists to keep accord objections writable, and have every row rejected moments
+later by `verify_federation_tier_ingest`. That is the same DoS this cut moved
+the reservation gate forward to close, re-opened one budget over.
+
+Rows claiming a genesis id are now their own class, `GenesisClaim`: charged
+against the node budget and the shared untracked tail — what any stranger
+already pays, so no new scarcity is exposed — and never promoted to a peer
+bucket. **Debit only what the claim is entitled to.** Being denied a bucket is
+strictly more restrictive for an attacker than being given one (the tail is
+shared and small), and it is exactly right for the node's own boot seed, which
+is not a peer.
+
+The genuine genesis rows lose the reserve's flood protection; that is the honest
+trade, stated rather than hidden. They are written once at boot, and a node
+whose node budget is exhausted at boot fails the seed to `Absent`, which boots
+and retries. A budget an unauthenticated claim can drain protects nothing.
+
 ### Fixed — the node's own genesis seed was counted as peer traffic (#665)
 
 Boot installs the delegation plane through `put_attestation`, which charges the

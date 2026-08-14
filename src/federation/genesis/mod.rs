@@ -2047,6 +2047,78 @@ pub(crate) async fn assert_below_quorum_row_cannot_confer(
     );
 }
 
+/// v31.1.0 (CIRISPersist#665 review) — **A FORGED HOLDER CLAIM MUST NOT DRAIN
+/// THE RESERVE.**
+///
+/// The quota classifies at TIER 0, ahead of any signature check, so
+/// `attesting_key_id = "A1"` on an inbound row is a CLAIM and a claim is free.
+/// `check_genesis_attestation_reserved` runs first and does not help: it
+/// compares the claimed key against the roster and authenticates nothing.
+///
+/// Routing those rows to `Reserved` — the first fix for the `tracked_peers`
+/// regression — therefore let an unauthenticated peer spend the budget that
+/// exists to keep accord objections writable, with rows the tier-3 verify was
+/// about to reject. This asserts the property the class now owes: **a forged
+/// claim consumes nothing it was not entitled to.**
+///
+/// Driven against the quota directly rather than through `put_attestation`,
+/// because the point is what the meter does BEFORE the signature gate is
+/// reached — going through the door would let the refusal mask whether the
+/// debit happened.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) fn assert_forged_genesis_claim_spares_the_reserve(tag: &str) {
+    use crate::federation::replication::admission::{PeerWriteQuota, WriteAdmissionClass};
+
+    let baked = &canonical_genesis_bundle().attestations[0].attestation;
+
+    // A stranger's row: a real baked genesis id, federation tier, `A1` merely
+    // CLAIMED, and a signature over nothing.
+    let mut forged = baked.clone();
+    forged.scrub_signature_classical = "AA".repeat(32);
+    forged.scrub_signature_pqc = None;
+    forged.additional_scrubs = Vec::new();
+
+    // It passes the pure reservation gate — that gate checks the claim, not the
+    // key. If this ever fails, the gate grew authentication and this witness
+    // should be re-read rather than deleted.
+    assert!(
+        check_genesis_attestation_reserved(&forged).is_ok(),
+        "[{tag}] the forgery must pass the PURE gate, or this witnesses the gate and not the meter"
+    );
+
+    assert_eq!(
+        PeerWriteQuota::classify(&forged),
+        WriteAdmissionClass::GenesisClaim,
+        "[{tag}] a row claiming a baked genesis id is its own class — NOT `Reserved`, which an \
+         unauthenticated claim must never be able to spend"
+    );
+
+    // And the reserve is untouched by any volume of it. `Reserved` is charged
+    // against a budget nothing else can drain; a flood of forged claims must
+    // leave a genuine accord objection writable.
+    let quota = PeerWriteQuota::new();
+    for _ in 0..512 {
+        let _ = quota.check_write(&forged);
+    }
+    let objection = ordinary_scores_row("reserve-probe", "reserve-probe-signer");
+    let mut objection = objection;
+    objection.attestation_envelope = serde_json::json!({
+        "dimension": "objection:raised:v1",
+        "objects_to": "anything",
+    });
+    assert_eq!(
+        PeerWriteQuota::classify(&objection),
+        WriteAdmissionClass::Reserved,
+        "[{tag}] the probe must actually be reserved-class"
+    );
+    assert!(
+        quota.check_write(&objection).is_ok(),
+        "[{tag}] after a flood of FORGED genesis claims the reserve must still admit a genuine \
+         accord objection — that budget exists so an ordinary flood cannot crowd out \
+         constitutional traffic, and an unauthenticated claim is an ordinary flood"
+    );
+}
+
 /// v31.1.0 (CIRISPersist#665) — **THE NODE'S OWN SEED IS NOT A PEER.**
 ///
 /// After a full genesis seed on a fresh directory, the peer-write quota must

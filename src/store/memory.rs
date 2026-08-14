@@ -17610,6 +17610,15 @@ mod tests {
         crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "memory").await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — **a forged holder claim must not
+    /// drain the reserve.** Backend-independent (the quota is shared code), so
+    /// it is asserted once rather than three times.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn forged_genesis_claim_spares_the_reserve_665() {
+        crate::federation::genesis::assert_forged_genesis_claim_spares_the_reserve("shared");
+    }
+
     /// v31.1.0 (CIRISPersist#665) — the MEMORY leg: **the genesis seed is not
     /// peer traffic.** A fresh node must report zero observed peers.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

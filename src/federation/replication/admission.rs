@@ -1096,6 +1096,38 @@ pub enum WriteAdmissionClass {
     /// objection family. Charged against the reserve and nothing else, so an
     /// ordinary flood can never crowd them out.
     Reserved,
+    /// v31.1.0 (CIRISPersist#665 review) — a row CLAIMING a baked genesis
+    /// delegation id. Charged against the node budget and the shared untracked
+    /// tail, and **never given a peer bucket**.
+    ///
+    /// # Why this is not [`Reserved`](Self::Reserved), and not [`Ordinary`](Self::Ordinary)
+    ///
+    /// It was `Reserved` for one release and that was wrong. The quota runs at
+    /// TIER 0, before any signature is checked, so at classification time
+    /// `attesting_key_id = "A1"` is a CLAIM and a claim is free — an
+    /// unauthenticated peer could spend the budget that exists to keep accord
+    /// objections writable, with rows `verify_federation_tier_ingest` was about
+    /// to reject. That is the same DoS this cut moved the reservation gate
+    /// forward to close, re-opened one budget over: the gate authenticates
+    /// nothing, it only checks that the CLAIMED key is on the roster.
+    ///
+    /// It cannot be `Ordinary` either, for the reason the class was introduced:
+    /// `Ordinary` promotes the writer to a tracked peer bucket, and the node's
+    /// own boot seed is not a peer. A fresh node reporting one observed peer
+    /// lifts `node_state`'s peer-quota band out of `unknown` into `green` and
+    /// destroys the distinction between "clean" and "never exercised".
+    ///
+    /// So it is charged where an unauthenticated stranger belongs — the node
+    /// budget and the shared tail, both of which any peer can already spend, so
+    /// no NEW scarcity is exposed — and is denied a bucket, which is strictly
+    /// MORE restrictive for an attacker (the tail is shared and small, where a
+    /// bucket would have been their own) and exactly right for the seed.
+    ///
+    /// The genesis rows lose the reserve's flood protection. That is the honest
+    /// trade: they are written once at boot, and a node whose NODE budget is
+    /// exhausted at boot fails the seed to `Absent`, which boots. Protecting
+    /// them with a budget an unauthenticated claim can drain protects nothing.
+    GenesisClaim,
 }
 
 /// One horizon of one dimension of one budget: a capacity and a continuous
@@ -1613,8 +1645,9 @@ impl PeerWriteQuota {
     /// it lead the whole chain. See [`RESERVED_CLASS_BUDGET_MULTIPLE`] for
     /// what a *pure* (hence forgeable) class decision does and does not buy.
     pub fn classify(row: &crate::federation::types::Attestation) -> WriteAdmissionClass {
-        // v31.1.0 (CIRISPersist#665) — **THE BAKED GENESIS DELEGATION PLANE IS
-        // RESERVED CLASS, AND THE NODE'S OWN SEED IS NOT A PEER.**
+        // v31.1.0 (CIRISPersist#665) — **A ROW CLAIMING A BAKED GENESIS ID IS
+        // ITS OWN CLASS, BECAUSE THE NODE'S OWN SEED IS NOT A PEER AND A CLAIM
+        // IS NOT AN IDENTITY.**
         //
         // 31.1.0 made boot install `genesis-charter` / `genesis-grant:…` /
         // `genesis-lifecycle` through `put_attestation`, which charges this
@@ -1626,24 +1659,28 @@ impl PeerWriteQuota {
         // out of `unknown` into `green`. Every fresh node would have reported a
         // TESTED quota on the strength of its own compiled-in artifact.
         //
-        // `genesis-lifecycle` already landed here via its `accord:` dimension;
-        // the two `delegates_to` rows carry no dimension at all and fell to
-        // `Ordinary`, which is what opened a peer bucket. Classifying the plane
-        // by ID finishes what the dimension arm started — these three rows are
-        // the constitutional root, which is precisely the traffic the reserved
-        // budget exists to keep writable under an ordinary flood.
+        // The first fix routed these ids to `Reserved`, which does not open a
+        // bucket — correct about the symptom and **wrong about the budget**.
+        // This runs at TIER 0, ahead of any signature check, so the only thing
+        // establishing `attesting_key_id = "A1"` is the row SAYING SO.
+        // `check_genesis_attestation_reserved` runs before it and does not help:
+        // it compares the CLAIMED key against the roster and authenticates
+        // nothing. An unauthenticated peer could therefore drain the budget that
+        // keeps accord objections writable, using rows
+        // `verify_federation_tier_ingest` was about to reject — the same DoS
+        // this cut moved that gate forward to close, re-opened one budget over.
         //
-        // **Why this is not a metering hole.** The reserved budget is real:
-        // these writes are charged, just not against a PEER. And a stranger
-        // cannot reach this arm to spend it — `check_genesis_attestation_reserved`
-        // is pure, and runs AHEAD of this quota at every backend's write door
-        // (moved there in this cut for exactly this reason), so a row claiming a
-        // baked genesis id from anyone but a seated accord holder is refused
-        // before any budget is touched.
+        // So the class is neither: charged against the node budget and the
+        // shared untracked tail — what any stranger already pays, so no new
+        // scarcity is exposed — and never promoted to a peer bucket. **Debit
+        // only what the claim is entitled to.** See
+        // `WriteAdmissionClass::GenesisClaim` for the full reasoning, including
+        // why being denied a bucket is strictly more restrictive for an attacker
+        // than being given one.
         if crate::federation::genesis::genesis_delegation_ids()
             .contains(&row.attestation_id.as_str())
         {
-            return WriteAdmissionClass::Reserved;
+            return WriteAdmissionClass::GenesisClaim;
         }
         match crate::federation::admission::envelope_dimension(&row.attestation_envelope) {
             Some(dim)
@@ -1774,6 +1811,26 @@ impl PeerWriteQuota {
         st.node.refill(&node_spec, now);
         if let Some(refused) = st.node.refusal(&node_spec, QuotaBudget::Node, cost) {
             return Err(refused);
+        }
+
+        // v31.1.0 (CIRISPersist#665 review) — a row CLAIMING a baked genesis id
+        // is metered like any unauthenticated stranger (node + shared tail) and
+        // is NEVER promoted to a peer bucket. See `WriteAdmissionClass::GenesisClaim`
+        // for why it is neither `Reserved` (an unauthenticated claim must not be
+        // able to drain the reserve) nor `Ordinary` (the node's own boot seed is
+        // not a peer). Placed after the node charge and before the bucket
+        // lookup, so it pays what everyone pays and skips only the promotion.
+        if class == WriteAdmissionClass::GenesisClaim {
+            st.tail.refill(&tail_spec, now);
+            if let Some(refused) = st
+                .tail
+                .refusal(&tail_spec, QuotaBudget::UntrackedTail, cost)
+            {
+                return Err(refused);
+            }
+            st.tail.spend(cost);
+            st.node.spend(cost);
+            return Ok(());
         }
 
         // Tracked peer: its own budget, and it does not touch the tail.
