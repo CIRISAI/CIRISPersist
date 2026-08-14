@@ -274,6 +274,30 @@ run_bg docver     python3 scripts/doc_version_refs.py
 # enables `pyo3`, so it was invisible locally and broke CIRISEdge's mobile
 # cross-compiles. Cheap `cargo check`, kept in the FAST tier on purpose.
 run_bg pyo3sqlite cargo check --no-default-features --features "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
+
+# v31.3.0 (CIRISPersist#678) — THE AXIS x BACKEND COMPILE SWEEP.
+#
+# Every test leg is BASE + axis, and BASE = (postgres, server, pyo3, sqlite) —
+# BOTH backends, always. So no leg has ever built an axis feature without a
+# backend, or with only one, and the lint pass has the same shape. The matrix
+# is itself a union on the backend axis, which is the exact blindness it was
+# built to prevent.
+#
+# That is not theoretical: it cost v31.1.0 TWO build breaks in one day, both
+# green on every backend leg —
+#   - `--features cirisnode` alone could not compile the test target at all
+#     (six media helpers gated broader than their own callers);
+#   - the `default` leg died exit=101 on a witness importing a module gated
+#     `any(sqlite, postgres)`.
+#
+# Both were COMPILE errors, so `cargo check` alone catches them — no test run,
+# no database, cheap enough to sweep the whole product. Compile-only on
+# purpose: this asks "does this configuration exist", not "does it pass".
+for _axis in cirisaudit secrets cirisnode cirisgraph telemetry; do
+  run_bg "axis-${_axis}-none"   cargo check --all-targets --no-default-features --features "$_axis"
+  run_bg "axis-${_axis}-sqlite" cargo check --all-targets --no-default-features --features "$_axis sqlite"
+  run_bg "axis-${_axis}-pg"     cargo check --all-targets --no-default-features --features "$_axis postgres"
+done
 wait
 FAST_GATES="fmt pyi featmatrix docver pyo3sqlite"
 fast_fail=0

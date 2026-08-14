@@ -5,6 +5,137 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.3.0] - 2026-08-14
+
+### Added — the matrix was a union on the backend axis, and it cost two build breaks in one day (#678)
+
+Every test leg is `BASE + axis`, and `BASE = (postgres, server, pyo3, sqlite)` —
+**both backends, always**. So no leg had ever built an axis feature without a
+backend, or with only one, and `LINT_SHIPPED` has the same shape. The matrix was
+itself a union on the backend axis: the exact blindness it exists to prevent,
+one level up.
+
+v31.1.0 paid for it twice in a single day, both green on every backend leg:
+`--features cirisnode` alone could not compile the test target at all, and the
+`default` leg died `exit=101` on a witness importing a module gated narrower
+than itself.
+
+`certify.sh` now sweeps **axis × {none, sqlite, postgres}** — 15 configurations,
+**compile-only on purpose**. Both breaks were compile errors, so `cargo check`
+catches them with no test run and no database; the question asked is *"does this
+configuration exist"*, not *"does it pass"*.
+
+It found live ones immediately. `cirisnode,postgres` was red, and **all five
+postgres-only configurations** were red under `-D warnings` — every cause the
+same shape, an item gated broader than what actually calls it:
+
+- a `NodeCoreDispatch` match whose **postgres arm was gated and whose sqlite arm
+  was not**, so the postgres-only build referenced a variant that does not exist
+  there — asymmetric gating on two arms of one match, invisible to any build
+  carrying both;
+- `node_core_service_sqlite_round_trip`, gated on the backend *union* while
+  asserting the **sqlite** dispatch variant — the name was not decoration;
+- two postgres "PG twin" tests seeding through `media_seed*`, whose bodies match
+  `NodeCoreDispatch::Sqlite`, so they need sqlite as well;
+- `merkle_store::deserialize_witness_signatures`, ungated while both its call
+  sites are `#[cfg(feature = "sqlite")]`;
+- `blobs::exercise_put_blob_admission`, gated on the backend union while only the
+  sqlite backend calls it (its `_for_host` variant is the one both use);
+- five `media_*` helpers, which had been *widened* to the union that morning for
+  a postgres caller — and once that caller was correctly gated to require sqlite,
+  the union left them dead.
+
+**That last one is the lesson.** The correct gate is the union of the gates of
+the ACTUAL callers, and it moves when the callers move. Three passes over the
+same five helpers in one day — widened, then narrowed — because each time the
+gate was reasoned about instead of measured. The sweep measures it.
+
+`-D warnings` is deliberate here, not incidental: `dead_code` under a
+single-backend build IS the signal being hunted. An item nothing calls in a
+configuration is an item gated wider than its callers.
+
+### Fixed — two migration citations named files that exist in neither tree (#680)
+
+`derive_persist_steward_bootstrap.rs` cited
+`migrations/{postgres,sqlite}/lens/V005__persist_steward_bootstrap.sql` in both
+its module doc and its `_handoff` output. Neither exists, and nothing under
+`migrations/` mentions `persist_steward` at all — V005 is `V005__readonly_role.sql`
+on postgres with no sqlite twin. The list described a plan that was not executed
+the way it was written. **A citation to a phantom file is worse than no citation:
+it is the thing a reader trusts instead of looking.** Replaced with what is
+actually true — the bootstrap record is constructed in code, not baked into DDL.
+
+### Added — backend parity is an enforced invariant now, not a claim (#670)
+
+`README.md` has said for some time that persist behaves the same on postgres,
+sqlite and memory *"as an enforced invariant."* It was not enforced. It was
+convention plus per-case witnesses, and v31 alone found five divergences of one
+shape — **a gate, an order, or a type that one backend has and its siblings do
+not**. The cost is always the same: the memory and sqlite arms are correct, so
+nobody can see it, and it surfaces on the one backend production runs.
+
+`store::parity` reads `src/store/{memory,sqlite,postgres}.rs` **from disk as
+text** and, for every method of `FederationDirectory` / `BlobStorage` /
+`Backend`, extracts the **ordered sequence of gate calls**. All three backends
+must produce the same sequence. Order is compared, not just membership, because
+#660 was an *ordering* bug with every right gate present.
+
+Reading source text rather than reflecting over the compiled crate is
+load-bearing: **the postgres arm is scanned under `--features sqlite`, and
+under no features at all.** A conformance check that only runs when the backend
+it checks is compiled goes dark exactly where this class of defect lives.
+
+The door set is **derived** from the impl blocks — there is no list anyone has
+to remember to extend. `DECLARED_DIVERGENCES` is subtractive over that derived
+set, and each entry **pins the exact sequence** its backend may have, so an
+exemption authorises one shape rather than "anything goes"; an exemption whose
+door has since been fixed goes stale and fails.
+
+### Fixed — the four live divergences the gate found on its first run (#670)
+
+None of these admitted a row that should have been refused. All four change
+**which typed refusal a caller receives** when a row violates more than one
+gate, which is consumer-visible (see #624) and is the reason they are fixed
+rather than filed.
+
+- **`attestation_upsert_local` / `attestation_insert_local`** — sqlite and
+  postgres ran `check_attested_subject_admission`, a directory walk, *ahead* of
+  three pure predicates. Memory had the AV-76 order and the two SQL backends
+  did not, so a row failing a free predicate paid for a directory resolution
+  first on the backends production runs. Moved behind the pure gates on both.
+- **`put_public_key`** — the same shape. `consent_role::check_admissible` is a
+  pure predicate over a closed vocabulary and ran on the SQL backends only
+  after four accord-conferral directory walks *and* the conflict-check read.
+  Moved to the head of the door on both, matching memory.
+- **`put_family_membership_revocation`** — memory wrote into
+  `federation_hard_case_events` directly where its siblings go through
+  `record_hard_case`, which is where `check_admin_action_attribution` lives.
+  Behaviourally identical *today* — the gate short-circuits for a kind that is
+  not `admin_action:*`, and the idempotent insert matched — which is exactly
+  what made it invisible. It was one gate away from a hole, permanently, on the
+  arm nobody watches.
+- **`reseal_attestation_v31`** — memory ran the signature gate before the pure
+  shape gate, the #660 tier inversion one door over. The pure gate leads now;
+  the second ask under the lock stays, and is declared, because memory's
+  read-then-write is not one transaction the way the SQL backends' is.
+
+`put_goal` (memory does not compute the write-only `goal_text_canonical`
+projection, which no reader reads) and `put_revocation` (memory's anti-rollback
+lookup needs the state lock the insert holds — stronger than the SQL position,
+not weaker) are **declared** rather than changed.
+
+### Fixed — the seal has one home, and now a gate says so (#670, #643)
+
+`no_backend_file_hand_rolls_the_seal` is #643 turned into a check. `pg_resign`
+was the only one of three sibling re-sign helpers never redirected to the
+shared seal, so **every** postgres attestation fixture signed without its
+instants — 34 of 46 postgres reds, 14 of them matching the *wrong* refusal,
+which is green-adjacent noise sitting over real typed-variant regressions.
+
+One dead hand-rolled copy in `memory.rs` is removed: it called `sign_envelope`,
+assigned the hash and both signature halves, and then called `reseal`, which
+recomputed all three from the same signer. Dead is the lucky outcome of that
+shape; `pg_resign` is the same code that was not overwritten.
 ## [31.2.0] - 2026-08-14
 
 ### Changed — the re-minted genesis seed is baked (#660, CIRISServer#398)

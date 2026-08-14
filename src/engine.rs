@@ -8702,7 +8702,10 @@ mod tests {
     /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
     /// the SQLite dispatch variant and a `put_contribution` /
     /// `list_contributions` round-trips through it.
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    // v31.3.0 (CIRISPersist#678) — the name is not decoration: this asserts the
+    // SQLITE dispatch variant, so it needs sqlite, not "some backend". Gated on
+    // the union it compiled only because every leg carries both.
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     #[tokio::test]
     async fn node_core_service_sqlite_round_trip() {
         use crate::cirisnode::{
@@ -8721,6 +8724,11 @@ mod tests {
 
         let dispatch = engine.node_core_service();
         let backend = match dispatch {
+            // v31.3.0 (CIRISPersist#678) — the POSTGRES arm was gated and the
+            // SQLITE arm was not, so `--features cirisnode,postgres` referenced
+            // a variant that does not exist there. Asymmetric gating on the two
+            // arms of one match is invisible to any build that has both.
+            #[cfg(feature = "sqlite")]
             NodeCoreDispatch::Sqlite(b) => b,
             #[cfg(feature = "postgres")]
             NodeCoreDispatch::Postgres(_) => panic!("expected sqlite NodeCore variant"),
@@ -17189,7 +17197,7 @@ mod tests {
     // envelope so `put_contribution` admits them with no trust gate and
     // no registered author key (author_id == the signing pubkey).
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_pubkey_b64(key: &SigningKey) -> String {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -17198,7 +17206,7 @@ mod tests {
         B64.encode(vk.to_bytes())
     }
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_sign(
         env: &crate::cirisnode::ContributionEnvelope,
         key: &SigningKey,
@@ -17215,7 +17223,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_sha_hex(seed: u8) -> String {
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
@@ -17227,7 +17235,7 @@ mod tests {
     /// Build a signed `takedown_notice` Contribution with a chosen
     /// claimant + `submitted_at` (so the secondary-key / window / cursor
     /// axes are controllable).
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_build_takedown(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17280,7 +17288,7 @@ mod tests {
 
     /// Build a signed `key_grant` Contribution with a chosen recipient +
     /// content + `submitted_at`. The grant publisher is `author_key`.
-    #[cfg(all(feature = "cirisnode", any(feature = "sqlite", feature = "postgres")))]
+    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     fn media_build_key_grant(
         author_key: &SigningKey,
         sha_hex: &str,
@@ -17702,7 +17710,9 @@ mod tests {
 
     /// PG twin of `list_takedowns_for_filters_target_claimant_and_window`
     /// — env-gated; runtime-verified against the lead's docker PG.
-    #[cfg(all(feature = "postgres", feature = "cirisnode"))]
+    // v31.3.0 (CIRISPersist#678) — this PG twin seeds through `media_seed*`,
+    // whose bodies match `NodeCoreDispatch::Sqlite`, so it needs sqlite too.
+    #[cfg(all(feature = "postgres", feature = "sqlite", feature = "cirisnode"))]
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn list_takedowns_for_filters_postgres() {
@@ -17752,7 +17762,9 @@ mod tests {
     }
 
     /// PG twin of the key_grant facade test — env-gated.
-    #[cfg(all(feature = "postgres", feature = "cirisnode"))]
+    // v31.3.0 (CIRISPersist#678) — this PG twin seeds through `media_seed*`,
+    // whose bodies match `NodeCoreDispatch::Sqlite`, so it needs sqlite too.
+    #[cfg(all(feature = "postgres", feature = "sqlite", feature = "cirisnode"))]
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn list_key_grants_for_filters_postgres() {

@@ -2955,6 +2955,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
         }
 
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — the consent_role token is a
+        // PURE predicate over a closed vocabulary, so it leads the four
+        // accord-conferral gates below, every one of which is a directory walk.
+        // v31.2.0 (CIRISPersist#670): it used to run AFTER them, and after the
+        // conflict-check read — a row naming a token that does not exist paid
+        // for four authority resolutions before anything told it so, on the two
+        // backends production runs and not on memory. Backend-symmetric now.
+        // The wire ⇔ stored `'unregistered'` mapping stays at the bind site,
+        // where the column is written.
+        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+
         // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
         // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
         // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
@@ -3041,11 +3052,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     crate::federation::Error::Backend(format!("roles serialize: {e}"))
                 })?)
             };
-        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
-        // token (Rust-level; SQLite's V020 ALTER could not add the PG
-        // CHECK, this keeps the backends symmetric), then map wire None
-        // ⇔ the stored V020 'unregistered' default (NOT NULL column).
-        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — map wire None ⇔ the stored
+        // V020 'unregistered' default (NOT NULL column). The admission gate on
+        // the token itself (Rust-level; SQLite's V020 ALTER could not add the
+        // PG CHECK, so the check keeps the backends symmetric) ran at the top
+        // of this door, ahead of the conferral walks — CIRISPersist#670.
         let consent_role_stored =
             crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
                 .to_owned();
@@ -14258,20 +14269,6 @@ impl SqliteBackend {
             &envelope_value,
         )
         .await?;
-        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
-        // federation write path and with the other two backends. V114 removed
-        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
-        // the local writer must run the predicate explicitly or the two write
-        // paths would enforce different rules.
-        crate::federation::admission::check_attested_subject_admission(
-            self,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-        )
-        .await?;
-
         // The (occurrence, dimension) key + the gate axis. Required.
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(
@@ -14300,6 +14297,27 @@ impl SqliteBackend {
             self,
             disposition,
             &input,
+        )
+        .await?;
+
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
+        // federation write path and with the other two backends. V114 removed
+        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
+        // the local writer must run the predicate explicitly or the two write
+        // paths would enforce different rules.
+        // v31.2.0 (CIRISPersist#670) — it runs HERE, behind the pure gates, not
+        // ahead of them. It resolves the subject through the directory; the
+        // three gates above are pure functions of `input`. Memory had this
+        // order and the two SQL backends did not, which is the AV-76 tier
+        // inversion of #660 wearing different clothes: a row that fails a free
+        // predicate was paying for a directory walk first, on the two backends
+        // production runs.
+        crate::federation::admission::check_attested_subject_admission(
+            self,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
         )
         .await?;
 

@@ -2007,7 +2007,10 @@ pub(crate) fn sealed_put_blob_attestation(
 /// Plus the control that an honest holder claim still lands — including one
 /// asserted in the PAST, which is the case #652 added the field for (*"a holder
 /// announcing bytes it has held for a week is making a claim about the week"*).
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+// v31.3.0 (CIRISPersist#678) — the `_for_host` variant below is called by BOTH
+// backends, but this wrapper only by sqlite, so the union gate left it dead
+// under postgres-only.
+#[cfg(all(test, feature = "sqlite"))]
 pub(crate) async fn exercise_put_blob_admission<B>(backend: &B, suffix: &str)
 where
     B: BlobStorage + crate::federation::FederationDirectory,
