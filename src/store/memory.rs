@@ -17610,6 +17610,72 @@ mod tests {
         crate::federation::genesis::assert_below_quorum_row_cannot_confer(&backend, "memory").await;
     }
 
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **a refused
+    /// replacement must not delete the row it was replacing.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn refused_replacement_keeps_the_row_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_refused_replacement_keeps_the_row(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **re-running the
+    /// saved ceremony repairs the node's own ceremony row.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn saved_ceremony_repairs_its_own_row_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        // Thin the co-signature set beneath persist, leaving the signed
+        // envelope — and therefore the bound instants — byte-identical.
+        {
+            let mut state = backend.state.lock().expect("memory backend lock");
+            let target = &crate::federation::genesis::canonical_genesis_bundle().attestations[0]
+                .attestation
+                .attestation_id;
+            for row in state.federation_attestations.iter_mut() {
+                if row.attestation_id == *target {
+                    row.additional_scrubs.clear();
+                }
+            }
+        }
+        crate::federation::genesis::assert_saved_ceremony_repairs_its_own_row(&backend, "memory")
+            .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg: **a lost bake race
+    /// must not be reported as success.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn lost_bake_race_is_not_reported_as_success_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("the winner installs the current plane");
+        crate::federation::genesis::assert_lost_bake_race_is_not_reported_as_success(
+            &backend, "memory",
+        )
+        .await;
+    }
+
     /// v31.1.0 (CIRISPersist#665 review) — **a forged holder claim must not
     /// drain the reserve.** Backend-independent (the quota is shared code), so
     /// it is asserted once rather than three times.

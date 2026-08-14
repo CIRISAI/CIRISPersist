@@ -36,6 +36,54 @@ all falls through to `verify_family_seeded`, which owns that report.
 Witnessed on memory, sqlite and postgres; mutation-tested (dropping the gate
 reds all three).
 
+### Fixed — SECURITY — equal `asserted_at` was one case and it is two (#665 review)
+
+Five findings across the bake and posture paths, all one missing distinction.
+Equal `asserted_at` was undifferentiated, and the two halves pull in **opposite**
+directions — which is the tell that the case was under-discriminated rather than
+mis-signed. The closed set is now:
+
+| stored vs candidate | verdict |
+|---|---|
+| whole row equal | already present |
+| same envelope, different UNSIGNED material | **repairable** |
+| same `asserted_at`, different envelope content | **ambiguous — never `Entrenched`** |
+| candidate strictly newer | replace |
+
+**Re-running the saved ceremony could not repair the node's own row.** A row
+whose signed envelope was byte-identical with only unsigned material damaged
+failed whole-row equality, then failed strict recency (the bound instants are
+identical), and fell into the bake's anti-rollback refusal. With that ceremony
+newer than the compiled-in artifact the boot seed could not help either, leaving
+another full ceremony as the only recovery — on the path an operator reaches for
+during an incident. There is no rollback risk: the signed bytes are identical,
+so restoring unsigned material is not a supersession.
+
+**Posture could reach `Entrenched` on an ambiguity.** The successor test asked
+*"the baked row is not newer"*, which is true of a tie, so a stored row of the
+same vintage with different content read as a successor. `Entrenched` is the
+strongest claim this plane makes; the successor has to win, not tie.
+
+**A refused replacement deleted the row it was replacing.** Delete-then-insert
+with the refusal after the delete, and the retry hitting the same refusal —
+stable, not transient. Trigger: a ceremony machine whose clock runs ahead of
+`DEFAULT_MAX_TOUCH_SKEW`, which `classify_shape` accepts at the row's own instant
+and the write door refuses against `Utc::now()`. The deterministic doors now run
+before anything is deleted, **including the wall-clock gate a shape-only
+preflight missed** — the seed path had the same hole.
+
+**The bake could purge the evidence of a substitution.** A corrupted row with an
+older bound instant passed recency and was deleted, destroying the only proof
+anything was wrong. The boot path deliberately leaves unverifiable statements in
+place so posture can report them; the bake now asks the same question with the
+same predicate before deleting.
+
+**A duplicate key proved someone won, not that your row is present.** The insert
+branch reported `AlreadyPresent` on the collision alone, so two concurrent bakes
+with different content both returned success. Both call sites now reclassify
+through one shared helper; `AlreadyPresent` is only ever said of a row this
+bundle would itself have written.
+
 ### Fixed — SECURITY — a forged holder claim could drain the reserved quota (#665 review)
 
 The fix below routed rows carrying a baked genesis id to `WriteAdmissionClass::Reserved`,
