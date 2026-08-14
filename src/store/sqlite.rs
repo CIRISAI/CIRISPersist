@@ -21051,6 +21051,20 @@ mod tests {
         .await;
     }
 
+    /// v31.1.0 (CIRISPersist#622) — the SQLITE leg of the **symbolic
+    /// `revocation_id`** witness. `TEXT PRIMARY KEY` since V004; this leg is
+    /// here to prove the relaxation did not move sqlite, not because sqlite was
+    /// ever wrong.
+    #[tokio::test]
+    async fn symbolic_revocation_id_round_trips_sqlite_622() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::backend_parity_test_support::exercise_symbolic_revocation_id_round_trips(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#660) — the SQLITE leg of the **attestation
     /// `original_content_hash` hex** parity witness.
     #[tokio::test]
