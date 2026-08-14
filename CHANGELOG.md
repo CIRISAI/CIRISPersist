@@ -7,6 +7,37 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.1.0] - 2026-08-13
 
+### Fixed — the node's own genesis seed was counted as peer traffic (#665)
+
+Boot installs the delegation plane through `put_attestation`, which charges the
+peer-write quota — so a **fresh engine came up having "observed" one peer**
+(`A1`), a peer no peer had ever spoken as. Caught by
+`tests/python/test_node_state_surface.py::test_the_zeroes_do_not_share_a_token`.
+
+Not cosmetic. `tracked_peers` is the token that separates *"nobody has talked to
+us"* from *"peers have, and none were denied"*, and `node_state` reads
+`tracked_peers > 0` as the condition that lifts the peer-quota band out of
+`unknown` into `green`. Every fresh node would have reported a TESTED quota on
+the strength of its own compiled-in artifact, and an operator would have lost
+exactly the distinction the typed standings exist to preserve.
+
+The baked delegation plane is now **reserved class**, which is charged against
+its own budget and opens no peer bucket — the same treatment `genesis-lifecycle`
+already received via its `accord:` dimension, extended to the two `delegates_to`
+rows that carry no dimension at all and were falling to `Ordinary`. These three
+rows are the constitutional root, which is precisely the traffic the reserved
+budget exists to keep writable under a flood.
+
+Not a metering hole: the writes are still charged, just not against a peer, and
+`check_genesis_attestation_reserved` — which is pure — **moved ahead of the
+quota** at all three write doors so a row claiming a baked genesis id from
+anyone but a seated accord holder is refused before any budget is touched.
+
+Also restated as a Rust witness on all three backends, because
+`tests/python/` is run by CI and **not** by `certify.sh full` — so the release
+gate was structurally blind to this class. A green certify is not a superset of
+CI until that is closed.
+
 ### Changed — SECURITY — the compiled-in genesis bundle is the FLOOR, not the identity (#665 review)
 
 Three review P1s, all one gap: `seed_delegation_plane` and the delegation half

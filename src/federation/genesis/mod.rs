@@ -1925,6 +1925,54 @@ pub(crate) async fn assert_refused_replacement_classes(
     );
 }
 
+/// v31.1.0 (CIRISPersist#665) — **THE NODE'S OWN SEED IS NOT A PEER.**
+///
+/// After a full genesis seed on a fresh directory, the peer-write quota must
+/// have observed NOTHING: no tracked peers, no denials.
+///
+/// # Why this is a real property and not test bookkeeping
+///
+/// `tracked_peers` is the token that separates *"nobody has talked to us"* from
+/// *"peers have, and none were denied"* — and
+/// [`node_state`](crate::federation::node_state) reads `tracked_peers > 0` as
+/// the condition that lifts the peer-quota band out of `unknown` into `green`.
+/// So a single spurious peer does not merely look untidy: every fresh node
+/// reports a TESTED quota, and an operator loses exactly the distinction the
+/// typed standings exist to preserve — `slot_denials == 0` becomes
+/// indistinguishable between "clean" and "never exercised".
+///
+/// 31.1.0 introduced that regression by making boot install the delegation
+/// plane through `put_attestation`, which charges the quota: a fresh engine came
+/// up having "observed" `A1`, a peer no peer had ever spoken as. The compiled-in
+/// bundle is this binary's own artifact, not traffic.
+///
+/// # Why it is asserted HERE, in Rust
+///
+/// It was caught by `tests/python/test_node_state_surface.py`, which CI runs and
+/// **`certify.sh full` does not** — so the release gate was structurally blind
+/// to it. Restating the invariant at the Rust layer puts it under nextest, which
+/// both run. The python test keeps its own assertion; this is the one that fails
+/// first and on every leg.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) fn assert_genesis_seed_is_not_peer_traffic(
+    quota: &crate::federation::replication::admission::PeerWriteQuota,
+    tag: &str,
+) {
+    assert_eq!(
+        quota.tracked_peers(),
+        0,
+        "[{tag}] a freshly seeded node must have observed NO peers — the compiled-in genesis \
+         bundle is this binary's own artifact, not traffic. `tracked_peers > 0` is what lifts \
+         the peer-quota band out of `unknown`, so counting the seed reports a TESTED quota on \
+         a node nobody has ever talked to"
+    );
+    assert_eq!(
+        quota.slot_denials(),
+        0,
+        "[{tag}] and nothing was denied a bucket"
+    );
+}
+
 /// v31.1.0 (CIRISPersist#665 review) — **THE ROLLING-DEPLOYMENT WITNESS: a
 /// stale initializer must not delete the row that overtook it.**
 ///

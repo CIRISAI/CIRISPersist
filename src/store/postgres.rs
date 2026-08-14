@@ -4227,10 +4227,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // ── AV-76 TIER 0 — the free prologue ────────────────────────
         // Neither check below reads the row's content, touches the DB, or
         // takes a pooled connection.
+        // v31.1.0 (CIRISPersist#665) — THE BAKED GENESIS IDS ARE RESERVED, and
+        // this gate now runs AHEAD of the quota rather than in tier 1. It is
+        // pure, so it was always free to lead; it has to now, because the quota
+        // classifies these ids into the RESERVED budget and the reverse order
+        // would let a stranger spend the budget that keeps constitutional
+        // traffic writable simply by claiming a genesis id on a row this gate is
+        // about to refuse. See the memory backend for the full rationale;
+        // backend-symmetric across memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         if !row.attesting_key_id.is_empty() {
             // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
-            // quota. It LEADS because it is the only check in the whole
-            // stack that consults no shared state at all, so it also
+            // quota. It LEADS the state-consulting checks because it is the
+            // only one that consults no shared state at all, so it also
             // bounds the recursive directory walk the trust scorer runs at
             // any threshold > 0. It answers "you are writing too fast",
             // never "that key exists" — strictly less leaky than the gate
@@ -4289,10 +4298,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
-        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED. See
-        // the memory backend's put_attestation for the placement rationale;
-        // pure ⇒ TIER 1, backend-symmetric across memory / sqlite / postgres.
-        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — the baked genesis ids are RESERVED; that
+        // gate moved to the top of this function in v31.1.0 (#665), ahead of the
+        // write quota. See it there for why the order is load-bearing.
+        //
         // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
         // STATED rather than left to the `hex::decode` at bind time. See the
         // memory backend: binding nothing, it accepted what this refuses.
@@ -22256,6 +22265,33 @@ mod tests {
                 &backend, "postgres",
             )
             .await;
+        })
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the POSTGRES leg: **the genesis seed is not
+    /// peer traffic.** A fresh node must report zero observed peers.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn genesis_seed_is_not_peer_traffic_postgres_665() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
+                .await
+                .expect("holders seed");
+            crate::federation::genesis::seed_family_and_canonical(&backend)
+                .await
+                .expect("seed the baked plane");
+            crate::federation::genesis::assert_genesis_seed_is_not_peer_traffic(
+                &backend.peer_write_quota,
+                "postgres",
+            );
         })
         .await;
     }

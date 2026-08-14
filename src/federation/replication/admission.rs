@@ -1613,6 +1613,38 @@ impl PeerWriteQuota {
     /// it lead the whole chain. See [`RESERVED_CLASS_BUDGET_MULTIPLE`] for
     /// what a *pure* (hence forgeable) class decision does and does not buy.
     pub fn classify(row: &crate::federation::types::Attestation) -> WriteAdmissionClass {
+        // v31.1.0 (CIRISPersist#665) — **THE BAKED GENESIS DELEGATION PLANE IS
+        // RESERVED CLASS, AND THE NODE'S OWN SEED IS NOT A PEER.**
+        //
+        // 31.1.0 made boot install `genesis-charter` / `genesis-grant:…` /
+        // `genesis-lifecycle` through `put_attestation`, which charges this
+        // quota — so a FRESH engine came up having "observed" one peer (`A1`)
+        // that no peer had ever spoken as. That corrupts the signal at its
+        // source: `tracked_peers` exists to separate *"nobody has talked to
+        // us"* from *"peers have, and none were denied"*, and `node_state`
+        // reads `tracked_peers > 0` as the thing that lifts the peer-quota band
+        // out of `unknown` into `green`. Every fresh node would have reported a
+        // TESTED quota on the strength of its own compiled-in artifact.
+        //
+        // `genesis-lifecycle` already landed here via its `accord:` dimension;
+        // the two `delegates_to` rows carry no dimension at all and fell to
+        // `Ordinary`, which is what opened a peer bucket. Classifying the plane
+        // by ID finishes what the dimension arm started — these three rows are
+        // the constitutional root, which is precisely the traffic the reserved
+        // budget exists to keep writable under an ordinary flood.
+        //
+        // **Why this is not a metering hole.** The reserved budget is real:
+        // these writes are charged, just not against a PEER. And a stranger
+        // cannot reach this arm to spend it — `check_genesis_attestation_reserved`
+        // is pure, and runs AHEAD of this quota at every backend's write door
+        // (moved there in this cut for exactly this reason), so a row claiming a
+        // baked genesis id from anyone but a seated accord holder is refused
+        // before any budget is touched.
+        if crate::federation::genesis::genesis_delegation_ids()
+            .contains(&row.attestation_id.as_str())
+        {
+            return WriteAdmissionClass::Reserved;
+        }
         match crate::federation::admission::envelope_dimension(&row.attestation_envelope) {
             Some(dim)
                 if RESERVED_CLASS_DIMENSION_PREFIXES

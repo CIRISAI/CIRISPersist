@@ -2285,9 +2285,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // NEITHER — it had no `admission_gate` field at all, so the
         // v3.4.0 trust gate had never run on this backend, and the AV-76
         // quota would have shipped existing on two backends out of three.
+        // v31.1.0 (CIRISPersist#665) — THE BAKED GENESIS IDS ARE RESERVED, and
+        // this gate now runs AHEAD of the quota rather than in tier 1.
+        //
+        // It is pure (a compare against a 3-element set, then a membership test
+        // against the baked roster — no directory read), so it was always free
+        // to lead. It has to, now that the quota classifies these ids into the
+        // RESERVED budget: were the order reversed, a stranger could spend the
+        // budget that keeps constitutional traffic writable simply by claiming
+        // a genesis id on a row this gate is about to refuse. Refusing first
+        // means only a seated accord holder's row ever reaches that budget.
+        //
+        // Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+
         if !row.attesting_key_id.is_empty() {
-            // Per-peer write quota. It LEADS because it is the only check
-            // in the whole stack that consults no shared state, so it also
+            // Per-peer write quota. It LEADS the state-consulting checks because
+            // it is the only one that consults no shared state, so it also
             // bounds the recursive directory walk the trust scorer runs at
             // any threshold > 0. It answers "you are writing too fast",
             // never "that key exists" — strictly less leaky than the gate
@@ -2340,16 +2354,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         //
         // This tier is IDENTICAL across memory / sqlite / postgres.
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
-        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED.
-        // Immediately behind the canonicalization so the envelope compare sees
-        // the bytes that will be stored, and ahead of the #598/#643 binding
-        // gates so a squat is named by the reservation rather than by whichever
-        // neighbouring gate the attacker's row happens to trip first. The baked
-        // rows themselves pass here unchanged, so the pre-v31 refusal those two
-        // gates produce — the inversion `bundle_delegation_plane_v31_shaped`
-        // drives — is untouched. Pure ⇒ TIER 1; backend-symmetric across
-        // memory / sqlite / postgres.
-        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v31.0.0 (CIRISPersist#660) — the baked genesis ids are RESERVED, and
+        // the gate that says so has run at the very top of this function since
+        // v31.1.0 (#665), ahead of the write quota — see the comment there for
+        // why the order is load-bearing. It used to sit here, behind the
+        // canonicalization; it does not read the envelope, so the move costs it
+        // nothing.
+        //
         // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex. The
         // SQL backends refused a non-hex value only as a side effect of binding
         // a BLOB/BYTEA; memory binds nothing and accepted it. Stated on all
@@ -17566,6 +17577,25 @@ mod tests {
 
         crate::federation::genesis::assert_rebake_supersedes_prior_ceremony(&backend, "memory")
             .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#665) — the MEMORY leg: **the genesis seed is not
+    /// peer traffic.** A fresh node must report zero observed peers.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn genesis_seed_is_not_peer_traffic_memory_665() {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("seed the baked plane");
+        crate::federation::genesis::assert_genesis_seed_is_not_peer_traffic(
+            &backend.peer_write_quota,
+            "memory",
+        );
     }
 
     /// v31.1.0 (CIRISPersist#665 review) — the MEMORY leg of the **refused
