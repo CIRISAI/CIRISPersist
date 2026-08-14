@@ -5,6 +5,40 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.4.0] - 2026-08-14
+
+### Fixed — a consumer could SIGN an AdmitSpec and could not REGISTER the authority it verifies against (#664)
+
+`cohort::test_support::admit_family` is `pub`, and its own doc states the
+precondition: `authority_key_id` **MUST** already be registered, via
+`tier_ingest::test_support::register_hybrid_key`. That function was `pub` — but
+its **module** was `pub(crate)`. So a downstream fixture could produce the
+signature and could not create the key the signature verifies against: a fixture
+that fails closed with no way to open it. **#604 records four independent
+workstreams hitting that wall.**
+
+`tier_ingest::test_support` is now `pub`. The whole module widens rather than the
+one function, because the same wall is one call away in every direction —
+`sign_envelope`, `seal_row_in_place` (which stamps the #598 instants AND the
+#643 row mirror as one step), `seal_revocation`, `stamp_mirror`. A consumer
+building a valid row needs the helpers this crate's own fixtures need, and
+shipping half of them is how the next `pub(crate)` wall gets found by someone
+else's blocked test. **This release used `seal_row_in_place` twice to repair its
+own fixtures** — a consumer reaching for it is reaching for the right thing.
+
+The `#[cfg(any(test, feature = "test-anchor"))]` fence is unchanged: none of this
+exists in a build that has not opted into `test-anchor`. It is a supported
+contract for FIXTURES and nothing else — these helpers sign with deterministic
+test keypairs and are not a production signing path.
+
+**Witnessed from outside the crate, deliberately.** `tests/downstream_fixture_surface.rs`
+is an integration test because `tests/` compiles as a separate crate, so
+`pub(crate)` is invisible there exactly as it is to CIRISServer, CIRISEdge and
+CIRISAgent. A unit test inside `src/` could reach `pub(crate)` and would have
+passed while every consumer stayed blocked — which is precisely how this survived:
+persist's own fixtures were green throughout. Mutation-tested: reverting to
+`pub(crate)` fails the BUILD (`error[E0603]`), not an assertion.
+
 ## [31.3.0] - 2026-08-14
 
 ### Added — the matrix was a union on the backend axis, and it cost two build breaks in one day (#678)
