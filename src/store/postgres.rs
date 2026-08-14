@@ -6780,6 +6780,32 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_stored_proposal).collect()
     }
 
+    /// v31.1.0 (CIRISPersist#662) — the payload-digest lookup the withdrawal
+    /// projection resolves with, so a role-claiming key offer costs one query
+    /// instead of a scan of the whole ceremony log.
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM cirislens.accord_proposal WHERE payload_sha256 = $1 \
+                 ORDER BY created_at ASC, proposal_digest ASC",
+                &[&payload_sha256],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_accord_proposals_by_payload: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_stored_proposal).collect()
+    }
+
     async fn put_accord_participation(
         &self,
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
@@ -9197,7 +9223,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 // `created_at`: a vote landing must move the bundle forward in
                 // the stream, or a peer that read it pre-quorum never sees the
                 // version that carries one.
-                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                // v31.1.0 (PR review P1) — `evidence_at` is SELECTED and
+                // carried out with the row, never recomputed at assembly time:
+                // a vote landing in between would otherwise return an instant
+                // later than the one the page was chosen with, and a consumer
+                // resuming from it would skip the proposals cut by `LIMIT` in
+                // that gap.
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                        evidence_at \
                  FROM ( \
                    SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
                           proposal_digest, \
@@ -9218,10 +9251,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "list_signed_accord_quorum_evidence_since: {e}"
                 ))
             })?;
-        let page = rows
-            .into_iter()
-            .map(pg_row_to_stored_proposal)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut page = Vec::with_capacity(rows.len());
+        for row in rows {
+            let evidence_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("evidence_at")
+                .map_err(|e| crate::federation::Error::Backend(format!("evidence_at: {e}")))?;
+            page.push((pg_row_to_stored_proposal(row)?, evidence_at));
+        }
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 

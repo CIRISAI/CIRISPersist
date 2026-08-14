@@ -5945,6 +5945,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_accord_proposals_by_anchor: {e}")))
     }
 
+    /// v31.1.0 (CIRISPersist#662) — the payload-digest lookup the withdrawal
+    /// projection resolves with, so a role-claiming key offer costs one query
+    /// instead of a scan of the whole ceremony log.
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = payload_sha256.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM accord_proposal WHERE payload_sha256 = ?1 \
+                 ORDER BY created_at ASC, proposal_digest ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_stored_proposal)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_accord_proposals_by_payload: {e}"))
+        })
+    }
+
     async fn put_accord_participation(
         &self,
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
@@ -8292,8 +8317,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // that carries one. `MAX(a, b)` here is SQLite's SCALAR max (two
             // args), and the timestamps are `to_rfc3339()` UTC text, which
             // orders lexicographically the same way it orders in time.
+            // v31.1.0 (PR review P1) — `evidence_at` is SELECTED and carried
+            // out with the row, never recomputed at assembly time: a vote
+            // landing in between would otherwise return an instant later than
+            // the one the page was chosen with, and a consumer resuming from
+            // it would skip the proposals cut by `LIMIT` in that gap.
             let mut stmt = conn.prepare(
-                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
+                        evidence_at \
                  FROM ( \
                    SELECT proposal_json, authority_signature, persist_row_hash, created_at, \
                           proposal_digest, \
@@ -8306,10 +8337,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  WHERE (?1 IS NULL OR evidence_at > ?1) \
                  ORDER BY evidence_at ASC, proposal_digest ASC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_s, limit],
-                sqlite_row_to_stored_proposal,
-            )?;
+            let rows = stmt.query_map(rusqlite::params![since_s, limit], |row| {
+                let evidence_at: String = row.get("evidence_at")?;
+                Ok((
+                    sqlite_row_to_stored_proposal(row)?,
+                    parse_rfc3339(&evidence_at),
+                ))
+            })?;
             rows.collect()
         })()
         .map_err(|e| {

@@ -7366,6 +7366,16 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        &accord_holder_roster_key_ids(),
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -7409,6 +7419,16 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
     if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
+    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
+    // production gate. A simulation twin that skipped it would model a mesh
+    // whose ordering behaviour differs from the one we ship.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        identity_type::CANONICAL,
+        &row.key_id,
+        &accord_holder_roster_key_ids(),
+    )
+    .await?;
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -8757,6 +8777,28 @@ pub async fn check_accord_role_admission_over_roster(
         directory,
         super::genesis::posture::ACCORD_ROLE_ADMISSION,
         roster_key_ids,
+    )
+    .await?;
+
+    // (1c) v31.1.0 (CIRISPersist#662, PR #667 review P1) — MATERIALIZE BEFORE
+    // CONSULTING. The third instance of this gate shape needed the third copy
+    // of this call, and not having it was a real hole: `withdraw_role:{role}`
+    // evidence for a co-steward role or an accord-co-scrubbed identity_type
+    // could arrive before its target key, and step (2) would then consult an
+    // empty table and re-confer the withdrawn role.
+    //
+    // The invariant, stated where a fourth gate would be written: NO
+    // `federation_keys` row claiming an accord-conferred role is admitted
+    // without this call running for that `(role, key_id)` first. The three
+    // pure reads of the projection (`has_accord_conferred_role`,
+    // `is_infra_attest_effective`, `is_canonical_effective`) are correct only
+    // because of it. See `accord_carriage::project_role_withdrawal_for_key`
+    // for the enumerated gate set.
+    super::accord_carriage::project_role_withdrawal_for_key(
+        directory,
+        role,
+        &row.key_id,
+        &accord_holder_roster_key_ids(),
     )
     .await?;
 

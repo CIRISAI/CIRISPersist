@@ -5142,6 +5142,43 @@ pub trait FederationDirectory: Send + Sync {
         prior_family_digest: &str,
     ) -> Result<Vec<accord_quorum::StoredProposal>, Error>;
 
+    /// v31.1.0 (CIRISPersist#662, PR review P2) — stored proposals whose
+    /// `payload_sha256` equals `payload_sha256`.
+    ///
+    /// The lookup
+    /// [`accord_carriage::project_role_withdrawal_for_key`] resolves a
+    /// withdrawal candidate with. That path runs inside the role-admission
+    /// gates, so an ATTACKER chooses when it runs — by offering a key that
+    /// claims `canonical` or `infra:attest`, before the co-scrub gate has had
+    /// a chance to reject the row. Resolving it by scanning the evidence plane
+    /// would make every such attempt read all of accord history plus one
+    /// participation query per proposal: a request-amplification path on the
+    /// key write chokepoint that grows with the ceremony log.
+    ///
+    /// The default implementation filters the evidence cursor, so a backend
+    /// that has not specialized it is correct but not fast; the three real
+    /// backends override it with a single indexed query. (Nothing takes the
+    /// default in practice — the FFI capsule routes the whole admission as one
+    /// op, so the projection runs against a real backend on the far side.)
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<accord_quorum::StoredProposal>, Error> {
+        let mut out = Vec::new();
+        for bundle in self
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await?
+        {
+            if bundle.proposal.payload_sha256 != payload_sha256 {
+                continue;
+            }
+            if let Some(stored) = self.get_accord_proposal(&bundle.proposal.digest()).await? {
+                out.push(stored);
+            }
+        }
+        Ok(out)
+    }
+
     /// #302 — admit an `accord_participation`. Verify-before-mutation: the
     /// proposal MUST exist, the member MUST be in `standing_roster` (C3), and
     /// [`AccordParticipation::verify`](ciris_verify_core::accord_live_quorum::AccordParticipation::verify)

@@ -65,10 +65,17 @@
 //!    for a key's right to exist. Trust roots also CO-EXIST — a new ceremony
 //!    ADDS one — so a re-seed re-establishes who may confer privilege, not who
 //!    exists.
-//! 2. `federation_revocations` has **no replication serve cursor at all**
-//!    (there is no `list_signed_revocations_since`; the key-level revocation
-//!    plane is explicitly out of CIRISPersist#507's scope). Purge it and
-//!    anti-entropy cannot refill it — the exclusion is gone permanently.
+//! 2. `federation_revocations` had **no replication serve cursor at all** —
+//!    purge it and anti-entropy could not refill it, so the exclusion was gone
+//!    permanently. v31.1.0 (CIRISPersist#655) added
+//!    `list_signed_revocations_since`, which changes the blast radius but NOT
+//!    this conclusion: a refill needs some peer to still hold the row, so the
+//!    cursor helps a single node that lost state and does nothing for a purge
+//!    that ran everywhere or for a plane no peer retained. The same is now true
+//!    of `federation_role_withdrawals`, whose rebuild path (CIRISPersist#662)
+//!    is a LOCAL re-derivation from replicated accord evidence — it needs the
+//!    evidence to have survived somewhere too. "Recoverable in principle" is
+//!    not "safe to delete".
 //! 3. The exclusions that DO live in `federation_attestations` — peer
 //!    de-admission ([`PEER_DEADMISSION_DIMENSION`]), quarantine markers,
 //!    moderation / reconsideration / slashing / objection reports, and the

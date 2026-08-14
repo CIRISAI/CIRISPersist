@@ -7735,6 +7735,190 @@ impl PyEngine {
         self.operational_list_since(py, since_rfc3339, limit, OperationalKind::PartnerRecord)
     }
 
+    /// v31.1.0 (CIRISPersist#655) — bulk-list `SignedRevocation` wrappers
+    /// since a cursor, as a JSON array, ordered `(scrub_timestamp ASC,
+    /// revocation_id ASC)`. The key-level exclusion plane's serve cursor:
+    /// before this, the plane could be destroyed and never rebuilt because
+    /// nothing could serve it. Every row qualifies (a revocation cannot be
+    /// admitted unsigned).
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_revocations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_since_rfc3339(since_rfc3339)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_revocations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed revocation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE
+    /// bundles (proposal + its hybrid-signed participations) since a cursor,
+    /// as a JSON array, ordered `(evidence_at ASC, proposal_digest ASC)`.
+    ///
+    /// This is the plane a peer rebuilds the `infra:attest` exclusion set
+    /// from. The withdrawal tombstones themselves are never served: they carry
+    /// no signature of their own, so shipping them would be shipping a verdict
+    /// to be trusted. A receiver calls `apply_replicated_accord_evidence`,
+    /// which re-tallies, and derives its own tombstones locally.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_accord_quorum_evidence_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_since_rfc3339(since_rfc3339)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_accord_quorum_evidence_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "accord evidence list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence
+    /// bundle (JSON, as `list_signed_accord_quorum_evidence_since` returns its
+    /// elements) by RE-TALLYING it against this node's own accord roster, then
+    /// re-deriving this node's own withdrawal tombstones.
+    ///
+    /// Returns the admission report as JSON: the YES count THIS node counted,
+    /// the threshold it had to clear, the roster size, and the `(role,
+    /// key_id)` tombstones the admit re-derived. `ValueError` (fail-closed)
+    /// if the receiver's own re-tally does not authorize the bundle — the
+    /// sender's verdict is not consulted.
+    fn apply_replicated_accord_evidence(
+        &self,
+        py: Python<'_>,
+        evidence_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let evidence: crate::federation::accord_carriage::AccordQuorumEvidence =
+            serde_json::from_str(evidence_json)
+                .map_err(|e| PyValueError::new_err(format!("accord evidence JSON decode: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let report = b
+                                .apply_replicated_accord_evidence(&evidence)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&report).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "accord evidence admission JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v31.1.0 (CIRISPersist#662) — **the repair door**: re-derive every
+    /// role-withdrawal tombstone this node's stored accord evidence supports,
+    /// returning the `(role, key_id)` pairs projected, as a JSON array.
+    ///
+    /// This is what makes the exclusion plane rebuildable rather than merely
+    /// re-fetchable: after a purge, a restore from an older backup, or a fresh
+    /// node catching up through the evidence cursor, the tombstones are
+    /// RECOMPUTED from signed evidence rather than accepted from a peer.
+    /// Idempotent.
+    fn rematerialize_role_withdrawals(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let pairs =
+                                crate::federation::accord_carriage::rematerialize_role_withdrawals(
+                                    b.as_ref(),
+                                )
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&pairs).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "rematerialized withdrawals JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full
     /// `SignedPartnerRecord` wrappers (row + the M-of-N steward signature set
     /// + threshold) since a cursor, as a JSON array, with the same
@@ -28772,6 +28956,23 @@ fn rate_limited_message(
         "{kind}: {} (retry_after_seconds={retry_after_seconds})",
         reason.as_str()
     )
+}
+
+/// v31.1.0 (CIRISPersist#655/#662) — the shared `since_rfc3339` decode every
+/// `list_*_since` binding does: an empty string reads as "from the start",
+/// same as `None`, and a malformed instant is a `ValueError` rather than a
+/// silent full scan.
+fn parse_since_rfc3339(
+    since_rfc3339: Option<&str>,
+) -> PyResult<Option<chrono::DateTime<chrono::Utc>>> {
+    match since_rfc3339.filter(|s| !s.is_empty()) {
+        Some(s) => Ok(Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                .with_timezone(&chrono::Utc),
+        )),
+        None => Ok(None),
+    }
 }
 
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {

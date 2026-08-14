@@ -374,7 +374,35 @@ pub async fn admit_replicated_accord_evidence_over_roster(
 /// `canonical` and `infra:attest` keep their frozen dedicated tokens; every
 /// other accord-conferred role rides
 /// [`op_withdraw_role`](super::admission::op_withdraw_role).
+///
+/// # BOTH role surfaces, DERIVED rather than re-enumerated (PR #667 review P1)
+///
+/// A record claims a role through
+/// [`claims_role`](super::KeyRecord::claims_role), which is
+/// `identity_type ∪ capability_roles` — and this walked `capability_roles`
+/// alone. A role claimed through `identity_type` (`registry`, `verify`,
+/// `substrate_persist`, `trusted_publisher`, `lenscore_detector` — every
+/// accord-co-scrubbed identity type) therefore produced no
+/// `withdraw_role:{role}` candidate at all: the withdrawal was authorized,
+/// stored as evidence, and silently inert, and `rematerialize_role_withdrawals`
+/// could not restore it either.
+///
+/// **`identity_type` is the only field in this substrate that is
+/// simultaneously authority-bearing and shaped like a label**, which is why
+/// every hand-written enumeration of "the security-relevant bits" keeps
+/// omitting it. `is_canonical` reads standing straight off it and
+/// `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it, yet it reads as
+/// metadata. CIRISPersist#661 was this same field missing from the subject
+/// binding one release earlier; this is the fourth occurrence in the v31 line.
+///
+/// So the remedy is not "add the other list" — it is to **stop keeping a
+/// second list**. The candidate set is derived from the same union
+/// `claims_role` tests, so the gate and the projection cannot disagree about
+/// what a record claims.
 fn withdrawal_ops_for(record: &super::KeyRecord) -> Vec<(String, String)> {
+    // Considered for EVERY key regardless of what it claims today: a tombstone
+    // exists to block a future re-add, and the key that will be re-offered
+    // carrying `canonical` may be carrying nothing at all right now.
     let mut out = vec![
         (
             OP_WITHDRAW_CANONICAL.to_owned(),
@@ -385,23 +413,78 @@ fn withdrawal_ops_for(record: &super::KeyRecord) -> Vec<(String, String)> {
             roles::INFRA_ATTEST.to_owned(),
         ),
     ];
-    for role in &record.capability_roles {
+    for role in claimed_roles(record) {
         if role == roles::INFRA_ATTEST || role == identity_type::CANONICAL {
             continue;
         }
-        out.push((op_withdraw_role(role), role.clone()));
+        out.push((op_withdraw_role(&role), role));
     }
     out
 }
 
+/// Every role `record` claims on EITHER surface — the same union
+/// [`claims_role`](super::KeyRecord::claims_role) tests, spelled once here so
+/// the projection cannot drift from the gate that reads it.
+fn claimed_roles(record: &super::KeyRecord) -> Vec<String> {
+    let mut claimed: Vec<String> = identity_type::parse_set(&record.identity_type)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    claimed.extend(record.capability_roles.iter().cloned());
+    claimed.sort();
+    claimed.dedup();
+    claimed
+}
+
+/// Is `(role, key_id)` already tombstoned on this node?
+async fn withdrawal_exists(
+    directory: &dyn FederationDirectory,
+    role: &str,
+    key_id: &str,
+) -> Result<bool, Error> {
+    Ok(if role == identity_type::CANONICAL {
+        directory
+            .lookup_canonical_withdrawal(key_id)
+            .await?
+            .is_some()
+    } else {
+        directory
+            .lookup_role_withdrawal(role, key_id)
+            .await?
+            .is_some()
+    })
+}
+
 /// Record the tombstone for one re-derived `(role, key_id)`. `canonical`
 /// keeps its dedicated V095 table; every other role lands on V104.
+///
+/// # An existing tombstone SATISFIES the exclusion (PR #667 review P2)
+///
+/// The tombstone tables are keyed `(role, key_id)` and
+/// `record_*_withdrawal` is idempotent only for a byte-identical re-record —
+/// a second row with a DIFFERENT `authority_decision_digest` is a
+/// [`Error::Conflict`]. Two distinct quorum-authorized proposals withdrawing
+/// the same `(role, key_id)` is not exotic: an operator who retries a ceremony
+/// with a fresh nonce produces exactly that. The repair sweep would then hit
+/// `Conflict` on the second proposal and propagate it, so
+/// [`rematerialize_role_withdrawals`] — the door whose entire purpose is to
+/// rebuild an exclusion — would fail permanently, on every retry, over
+/// evidence that is entirely valid.
+///
+/// So an already-materialized tombstone short-circuits: **first authorized
+/// withdrawal wins**, deterministically, and the second is satisfied rather
+/// than refused. Nothing weakens — a second authority cannot un-withdraw, and
+/// a supersede tombstone's exemption names one successor key_id which its own
+/// quorum authorized.
 async fn record_projected_withdrawal(
     directory: &dyn FederationDirectory,
     role: &str,
     key_id: &str,
     authority_digest: &str,
 ) -> Result<(), Error> {
+    if withdrawal_exists(directory, role, key_id).await? {
+        return Ok(());
+    }
     if role == identity_type::CANONICAL {
         directory
             .record_canonical_withdrawal(key_id, None, authority_digest)
@@ -545,28 +628,52 @@ async fn try_record_withdrawal(
 /// only a tombstone the node re-tallied itself, from a proposal already in its
 /// own state. `Ok(true)` iff a tombstone was materialized by this call.
 ///
+/// # THE INVARIANT, and the closed set that has to keep it
+///
+/// Eight places read the withdrawal projection. Three are **pure reads** —
+/// [`has_accord_conferred_role`](super::admission::has_accord_conferred_role),
+/// [`is_infra_attest_effective`](super::admission::is_infra_attest_effective),
+/// [`is_canonical_effective`](super::admission::is_canonical_effective) — and
+/// they are correct **provided every write gate materializes first**. They can
+/// be pure because they take a `key_id` that is already stored, and a stored
+/// key reached storage through a gate.
+///
+/// So the invariant is not a count, it is: *no `federation_keys` row claiming
+/// an accord-conferred role is admitted without this call running for that
+/// `(role, key_id)` first.* The write gates that must keep it, in
+/// `admission.rs`:
+///
+/// 1. `check_canonical_role_admission_over_roster` — the production canonical gate.
+/// 2. `check_canonical_role_admission_over_roster_with_custody_root` — the
+///    `test-anchor` mesh-simulation twin.
+/// 3. `check_canonical_role_admission_over_roster_legacy` — the pre-floor test twin.
+/// 4. `check_infra_attest_role_admission_over_roster`.
+/// 5. `check_accord_role_admission_over_roster` — the role-generic gate, and
+///    therefore every CO_STEWARD_ROLE and every accord-co-scrubbed
+///    `identity_type` that routes through it.
+///
+/// A sixth gate added without this call is a silent hole of exactly the shape
+/// (5) was: the review found (5) precisely because (1) and (4) had been fixed
+/// and it had not. Enumerated here rather than counted, so a new gate is a
+/// visible omission.
+///
 /// Cheap where it runs: the gates fast-path out unless the row actually claims
 /// the gated role, so this is on the accord-conferral path only, never on
-/// ordinary key registration.
+/// ordinary key registration. The lookup is by payload digest (see
+/// [`FederationDirectory::list_accord_proposals_by_payload`](super::FederationDirectory::list_accord_proposals_by_payload))
+/// rather than a scan of all evidence, because an attacker chooses when a
+/// role-claiming key is offered and must not be able to choose an O(accord
+/// history) read with it.
 pub async fn project_role_withdrawal_for_key(
     directory: &dyn FederationDirectory,
     role: &str,
     key_id: &str,
     roster_key_ids: &[String],
 ) -> Result<bool, Error> {
-    // Already materialized — the common case, and the cheapest exit.
-    let existing = if role == identity_type::CANONICAL {
-        directory
-            .lookup_canonical_withdrawal(key_id)
-            .await?
-            .map(|_| ())
-    } else {
-        directory
-            .lookup_role_withdrawal(role, key_id)
-            .await?
-            .map(|_| ())
-    };
-    if existing.is_some() {
+    // Already materialized — the common case, and the cheapest exit. It is
+    // also what keeps this off the hot path: after the first admission of a
+    // withdrawn key, every later offer costs one indexed point read.
+    if withdrawal_exists(directory, role, key_id).await? {
         return Ok(false);
     }
 
@@ -577,18 +684,20 @@ pub async fn project_role_withdrawal_for_key(
     } else {
         op_withdraw_role(role)
     };
+    // The digest is computed HERE, from `(op, key_id)`, and then used to LOOK
+    // UP rather than to filter a scan. Both properties matter: computing it
+    // locally is what stops a sender naming the target, and looking it up is
+    // what stops an attacker turning each role-claiming key offer into a read
+    // of the whole accord history plus one participation query per proposal.
     let expected = canonical_withdrawal_payload_sha256(&op, key_id, None)?;
 
-    for bundle in directory
-        .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+    for stored in directory
+        .list_accord_proposals_by_payload(&expected)
         .await?
     {
-        if bundle.proposal.payload_sha256 != expected {
-            continue;
-        }
         if try_record_withdrawal(
             directory,
-            &bundle.proposal.digest(),
+            &stored.proposal.digest(),
             &op,
             role,
             key_id,
@@ -653,26 +762,41 @@ pub async fn rematerialize_role_withdrawals_over_roster(
 /// exactly the preserve-set ≢ verified-set shape CIRISPersist#541 paid for,
 /// one plane over.
 ///
-/// Each backend's `WHERE`/`ORDER BY` computes the same
-/// `max(created_at, max(server_arrival_at))` in SQL so the page can be limited
-/// server-side; this recomputes it from the participations it has just loaded,
-/// which is what keeps the value a caller resumes from equal to the value the
-/// query filtered on.
+/// # The SELECTED instant is returned, never a recomputed one (PR review P1)
+///
+/// Each backend computes `max(created_at, max(server_arrival_at))` in SQL to
+/// filter and order the page, then passes the value it selected on with each
+/// proposal. This function must NOT recompute it from the participations it
+/// loads a moment later, and the reason is a torn read:
+///
+/// A vote can land between the page query and this assembly. Recomputing would
+/// then return an `evidence_at` LATER than the one the page was selected with
+/// — so a consumer resuming from the last bundle's timestamp would skip every
+/// proposal whose selected instant fell in the gap and was cut by the page
+/// limit. Those proposals are never re-offered, and on this plane that means
+/// withdrawal evidence lost to a race.
+///
+/// Returning the selected instant fails the other way: the bundle may carry a
+/// vote that arrived after selection, and will simply be re-offered on the
+/// next page because that vote's arrival advanced its visibility instant past
+/// the cursor. At-least-once, which is the only safe direction for an
+/// exclusion plane.
 pub async fn assemble_evidence_page(
     directory: &dyn FederationDirectory,
-    proposals: Vec<super::accord_quorum::StoredProposal>,
+    proposals: Vec<(
+        super::accord_quorum::StoredProposal,
+        chrono::DateTime<chrono::Utc>,
+    )>,
 ) -> Result<Vec<AccordQuorumEvidence>, Error> {
     let mut out = Vec::with_capacity(proposals.len());
-    for stored in proposals {
+    for (stored, evidence_at) in proposals {
         let digest = stored.proposal.digest();
-        let rows = directory.list_accord_participations(&digest).await?;
-        let evidence_at = rows
-            .iter()
-            .map(|r| r.server_arrival_at)
-            .max()
-            .map_or(stored.created_at, |latest| latest.max(stored.created_at));
-        let mut participations: Vec<AccordParticipation> =
-            rows.into_iter().map(|s| s.participation).collect();
+        let mut participations: Vec<AccordParticipation> = directory
+            .list_accord_participations(&digest)
+            .await?
+            .into_iter()
+            .map(|s| s.participation)
+            .collect();
         participations.sort_by(|a, b| a.member_id.cmp(&b.member_id));
         out.push(AccordQuorumEvidence {
             proposal: stored.proposal,
@@ -1106,6 +1230,193 @@ mod carriage_tests {
             !is_infra_attest_effective(b, &ci_late).await.unwrap(),
             "(11) and the role is not effective by any route"
         );
+
+        // ── (12) THE OTHER ROLE SURFACE (PR #667 round-2 review P1).
+        //
+        //   `claims_role` is `identity_type ∪ capability_roles`, and the
+        //   projection enumerated `capability_roles` alone — so a role claimed
+        //   through `identity_type` could be withdrawn by a real quorum and
+        //   the tombstone would never materialize. `identity_type` is the only
+        //   field here that is authority-bearing while shaped like a label,
+        //   which is why it keeps falling out of hand-written enumerations;
+        //   this leg exists so the next omission is a red test.
+        //
+        //   Driven through the ROLE-GENERIC gate, which is also the third
+        //   consulting site the same review found unmaterialized. ──
+        let ci_idt = format!("idt-{tag}");
+        let generic_role = identity_type::REGISTRY;
+        let idt_record = SignedKeyRecord {
+            record: signed_canonical_record_with_roles(
+                &ci_idt,
+                generic_role, // claimed via identity_type, NOT capability_roles
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                Vec::new(),
+                serde_json::json!({ "key_id": ci_idt }),
+                &[&nb.holders[0], &nb.holders[1]],
+            ),
+        };
+        assert!(
+            idt_record.record.capability_roles.is_empty(),
+            "(12) the fixture must claim through identity_type ONLY, or it proves nothing"
+        );
+        assert!(idt_record.record.claims_role(generic_role));
+
+        // Evidence first, key second — the same ordering as (11).
+        let idt_digest = seed_quorum(
+            a,
+            &na,
+            &crate::federation::admission::op_withdraw_role(generic_role),
+            &ci_idt,
+            &[0, 1],
+            &format!("id-{tag}"),
+        )
+        .await;
+        let idt_bundle = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == idt_digest)
+            .expect("(12) generic-role withdrawal evidence is servable");
+        admit_replicated_accord_evidence_over_roster(b, &idt_bundle, &nb.roster_key_ids)
+            .await
+            .expect("(12) the bundle carries a strict majority");
+        let idt_err = b
+            .put_public_key(idt_record)
+            .await
+            .expect_err("(12) an identity_type-claimed withdrawn role must be REFUSED");
+        assert_eq!(
+            idt_err.kind(),
+            "role_withdrawn",
+            "(12) the generic gate must materialize before consulting: {idt_err}"
+        );
+
+        // The leg above drives the identity_type claim through the GATE, which
+        // resolves the op from its `role` argument — so it exercises the
+        // ordering fix but NOT `withdrawal_ops_for`, the enumeration that had
+        // the bug. Mutation testing caught exactly that: reverting
+        // `claimed_roles` to `capability_roles` alone left the leg above green.
+        //
+        // The enumeration is what the ADMIT-TIME projection and the repair
+        // sweep walk, so the case that measures it is the reverse ordering:
+        // an identity_type-claiming key ALREADY PRESENT when its withdrawal
+        // evidence arrives.
+        let ci_idt2 = format!("idt2-{tag}");
+        b.put_public_key(SignedKeyRecord {
+            record: signed_canonical_record_with_roles(
+                &ci_idt2,
+                generic_role,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                Vec::new(),
+                serde_json::json!({ "key_id": ci_idt2 }),
+                &[&nb.holders[0], &nb.holders[1]],
+            ),
+        })
+        .await
+        .expect("(12) an identity_type-claimed co-steward key is admissible while un-withdrawn");
+        let idt2_digest = seed_quorum(
+            a,
+            &na,
+            &crate::federation::admission::op_withdraw_role(generic_role),
+            &ci_idt2,
+            &[0, 1],
+            &format!("i2-{tag}"),
+        )
+        .await;
+        let idt2_bundle = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == idt2_digest)
+            .expect("(12) servable");
+        let idt2_admission =
+            admit_replicated_accord_evidence_over_roster(b, &idt2_bundle, &nb.roster_key_ids)
+                .await
+                .expect("(12) admitted");
+        assert_eq!(
+            idt2_admission.withdrawals_projected,
+            vec![(generic_role.to_owned(), ci_idt2.clone())],
+            "(12) the admit-time projection must enumerate the identity_type surface too"
+        );
+        assert!(
+            b.lookup_role_withdrawal(generic_role, &ci_idt2)
+                .await
+                .unwrap()
+                .is_some(),
+            "(12) and the tombstone exists"
+        );
+
+        // And the same claim through `capability_roles` on an ALREADY-PRESENT
+        // key: the admit-time projection must see it on that surface too.
+        let ci_cap = format!("cap-{tag}");
+        b.put_public_key(SignedKeyRecord {
+            record: signed_canonical_record_with_roles(
+                &ci_cap,
+                identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                vec![generic_role.to_owned()],
+                serde_json::json!({ "key_id": ci_cap }),
+                &[&nb.holders[0], &nb.holders[1]],
+            ),
+        })
+        .await
+        .expect("(12) a capability_roles claim of the same role is admissible");
+        let cap_digest = seed_quorum(
+            a,
+            &na,
+            &crate::federation::admission::op_withdraw_role(generic_role),
+            &ci_cap,
+            &[0, 1],
+            &format!("cp-{tag}"),
+        )
+        .await;
+        let cap_bundle = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == cap_digest)
+            .expect("(12) servable");
+        let cap_admission =
+            admit_replicated_accord_evidence_over_roster(b, &cap_bundle, &nb.roster_key_ids)
+                .await
+                .expect("(12) admitted");
+        assert_eq!(
+            cap_admission.withdrawals_projected,
+            vec![(generic_role.to_owned(), ci_cap.clone())],
+            "(12) the admit-time projection covers capability_roles as well"
+        );
+
+        // ── (13) A SECOND AUTHORIZED WITHDRAWAL DOES NOT BREAK THE REPAIR
+        //        DOOR (PR #667 round-2 review P2). An operator who retries a
+        //        ceremony with a fresh nonce produces two valid proposals for
+        //        one `(role, key_id)`; the tombstone table is keyed on that
+        //        pair, so the second `record_*` is a `Conflict`. Propagating it
+        //        made `rematerialize_role_withdrawals` — the door whose whole
+        //        purpose is rebuilding an exclusion — fail permanently over
+        //        evidence that is entirely valid. ──
+        let retry_digest = seed_quorum(
+            b,
+            &nb,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci,
+            &[0, 1],
+            &format!("rt-{tag}"),
+        )
+        .await;
+        assert_ne!(retry_digest, digest, "(13) a genuinely distinct proposal");
+        let swept_again = rematerialize_role_withdrawals_over_roster(b, &nb.roster_key_ids)
+            .await
+            .expect("(13) the repair sweep must survive a redundant valid withdrawal");
+        assert!(
+            swept_again.contains(&(roles::INFRA_ATTEST.to_owned(), ci.clone())),
+            "(13) and still report the exclusion as in place: {swept_again:?}"
+        );
+        assert!(!is_infra_attest_effective(b, &ci).await.unwrap());
     }
 
     /// PR #667 review P1 — **the cursor must advance when a vote lands.**

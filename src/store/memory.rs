@@ -4799,6 +4799,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v31.1.0 (CIRISPersist#662) — the payload-digest lookup the withdrawal
+    /// projection resolves with, so a role-claiming key offer costs one pass
+    /// instead of assembling every proposal's participation set.
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .accord_proposals
+            .values()
+            .filter(|p| p.proposal.payload_sha256 == payload_sha256)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
+        });
+        Ok(rows)
+    }
+
     async fn put_accord_participation(
         &self,
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
@@ -6213,15 +6236,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .max()
                     .map_or(p.created_at, |latest| latest.max(p.created_at))
             };
+            // v31.1.0 (PR review P1) — the SELECTED instant is carried out
+            // with each row, never recomputed at assembly time; see
+            // `assemble_evidence_page` for the torn read that would otherwise
+            // let a consumer's cursor skip a page-limited proposal.
             let mut rows: Vec<_> = state
                 .accord_proposals
                 .values()
-                .filter(|p| since.is_none_or(|s| evidence_at(p) > s))
-                .cloned()
+                .map(|p| (p.clone(), evidence_at(p)))
+                .filter(|(_, at)| since.is_none_or(|s| *at > s))
                 .collect();
-            rows.sort_by(|a, b| {
-                evidence_at(a)
-                    .cmp(&evidence_at(b))
+            rows.sort_by(|(a, a_at), (b, b_at)| {
+                a_at.cmp(b_at)
                     .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
             });
             rows.truncate(limit as usize);
