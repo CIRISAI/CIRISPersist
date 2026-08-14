@@ -140,6 +140,41 @@ larger than one page silently drops rows; and every signed-plane writer updates
 `signed_wire_index` after the primary row commits, so a failure there leaves a
 durable row unindexed. Both are family-wide properties, not new here, and both
 want one change with one witness rather than sixteen divergent patches.
+### Fixed — a revocation id the public type permits, that one backend refuses (#622)
+
+`Revocation::revocation_id` is a plain `String`. Nothing in the type, the wire
+contract, or `put_revocation`'s gates constrains it to UUID shape, and memory
+and SQLite have stored whatever they were handed since V004. Postgres typed the
+column `UUID PRIMARY KEY`, so a symbolic id was **admitted on two backends and
+refused at the driver on the one production runs**, before a single admission
+gate ran:
+
+```
+invalid argument: revocation_id is not a valid UUID
+```
+
+This is **V121 one table over** — that migration relaxed `attestation_id`
+because the genesis ceremony signs symbolic ids, and every Postgres node failed
+genesis while every SQLite node was immune. Same defect, same fix, same
+direction: removing a backend asymmetry rather than creating one. Found by the
+#670 schema-parity gate, which compares the two migration trees' resulting
+column types and classes `uuid` against `TEXT` as a **narrowing**, not an
+encoding.
+
+**V125** relaxes `federation_revocations.revocation_id` and its
+`federation_revocation_quorum_state` child in one migration — PostgreSQL
+requires a foreign key's type to match its referent, so altering the parent
+alone fails. Two code sites parsed the id before binding, and both were the
+same defect: the write door and `attach_revocation_pqc_signature`. Fixing only
+the write door would have stored rows that could never be PQC-completed.
+
+It also **repairs the revocation cursor**, which was already inconsistent with
+itself: `WHERE (revoked_at, revocation_id::text) < (…)` against `ORDER BY
+revoked_at DESC, revocation_id DESC`. On a `uuid` column the resume predicate
+compared text while the sort compared UUIDs, so the cursor could skip a row at
+a `revoked_at` tie and never serve it again — #668's class, live on Postgres
+and not on SQLite. The residual collation difference (Postgres default vs
+SQLite BINARY) is filed with #668.
 
 ### Fixed — SECURITY — the delegation leg verified a proxy, not the property (#665 review)
 

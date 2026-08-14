@@ -5597,18 +5597,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
 
-        // v0.5.8 — parse revocation_id to uuid::Uuid before binding.
-        // Some tokio-postgres / postgres-types version combinations
-        // refuse to serialize &String against a `$1::uuid` cast param
-        // (driver's type-check sees the inferred UUID column type and
-        // rejects String). Parsing to Uuid + binding via the
-        // with-uuid-1 feature sidesteps the inference question.
-        let revocation_uuid = uuid::Uuid::parse_str(&row.revocation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "revocation_id is not a valid UUID: {e}"
-            ))
-        })?;
-
+        // v31.1.0 (CIRISPersist#622) — bound as TEXT, because V123 typed the
+        // column TEXT. This used to parse the id into a `uuid::Uuid` first, and
+        // that parse was the whole defect: `Revocation::revocation_id` is a
+        // `String`, nothing in the type or the gates constrains it to UUID
+        // shape, and memory and sqlite have always stored whatever they were
+        // handed. A symbolic id was admitted on two backends and refused HERE,
+        // with `revocation_id is not a valid UUID`, before a single admission
+        // gate ran. V121 removed the identical narrowing from `attestation_id`.
+        //
         // v31.0.0 (#644) — revocation_envelope is TEXT since V122.
         let revocation_envelope_text =
             pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
@@ -5651,7 +5648,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                     $16, $17)",
                 &[
-                    &revocation_uuid,
+                    &row.revocation_id,
                     &row.revoked_key_id,
                     &row.revoking_key_id,
                     &row.reason,
@@ -10256,10 +10253,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Parse to uuid::Uuid before binding — see the 1693 note.
-        let rev_uuid = uuid::Uuid::parse_str(revocation_id).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("revocation_id uuid: {e}"))
-        })?;
+        // v31.1.0 (CIRISPersist#622) — bound as TEXT since V123. The UUID parse
+        // that used to sit here refused, at the driver, every id its two sibling
+        // backends store without comment. `attach_revocation_pqc_signature` is
+        // the SECOND site of one defect, and it would have kept the row
+        // unreachable for PQC completion even after the write door was fixed.
         let row_opt = client
             .query_opt(
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
@@ -10268,7 +10266,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
                     revoked_after, persist_row_hash \
                  FROM cirislens.federation_revocations WHERE revocation_id = $1",
-                &[&rev_uuid],
+                &[&revocation_id],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
@@ -10296,7 +10294,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "UPDATE cirislens.federation_revocations \
                  SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
                  WHERE revocation_id = $4 AND pqc_completed_at IS NULL",
-                &[&scrub_signature_pqc, &now, &new_hash, &rev_uuid],
+                &[&scrub_signature_pqc, &now, &new_hash, &revocation_id],
             )
             .await
             .map_err(|e| {
@@ -22332,6 +22330,25 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         crate::federation::admission::backend_parity_test_support::exercise_revocation_parity(
+            &backend, "postgres",
+        )
+        .await;
+    }
+
+    /// v31.1.0 (CIRISPersist#622) — the POSTGRES leg of the **symbolic
+    /// `revocation_id`** witness, and the only one of the three that could ever
+    /// have failed. Before V123 this backend refused the id at the driver, with
+    /// `revocation_id is not a valid UUID`, before any admission gate ran.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn symbolic_revocation_id_round_trips_postgres_622() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::backend_parity_test_support::exercise_symbolic_revocation_id_round_trips(
             &backend, "postgres",
         )
         .await;

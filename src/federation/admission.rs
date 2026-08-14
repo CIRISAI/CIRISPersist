@@ -21670,6 +21670,82 @@ pub(crate) mod backend_parity_test_support {
         );
     }
 
+    /// **CIRISPersist#622 on the revocation door** — a `revocation_id` that is
+    /// not a UUID round-trips on **every** backend.
+    ///
+    /// `Revocation::revocation_id` is a `String`, and nothing in the type, the
+    /// wire contract, or `put_revocation`'s gates constrains it to UUID shape.
+    /// Memory and SQLite have always stored whatever they were handed. Postgres
+    /// typed the column `UUID PRIMARY KEY` (V004) and parsed the id before
+    /// binding, so a symbolic id was admitted on two backends and refused at the
+    /// DRIVER on the one production runs — before a single admission gate ran:
+    ///
+    /// ```text
+    /// invalid argument: revocation_id is not a valid UUID
+    /// ```
+    ///
+    /// V123 relaxes the column exactly as V121 relaxed `attestation_id` for the
+    /// genesis ceremony's symbolic ids.
+    ///
+    /// **The shape of this witness is the point.** The pre-existing parity body
+    /// above mints its ids with `fresh_revocation_id()` — a UUID — precisely
+    /// *because* postgres refused anything else. A witness that keeps doing that
+    /// would pass today, would have passed before V123, and would prove nothing.
+    /// So this one uses an id that could not previously be written, and it
+    /// **re-reads the row** rather than trusting the `Ok(())`: a door that
+    /// accepts and stores something else is the failure mode a write-only
+    /// assertion cannot see.
+    pub(crate) async fn exercise_symbolic_revocation_id_round_trips(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let who = format!("{tag}-622-subject");
+        ts::register_identity_key(dir, &who, identity_type::AGENT).await;
+        let at = chrono::Utc::now();
+
+        // Deliberately NOT a UUID, and deliberately in the shape the genesis
+        // ceremony uses for attestation ids (#622 / V121): a stable, readable,
+        // colon-scoped name. `tag` keeps a run against the SHARED postgres test
+        // DB from colliding with a prior one.
+        let symbolic = format!("revocation:{tag}:622-not-a-uuid");
+        assert!(
+            uuid::Uuid::parse_str(&symbolic).is_err(),
+            "[{tag}] the fixture id must NOT parse as a UUID, or this witness is \
+             indistinguishable from the parity body above"
+        );
+
+        dir.put_revocation(SignedRevocation {
+            revocation: self_revocation(&symbolic, &who, at),
+        })
+        .await
+        .expect("a non-UUID revocation_id must be admitted on EVERY backend (#622)");
+
+        let stored = dir.revocations_for(&who).await.expect("read");
+        assert_eq!(
+            stored.len(),
+            1,
+            "[{tag}] exactly one revocation is stored for the subject"
+        );
+        assert_eq!(
+            stored[0].revocation_id, symbolic,
+            "[{tag}] the id must round-trip BYTE-FOR-BYTE. A backend that stores a \
+             normalized or re-minted id is a backend a consumer cannot address rows on."
+        );
+
+        // And the SECOND site of the same defect: the PQC-completion door looked
+        // the row up by a parsed UUID too, so fixing only the write door would
+        // have left a stored row permanently unreachable for hybrid completion.
+        dir.attach_revocation_pqc_signature(&symbolic, "AAAA")
+            .await
+            .expect("the PQC-attach door must find a row by its non-UUID id (#622)");
+        let after = dir.revocations_for(&who).await.expect("read");
+        assert_eq!(
+            after[0].scrub_signature_pqc.as_deref(),
+            Some("AAAA"),
+            "[{tag}] the attach applied to the row addressed by the symbolic id"
+        );
+    }
+
     /// **Gap 2 on the attestation door**: the same non-hex
     /// `original_content_hash`, refused before anything is written.
     ///

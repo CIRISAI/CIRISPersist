@@ -17739,6 +17739,19 @@ mod tests {
         .await;
     }
 
+    /// v31.1.0 (CIRISPersist#622) — the MEMORY leg of the **symbolic
+    /// `revocation_id`** witness. This backend never narrowed the column, which
+    /// is exactly why nobody could see that postgres did.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn symbolic_revocation_id_round_trips_memory_622() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::backend_parity_test_support::exercise_symbolic_revocation_id_round_trips(
+            &backend, "memory",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **attestation
     /// `original_content_hash` hex** parity witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
