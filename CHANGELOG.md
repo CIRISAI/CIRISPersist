@@ -7,6 +7,33 @@ threat-model citations because this crate's audit story is the point.
 
 ## [31.5.0] - 2026-08-15
 
+### Fixed — the generated directory double could go stale without anyone being told (#688)
+
+`gen_directory_double.py --check` ran in `certify.sh` **only** — not CI, not the
+pre-commit hook — so a stale double reached `main` unless someone ran a full
+local certification.
+
+**Severity stated honestly: the compiler is the primary backstop and covers the
+common case.** A new REQUIRED trait method makes the double an incomplete impl
+(`E0046`) and fails any build. This closes the narrower band the compiler cannot
+see — a CHANGED signature the existing delegation still satisfies, a hand-edit to
+the generated file, or the generator itself moving without a regeneration.
+
+It is worth closing because #603's whole thesis is *a zero is not evidence unless
+the instrument can fail*, and the double **is** an instrument. An ungated
+generated instrument can drift from the thing it measures without anyone being
+told — the same shape as the defect it was built to detect, one level up.
+
+Added to CI beside the three existing gate steps, and to the pre-commit hook
+**with its own `gate_script_present` guard at the same nesting level as its
+siblings**. An earlier draft was nested INSIDE the doc-version guard, so it fired
+only when a *different* script happened to exist and carried no guard of its own
+— precisely the #595 failure the hook's own header documents.
+
+Verified the gate actually fires rather than assuming: a hand-edit to the
+generated file makes `--check` exit non-zero, and it returns to clean when
+restored. A gate nobody tests is the thing this issue is about.
+
 ### Fixed — SECURITY — a quorum-WITHDRAWN trust root kept projecting Global (#685)
 
 `namespace::is_trust_root` is the load-bearing predicate in `projection_for`: a

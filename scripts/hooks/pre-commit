@@ -112,6 +112,32 @@ if echo "$STAGED" | grep -qE '\.rs$|^CHANGELOG\.md$|^Cargo\.toml$|^evidence/doc_
     fi
 fi
 
+# v31.5.0 (CIRISPersist#688) — the generated `FederationDirectory` double must
+# still match the trait it was generated from.
+#
+# Guarded by `gate_script_present` at the SAME nesting level as its siblings.
+# An earlier draft of this gate was nested INSIDE the doc-version guard, so it
+# fired only when a different script happened to exist and carried no guard of
+# its own — which is precisely the #595 failure this hook's own header
+# documents: on a branch predating the script it dies with a bare python
+# traceback instead of skipping.
+#
+# Fires on the trait, the generator, or the generated file itself. The compiler
+# already catches a MISSING method (`E0046`); this catches the changed-signature
+# and hand-edit band it cannot see.
+if echo "$STAGED" | grep -qE '^src/federation/mod\.rs$|^src/federation/directory_double\.rs$|^scripts/gen_directory_double\.py$'; then
+    if gate_script_present scripts/gen_directory_double.py "directory double staleness gate"; then
+        echo "─── pre-commit: generated directory double is current ───"
+        if ! python3 scripts/gen_directory_double.py --check; then
+            echo
+            echo "✗ the generated FederationDirectory double is stale." >&2
+            echo '  Run: python3 scripts/gen_directory_double.py' >&2
+            echo '  Do NOT hand-edit src/federation/directory_double.rs.' >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Only run the Rust gates if Rust files changed. Bench-only /
 # changelog-only / migration-only / docs-only commits skip them.
 if ! echo "$STAGED" | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
