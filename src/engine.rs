@@ -7867,6 +7867,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
         };
         backend
             .insert_trace_events_batch(&[mk("bf-t1", "bf-agent"), mk("bf-t2", "bf-ghost")])
@@ -18199,10 +18203,10 @@ mod tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES ($1, 'AAAA', 'hybrid', $2, $1, \
                           '2026-01-01T00:00:00Z', '{}'::jsonb, \
-                          '', '', $1, '2026-01-01T00:00:00Z', '0') \
+                          '', '', $1, '2026-01-01T00:00:00Z', '0', NOW()) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[&key_id, &identity_type],
             )

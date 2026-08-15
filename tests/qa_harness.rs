@@ -389,19 +389,51 @@ async fn av24_sign_verify_round_trip_all_rows() {
 
     let snap = backend.snapshot_events();
     assert_eq!(snap.len(), N_BATCHES * COMPONENTS);
-    for row in &snap {
+    // v32.0.0 (CIRISPersist#690) — the preimage is the whole envelope, and it
+    // is rebuilt here ENTIRELY from persisted columns. Verifying against
+    // `canonical(payload)` alone stopped being correct when the signature
+    // widened to cover the treatment claims; verifying against a preimage
+    // assembled from the in-memory envelope would be a restatement rather than
+    // a check, because the envelope holds fields the row may not.
+    //
+    // Every row, not a sample: `scenario E` exists to prove the property holds
+    // across the whole batch set, and a per-row `expect` here is what would
+    // localise a partial write path (one door stamping the columns, another
+    // not) rather than reporting "some row failed".
+    for (i, row) in snap.iter().enumerate() {
         let payload = serde_json::Value::Object(row.payload.clone());
         let canon = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&payload)
             .unwrap();
+        let post_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canon));
+        let preimage = ciris_persist::ingest::scrub_preimage(
+            &post_sha,
+            row.original_content_hash
+                .as_deref()
+                .unwrap_or_else(|| panic!("row {i}: original_content_hash not persisted")),
+            row.scrub_ner_ran
+                .unwrap_or_else(|| panic!("row {i}: scrub_ner_ran not persisted")),
+            row.scrub_applied_trace_level
+                .as_deref()
+                .unwrap_or_else(|| panic!("row {i}: scrub_applied_trace_level not persisted")),
+            row.scrub_model_digest.as_deref(),
+            row.scrub_key_id
+                .as_deref()
+                .unwrap_or_else(|| panic!("row {i}: scrub_key_id not persisted")),
+            row.scrub_timestamp
+                .unwrap_or_else(|| panic!("row {i}: scrub_timestamp not persisted")),
+        );
         let sig_bytes = BASE64
             .decode(row.scrub_signature.as_ref().unwrap())
             .unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-        pubkey
-            .verify_strict(&canon, &sig)
-            .unwrap_or_else(|_| panic!("scrub_signature must verify on every row"));
+        pubkey.verify_strict(&preimage, &sig).unwrap_or_else(|_| {
+            panic!(
+                "row {i}: scrub_signature must verify against a preimage rebuilt \
+                 from persisted columns — a peer has nothing else to work from"
+            )
+        });
     }
     println!(
         "scenario E: {} rows, all scrub_signatures ed25519_verified",

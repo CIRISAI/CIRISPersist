@@ -128,7 +128,27 @@ LOG_DIR="${CERTIFY_LOG_DIR:-target/certify-logs}"
 CORES="$(nproc)"
 
 LEGS="core cirisaudit secrets cirisnode cirisgraph telemetry rest test-anchor"
-ALL_KEYS="$LEGS default fmt clippy pyi featmatrix docver pyo3sqlite"
+
+# v32.0.0 (CIRISPersist#694) — the axis sweep's key list is DERIVED, not typed
+# out a second time.
+#
+# Before this, `ALL_KEYS` was a hand-maintained duplicate and it had already
+# drifted: `dirdouble` and all fifteen `axis-*` legs were launched by `run_bg`,
+# burned full CPU, wrote their `.rc` files — and appeared in no list that anyone
+# read. The verdict loop iterates `ALL_KEYS`, so sixteen legs could go red and
+# the run still printed EVERY CI LEG GREEN BY EXIT CODE.
+#
+# Both of those gates exist BECAUSE a check was blind (the axis sweep because
+# the feature matrix was a union on the backend axis; the double's check because
+# an ungated generated instrument drifts). They were installed here and left
+# unread. Deriving the list from the same variable the launcher loops over is
+# what stops that from recurring — a second hand-written list is how it started.
+AXES="cirisaudit secrets cirisnode cirisgraph telemetry"
+AXIS_KEYS=""
+for _a in $AXES; do
+    AXIS_KEYS="$AXIS_KEYS axis-${_a}-none axis-${_a}-sqlite axis-${_a}-pg"
+done
+ALL_KEYS="$LEGS default fmt clippy pyi featmatrix docver pyo3sqlite dirdouble$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -294,13 +314,44 @@ run_bg pyo3sqlite cargo check --no-default-features --features "pyo3-sqlite sqli
 # Both were COMPILE errors, so `cargo check` alone catches them — no test run,
 # no database, cheap enough to sweep the whole product. Compile-only on
 # purpose: this asks "does this configuration exist", not "does it pass".
-for _axis in cirisaudit secrets cirisnode cirisgraph telemetry; do
+for _axis in $AXES; do
   run_bg "axis-${_axis}-none"   cargo check --all-targets --no-default-features --features "$_axis"
   run_bg "axis-${_axis}-sqlite" cargo check --all-targets --no-default-features --features "$_axis sqlite"
   run_bg "axis-${_axis}-pg"     cargo check --all-targets --no-default-features --features "$_axis postgres"
 done
 wait
-FAST_GATES="fmt pyi featmatrix docver pyo3sqlite"
+# v32.0.0 (#694) — `dirdouble` and the axis sweep join the fast gates. They ran
+# in this stage all along; only their verdicts were dropped. Reading them HERE,
+# before the expensive legs dispatch, is the point of the fast stage: a compile
+# break under `--features cirisnode` alone should cost seconds, not the full
+# test matrix first.
+FAST_GATES="fmt pyi featmatrix docver pyo3sqlite dirdouble$AXIS_KEYS"
+
+# Every `.rc` this run produced must be claimed by a key someone reads. The log
+# directory is wiped at startup, so anything here was written by this run.
+#
+# This is the part that does not decay. The fix above is correct today; this
+# makes the NEXT unread leg announce itself instead of waiting to be found by
+# someone reading the script line by line — which is how #694 was found, and is
+# not a repeatable detection method.
+unclaimed=""
+for _rcf in "$LOG_DIR"/*.rc; do
+    [ -f "$_rcf" ] || continue
+    _k="$(basename "$_rcf" .rc)"
+    case " $ALL_KEYS " in
+        *" $_k "*) ;;
+        *) unclaimed="$unclaimed $_k" ;;
+    esac
+done
+if [ -n "$unclaimed" ]; then
+    echo
+    echo "STOPPED — leg(s) ran and no list reads their result:$unclaimed"
+    echo "  A leg whose exit code nobody inspects is worse than one that never"
+    echo "  ran: it produces a log that looks like evidence. Add it to ALL_KEYS"
+    echo "  (and to FAST_GATES if it belongs to the fast stage)."
+    echo "SCRIPT_EXIT=1"; exit 1
+fi
+
 fast_fail=0
 for g in $FAST_GATES; do
     rc="$(cat "$LOG_DIR/$g.rc" 2>/dev/null || echo 99)"

@@ -69,6 +69,10 @@ fn row(agent_hash: &str, trace_id: &str, thought_id: &str, ts: DateTime<Utc>) ->
         scrub_signature: None,
         scrub_key_id: None,
         scrub_timestamp: None,
+        // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+        scrub_ner_ran: None,
+        scrub_applied_trace_level: None,
+        scrub_model_digest: None,
         cohort_scope: "federation".to_owned(),
         cohort_target_id: None,
         signature_ml_dsa_65: None,

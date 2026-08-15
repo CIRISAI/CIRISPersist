@@ -159,6 +159,13 @@ struct State {
     /// `Revocation` struct, and the reason one revocation hashes identically on
     /// every node that holds it.
     revocation_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+
+    /// `federation_keys.admitted_at` (V126): when THIS node admitted each key
+    /// record. Keyed by `key_id`. A side map rather than a field on `KeyRecord`,
+    /// because the record's bytes must hash identically on every node while each
+    /// node keeps its own arrival order — the same separation `ServedRevocation`
+    /// makes (#682).
+    key_record_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
     /// to `federation_keys`. Keyed by `key_id`. Memory backend
     /// mirrors the V051 PG/SQLite shape: same fields, same soft-
@@ -407,6 +414,43 @@ struct MemScopeBlob {
     last_accessed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// v31.4.0 (CIRISPersist#682) — this node's position on one key row.
+///
+/// The memory analogue of the V126 column, and of the sqlite dialect's
+/// `COALESCE(admitted_at, scrub_timestamp)`: a row that reached the map without
+/// a stamp falls back to the producer's instant, which is what the V126
+/// backfill writes for rows that predate the column. Defined once because the
+/// serve cursor and the allocator MUST read the same expression — an allocator
+/// blind to a position the cursor can see would hand out a value below it, and
+/// the row stamped with that value would sort behind a cursor that had already
+/// passed. That is #682 itself, re-entering through the allocator.
+fn key_record_position(
+    admitted: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    record: &crate::federation::KeyRecord,
+) -> chrono::DateTime<chrono::Utc> {
+    admitted
+        .get(&record.key_id)
+        .copied()
+        .unwrap_or(record.scrub_timestamp)
+}
+
+/// v31.4.0 (CIRISPersist#682) — allocate THIS node's next admission position on
+/// `federation_keys`. Memory twin of `SqliteBackend::next_key_admission_position`.
+///
+/// Strictly after the last position handed out rather than read off the wall
+/// clock: a backward step (NTP correction, VM restore) would stamp a later row
+/// below a position a consumer already passed, and `> since` would skip it
+/// permanently. Callers hold the state lock, so allocation on this backend is
+/// strictly increasing.
+fn next_key_admission_position(state: &State) -> chrono::DateTime<chrono::Utc> {
+    let last = state
+        .federation_keys
+        .values()
+        .map(|k| key_record_position(&state.key_record_admitted_at, k))
+        .max();
+    crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+}
+
 impl Default for MemoryBackend {
     fn default() -> Self {
         Self {
@@ -421,6 +465,7 @@ impl Default for MemoryBackend {
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
                 revocation_admitted_at: HashMap::new(),
+                key_record_admitted_at: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
@@ -1066,6 +1111,14 @@ impl MemoryBackend {
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
+        // v31.4.0 (CIRISPersist#682) — stamped through the same allocator as
+        // the real door. A helper that writes the row but skips the position
+        // would make memory the one backend where the column is optional, which
+        // is the divergence class this repo keeps paying for.
+        let admitted_at = next_key_admission_position(&state);
+        state
+            .key_record_admitted_at
+            .insert(key_id.to_owned(), admitted_at);
         state.federation_keys.insert(key_id.to_owned(), rec);
         // Keep the legacy map populated too — some tests still
         // reference it via `state.keys`. Single source of truth at
@@ -2027,7 +2080,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v31.0.0 (CIRISPersist#640/#646) — indexed from the STORED row, after
             // the insert AND after the guard is released; see
             // `MemoryBackend::index_stored_record`.
+            // v31.4.0 (CIRISPersist#682) — THIS node's admission position
+            // (the memory analogue of the V126 column), stamped here and never
+            // read from the wire. The serve cursor keys on it, so a record
+            // whose `scrub_timestamp` is old — the everyday delayed-replication
+            // case on the identity plane — still lands ahead of every
+            // consumer's cursor instead of behind it. Allocated under the same
+            // state lock as the insert.
+            let admitted_at = next_key_admission_position(&state);
             let key_id = row.key_id.clone();
+            state
+                .key_record_admitted_at
+                .insert(key_id.clone(), admitted_at);
             state.federation_keys.insert(key_id.clone(), row);
             key_id
         };
@@ -6224,27 +6288,47 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         // Every `federation_keys` row is signed — `scrub_signature_classical`
         // is required at admission, so there is no filter to apply here.
+        //
+        // v31.4.0 (#682) — keyed on THIS node's `admitted_at`, not the
+        // producer's `scrub_timestamp`. A record signed in January, replicated
+        // late and admitted in February, sorted under January and was never
+        // served to a consumer past it. The side map is the memory analogue of
+        // the V126 column; a row without an entry falls back to
+        // `scrub_timestamp`, matching the sqlite dialect's
+        // `COALESCE(admitted_at, scrub_timestamp)`.
+        let position = |k: &crate::federation::KeyRecord| {
+            key_record_position(&state.key_record_admitted_at, k)
+        };
+        // v31.4.0 (#668) — compare the PAIR. Resuming on the instant alone
+        // skips the remainder of any tie larger than one page, silently.
         let mut rows: Vec<_> = state
             .federation_keys
             .values()
-            .filter(|k| since.is_none_or(|s| k.scrub_timestamp > s))
+            .filter(|k| {
+                since
+                    .as_ref()
+                    .is_none_or(|(s_at, s_id)| (position(k), &k.key_id) > (*s_at, s_id))
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
-            a.scrub_timestamp
-                .cmp(&b.scrub_timestamp)
+            position(a)
+                .cmp(&position(b))
                 .then_with(|| a.key_id.cmp(&b.key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows
             .into_iter()
-            .map(|record| crate::federation::SignedKeyRecord { record })
+            .map(|record| crate::federation::ServedKeyRecord {
+                admitted_at: position(&record),
+                record,
+            })
             .collect())
     }
 
@@ -7155,6 +7239,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let mut to_insert = key;
             to_insert.persist_row_hash =
                 crate::federation::types::compute_persist_row_hash(&to_insert)?;
+            // v31.4.0 (CIRISPersist#682) — THIS node's admission position. An
+            // operator-added peer is a `federation_keys` row like any other and
+            // is served by the same cursor, so it is stamped by the same
+            // allocator as `put_public_key`.
+            let admitted_at = next_key_admission_position(&state);
+            state
+                .key_record_admitted_at
+                .insert(key_id.to_owned(), admitted_at);
             state.federation_keys.insert(key_id.to_owned(), to_insert);
         }
 
@@ -8894,6 +8986,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             // v0.3.4 deployment_profile columns. Test fixture stays
             // 2.7.0-shape (no profile) — None across the board.
             agent_role: None,
@@ -9649,6 +9745,134 @@ mod tests {
             "a revocation admitted after a backward clock step must still be served to a \
              consumer resuming from the pre-step cursor"
         );
+    }
+
+    // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
+    //     cursor, memory arm. Assertion bodies shared with the sqlite and
+    //     postgres arms; only the PLANT is backend-specific.
+
+    /// #682 — a key record signed a year ago and admitted now is still served
+    /// to a consumer whose cursor has passed that instant.
+    #[tokio::test]
+    async fn late_replicated_key_record_is_served_memory_682() {
+        let backend = MemoryBackend::new();
+        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
+            &backend, "mem",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
+    /// every row seen exactly once.
+    ///
+    /// The tie is PLANTED because it cannot be produced through this backend's
+    /// write path: `monotonic_admission_instant` allocates strictly above the
+    /// last position, so two admissions here never collide. It is reachable in
+    /// production through the V126 backfill (every pre-existing row stamped
+    /// with its `scrub_timestamp`, and a batch from one producer shares one)
+    /// and through two writers racing the same `MAX`.
+    #[tokio::test]
+    async fn one_admission_instant_pages_exactly_once_memory_668() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        let ids: Vec<String> = (0..5).map(|i| format!("k668-mem-{i}")).collect();
+        for id in &ids {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // THE TIE, as state: every row collapses onto one instant.
+        let tied_at = chrono::Utc::now();
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for id in &ids {
+                st.key_record_admitted_at.insert(id.clone(), tied_at);
+            }
+        }
+
+        rts::assert_one_admission_instant_pages_exactly_once(&backend, "mem", &ids, 3)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the admission position survives a backward clock step on this
+    /// backend's real write path. The post-step state is planted directly; two
+    /// admissions under a forward clock would pass with `Utc::now()` and prove
+    /// nothing.
+    #[tokio::test]
+    async fn key_admission_survives_a_backward_clock_step_memory_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-mem-a", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE BACKWARD STEP, as state: the last position handed out is now an
+        // hour ahead of the wall clock.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for v in st.key_record_admitted_at.values_mut() {
+                *v = future;
+            }
+        }
+
+        rts::assert_key_admission_survives_backward_step(&backend, "mem", future)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the allocator reads the same position expression the cursor
+    /// orders by (`key_record_position`, which falls back to
+    /// `scrub_timestamp`), not just the side map.
+    ///
+    /// Memory mirrors the sqlite dialect here: a row with no entry in
+    /// `key_record_admitted_at` has an effective position of its
+    /// `scrub_timestamp`, and an allocator blind to that stamps below it.
+    #[tokio::test]
+    async fn allocator_reads_the_fallback_position_memory_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-mem-fb", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE UNSTAMPED ROW, as state: the side-map entry removed and the
+        // `scrub_timestamp` moved an hour ahead, so the fallback is the largest
+        // position in the map.
+        let fallback_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            assert!(
+                st.key_record_admitted_at.remove("k682-mem-fb").is_some(),
+                "the fallback plant must remove a stamp that was actually there"
+            );
+            let row = st
+                .federation_keys
+                .get_mut("k682-mem-fb")
+                .expect("seeded row");
+            row.scrub_timestamp = fallback_at;
+        }
+
+        rts::assert_allocator_reads_the_fallback_position(
+            &backend,
+            "mem",
+            "k682-mem-fb",
+            fallback_at,
+        )
+        .await
+        .unwrap();
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
@@ -11104,6 +11328,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -11360,6 +11588,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: None,
                 agent_template: None,
                 deployment_domain: None,

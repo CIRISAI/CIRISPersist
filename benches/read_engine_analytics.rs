@@ -87,6 +87,10 @@ fn bench_event(
         scrub_signature: Some("scrub-sig".to_owned()),
         scrub_key_id: Some("scrub-key".to_owned()),
         scrub_timestamp: None,
+        // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+        scrub_ner_ran: None,
+        scrub_applied_trace_level: None,
+        scrub_model_digest: None,
         cohort_scope: "federation".to_string(),
         cohort_target_id: None,
         signature_ml_dsa_65: None,

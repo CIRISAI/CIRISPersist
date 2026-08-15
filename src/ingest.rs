@@ -24,6 +24,7 @@ use ciris_keyring::HardwareSigner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::schema::TraceLevel;
 use crate::schema::{BatchEnvelope, BatchEvent, CompleteTrace, Error as SchemaError};
 use crate::scrub::{ScrubError, Scrubber};
 use crate::store::{Backend, Error as StoreError, InsertReport};
@@ -136,6 +137,32 @@ pub enum IngestError {
     #[error("scrub: {0}")]
     Scrub(#[from] ScrubError),
 
+    /// v32.0.0 (CIRISPersist#690) — **the treatment does not match the label.**
+    ///
+    /// A `full_traces` batch whose scrubber reports `ner_ran: false` is refused
+    /// rather than stored. Without this the envelope's new fields would be an
+    /// observation nobody acts on, which is #685 all over again: a fact that is
+    /// stored, verifiable, and never consulted by the reader that matters.
+    ///
+    /// The honest path for a node with no model loaded is not to store
+    /// `full_traces` unscrubbed — it is to scrub at `detailed` and RELABEL, so
+    /// the claim matches the treatment. This refusal is what makes that the only
+    /// path.
+    ///
+    /// Lens → HTTP 422: the sender must downgrade the level or load a model.
+    #[error(
+        "scrub treatment does not match label: trace_level={label} requires a \
+         named-entity pass, but the scrubber reported ner_ran=false \
+         (treated_as={treated}). Downgrade the level and relabel, or load a \
+         model (CIRISPersist#690)"
+    )]
+    ScrubTreatmentMismatch {
+        /// The level the batch claims.
+        label: String,
+        /// The level it was actually treated at.
+        treated: String,
+    },
+
     /// Backend write failure (DB unreachable, IO, etc.). Lens → HTTP
     /// 503 + Retry-After (the lens's bounded-queue layer also kicks
     /// in here for the journal-replay path; FSD §3.4 #2).
@@ -202,6 +229,13 @@ impl IngestError {
             // failed) is available via the inner `ScopeRefusalReason::kind`.
             IngestError::ScopeRefused(_) => "write_scope_refused",
             IngestError::PipelineInvariant { kind, .. } => kind,
+            // v32.0.0 (#690) — its own token, not folded into `scrub`. A
+            // scrubber BUG and a batch whose treatment does not match its label
+            // are different conditions with different remedies: the first is
+            // ours to fix, the second the sender fixes by downgrading the level
+            // or loading a model. A shared token would make the lens report
+            // "scrubber broken" for a correctly-functioning refusal.
+            IngestError::ScrubTreatmentMismatch { .. } => "scrub_treatment_mismatch",
         }
     }
 
@@ -230,6 +264,12 @@ impl IngestError {
             // The per-reason machine token (e.g. `scope_no_community_membership`)
             // is the actionable detail for a write-scope refusal.
             IngestError::ScopeRefused(r) => Some(r.kind().to_string()),
+            // AV-15-safe: both values are closed-vocabulary trace levels, never
+            // user payload — and the sender needs to know WHICH level it was
+            // treated at to decide whether to relabel or load a model.
+            IngestError::ScrubTreatmentMismatch { label, treated } => {
+                Some(format!("label={label} treated_as={treated}"))
+            }
             IngestError::Verify(_)
             | IngestError::Scrub(_)
             | IngestError::Store(_)
@@ -250,12 +290,87 @@ pub struct ScrubEnvelope {
     /// sha256(canonical(component.data_pre_scrub)) — proves what the
     /// scrubber input was without retaining the original bytes.
     pub original_content_hash: String,
-    /// base64(ed25519_sign(canonical(component.data_post_scrub))).
+    /// base64(ed25519_sign([`scrub_preimage`])) — **the whole envelope**, not
+    /// the payload alone (v32.0.0, CIRISPersist#690).
+    ///
+    /// This used to be `sign(canonical(data_post_scrub))`: a signature over the
+    /// CONTENT and nothing else, which left every field beside it — the input
+    /// hash, the key id, the timestamp — unsigned metadata a relay could
+    /// rewrite while the signature still verified. That is #643 on this plane,
+    /// where the attestation signature covered the envelope only and left the
+    /// verb an unsigned column.
+    ///
+    /// The content is still bound, through `post_content_sha256` inside the
+    /// preimage. What changed is that the statements ABOUT the content are now
+    /// bound too.
     pub scrub_signature: String,
     /// Identifier for the deployment's signing key.
     pub scrub_key_id: String,
     /// When the scrub+sign happened.
     pub scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    /// **Did a named-entity pass actually run?** (#690)
+    ///
+    /// `NullScrubber` is a pass-through and produced a perfectly valid envelope,
+    /// byte-indistinguishable in shape from a full NER pass — so a receiver
+    /// could not tell an NER-scrubbed `full_traces` trace from one that was
+    /// never scrubbed. It can now, and the claim is signed rather than asserted.
+    pub ner_ran: bool,
+    /// The trace level the content was **actually treated at**, after any
+    /// downgrade — which may differ from the level the trace is labelled with
+    /// upstream.
+    ///
+    /// A node with no model loaded scrubs at `detailed` and relabels the trace
+    /// `detailed`, so the claim matches the treatment. Binding the level as well
+    /// as the flag is what forbids the remaining lie: content labelled
+    /// `full_traces` that received Detailed handling, with an honest `ner_ran`
+    /// beside it.
+    pub trace_level: String,
+    /// **Digest of the NER model that ran**, `None` when none did (#690).
+    ///
+    /// `ner_ran: true` says a pass happened; it does not say what that pass
+    /// could catch. Two models disagree about what counts as PII, so a receiver
+    /// enforcing "properly scrubbed" needs to know WHICH instrument was used.
+    /// The difference is between *"a scrub ran"*, *"an NER scrub ran"*, and *"an
+    /// NER scrub ran with a model I accept"* — and only the last is enforceable.
+    pub scrubber_model_digest: Option<String>,
+}
+
+/// **The bytes a scrub signature covers** (v32.0.0, CIRISPersist#690).
+///
+/// One function, used by the signer and by any verifier, so the two cannot
+/// drift — the CIRISVerify `authorization_digest` lesson (#398): a preimage with
+/// two implementations is a preimage with two answers.
+///
+/// Deliberately over a HASH of the post-scrub content rather than the content
+/// itself. The signed input stays a fixed size regardless of trace size, which
+/// is the #398 failure that stopped a hardware token mid-ceremony when a
+/// widened preimage reached 83 KB.
+#[must_use]
+pub fn scrub_preimage(
+    post_content_sha256: &str,
+    original_content_hash: &str,
+    ner_ran: bool,
+    trace_level: &str,
+    scrubber_model_digest: Option<&str>,
+    scrub_key_id: &str,
+    scrub_timestamp: chrono::DateTime<chrono::Utc>,
+) -> Vec<u8> {
+    // JCS via serde_json's ordered map: keys serialize lexicographically, which
+    // is what both sides canonicalize to.
+    let v = serde_json::json!({
+        "post_content_sha256": post_content_sha256,
+        "original_content_hash": original_content_hash,
+        "ner_ran": ner_ran,
+        "trace_level": trace_level,
+        "scrubber_model_digest": scrubber_model_digest,
+        "scrub_key_id": scrub_key_id,
+        "scrub_timestamp": scrub_timestamp.to_rfc3339(),
+    });
+    // The house canonicalizer, not a second JCS implementation — #398's lesson
+    // is that a preimage with two implementations is a preimage with two
+    // answers. `ceg_produce_canonicalize` is what every other signed shape in
+    // this crate goes through.
+    crate::verify::canonical::ceg_produce_canonicalize(&v).unwrap_or_default()
 }
 
 /// Whether [`IngestPipeline::receive_and_persist`] runs its own
@@ -452,12 +567,33 @@ where
 
         // 4. Scrub. By the time we get here every signature has been
         //    accepted, so we know the bytes are real agent testimony.
-        let scrubbed_fields = self.scrubber.scrub_batch(&mut env)?;
+        let scrub_outcome = self.scrubber.scrub_batch(&mut env)?;
+        let scrubbed_fields = scrub_outcome.fields_modified;
+
+        // 4a. v32.0.0 (#690) — REFUSE a full_traces batch that did not get a
+        //     named-entity pass. The envelope now carries the treatment, and a
+        //     carried fact nobody enforces is the #685 shape: stored,
+        //     verifiable, unconsulted.
+        //
+        //     Checked against the level the scrubber says it TREATED the content
+        //     at, not the incoming label, so a node that downgrades to
+        //     `detailed` and relabels passes honestly while one that keeps the
+        //     `full_traces` label without the pass does not.
+        if scrub_outcome.applied_trace_level == TraceLevel::FullTraces.as_str()
+            && !scrub_outcome.ner_ran
+        {
+            return Err(IngestError::ScrubTreatmentMismatch {
+                label: TraceLevel::FullTraces.as_str().to_owned(),
+                treated: scrub_outcome.applied_trace_level.clone(),
+            });
+        }
 
         // 5. Step 3.5 — sign per-component scrub envelope. UNCONDITIONAL
         //    (FSD §3.3 step 3.5; §3.4 robustness primitive #7).
         //    Same key signs every component on every trace level.
-        let envelopes = self.sign_scrub_envelopes(&env, &pre_scrub_hashes).await?;
+        let envelopes = self
+            .sign_scrub_envelopes(&env, &pre_scrub_hashes, &scrub_outcome)
+            .await?;
 
         // 6. Decompose each CompleteTrace into row-shaped writes.
         //    Envelope columns get attached to each row by index.
@@ -501,6 +637,14 @@ where
                         row.scrub_signature = Some(env_for_row.scrub_signature.clone());
                         row.scrub_key_id = Some(env_for_row.scrub_key_id.clone());
                         row.scrub_timestamp = Some(env_for_row.scrub_timestamp);
+                        // v32.0.0 (#690) — the treatment claims travel onto the
+                        // row because they are INSIDE `scrub_signature`'s
+                        // preimage. Persisting the signature without them
+                        // yields a signature that verified once, at signing
+                        // time, and can never be checked again.
+                        row.scrub_ner_ran = Some(env_for_row.ner_ran);
+                        row.scrub_applied_trace_level = Some(env_for_row.trace_level.clone());
+                        row.scrub_model_digest = env_for_row.scrubber_model_digest.clone();
                         // CIRISPersist#91 — record WHO established
                         // authenticity. `signature_verified` keeps its
                         // plain meaning ("the signature is valid") and
@@ -892,7 +1036,9 @@ where
         &self,
         env: &BatchEnvelope,
         pre_hashes: &[String],
+        outcome: &crate::scrub::ScrubOutcome,
     ) -> Result<Vec<ScrubEnvelope>, IngestError> {
+        use sha2::{Digest as _, Sha256};
         let now = chrono::Utc::now();
         let key_id = self.signer_key_id.to_owned();
         let mut envelopes = Vec::with_capacity(pre_hashes.len());
@@ -906,9 +1052,23 @@ where
                             .canonicalizer
                             .canonicalize_value(&value)
                             .map_err(IngestError::Verify)?;
+                        // v32.0.0 (#690) — the signature covers the ENVELOPE now,
+                        // not the payload alone. The content is still bound, via
+                        // its hash inside the preimage; what is new is that the
+                        // statements ABOUT the content are bound with it.
+                        let post_sha = hex::encode(Sha256::digest(&post_bytes));
+                        let preimage = scrub_preimage(
+                            &post_sha,
+                            &pre_hashes[idx],
+                            outcome.ner_ran,
+                            &outcome.applied_trace_level,
+                            outcome.scrubber_model_digest.as_deref(),
+                            &key_id,
+                            now,
+                        );
                         let sig_bytes = self
                             .signer
-                            .sign(&post_bytes)
+                            .sign(&preimage)
                             .await
                             .map_err(|e| IngestError::Sign(format!("{e}")))?;
                         envelopes.push(ScrubEnvelope {
@@ -916,6 +1076,9 @@ where
                             scrub_signature: BASE64.encode(&sig_bytes),
                             scrub_key_id: key_id.clone(),
                             scrub_timestamp: now,
+                            ner_ran: outcome.ner_ran,
+                            trace_level: outcome.applied_trace_level.clone(),
+                            scrubber_model_digest: outcome.scrubber_model_digest.clone(),
                         });
                         idx += 1;
                     }
@@ -1580,16 +1743,30 @@ mod tests {
             );
         }
 
-        // THREAT_MODEL.md AV-24 verification: ed25519_verify the
-        // first row's scrub_signature against signer's public key
-        // and the canonical(post-scrub) bytes — proves a peer with
-        // the published public key can verify the deployment's
-        // attestation.
+        // THREAT_MODEL.md AV-24 verification: ed25519_verify the first row's
+        // scrub_signature against the signer's public key — proving a peer with
+        // the published public key can verify the deployment's attestation.
         //
         // v17.7.0 (#470 arc, crypto-DRY closure) — strict-verify through the
         // canonical `ciris_crypto::Ed25519Verifier::verify_strict` (v10.4.0)
         // instead of reaching for `ed25519_dalek` directly: ONE Ed25519
         // acceptance rule in the repo, not two.
+        //
+        // v32.0.0 (CIRISPersist#690) — **the preimage is rebuilt from the
+        // STORED ROW**, not from the envelope the pipeline just handed us.
+        //
+        // That distinction is the entire value of this test, and it is what
+        // caught the defect this version fixes. #690 widened the preimage from
+        // `canonical(post_scrub)` to the whole envelope, and initially shipped
+        // WITHOUT the three treatment columns — so `scrub_signature` covered
+        // three values that were persisted nowhere. It verified once, at
+        // signing time, and was unverifiable by anyone forever after: strictly
+        // worse than the ambiguity #690 set out to remove.
+        //
+        // A test that rebuilt the preimage from the in-memory envelope would
+        // have passed throughout, because the envelope holds fields the row
+        // does not. Reading only what a peer can read is what makes this an
+        // instrument rather than a restatement.
         let pubkey_bytes = signer.public_key().await.expect("signer.public_key");
 
         let row0 = &snap[0];
@@ -1597,14 +1774,65 @@ mod tests {
         let canonical = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&payload_value)
             .unwrap();
+        let post_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical));
+
+        // Every component of the preimage comes off the row. If any of these is
+        // `None`, this `expect` fires and names the column — which is the
+        // failure mode worth having, because the alternative is a signature
+        // that silently cannot be checked.
+        let preimage = scrub_preimage(
+            &post_sha,
+            row0.original_content_hash
+                .as_deref()
+                .expect("original_content_hash persisted"),
+            row0.scrub_ner_ran
+                .expect("scrub_ner_ran persisted — it is inside the signature preimage"),
+            row0.scrub_applied_trace_level
+                .as_deref()
+                .expect("scrub_applied_trace_level persisted — inside the preimage"),
+            row0.scrub_model_digest.as_deref(),
+            row0.scrub_key_id
+                .as_deref()
+                .expect("scrub_key_id persisted"),
+            row0.scrub_timestamp.expect("scrub_timestamp persisted"),
+        );
+
         let sig_b64 = row0.scrub_signature.as_ref().unwrap();
         let sig_bytes = BASE64.decode(sig_b64).expect("base64 decode");
         let verified = ciris_crypto::Ed25519Verifier
-            .verify_strict(&pubkey_bytes, &canonical, &sig_bytes)
+            .verify_strict(&pubkey_bytes, &preimage, &sig_bytes)
             .expect("verify_strict parse");
         assert!(
             verified,
-            "scrub_signature verifies against canonical(post-scrub)"
+            "scrub_signature must verify against a preimage rebuilt ENTIRELY \
+             from persisted columns — if it does not, some field of the \
+             preimage is not being stored and no peer can ever check this \
+             signature"
+        );
+
+        // And the treatment claims are the ones the pipeline actually made,
+        // not defaults that happen to hash correctly. This batch is `generic`,
+        // which by design carries no content text (TRACE_WIRE_FORMAT.md §7), so
+        // the honest triple is "treated at generic, no NER pass, no model" —
+        // and the #690 door does not refuse it, because the label and the
+        // treatment agree.
+        assert_eq!(
+            row0.scrub_applied_trace_level.as_deref(),
+            Some("generic"),
+            "the level TREATED is persisted, and for a generic batch that is \
+             `generic` — not the pipeline's default and not the label of some \
+             other batch"
+        );
+        assert_eq!(
+            row0.scrub_ner_ran,
+            Some(false),
+            "Some(false) — a CLAIM that no pass ran, which is not the same as \
+             None (a pre-v32.0.0 row that made no claim at all). Collapsing \
+             those two is how an unscrubbed row would read as attested"
+        );
+        assert!(
+            row0.scrub_model_digest.is_none(),
+            "no model ran, so none may be named"
         );
     }
 

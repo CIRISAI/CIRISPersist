@@ -176,13 +176,35 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// ABI version of [`DirectoryVTable`]. Bumped on any breaking change to
 /// the vtable's layout or function-pointer signatures.
 ///
-/// This is INDEPENDENT of [`DirectoryOp`]'s wire growth: appending a new
+/// This is INDEPENDENT of [`DirectoryOp`]'s wire *growth*: appending a new
 /// [`DirectoryOp`] variant does NOT bump this, because the vtable
 /// signature (`build_op` takes opaque bytes) is unchanged — an older
 /// consumer simply never emits the new variant, and a well-formed op it
 /// does emit still round-trips. The version guards the *C-ABI shape*
 /// (function-pointer count/order/signatures), which the serialized-op
 /// design keeps stable across op growth.
+///
+/// **Growth is not the same as a break** (v32.0.0, CIRISPersist#682). When
+/// an *existing* variant's field set or field types change, an older
+/// consumer's well-formed op no longer round-trips: it emits the variant
+/// by name, hits a `serde_json` type error, and gets an opaque
+/// [`DirectoryOpResult::Err`] on the hot path instead of a diagnosis. The
+/// `abi_version` field is the only signal a consumer can read at
+/// capsule-receive time, before any op is dispatched, so a variant-shape
+/// break MUST bump it — otherwise the load-time gate says "compatible"
+/// about a contract the consumer was not compiled for, and the mismatch
+/// surfaces later, further from its cause, as a serde error rather than
+/// "pin floor too low".
+///
+/// v2 is that case: `ListSignedKeyRecordsSince` took a bare instant and
+/// returned [`SignedKeyRecord`]s; it now takes the `(admitted_at, key_id)`
+/// pair and returns [`crate::federation::ServedKeyRecord`]s. Breaking it
+/// in place rather than appending a second op is deliberate — the old
+/// cursor semantics are the #682 defect itself (a record replicated late
+/// sorts under its producer's timestamp and is never served past it), and
+/// preserving a reachable path to a known under-serving read, for
+/// compatibility, would keep the vulnerability alive in exactly the
+/// consumers slowest to upgrade.
 ///
 /// Consumers MUST check the field at capsule-receive time:
 ///
@@ -196,7 +218,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 1;
+pub const DIRECTORY_ABI_VERSION: u32 = 2;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -717,8 +739,15 @@ pub enum DirectoryOp {
     /// cursor, for the edge advertise/serve responder. Result rides
     /// `SignedKeyRecords`. APPEND-ONLY.
     ListSignedKeyRecordsSince {
-        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Cursor: rows strictly after `(admitted_at, key_id)` (None ⇒ from
+        /// start).
+        ///
+        /// v31.4.0 (#682/#668) — the PAIR, and THIS node's admission position
+        /// rather than the producer's `scrub_timestamp`. A record signed in
+        /// January, replicated late and admitted in February, sorted under
+        /// January and was never served past it; and a resume on the instant
+        /// alone skips the remainder of any tie larger than one page.
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -962,7 +991,7 @@ pub enum DirectoryOpResult {
     SignedCommunityMembershipRevocations(Vec<SignedCommunityMembershipRevocation>),
     /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
-    SignedKeyRecords(Vec<SignedKeyRecord>),
+    SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
     /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
     SignedIdentityOccurrencesSince(Vec<SignedIdentityOccurrence>),
@@ -3119,9 +3148,9 @@ impl FederationDirectory for OpsDirectory {
     /// the capsule, for the edge advertise/serve responder.
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedKeyRecord>, Error> {
+    ) -> Result<Vec<crate::federation::ServedKeyRecord>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedKeyRecordsSince { since, limit })
             .await?
@@ -3864,10 +3893,113 @@ mod tests {
         assert!(format!("{rebuilt}").contains("digest-abc"));
     }
 
+    /// v32.0.0 (CIRISPersist#682) — bumped 1 → 2 because
+    /// `ListSignedKeyRecordsSince` changed SHAPE in place (bare instant →
+    /// `(admitted_at, key_id)` pair; `SignedKeyRecord` → `ServedKeyRecord`).
+    ///
+    /// The pin is deliberately two assertions on two different things: the
+    /// constant consumers compile against, and the value this build actually
+    /// puts in the vtable a consumer reads at runtime. A single assertion
+    /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_1() {
-        assert_eq!(DIRECTORY_ABI_VERSION, 1);
-        assert_eq!(PERSIST_DIRECTORY_VTABLE.abi_version, 1);
+    fn abi_version_pinned_at_2() {
+        assert_eq!(
+            DIRECTORY_ABI_VERSION, 2,
+            "an existing DirectoryOp variant's shape changed in v32.0.0; the \
+             load-time gate is the only signal a consumer gets BEFORE it \
+             dispatches an op, so a shape break must move this or the gate \
+             certifies a contract the consumer was not built for"
+        );
+        assert_eq!(
+            PERSIST_DIRECTORY_VTABLE.abi_version, 2,
+            "the shipped vtable must advertise what consumers pin against"
+        );
+    }
+
+    /// Structural digest of one `pub enum NAME { … }` body from this file's own
+    /// source: doc comments and blank lines dropped, whitespace collapsed,
+    /// **attributes kept** (a `#[serde(rename)]` moves the wire name, so it is
+    /// contract, not decoration).
+    ///
+    /// Deliberately blind to prose so that documenting a variant never costs a
+    /// re-pin — a gate that cries wolf on comment edits gets its digest bumped
+    /// reflexively, which is the same as not having it.
+    fn structural_digest(enum_name: &str) -> String {
+        let src = include_str!("directory_capsule.rs");
+        let open = format!("pub enum {enum_name} {{");
+        let mut lines = src.lines().skip_while(|l| !l.starts_with(&open));
+        assert!(
+            lines.next().is_some(),
+            "`{open}` not found — the gate's own recognizer broke, which would \
+             otherwise digest an EMPTY body and pass forever"
+        );
+
+        let mut body = Vec::new();
+        for line in lines {
+            if line == "}" {
+                assert!(
+                    !body.is_empty(),
+                    "empty enum body for {enum_name} — recognizer failure"
+                );
+                return format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(body.join("\n").as_bytes())
+                );
+            }
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("///") {
+                continue;
+            }
+            body.push(t.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        panic!("unterminated enum body for {enum_name}");
+    }
+
+    /// v32.0.0 (CIRISPersist#682) — **the append-only rule, enforced.**
+    ///
+    /// [`DirectoryOp`] and [`DirectoryOpResult`] are the wire contract between a
+    /// persist wheel and consumers built against an older persist. The rule —
+    /// append at the end, never change an existing variant's field set or types
+    /// — lived only in a doc comment, and in v32.0.0 it was violated twice in
+    /// one change (`ListSignedKeyRecordsSince.since` gained a tuple;
+    /// `SignedKeyRecords` swapped its payload type) with
+    /// [`DIRECTORY_ABI_VERSION`] left at 1. A consumer would have passed the
+    /// load-time gate and then failed on the hot path with an opaque serde
+    /// error.
+    ///
+    /// This pins the SHAPE so the next such edit cannot be silent. A red here
+    /// is not "fix the digest" — it is a fork:
+    ///
+    /// * **Growth** (a new variant appended, nothing existing touched):
+    ///   re-pin the digest, leave [`DIRECTORY_ABI_VERSION`] alone.
+    /// * **Break** (an existing variant's fields or types changed, or a variant
+    ///   renamed/removed/reordered): re-pin the digest **and** bump
+    ///   [`DIRECTORY_ABI_VERSION`], or older consumers get that opaque error
+    ///   instead of "pin floor too low".
+    #[test]
+    fn directory_op_wire_contract_is_pinned_682() {
+        assert_eq!(
+            structural_digest("DirectoryOp"),
+            "2ff162ee23d3d9bde2339a370c0751a061285ffed59d19d976e61ab6b76c2025",
+            "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
+             touched nothing existing) → re-pin this digest only. BREAK \
+             (changed/renamed/removed/reordered an existing variant) → re-pin \
+             AND bump DIRECTORY_ABI_VERSION; see its doc for why the load-time \
+             gate is the only signal a consumer gets before dispatching."
+        );
+    }
+
+    /// Companion to [`directory_op_wire_contract_is_pinned_682`] for the result
+    /// half. Pinned separately so a red names which side of the call moved —
+    /// a consumer can be forward-compatible on ops and not on results.
+    #[test]
+    fn directory_op_result_wire_contract_is_pinned_682() {
+        assert_eq!(
+            structural_digest("DirectoryOpResult"),
+            "b76ec943a4caebe1f0ff7c481e5aa22d893e19a3261c07f74cf0d867d40173f5",
+            "DirectoryOpResult's wire shape changed — same fork as the op gate: \
+             growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
+        );
     }
 
     #[test]

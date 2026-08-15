@@ -105,7 +105,25 @@ class BatchSummary(TypedDict):
     scrubbed_fields: int
     signatures_verified: int
 
-ScrubberCallable = Callable[[dict[str, Any]], tuple[dict[str, Any], int]]
+#: Return shape from a scrubber callable.
+#:
+#: v32.0.0 (CIRISPersist#690) — two shapes are accepted, and the difference
+#: decides whether a ``full_traces`` batch is storable at all:
+#:
+#: * ``(scrubbed, modified_count, ner_ran, model_digest)`` — the callable
+#:   **states what it did**. Required for ``full_traces``.
+#: * ``(scrubbed, modified_count)`` — legacy. Reported as ``ner_ran=False``
+#:   with no model digest, because a count is not evidence of a named-entity
+#:   pass: ``0`` means both "NER ran and found nothing" and "no NER ran".
+#:   Persist will not infer the claim from a nonzero count.
+#:
+#: A legacy callable handed a ``full_traces`` batch is therefore refused with
+#: ``ValueError("scrub_treatment_mismatch", ...)``. The remedies are to return
+#: the 4-tuple, or to scrub at ``detailed`` and relabel the trace ``detailed``.
+ScrubberOutcome = (
+    tuple[dict[str, Any], int] | tuple[dict[str, Any], int, bool, str | None]
+)
+ScrubberCallable = Callable[[dict[str, Any]], ScrubberOutcome]
 
 # --- pyi_surface: BEGIN GENERATED REGION ---
 
@@ -2041,8 +2059,8 @@ class Engine:
     def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
 
-    def list_signed_key_records_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) — bulk-list SignedKeyRecord wrappers since a cursor, as a JSON array, ordered (scrub_times..."""
+    def list_signed_key_records_since(self, since_rfc3339: str | None, since_key_id: str | None, limit: int) -> str:
+        """(derived) epistemic — v31.4.0 (CIRISPersist#682, #668) — bulk-list ServedKeyRecords since a cursor, as a JSON array, ordered (admitted_at ASC, key_id ASC). Every federat..."""
 
     def list_signed_location_proofs_since(self, since_rfc3339: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""

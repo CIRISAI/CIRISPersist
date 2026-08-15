@@ -2260,9 +2260,9 @@ mod tests {
                     key_id, pubkey_ed25519_base64, algorithm, identity_type, \
                     identity_ref, valid_from, registration_envelope, \
                     original_content_hash, scrub_signature_classical, \
-                    scrub_key_id, scrub_timestamp, persist_row_hash\
+                    scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES ($1, 'AAAA', 'hybrid', 'agent', $1, NOW(), \
-                          '{}'::jsonb, decode('00', 'hex'), '', $1, NOW(), '0') \
+                          '{}'::jsonb, decode('00', 'hex'), '', $1, NOW(), '0', NOW()) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[&key_id],
             )
