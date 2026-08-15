@@ -5,6 +5,87 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.4.0] - 2026-08-14
+
+### Added — the arm no consumer could reach is reachable now (#603, #604)
+
+`resolve_mesh_config` folds per-root reads and carries `unreadable_roots`, so
+*"this backend cannot answer for root R"* stays distinct from *"root R said
+nothing"*. **No test in this repo could reach that arm.** All three shipped
+backends implement every method, so none can return `Error::Unsupported` — the
+only party exercising it was CIRISServer, through their own directory impl, which
+is how the original defect was found.
+
+#604 recorded the shape across five workstreams in one week:
+
+```text
+Ok(value)  -> a real answer
+Ok(empty)  -> a real answer that happens to be empty
+Err(_)     -> WE COULD NOT ASK
+```
+
+Collapsing the third arm into the second is how a zero becomes evidence it has
+not earned. **A zero is not evidence unless the instrument can fail.**
+
+`federation::directory_double::FaultInjectingDirectory` is that instrument. It
+**wraps** a real directory rather than stubbing the trait, so every un-faulted
+call keeps real behaviour and a fixture declares only the divergence it cares
+about:
+
+```rust
+let dbl = FaultInjectingDirectory::new(backend)
+    .unsupported("list_attestations_for");
+```
+
+**Generated, not hand-written.** `scripts/gen_directory_double.py` parses the
+trait and emits all 81 delegations; hand-writing them is 81 chances to typo a
+delegation and it rots the moment someone adds a method. The generated file is
+committed — `cargo` never runs the generator, so there is no build-time codegen —
+and `--check` runs in `certify.sh` and the pre-commit hook, so a stale double
+fails loudly. The compiler remains the backstop: a new trait method that nobody
+regenerates fails to COMPILE.
+
+`pub`, behind the unchanged `test-anchor` fence, because consumers need it —
+#664 was the same wall one module over.
+
+**Witnessed from outside the crate**, in `tests/unreadable_arm_reachable.rs`,
+with the precondition asserted: the node must actually HAVE a trusted root, or
+the fault fires into an empty loop and the test passes for the wrong reason.
+Mutation-tested — restoring the pre-#601 `Err(Unsupported) => {}` reds the
+witness and correctly leaves the transparency test alone.
+
+### Fixed — a consumer could SIGN an AdmitSpec and could not REGISTER the authority it verifies against (#664)
+
+`cohort::test_support::admit_family` is `pub`, and its own doc states the
+precondition: `authority_key_id` **MUST** already be registered, via
+`tier_ingest::test_support::register_hybrid_key`. That function was `pub` — but
+its **module** was `pub(crate)`. So a downstream fixture could produce the
+signature and could not create the key the signature verifies against: a fixture
+that fails closed with no way to open it. **#604 records four independent
+workstreams hitting that wall.**
+
+`tier_ingest::test_support` is now `pub`. The whole module widens rather than the
+one function, because the same wall is one call away in every direction —
+`sign_envelope`, `seal_row_in_place` (which stamps the #598 instants AND the
+#643 row mirror as one step), `seal_revocation`, `stamp_mirror`. A consumer
+building a valid row needs the helpers this crate's own fixtures need, and
+shipping half of them is how the next `pub(crate)` wall gets found by someone
+else's blocked test. **This release used `seal_row_in_place` twice to repair its
+own fixtures** — a consumer reaching for it is reaching for the right thing.
+
+The `#[cfg(any(test, feature = "test-anchor"))]` fence is unchanged: none of this
+exists in a build that has not opted into `test-anchor`. It is a supported
+contract for FIXTURES and nothing else — these helpers sign with deterministic
+test keypairs and are not a production signing path.
+
+**Witnessed from outside the crate, deliberately.** `tests/downstream_fixture_surface.rs`
+is an integration test because `tests/` compiles as a separate crate, so
+`pub(crate)` is invisible there exactly as it is to CIRISServer, CIRISEdge and
+CIRISAgent. A unit test inside `src/` could reach `pub(crate)` and would have
+passed while every consumer stayed blocked — which is precisely how this survived:
+persist's own fixtures were green throughout. Mutation-tested: reverting to
+`pub(crate)` fails the BUILD (`error[E0603]`), not an assertion.
+
 ## [31.3.0] - 2026-08-14
 
 ### Added — the matrix was a union on the backend axis, and it cost two build breaks in one day (#678)

@@ -493,9 +493,30 @@ where
 // v21.15.0 (CIRISPersist#536) — also compiled under `feature = "test-anchor"`
 // so `operational::test_support::establish_trust_root` (a downstream fixture)
 // can reuse the deterministic `sign_envelope` / `hybrid_pubkeys` derivation.
+/// v31.4.0 (CIRISPersist#664) — **`pub`, not `pub(crate)`: a downstream fixture
+/// must be able to register the authority whose signature it is about to make.**
+///
+/// `cohort::test_support::admit_family` is already `pub`, and its own doc states
+/// the precondition that `authority_key_id` MUST already be registered — via
+/// `register_hybrid_key`, which lived behind a `pub(crate)` module. So a consumer
+/// could **sign** an `AdmitSpec` and could not **register** the key that
+/// signature verifies against: a fixture that fails closed with no way to open
+/// it. Four independent downstream workstreams hit that wall (#604).
+///
+/// The whole module widens rather than the one function, because the same wall
+/// is one call away in every direction — `sign_envelope`, `seal_row_in_place`
+/// (which stamps the #598 instants AND the #643 row mirror as one step),
+/// `seal_revocation`, `stamp_mirror`. A consumer building a valid row needs the
+/// same helpers this crate's own fixtures need, and shipping half of them is how
+/// the next `pub(crate)` wall gets discovered by someone else's blocked test.
+///
+/// This is **test-only surface**: the `#[cfg]` is unchanged, so nothing here
+/// exists in a build that has not opted into `test-anchor`. Treat it as a
+/// supported contract for fixtures and as nothing else — these helpers sign with
+/// deterministic test keypairs and are not a production signing path.
 #[cfg(any(test, feature = "test-anchor"))]
 #[allow(dead_code)]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
