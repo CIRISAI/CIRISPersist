@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.5.0] - 2026-08-15
+
+### Fixed — the generated directory double could go stale without anyone being told (#688)
+
+`gen_directory_double.py --check` ran in `certify.sh` **only** — not CI, not the
+pre-commit hook — so a stale double reached `main` unless someone ran a full
+local certification.
+
+**Severity stated honestly: the compiler is the primary backstop and covers the
+common case.** A new REQUIRED trait method makes the double an incomplete impl
+(`E0046`) and fails any build. This closes the narrower band the compiler cannot
+see — a CHANGED signature the existing delegation still satisfies, a hand-edit to
+the generated file, or the generator itself moving without a regeneration.
+
+It is worth closing because #603's whole thesis is *a zero is not evidence unless
+the instrument can fail*, and the double **is** an instrument. An ungated
+generated instrument can drift from the thing it measures without anyone being
+told — the same shape as the defect it was built to detect, one level up.
+
+Added to CI beside the three existing gate steps, and to the pre-commit hook
+**with its own `gate_script_present` guard at the same nesting level as its
+siblings**. An earlier draft was nested INSIDE the doc-version guard, so it fired
+only when a *different* script happened to exist and carried no guard of its own
+— precisely the #595 failure the hook's own header documents.
+
+Verified the gate actually fires rather than assuming: a hand-edit to the
+generated file makes `--check` exit non-zero, and it returns to clean when
+restored. A gate nobody tests is the thing this issue is about.
+
+### Fixed — SECURITY — a quorum-WITHDRAWN trust root kept projecting Global (#685)
+
+`namespace::is_trust_root` is the load-bearing predicate in `projection_for`: a
+public record from a trust root reaches the **whole federation**, the same scope
+from a plain producer relays over its cohort. It called the bare `is_canonical` /
+`is_infra_attest`, which answer *"does the row carry this role"* and say nothing
+about whether a quorum has since withdrawn it.
+
+So a key whose trust-root role had been withdrawn **kept gossiping globally**.
+The tombstone was stored, verifiable, and unread on this path — the edge existed
+and the reader skipped it. Same shape as #659 (a co-scrub conferring `canonical`
+on any key_id) and #608 (a sanction not covering the sanctioning dimension), and
+`is_infra_attest`'s own doc already said a consumer deciding whether to **trust**
+must call the `_effective` variant. This one decides trust and did not.
+
+**The correct behaviour was established eighteen major versions ago and this one
+path missed it.** `Engine::is_canonical` has been tombstone-aware since v13.1.0
+(#377) — *"a WITHDRAWN canonical reads false"*. The fix restores consistency
+rather than inventing a rule.
+
+**Audited the rest of the family in the same pass**, which the issue asked for:
+every other non-test caller of the bare predicates is either already `_effective`
+or is deliberately asserting SHAPE rather than trust — `accord_carriage`'s
+witness uses the bare form precisely to assert *"the stored row is untouched —
+tombstones never mutate rows"*, which is correct. `is_trust_root` was the only
+production consumer making the mistake.
+
+**The witness withdraws TWICE, and that is the point.** `is_trust_root` is an OR
+over two roles and the baked canonical carries both, so withdrawing one and
+asserting `false` could not distinguish *"both arms consult the tombstone"* from
+*"one arm does and the other short-circuits"*. It withdraws each in turn and pins
+the value after each — including the intermediate assertion that one withdrawal
+alone leaves it **true**.
+
+The two arms also read **different tombstone tables**, which the witness now
+pins: `is_canonical_effective` consults `lookup_canonical_withdrawal` (the
+dedicated canonical table) while `is_infra_attest_effective` consults the generic
+`lookup_role_withdrawal` (V104). A witness using one writer for both would have
+left an arm untested.
+
+Mutation-tested: reverting to the bare predicates reds the final assertion.
+
+Found by a Class D retraction/tombstone sweep and verified against `main` before
+filing — the sweep marked the call sites as read and the consequence as
+inference; the consequence is now confirmed from `is_trust_root`'s own doc.
+
 ## [31.4.0] - 2026-08-14
 
 ### Added — the arm no consumer could reach is reachable now (#603, #604)

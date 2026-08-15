@@ -1165,6 +1165,23 @@ jobs:
       # version in evidence/doc_version_baseline.tsv; the ratchet only tightens.
       - name: doc version references name shipped versions
         run: python3 scripts/doc_version_refs.py
+      # v31.5.0 (CIRISPersist#688) — the generated `FederationDirectory` double
+      # must still match the trait it was generated from.
+      #
+      # The COMPILER is the primary backstop and covers the common case: a new
+      # REQUIRED trait method makes the double an incomplete impl (`E0046`) and
+      # fails any build. This covers the band the compiler cannot see — a
+      # CHANGED signature the existing delegation still satisfies, a hand-edit
+      # to the generated file, or the generator itself moving without a
+      # regeneration.
+      #
+      # It ran in `certify.sh` only, which meant a stale double reached `main`
+      # unless someone ran a full local certification. #603's whole thesis is
+      # that a zero is not evidence unless the instrument can fail — and the
+      # double IS an instrument, so an ungated generated one can drift from the
+      # thing it measures without anyone being told.
+      - name: generated directory double is current
+        run: python3 scripts/gen_directory_double.py --check
       # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
       # the --all-features pass below: `dead_code` / `unused_imports` fire only
       # when a feature is OFF, so the narrow pass catches lints the total pass
