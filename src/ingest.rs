@@ -24,8 +24,8 @@ use ciris_keyring::HardwareSigner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::schema::{BatchEnvelope, BatchEvent, CompleteTrace, Error as SchemaError};
 use crate::schema::TraceLevel;
+use crate::schema::{BatchEnvelope, BatchEvent, CompleteTrace, Error as SchemaError};
 use crate::scrub::{ScrubError, Scrubber};
 use crate::store::{Backend, Error as StoreError, InsertReport};
 use crate::verify::{canonical::Canonicalizer, Error as VerifyError};

@@ -5632,9 +5632,17 @@ impl PyEngine {
                         // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
                         // refusal is caller-fault (the writer stamped a
                         // cohort it isn't a member of); lens-side HTTP 403.
+                        // v32.0.0 (CIRISPersist#690) — a batch whose treatment
+                        // does not match its label is caller-fault and belongs
+                        // here, NOT with Sign/Store: nothing on this node is
+                        // broken. The sender downgrades the level and relabels,
+                        // or loads a model. Lens-side HTTP 422, and `detail`
+                        // carries which level it was actually treated at so the
+                        // sender can tell those two remedies apart.
                         IngestError::Schema(_)
                         | IngestError::Verify(_)
                         | IngestError::Scrub(_)
+                        | IngestError::ScrubTreatmentMismatch { .. }
                         | IngestError::ScopeRefused(_)
                         | IngestError::PipelineInvariant { .. } => Err(match detail {
                             Some(d) => PyValueError::new_err((kind, d)),
@@ -29967,18 +29975,45 @@ where
 }
 
 /// Scrubber bridge: wraps a Python callable in the [`Scrubber`]
-/// trait. The callable receives the JSON-equivalent envelope dict
-/// and returns `(scrubbed_dict, modified_count)`.
+/// trait. The callable receives the JSON-equivalent envelope dict and returns
+/// its treatment.
+///
+/// # Return protocol (v32.0.0, CIRISPersist#690)
+///
+/// Two shapes are accepted, and the difference is not stylistic:
+///
+/// * `(scrubbed_dict, modified_count, ner_ran, model_digest)` — the callable
+///   **states what it did**. `ner_ran` is a `bool`; `model_digest` is `str` or
+///   `None`. This is the shape a production scrubber must return.
+/// * `(scrubbed_dict, modified_count)` — the legacy 2-tuple. Accepted, and
+///   reported as `ner_ran: false` with no model digest, because **a count is
+///   not evidence of a named-entity pass**: `0` means both "NER ran and found
+///   nothing" and "no NER ran", which is the entire defect #690 exists to
+///   close. The bridge cannot substantiate a claim the callable never made, and
+///   inferring `ner_ran` from a nonzero count would manufacture exactly the
+///   evidence the issue is about.
+///
+/// **Consequence, stated plainly:** a 2-tuple callable handed a `full_traces`
+/// batch is refused downstream by `IngestError::ScrubTreatmentMismatch`. That
+/// is the intended behaviour, not a regression — the remedy is to return the
+/// 4-tuple, or to scrub at `detailed` and relabel. What is NOT available any
+/// more is storing content under a `full_traces` label that nothing
+/// substantiates.
 struct PyCallableScrubber {
     callable: Arc<Py<PyAny>>,
 }
 
 impl Scrubber for PyCallableScrubber {
-    fn scrub_batch(&self, env: &mut crate::schema::BatchEnvelope) -> Result<usize, ScrubError> {
+    fn scrub_batch(
+        &self,
+        env: &mut crate::schema::BatchEnvelope,
+    ) -> Result<crate::scrub::ScrubOutcome, ScrubError> {
         // Bypass GENERIC at this layer too; mission constraint
         // (MISSION.md §2 — `scrub/`): GENERIC has no content text.
         if env.trace_level == crate::schema::TraceLevel::Generic {
-            return Ok(0);
+            return Ok(crate::scrub::ScrubOutcome::none_at(
+                crate::schema::TraceLevel::Generic.as_str(),
+            ));
         }
         let value = serde_json::to_value(&*env)?;
         Python::attach(|py| {
@@ -29996,10 +30031,27 @@ impl Scrubber for PyCallableScrubber {
                 .bind(py)
                 .call1((py_obj,))
                 .map_err(|e| ScrubError::External(format!("scrubber call: {e}")))?;
-            // Expect (scrubbed_dict, modified_count).
-            let tuple: (Py<PyAny>, usize) = result
-                .extract()
-                .map_err(|e| ScrubError::External(format!("scrubber return shape: {e}")))?;
+            // v32.0.0 (#690) — the 4-tuple FIRST, so a callable that states its
+            // treatment is taken at its word; the 2-tuple only as a fallback.
+            // Tried in the other order, `.extract()` on the 2-tuple would fail
+            // for a 4-tuple and the richer claim would be silently discarded.
+            let (scrubbed, modified, ner_ran, model_digest) =
+                match result.extract::<(Py<PyAny>, usize, bool, Option<String>)>() {
+                    Ok((d, n, ner, dig)) => (d, n, ner, dig),
+                    Err(_) => {
+                        let (d, n): (Py<PyAny>, usize) = result.extract().map_err(|e| {
+                            ScrubError::External(format!(
+                                "scrubber return shape: expected (dict, count, ner_ran, \
+                             model_digest) or the legacy (dict, count): {e}"
+                            ))
+                        })?;
+                        // NOT inferred from `n`. A nonzero count says fields changed,
+                        // never that a named-entity pass ran — treating it as proof
+                        // would manufacture the evidence #690 exists to demand.
+                        (d, n, false, None)
+                    }
+                };
+            let tuple = (scrubbed, modified);
             // json.dumps on the returned dict.
             let dumped = json_mod
                 .call_method1("dumps", (tuple.0,))
@@ -30028,7 +30080,17 @@ impl Scrubber for PyCallableScrubber {
                 ));
             }
             *env = new_env;
-            Ok(tuple.1)
+            // `applied_trace_level` is read from the envelope AFTER the
+            // preservation gate above, which rejects any callable that altered
+            // `trace_level`. So this is the level the content was actually
+            // treated at, not a level the callable asserted separately — one
+            // fewer claim that can disagree with the envelope it describes.
+            Ok(crate::scrub::ScrubOutcome {
+                fields_modified: tuple.1,
+                ner_ran,
+                applied_trace_level: env.trace_level.as_str().to_owned(),
+                scrubber_model_digest: model_digest,
+            })
         })
     }
 }
@@ -30588,6 +30650,119 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `full_traces` envelope with one ASCII trace — the shape the #690 door
+    /// judges. Built through `from_json` so it is a real parsed envelope, not a
+    /// struct literal that could drift from what the wire actually produces.
+    fn bridge_envelope() -> crate::schema::BatchEnvelope {
+        let body = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "full_traces",
+                "trace": {
+                    "trace_id": "trace-bridge-1",
+                    "thought_id": "th-1",
+                    "task_id": "task-1",
+                    "agent_id_hash": "deadbeef",
+                    "started_at": "2026-04-30T00:15:53.123456+00:00",
+                    "completed_at": "2026-04-30T00:16:12.789012+00:00",
+                    "trace_level": "full_traces",
+                    "trace_schema_version": "2.7.0",
+                    "components": [],
+                    "signature": "AAAA",
+                    "signature_key_id": "ciris-agent-key:dead"
+                }
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "full_traces",
+            "trace_schema_version": "2.7.0"
+        });
+        crate::schema::BatchEnvelope::from_json(body.to_string().as_bytes()).unwrap()
+    }
+
+    /// Build a `PyCallableScrubber` from a Python source expression evaluating
+    /// to a callable, run it, and return the outcome.
+    fn run_bridge(src: &str) -> Result<crate::scrub::ScrubOutcome, ScrubError> {
+        let callable = Python::attach(|py| {
+            py.eval(std::ffi::CString::new(src).unwrap().as_c_str(), None, None)
+                .unwrap()
+                .unbind()
+        });
+        let s = PyCallableScrubber {
+            callable: Arc::new(callable),
+        };
+        let mut env = bridge_envelope();
+        s.scrub_batch(&mut env)
+    }
+
+    /// **CIRISPersist#690 — the Python bridge must not invent evidence.**
+    ///
+    /// The production scrubber is the Python one, so this boundary decides
+    /// whether real `full_traces` traffic is storable. Both protocol shapes are
+    /// exercised against a live interpreter rather than reasoned about:
+    ///
+    /// * the legacy 2-tuple reports `ner_ran: false` **even with a nonzero
+    ///   count**, which is the whole point — inferring the pass from the count
+    ///   would manufacture the evidence #690 exists to demand, and `0` is
+    ///   ambiguous in exactly the direction that matters;
+    /// * the 4-tuple is taken at its word, digest and all.
+    ///
+    /// The 4-tuple case is checked FIRST in the implementation; this pins that
+    /// ordering by asserting a 4-tuple is not silently read as a 2-tuple.
+    #[test]
+    fn the_scrubber_bridge_reports_only_what_the_callable_claims_690() {
+        // pyo3 0.29 renamed `prepare_freethreaded_python`; this is the current
+        // spelling and is idempotent, so a second test may call it safely.
+        Python::initialize();
+
+        // Legacy 2-tuple, NONZERO count: fields changed, no pass claimed.
+        let legacy = run_bridge("lambda d: (d, 7)").expect("legacy 2-tuple must still be accepted");
+        assert_eq!(legacy.fields_modified, 7);
+        assert!(
+            !legacy.ner_ran,
+            "a count is not evidence of a named-entity pass — inferring one from \
+             7 modified fields is precisely the fabrication #690 forbids"
+        );
+        assert!(legacy.scrubber_model_digest.is_none());
+        assert_eq!(
+            legacy.applied_trace_level, "full_traces",
+            "the level is read from the envelope after the preservation gate, \
+             not asserted separately by the callable"
+        );
+
+        // And that legacy outcome is exactly the state the ingest door refuses.
+        assert!(
+            legacy.applied_trace_level == "full_traces" && !legacy.ner_ran,
+            "a legacy callable on full_traces must land in the refusable state, \
+             or #690's door is unreachable from the shipped Python surface"
+        );
+
+        // 4-tuple: the claim is carried through intact.
+        let stated = run_bridge("lambda d: (d, 3, True, 'sha256:abc')")
+            .expect("4-tuple is the documented production shape");
+        assert_eq!(stated.fields_modified, 3);
+        assert!(stated.ner_ran, "a 4-tuple must not be read as a 2-tuple");
+        assert_eq!(stated.scrubber_model_digest.as_deref(), Some("sha256:abc"));
+
+        // 4-tuple that honestly reports NO pass, with an explicit None digest —
+        // distinct from the legacy shape in provenance, identical in claim.
+        let honest = run_bridge("lambda d: (d, 0, False, None)").expect("accepted");
+        assert!(!honest.ner_ran);
+        assert!(honest.scrubber_model_digest.is_none());
+
+        // A shape that is neither must be REFUSED, not coerced. A bare dict
+        // silently treated as "no changes, no pass" would be a third meaning of
+        // zero, which is the ambiguity this issue removes.
+        let bad = run_bridge("lambda d: d");
+        assert!(bad.is_err(), "an unrecognized return shape must refuse");
+        let msg = format!("{}", bad.unwrap_err());
+        assert!(
+            msg.contains("ner_ran"),
+            "the error must name the expected shape so a Python author can fix \
+             it without reading Rust: {msg:?}"
+        );
+    }
 
     /// **CIRISPersist#571 — the quota reason survives the FFI boundary.**
     ///

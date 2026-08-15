@@ -5,6 +5,173 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [32.0.0] - 2026-08-14
+
+### BREAKING — read this before pinning
+
+Three surfaces move. All three are deliberate, and all three are cheaper now
+than after the first mesh agent ships against them.
+
+1. `FederationDirectory::list_signed_key_records_since` takes
+   `Option<(DateTime<Utc>, String)>` — the `(admitted_at, key_id)` **pair** —
+   and returns `Vec<ServedKeyRecord>` rather than `Vec<SignedKeyRecord>`.
+2. `DIRECTORY_ABI_VERSION` 1 → **2**. Consumers that pin the floor must re-pin.
+3. `Scrubber::scrub_batch` returns `Result<ScrubOutcome, ScrubError>` instead of
+   `Result<usize, ScrubError>`. The count is `ScrubOutcome::fields_modified`.
+4. **Python scrubber callables** should now return
+   `(scrubbed, modified_count, ner_ran, model_digest)`. The legacy
+   `(scrubbed, modified_count)` still type-checks and still runs — but it is
+   reported as `ner_ran=False`, so a legacy callable handed a `full_traces`
+   batch is **refused** by item 3's door with
+   `ValueError("scrub_treatment_mismatch", …)`. Nothing silently degrades; the
+   behaviour change is a refusal, not a quieter store. Remedies: return the
+   4-tuple, or scrub at `detailed` and relabel.
+
+### Fixed — SECURITY — a key record replicated late was never served past its own timestamp (#682, #668)
+
+`list_signed_key_records_since` sorted and paged on `scrub_timestamp` — the
+**producer's** clock, carried inside the signed record. A record signed in
+January, replicated to this node and admitted in February, sorted under January.
+Any consumer whose cursor had already passed January never saw it. Not on the
+next page: never. The record is validly signed, correctly stored, and
+permanently invisible to the serve path.
+
+This is the class the v31.1.0 note called *a wall clock is not a cursor*, one
+plane over. A cursor must order by **when THIS node admitted the row**, which is
+monotonic and local, never by a timestamp the producer chose.
+
+`federation_keys` gains `admitted_at` (V126, both dialects), allocated through
+the shared `monotonic_admission_instant` — one allocator, not three backend
+mechanisms that drift.
+
+**The position is node-local and stays OUT of the content hash.** It is carried
+beside the record in `ServedKeyRecord`, never inside `KeyRecord`, so one record
+hashes identically on every node that holds it. An earlier draft of this change
+let `admitted_at` into the Key plane's content hash, which would have made the
+same record hash differently per node — caught before merge and fixed.
+
+Postgres sets the column `NOT NULL` after its backfill. SQLite leaves it
+nullable (the dialect cannot alter nullability in place) with the Rust writer as
+enforcement, mirroring V123. **The sqlite allocator therefore reads
+`MAX(COALESCE(admitted_at, scrub_timestamp))`, not `MAX(admitted_at)`**: a row
+that reached the table unstamped has an effective position of its
+`scrub_timestamp`, and a bare `MAX` cannot see it and would allocate *below* it,
+re-opening the gap through the allocator itself. The allocator must read the
+expression the reader reads.
+
+Paired with it, the #668 half: resuming on the instant **alone** skips the
+remainder of any tie larger than one page. The cursor compares the pair.
+
+Nine witnesses — three properties × three backends, assertion bodies shared in
+`register::test_support` so no backend can quietly assert less:
+
+* **#682, late replication.** A record signed a year ago and admitted now is
+  still served to a consumer whose cursor has passed that instant. The old
+  record is admitted **second** on purpose: admitted first it would pass under
+  either key and prove nothing.
+* **#668, the tie.** `limit + 2` rows on one instant page through, each seen
+  exactly once. Planted, and the test says so plainly — the allocator issues
+  strictly-increasing positions, so this backend cannot produce the state
+  naturally; a witness that quietly relied on that would be testing nothing.
+* **Monotonicity.** The post-backward-step state is planted directly. Two
+  admissions under a forward clock prove nothing about a clock that steps back.
+
+The Python surface takes the pair as `(since_rfc3339, since_key_id, limit)` and
+**refuses half a cursor** rather than guessing: one without the other would page
+from the start of that instant and re-serve every row tied at it.
+
+### Fixed — the append-only capsule contract was broken in place, and the ABI version did not move (#682)
+
+The cursor fix above changed two **existing** capsule variants — `DirectoryOp::
+ListSignedKeyRecordsSince.since` and `DirectoryOpResult::SignedKeyRecords` —
+against a contract whose own doc says *never change an existing variant's field
+set or field types*, while `DIRECTORY_ABI_VERSION` stayed at 1.
+
+`abi_version` is the only signal a consumer can read at capsule-receive time,
+before any op is dispatched. Left at 1 it certifies "compatible" about a contract
+the consumer was not compiled for; the mismatch then surfaces on the hot path as
+an opaque `serde` type error on every serve-cursor call, far from its cause,
+instead of *pin floor too low* at load.
+
+Breaking the op **in place** rather than appending a second one is deliberate and
+stays. The old cursor semantics **are** the #682 defect. Preserving a reachable
+path to a known under-serving read, for the benefit of consumers slowest to
+upgrade, keeps the vulnerability alive exactly where it is least likely to be
+noticed.
+
+**The rule is now a gate, not a comment.** It was a comment when it was violated,
+twice in one change. `directory_op_wire_contract_is_pinned_682` and its
+result-half companion digest the two enum bodies from the file's own source:
+doc comments and blank lines dropped, whitespace collapsed, **attributes kept**
+— a `#[serde(rename)]` moves the wire tag, so it is contract, not decoration. A
+red is a fork, and the message says which: **growth** (a variant appended,
+nothing existing touched) re-pins the digest alone; a **break** re-pins *and*
+bumps the ABI version. Pinned separately so a red names which side of the call
+moved.
+
+Mutation-tested in four directions, because a digest gate that cannot fail is a
+digest gate that reports: the ABI constant reverted → red with the diagnosis
+attached; a doc-comment edit inside the enum → green, prose-blind as claimed;
+a `#[serde(rename)]` that **compiles clean** and silently renames the wire tag →
+op gate red, result gate green; a recognizer failure → asserts, rather than
+digesting an empty body and passing forever.
+
+### Added — the scrub envelope states WHAT ran, and the signature covers it (#690)
+
+A scrub envelope recorded that content was scrubbed and by whom. It could not
+distinguish **"the named-entity pass ran and found nothing"** from **"no
+named-entity pass ran at all"** — `scrub_batch` returned a count, and `0` meant
+both. A downstream consumer deciding whether a `full_traces` batch is safe to
+read had no way to tell those apart, and the difference is the whole question.
+
+`ScrubOutcome` now carries `fields_modified`, `ner_ran`, `applied_trace_level`
+and `scrubber_model_digest`. The three new facts ride **inside** the signed
+envelope: `scrub_preimage` binds them through `ceg_produce_canonicalize`, so the
+claim about treatment is covered by the same signature as the claim about
+content. This is the v31.2.0 rule — *content is bound; evidence about content is
+not* — applied to the evidence.
+
+`scrubber_model_digest` is `Option`, and a pass-through **must** leave it `None`.
+A scrubber that names a model it did not run is worse than one that names none.
+
+**The fact is enforced, not merely recorded.** A `full_traces` batch whose
+scrubber reports `ner_ran: false` is refused with
+`IngestError::ScrubTreatmentMismatch` (kind token `scrub_treatment_mismatch`,
+its own token — a scrubber *bug* and a batch whose treatment does not match its
+*label* are different conditions with different remedies, and a shared token
+would make the lens report "scrubber broken" for a correctly-functioning
+refusal). A carried fact that no reader enforces is the #685 shape: stored,
+verifiable, and never consulted by the reader that matters.
+
+The door checks the level the scrubber says it **treated** the content at, not
+the incoming label. A node with no model loaded has an honest path — scrub at
+`detailed` and **relabel**, so the claim matches the treatment — and that path
+passes. Both directions are witnessed: the refusable state, and the downgraded
+relabelled scrub that must **not** be refused, because a door that rejects a
+node behaving correctly pushes operators toward mislabelling instead of
+downgrading.
+
+**The production scrubber is the Python one**, so the bridge decides whether
+real `full_traces` traffic is storable at all. It accepts the 4-tuple and takes
+the callable at its word, accepts the legacy 2-tuple and reports `ner_ran:
+false`, and **refuses any other shape** rather than coercing it — a bare dict
+read as "no changes, no pass" would be a third meaning of zero, which is the
+ambiguity this issue removes. It does **not** infer `ner_ran` from a nonzero
+count; that would manufacture exactly the evidence being demanded. Witnessed
+against a live interpreter, and mutation-tested: teaching the bridge to infer
+the pass from the count turns the witness red.
+
+The `ScrubberCallable` stub in `ciris_persist.pyi` is updated with it. That
+alias lives **outside** the generated region, so `pyi_surface.py check` — which
+verifies coverage, not signatures — would have kept reporting OK while the stub
+told every Python consumer the wrong return type.
+
+**Scope, stated plainly:** the three fields are bound into the signature and
+enforced at the door. They are not yet projected as queryable columns on the
+persisted row — a reader gets them by verifying the envelope, not by a `SELECT`.
+That projection is additive and does not need another major; it is filed as
+follow-up, not implied here as done.
+
 ## [31.5.0] - 2026-08-15
 
 ### Fixed — the generated directory double could go stale without anyone being told (#688)

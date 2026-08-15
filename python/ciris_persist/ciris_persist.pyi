@@ -105,7 +105,25 @@ class BatchSummary(TypedDict):
     scrubbed_fields: int
     signatures_verified: int
 
-ScrubberCallable = Callable[[dict[str, Any]], tuple[dict[str, Any], int]]
+#: Return shape from a scrubber callable.
+#:
+#: v32.0.0 (CIRISPersist#690) — two shapes are accepted, and the difference
+#: decides whether a ``full_traces`` batch is storable at all:
+#:
+#: * ``(scrubbed, modified_count, ner_ran, model_digest)`` — the callable
+#:   **states what it did**. Required for ``full_traces``.
+#: * ``(scrubbed, modified_count)`` — legacy. Reported as ``ner_ran=False``
+#:   with no model digest, because a count is not evidence of a named-entity
+#:   pass: ``0`` means both "NER ran and found nothing" and "no NER ran".
+#:   Persist will not infer the claim from a nonzero count.
+#:
+#: A legacy callable handed a ``full_traces`` batch is therefore refused with
+#: ``ValueError("scrub_treatment_mismatch", ...)``. The remedies are to return
+#: the 4-tuple, or to scrub at ``detailed`` and relabel the trace ``detailed``.
+ScrubberOutcome = (
+    tuple[dict[str, Any], int] | tuple[dict[str, Any], int, bool, str | None]
+)
+ScrubberCallable = Callable[[dict[str, Any]], ScrubberOutcome]
 
 # --- pyi_surface: BEGIN GENERATED REGION ---
 

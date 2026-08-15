@@ -37,12 +37,24 @@ use ciris_persist::ingest::scrub_preimage;
 fn every_treatment_claim_is_inside_the_signed_preimage_690() {
     let now = chrono::Utc::now();
     let base = scrub_preimage(
-        "post-sha", "orig-hash", true, "full_traces", Some("model-abc"), "key-1", now,
+        "post-sha",
+        "orig-hash",
+        true,
+        "full_traces",
+        Some("model-abc"),
+        "key-1",
+        now,
     );
 
     // ner_ran — the claim the whole issue is about.
     let flipped_ner = scrub_preimage(
-        "post-sha", "orig-hash", false, "full_traces", Some("model-abc"), "key-1", now,
+        "post-sha",
+        "orig-hash",
+        false,
+        "full_traces",
+        Some("model-abc"),
+        "key-1",
+        now,
     );
     assert_ne!(
         base, flipped_ner,
@@ -55,20 +67,38 @@ fn every_treatment_claim_is_inside_the_signed_preimage_690() {
     // LABELLED full_traces that received Detailed treatment is expressible with
     // an honest ner_ran beside it.
     let flipped_level = scrub_preimage(
-        "post-sha", "orig-hash", true, "detailed", Some("model-abc"), "key-1", now,
+        "post-sha",
+        "orig-hash",
+        true,
+        "detailed",
+        Some("model-abc"),
+        "key-1",
+        now,
     );
     assert_ne!(base, flipped_level, "trace_level is not bound");
 
     // model digest — "an NER pass ran" versus "an NER pass I accept ran".
     let flipped_model = scrub_preimage(
-        "post-sha", "orig-hash", true, "full_traces", Some("model-xyz"), "key-1", now,
+        "post-sha",
+        "orig-hash",
+        true,
+        "full_traces",
+        Some("model-xyz"),
+        "key-1",
+        now,
     );
     assert_ne!(base, flipped_model, "scrubber_model_digest is not bound");
 
     // And absence must differ from presence — otherwise "no model" and "some
     // model" collapse, which is the same ambiguity as fields_modified == 0.
     let no_model = scrub_preimage(
-        "post-sha", "orig-hash", true, "full_traces", None, "key-1", now,
+        "post-sha",
+        "orig-hash",
+        true,
+        "full_traces",
+        None,
+        "key-1",
+        now,
     );
     assert_ne!(
         base, no_model,
@@ -78,15 +108,33 @@ fn every_treatment_claim_is_inside_the_signed_preimage_690() {
     // The pre-existing fields stay bound — this widened the preimage, it did not
     // trade one set of claims for another.
     let flipped_orig = scrub_preimage(
-        "post-sha", "other-hash", true, "full_traces", Some("model-abc"), "key-1", now,
+        "post-sha",
+        "other-hash",
+        true,
+        "full_traces",
+        Some("model-abc"),
+        "key-1",
+        now,
     );
     assert_ne!(base, flipped_orig, "original_content_hash is not bound");
     let flipped_key = scrub_preimage(
-        "post-sha", "orig-hash", true, "full_traces", Some("model-abc"), "key-2", now,
+        "post-sha",
+        "orig-hash",
+        true,
+        "full_traces",
+        Some("model-abc"),
+        "key-2",
+        now,
     );
     assert_ne!(base, flipped_key, "scrub_key_id is not bound");
     let flipped_content = scrub_preimage(
-        "other-sha", "orig-hash", true, "full_traces", Some("model-abc"), "key-1", now,
+        "other-sha",
+        "orig-hash",
+        true,
+        "full_traces",
+        Some("model-abc"),
+        "key-1",
+        now,
     );
     assert_ne!(
         base, flipped_content,
@@ -105,10 +153,25 @@ fn every_treatment_claim_is_inside_the_signed_preimage_690() {
 #[test]
 fn the_preimage_does_not_grow_with_the_payload_690() {
     let now = chrono::Utc::now();
-    let small = scrub_preimage("a".repeat(64).as_str(), "o", true, "full_traces", Some("m"), "k", now);
+    let small = scrub_preimage(
+        "a".repeat(64).as_str(),
+        "o",
+        true,
+        "full_traces",
+        Some("m"),
+        "k",
+        now,
+    );
     // A hash is a hash: the "content" is already reduced before it gets here.
-    let same_shape =
-        scrub_preimage("b".repeat(64).as_str(), "o", true, "full_traces", Some("m"), "k", now);
+    let same_shape = scrub_preimage(
+        "b".repeat(64).as_str(),
+        "o",
+        true,
+        "full_traces",
+        Some("m"),
+        "k",
+        now,
+    );
     assert_eq!(
         small.len(),
         same_shape.len(),
