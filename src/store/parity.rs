@@ -240,6 +240,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("map_err", Class::Plumbing),
     ("memory_idempotent_insert", Class::Delegates),
     ("mint_content_kem_keypair", Class::Plumbing),
+    // v31.4.0 (CIRISPersist#682). Plumbing, deliberately: it allocates THIS
+    // node's next `federation_keys.admitted_at` and fails only when the `MAX`
+    // read fails — a substrate error. It asks nothing about the caller's row
+    // and can refuse no input, so it cannot be a gate. Its ABSENCE from a door
+    // is a real defect, but the #682 witnesses catch that directly (mutating
+    // the call out reds the late-replication witness on that backend), which is
+    // where that belongs.
+    ("next_key_admission_position", Class::Plumbing),
     ("ok_or_else", Class::Plumbing),
     ("optional", Class::Plumbing),
     ("parse_from_rfc3339", Class::Plumbing),
@@ -292,6 +300,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_project_consent_peer_set", Class::Delegates),
     ("sqlite_row_to_community", Class::Delegates),
     ("sqlite_row_to_family", Class::Delegates),
+    // v31.4.0 (CIRISPersist#682) — newly VISIBLE rather than newly written.
+    // `list_signed_key_records_since` used to pass this as a bare function
+    // reference to `query_map`; the pair cursor reads `_pos` alongside the row,
+    // so it is now called explicitly and propagates. Same class as every other
+    // `sqlite_row_to_*` sibling.
+    ("sqlite_row_to_key_record", Class::Delegates),
     ("sqlite_row_to_revocation", Class::Delegates),
     ("sqlite_row_to_stored_proposal", Class::Delegates),
     ("sqlite_row_tuple_to_peer_metadata", Class::Delegates),
