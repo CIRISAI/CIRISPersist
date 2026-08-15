@@ -210,6 +210,38 @@ pub struct TraceEventRow {
     /// trace's `completed_at` and lens handling.
     pub scrub_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 
+    // ─── v32.0.0 (CIRISPersist#690) scrub TREATMENT columns.
+    //
+    // These are not decoration beside the envelope — they are INSIDE its
+    // signature preimage, so a verifier that cannot read them cannot rebuild
+    // the preimage and cannot check `scrub_signature` at all.
+    //
+    // That is not hypothetical. #690 widened the preimage from
+    // `canonical(post_scrub)` to the whole envelope, and shipped without these
+    // columns: the signature was covering three values that were stored
+    // NOWHERE. It verified at signing time and was unverifiable by anyone,
+    // forever after, which is strictly worse than the ambiguity it set out to
+    // fix. Caught by the AV-24 round-trip witness, which is the only test that
+    // rebuilds the preimage from a STORED row rather than from the in-memory
+    // envelope it was just handed.
+    //
+    // Rule this encodes: **every field in a signature preimage must be
+    // recoverable from what is persisted.** The preserve set must equal the
+    // verified set.
+    /// **Did a named-entity pass actually run?** `None` on pre-v32.0.0 rows,
+    /// whose signatures cover the older, narrower preimage.
+    pub scrub_ner_ran: Option<bool>,
+    /// The trace level the content was actually TREATED at, which may be a
+    /// downgrade from the level the trace is labelled with.
+    pub scrub_applied_trace_level: Option<String>,
+    /// Digest of the NER model that ran; `None` when no pass happened.
+    ///
+    /// Nullable for two DIFFERENT reasons that a verifier must not conflate: a
+    /// pre-v32.0.0 row (no claim was ever made) and a v32.0.0 row that honestly
+    /// ran no model. `scrub_ner_ran` is what separates them — it is `None` only
+    /// in the first case.
+    pub scrub_model_digest: Option<String>,
+
     // ─── v4.0 cohort_scope columns (CIRISPersist#160, V060, FSD §4.3
     // / §12.0 item 1). The CEG visibility/routing axis the producer's
     // policy formed for the trace; persist RECORDS it (MISSION §1.7)

@@ -7867,6 +7867,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
         };
         backend
             .insert_trace_events_batch(&[mk("bf-t1", "bf-agent"), mk("bf-t2", "bf-ghost")])

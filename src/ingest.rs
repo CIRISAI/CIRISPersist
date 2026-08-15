@@ -637,6 +637,14 @@ where
                         row.scrub_signature = Some(env_for_row.scrub_signature.clone());
                         row.scrub_key_id = Some(env_for_row.scrub_key_id.clone());
                         row.scrub_timestamp = Some(env_for_row.scrub_timestamp);
+                        // v32.0.0 (#690) — the treatment claims travel onto the
+                        // row because they are INSIDE `scrub_signature`'s
+                        // preimage. Persisting the signature without them
+                        // yields a signature that verified once, at signing
+                        // time, and can never be checked again.
+                        row.scrub_ner_ran = Some(env_for_row.ner_ran);
+                        row.scrub_applied_trace_level = Some(env_for_row.trace_level.clone());
+                        row.scrub_model_digest = env_for_row.scrubber_model_digest.clone();
                         // CIRISPersist#91 — record WHO established
                         // authenticity. `signature_verified` keeps its
                         // plain meaning ("the signature is valid") and
@@ -1735,16 +1743,30 @@ mod tests {
             );
         }
 
-        // THREAT_MODEL.md AV-24 verification: ed25519_verify the
-        // first row's scrub_signature against signer's public key
-        // and the canonical(post-scrub) bytes — proves a peer with
-        // the published public key can verify the deployment's
-        // attestation.
+        // THREAT_MODEL.md AV-24 verification: ed25519_verify the first row's
+        // scrub_signature against the signer's public key — proving a peer with
+        // the published public key can verify the deployment's attestation.
         //
         // v17.7.0 (#470 arc, crypto-DRY closure) — strict-verify through the
         // canonical `ciris_crypto::Ed25519Verifier::verify_strict` (v10.4.0)
         // instead of reaching for `ed25519_dalek` directly: ONE Ed25519
         // acceptance rule in the repo, not two.
+        //
+        // v32.0.0 (CIRISPersist#690) — **the preimage is rebuilt from the
+        // STORED ROW**, not from the envelope the pipeline just handed us.
+        //
+        // That distinction is the entire value of this test, and it is what
+        // caught the defect this version fixes. #690 widened the preimage from
+        // `canonical(post_scrub)` to the whole envelope, and initially shipped
+        // WITHOUT the three treatment columns — so `scrub_signature` covered
+        // three values that were persisted nowhere. It verified once, at
+        // signing time, and was unverifiable by anyone forever after: strictly
+        // worse than the ambiguity #690 set out to remove.
+        //
+        // A test that rebuilt the preimage from the in-memory envelope would
+        // have passed throughout, because the envelope holds fields the row
+        // does not. Reading only what a peer can read is what makes this an
+        // instrument rather than a restatement.
         let pubkey_bytes = signer.public_key().await.expect("signer.public_key");
 
         let row0 = &snap[0];
@@ -1752,14 +1774,65 @@ mod tests {
         let canonical = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&payload_value)
             .unwrap();
+        let post_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical));
+
+        // Every component of the preimage comes off the row. If any of these is
+        // `None`, this `expect` fires and names the column — which is the
+        // failure mode worth having, because the alternative is a signature
+        // that silently cannot be checked.
+        let preimage = scrub_preimage(
+            &post_sha,
+            row0.original_content_hash
+                .as_deref()
+                .expect("original_content_hash persisted"),
+            row0.scrub_ner_ran
+                .expect("scrub_ner_ran persisted — it is inside the signature preimage"),
+            row0.scrub_applied_trace_level
+                .as_deref()
+                .expect("scrub_applied_trace_level persisted — inside the preimage"),
+            row0.scrub_model_digest.as_deref(),
+            row0.scrub_key_id
+                .as_deref()
+                .expect("scrub_key_id persisted"),
+            row0.scrub_timestamp.expect("scrub_timestamp persisted"),
+        );
+
         let sig_b64 = row0.scrub_signature.as_ref().unwrap();
         let sig_bytes = BASE64.decode(sig_b64).expect("base64 decode");
         let verified = ciris_crypto::Ed25519Verifier
-            .verify_strict(&pubkey_bytes, &canonical, &sig_bytes)
+            .verify_strict(&pubkey_bytes, &preimage, &sig_bytes)
             .expect("verify_strict parse");
         assert!(
             verified,
-            "scrub_signature verifies against canonical(post-scrub)"
+            "scrub_signature must verify against a preimage rebuilt ENTIRELY \
+             from persisted columns — if it does not, some field of the \
+             preimage is not being stored and no peer can ever check this \
+             signature"
+        );
+
+        // And the treatment claims are the ones the pipeline actually made,
+        // not defaults that happen to hash correctly. This batch is `generic`,
+        // which by design carries no content text (TRACE_WIRE_FORMAT.md §7), so
+        // the honest triple is "treated at generic, no NER pass, no model" —
+        // and the #690 door does not refuse it, because the label and the
+        // treatment agree.
+        assert_eq!(
+            row0.scrub_applied_trace_level.as_deref(),
+            Some("generic"),
+            "the level TREATED is persisted, and for a generic batch that is \
+             `generic` — not the pipeline's default and not the label of some \
+             other batch"
+        );
+        assert_eq!(
+            row0.scrub_ner_ran,
+            Some(false),
+            "Some(false) — a CLAIM that no pass ran, which is not the same as \
+             None (a pre-v32.0.0 row that made no claim at all). Collapsing \
+             those two is how an unscrubbed row would read as attested"
+        );
+        assert!(
+            row0.scrub_model_digest.is_none(),
+            "no model ran, so none may be named"
         );
     }
 

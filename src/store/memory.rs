@@ -8986,6 +8986,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             // v0.3.4 deployment_profile columns. Test fixture stays
             // 2.7.0-shape (no profile) — None across the board.
             agent_role: None,
@@ -11324,6 +11328,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -11580,6 +11588,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: None,
                 agent_template: None,
                 deployment_domain: None,

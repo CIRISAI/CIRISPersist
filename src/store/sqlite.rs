@@ -501,11 +501,13 @@ impl Backend for SqliteBackend {
                 deployment_type, deployment_region, deployment_trust_mode, \
                 verification_source, cohort_scope, cohort_target_id, \
                 signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
-                shard_key\
+                shard_key, \
+                scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+                ?41, ?42, ?43\
                 ) ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
                 event_type, attempt_index, ts) DO NOTHING";
 
@@ -550,7 +552,7 @@ impl Backend for SqliteBackend {
                     // shard and still collides on the sharded UNIQUE index.
                     let shard_key = i64::from(super::decompose::trace_dedup_shard_key(row));
 
-                    let params: [SqlValue; 40] = [
+                    let params: [SqlValue; 43] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -606,6 +608,18 @@ impl Backend for SqliteBackend {
                         opt_text(row.pqc_key_id.as_deref()),
                         // #226 — shard_key (V094).
                         SqlValue::Integer(shard_key),
+                        // v32.0.0 (#690, V127) — the scrub TREATMENT claims.
+                        // These are INSIDE the `scrub_signature` preimage, so
+                        // failing to persist them makes the signature
+                        // unverifiable rather than merely under-documented.
+                        // SQLite has no BOOLEAN; 0/1 INTEGER is this schema's
+                        // convention and `Option<bool>` maps straight onto it.
+                        match row.scrub_ner_ran {
+                            Some(b) => SqlValue::Integer(i64::from(b)),
+                            None => SqlValue::Null,
+                        },
+                        opt_text(row.scrub_applied_trace_level.as_deref()),
+                        opt_text(row.scrub_model_digest.as_deref()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -1006,7 +1020,9 @@ impl Backend for SqliteBackend {
                         signature, signing_key_id, signature_verified, schema_version, \
                         pii_scrubbed, audit_sequence_number, audit_entry_hash, \
                         audit_signature, original_content_hash, scrub_signature, \
-                        scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                        scrub_key_id, scrub_timestamp, \
+                        scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                        agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
@@ -14206,6 +14222,14 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             scrub_signature: row.get("scrub_signature")?,
             scrub_key_id: row.get("scrub_key_id")?,
             scrub_timestamp,
+            // v32.0.0 (#690, V127) — read back so a verifier can rebuild the
+            // `scrub_signature` preimage. `Option<bool>` over SQLite's INTEGER
+            // 0/1 preserves the three-way distinction the schema depends on:
+            // NULL (pre-v32.0.0, no claim), 0 (claimed: no NER pass), 1
+            // (claimed: a pass ran).
+            scrub_ner_ran: row.get("scrub_ner_ran")?,
+            scrub_applied_trace_level: row.get("scrub_applied_trace_level")?,
+            scrub_model_digest: row.get("scrub_model_digest")?,
             agent_role: row.get("agent_role")?,
             agent_template: row.get("agent_template")?,
             deployment_domain: row.get("deployment_domain")?,
@@ -16475,7 +16499,9 @@ impl crate::read::ReadEngine for SqliteBackend {
                             signature_verified, schema_version, pii_scrubbed, \
                             audit_sequence_number, audit_entry_hash, audit_signature, \
                             original_content_hash, scrub_signature, scrub_key_id, \
-                            scrub_timestamp, agent_role, agent_template, \
+                            scrub_timestamp, \
+                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
@@ -20188,6 +20214,10 @@ mod tests {
             scrub_signature: Some("sig-scrub".to_owned()),
             scrub_key_id: Some("scrub-key-1".to_owned()),
             scrub_timestamp: Some(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 1).unwrap()),
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -33536,6 +33566,10 @@ mod tests {
             scrub_signature: Some("scrub-sig".to_owned()),
             scrub_key_id: Some("scrub-key".to_owned()),
             scrub_timestamp: Some(base),
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: Some("ally".to_owned()),
             agent_template: Some("ally-v3".to_owned()),
             deployment_domain: deployment_domain.map(str::to_owned),
@@ -34902,6 +34936,10 @@ mod tests {
                     scrub_signature: None,
                     scrub_key_id: None,
                     scrub_timestamp: None,
+                    // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                    scrub_ner_ran: None,
+                    scrub_applied_trace_level: None,
+                    scrub_model_digest: None,
                     agent_role: None,
                     agent_template: None,
                     deployment_domain: Some("invis-d".into()),
@@ -35012,6 +35050,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: None,
                 agent_template: None,
                 deployment_domain: Some("d-518".to_owned()),

@@ -1228,8 +1228,29 @@ impl Backend for PostgresBackend {
                             deployment_type, deployment_region, deployment_trust_mode, \
                             verification_source, cohort_scope, cohort_target_id, \
                             signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
-                            shard_key";
-        const N_COLS: usize = 40;
+                            shard_key, \
+                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest";
+        // v32.0.0 (#690) — 40 -> 43, and now DERIVED rather than restated.
+        //
+        // The placeholder generator below multiplies by this, so a hand-kept
+        // count that disagreed with `COLS` produced a runtime bind failure, not
+        // a compile error — and only on a real Postgres, which the memory and
+        // sqlite legs never reach. Counting the commas in `COLS` at compile
+        // time makes the two impossible to disagree: same discipline as the
+        // certify axis-key list (#694), one plane down.
+        const fn count_cols(s: &str) -> usize {
+            let b = s.as_bytes();
+            let mut i = 0;
+            let mut n = 1;
+            while i < b.len() {
+                if b[i] == b',' {
+                    n += 1;
+                }
+                i += 1;
+            }
+            n
+        }
+        const N_COLS: usize = count_cols(COLS);
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -1337,6 +1358,12 @@ impl Backend for PostgresBackend {
             // a subset of the dedup key; a true duplicate computes the same
             // shard and still collides on the sharded UNIQUE index below.
             params.push(Box::new(super::decompose::trace_dedup_shard_key(row)));
+            // v32.0.0 (#690, V127) — the scrub TREATMENT claims. These sit
+            // INSIDE the `scrub_signature` preimage, so a row written without
+            // them carries a signature nobody can ever check.
+            params.push(Box::new(row.scrub_ner_ran));
+            params.push(Box::new(row.scrub_applied_trace_level.clone()));
+            params.push(Box::new(row.scrub_model_digest.clone()));
         }
         // THREAT_MODEL.md AV-9: dedup-key target still includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -2009,7 +2036,9 @@ impl Backend for PostgresBackend {
                             signature, signing_key_id, signature_verified, schema_version, \
                             pii_scrubbed, audit_sequence_number, audit_entry_hash, \
                             audit_signature, original_content_hash, scrub_signature, \
-                            scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                            scrub_key_id, scrub_timestamp, \
+                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                             cohort_scope, cohort_target_id, \
@@ -2029,7 +2058,9 @@ impl Backend for PostgresBackend {
                             signature, signing_key_id, signature_verified, schema_version, \
                             pii_scrubbed, audit_sequence_number, audit_entry_hash, \
                             audit_signature, original_content_hash, scrub_signature, \
-                            scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                            scrub_key_id, scrub_timestamp, \
+                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                             cohort_scope, cohort_target_id, \
@@ -16349,6 +16380,14 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             scrub_signature: row.safe_get_with("scrub_signature", Error::Backend)?,
             scrub_key_id: row.safe_get_with("scrub_key_id", Error::Backend)?,
             scrub_timestamp: row.safe_get_with("scrub_timestamp", Error::Backend)?,
+            // v32.0.0 (#690, V127) — read back so a verifier can rebuild the
+            // `scrub_signature` preimage. NULL stays NULL: a pre-v32.0.0 row
+            // made no treatment claim, and coercing that to `false` would
+            // assert it was checked and found unscrubbed.
+            scrub_ner_ran: row.safe_get_with("scrub_ner_ran", Error::Backend)?,
+            scrub_applied_trace_level: row
+                .safe_get_with("scrub_applied_trace_level", Error::Backend)?,
+            scrub_model_digest: row.safe_get_with("scrub_model_digest", Error::Backend)?,
             agent_role: row.safe_get_with("agent_role", Error::Backend)?,
             agent_template: row.safe_get_with("agent_template", Error::Backend)?,
             deployment_domain: row.safe_get_with("deployment_domain", Error::Backend)?,
@@ -17015,7 +17054,9 @@ impl crate::read::ReadEngine for PostgresBackend {
                         signature, signing_key_id, signature_verified, schema_version, \
                         pii_scrubbed, audit_sequence_number, audit_entry_hash, \
                         audit_signature, original_content_hash, scrub_signature, \
-                        scrub_key_id, scrub_timestamp, agent_role, agent_template, \
+                        scrub_key_id, scrub_timestamp, \
+                        scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                        agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
@@ -23139,6 +23180,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -23589,6 +23634,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -23946,6 +23995,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: Some("ally".into()),
                 agent_template: Some("ally-v3-default".into()),
                 deployment_domain: deployment_domain.map(str::to_owned),
@@ -24580,6 +24633,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: Some("ally".into()),
                 agent_template: Some("ally-v3-default".into()),
                 deployment_domain: deployment_domain.map(str::to_owned),
@@ -25647,6 +25704,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: Some("ally".into()),
             agent_template: Some("ally-v3-default".into()),
             deployment_domain: Some("moderation".into()),
@@ -27751,6 +27812,10 @@ mod tests {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             agent_role: None,
             agent_template: None,
             deployment_domain: None,
@@ -28254,6 +28319,10 @@ mod tests {
                     scrub_signature: None,
                     scrub_key_id: None,
                     scrub_timestamp: None,
+                    // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                    scrub_ner_ran: None,
+                    scrub_applied_trace_level: None,
+                    scrub_model_digest: None,
                     agent_role: None,
                     agent_template: None,
                     deployment_domain: Some("invis-d".into()),
@@ -28377,6 +28446,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: None,
                 agent_template: None,
                 deployment_domain: Some("d-518".into()),
@@ -36940,6 +37013,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
                 agent_role: None,
                 agent_template: None,
                 deployment_domain: Some(domain.to_owned()),
@@ -39421,6 +39498,10 @@ mod tests {
                 scrub_signature: None,
                 scrub_key_id: None,
                 scrub_timestamp: None,
+                // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                scrub_ner_ran: None,
+                scrub_applied_trace_level: None,
+                scrub_model_digest: None,
             }
         };
 

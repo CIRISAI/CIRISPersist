@@ -166,6 +166,14 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             scrub_signature: None,
             scrub_key_id: None,
             scrub_timestamp: None,
+            // v32.0.0 (#690) — set together with the signature they are part of
+            // the preimage for, by the same ingest step, immediately after this
+            // returns. `None` here for the same reason the four above are:
+            // decomposition has not scrubbed anything, so it has no claim to
+            // make. A default of `Some(false)` would be a claim.
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
             // v4.0 cohort_scope (CIRISPersist#160, V060, FSD §4.3 /
             // §12.0 item 1). Carried verbatim from the CompleteTrace
             // envelope's producer-declared (cohort_scope, target),
