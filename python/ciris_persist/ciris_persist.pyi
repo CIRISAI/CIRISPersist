@@ -2041,8 +2041,8 @@ class Engine:
     def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
 
-    def list_signed_key_records_since(self, since_rfc3339: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) — bulk-list SignedKeyRecord wrappers since a cursor, as a JSON array, ordered (scrub_times..."""
+    def list_signed_key_records_since(self, since_rfc3339: str | None, since_key_id: str | None, limit: int) -> str:
+        """(derived) epistemic — v31.4.0 (CIRISPersist#682, #668) — bulk-list ServedKeyRecords since a cursor, as a JSON array, ordered (admitted_at ASC, key_id ASC). Every federat..."""
 
     def list_signed_location_proofs_since(self, since_rfc3339: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""

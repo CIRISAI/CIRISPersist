@@ -2170,6 +2170,55 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// v31.4.0 (CIRISPersist#682) — allocate THIS node's next admission
+    /// position on `federation_keys` (V126).
+    ///
+    /// Every door that inserts a key row calls this, so the three of them
+    /// cannot drift: `seed_genesis_accord_holders`, `put_public_key`,
+    /// `add_peer_record`.
+    ///
+    /// The value is **not** the producer's `scrub_timestamp`. That is their
+    /// assertion about when they signed, and a record signed in January,
+    /// replicated late and admitted here in February, would sort under January
+    /// — behind every consumer whose cursor has passed it, permanently (#682).
+    /// It is not the bare wall clock either: a backward step (NTP correction,
+    /// VM restore) would stamp a later row below a position already handed out,
+    /// and `> since` would skip it just as permanently. So it is allocated
+    /// strictly after the last position issued; see
+    /// [`monotonic_admission_instant`](crate::federation::types::monotonic_admission_instant).
+    ///
+    /// **The MAX is taken over `COALESCE(admitted_at, scrub_timestamp)`, the
+    /// same expression the serve cursor orders by and the same one the V126
+    /// index is built on.** This dialect leaves the column nullable — SQLite
+    /// cannot alter nullability in place — so a row that reached the table
+    /// without a stamp has an effective position of its `scrub_timestamp`. A
+    /// bare `MAX(admitted_at)` cannot see that row, and would happily allocate
+    /// *below* it, re-opening the very gap this closes. The allocator must read
+    /// the position the reader reads.
+    ///
+    /// Taken under the connection lock, which serializes writers on this
+    /// backend; callers must not already hold it (`parking_lot::Mutex` is not
+    /// reentrant).
+    fn next_key_admission_position(
+        &self,
+    ) -> Result<chrono::DateTime<chrono::Utc>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let conn = conn.lock();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT MAX(COALESCE(admitted_at, scrub_timestamp)) FROM federation_keys",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
+            .flatten();
+        Ok(crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last.as_deref().map(parse_rfc3339),
+        ))
+    }
+
     /// Genesis-trusted seed of the HUMANITY_ACCORD holder rooting-anchor rows
     /// (CIRISPersist#347). Admits each baked `accord_holder` `SignedKeyRecord`
     /// into `federation_keys`, idempotent (`ON CONFLICT (key_id) DO NOTHING`).
@@ -2215,6 +2264,14 @@ impl SqliteBackend {
                         .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
                 )
             };
+            // v31.4.0 (CIRISPersist#682) — THIS node's admission position
+            // (V126), allocated per record because each is a separate row in
+            // this node's stream. Not the producer's `scrub_timestamp`: the
+            // pinned #268 ceremony bake is months old BY DESIGN, so keying the
+            // serve cursor on it would sort every genesis holder behind any
+            // consumer's cursor and it would never replicate. See
+            // [`SqliteBackend::next_key_admission_position`].
+            let admitted_at = self.next_key_admission_position()?;
             let conn = self.conn.clone();
             let kid = row.key_id.clone();
             (move || -> Result<(), rusqlite::Error> {
@@ -2225,8 +2282,8 @@ impl SqliteBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+                        attestation_evidence, consent_role, admitted_at\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
                      ON CONFLICT (key_id) DO NOTHING",
                     rusqlite::params![
                         row.key_id,
@@ -2254,6 +2311,7 @@ impl SqliteBackend {
                         crate::federation::types::consent_role::stored_from_wire(
                             row.consent_role.as_deref(),
                         ),
+                        admitted_at.to_rfc3339(),
                     ],
                 )?;
                 Ok(())
@@ -3076,6 +3134,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // normalizes anything — `consent_role` (wire `None` ⇔ stored
         // `'unregistered'`) diverges on this very statement, three lines up.
         let key_id_for_index = row.key_id.clone();
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
+        // stamped here and never read from the wire. The serve cursor keys on
+        // it, so a record whose `scrub_timestamp` is old — the everyday
+        // delayed-replication case on the identity plane — still lands ahead of
+        // every consumer's cursor instead of behind it. See
+        // [`SqliteBackend::next_key_admission_position`].
+        let admitted_at = self.next_key_admission_position()?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3085,8 +3150,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role, additional_scrubs\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    attestation_evidence, consent_role, additional_scrubs, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 rusqlite::params![
                     row.key_id,
                     row.pubkey_ed25519_base64,
@@ -3108,6 +3173,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     attestation_evidence_text,
                     consent_role_stored,
                     additional_scrubs_text,
+                    admitted_at.to_rfc3339(),
                 ],
             )?;
             Ok(())
@@ -8344,13 +8410,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         (COALESCE(admitted_at, scrub_timestamp) = ?1 AND key_id > ?2)) \
                  ORDER BY COALESCE(admitted_at, scrub_timestamp) ASC, key_id ASC LIMIT ?3",
             )?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_at, since_id, limit],
-                |row| {
-                    let pos: String = row.get("_pos")?;
-                    Ok((sqlite_row_to_key_record(row)?, pos))
-                },
-            )?;
+            let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
+                let pos: String = row.get("_pos")?;
+                Ok((sqlite_row_to_key_record(row)?, pos))
+            })?;
             let mut out = Vec::new();
             for r in rows {
                 let (record, pos) = r?;
@@ -10116,6 +10179,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let scrub_key_id_owned = key.scrub_key_id.clone();
         let scrub_classical_owned = key.scrub_signature_classical.clone();
         let transport_owned = meta.transport_identity.clone();
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126).
+        // An operator-added peer is a `federation_keys` row like any other and
+        // is served by the same cursor, so it is stamped by the same allocator;
+        // see [`SqliteBackend::next_key_admission_position`]. Taken before the
+        // closure because that closure takes the connection lock itself and
+        // `parking_lot::Mutex` is not reentrant.
+        let admitted_at_str = self.next_key_admission_position()?.to_rfc3339();
 
         let conn = self.conn.clone();
         let outcome = (
@@ -10130,8 +10200,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+                        attestation_evidence, consent_role, admitted_at\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
                      ON CONFLICT(key_id) DO NOTHING",
                     rusqlite::params![
                         key_id_owned,
@@ -10156,6 +10226,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         // NOT NULL; peer rows carry the 'unregistered'
                         // default (wire None).
                         crate::federation::types::consent_role::UNREGISTERED,
+                        admitted_at_str,
                     ],
                 )?;
 
@@ -24267,6 +24338,102 @@ mod tests {
         );
     }
 
+    // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
+    //     cursor, sqlite arm. Assertion bodies shared with the memory and
+    //     postgres arms; only the PLANT is backend-specific.
+
+    /// #682 — a key record signed a year ago and admitted now is still served
+    /// to a consumer whose cursor has passed that instant.
+    #[tokio::test]
+    async fn late_replicated_key_record_is_served_sqlite_682() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
+            &backend, "sq",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
+    /// every row seen exactly once.
+    ///
+    /// The tie is PLANTED because it cannot be produced through this backend's
+    /// write path: `monotonic_admission_instant` allocates strictly above the
+    /// last position, so two admissions here never collide. It is reachable in
+    /// production through the V126 backfill (every pre-existing row stamped
+    /// with its `scrub_timestamp`, and a batch from one producer shares one)
+    /// and through two writers racing the same `MAX`.
+    #[tokio::test]
+    async fn one_admission_instant_pages_exactly_once_sqlite_668() {
+        use crate::federation::register::test_support as rts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ids: Vec<String> = (0..5).map(|i| format!("k668-sq-{i}")).collect();
+        for id in &ids {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // THE TIE, as state: every row collapses onto one instant. Written in
+        // the same RFC-3339 form the writer uses, so the stored string and a
+        // cursor round-tripped through `parse_rfc3339` compare equal.
+        let tied_at = rts::truncate_to_micros(chrono::Utc::now());
+        {
+            let conn = backend.conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_keys SET admitted_at = ?1",
+                    rusqlite::params![tied_at.to_rfc3339()],
+                )
+                .unwrap();
+            assert_eq!(n, ids.len(), "the tie plant must touch every seeded row");
+        }
+
+        rts::assert_one_admission_instant_pages_exactly_once(&backend, "sq", &ids, 3)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the admission position survives a backward clock step on this
+    /// backend's real write path. The post-step state is planted directly; two
+    /// admissions under a forward clock would pass with `Utc::now()` and prove
+    /// nothing.
+    #[tokio::test]
+    async fn key_admission_survives_a_backward_clock_step_sqlite_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-sq-a", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE BACKWARD STEP, as state: the last position handed out is now an
+        // hour ahead of the wall clock.
+        let future = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
+        {
+            let conn = backend.conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_keys SET admitted_at = ?1",
+                    rusqlite::params![future.to_rfc3339()],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the backward-step plant must touch the seeded row");
+        }
+
+        rts::assert_key_admission_survives_backward_step(&backend, "sq", future)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn put_revocation_rejects_out_of_closed_set_region() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
@@ -28486,17 +28653,30 @@ mod tests {
         let mut expect = key;
         expect.persist_row_hash =
             crate::federation::types::compute_persist_row_hash(&expect).unwrap();
+        // v31.4.0 (#682) — the RECORD is compared, not the served wrapper.
+        // `ServedKeyRecord::admitted_at` is node-local and deliberately outside
+        // the record's bytes, so that one record hashes identically on every
+        // node; comparing the wrapper would assert the opposite.
         assert_eq!(
             serde_json::to_vec(&SignedKeyRecord {
                 record: expect.clone()
             })
             .unwrap(),
-            serde_json::to_vec(&rows[0]).unwrap(),
+            serde_json::to_vec(&SignedKeyRecord {
+                record: rows[0].record.clone()
+            })
+            .unwrap(),
             "returned SignedKeyRecord must be byte-identical to the stored row"
         );
 
+        // v31.4.0 (#682/#668) — the cursor is the PAIR, and it is the row's own
+        // ADMISSION position, not its `scrub_timestamp`. Resuming from a row's
+        // own pair must exclude that row and nothing else (strict `>`).
         let excluded = backend
-            .list_signed_key_records_since(Some(expect.scrub_timestamp), 100)
+            .list_signed_key_records_since(
+                Some((rows[0].admitted_at, rows[0].record.key_id.clone())),
+                100,
+            )
             .await
             .unwrap();
         assert!(excluded.is_empty(), "since == cursor must exclude the row");

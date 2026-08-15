@@ -3333,7 +3333,6 @@ pub struct ServedKeyRecord {
     pub admitted_at: chrono::DateTime<chrono::Utc>,
 }
 
-
 /// v31.1.0 (CIRISPersist#655, PR #667 round-3 review) — **one revocation as the
 /// SERVE cursor returns it**: the record, plus this node's own position on it.
 ///

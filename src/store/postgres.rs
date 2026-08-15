@@ -2978,6 +2978,52 @@ impl PostgresBackend {
 //     decoded at the persist boundary.
 
 impl PostgresBackend {
+    /// v31.4.0 (CIRISPersist#682) — allocate THIS node's next admission
+    /// position on `federation_keys` (V126). Postgres twin of
+    /// [`SqliteBackend::next_key_admission_position`](crate::store::sqlite::SqliteBackend).
+    ///
+    /// Every door that inserts a key row calls this, so the three of them
+    /// cannot drift: `seed_genesis_accord_holders`, `put_public_key`,
+    /// `add_peer_record`.
+    ///
+    /// The value is **not** the producer's `scrub_timestamp` — a record signed
+    /// in January, replicated late and admitted here in February, would sort
+    /// under January, behind every consumer whose cursor has passed it,
+    /// permanently (#682). It is not the bare wall clock either: a backward
+    /// step (NTP correction, VM restore) would stamp a later row below a
+    /// position already handed out, and `> since` would skip it just as
+    /// permanently. See
+    /// [`monotonic_admission_instant`](crate::federation::types::monotonic_admission_instant).
+    ///
+    /// The MAX is over the bare column, unlike the sqlite twin's
+    /// `COALESCE(admitted_at, scrub_timestamp)`: V126 sets `NOT NULL` on this
+    /// dialect after its backfill, so there is no row whose position comes from
+    /// the fallback. Each dialect's allocator reads exactly the expression its
+    /// own cursor orders by and its own V126 index is built on.
+    ///
+    /// Two writers racing can still read the same MAX and tie. That is
+    /// tolerated, not overlooked: the serve cursor resumes on the
+    /// `(admitted_at, key_id)` PAIR (#668), so a tie pages through correctly.
+    /// It is a different question from the reversal this closes — one row at a
+    /// page boundary versus every row after the step, permanently.
+    async fn next_key_admission_position(
+        &self,
+        client: &impl deadpool_postgres::GenericClient,
+    ) -> Result<chrono::DateTime<chrono::Utc>, crate::federation::Error> {
+        let last: Option<chrono::DateTime<chrono::Utc>> = client
+            .query_one(
+                "SELECT MAX(admitted_at) FROM cirislens.federation_keys",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
+            .get(0);
+        Ok(crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last,
+        ))
+    }
+
     /// Genesis-trusted seed of the HUMANITY_ACCORD holder rooting-anchor rows
     /// (CIRISPersist#347) — Postgres twin of
     /// [`SqliteBackend::seed_genesis_accord_holders`]. Idempotent
@@ -3022,6 +3068,13 @@ impl PostgresBackend {
             // v31.0.0 (#644) — registration_envelope is TEXT since V122.
             let registration_envelope_text =
                 pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
+            // v31.4.0 (CIRISPersist#682) — THIS node's admission position
+            // (V126), allocated per record because each is a separate row in
+            // this node's stream. The pinned #268 ceremony bake is months old
+            // BY DESIGN, so keying the serve cursor on `scrub_timestamp` would
+            // sort every genesis holder behind any consumer's cursor and it
+            // would never replicate.
+            let admitted_at = self.next_key_admission_position(&client).await?;
             client
                 .execute(
                     "INSERT INTO cirislens.federation_keys (\
@@ -3029,8 +3082,8 @@ impl PostgresBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+                        attestation_evidence, consent_role, admitted_at\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
                      ON CONFLICT (key_id) DO NOTHING",
                     &[
                         &row.key_id,
@@ -3052,6 +3105,7 @@ impl PostgresBackend {
                         &roles_param,
                         &row.attestation_evidence,
                         &consent_role_stored,
+                        &admitted_at,
                     ],
                 )
                 .await
@@ -3808,6 +3862,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
         let registration_envelope_text =
             pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
+        // stamped here and never read from the wire. The serve cursor keys on
+        // it, so a record whose `scrub_timestamp` is old — the everyday
+        // delayed-replication case on the identity plane — still lands ahead of
+        // every consumer's cursor instead of behind it.
+        let admitted_at = self.next_key_admission_position(&client).await?;
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -3815,8 +3875,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role, additional_scrubs\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+                    attestation_evidence, consent_role, additional_scrubs, admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -3839,6 +3899,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_evidence,
                     &consent_role_stored,
                     &additional_scrubs_param,
+                    &admitted_at,
                 ],
             )
             .await
@@ -10934,14 +10995,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
         let registration_envelope_text =
             pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126).
+        // An operator-added peer is a `federation_keys` row like any other and
+        // is served by the same cursor, so it is stamped by the same allocator.
+        // Read through `tx`, so the MAX and the INSERT are the same snapshot.
+        let admitted_at = self.next_key_admission_position(&tx).await?;
         tx.execute(
             "INSERT INTO cirislens.federation_keys (\
                 key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                 identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                attestation_evidence, consent_role\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+                attestation_evidence, consent_role, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
              ON CONFLICT (key_id) DO NOTHING",
             &[
                 &key.key_id,
@@ -10963,6 +11029,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &roles_param,
                 &key.attestation_evidence,
                 &consent_role_stored,
+                &admitted_at,
             ],
         )
         .await
@@ -25849,6 +25916,135 @@ mod tests {
         );
     }
 
+    // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
+    //     cursor, postgres arm. Assertion bodies shared with the memory and
+    //     sqlite arms; only the PLANT is backend-specific.
+    //
+    //     Each runs in an ISOLATED database. The cursor assertions are about
+    //     what a full page contains and how many rows a tie holds, so a shared
+    //     database's leftover `federation_keys` rows would make them measure
+    //     the fixture instead of the fix.
+
+    /// #682 — a key record signed a year ago and admitted now is still served
+    /// to a consumer whose cursor has passed that instant.
+    ///
+    /// This is the arm that matters most: postgres allocates its position over
+    /// a connection pool rather than under a process-local lock, and it is the
+    /// backend production runs.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn late_replicated_key_record_is_served_pg_682() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
+                &backend, "pg",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
+    /// every row seen exactly once.
+    ///
+    /// The tie is PLANTED because it cannot be produced through this backend's
+    /// write path: `monotonic_admission_instant` allocates strictly above the
+    /// last position. It is reachable in production through the V126 backfill
+    /// (every pre-existing row stamped with its `scrub_timestamp`, and a batch
+    /// from one producer shares one) and through two writers racing the same
+    /// `MAX` — which on this backend is a pool read, not a locked one.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn one_admission_instant_pages_exactly_once_pg_668() {
+        use crate::federation::register::test_support as rts;
+        use crate::federation::FederationDirectory as _;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            let ids: Vec<String> = (0..5).map(|i| format!("k668-pg-{i}")).collect();
+            for id in &ids {
+                backend
+                    .put_public_key(crate::federation::SignedKeyRecord {
+                        record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            // THE TIE, as state: every row collapses onto one instant.
+            let tied_at = rts::truncate_to_micros(chrono::Utc::now());
+            {
+                let client = backend.get_client().await.unwrap();
+                let n = client
+                    .execute(
+                        "UPDATE cirislens.federation_keys SET admitted_at = $1",
+                        &[&tied_at],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    n as usize,
+                    ids.len(),
+                    "the tie plant must touch every seeded row"
+                );
+            }
+
+            rts::assert_one_admission_instant_pages_exactly_once(&backend, "pg", &ids, 3)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// #682 — the admission position survives a backward clock step on this
+    /// backend's real write path. The post-step state is planted directly; two
+    /// admissions under a forward clock would pass with `Utc::now()` and prove
+    /// nothing.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn key_admission_survives_a_backward_clock_step_pg_682() {
+        use crate::federation::register::test_support as rts;
+        use crate::federation::FederationDirectory as _;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: rts::self_scrubbed_record_signed_at("k682-pg-a", chrono::Utc::now()),
+                })
+                .await
+                .unwrap();
+
+            // THE BACKWARD STEP, as state: the last position handed out is now
+            // an hour ahead of the wall clock.
+            let future = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
+            {
+                let client = backend.get_client().await.unwrap();
+                let n = client
+                    .execute(
+                        "UPDATE cirislens.federation_keys SET admitted_at = $1",
+                        &[&future],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(n, 1, "the backward-step plant must touch the seeded row");
+            }
+
+            rts::assert_key_admission_survives_backward_step(&backend, "pg", future)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
     /// Build a federation KeyRecord with controllable valid_from /
     /// pqc_completed.
     fn fix_section_i_key(
@@ -33056,9 +33252,10 @@ mod tests {
                 "INSERT INTO cirislens.federation_keys (\
                     key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, \
                     valid_from, registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash) \
+                    scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, \
+                    admitted_at) \
                  VALUES ($1, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', 'hybrid', \
-                    'accord_holder', 'x', NOW(), '{}', E'\\\\xaa', 's', $1, NOW(), 'h')",
+                    'accord_holder', 'x', NOW(), '{}', E'\\\\xaa', 's', $1, NOW(), 'h', NOW())",
                 &[&key_id],
             )
             .await
@@ -37093,10 +37290,10 @@ mod tests {
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES ($1, $2, $3, 'hybrid', 'agent', $1, \
                           '2026-01-01T00:00:00Z', '{}', '\\x00', '', $1, \
-                          '2026-01-01T00:00:00Z', '0') \
+                          '2026-01-01T00:00:00Z', '0', NOW()) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[&key_id, &ed_b64, &mldsa_b64],
             )
@@ -39807,17 +40004,30 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // v31.4.0 (#682) — the RECORD is compared, not the served wrapper.
+        // `ServedKeyRecord::admitted_at` is node-local and deliberately outside
+        // the record's bytes, so that one record hashes identically on every
+        // node; comparing the wrapper would assert the opposite.
         assert_eq!(
             serde_json::to_vec(&crate::federation::SignedKeyRecord {
                 record: reloaded.clone()
             })
             .unwrap(),
-            serde_json::to_vec(&mine[0]).unwrap(),
+            serde_json::to_vec(&crate::federation::SignedKeyRecord {
+                record: mine[0].record.clone()
+            })
+            .unwrap(),
             "returned SignedKeyRecord must be byte-identical to the stored row"
         );
 
+        // v31.4.0 (#682/#668) — the cursor is the PAIR, and it is the row's own
+        // ADMISSION position, not its `scrub_timestamp`. Resuming from a row's
+        // own pair must exclude that row (strict `>`).
         let excluded = backend
-            .list_signed_key_records_since(Some(reloaded.scrub_timestamp), 100_000)
+            .list_signed_key_records_since(
+                Some((mine[0].admitted_at, mine[0].record.key_id.clone())),
+                100_000,
+            )
             .await
             .unwrap();
         assert!(

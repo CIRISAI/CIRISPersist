@@ -8235,27 +8235,49 @@ impl PyEngine {
         })
     }
 
-    /// v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) —
-    /// bulk-list `SignedKeyRecord` wrappers since a cursor, as a JSON array,
-    /// ordered `(scrub_timestamp ASC, key_id ASC)`. Every `federation_keys`
-    /// row qualifies (the classical scrub signature is required at
-    /// admission, so there is no unsigned shape to filter).
-    #[pyo3(signature = (since_rfc3339, limit))]
+    /// v31.4.0 (CIRISPersist#682, #668) — bulk-list `ServedKeyRecord`s since a
+    /// cursor, as a JSON array, ordered `(admitted_at ASC, key_id ASC)`. Every
+    /// `federation_keys` row qualifies (the classical scrub signature is
+    /// required at admission, so there is no unsigned shape to filter).
+    ///
+    /// **BREAKING against v21.1.0 (#507c) in two ways, both deliberate.**
+    ///
+    /// The cursor is THIS node's `admitted_at`, not the producer's
+    /// `scrub_timestamp`: a record signed in January, replicated late and
+    /// admitted in February, used to sort under January and was never served to
+    /// a consumer past it — never, not late (#682).
+    ///
+    /// And it is the PAIR. `since_key_id` accompanies `since_rfc3339`; resume
+    /// from the last element's `admitted_at` and `record.key_id` together, or a
+    /// tie larger than one page loses its remainder (#668). Supplying one
+    /// without the other is refused rather than guessed — a half-cursor would
+    /// silently page as if from the start of that instant, re-serving rows.
+    #[pyo3(signature = (since_rfc3339, since_key_id, limit))]
     fn list_signed_key_records_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_key_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since_at = since_rfc3339.filter(|s| !s.is_empty());
+        let since_id = since_key_id.filter(|s| !s.is_empty());
+        let since =
+            match (since_at, since_id) {
+                (Some(s), Some(k)) => Some((
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                        .with_timezone(&chrono::Utc),
+                    k.to_owned(),
+                )),
+                (None, None) => None,
+                _ => return Err(PyValueError::new_err(
+                    "list_signed_key_records_since: the cursor is the PAIR (#668) — supply both \
+                     since_rfc3339 and since_key_id, or neither. Half a cursor would page from \
+                     the start of that instant and re-serve every row tied at it.",
+                )),
+            };
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
