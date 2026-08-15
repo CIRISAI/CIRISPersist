@@ -9826,6 +9826,51 @@ mod tests {
             .unwrap();
     }
 
+    /// #682 — the allocator reads the same position expression the cursor
+    /// orders by (`key_record_position`, which falls back to
+    /// `scrub_timestamp`), not just the side map.
+    ///
+    /// Memory mirrors the sqlite dialect here: a row with no entry in
+    /// `key_record_admitted_at` has an effective position of its
+    /// `scrub_timestamp`, and an allocator blind to that stamps below it.
+    #[tokio::test]
+    async fn allocator_reads_the_fallback_position_memory_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-mem-fb", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE UNSTAMPED ROW, as state: the side-map entry removed and the
+        // `scrub_timestamp` moved an hour ahead, so the fallback is the largest
+        // position in the map.
+        let fallback_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            assert!(
+                st.key_record_admitted_at.remove("k682-mem-fb").is_some(),
+                "the fallback plant must remove a stamp that was actually there"
+            );
+            let row = st
+                .federation_keys
+                .get_mut("k682-mem-fb")
+                .expect("seeded row");
+            row.scrub_timestamp = fallback_at;
+        }
+
+        rts::assert_allocator_reads_the_fallback_position(
+            &backend,
+            "mem",
+            "k682-mem-fb",
+            fallback_at,
+        )
+        .await
+        .unwrap();
+    }
+
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
         // v31.0.0 (#659) — and the typed columns are BOUND INTO the bytes that

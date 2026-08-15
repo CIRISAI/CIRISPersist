@@ -24434,6 +24434,51 @@ mod tests {
             .unwrap();
     }
 
+    /// #682 — the allocator reads `COALESCE(admitted_at, scrub_timestamp)`, the
+    /// same expression the cursor orders by, not the bare column.
+    ///
+    /// This dialect leaves `admitted_at` nullable — `ALTER TABLE` cannot add a
+    /// NOT NULL column to a populated table and cannot alter nullability in
+    /// place — so a row whose position comes from the fallback is a real state,
+    /// and it is the one a bare `MAX(admitted_at)` is blind to.
+    #[tokio::test]
+    async fn allocator_reads_the_fallback_position_sqlite_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-sq-fb", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE UNSTAMPED ROW, as state: no stored position, and a
+        // `scrub_timestamp` an hour ahead — so the fallback is the largest
+        // position in the table and an allocator that ignores it stamps below.
+        let fallback_at = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
+        {
+            let conn = backend.conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_keys SET admitted_at = NULL, scrub_timestamp = ?1 \
+                     WHERE key_id = ?2",
+                    rusqlite::params![fallback_at.to_rfc3339(), "k682-sq-fb"],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the fallback plant must touch the seeded row");
+        }
+
+        rts::assert_allocator_reads_the_fallback_position(
+            &backend,
+            "sq",
+            "k682-sq-fb",
+            fallback_at,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn put_revocation_rejects_out_of_closed_set_region() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

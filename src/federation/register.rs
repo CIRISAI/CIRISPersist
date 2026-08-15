@@ -1784,10 +1784,12 @@ pub mod test_support {
     ///
     /// The allocator's rule is unit-tested in `federation::types`. What this
     /// asserts, and a unit test cannot, is that it is actually WIRED into
-    /// `put_public_key` on this backend — including that the allocator reads
-    /// the same position expression the serve cursor orders by, since an
-    /// allocator blind to a position the reader can see would hand out a value
-    /// below it.
+    /// `put_public_key` on this backend.
+    ///
+    /// It says nothing about the allocator reading the *fallback* position —
+    /// this plant writes the `admitted_at` column itself, which a bare
+    /// `MAX(admitted_at)` sees. That is a separate claim with its own witness:
+    /// [`assert_allocator_reads_the_fallback_position`].
     pub async fn assert_key_admission_survives_backward_step(
         directory: &dyn FederationDirectory,
         tag: &str,
@@ -1842,6 +1844,94 @@ pub mod test_support {
             served.admitted_at > future,
             "({tag}) #682: the new position must be strictly above the stepped-forward one — got \
              {}, planted {future}",
+            served.admitted_at
+        );
+        Ok(())
+    }
+
+    /// **v31.4.0 (CIRISPersist#682) — THE ALLOCATOR READS THE EXPRESSION THE
+    /// READER READS**, on the backends whose position can come from a fallback.
+    ///
+    /// Call after planting one row that has NO stored position, so its
+    /// effective position is its `scrub_timestamp` — and plant that instant in
+    /// the FUTURE, so the fallback is the largest position in the table.
+    ///
+    /// This is only reachable where the column is nullable: the sqlite dialect,
+    /// whose `ALTER TABLE` cannot add a NOT NULL column to a populated table
+    /// and cannot alter nullability in place, and memory, which mirrors it.
+    /// Postgres sets NOT NULL after the V126 backfill and has no such row, so
+    /// it correctly reads the bare column and is deliberately not driven here.
+    ///
+    /// The cursor already reads the fallback — `COALESCE(admitted_at,
+    /// scrub_timestamp)`, and `key_record_position` in memory. If the ALLOCATOR
+    /// does not, it is blind to a position the reader can see, and it stamps
+    /// the next admission BELOW that row. A consumer whose cursor has passed
+    /// the fallback row then never sees the new one: #682 exactly, re-entering
+    /// through the allocator instead of through the cursor.
+    pub async fn assert_allocator_reads_the_fallback_position(
+        directory: &dyn FederationDirectory,
+        tag: &str,
+        unstamped_key_id: &str,
+        fallback_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        // The plant is verified, not assumed: the cursor must actually be
+        // serving this row AT its fallback instant, or the allocator is not
+        // being asked the question.
+        let before = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        let planted = before
+            .iter()
+            .find(|r| r.record.key_id == unstamped_key_id)
+            .unwrap_or_else(|| panic!("({tag}) #682: the unstamped row must be served at all"));
+        assert_eq!(
+            planted.admitted_at, fallback_at,
+            "({tag}) #682: the unstamped row's position must come from the FALLBACK — if it does \
+             not, the plant did not take and this witness cannot fail"
+        );
+        assert_eq!(
+            before
+                .iter()
+                .map(|r| r.admitted_at)
+                .max()
+                .expect("non-empty"),
+            fallback_at,
+            "({tag}) #682: the fallback row must hold the LARGEST position in the table, or an \
+             allocator that ignores it would still land above everything by accident"
+        );
+
+        let after_fallback = format!("k682-fb-{tag}");
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: self_scrubbed_record_signed_at(
+                    &after_fallback,
+                    truncate_to_micros(chrono::Utc::now()),
+                ),
+            })
+            .await?;
+
+        let resumed = directory
+            .list_signed_key_records_since(
+                Some((fallback_at, unstamped_key_id.to_owned())),
+                u32::MAX,
+            )
+            .await?;
+        let served = resumed
+            .iter()
+            .find(|r| r.record.key_id == after_fallback)
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #682: the next admission must sort ABOVE a row whose position comes \
+                     from the `scrub_timestamp` fallback. An allocator reading only the stored \
+                     column cannot see that row, stamps below it, and the new record is invisible \
+                     to every consumer already past it. Served: {:?}",
+                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            served.admitted_at > fallback_at,
+            "({tag}) #682: the new position must be strictly above the fallback one — got {}, \
+             fallback {fallback_at}",
             served.admitted_at
         );
         Ok(())
