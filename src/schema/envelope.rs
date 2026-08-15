@@ -31,6 +31,20 @@ pub enum TraceLevel {
     FullTraces,
 }
 
+impl TraceLevel {
+    /// The wire token — the same `snake_case` string serde emits, so a level
+    /// recorded in a signed envelope and a level on the wire are one vocabulary
+    /// rather than two spellings (v32.0.0, CIRISPersist#690).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Detailed => "detailed",
+            Self::FullTraces => "full_traces",
+        }
+    }
+}
+
 /// Optional correlation metadata
 /// (TRACE_WIRE_FORMAT.md §1, agent's `correlation_metadata` field).
 ///
