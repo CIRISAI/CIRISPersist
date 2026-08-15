@@ -59,17 +59,18 @@ pub async fn storage_summary_pg(
         u64::try_from(sz).unwrap_or(0)
     };
 
-    let trace_events = table_usage_pg(&client, "cirislens.trace_events", "ts").await?;
-    let trace_llm_calls = table_usage_pg(&client, "cirislens.trace_llm_calls", "ts").await?;
+    let trace_events =
+        table_usage_pg(&client, "cirislens.trace_events", "ts", Some("admitted_at")).await?;
+    let trace_llm_calls = table_usage_pg(&client, "cirislens.trace_llm_calls", "ts", None).await?;
     // detection_events lives in cirislens_derived (V008). Always
     // built — DerivedSchema is feature-flag-independent.
     let detection_events =
-        table_usage_pg(&client, "cirislens_derived.detection_events", "ts").await?;
+        table_usage_pg(&client, "cirislens_derived.detection_events", "ts", None).await?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_pg(&client, "cirislens.audit_log", "recorded_at").await?
+            table_usage_pg(&client, "cirislens.audit_log", "recorded_at", None).await?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -77,11 +78,16 @@ pub async fn storage_summary_pg(
         }
     };
 
-    let edge_outbound_queue =
-        table_usage_pg(&client, "cirislens.edge_outbound_queue", "enqueued_at").await?;
+    let edge_outbound_queue = table_usage_pg(
+        &client,
+        "cirislens.edge_outbound_queue",
+        "enqueued_at",
+        None,
+    )
+    .await?;
 
     let federation_keys =
-        table_usage_pg(&client, "cirislens.federation_keys", "valid_from").await?;
+        table_usage_pg(&client, "cirislens.federation_keys", "valid_from", None).await?;
 
     Ok(StorageSummary {
         trace_events,
@@ -102,10 +108,17 @@ pub async fn storage_summary_pg(
 /// derived schema) surface as a default `TableUsage` rather than
 /// erroring — the storage summary is best-effort introspection, not
 /// a schema invariant.
+/// v32.1.0 (CIRISPersist#606) — `admitted_col` names the node-local admission
+/// instant when the table has one (today: `trace_events` only, V128).
+///
+/// Passed explicitly rather than probed: a probe that guesses wrong fails
+/// toward "no reading", and a liveness field that is silently always `None` is
+/// exactly the shape of a check that cannot fail.
 async fn table_usage_pg(
     client: &deadpool_postgres::Client,
     qualified: &str,
     ts_column: &str,
+    admitted_col: Option<&str>,
 ) -> Result<TableUsage, RetentionError> {
     // pg_relation_size accepts a regclass; a missing table errors
     // with `relation "..." does not exist`. We map that to an empty
@@ -159,11 +172,31 @@ async fn table_usage_pg(
         .try_get("newest")
         .map_err(|e| RetentionError::Backend(format!("decode {qualified} newest: {e}")))?;
 
+    // v32.1.0 (#606) — a SEPARATE `MAX()`, pushed down and index-served, so a
+    // liveness read stays an aggregate rather than a scan of the largest table
+    // in the schema. Kept out of the stats query above because most tables have
+    // no such column and a NULL there would be indistinguishable from an empty
+    // table.
+    let newest_admitted_at: Option<DateTime<Utc>> = match admitted_col {
+        Some(col) => {
+            let sql = format!("SELECT MAX({col})::TIMESTAMPTZ AS newest_admitted FROM {qualified}");
+            let arow = client
+                .query_one(&sql, &[])
+                .await
+                .map_err(|e| RetentionError::Backend(format!("admitted stats {qualified}: {e}")))?;
+            arow.try_get("newest_admitted").map_err(|e| {
+                RetentionError::Backend(format!("decode {qualified} newest_admitted: {e}"))
+            })?
+        }
+        None => None,
+    };
+
     Ok(TableUsage {
         bytes,
         rows,
         oldest_ts,
         newest_ts,
+        newest_admitted_at,
     })
 }
 

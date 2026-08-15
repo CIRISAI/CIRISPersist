@@ -1213,6 +1213,35 @@ impl Backend for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
 
+        // v32.1.0 (CIRISPersist#606) — ONE admission instant for the whole
+        // batch, allocated inside this transaction.
+        //
+        // One per batch, not one per row: the rows of a batch arrived together,
+        // so they were admitted together, and a per-row instant would invent an
+        // ordering the arrival did not have.
+        //
+        // Through `monotonic_admission_instant` rather than a bare `now()`,
+        // because `MAX(admitted_at)` is the liveness reading. Under a backward
+        // clock step a bare now() writes values BELOW the existing max, so the
+        // max freezes and the plane reads dark while traces are actively
+        // landing — the same false-outage this issue exists to remove,
+        // re-introduced from the other side. Reading the max inside the
+        // transaction is what makes the allocation race-free against a
+        // concurrent batch.
+        let last_admitted: Option<chrono::DateTime<chrono::Utc>> = tx
+            .query_one(
+                "SELECT MAX(admitted_at)::TIMESTAMPTZ AS m FROM cirislens.trace_events",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read max admitted_at: {e}")))?
+            .try_get("m")
+            .map_err(|e| Error::Backend(format!("decode max admitted_at: {e}")))?;
+        let admitted_at = crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last_admitted,
+        );
+
         // Build one INSERT ... VALUES (...), (...), ...
         // ON CONFLICT (trace_id, thought_id, event_type, attempt_index, ts)
         // DO NOTHING
@@ -1229,7 +1258,8 @@ impl Backend for PostgresBackend {
                             verification_source, cohort_scope, cohort_target_id, \
                             signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
                             shard_key, \
-                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest";
+                            scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            admitted_at";
         // v32.0.0 (#690) — 40 -> 43, and now DERIVED rather than restated.
         //
         // The placeholder generator below multiplies by this, so a hand-kept
@@ -1364,6 +1394,13 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.scrub_ner_ran));
             params.push(Box::new(row.scrub_applied_trace_level.clone()));
             params.push(Box::new(row.scrub_model_digest.clone()));
+            // v32.1.0 (#606) — the batch's admission instant. NOT
+            // `row.admitted_at`: the backend stamps this, so a caller cannot
+            // assert when this node received its bytes. `ON CONFLICT DO
+            // NOTHING` leaves an existing row's value alone — a re-delivery is
+            // not an arrival, and letting a replay refresh the instant would
+            // make a stuck producer look live.
+            params.push(Box::new(admitted_at));
         }
         // THREAT_MODEL.md AV-9: dedup-key target still includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -2038,6 +2075,7 @@ impl Backend for PostgresBackend {
                             audit_signature, original_content_hash, scrub_signature, \
                             scrub_key_id, scrub_timestamp, \
                             scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            admitted_at, \
                             agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
@@ -2060,6 +2098,7 @@ impl Backend for PostgresBackend {
                             audit_signature, original_content_hash, scrub_signature, \
                             scrub_key_id, scrub_timestamp, \
                             scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            admitted_at, \
                             agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
@@ -16384,6 +16423,9 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             // `scrub_signature` preimage. NULL stays NULL: a pre-v32.0.0 row
             // made no treatment claim, and coercing that to `false` would
             // assert it was checked and found unscrubbed.
+            // v32.1.0 (#606) — read back so callers can see this node's own
+            // intake instant; `MAX()` of it is the liveness reading.
+            admitted_at: row.safe_get_with("admitted_at", Error::Backend)?,
             scrub_ner_ran: row.safe_get_with("scrub_ner_ran", Error::Backend)?,
             scrub_applied_trace_level: row
                 .safe_get_with("scrub_applied_trace_level", Error::Backend)?,
@@ -17056,6 +17098,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, \
                         scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                        admitted_at, \
                         agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
@@ -23181,6 +23224,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -23635,6 +23680,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -23996,6 +24043,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,
@@ -24634,6 +24683,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,
@@ -25705,6 +25756,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -27813,6 +27866,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -28320,6 +28375,8 @@ mod tests {
                     scrub_key_id: None,
                     scrub_timestamp: None,
                     // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                    // v32.1.0 (#606) — the backend stamps this at insert.
+                    admitted_at: None,
                     scrub_ner_ran: None,
                     scrub_applied_trace_level: None,
                     scrub_model_digest: None,
@@ -28447,6 +28504,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,
@@ -37014,6 +37073,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,
@@ -39499,6 +39560,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,

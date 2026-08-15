@@ -171,6 +171,8 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             // returns. `None` here for the same reason the four above are:
             // decomposition has not scrubbed anything, so it has no claim to
             // make. A default of `Some(false)` would be a claim.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,

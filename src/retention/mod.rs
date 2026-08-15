@@ -129,7 +129,31 @@ pub struct TableUsage {
     pub oldest_ts: Option<DateTime<Utc>>,
     /// `MAX(<time_column>)` — the newest row's timestamp. `None`
     /// when the table is empty.
+    ///
+    /// **This is the PRODUCER's assertion**, not this node's observation. For
+    /// `trace_events` it is the component timestamp carried inside the signed
+    /// `CompleteTrace`. Correct for retention and for ordering; wrong for
+    /// liveness — see [`Self::newest_admitted_at`].
     pub newest_ts: Option<DateTime<Utc>>,
+    /// v32.1.0 (CIRISPersist#606) — `MAX(admitted_at)`: **when THIS node last
+    /// accepted a row, on its own clock.** `None` for tables that carry no
+    /// admission instant, and for a table whose rows all predate V128.
+    ///
+    /// Two different questions, two fields. [`Self::newest_ts`] answers "how
+    /// recent is the newest thing we hold"; this answers "is this node
+    /// receiving" — and only the second is what a liveness band asks.
+    ///
+    /// Building the band on `newest_ts` meant the signal that says *arrival
+    /// stopped* was derived from a number supplied by the party that stopped
+    /// arriving. A slow producer clock pinned the plane dark while it was being
+    /// actively fed; a fast one pinned it green through any subsequent silence;
+    /// and a backfill of last month's traces was indistinguishable from
+    /// liveness, because it moves `count(*)` and not `MAX(ts)`.
+    ///
+    /// `None` here is honest rather than merely absent: a node that upgraded
+    /// never observed an admission instant for its history, and a synthesized
+    /// value would be a fabricated observation.
+    pub newest_admitted_at: Option<DateTime<Utc>>,
 }
 
 /// v2.7.0 (CIRISPersist#107) — handle returned by
@@ -252,6 +276,155 @@ mod tests {
         assert_eq!(u.rows, 0);
         assert!(u.oldest_ts.is_none());
         assert!(u.newest_ts.is_none());
+        // v32.1.0 (#606) — a table with no admission instant reads `None`, not
+        // a synthesized zero. "Never observed" and "observed nothing" are
+        // different facts and a liveness band must be able to tell them apart.
+        assert!(u.newest_admitted_at.is_none());
+    }
+
+    /// **CIRISPersist#606 — liveness must track ARRIVAL, not the producer's
+    /// clock.**
+    ///
+    /// The trace plane's only liveness signal was `MAX(trace_events.ts)`, and
+    /// `ts` is the producer's asserted component timestamp carried inside the
+    /// signed `CompleteTrace`. So the signal saying *arrival stopped* was
+    /// derived from a number supplied by the party that stopped arriving.
+    ///
+    /// This is the backfill leg, which is the sharpest of the issue's three
+    /// failure modes because it is indistinguishable from silence on the old
+    /// reading: a batch of **year-old** traces arriving RIGHT NOW moves
+    /// `count(*)` and leaves `MAX(ts)` a year in the past. On the old signal a
+    /// node being actively fed reads dark. The two fields must now disagree,
+    /// and each must be right about its own question.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn backfill_moves_admission_but_not_the_producer_timestamp_606() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use crate::store::Backend as _;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x07; 32]),
+            "test-606".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+
+        let before = chrono::Utc::now();
+
+        // A YEAR-OLD trace, admitted now. This is the everyday case — a peer
+        // catching up, or a replay — not an exotic one.
+        let old_ts = chrono::DateTime::parse_from_rfc3339("2025-08-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row = crate::store::TraceEventRow {
+            trace_id: "tr-606".to_owned(),
+            thought_id: "th-606".to_owned(),
+            task_id: None,
+            step_point: None,
+            event_type: crate::schema::ReasoningEventType::ActionResult,
+            attempt_index: 0,
+            ts: old_ts,
+            agent_name: None,
+            agent_id_hash: "agent-606".to_owned(),
+            cognitive_state: None,
+            trace_level: crate::schema::TraceLevel::Generic,
+            payload: serde_json::Map::new(),
+            cost_llm_calls: None,
+            cost_tokens: None,
+            cost_usd: None,
+            signature: "c2ln".to_owned(),
+            signing_key_id: "k1".to_owned(),
+            signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
+            schema_version: "2.7.0".to_owned(),
+            pii_scrubbed: false,
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+            // A caller-supplied instant, deliberately absurd: the backend must
+            // overwrite it. If this value survives, a producer can assert when
+            // this node received its bytes.
+            admitted_at: Some(
+                chrono::DateTime::parse_from_rfc3339("1999-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            scrub_ner_ran: None,
+            scrub_applied_trace_level: None,
+            scrub_model_digest: None,
+            cohort_scope: "federation".to_owned(),
+            cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
+        };
+        let rep = sq
+            .insert_trace_events_batch(std::slice::from_ref(&row))
+            .await
+            .expect("insert");
+        assert_eq!(rep.inserted, 1);
+
+        let s = engine.storage_summary().await.expect("summary");
+
+        // The producer's claim is preserved exactly — `newest_ts` is still the
+        // right answer for retention and ordering, and this change must not
+        // have quietly redefined it.
+        assert_eq!(
+            s.trace_events.newest_ts,
+            Some(old_ts),
+            "newest_ts must remain the PRODUCER's assertion"
+        );
+
+        // The node's own observation is NOW, which is what a liveness band
+        // asks. On the old signal this plane would have read a year stale
+        // while actively receiving.
+        let admitted = s
+            .trace_events
+            .newest_admitted_at
+            .expect("newest_admitted_at populated after an insert");
+        assert!(
+            admitted >= before,
+            "admission instant must be THIS node's clock at intake, got {admitted}"
+        );
+
+        // And the caller's value was overwritten. A producer — or anything
+        // upstream that shaped these bytes — must not be able to assert when
+        // this node received them, or the column re-imports the very
+        // dependency it exists to remove.
+        assert!(
+            chrono::Datelike::year(&admitted) > 1999,
+            "the backend must OVERWRITE a caller-supplied admitted_at, got {admitted}"
+        );
+
+        // A RE-DELIVERY IS NOT AN ARRIVAL. Re-inserting the same row conflicts,
+        // and the stored instant must not move: letting a replay refresh it
+        // would make a stuck producer look live, which is this issue's second
+        // failure mode wearing a different hat.
+        let rep2 = sq
+            .insert_trace_events_batch(std::slice::from_ref(&row))
+            .await
+            .expect("re-insert");
+        assert_eq!(rep2.inserted, 0, "the re-delivery must conflict");
+        assert_eq!(rep2.conflicted, 1);
+        let s2 = engine.storage_summary().await.expect("summary 2");
+        assert_eq!(
+            s2.trace_events.newest_admitted_at, s.trace_events.newest_admitted_at,
+            "a re-delivery must NOT advance the admission instant"
+        );
     }
 
     #[test]

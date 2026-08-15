@@ -61,14 +61,15 @@ fn storage_summary_blocking(
         .map_err(|e| RetentionError::Backend(format!("pragma page_size: {e}")))?;
     let total_disk_bytes = u64::try_from(page_count.saturating_mul(page_size)).unwrap_or(0);
 
-    let trace_events = table_usage_sqlite(&guard, "trace_events", "ts")?;
-    let trace_llm_calls = table_usage_sqlite(&guard, "trace_llm_calls", "ts")?;
-    let detection_events = table_usage_sqlite(&guard, "cirislens_derived_detection_events", "ts")?;
+    let trace_events = table_usage_sqlite(&guard, "trace_events", "ts", Some("admitted_at"))?;
+    let trace_llm_calls = table_usage_sqlite(&guard, "trace_llm_calls", "ts", None)?;
+    let detection_events =
+        table_usage_sqlite(&guard, "cirislens_derived_detection_events", "ts", None)?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_sqlite(&guard, "cirislens_audit_log", "recorded_at")?
+            table_usage_sqlite(&guard, "cirislens_audit_log", "recorded_at", None)?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -76,8 +77,9 @@ fn storage_summary_blocking(
         }
     };
 
-    let edge_outbound_queue = table_usage_sqlite(&guard, "edge_outbound_queue", "enqueued_at")?;
-    let federation_keys = table_usage_sqlite(&guard, "federation_keys", "valid_from")?;
+    let edge_outbound_queue =
+        table_usage_sqlite(&guard, "edge_outbound_queue", "enqueued_at", None)?;
+    let federation_keys = table_usage_sqlite(&guard, "federation_keys", "valid_from", None)?;
 
     Ok(StorageSummary {
         trace_events,
@@ -90,10 +92,18 @@ fn storage_summary_blocking(
     })
 }
 
+/// v32.1.0 (CIRISPersist#606) — `admitted_col` names the node-local admission
+/// instant when the table has one (today: `trace_events` only, V128).
+///
+/// Passed explicitly rather than probed, because a probe that guesses wrong
+/// fails toward "no reading" — and a liveness field that is silently always
+/// `None` is exactly the shape of a check that cannot fail. A caller that adds
+/// the column to another table must say so here, and will notice.
 fn table_usage_sqlite(
     conn: &Connection,
     table: &str,
     ts_column: &str,
+    admitted_col: Option<&str>,
 ) -> Result<TableUsage, RetentionError> {
     // Bytes is 0 on SQLite (no dbstat compiled in). See module docs.
     let bytes = 0u64;
@@ -135,11 +145,31 @@ fn table_usage_sqlite(
         None => None,
     };
 
+    // v32.1.0 (#606) — a SEPARATE `MAX()`, pushed down and index-served, so a
+    // liveness read stays an aggregate rather than becoming a scan of the
+    // largest table in the schema. Kept out of the stats query above because
+    // most tables have no such column and a NULL there would be
+    // indistinguishable from an empty table.
+    let newest_admitted_at = match admitted_col {
+        Some(col) => {
+            let sql = format!("SELECT MAX({col}) FROM {table}");
+            let raw: Option<String> = conn
+                .query_row(&sql, [], |row| row.get(0))
+                .map_err(|e| RetentionError::Backend(format!("admitted stats {table}: {e}")))?;
+            match raw {
+                Some(s) => Some(parse_rfc3339(&s)?),
+                None => None,
+            }
+        }
+        None => None,
+    };
+
     Ok(TableUsage {
         bytes,
         rows,
         oldest_ts,
         newest_ts,
+        newest_admitted_at,
     })
 }
 

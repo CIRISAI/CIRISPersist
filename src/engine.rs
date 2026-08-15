@@ -7868,6 +7868,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,

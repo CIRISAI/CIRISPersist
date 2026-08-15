@@ -485,6 +485,37 @@ impl Backend for SqliteBackend {
             let tx = conn.transaction()?;
             let mut inserted = 0usize;
 
+            // v32.1.0 (CIRISPersist#606) — ONE admission instant for the whole
+            // batch, allocated inside this transaction.
+            //
+            // One per batch, not one per row: the rows of a batch arrived
+            // together, so they were admitted together, and a per-row instant
+            // would invent an ordering the arrival did not have.
+            //
+            // Through `monotonic_admission_instant` rather than a bare
+            // `Utc::now()`, because `MAX(admitted_at)` is the liveness reading.
+            // Under a backward clock step a bare now() writes values BELOW the
+            // existing max, so the max freezes and the plane reads dark while
+            // traces are actively landing — the same false-outage this issue
+            // exists to remove, re-introduced from the other side. Reading the
+            // max inside the transaction is what makes the allocation
+            // race-free against a concurrent batch.
+            let last_admitted: Option<String> = tx
+                .query_row("SELECT MAX(admitted_at) FROM trace_events", [], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .flatten();
+            let last_admitted = last_admitted
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let admitted_at = crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last_admitted,
+            );
+            let admitted_at_str = admitted_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
             // Single-row prepared INSERT inside a transaction. SQLite
             // optimizes this case well (parsed once, executed N times)
             // and the per-row branching for audit-anchor extraction
@@ -502,12 +533,13 @@ impl Backend for SqliteBackend {
                 verification_source, cohort_scope, cohort_target_id, \
                 signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
                 shard_key, \
-                scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest\
+                scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                admitted_at\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
                 ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-                ?41, ?42, ?43\
+                ?41, ?42, ?43, ?44\
                 ) ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
                 event_type, attempt_index, ts) DO NOTHING";
 
@@ -552,7 +584,7 @@ impl Backend for SqliteBackend {
                     // shard and still collides on the sharded UNIQUE index.
                     let shard_key = i64::from(super::decompose::trace_dedup_shard_key(row));
 
-                    let params: [SqlValue; 43] = [
+                    let params: [SqlValue; 44] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -620,6 +652,14 @@ impl Backend for SqliteBackend {
                         },
                         opt_text(row.scrub_applied_trace_level.as_deref()),
                         opt_text(row.scrub_model_digest.as_deref()),
+                        // v32.1.0 (#606) — the batch's admission instant. NOT
+                        // `row.admitted_at`: the backend stamps this, so a
+                        // caller cannot assert when this node received its
+                        // bytes. `ON CONFLICT DO NOTHING` below leaves an
+                        // existing row's value alone — a re-delivery is not an
+                        // arrival, and letting a replay refresh the instant
+                        // would make a stuck producer look live.
+                        SqlValue::Text(admitted_at_str.clone()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -1022,6 +1062,7 @@ impl Backend for SqliteBackend {
                         audit_signature, original_content_hash, scrub_signature, \
                         scrub_key_id, scrub_timestamp, \
                         scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                        admitted_at, \
                         agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
@@ -14227,6 +14268,12 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             // 0/1 preserves the three-way distinction the schema depends on:
             // NULL (pre-v32.0.0, no claim), 0 (claimed: no NER pass), 1
             // (claimed: a pass ran).
+            // v32.1.0 (#606) — read back so callers can see this node's own
+            // intake instant; `MAX()` of it is the liveness reading.
+            admitted_at: {
+                let raw: Option<String> = row.get("admitted_at")?;
+                raw.as_deref().map(parse_rfc3339)
+            },
             scrub_ner_ran: row.get("scrub_ner_ran")?,
             scrub_applied_trace_level: row.get("scrub_applied_trace_level")?,
             scrub_model_digest: row.get("scrub_model_digest")?,
@@ -16501,6 +16548,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                             original_content_hash, scrub_signature, scrub_key_id, \
                             scrub_timestamp, \
                             scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
+                            admitted_at, \
                             agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
@@ -20215,6 +20263,8 @@ mod tests {
             scrub_key_id: Some("scrub-key-1".to_owned()),
             scrub_timestamp: Some(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 1).unwrap()),
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -33567,6 +33617,8 @@ mod tests {
             scrub_key_id: Some("scrub-key".to_owned()),
             scrub_timestamp: Some(base),
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -34937,6 +34989,8 @@ mod tests {
                     scrub_key_id: None,
                     scrub_timestamp: None,
                     // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                    // v32.1.0 (#606) — the backend stamps this at insert.
+                    admitted_at: None,
                     scrub_ner_ran: None,
                     scrub_applied_trace_level: None,
                     scrub_model_digest: None,
@@ -35051,6 +35105,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,
