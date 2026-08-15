@@ -185,13 +185,16 @@ jobs:
         # declared here. Harmless if the package is public (it just
         # authenticates anyway).
         #
-        # FORK PRs: a fork's `GITHUB_TOKEN` carries no packages scope, so this
-        # pull fails unless the GHCR package is PUBLIC. Docker Hub's anonymous
-        # pull did work for forks, so this is the one behaviour that narrows.
-        # Set the package's visibility to public (Org -> Packages ->
-        # postgres -> Package settings) to restore fork parity; the image is a
-        # verbatim mirror of an already-public upstream, so there is nothing to
-        # protect by keeping it private.
+        # FORK PRs: VERIFIED WORKING. `ghcr.io/cirisai/postgres` is public — an
+        # anonymous manifest fetch (`ghcr.io/token` + `/v2/.../manifests/16`,
+        # no credentials) returns HTTP 200, which is the exact request a fork
+        # runner makes. So fork parity with Docker Hub's anonymous pull is
+        # intact and nothing needs configuring.
+        #
+        # The credentials above are kept anyway, as cheap insurance: if the
+        # package's visibility is ever flipped to private, same-repo CI keeps
+        # working instead of failing at container init across all eight legs.
+        # They are inert while it stays public.
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
