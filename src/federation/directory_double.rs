@@ -528,9 +528,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedKeyRecord>, Error> {
+    ) -> Result<Vec<ServedKeyRecord>, Error> {
         if let Some(e) = self.faulted("list_signed_key_records_since") {
             return Err(e);
         }

@@ -3296,6 +3296,42 @@ pub struct SignedRevocation {
     /// The revocation being submitted.
     pub revocation: Revocation,
 }
+/// v31.4.0 (CIRISPersist#682) — **one key record as the SERVE cursor returns
+/// it**: the record, plus this node's own position on it.
+///
+/// The identity twin of [`ServedRevocation`], and for the same reason.
+/// `list_signed_key_records_since` used to filter and order on
+/// `scrub_timestamp` — the PRODUCER's clock — so a record signed in January,
+/// replicated late and admitted here in February, sorted under January and was
+/// never served to a consumer whose cursor had passed it. Not late: **never**.
+///
+/// `federation_keys` is the plane every other plane's verification resolves
+/// against, which makes this the sharpest version of that defect. The revocation
+/// cursor decides which keys are EXCLUDED; this one decides which keys ARE.
+///
+/// Separate from [`SignedKeyRecord`] on purpose: `admitted_at` is node-local and
+/// must never enter a content hash or a signed envelope. Keeping it out of
+/// `KeyRecord` is what lets one record hash identically on every node while each
+/// node keeps its own arrival order — the same separation `ServedRevocation`
+/// makes, and the same reason the genesis digest excludes node-local fields
+/// (#660).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedKeyRecord {
+    /// The key record itself, unchanged — the same value [`SignedKeyRecord`]
+    /// carries and the same bytes the signed-wire content hash is taken over.
+    pub record: KeyRecord,
+    /// When THIS node admitted the row — receiver-stamped, never read from the
+    /// wire, allocated through
+    /// [`monotonic_admission_instant`](crate::federation::types::monotonic_admission_instant)
+    /// so a backward clock step cannot strand a row below a cursor that has
+    /// already passed.
+    ///
+    /// This is the value a caller resumes from, paired with
+    /// [`Self::record`]`.key_id` — the PAIR, not the instant alone, because a
+    /// page ordered by `(instant, id)` and resumed by instant alone skips the
+    /// remainder of any tie larger than one page (#668).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// v31.1.0 (CIRISPersist#655, PR #667 round-3 review) — **one revocation as the
 /// SERVE cursor returns it**: the record, plus this node's own position on it.

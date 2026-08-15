@@ -398,8 +398,8 @@ pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
     EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedRevocation, SignedAttestation,
-    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedKeyRecord, ServedRevocation,
+    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
     SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm,
     TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
@@ -2220,11 +2220,24 @@ pub trait FederationDirectory: Send + Sync {
     /// carries its own scrub-signature fields inline (it IS the signed
     /// wrapper for read purposes); [`SignedKeyRecord`] exists only so the
     /// write-input and bulk-read shapes match (`{ record: KeyRecord }`).
+    /// v31.4.0 (CIRISPersist#682, #668) — **BREAKING: resumes on THIS node's
+    /// admission position, as a PAIR.**
+    ///
+    /// `since` is `(admitted_at, key_id)` — the pair, not the instant alone.
+    /// The page is ordered by that pair and the filter is strictly greater than
+    /// it, so a tie larger than one page resumes correctly instead of skipping
+    /// its remainder (#668).
+    ///
+    /// It keys on `admitted_at` (receiver-stamped, monotonic) rather than
+    /// `scrub_timestamp` (the producer's clock). A record signed in January,
+    /// replicated late and admitted in February, used to sort under January and
+    /// was never served to a consumer past it — #655's defect on the identity
+    /// plane, which every other plane's verification resolves against (#682).
     async fn list_signed_key_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedKeyRecord>, Error>;
+    ) -> Result<Vec<ServedKeyRecord>, Error>;
 
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`SignedIdentityOccurrence`] wrappers (row + the detached

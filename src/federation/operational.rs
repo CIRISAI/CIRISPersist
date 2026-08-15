@@ -4587,23 +4587,35 @@ pub mod test_support {
     /// v24.1.0 (CIRISPersist#547) — the round trip itself: hash what this node
     /// ADVERTISES for `key_id` and demand the point-read serve it, byte-exact.
     ///
-    /// Deliberately hashes the ADVERTISE surface
+    /// Deliberately reads the ADVERTISE surface
     /// ([`FederationDirectory::list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since))
-    /// rather than a re-serialized `lookup_public_key`, because the advertised
-    /// bytes are what a peer actually asks for — the measured symptom was
-    /// `ADVERTISED hash ⇒ POINT-READ None`.
+    /// rather than `lookup_public_key`, because the advertised row is what a
+    /// peer actually asks for — the measured symptom was `ADVERTISED hash ⇒
+    /// POINT-READ None`.
+    ///
+    /// v31.4.0 (CIRISPersist#682) — the hash is taken over the
+    /// [`SignedKeyRecord`](crate::federation::SignedKeyRecord) wrapper, NOT over
+    /// the [`ServedKeyRecord`](crate::federation::ServedKeyRecord) that surface
+    /// now returns. The cursor carries this node's `admitted_at` BESIDE the
+    /// record; the content-addressed bytes are the record's own, or one key
+    /// record would hash differently on every node and no ref would resolve
+    /// anywhere but where it was minted. Reading the served wrapper and hashing
+    /// the record's is the whole point of the split.
     async fn assert_advertised_key_ref_is_servable(
         directory: &dyn crate::federation::FederationDirectory,
         key_id: &str,
         tag: &str,
         after: &str,
     ) -> Result<(), crate::federation::Error> {
-        let advertised = directory
+        let served_row = directory
             .list_signed_key_records_since(None, 10_000)
             .await?
             .into_iter()
             .find(|r| r.record.key_id == key_id)
             .unwrap_or_else(|| panic!("({tag}) {key_id} is advertised after {after}"));
+        let advertised = crate::federation::SignedKeyRecord {
+            record: served_row.record,
+        };
         let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
         let served = directory
             .lookup_signed_record_by_content_hash("Key", &hash)

@@ -1499,6 +1499,443 @@ pub mod test_support {
         }
         Ok(())
     }
+
+    // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's SERVE
+    //     cursor. Three shared bodies, driven from all three backends, because
+    //     "correct on memory" has never once implied "correct on postgres".
+
+    /// Truncate to microseconds. Postgres `TIMESTAMPTZ` is microsecond
+    /// precision while `Utc::now()` carries nanoseconds, so an instant minted
+    /// at full precision does not survive that round-trip and a cursor built
+    /// from the pre-write value would not equal the stored one (#634).
+    pub fn truncate_to_micros(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        use chrono::Timelike as _;
+        t.with_nanosecond(t.nanosecond() / 1_000 * 1_000)
+            .unwrap_or(t)
+    }
+
+    /// v31.4.0 (CIRISPersist#682) — a self-scrubbed registration whose
+    /// `scrub_timestamp` the caller chooses.
+    ///
+    /// The field is exposed rather than fixed because it is the whole subject
+    /// of #682: `scrub_timestamp` is the PRODUCER's assertion about when it
+    /// signed, and **nothing on this plane constrains it to be recent.** The
+    /// revocation plane has a skew ceiling; the key plane has none. That is
+    /// what makes the failure ordinary rather than adversarial — a peer that
+    /// was offline replicates a months-old registration on reconnect, which is
+    /// the everyday case, not an attack.
+    pub fn self_scrubbed_record_signed_at(
+        key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> KeyRecord {
+        let (ed_pk, mldsa_pk) = ts::hybrid_pubkeys(key_id);
+        let signed_at = truncate_to_micros(scrub_timestamp);
+        KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type::AGENT.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: signed_at,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: signed_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// **v31.4.0 (CIRISPersist#682) — A RECORD REPLICATED LATE IS STILL SERVED,
+    /// on every backend.**
+    ///
+    /// The defect this witnesses, stated as the sequence it drives:
+    ///
+    /// 1. A consumer reads this node's key stream to the end and keeps its
+    ///    cursor.
+    /// 2. A record **signed a year ago** arrives — a peer that was offline
+    ///    reconnects and replicates — and this node admits it now.
+    /// 3. The consumer resumes.
+    ///
+    /// Keyed on `scrub_timestamp`, step 3 returns nothing: the row sorts a year
+    /// back, behind a cursor that has already passed it, and no retry ever
+    /// recovers it because its sort position is fixed by someone else's clock.
+    /// Not late — **never**. On the identity plane that means a peer that never
+    /// learns the key exists, and every signature by that key is unverifiable
+    /// there forever.
+    ///
+    /// Keyed on `admitted_at` it is served, because this node admitted it after
+    /// the cursor was taken.
+    ///
+    /// The old record is admitted SECOND on purpose. Admitting it first would
+    /// pass under either key, and prove nothing.
+    pub async fn exercise_late_replicated_key_record_is_served(
+        directory: &dyn FederationDirectory,
+        tag: &str,
+    ) -> Result<(), Error> {
+        let now = truncate_to_micros(chrono::Utc::now());
+        let early = format!("k682-early-{tag}");
+        let late = format!("k682-late-{tag}");
+
+        // (1) A record signed just now, admitted first. The consumer reads to
+        //     the end and keeps its cursor.
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: self_scrubbed_record_signed_at(&early, now - chrono::Duration::minutes(1)),
+            })
+            .await?;
+        let first_pass = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        let cursor = first_pass
+            .iter()
+            .find(|r| r.record.key_id == early)
+            .map(|r| (r.admitted_at, r.record.key_id.clone()))
+            .unwrap_or_else(|| {
+                panic!("({tag}) #682: the freshly admitted record must be served at all")
+            });
+
+        // (2) THE LATE REPLICATION. Signed a year before the cursor, admitted
+        //     now. This is the everyday case, not an attack.
+        let stale_signed_at = now - chrono::Duration::days(365);
+        assert!(
+            stale_signed_at < cursor.0,
+            "({tag}) #682: the late record's signed instant must be BELOW the consumer's cursor, \
+             or the witness cannot distinguish the two keys"
+        );
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: self_scrubbed_record_signed_at(&late, stale_signed_at),
+            })
+            .await?;
+
+        // (3) The consumer resumes from exactly where it stopped.
+        let resumed = directory
+            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
+            .await?;
+        let served = resumed
+            .iter()
+            .find(|r| r.record.key_id == late)
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #682: a key record signed a year ago and admitted NOW must still be \
+                     served to a consumer resuming from {cursor:?} — keyed on the producer's \
+                     `scrub_timestamp` it sorts a year back, behind the cursor, and is never \
+                     served to that consumer again. On the identity plane that is a peer that \
+                     never learns the key exists. Served: {:?}",
+                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
+                )
+            });
+
+        // The position is THIS node's, and it is not the producer's instant.
+        assert!(
+            served.admitted_at > cursor.0,
+            "({tag}) #682: the served position must be this node's admission instant, strictly \
+             after the cursor — got {}, cursor {}",
+            served.admitted_at,
+            cursor.0
+        );
+        assert_eq!(
+            served.record.scrub_timestamp, stale_signed_at,
+            "({tag}) #682: `scrub_timestamp` keeps its job unchanged — it is the producer's \
+             assertion and is bound into the signed envelope; the fix adds a position beside it \
+             rather than rewriting it"
+        );
+
+        // And the record's own bytes carry no node-local field: one record must
+        // hash identically on every node while each keeps its own arrival
+        // order. That separation is the reason `admitted_at` lives on
+        // `ServedKeyRecord` and not on `KeyRecord`.
+        let stored = directory
+            .lookup_public_key(&late)
+            .await?
+            .unwrap_or_else(|| panic!("({tag}) #682: the late record must be stored"));
+        assert_eq!(
+            serde_json::to_vec(&crate::federation::SignedKeyRecord {
+                record: stored.clone()
+            })
+            .expect("serialize stored"),
+            serde_json::to_vec(&crate::federation::SignedKeyRecord {
+                record: served.record.clone()
+            })
+            .expect("serialize served"),
+            "({tag}) #682: the SERVED record must be byte-identical to the STORED one — the \
+             admission position rides beside the record, never inside it"
+        );
+        Ok(())
+    }
+
+    /// **v31.4.0 (CIRISPersist#668) — a tie LARGER THAN ONE PAGE resumes
+    /// instead of losing its remainder.**
+    ///
+    /// Call after planting: every `expected` row must already share ONE
+    /// `admitted_at`, and `expected.len()` must exceed `page`. The tie cannot
+    /// be produced through the write path — `monotonic_admission_instant`
+    /// allocates strictly above the last position, so two admissions on this
+    /// node never collide — but it is reachable in production two ways, which
+    /// is why this is planted rather than skipped:
+    ///
+    /// - the **V126 backfill** stamps every pre-existing row with its
+    ///   `scrub_timestamp`, and a batch replicated from one producer shares
+    ///   one; and
+    /// - two writers racing read the same `MAX` and tie (the postgres door
+    ///   reads over a connection pool, not under a process-local lock).
+    ///
+    /// Resumed on the instant ALONE, a page ends mid-tie and the next read asks
+    /// for `> instant`, which skips every remaining row at that instant —
+    /// silently, and permanently. Resumed on the `(instant, key_id)` PAIR it
+    /// continues where it stopped.
+    pub async fn assert_one_admission_instant_pages_exactly_once(
+        directory: &dyn FederationDirectory,
+        tag: &str,
+        expected: &[String],
+        page: u32,
+    ) -> Result<(), Error> {
+        assert!(
+            expected.len() > page as usize,
+            "({tag}) #668: the tie must be LARGER than one page or the witness cannot fail — \
+             {} rows against a page of {page}",
+            expected.len()
+        );
+        // The plant is verified, not assumed: a witness whose setup silently
+        // did nothing passes for the wrong reason.
+        let all = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        let tied: Vec<_> = all
+            .iter()
+            .filter(|r| expected.contains(&r.record.key_id))
+            .collect();
+        assert_eq!(
+            tied.len(),
+            expected.len(),
+            "({tag}) #668: every planted row must be readable before paging is measured"
+        );
+        let instants: std::collections::BTreeSet<_> = tied.iter().map(|r| r.admitted_at).collect();
+        assert_eq!(
+            instants.len(),
+            1,
+            "({tag}) #668: the planted rows must share exactly ONE admission instant, or this \
+             witness is not measuring a tie at all — got {instants:?}"
+        );
+
+        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+        let mut seen: Vec<String> = Vec::new();
+        // A ceiling on page reads: without one, a cursor that fails to advance
+        // spins forever instead of failing.
+        let ceiling = all.len() * 2 + 8;
+        let mut pages = 0usize;
+        loop {
+            assert!(
+                pages < ceiling,
+                "({tag}) #668: the cursor stopped advancing — {pages} pages over {} rows",
+                all.len()
+            );
+            pages += 1;
+            let rows = directory
+                .list_signed_key_records_since(cursor.clone(), page)
+                .await?;
+            let Some(last) = rows.last() else { break };
+            for r in &rows {
+                if expected.contains(&r.record.key_id) {
+                    seen.push(r.record.key_id.clone());
+                }
+            }
+            cursor = Some((last.admitted_at, last.record.key_id.clone()));
+        }
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            sorted, deduped,
+            "({tag}) #668: a row was served TWICE while paging a tie — {seen:?}"
+        );
+        let mut want: Vec<String> = expected.to_vec();
+        want.sort();
+        assert_eq!(
+            sorted,
+            want,
+            "({tag}) #668: paging a tie of {} rows {page} at a time must yield every row EXACTLY \
+             once. Resumed on the instant alone, the read after the first page asks for \
+             `> instant` and skips the rest of the tie — silently, and forever.",
+            expected.len()
+        );
+        Ok(())
+    }
+
+    /// **v31.4.0 (CIRISPersist#682) — the admission position survives a
+    /// BACKWARD CLOCK STEP, on this backend's real write path.**
+    ///
+    /// Call after planting every stored position to `future` — an instant an
+    /// hour ahead of the wall clock, which is what a node looks like after an
+    /// NTP correction or a VM restore. Two admissions under a forward clock
+    /// would pass with a bare `Utc::now()` and prove nothing, which is why the
+    /// post-step state is planted rather than waited for.
+    ///
+    /// The allocator's rule is unit-tested in `federation::types`. What this
+    /// asserts, and a unit test cannot, is that it is actually WIRED into
+    /// `put_public_key` on this backend.
+    ///
+    /// It says nothing about the allocator reading the *fallback* position —
+    /// this plant writes the `admitted_at` column itself, which a bare
+    /// `MAX(admitted_at)` sees. That is a separate claim with its own witness:
+    /// [`assert_allocator_reads_the_fallback_position`].
+    pub async fn assert_key_admission_survives_backward_step(
+        directory: &dyn FederationDirectory,
+        tag: &str,
+        future: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        // The plant is verified, not assumed.
+        let before = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        assert!(
+            !before.is_empty(),
+            "({tag}) #682: the backward-step plant needs at least one existing row"
+        );
+        let planted_max = before
+            .iter()
+            .map(|r| (r.admitted_at, r.record.key_id.clone()))
+            .max()
+            .expect("non-empty");
+        assert_eq!(
+            planted_max.0, future,
+            "({tag}) #682: the plant did not take — the last position handed out must be the \
+             stepped-forward instant, or the next admission is not being asked the question"
+        );
+
+        // The consumer has read everything and holds the post-step cursor.
+        let admitted_after_step = format!("k682-step-{tag}");
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: self_scrubbed_record_signed_at(
+                    &admitted_after_step,
+                    truncate_to_micros(chrono::Utc::now()),
+                ),
+            })
+            .await?;
+
+        let resumed = directory
+            .list_signed_key_records_since(Some(planted_max.clone()), u32::MAX)
+            .await?;
+        let served = resumed
+            .iter()
+            .find(|r| r.record.key_id == admitted_after_step)
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #682: a record admitted AFTER a backward clock step must still sort \
+                     after every row admitted before it. Stamped from the bare wall clock it \
+                     lands an hour BELOW the cursor {planted_max:?} a consumer already passed, \
+                     and `> since` skips it permanently. Served: {:?}",
+                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            served.admitted_at > future,
+            "({tag}) #682: the new position must be strictly above the stepped-forward one — got \
+             {}, planted {future}",
+            served.admitted_at
+        );
+        Ok(())
+    }
+
+    /// **v31.4.0 (CIRISPersist#682) — THE ALLOCATOR READS THE EXPRESSION THE
+    /// READER READS**, on the backends whose position can come from a fallback.
+    ///
+    /// Call after planting one row that has NO stored position, so its
+    /// effective position is its `scrub_timestamp` — and plant that instant in
+    /// the FUTURE, so the fallback is the largest position in the table.
+    ///
+    /// This is only reachable where the column is nullable: the sqlite dialect,
+    /// whose `ALTER TABLE` cannot add a NOT NULL column to a populated table
+    /// and cannot alter nullability in place, and memory, which mirrors it.
+    /// Postgres sets NOT NULL after the V126 backfill and has no such row, so
+    /// it correctly reads the bare column and is deliberately not driven here.
+    ///
+    /// The cursor already reads the fallback — `COALESCE(admitted_at,
+    /// scrub_timestamp)`, and `key_record_position` in memory. If the ALLOCATOR
+    /// does not, it is blind to a position the reader can see, and it stamps
+    /// the next admission BELOW that row. A consumer whose cursor has passed
+    /// the fallback row then never sees the new one: #682 exactly, re-entering
+    /// through the allocator instead of through the cursor.
+    pub async fn assert_allocator_reads_the_fallback_position(
+        directory: &dyn FederationDirectory,
+        tag: &str,
+        unstamped_key_id: &str,
+        fallback_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        // The plant is verified, not assumed: the cursor must actually be
+        // serving this row AT its fallback instant, or the allocator is not
+        // being asked the question.
+        let before = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        let planted = before
+            .iter()
+            .find(|r| r.record.key_id == unstamped_key_id)
+            .unwrap_or_else(|| panic!("({tag}) #682: the unstamped row must be served at all"));
+        assert_eq!(
+            planted.admitted_at, fallback_at,
+            "({tag}) #682: the unstamped row's position must come from the FALLBACK — if it does \
+             not, the plant did not take and this witness cannot fail"
+        );
+        assert_eq!(
+            before
+                .iter()
+                .map(|r| r.admitted_at)
+                .max()
+                .expect("non-empty"),
+            fallback_at,
+            "({tag}) #682: the fallback row must hold the LARGEST position in the table, or an \
+             allocator that ignores it would still land above everything by accident"
+        );
+
+        let after_fallback = format!("k682-fb-{tag}");
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: self_scrubbed_record_signed_at(
+                    &after_fallback,
+                    truncate_to_micros(chrono::Utc::now()),
+                ),
+            })
+            .await?;
+
+        let resumed = directory
+            .list_signed_key_records_since(
+                Some((fallback_at, unstamped_key_id.to_owned())),
+                u32::MAX,
+            )
+            .await?;
+        let served = resumed
+            .iter()
+            .find(|r| r.record.key_id == after_fallback)
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) #682: the next admission must sort ABOVE a row whose position comes \
+                     from the `scrub_timestamp` fallback. An allocator reading only the stored \
+                     column cannot see that row, stamps below it, and the new record is invisible \
+                     to every consumer already past it. Served: {:?}",
+                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            served.admitted_at > fallback_at,
+            "({tag}) #682: the new position must be strictly above the fallback one — got {}, \
+             fallback {fallback_at}",
+            served.admitted_at
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

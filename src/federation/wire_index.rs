@@ -500,10 +500,18 @@ pub async fn wire_refs_for_subject(
 
     // Key — no subject-scoped signed read; filtered from the same bulk read
     // the index is built from, which is what keeps it byte-exact.
+    // v31.4.0 (CIRISPersist#682) — hashed as the `SignedKeyRecord` wrapper, NOT
+    // as the `ServedKeyRecord` the cursor now returns. `admitted_at` is THIS
+    // node's position on the record and must stay out of a content hash, or one
+    // key record would hash differently on every node holding it — and the ref
+    // this node advertised would not resolve against the row it stored, because
+    // `entry_as_stored` reloads through `lookup_public_key` and wraps in
+    // `SignedKeyRecord`. Same treatment as the revocation plane (#655).
     for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
         if r.record.key_id == subject_key_id {
             let rk = record_key(&[("key_id", &r.record.key_id)]);
-            out.push(("Key", content_hash_of(&r)?, rk));
+            let wrapped = super::SignedKeyRecord { record: r.record };
+            out.push(("Key", content_hash_of(&wrapped)?, rk));
         }
     }
     for a in dir.list_attestations_for(subject_key_id).await? {
@@ -625,9 +633,15 @@ pub async fn all_kind_hash_keys(
     dir: &dyn super::FederationDirectory,
 ) -> Result<Vec<(&'static str, String, String)>, Error> {
     let mut out = Vec::new();
+    // v31.4.0 (CIRISPersist#682) — hashed as the `SignedKeyRecord` wrapper, NOT
+    // as the `ServedKeyRecord` the cursor now returns: `admitted_at` is this
+    // node's position on the record and must stay out of a content hash, or one
+    // key record would hash differently on every node holding it. Same
+    // treatment as the revocation plane below (#655).
     for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
         let rk = record_key(&[("key_id", &r.record.key_id)]);
-        out.push(("Key", content_hash_of(&r)?, rk));
+        let wrapped = super::SignedKeyRecord { record: r.record };
+        out.push(("Key", content_hash_of(&wrapped)?, rk));
     }
     // Federation-tier-only by construction (the E5 invariant).
     for a in dir.list_attestations_since(None, u32::MAX).await? {
