@@ -160,7 +160,41 @@ jobs:
         # zero TimescaleDB); the agnostic path is what CI must verify. The
         # scoring rollup is a plain table refreshed by an idempotent upsert,
         # so the rollup tests run (not skip) here against the plain table.
-        image: postgres:16
+        #
+        # v32.1.1 — pulled from GHCR, not Docker Hub. A service image is pulled
+        # ONCE PER MATRIX LEG, so this job alone issued eight anonymous Docker
+        # Hub pulls per CI run from GitHub's SHARED runner IPs, where the
+        # anonymous allowance (100/6h/IP) is spent by every other customer on
+        # that address. A 429 there kills the job at "Initialize containers" —
+        # before a line of our code runs — and `auto-retry.yml` then re-ran it,
+        # issuing eight MORE pulls against the limit that had just rejected us.
+        # The retry fed the rate limit it was retrying against.
+        #
+        # GHCR pulls inside Actions are not rate limited, need no secret beyond
+        # the built-in token, and are same-datacenter. `ci-hygiene.yml` mirrors
+        # the upstream tag daily and only pushes when the digest moves, so this
+        # tracks `postgres:16`'s patch releases rather than pinning a stale copy.
+        #
+        # If the mirror is ever empty (a fresh fork, or the hygiene workflow
+        # disabled), this pull fails LOUDLY at container init rather than
+        # silently testing against something else — run `ci-hygiene.yml` by
+        # hand (`workflow_dispatch`) to populate it.
+        image: ghcr.io/cirisai/postgres:16
+        # A service image is pulled by the runner BEFORE any step executes, so
+        # it cannot reuse a `docker/login-action` step — the credentials must be
+        # declared here. Harmless if the package is public (it just
+        # authenticates anyway).
+        #
+        # FORK PRs: a fork's `GITHUB_TOKEN` carries no packages scope, so this
+        # pull fails unless the GHCR package is PUBLIC. Docker Hub's anonymous
+        # pull did work for forks, so this is the one behaviour that narrows.
+        # Set the package's visibility to public (Org -> Packages ->
+        # postgres -> Package settings) to restore fork parity; the image is a
+        # verbatim mirror of an already-public upstream, so there is nothing to
+        # protect by keeping it private.
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_USER: ciris
           POSTGRES_PASSWORD: ciris
