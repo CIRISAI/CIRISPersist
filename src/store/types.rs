@@ -228,6 +228,28 @@ pub struct TraceEventRow {
     // Rule this encodes: **every field in a signature preimage must be
     // recoverable from what is persisted.** The preserve set must equal the
     // verified set.
+    /// v32.1.0 (CIRISPersist#606) — **when THIS node admitted the row**, on its
+    /// own clock. `None` on rows written before V128.
+    ///
+    /// **STAMPED BY THE BACKEND at insert; any value a caller sets here is
+    /// overwritten.** It is this node's observation of its own intake, so a
+    /// caller — including a remote producer whose bytes became this row — must
+    /// not be able to assert it. That is the whole point: the previous liveness
+    /// signal was `MAX(ts)`, and `ts` is the producer's claim, so the signal
+    /// saying *arrival stopped* came from the party that stopped arriving.
+    ///
+    /// NODE-LOCAL AND UNSIGNED. It is not in the CEG envelope, is never
+    /// replicated, and must never enter a canonicalization — two nodes holding
+    /// the same trace legitimately admitted it at different instants. Unlike
+    /// `KeyRecord`, `TraceEventRow` is not hashed wholesale (its integrity comes
+    /// from the `signature` over the `CompleteTrace` it was decomposed from), so
+    /// this field needs no deny-list entry; if that ever changes, it needs one.
+    ///
+    /// Distinct from [`Self::ts`] on purpose — two questions, two fields.
+    /// `ts` answers "how recent is this trace"; this answers "is this node
+    /// receiving".
+    pub admitted_at: Option<chrono::DateTime<chrono::Utc>>,
+
     /// **Did a named-entity pass actually run?** `None` on pre-v32.0.0 rows,
     /// whose signatures cover the older, narrower preimage.
     pub scrub_ner_ran: Option<bool>,

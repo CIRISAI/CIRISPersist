@@ -1248,6 +1248,25 @@ impl Backend for MemoryBackend {
         // batch that contains two rows with the same dedup tuple is a
         // schema bug and would be ON CONFLICT-suppressed in Postgres.
         let mut seen = HashSet::new();
+        // v32.1.0 (CIRISPersist#606) — ONE admission instant for the whole
+        // batch, allocated under the same lock the insert holds.
+        //
+        // Memory must match the SQL backends here or the witnesses that run on
+        // all three stop meaning the same thing — this backend tolerates what
+        // sqlite and postgres reject, which is exactly how a parity gap hides.
+        // Same allocator, same reason: `MAX(admitted_at)` is the liveness
+        // reading, so a backward clock step must still advance it rather than
+        // freezing the max and reading dark while traces land.
+        let last_admitted = state
+            .events
+            .values()
+            .filter_map(|(_, r)| r.admitted_at)
+            .max();
+        let admitted_at = crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last_admitted,
+        );
+
         for row in rows {
             let key = (
                 row.agent_id_hash.clone(),
@@ -1261,12 +1280,20 @@ impl Backend for MemoryBackend {
                 continue;
             }
             if state.events.contains_key(&key) {
+                // A re-delivery is not an arrival: the existing row keeps its
+                // instant, mirroring `ON CONFLICT ... DO NOTHING`. Refreshing
+                // it here would make a stuck producer replaying old batches
+                // look live, which is the failure this column exists to end.
                 conflicted += 1;
                 continue;
             }
             let event_id = state.next_event_id;
             state.next_event_id += 1;
-            state.events.insert(key, (event_id, row.clone()));
+            let mut stored = row.clone();
+            // Stamped by the backend, overwriting whatever the caller set — a
+            // producer must not be able to assert when THIS node received it.
+            stored.admitted_at = Some(admitted_at);
+            state.events.insert(key, (event_id, stored));
             inserted += 1;
         }
         Ok(InsertReport {
@@ -8987,6 +9014,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -11329,6 +11358,8 @@ mod tests {
             scrub_key_id: None,
             scrub_timestamp: None,
             // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+            // v32.1.0 (#606) — the backend stamps this at insert.
+            admitted_at: None,
             scrub_ner_ran: None,
             scrub_applied_trace_level: None,
             scrub_model_digest: None,
@@ -11589,6 +11620,8 @@ mod tests {
                 scrub_key_id: None,
                 scrub_timestamp: None,
                 // v32.0.0 (#690) — no scrub ran here, so no claim is made.
+                // v32.1.0 (#606) — the backend stamps this at insert.
+                admitted_at: None,
                 scrub_ner_ran: None,
                 scrub_applied_trace_level: None,
                 scrub_model_digest: None,

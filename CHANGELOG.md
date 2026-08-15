@@ -5,6 +5,117 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [32.1.0] - 2026-08-15
+
+Additive. No breaking surfaces — `TableUsage` gains a field, `TraceEventRow`
+gains a field, and both are `Option`. Consumers on 32.0.0 need no changes.
+
+### Added — the trace plane's liveness signal stops running on the producer's clock (#606)
+
+A node's only way to answer *"is anything still arriving"* was
+`MAX(trace_events.ts)`. But `ts` is the **producer's** asserted component
+timestamp, carried inside the signed `CompleteTrace`. So the signal that says
+*arrival stopped* was derived from a number supplied by the party that stopped
+arriving.
+
+Filed off CIRISServer 0.5.156's release gate and the RCA for an outage where
+traces stopped for **71 hours and nothing said so**.
+
+Three failure modes, each of which looks like the instrument working:
+
+* **A slow producer clock pins the plane dark while it is being actively fed.**
+  Every batch verifies, every row lands, `count(*)` climbs — and `MAX(ts)` never
+  catches up, so the band sits red and the operator hunts an outage that is not
+  happening. An alarm that fires during correct operation gets muted, and the
+  muted alarm is the one missing during the next real outage.
+* **A fast producer clock pins it green forever.** One row stamped next week and
+  the plane reads healthy through any subsequent silence.
+* **Backfill is indistinguishable from liveness.** A replay of last month's
+  traces moves `count(*)` and not `MAX(ts)`; a replay of a future-dated batch
+  moves the band and not the health. Neither is what *"did anything arrive"*
+  means.
+
+`trace_events` gains `admitted_at` (V128, both dialects), surfaced as
+`TableUsage::newest_admitted_at` beside the existing `newest_ts`. **Two
+questions, two fields** — the axis-fusion rule this substrate applies elsewhere.
+`newest_ts` keeps its exact meaning (the producer's claim, which is the right
+answer for retention and ordering); `newest_admitted_at` answers "is this node
+receiving", which is the one question a liveness band actually asks.
+
+**Stamped by the backend, not the caller.** Any `admitted_at` a caller sets is
+overwritten at insert. A producer — or anything upstream that shaped those bytes
+— must not be able to assert when *this* node received them, or the column
+re-imports the exact dependency it exists to remove.
+
+**Allocated through `monotonic_admission_instant`**, the same allocator #682 uses
+on the key plane, reading the current max inside the insert transaction. A bare
+`now()` would be wrong in a way that matters: under a backward clock step it
+writes values *below* the existing max, so `MAX()` freezes and the plane reads
+dark while traces are actively landing — this issue's own false-outage,
+re-introduced from the other side. One instant per **batch**, not per row: the
+rows of a batch arrived together, and a per-row instant would invent an ordering
+the arrival did not have.
+
+**A re-delivery is not an arrival.** `ON CONFLICT … DO NOTHING` leaves an
+existing row's instant alone. Letting a replay refresh it would make a stuck
+producer look live.
+
+Node-local and unsigned: not in the CEG envelope, never replicated, never
+canonicalized. Two nodes holding the same trace legitimately admitted it at
+different instants. Unlike `KeyRecord`, `TraceEventRow` is not hashed wholesale
+— its integrity comes from the `signature` over the `CompleteTrace` it was
+decomposed from — so the field needs no hash-exclusion entry; a note on the
+field says what to do if that ever changes.
+
+Nullable with **no backfill**, deliberately. A node that upgrades has genuinely
+never observed an admission instant for its history. `None` is a legible zero
+where a synthesized one would be a fabricated observation — and inventing `ts`
+here would re-import the producer-clock dependency wholesale.
+
+Indexed on both dialects, partial on `admitted_at IS NOT NULL`. The index serves
+the two reads that matter and both are `MAX()`: the liveness aggregate and the
+writer's own allocator probe. Without it each becomes a scan of the largest
+table in the schema.
+
+Witnessed on the property that actually matters — **a year-old batch arriving
+now**, which is the everyday case (a peer catching up, a replay), not an exotic
+one. `newest_ts` reads a year in the past and `newest_admitted_at` reads *now*;
+the two must disagree and each must be right about its own question. The witness
+also pins that a caller-supplied instant is overwritten, and that a re-delivery
+conflicts without advancing the reading. Mutation-tested: teaching the insert to
+trust the caller's value turns it red.
+
+Downstream, `operator.trace_plane.*` can drop the caveat it currently ships on
+the wire saying the reading is the producer's clock, and `future_dated` collapses
+back into a clock diagnostic rather than a liveness state.
+
+### Changed — CIRISVerify re-pinned v13.2.0 → v13.3.1
+
+Two upstream releases adopted in one step, all seven pins flipped together (a
+subset bump splits `ciris_crypto` into two graph versions and type-breaks at the
+seam):
+
+* **v13.3.0** — *"a 429 is not a revocation; a schema mismatch is not
+  unreachable."*
+* **v13.3.1** — *"Retry-After is a floor, not a ceiling; a rate-limited gate is
+  inconclusive, not failed"*, one of whose two defects v13.3.0 itself introduced.
+
+**Persist's exposure to both: none.** They touch `revocation.rs`, `https.rs`,
+`error.rs`, `engine.rs` and `validation.rs`; persist references none of them. Its
+revocation plane is storage-local (`check_revocation_authority`, `_bound`,
+`_envelope_binding`, `_scrub_skew`, `_anti_rollback` are persist's own gates over
+stored rows) and its `VerifyError` is `crate::verify::hybrid`'s own enum. The
+fixed paths are the registry HTTPS probe, which persist does not call. Stated
+plainly because "we took the security fix" would overclaim.
+
+Because the v13.3.0 re-pin was merged to `main` but never **tagged**, v13.3.1
+supersedes it cleanly and no persist release ever carried the defective version
+— which is the argument for merging dependency re-pins without tagging them.
+
+Related: CIRISVerify#257 — that error enum has no `#[non_exhaustive]`, so a
+future variant addition is semver-breaking despite a minor bump. Persist holds no
+exhaustive match over it and is unaffected; Edge and Server should check.
+
 ## [32.0.0] - 2026-08-14
 
 ### BREAKING — read this before pinning
