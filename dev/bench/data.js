@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786751393441,
+  "lastUpdate": 1786756657897,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -68351,6 +68351,402 @@ window.BENCHMARK_DATA = {
             "name": "storage_floor/next_sequence_full",
             "value": 290,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d91bfd2234547f98c0d77d5bbde5fd9ae3d1af12",
+          "message": "v31.4.0 — a consumer can register the authority it signs with, and reach the arm that could not fail\n\nv31.4.0 — a consumer can register the authority it signs with, and reach the arm that could not fail",
+          "timestamp": "2026-08-14T19:43:56-05:00",
+          "tree_id": "4ca15affef6d3a9933105ef96500152637fc0846",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/d91bfd2234547f98c0d77d5bbde5fd9ae3d1af12"
+        },
+        "date": 1786756655882,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45673424,
+            "range": "± 26673",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3104660,
+            "range": "± 244349",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 10683,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 16164,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 26678,
+            "range": "± 463",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 73866,
+            "range": "± 390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 34,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 198,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 509,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 579,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1994,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 70,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 221,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 961,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 27414,
+            "range": "± 1182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 68095,
+            "range": "± 4973",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 225555,
+            "range": "± 1430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 10094,
+            "range": "± 582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11427,
+            "range": "± 674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15872,
+            "range": "± 730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 26843,
+            "range": "± 1074",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 4144462,
+            "range": "± 12602",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4840248,
+            "range": "± 61543",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 299640,
+            "range": "± 10845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 890538,
+            "range": "± 27435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 47857127,
+            "range": "± 402509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1482046,
+            "range": "± 42553",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7942801,
+            "range": "± 169785",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 119826457,
+            "range": "± 2606791",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3761322,
+            "range": "± 142562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 19896843,
+            "range": "± 266070",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 6479,
+            "range": "± 108",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 95387,
+            "range": "± 474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 128150,
+            "range": "± 777",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 14464,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 127561,
+            "range": "± 508",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 251080,
+            "range": "± 1129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 48709,
+            "range": "± 208",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 246131,
+            "range": "± 5778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 763261,
+            "range": "± 9411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 68722,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 292566,
+            "range": "± 2319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1643208,
+            "range": "± 14018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1976816,
+            "range": "± 16319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 66,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 59,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 101258,
+            "range": "± 7850",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 96158,
+            "range": "± 3543",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 6753,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 45133,
+            "range": "± 1290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 421180,
+            "range": "± 5126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 523,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 95,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 220,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
