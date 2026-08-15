@@ -1,0 +1,123 @@
+# CI hygiene — remove the Docker Hub rate-limit class, and keep the run list
+# readable.
+#
+# ── WHY THE MIRROR ───────────────────────────────────────────────────────
+# `ci.yml`'s test matrix declares `services: postgres`, and a service image is
+# pulled ONCE PER MATRIX LEG. At eight legs that is eight anonymous Docker Hub
+# pulls per CI run, from GitHub's SHARED runner IPs — where Docker Hub's
+# anonymous allowance (100 per 6h per IP) is spent by every other customer on
+# that address too.
+#
+# The failure mode is self-feeding, which is what makes it worth engineering
+# away rather than retrying harder:
+#
+#   8 pulls/run -> a 429 at "Initialize containers" -> the job dies before it
+#   runs a line of our code -> auto-retry.yml reruns the failed jobs -> EIGHT
+#   MORE PULLS against the limit that just rejected us.
+#
+# The retry is aimed at the thing the retry is causing. `auto-retry.yml`'s own
+# header documents this exact flake as its reason for existing; this workflow
+# removes the cause so that reaction stops firing for it.
+#
+# GHCR is the fix rather than Docker Hub authentication because it removes the
+# ceiling instead of raising it: pulls from ghcr.io inside Actions are not rate
+# limited, authenticate with the built-in GITHUB_TOKEN (no new secret to rotate
+# or leak), and come from the same datacenter, so they are also faster.
+#
+# The mirror is DIGEST-CHECKED and idempotent: if upstream has not moved, it
+# pushes nothing. `postgres:16` is a moving tag, so this also keeps us current
+# with its patch releases rather than pinning a stale copy forever.
+#
+# ── WHY THE PRUNE ────────────────────────────────────────────────────────
+# `auto-retry.yml` listens on `workflow_run: [completed]`, which fires on EVERY
+# CI completion. Its job then gates on `conclusion == 'failure'`, so on a green
+# CI the job is skipped — correctly, and at zero runner cost, because a
+# job-level `if` that is false never allocates.
+#
+# But GitHub still records a workflow-run entry, and there is no way to filter
+# `workflow_run` by conclusion in `on:`. Measured on this repo: 22 of 23
+# auto-retry entries were `skipped`. That is 96% of a workflow's history saying
+# nothing, and it drowns the entries that DO mean something in any run-list
+# view or monitor.
+#
+# So the entries are pruned. Nothing is lost: a skipped auto-retry means "CI did
+# not fail, so there was nothing to retry" — a fact already carried, better, by
+# the CI run it was listening to. What survives is exactly the informative case:
+# an auto-retry entry that SUCCEEDED, meaning it really did detect a transient
+# flake and re-ran something.
+name: ci-hygiene
+
+on:
+  schedule:
+    # Daily. The mirror only pushes when upstream moved; the prune only deletes
+    # entries that carry no information.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-postgres-to-ghcr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Mirror postgres:16 iff upstream moved
+        env:
+          SRC: postgres:16
+          DST: ghcr.io/${{ github.repository_owner }}/postgres:16
+        run: |
+          set -euo pipefail
+          # Compare by DIGEST, not by tag: `postgres:16` is a moving tag, and a
+          # tag comparison would either never update or push every day.
+          src_digest="$(docker manifest inspect "$SRC" | sha256sum | cut -d' ' -f1)"
+          if dst_manifest="$(docker manifest inspect "${DST,,}" 2>/dev/null)"; then
+              dst_digest="$(printf '%s' "$dst_manifest" | sha256sum | cut -d' ' -f1)"
+          else
+              dst_digest="absent"
+          fi
+          echo "src=$src_digest dst=$dst_digest"
+          if [ "$src_digest" = "$dst_digest" ]; then
+              echo "::notice::GHCR mirror already current — nothing pushed."
+              exit 0
+          fi
+          docker pull "$SRC"
+          docker tag "$SRC" "${DST,,}"
+          docker push "${DST,,}"
+          echo "::notice::Mirrored $SRC -> ${DST,,}"
+
+  prune-uninformative-auto-retry-runs:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete SKIPPED auto-retry runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # ONLY conclusion=skipped, and ONLY the auto-retry workflow. A skipped
+          # auto-retry says "CI did not fail" — a fact the CI run itself already
+          # carries. Every other conclusion (success = it really re-ran
+          # something; failure = the retry logic itself broke) is INFORMATION
+          # and is left alone.
+          ids="$(gh api "repos/$REPO/actions/workflows/auto-retry.yml/runs?status=skipped&per_page=100" \
+                   --jq '.workflow_runs[].id' 2>/dev/null || true)"
+          if [ -z "$ids" ]; then
+              echo "::notice::No skipped auto-retry runs to prune."
+              exit 0
+          fi
+          n=0
+          for id in $ids; do
+              # `|| true`: a run deleted by a concurrent prune, or one GitHub is
+              # still finalising, must not fail the job — this is hygiene, not a
+              # gate, and it should never be the reason a day looks red.
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && n=$((n + 1)) || true
+          done
+          echo "::notice::Pruned $n skipped auto-retry run(s)."
