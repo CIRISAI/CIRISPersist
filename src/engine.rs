@@ -7023,6 +7023,14 @@ impl Engine {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::ceg::AttestationListPage, crate::ceg::Error> {
         use crate::ceg::ReadEngine;
+        // v32.2.0 (CIRISPersist#605) — refuse a window bound that does not sort
+        // the way it reads, BEFORE any backend pushes it down.
+        //
+        // Here rather than in each backend: the predicate is a lexicographic
+        // comparison over RFC-3339 text in every one of them, so the invariant
+        // belongs to the filter, and a per-backend check is three chances to
+        // implement it differently — the parity gap this codebase keeps finding.
+        filter.validate()?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => b.list_attestations(filter, cursor, limit, scope).await,

@@ -128,6 +128,7 @@ pub use list::federation::{
     AttestationCursor, AttestationFilter, AttestationListPage, AttesterSet, ComposedVerdict,
     ConfidenceBand, FederationKeyCursor, FederationKeyFilter, FederationKeyListPage, LifecycleView,
     RevocationCursor, RevocationFilter, RevocationListPage, ScoresPage, Tier,
+    OPEN_ENDED_WINDOW_END,
 };
 pub use list::llm::{LlmCallCursor, LlmCallFilter, LlmCallListPage};
 pub use list::tasks::{TaskClass, TaskCursor, TaskFilter, TaskGroup, TaskListPage};
