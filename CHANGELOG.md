@@ -5,6 +5,54 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [31.5.0] - 2026-08-15
+
+### Fixed — SECURITY — a quorum-WITHDRAWN trust root kept projecting Global (#685)
+
+`namespace::is_trust_root` is the load-bearing predicate in `projection_for`: a
+public record from a trust root reaches the **whole federation**, the same scope
+from a plain producer relays over its cohort. It called the bare `is_canonical` /
+`is_infra_attest`, which answer *"does the row carry this role"* and say nothing
+about whether a quorum has since withdrawn it.
+
+So a key whose trust-root role had been withdrawn **kept gossiping globally**.
+The tombstone was stored, verifiable, and unread on this path — the edge existed
+and the reader skipped it. Same shape as #659 (a co-scrub conferring `canonical`
+on any key_id) and #608 (a sanction not covering the sanctioning dimension), and
+`is_infra_attest`'s own doc already said a consumer deciding whether to **trust**
+must call the `_effective` variant. This one decides trust and did not.
+
+**The correct behaviour was established eighteen major versions ago and this one
+path missed it.** `Engine::is_canonical` has been tombstone-aware since v13.1.0
+(#377) — *"a WITHDRAWN canonical reads false"*. The fix restores consistency
+rather than inventing a rule.
+
+**Audited the rest of the family in the same pass**, which the issue asked for:
+every other non-test caller of the bare predicates is either already `_effective`
+or is deliberately asserting SHAPE rather than trust — `accord_carriage`'s
+witness uses the bare form precisely to assert *"the stored row is untouched —
+tombstones never mutate rows"*, which is correct. `is_trust_root` was the only
+production consumer making the mistake.
+
+**The witness withdraws TWICE, and that is the point.** `is_trust_root` is an OR
+over two roles and the baked canonical carries both, so withdrawing one and
+asserting `false` could not distinguish *"both arms consult the tombstone"* from
+*"one arm does and the other short-circuits"*. It withdraws each in turn and pins
+the value after each — including the intermediate assertion that one withdrawal
+alone leaves it **true**.
+
+The two arms also read **different tombstone tables**, which the witness now
+pins: `is_canonical_effective` consults `lookup_canonical_withdrawal` (the
+dedicated canonical table) while `is_infra_attest_effective` consults the generic
+`lookup_role_withdrawal` (V104). A witness using one writer for both would have
+left an arm untested.
+
+Mutation-tested: reverting to the bare predicates reds the final assertion.
+
+Found by a Class D retraction/tombstone sweep and verified against `main` before
+filing — the sweep marked the call sites as read and the consequence as
+inference; the consequence is now confirmed from `is_trust_root`'s own doc.
+
 ## [31.4.0] - 2026-08-14
 
 ### Added — the arm no consumer could reach is reachable now (#603, #604)

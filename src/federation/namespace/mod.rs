@@ -292,18 +292,41 @@ pub fn visibility_for(
 }
 
 /// **Is `key_id` a federation trust root?** `true` iff it is an accord-blessed
-/// canonical server ([`is_canonical`](crate::federation::admission::is_canonical))
-/// OR an accord-blessed build-signing pipeline
-/// ([`is_infra_attest`](crate::federation::admission::is_infra_attest)) — the
-/// two [`AuthorityClass::AccordCoScrub`] roles. The `is_trust_root` the edge
-/// engine consults to promote a commons record to [`Projection::Global`].
+/// canonical server OR an accord-blessed build-signing pipeline — the two
+/// [`AuthorityClass::AccordCoScrub`] roles — **and neither role has been
+/// withdrawn.** The `is_trust_root` the edge engine consults to promote a
+/// commons record to [`Projection::Global`].
+///
+/// # It asks the EFFECTIVE question (v31.5.0, CIRISPersist#685)
+///
+/// This called the bare
+/// [`is_canonical`](crate::federation::admission::is_canonical) /
+/// [`is_infra_attest`](crate::federation::admission::is_infra_attest), which
+/// answer *"does the row carry this role"* and say nothing about whether a
+/// quorum has since withdrawn it. `is_infra_attest`'s own doc says a consumer
+/// deciding whether to **trust** must call the `_effective` variant; this one
+/// decides trust and did not.
+///
+/// The consequence was not subtle. This predicate is the load-bearing test in
+/// [`projection_for`]: a public record from a trust root reaches the **whole
+/// federation**, the same scope from a plain producer relays over its cohort.
+/// So a key whose trust-root role had been withdrawn by quorum **kept gossiping
+/// globally**. The withdrawal was stored, verifiable, and unread on this path —
+/// the edge existed and the reader skipped it, which is the same shape as #659
+/// (a co-scrub conferring `canonical` on any key_id) and #608 (a sanction not
+/// covering the sanctioning dimension).
+///
+/// The `_effective` variants consult
+/// [`lookup_role_withdrawal`](crate::federation::FederationDirectory::lookup_role_withdrawal)
+/// — the V095/V104 tombstone — and treat a withdrawal as disqualifying unless it
+/// is a rotate-in (`superseded_by == key_id`).
 pub async fn is_trust_root(
     directory: &dyn crate::federation::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, crate::federation::Error> {
     Ok(
-        crate::federation::admission::is_canonical(directory, key_id).await?
-            || crate::federation::admission::is_infra_attest(directory, key_id).await?,
+        crate::federation::admission::is_canonical_effective(directory, key_id).await?
+            || crate::federation::admission::is_infra_attest_effective(directory, key_id).await?,
     )
 }
 
