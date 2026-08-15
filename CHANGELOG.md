@@ -166,11 +166,32 @@ alias lives **outside** the generated region, so `pyi_surface.py check` — whic
 verifies coverage, not signatures — would have kept reporting OK while the stub
 told every Python consumer the wrong return type.
 
-**Scope, stated plainly:** the three fields are bound into the signature and
-enforced at the door. They are not yet projected as queryable columns on the
-persisted row — a reader gets them by verifying the envelope, not by a `SELECT`.
-That projection is additive and does not need another major; it is filed as
-follow-up, not implied here as done.
+**The columns are not optional, and an earlier draft of this release got that
+wrong.** V127 adds `scrub_ner_ran`, `scrub_applied_trace_level` and
+`scrub_model_digest` on both dialects, because all three are *inside* the
+signature preimage. Bound but unstored, `scrub_signature` would verify exactly
+once — inside the process that produced it — and be unverifiable by anyone
+forever after. No peer, no operator, not persist itself on a later read could
+rebuild the preimage. A signed claim nobody can check is not evidence; that is
+strictly worse than the ambiguity this issue set out to remove.
+
+The general rule, since this is the second time a version of it has bitten:
+**every field in a signature preimage must be recoverable from what is
+persisted.** The preserve set must equal the verified set.
+
+Nullable, with no backfill, deliberately. A pre-v32.0.0 row made no treatment
+claim, and writing `false` would assert it *was* checked and found unscrubbed —
+so `NULL` means "no claim" and `Some(false)` means "a claim that no pass ran". A
+verifier that collapsed those would read an unscrubbed row as attested.
+
+Caught by the AV-24 round-trip witness, which now rebuilds the preimage
+**entirely from the stored row** rather than from the envelope the pipeline just
+handed it. A test doing the latter would have passed throughout, because the
+envelope holds fields the row does not — reading only what a peer can read is
+what makes it an instrument rather than a restatement. Mutation-tested both
+ways: a field not persisted fires an `expect` naming the column; a field
+persisted *wrong* fails the signature itself, so a column cannot silently drift
+from the preimage it is part of.
 
 ## [31.5.0] - 2026-08-15
 
