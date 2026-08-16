@@ -43,6 +43,41 @@ impl TraceLevel {
             Self::FullTraces => "full_traces",
         }
     }
+
+    /// v32.3.0 (CIRISPersist#701) — how much content the level admits, as a
+    /// rank: `Generic` 0 < `Detailed` 1 < `FullTraces` 2.
+    ///
+    /// Exists so "is this a DOWNGRADE" is one definition rather than a
+    /// comparison open-coded at each site. A scrubber may reduce the level it
+    /// treated content at (the sanctioned remedy when no NER model is
+    /// available); it may never RAISE it, which would claim the content is more
+    /// detailed than what was actually processed.
+    ///
+    /// A named rank rather than `#[derive(Ord)]`: deriving would silently make
+    /// every comparison operator available on a type whose ordering is a
+    /// domain judgement, not an intrinsic one.
+    #[must_use]
+    pub fn detail_rank(self) -> u8 {
+        match self {
+            Self::Generic => 0,
+            Self::Detailed => 1,
+            Self::FullTraces => 2,
+        }
+    }
+
+    /// Parse a wire token back to a level. Inverse of [`Self::as_str`].
+    ///
+    /// v32.3.0 (#701) — needed because a Python scrubber now STATES the level
+    /// it treated content at, and that claim arrives as a wire token.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "generic" => Some(Self::Generic),
+            "detailed" => Some(Self::Detailed),
+            "full_traces" => Some(Self::FullTraces),
+            _ => None,
+        }
+    }
 }
 
 /// Optional correlation metadata

@@ -5,6 +5,89 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [32.3.0] - 2026-08-15
+
+Additive. Both items are defects in **v32.0.0's #690**, reported from a staged
+QA run where they appeared as ten `scrub_treatment_mismatch` refusals and **zero
+traces persisted**.
+
+### Fixed — the refusal message could never differ, and omitted the deciding field (#701)
+
+The `ScrubTreatmentMismatch` guard fires when `applied_trace_level ==
+full_traces && !ner_ran`, and then built its error from `label:
+TraceLevel::FullTraces` and `treated: applied_trace_level` — two values the
+branch condition had *just proven equal*. So every occurrence rendered:
+
+```
+('scrub_treatment_mismatch', 'label=full_traces treated_as=full_traces')
+```
+
+The message showed two identical values, implying a comparison that had failed
+between different things, and omitted `ner_ran` — the one fact that decides
+whether the operator stages a model or relabels. My own comment beside it
+claimed the sender "needs to know WHICH level it was treated at", which is
+exactly what the message structurally could not convey.
+
+The variant now carries `treated_as`, `ner_ran` and `model_digest`. The digest
+is the field that genuinely varies, and it separates two situations that
+otherwise look identical: **no model staged at all**, versus **a model that ran
+and still reported no pass** — a configuration gap and a scrubber bug, with
+different owners.
+
+### Fixed — the sanctioned remedy was unreachable from Python (#701)
+
+#690 documented the honest path for a node with no NER model: treat the content
+at `detailed` and **relabel**, so the claim matches the treatment. A Rust
+`Scrubber` can do that — it owns `&mut BatchEnvelope`. A Python callable could
+not:
+
+* the preservation gate rejects any callable that alters `trace_level`;
+* the outcome's `applied_trace_level` was then read back **off the envelope**,
+  pinning it equal to the incoming label by construction.
+
+So at `full_traces` with no model, a Python callable's only options were
+`ner_ran: true` (a lie) or a guaranteed refusal. **The documented remedy was
+structurally unavailable to the primary consumer** — and the PyO3 constructor
+defaults to `NullScrubber`, so this is the default path, not an edge case.
+
+Python scrubbers may now return a **5-tuple**:
+
+```python
+(scrubbed, modified_count, ner_ran, model_digest, applied_trace_level)
+```
+
+The callable states the level it treated at, and persist relabels the envelope
+to match. The preservation gate stays exactly as strict — the returned envelope
+still may not move `trace_level` itself.
+
+**Downgrade only.** Raising the level is refused: it would claim the content is
+more detailed than what was processed, and would let a `detailed` pass be
+laundered into a `full_traces` label. `TraceLevel::detail_rank` makes "is this a
+downgrade" one definition rather than a comparison open-coded per site.
+
+Shapes are tried widest-first, so a callable that states more is taken at its
+word; the 4-tuple and legacy 2-tuple are unchanged.
+
+**The witness that mattered checks the ENVELOPE, not the return value.** An
+outcome-only assertion passed with the relabel deleted — the outcome said
+`detailed` while the stored trace kept its `full_traces` label with only
+detailed treatment, which is the precise lie #690 exists to forbid. Found by
+mutation, not review, and the test helper now returns the envelope so the
+assertion can see it.
+
+### Known, not fixed — `detailed` passes through silently
+
+`NullScrubber` redacts nothing and reports honestly, so at `detailed` the #690
+door does not fire and an entirely unscrubbed batch is accepted with only a
+`tracing::warn!`. Production runs `detailed`, which means **the loud refusal
+guards the rare path and the silent pass-through covers the common one.**
+
+Not changed here, because the reporter explicitly did not ask for it and a new
+refusal on the default path is a behaviour change that deserves its own
+decision rather than riding a fix. #690 already made `ner_ran` and
+`applied_trace_level` carried, signed facts, which is what makes such a gate
+*possible*; whether to install one is the open question. Filed separately.
+
 ## [32.2.0] - 2026-08-15
 
 Additive. One new refusal on a filter that was silently returning nothing, plus

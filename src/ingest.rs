@@ -150,17 +150,40 @@ pub enum IngestError {
     /// path.
     ///
     /// Lens → HTTP 422: the sender must downgrade the level or load a model.
+    /// v32.3.0 (CIRISPersist#701) — **carries what DISCRIMINATES, not two
+    /// copies of the same constant.**
+    ///
+    /// The v32.0.0 shape had `label` and `treated`, and the guard's own
+    /// condition had already established they were equal — so every occurrence
+    /// rendered `label=full_traces treated_as=full_traces`, and the one field
+    /// that decides the operator's next move, `ner_ran`, was never printed. A
+    /// reader saw two identical values and could not tell whether the label was
+    /// wrong, the treatment was wrong, or something else entirely. Reported
+    /// from a staged QA run: ten of these, zero traces persisted, and nothing
+    /// in the message said why.
+    ///
+    /// `model_digest` is the field that genuinely varies, and it separates two
+    /// different situations that would otherwise look identical: no model
+    /// staged at all, versus a model that ran and still reported no
+    /// named-entity pass (which is a scrubber bug, not a configuration gap).
     #[error(
-        "scrub treatment does not match label: trace_level={label} requires a \
-         named-entity pass, but the scrubber reported ner_ran=false \
-         (treated_as={treated}). Downgrade the level and relabel, or load a \
-         model (CIRISPersist#690)"
+        "scrub treatment does not match label: this batch is labelled \
+         `{treated_as}`, which requires a named-entity pass, and none ran \
+         (ner_ran={ner_ran}, model={model_digest:?}). Either stage a model on \
+         this node, or have the scrubber treat the content at `detailed` and \
+         REPORT that level — from Python, return the 5-tuple \
+         `(scrubbed, count, ner_ran, model_digest, applied_trace_level)` \
+         (CIRISPersist#690, #701)"
     )]
     ScrubTreatmentMismatch {
-        /// The level the batch claims.
-        label: String,
-        /// The level it was actually treated at.
-        treated: String,
+        /// The level the content was treated at — which, at this door, is also
+        /// the level it is labelled.
+        treated_as: String,
+        /// Whether a named-entity pass ran. **This is the discriminating
+        /// fact**, and the reason this refusal exists.
+        ner_ran: bool,
+        /// Digest of the model that ran, if any. `None` = nothing staged.
+        model_digest: Option<String>,
     },
 
     /// Backend write failure (DB unreachable, IO, etc.). Lens → HTTP
@@ -267,9 +290,20 @@ impl IngestError {
             // AV-15-safe: both values are closed-vocabulary trace levels, never
             // user payload — and the sender needs to know WHICH level it was
             // treated at to decide whether to relabel or load a model.
-            IngestError::ScrubTreatmentMismatch { label, treated } => {
-                Some(format!("label={label} treated_as={treated}"))
-            }
+            // v32.3.0 (#701) — report what DISCRIMINATES. The old form printed
+            // `label=X treated_as=X`, two copies of one constant the guard had
+            // already proven equal, and omitted `ner_ran` — the field that
+            // decides whether the operator stages a model or relabels.
+            // AV-15-safe: levels are a closed vocabulary and the digest is a
+            // hash, never user payload.
+            IngestError::ScrubTreatmentMismatch {
+                treated_as,
+                ner_ran,
+                model_digest,
+            } => Some(format!(
+                "treated_as={treated_as} ner_ran={ner_ran} model={}",
+                model_digest.as_deref().unwrap_or("none")
+            )),
             IngestError::Verify(_)
             | IngestError::Scrub(_)
             | IngestError::Store(_)
@@ -583,8 +617,9 @@ where
             && !scrub_outcome.ner_ran
         {
             return Err(IngestError::ScrubTreatmentMismatch {
-                label: TraceLevel::FullTraces.as_str().to_owned(),
-                treated: scrub_outcome.applied_trace_level.clone(),
+                treated_as: scrub_outcome.applied_trace_level.clone(),
+                ner_ran: scrub_outcome.ner_ran,
+                model_digest: scrub_outcome.scrubber_model_digest.clone(),
             });
         }
 
