@@ -1251,33 +1251,44 @@ impl NodeCoreService for PostgresBackend {
         rows.into_iter().map(row_to_contribution).collect()
     }
 
-    async fn list_key_grants_for_stream_epoch(
+    async fn list_key_grants_for_scope_epoch(
         &self,
-        stream_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
         epoch: u64,
     ) -> Result<Vec<ContributionEnvelope>, Error> {
         // u64 epoch → bound i64 (BIGINT); tokio_postgres has no ToSql u64.
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-            Error::InvalidArgument("list_key_grants_for_stream_epoch: epoch exceeds i64".into())
+            Error::InvalidArgument("list_key_grants_for_scope_epoch: epoch exceeds i64".into())
         })?;
         let client = self
             .pool()
             .get()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // v34.0.0 (#704, V129) — the three predicates are written in the
+        // leading order of `contributions_key_grant_scope_epoch`
+        // (scope_kind, scope_id, epoch) so the partial index is a prefix
+        // match, not a scan.
+        //
+        // `key_grant_scope_kind` is NOT decoration: `scope_id` is an id
+        // WITHIN a scope kind, so a transit `netname` and a `stream_id`
+        // may collide as strings. Without this predicate a transit grant
+        // at the same epoch is returned to a STREAMING reader.
         let rows = client
             .query(
                 "SELECT contribution_id::text, contribution_type, domain, language, subject_kind, \
                         author_id, payload, witness_set, submitted_at, signature \
                  FROM cirisnode.contributions \
                  WHERE subject_kind = 'key_grant' \
-                   AND key_grant_scope_id = $1 \
-                   AND key_grant_epoch = $2 \
+                   AND key_grant_scope_kind = $1 \
+                   AND key_grant_scope_id = $2 \
+                   AND key_grant_epoch = $3 \
                  ORDER BY submitted_at DESC, contribution_id DESC",
-                &[&stream_id, &epoch_i64],
+                &[&scope_kind, &scope_id, &epoch_i64],
             )
             .await
-            .map_err(|e| map_pg_error(e, "list_key_grants_for_stream_epoch"))?;
+            .map_err(|e| map_pg_error(e, "list_key_grants_for_scope_epoch"))?;
         rows.into_iter().map(row_to_contribution).collect()
     }
 
@@ -2853,11 +2864,24 @@ mod tests {
         env
     }
 
-    // ── Cut C3b: stream/epoch-addressed grant cascade (CEG §10.5.3) ──
+    // ── Cut C3b: scope/epoch-addressed grant cascade (CEG §10.5.3) ──
 
-    fn build_stream_key_grant(
+    /// The `scope_kind` tokens the reads are addressed by, taken from
+    /// [`KeyGrantScope::as_str`] rather than spelled as literals — the
+    /// tests must not be able to agree with themselves on a token the
+    /// write path does not stamp (V129 header, #704).
+    fn stream_kind() -> &'static str {
+        crate::cirisnode::KeyGrantScope::StreamEpoch.as_str()
+    }
+
+    fn transit_kind() -> &'static str {
+        crate::cirisnode::KeyGrantScope::TransitMembership.as_str()
+    }
+
+    fn build_scope_key_grant(
         author_key: &ed25519_dalek::SigningKey,
-        stream_id: &str,
+        scope: crate::cirisnode::KeyGrantScope,
+        scope_id: &str,
         epoch: u64,
         recipient_key_id: &str,
     ) -> ContributionEnvelope {
@@ -2865,7 +2889,7 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: None,
-            stream_id: Some(stream_id.to_owned()),
+            stream_id: Some(scope_id.to_owned()),
             stream_epoch: Some(epoch),
             wrapped_dek_base64: {
                 use base64::Engine as _;
@@ -2877,8 +2901,8 @@ mod tests {
                 not_before: Utc::now(),
                 not_after: Utc::now() + chrono::Duration::days(30),
             },
-            scope: crate::cirisnode::KeyGrantScope::StreamEpoch,
-            scope_id: stream_id.to_owned(),
+            scope,
+            scope_id: scope_id.to_owned(),
             rotation_chain: vec![],
         };
         let mut env = ContributionEnvelope {
@@ -2903,9 +2927,118 @@ mod tests {
         env
     }
 
-    /// PG parity for the stream/epoch grant cascade: v2 grant admitted,
-    /// projected onto the V064 BIGINT/text columns, served by
-    /// list_key_grants_for_stream_epoch filtered on (stream_id, epoch).
+    fn build_stream_key_grant(
+        author_key: &ed25519_dalek::SigningKey,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        build_scope_key_grant(
+            author_key,
+            crate::cirisnode::KeyGrantScope::StreamEpoch,
+            stream_id,
+            epoch,
+            recipient_key_id,
+        )
+    }
+
+    /// v34.0.0 (#704, CIRISEdge#492) — THE COLLISION WITNESS, PG twin of
+    /// `sqlite_scope_kind_separates_colliding_scope_ids_at_same_epoch`.
+    ///
+    /// `scope_id` is an id WITHIN a `scope_kind`, so the two vocabularies
+    /// are free to collide: an IFAC `netname` may be spelled exactly like
+    /// a `stream_id`. Two grants at the SAME `scope_id` and the SAME
+    /// `epoch`, differing ONLY in `scope_kind`, must not see each other —
+    /// the streaming reader gets the streaming grant, the transit reader
+    /// gets the transit grant, and neither gets both.
+    ///
+    /// This is the ONLY shape that witnesses the `key_grant_scope_kind`
+    /// predicate. Every other test on this read uses distinct
+    /// `scope_id`s, and so passes with the predicate present or absent —
+    /// which is the whole defect being fixed here. Delete
+    /// `AND key_grant_scope_kind = $1` from the PG read and this test
+    /// goes red on both assertions; the neighbouring tests stay green.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_scope_kind_separates_colliding_scope_ids_at_same_epoch() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xD4; 32]);
+        // ONE id string, used as a stream_id AND as a transit netname.
+        let colliding_id = format!("collide-{}", Uuid::new_v4());
+        let epoch = 7u64;
+        let stream_recip = format!("rec-stream-{}", Uuid::new_v4());
+        let transit_recip = format!("rec-transit-{}", Uuid::new_v4());
+
+        let stream_grant = build_scope_key_grant(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::StreamEpoch,
+            &colliding_id,
+            epoch,
+            &stream_recip,
+        );
+        let transit_grant = build_scope_key_grant(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::TransitMembership,
+            &colliding_id,
+            epoch,
+            &transit_recip,
+        );
+        let stream_id_pk = stream_grant.contribution_id.clone();
+        let transit_id_pk = transit_grant.contribution_id.clone();
+        backend.put_contribution(stream_grant).await.unwrap();
+        backend.put_contribution(transit_grant).await.unwrap();
+
+        // The STREAMING read sees exactly the streaming grant.
+        let streaming = backend
+            .list_key_grants_for_scope_epoch(stream_kind(), &colliding_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming.len(),
+            1,
+            "streaming read must not see the transit grant at the same (scope_id, epoch); got {:?}",
+            streaming
+                .iter()
+                .map(|e| e.contribution_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(streaming[0].contribution_id, stream_id_pk);
+        let p: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(streaming[0].payload.clone()).unwrap();
+        assert_eq!(p.scope, crate::cirisnode::KeyGrantScope::StreamEpoch);
+        assert_eq!(p.recipient_key_id, stream_recip);
+
+        // The TRANSIT read sees exactly the transit grant.
+        let transit = backend
+            .list_key_grants_for_scope_epoch(transit_kind(), &colliding_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            transit.len(),
+            1,
+            "transit read must not see the streaming grant at the same (scope_id, epoch); got {:?}",
+            transit
+                .iter()
+                .map(|e| e.contribution_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(transit[0].contribution_id, transit_id_pk);
+        let p: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(transit[0].payload.clone()).unwrap();
+        assert_eq!(p.scope, crate::cirisnode::KeyGrantScope::TransitMembership);
+        assert_eq!(p.recipient_key_id, transit_recip);
+    }
+
+    /// PG parity for the scope/epoch grant cascade: v2 grant admitted,
+    /// projected onto the V129 BIGINT/text columns, served by
+    /// list_key_grants_for_scope_epoch filtered on
+    /// (scope_kind, scope_id, epoch).
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_stream_epoch_grant_round_trip_and_filter() {
@@ -2940,17 +3073,17 @@ mod tests {
             .unwrap();
 
         let rows = backend
-            .list_key_grants_for_stream_epoch(&stream, 1)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "exactly the (stream, epoch=1) grant");
         let rows2 = backend
-            .list_key_grants_for_stream_epoch(&stream, 2)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 2)
             .await
             .unwrap();
         assert_eq!(rows2.len(), 1);
         let none = backend
-            .list_key_grants_for_stream_epoch(&stream, 99)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 99)
             .await
             .unwrap();
         assert!(none.is_empty());
@@ -3005,7 +3138,7 @@ mod tests {
 
         // list(S, 1) = both grantees, and ONLY epoch-1 rows.
         let rows = backend
-            .list_key_grants_for_stream_epoch(&stream, 1)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both (S,1) grantees listed");
@@ -3024,7 +3157,7 @@ mod tests {
         // likewise; (S, 3) is empty.
         assert_eq!(
             backend
-                .list_key_grants_for_stream_epoch(&stream, 2)
+                .list_key_grants_for_scope_epoch(stream_kind(), &stream, 2)
                 .await
                 .unwrap()
                 .len(),
@@ -3032,14 +3165,14 @@ mod tests {
         );
         assert_eq!(
             backend
-                .list_key_grants_for_stream_epoch(&other_stream, 1)
+                .list_key_grants_for_scope_epoch(stream_kind(), &other_stream, 1)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert!(backend
-            .list_key_grants_for_stream_epoch(&stream, 3)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 3)
             .await
             .unwrap()
             .is_empty());
@@ -3054,7 +3187,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             backend
-                .list_key_grants_for_stream_epoch(&stream, 1)
+                .list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
                 .await
                 .unwrap()
                 .len(),
@@ -3082,7 +3215,7 @@ mod tests {
             "got: {err:?}"
         );
         assert!(backend
-            .list_key_grants_for_stream_epoch(&stream, 5)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 5)
             .await
             .unwrap()
             .is_empty());

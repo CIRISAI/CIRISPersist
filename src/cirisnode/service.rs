@@ -286,17 +286,55 @@ pub trait NodeCoreService: Send + Sync {
         recipient_key_id: &str,
     ) -> impl Future<Output = Result<Vec<ContributionEnvelope>, Error>> + Send;
 
-    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — list every
-    /// **stream/epoch-addressed** `key_grant` Contribution for
-    /// `(stream_id, epoch)`, newest-first. This is the catch-up /
-    /// delivery read the epoch-DEK cascade serves; persist returns the
-    /// grants and the consumer (LensCore) applies its own P4 catch-up
-    /// depth cap (the cap is a LensCore knob, NOT a substrate constant —
-    /// §10.5.3). Indexed via the V064 partial index
-    /// `contributions_key_grant_stream_epoch`.
-    fn list_key_grants_for_stream_epoch(
+    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) → v34.0.0
+    /// (CIRISPersist#704, CIRISEdge#492) — list every
+    /// **scope-epoch-addressed** `key_grant` Contribution for
+    /// `(scope_kind, scope_id, epoch)`, newest-first.
+    ///
+    /// `scope_kind` is the
+    /// [`KeyGrantScope::as_str`](super::KeyGrantScope::as_str) token of the scope
+    /// being resolved — the same string the write path projects onto
+    /// `key_grant_scope_kind`. Every epoch-addressed scope reads through
+    /// this ONE function:
+    ///
+    ///   - `"stream_epoch"` — the streaming epoch-DEK cascade
+    ///     (CEG 0.15 §10.5.3). `scope_id` is the `stream_id`. This is
+    ///     the catch-up / delivery read the cascade serves; persist
+    ///     returns the grants and the consumer (LensCore) applies its
+    ///     own P4 catch-up depth cap (the cap is a LensCore knob, NOT a
+    ///     substrate constant — §10.5.3).
+    ///   - `"transit_membership"` — the IFAC transit passphrase for
+    ///     scoped transit (CIRISEdge#492). `scope_id` is the `netname`.
+    ///
+    /// # Why one function and not two
+    ///
+    /// The two scopes are the same OBJECT: an `(id, epoch)` pair with
+    /// exactly one grant set per epoch, rotated by superseding the set
+    /// and converged by reading it. A dedicated
+    /// `list_key_grants_for_transit_epoch` beside a
+    /// `…_for_stream_epoch` would be a second copy of one invariant —
+    /// N implementations that agree only because someone diffed them,
+    /// and that diverge the first time one is fixed alone. This repo
+    /// tracks that failure mode as CIRISPersist#663. There is one
+    /// predicate here because there is one thing to say.
+    ///
+    /// # `scope_kind` is load-bearing, not decoration
+    ///
+    /// `scope_id` is an id WITHIN `scope_kind`, so it is namespaced by
+    /// it and by nothing else: a transit `netname` and a `stream_id`
+    /// are drawn from different vocabularies and may collide as
+    /// strings. Omitting the `scope_kind` predicate would let a transit
+    /// grant whose netname equals some stream id, at the same epoch,
+    /// land in a STREAMING reader's result set — two scopes' wrapped
+    /// DEKs fused into one authorization list. The predicate is also
+    /// what makes the V129 partial index
+    /// `contributions_key_grant_scope_epoch` — leading on
+    /// `(key_grant_scope_kind, key_grant_scope_id, key_grant_epoch)` —
+    /// usable as a prefix rather than a scan.
+    fn list_key_grants_for_scope_epoch(
         &self,
-        stream_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<Vec<ContributionEnvelope>, Error>> + Send;
 
@@ -308,9 +346,9 @@ pub trait NodeCoreService: Send + Sync {
     /// valid in exactly one addressing mode), then runs the FULL
     /// [`put_contribution`](Self::put_contribution) admission — trust
     /// gate + hybrid signature verification + payload re-validation +
-    /// V054/V064 column projection. A stream/epoch-addressed grant
-    /// written here for `(stream_id, epoch)` is served by
-    /// [`list_key_grants_for_stream_epoch`](Self::list_key_grants_for_stream_epoch);
+    /// V054/V129 column projection. A scope-epoch-addressed grant
+    /// written here for `(scope_kind, scope_id, epoch)` is served by
+    /// [`list_key_grants_for_scope_epoch`](Self::list_key_grants_for_scope_epoch);
     /// a content-addressed grant is served by the
     /// [`list_key_grants_for`](Self::list_key_grants_for) /
     /// [`list_key_grants_for_content`](Self::list_key_grants_for_content)

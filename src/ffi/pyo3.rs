@@ -19547,6 +19547,14 @@ impl PyEngine {
     /// `(stream_id, epoch)`, newest-first. JSON array of
     /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
     /// The consumer (LensCore) applies its own P4 catch-up depth cap.
+    ///
+    /// v34.0.0 (CIRISPersist#704) — the substrate read this delegates to
+    /// is now the general
+    /// [`list_key_grants_for_scope_epoch`](crate::cirisnode::NodeCoreService::list_key_grants_for_scope_epoch);
+    /// this Python surface pins `scope_kind =
+    /// KeyGrantScope::StreamEpoch`, so it is the STREAMING half and only
+    /// that half. A transit-membership grant whose `netname` collides
+    /// with `stream_id` at the same epoch is no longer returned here.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_list_key_grants_for_stream_epoch_json(
         &self,
@@ -19565,7 +19573,11 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
                         let rows = backend
-                            .list_key_grants_for_stream_epoch(&stream, epoch)
+                            .list_key_grants_for_scope_epoch(
+                                crate::cirisnode::KeyGrantScope::StreamEpoch.as_str(),
+                                &stream,
+                                epoch,
+                            )
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&rows)
@@ -19579,7 +19591,11 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
                         let rows = backend
-                            .list_key_grants_for_stream_epoch(&stream, epoch)
+                            .list_key_grants_for_scope_epoch(
+                                crate::cirisnode::KeyGrantScope::StreamEpoch.as_str(),
+                                &stream,
+                                epoch,
+                            )
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&rows)
