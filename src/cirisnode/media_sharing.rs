@@ -535,9 +535,19 @@ pub struct KeyGrantPayload {
     pub rotation_chain: Vec<String>,
 
     /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — the IFAC hash-truncation
-    /// size, for a [`KeyGrantScope::TransitMembership`] grant.
+    /// size **in BITS**, for a [`KeyGrantScope::TransitMembership`] grant.
     ///
-    /// **Required iff the scope is transit membership; refused otherwise.**
+    /// **Required iff the scope is transit membership; refused otherwise, and
+    /// bounded to [`IFAC_SIZE_MIN_BITS`]..=[`IFAC_SIZE_MAX_BITS`]** — all three
+    /// halves ENFORCED by [`extract_key_grant_payload`], which is the door
+    /// every write path and both backends reach it through.
+    ///
+    /// This doc made that claim for the whole of this cut with nothing keeping
+    /// it: a transit grant with no `ifac_size`, a `stream_epoch` grant carrying
+    /// one, and `ifac_size: 0` were all admitted. The first of those is the
+    /// expensive one — the recipient unwraps a passphrase it cannot use,
+    /// because it cannot size the interface, and nothing in the delivery path
+    /// reports a problem.
     ///
     /// NOT WRAPPED, deliberately. It is not a secret — a recipient must size
     /// the interface (`add_tcp_server_ifac(addr, netname, passphrase, size)`)
@@ -823,6 +833,90 @@ pub fn extract_takedown_notice_payload(
     Ok(Some(typed))
 }
 
+/// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — smallest admissible
+/// [`KeyGrantPayload::ifac_size`], in BITS.
+///
+/// EVIDENCE, not a house preference. Reticulum — the protocol this grant
+/// delivers a passphrase for — pins `IFAC_MIN_SIZE = 1` byte and honours a
+/// configured `ifac_size` only when it is at least `IFAC_MIN_SIZE*8` bits,
+/// dropping a smaller value back to the interface default (`RNS/Reticulum.py`,
+/// config parse). leviculum, the Rust implementation CIRISEdge actually runs,
+/// mirrors that guard verbatim (`leviculum-std/src/ini_config.rs`: keep the
+/// value only `if bits >= 8`, then store `bits / 8`) — and notes why: a
+/// sub-8-bit value rounds DOWN to zero bytes and silently disables IFAC on an
+/// interface the operator asked to protect.
+///
+/// So the floor is not "0 is obviously wrong". It is the point below which the
+/// two peers stop agreeing about whether the interface is gated at all.
+pub const IFAC_SIZE_MIN_BITS: u16 = 8;
+
+/// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — largest admissible
+/// [`KeyGrantPayload::ifac_size`], in BITS.
+///
+/// The access code is the TAIL of an Ed25519 signature over the frame —
+/// `ifac_identity.sign(raw)[-ifac_size:]` (`RNS/Transport.py::transmit`). An
+/// Ed25519 signature is 64 bytes, so 512 bits is the WHOLE width and there is
+/// nothing above it to truncate to: a larger value does not buy a longer code,
+/// it makes the sender's framing and the receiver's expectation disagree about
+/// how many bytes of the frame are the code. Reticulum's own interface
+/// documentation states the same range from the other side — "can be set to a
+/// custom size between 8 and 512 bits".
+///
+/// PROVENANCE: this bound is read off the Reticulum reference implementation
+/// and its docs, and off leviculum, NOT off anything in this repository —
+/// persist stores the value and never sizes an interface with it. It is
+/// recorded here because a delivery substrate that admits a value its consumer
+/// cannot use has not delivered anything.
+pub const IFAC_SIZE_MAX_BITS: u16 = 512;
+
+/// Enforce [`KeyGrantPayload::ifac_size`]'s doc'd contract — both halves.
+///
+/// The rule lives HERE, beside the addressing checks, rather than in each
+/// backend's write path: `extract_key_grant_payload` is the single door
+/// `put_key_grant` and both supersession emitters pass through, so a rule
+/// written once here cannot be enforced by sqlite and forgotten by postgres.
+///
+/// Ordering note — this runs AFTER the addressing match, on purpose. A
+/// content-addressed payload declaring `scope: transit_membership` is refused
+/// there, by the contradiction it actually contains; reporting a missing
+/// `ifac_size` first would answer a question the caller has not got to yet.
+fn validate_ifac_size(typed: &KeyGrantPayload) -> Result<(), Error> {
+    if typed.scope == KeyGrantScope::TransitMembership {
+        let Some(bits) = typed.ifac_size else {
+            return Err(Error::InvalidArgument(format!(
+                "key_grant: scope={} requires ifac_size (the IFAC hash-truncation \
+                 size, in bits, {IFAC_SIZE_MIN_BITS}..={IFAC_SIZE_MAX_BITS}). It is \
+                 NOT derivable from the grant: the recipient must size the interface \
+                 (add_tcp_server_ifac(addr, netname, passphrase, size)) BEFORE it can \
+                 unwrap the passphrase, so a transit grant without it delivers key \
+                 material its recipient cannot use",
+                KeyGrantScope::TransitMembership.as_str()
+            )));
+        };
+        if !(IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS).contains(&bits) {
+            return Err(Error::InvalidArgument(format!(
+                "key_grant: ifac_size={bits} is outside the IFAC range \
+                 {IFAC_SIZE_MIN_BITS}..={IFAC_SIZE_MAX_BITS} bits. The access code is \
+                 the tail of an Ed25519 signature over the frame, so 512 bits is the \
+                 whole signature and below 8 bits the receiver drops the code to zero \
+                 bytes and stops gating the interface at all"
+            )));
+        }
+        return Ok(());
+    }
+    if let Some(bits) = typed.ifac_size {
+        return Err(Error::InvalidArgument(format!(
+            "key_grant: ifac_size={bits} was sent with scope={}, which addresses no \
+             IFAC interface — only scope={} carries one. Drop ifac_size, or send the \
+             grant with scope={}",
+            typed.scope.as_str(),
+            KeyGrantScope::TransitMembership.as_str(),
+            KeyGrantScope::TransitMembership.as_str()
+        )));
+    }
+    Ok(())
+}
+
 /// v34.0.0 (CIRISPersist#704) — `key_grant` wire keys this cut REMOVED, each
 /// paired with the field that replaces it.
 ///
@@ -892,6 +986,10 @@ fn refuse_removed_key_grant_wire_keys(payload: &serde_json::Value) -> Result<(),
 ///   - `recipient_key_id` / `scope_id` non-empty.
 ///   - `wrapped_dek_base64` is valid base64.
 ///   - `key_validity_window.not_after > not_before`.
+///   - `ifac_size` present iff `scope` is
+///     [`KeyGrantScope::TransitMembership`], and within
+///     [`IFAC_SIZE_MIN_BITS`]..=[`IFAC_SIZE_MAX_BITS`] when present — see
+///     [`validate_ifac_size`].
 ///
 /// Addressing — **exactly one mode** (mirrors the V129
 /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c):
@@ -1028,6 +1126,11 @@ pub fn extract_key_grant_payload(
             }
         }
     }
+
+    // v34.0.0 (#704) — `ifac_size` is required iff the scope is transit
+    // membership, refused otherwise, and range-checked. Its doc comment
+    // asserted the first two for this whole cut with nothing keeping them.
+    validate_ifac_size(&typed)?;
     Ok(Some(typed))
 }
 
@@ -1550,20 +1653,186 @@ mod tests {
     // `scope_ref` arriving from an older caller is refused by name — see
     // `removed_wire_key_scope_ref_is_refused_by_name_704` below.
 
+    /// A VALID transit grant: epoch-addressed, netname as `scope_id`, and an
+    /// in-range `ifac_size` — the shape `validate_ifac_size` admits.
+    ///
+    /// 128 bits = 16 bytes, which is leviculum's convention for a NETWORK
+    /// (TCP/UDP) interface — the medium a CIRIS relay port runs on. A fixture
+    /// value picked from the consumer's conventions rather than from thin air.
+    fn fixture_transit_grant() -> KeyGrantPayload {
+        KeyGrantPayload {
+            scope: KeyGrantScope::TransitMembership,
+            scope_id: "ciris-transit-net".to_owned(),
+            ifac_size: Some(128),
+            ..fixture_stream_grant()
+        }
+    }
+
     /// The transit scope is accepted on the epoch-addressed path — the point of
     /// the generalization. Without this leg the widened check above could be
     /// refusing everything and the negative tests would not notice.
     #[test]
     fn a_transit_membership_grant_is_epoch_addressable_704() {
-        let mut typed = fixture_stream_grant();
-        typed.scope = KeyGrantScope::TransitMembership;
-        typed.scope_id = "ciris-transit-net".to_owned();
+        let typed = fixture_transit_grant();
         let value = serde_json::to_value(&typed).unwrap();
         assert!(
             extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
                 .unwrap()
                 .is_some(),
             "transit membership must validate on the epoch-addressed path"
+        );
+    }
+
+    // ── v34.0.0 (#704): `ifac_size` is required, refused, and bounded ──
+
+    /// REQUIRED half. A transit grant with no `ifac_size` is refused.
+    ///
+    /// This is the shape that cost the most if admitted: the recipient unwraps
+    /// a passphrase and cannot size the interface it belongs to, so the key
+    /// material is undeliverable while every layer reports success.
+    #[test]
+    fn transit_grant_without_ifac_size_is_refused_704() {
+        let mut typed = fixture_transit_grant();
+        typed.ifac_size = None;
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        // ONE contiguous phrase binding the field to its requirement. Two
+        // independent `contains` on "transit_membership" and "ifac_size" would
+        // also pass on the WRONG-SCOPE refusal below, which names both.
+        assert!(
+            matches!(&err, Error::InvalidArgument(m)
+                if m.contains("scope=transit_membership requires ifac_size")),
+            "the refusal must name the field and the scope that requires it: {err:?}"
+        );
+    }
+
+    /// REFUSED half, over EVERY non-transit scope — derived from
+    /// [`KeyGrantScope::ALL`], so a scope added later is covered on its first
+    /// commit rather than when someone remembers to extend a hand-written list.
+    ///
+    /// The fixture is chosen by `is_epoch_addressed` for the same reason: a
+    /// content-addressed base under an epoch scope would be refused by the
+    /// ADDRESSING check instead, and this test would pass while witnessing a
+    /// neighbouring gate.
+    #[test]
+    fn ifac_size_on_a_non_transit_scope_is_refused_704() {
+        for scope in KeyGrantScope::ALL {
+            if scope == KeyGrantScope::TransitMembership {
+                continue;
+            }
+            let mut typed = if scope.is_epoch_addressed() {
+                fixture_stream_grant()
+            } else {
+                fixture_key_grant()
+            };
+            typed.scope = scope;
+            // Admitted WITHOUT the field — so the refusal below has exactly one
+            // available explanation.
+            assert!(
+                extract_key_grant_payload(
+                    KEY_GRANT_SUBJECT_KIND,
+                    &serde_json::to_value(&typed).unwrap()
+                )
+                .unwrap()
+                .is_some(),
+                "the base fixture for {} must be VALID without ifac_size",
+                scope.as_str()
+            );
+
+            typed.ifac_size = Some(128);
+            let value = serde_json::to_value(&typed).unwrap();
+            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+            let named = format!("was sent with scope={}", scope.as_str());
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains(&named)),
+                "the refusal must name the scope it was sent with ({named:?}): {err:?}"
+            );
+        }
+    }
+
+    /// BOUNDS. `0` is refused, and so is every value outside
+    /// `IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS`.
+    ///
+    /// The two boundary values themselves are asserted ADMITTED in the same
+    /// test. Without that leg a range check that refused everything — or one
+    /// off by one at either end — would look identical from here.
+    #[test]
+    fn transit_grant_ifac_size_out_of_range_is_refused_704() {
+        for bits in [
+            0,
+            1,
+            IFAC_SIZE_MIN_BITS - 1,
+            IFAC_SIZE_MAX_BITS + 1,
+            u16::MAX,
+        ] {
+            let mut typed = fixture_transit_grant();
+            typed.ifac_size = Some(bits);
+            let value = serde_json::to_value(&typed).unwrap();
+            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m)
+                    if m.contains(&format!("ifac_size={bits} is outside the IFAC range"))),
+                "ifac_size={bits} must be refused BY VALUE, naming it: {err:?}"
+            );
+        }
+
+        // LITERALS, not the constants — a test that derives its boundary from
+        // the bound it is checking moves WITH a mistake in that bound. This
+        // leg was written against the constants first and MUTATION-TESTED:
+        // with `IFAC_SIZE_MAX_BITS` changed to 511 it stayed green, because
+        // both the admitted value and the refused one shifted underneath it.
+        // 8 and 512 are Reticulum's, and they are spelled here as such.
+        for bits in [8u16, 64, 128, 512] {
+            let mut typed = fixture_transit_grant();
+            typed.ifac_size = Some(bits);
+            let value = serde_json::to_value(&typed).unwrap();
+            assert!(
+                extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+                    .unwrap()
+                    .is_some(),
+                "ifac_size={bits} is inside the range Reticulum accepts and must be \
+                 admitted — the bounds are inclusive at both ends"
+            );
+        }
+    }
+
+    /// The bound VALUES, pinned to their source.
+    ///
+    /// The range test above asserts the RELATION — refused outside, admitted
+    /// at the edges. It cannot see a bound that is simply the wrong number,
+    /// because the wrong number would be the one it tests against. These two
+    /// values are claims about Reticulum, so they are pinned as literals with
+    /// the evidence attached: moving one is then a deliberate act with a red
+    /// test naming what would have to have changed upstream.
+    #[test]
+    fn ifac_size_bounds_are_pinned_to_reticulum_704() {
+        assert_eq!(
+            IFAC_SIZE_MIN_BITS, 8,
+            "Reticulum pins IFAC_MIN_SIZE = 1 byte and honours a configured \
+             ifac_size only at or above IFAC_MIN_SIZE*8 bits; leviculum mirrors \
+             the same >= 8 guard before storing bits/8"
+        );
+        assert_eq!(
+            IFAC_SIZE_MAX_BITS, 512,
+            "the access code is the tail of an Ed25519 signature over the frame \
+             (sign(raw)[-ifac_size:]), which is 64 bytes — 512 bits is the whole \
+             width, and Reticulum's interface documentation states the same range"
+        );
+    }
+
+    /// The gate the write path actually reaches: `put_key_grant` delegates to
+    /// `require_key_grant_envelope`, which delegates here. A rule enforced only
+    /// in the bare extractor would be a rule no writer meets.
+    #[test]
+    fn ifac_size_rule_is_enforced_through_the_put_gate_704() {
+        let mut typed = fixture_transit_grant();
+        typed.ifac_size = None;
+        let env = fixture_grant_envelope(&typed);
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m)
+                if m.contains("scope=transit_membership requires ifac_size")),
+            "got: {err:?}"
         );
     }
 

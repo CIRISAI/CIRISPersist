@@ -169,6 +169,57 @@ def test_transit_membership_grant_round_trips_through_python(tmp_path) -> None:
         eng.close(force=True)
 
 
+def test_transit_grant_without_ifac_size_is_refused_at_the_python_door(tmp_path) -> None:
+    """v34.0.0 (#704) — the required half of `ifac_size`, from the surface a
+    consumer calls.
+
+    A transit grant with no `ifac_size` delivers key material its recipient
+    cannot use: it cannot size the interface, so the passphrase it unwraps
+    installs nothing. The rule is enforced in `extract_key_grant_payload`, but
+    what a host needs to know is that the write RAISES rather than storing a
+    grant nobody can act on — so it is asserted here, at the FFI boundary, and
+    not only one layer down.
+
+    The type is `ciris_persist.Permanent` ("cannot succeed as issued; never
+    retry"), NOT the `ValueError` the read door raises for a bad `scope_kind`.
+    That difference is the point of the typed hierarchy: a caller's retry layer
+    must not treat an unusable grant as a transient write failure and re-send
+    it forever.
+    """
+    eng = _engine(tmp_path)
+    if not hasattr(eng, "cirisnode_put_key_grant_json"):
+        pytest.skip("wheel built without the cirisnode feature")
+    try:
+        env, _ = _sign_key_grant(
+            eng,
+            scope="transit_membership",
+            scope_id="ciris-transit-" + uuid.uuid4().hex[:8],
+            epoch=3,
+            payload_extra={},  # the omission under test
+        )
+        with pytest.raises(ciris_persist.Permanent) as caught:
+            eng.cirisnode_put_key_grant_json(json.dumps(env))
+        assert "scope=transit_membership requires ifac_size" in str(caught.value), (
+            "the refusal must name the field and the scope that requires it, or "
+            f"the caller has no way to fix the call: {caught.value}"
+        )
+
+        # And a value outside Reticulum's 8..=512-bit range is refused too — 0
+        # is the one that reads as "set" while gating nothing.
+        env, _ = _sign_key_grant(
+            eng,
+            scope="transit_membership",
+            scope_id="ciris-transit-" + uuid.uuid4().hex[:8],
+            epoch=3,
+            payload_extra={"ifac_size": 0},
+        )
+        with pytest.raises(ciris_persist.Permanent) as caught:
+            eng.cirisnode_put_key_grant_json(json.dumps(env))
+        assert "is outside the IFAC range" in str(caught.value)
+    finally:
+        eng.close(force=True)
+
+
 def test_scope_kind_separates_a_colliding_netname_from_a_stream_id(tmp_path) -> None:
     """The cross-scope collision the `scope_kind` predicate exists to prevent.
 

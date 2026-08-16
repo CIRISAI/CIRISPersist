@@ -89,6 +89,67 @@ matched the key being rejected rather than the field being recommended. The
 witness now pins a contiguous directive phrase per key; before that fix, stripping
 every replacement name from the messages killed one test of four.
 
+### BREAKING — the Python surface reaches transit grants, or the feature does not ship
+
+**PyO3 rename, no alias:**
+
+```
+Engine.cirisnode_list_key_grants_for_stream_epoch_json(stream_id, epoch)
+    -> Engine.cirisnode_list_key_grants_for_scope_epoch_json(scope_kind, scope_id, epoch)
+```
+
+The substrate read generalized above; this door did not. It pinned `scope_kind =
+KeyGrantScope::StreamEpoch` at both backend arms, and it is the **only** Python
+entry point for epoch-addressed grants — so consumers reaching persist through
+the wheel could not retrieve a `transit_membership` grant at all. Every Rust gate
+was green while no host could call the release's headline feature. This repo has
+shipped that class before, and it is why "shipped" here means host-reachable and
+not code-path-exists.
+
+A `#[deprecated]` alias forwarding to the streaming half was rejected for the
+reason the removals above were: it preserves the false assurance. A caller asking
+it for transit grants gets `[]` and reads it as "none issued". The name is
+deleted, so a stale Python caller gets an `AttributeError` naming the method.
+
+**`scope_kind` is refused, not silently queried.** An unknown token, or a real
+scope that is not epoch-addressed (`single_content`, `group_member`), raises
+`ValueError` naming the accepted tokens. `key_grant_scope_kind` is projected only
+for epoch-addressed grants, so such a query matches no row *by construction* and
+would return `[]` — indistinguishable from "no grants issued for this netname".
+On a key-delivery read that is a fail-open: the caller concludes it holds no key
+material and carries on.
+
+The accepted tokens are **derived**, never re-spelled: `KeyGrantScope::ALL`
+filtered by `is_epoch_addressed()` and rendered by `as_str()`, via the new
+`KeyGrantScope::{ALL, from_wire_str, epoch_addressed_tokens}`. `ALL` is held total
+against serde's derive-generated `expected one of …` vocabulary — a second
+enumeration nobody maintains — so a future scope kind reaches every refusal
+message on its first commit. The one remaining hand-spelled copy of this
+vocabulary, in `extract_key_grant_payload`'s refusal, now calls the derived form;
+the near-miss recorded at the end of this entry is the reason that mattered.
+
+### Fixed — the cirisnode Python surface enters CI
+
+`tests/python/test_transit_key_grant_surface.py` writes a `transit_membership`
+grant (netname, epoch, wrapped passphrase, `ifac_size`) through
+`cirisnode_put_key_grant_json`, reads every field back through the scope-epoch
+door, and proves a `stream_epoch` query at the **same** id and epoch does not see
+it. It signs through the shipped surface (`local_sign` +
+`canonicalize_envelope_for_signing`), so it walks a consumer's path rather than a
+test-only one.
+
+**It would have skipped.** `maturin develop --features …` *replaces*
+`[tool.maturin] features` rather than unioning with it, so the wheel CI runs
+pytest against carried `pyo3,sqlite` and **not** `cirisnode` — the entire
+cirisnode Python surface, key grants included, has been outside pytest since it
+landed, while every released wheel shipped it. Probing CI's exact feature line
+finds `cirisnode_put_key_grant_json` absent from the module. One word added to
+`ci.yml`; the suite goes to 46 passed, 0 skipped.
+
+The new witness was mutation-verified before it was trusted: pinning `scope_kind`
+back to `StreamEpoch` reds both the round-trip and the collision test, and
+dropping the refusal guard reds the refusal test alone.
+
 ### BREAKING — the classical wrap algorithm is GONE
 
 `WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm` (v1 — X25519 + AES-128-GCM HPKE) is
@@ -136,6 +197,84 @@ only backend, refutable and panicking when it is not. One more instance of
 "certify per feature SET, never a union": the union of features is the one
 configuration in which this class is invisible.
 
+### BREAKING — `ifac_size` is required on a transit grant, refused on every other, and bounded
+
+`KeyGrantPayload::ifac_size` documented itself as "Required iff the scope is
+transit membership; refused otherwise." **Nothing enforced either half.** A
+`transit_membership` grant with no `ifac_size`, a `stream_epoch` grant carrying
+one, a content-addressed grant carrying one, and `ifac_size: 0` were all admitted
+— verified from Python before the fix.
+
+The expensive one is the first. The recipient unwraps a passphrase and cannot size
+the interface it belongs to (`add_tcp_server_ifac(addr, netname, passphrase,
+size)`), so the key material is undeliverable while every layer reports success.
+This is a doc making a claim no code keeps — the class this cut has been removing
+throughout — and it is fixed now because adding a required field is a BREAK, and
+this is the last unreleased opportunity before the first mesh agent.
+
+Enforced in `extract_key_grant_payload`, the one door `put_key_grant` and both
+supersession emitters pass through, so the rule cannot be kept by sqlite and
+forgotten by postgres. It runs *after* the addressing match deliberately: a
+content-addressed payload declaring `scope: transit_membership` is refused there,
+by the contradiction it actually contains.
+
+**The range is 8..=512 bits, and both bounds are evidence, not judgement.** The
+floor is not "0 is obviously wrong": Reticulum pins `IFAC_MIN_SIZE = 1` byte and
+honours a configured size only at or above `IFAC_MIN_SIZE * 8` bits, and leviculum
+mirrors that guard with the reason attached — a sub-8-bit value rounds **down to
+zero bytes and silently stops gating the interface**. The ceiling is the
+mechanism: the access code is the tail of an Ed25519 signature over the frame
+(`sign(raw)[-ifac_size:]`), so 512 bits is the whole 64-byte width, and a larger
+value only makes sender framing and receiver expectation disagree. Reticulum's
+interface documentation states the same range independently.
+`IFAC_SIZE_MIN_BITS` / `IFAC_SIZE_MAX_BITS` are exported so a consumer builds
+against the bounds it will be judged by instead of copying two magic numbers.
+
+Multiple-of-8 was considered and **not** enforced: RNS floors `bits / 8`, so 12
+bits means one byte to both peers — consistent, merely lossy. Refusing it would
+make persist stricter than the reference implementation and reject a config
+`rnsd` accepts.
+
+### Fixed — the supersession sentinel copied HALF of an addressing tuple
+
+`emit_key_grant_supersession{,_sqlite}` built the revocation sentinel by copying
+`scope` from the prior grant — possibly `transit_membership` — while hard-coding
+`ifac_size: None`. Under the rule above, `retire_key_grants` on a transit grant
+would emit a payload its own validator refuses.
+
+**It would not have raised.** `retire_key_grants` counts a failed emission into
+`supersedes_failed`, logs a warning, and returns `Ok`: a caller checking only the
+`Result` sees a successful retirement that retired nothing, and the transit
+passphrase stays live. The witnesses therefore assert `supersedes_failed == 0`,
+not merely the `Ok`.
+
+The sentinel now carries `prior.ifac_size`, exactly as it already carries `scope`
+and `scope_id`. It describes the **same** interface on the same netname; there is
+no reading in which its scope carries over and its interface size does not. This
+is the `scope_ref`/`scope_id` shape collapsed above, one field over.
+
+Backend fixtures now DERIVE `ifac_size` from `scope` rather than taking it as an
+argument — a fixture that sets one half of that pair by hand stops describing a
+grant the write path admits.
+
+Also removed: `retire_key_grants`'s doc still specified the sentinel's
+`wrap_algorithm` as `HpkeRfc9180BaseX25519AesGcm`, a variant this cut deleted. The
+emitter has always copied the prior grant's algorithm.
+
+### One mutation survivor, recorded
+
+The range witness was written against `IFAC_SIZE_MIN_BITS` / `IFAC_SIZE_MAX_BITS`
+and mutation-tested: changing the ceiling to 511 left it **green**, because the
+admitted value and the refused value both shifted underneath it.
+
+> A test that derives its boundary from the bound it checks can only ever see the
+> RELATION. It cannot see a bound that is simply the wrong number.
+
+The admit leg now spells `8` and `512` as literals, and
+`ifac_size_bounds_are_pinned_to_reticulum_704` pins both values with their
+evidence — so moving one is a deliberate act, with a red test naming what would
+have to have changed upstream to justify it.
+
 ### Added — `ifac_size`
 
 The IFAC hash-truncation size for a transit grant. **Not wrapped**, deliberately:
@@ -144,6 +283,12 @@ passphrase — folding it into the ciphertext would make the grant unusable by t
 party it is addressed to. A typed `Option<u16>` rather than a value parsed out of
 an identifier, because an identifier carrying a second value inside it is a
 schema hiding in a string that nothing validates.
+
+`Option` remains the type, but it is not optional in the sense a reader would
+assume — presence is determined by `scope`, enforced and bounded per the BREAKING
+entry above. This paragraph originally shipped in this same cut describing the
+field as merely *documented* required, which is precisely the gap that entry
+closes.
 
 ### The two findings worth reading
 

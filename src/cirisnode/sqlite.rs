@@ -1875,8 +1875,14 @@ async fn emit_key_grant_supersession_sqlite(
         scope: prior.scope,
         scope_id: prior.scope_id.clone(),
         rotation_chain,
-        // v34.0.0 (#704) — transit-only; absent on every other scope.
-        ifac_size: None,
+        // v34.0.0 (#704) — CARRIED, exactly as `scope` and `scope_id` above
+        // are. The sentinel describes the SAME interface on the same netname;
+        // there is no reading in which its scope carries over and its interface
+        // size does not. Hard-coding `None` here made `retire_key_grants` on a
+        // transit grant emit a payload `extract_key_grant_payload` refuses —
+        // and `retire_key_grants` swallows that into `supersedes_failed` with a
+        // warn log, so the retirement would have failed QUIETLY.
+        ifac_size: prior.ifac_size,
     };
     let payload_value = serde_json::to_value(&supersession_payload)
         .map_err(|e| Error::Internal(format!("supersession serialize: {e}")))?;
@@ -3200,6 +3206,12 @@ mod tests {
         crate::cirisnode::KeyGrantScope::TransitMembership.as_str()
     }
 
+    /// v34.0.0 (#704) — the IFAC hash-truncation size every transit fixture
+    /// here carries, in BITS. 128 = 16 bytes, leviculum's convention for a
+    /// network (TCP/UDP) interface, and inside the
+    /// `IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS` range the extractor enforces.
+    const FIXTURE_IFAC_SIZE_BITS: u16 = 128;
+
     fn build_scope_key_grant_sqlite(
         author_key: &ed25519_dalek::SigningKey,
         scope: crate::cirisnode::KeyGrantScope,
@@ -3225,8 +3237,13 @@ mod tests {
             scope,
             scope_id: scope_id.to_owned(),
             rotation_chain: vec![],
-            // v34.0.0 (#704) — transit-only; absent on every other scope.
-            ifac_size: None,
+            // v34.0.0 (#704) — DERIVED from `scope`, never passed in: the
+            // extractor requires it iff the scope is transit membership and
+            // refuses it otherwise, so a fixture that set one half by hand
+            // would stop describing a grant the write path admits. 128 bits =
+            // 16 bytes, leviculum's convention for a network interface.
+            ifac_size: (scope == crate::cirisnode::KeyGrantScope::TransitMembership)
+                .then_some(FIXTURE_IFAC_SIZE_BITS),
         };
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
@@ -3638,6 +3655,126 @@ mod tests {
                 .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_b_id.as_str())))
                 .unwrap_or(false)),
             "supersession grant referencing prior_b_id"
+        );
+    }
+
+    /// Seed `federation_keys` for an actor so `put_contribution`'s
+    /// signature-verify path clears. Same record shape the retire test above
+    /// builds inline.
+    async fn seed_actor_federation_key_sqlite(backend: &SqliteBackend, author: &str) {
+        use crate::federation::FederationDirectory;
+        let record = crate::federation::types::KeyRecord {
+            key_id: author.to_owned(),
+            pubkey_ed25519_base64: author.to_owned(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: author.to_owned(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": author }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.to_owned(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
+            .unwrap();
+    }
+
+    /// v34.0.0 (#704) — THE CASE THAT WOULD HAVE BROKEN. Retiring a
+    /// `transit_membership` grant succeeds end-to-end, and the sentinel carries
+    /// the prior grant's `ifac_size`.
+    ///
+    /// Making `ifac_size` required on transit grants puts the supersession
+    /// emitter under its own validator: the sentinel copies `scope` from the
+    /// prior grant, so it declares `transit_membership` and must satisfy the
+    /// same rule the prior did. With `ifac_size: None` hard-coded there,
+    /// `put_contribution` refuses the sentinel — and `retire_key_grants` does
+    /// not propagate that: it counts the row into `supersedes_failed`, logs a
+    /// warning, and returns `Ok`. The caller sees a successful retirement that
+    /// retired nothing, which is why `supersedes_failed` is asserted here and
+    /// not just the `Ok`.
+    #[tokio::test]
+    async fn sqlite_retire_key_grants_supersedes_a_transit_grant_704() {
+        let (backend, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]);
+        let author = pubkey_b64(&author_key);
+        seed_actor_federation_key_sqlite(&backend, &author).await;
+
+        let netname = format!("ciris-transit-{}", Uuid::new_v4());
+        let epoch = 4u64;
+        let recip = format!("rec-transit-{}", Uuid::new_v4());
+        let prior = build_scope_key_grant_sqlite(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::TransitMembership,
+            &netname,
+            epoch,
+            &recip,
+        );
+        let prior_id = prior.contribution_id.clone();
+        cn.put_contribution(prior).await.unwrap();
+
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            author_key.clone(),
+            author.clone(),
+            None,
+            None,
+        ));
+        let signer = LocalSignerHardwareAdapter::new(local);
+        let report = cn
+            .retire_key_grants(&author, &signer, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.grants_seen, 1);
+        assert_eq!(
+            report.supersedes_failed, 0,
+            "the transit supersession must be EMITTED, not swallowed into \
+             supersedes_failed — a retirement that fails quietly leaves the \
+             passphrase live"
+        );
+        assert_eq!(report.supersedes_emitted, 1);
+
+        // The sentinel is addressed exactly like its prior, so the transit read
+        // at the same (netname, epoch) serves both.
+        let rows = cn
+            .list_key_grants_for_scope_epoch(transit_kind(), &netname, epoch)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "prior grant + its supersession sentinel");
+        let sentinel = rows
+            .iter()
+            .find(|g| {
+                g.payload
+                    .get("rotation_chain")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_id.as_str())))
+                    .unwrap_or(false)
+            })
+            .expect("supersession grant referencing the prior transit grant");
+        assert_eq!(
+            sentinel
+                .payload
+                .get("wrapped_dek_base64")
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "CEG 0.3 §5.6.8.4 revocation sentinel: empty DEK base64"
+        );
+        assert_eq!(
+            sentinel.payload.get("ifac_size").and_then(|v| v.as_u64()),
+            Some(u64::from(FIXTURE_IFAC_SIZE_BITS)),
+            "the sentinel must carry the PRIOR grant's ifac_size — it describes \
+             the same interface on the same netname"
         );
     }
 

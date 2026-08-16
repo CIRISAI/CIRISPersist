@@ -380,15 +380,22 @@ pub trait NodeCoreService: Send + Sync {
     /// grant is retired by issuing a FRESH `key_grant` Contribution
     /// with:
     ///
-    ///   - Same `recipient_key_id` + `content_sha256` as the prior
-    ///     grant.
+    ///   - The prior grant's ADDRESSING and description carried
+    ///     verbatim: `recipient_key_id`, `content_sha256`, `epoch`,
+    ///     `scope`, `scope_id`, `wrap_algorithm`, `ratchet_version`
+    ///     and — v34.0.0 (#704) — `ifac_size`. The sentinel names the
+    ///     same grant; a field copied by halves would describe a
+    ///     different one.
     ///   - `wrapped_dek_base64` set to an empty/zero marker
     ///     (revocation sentinel; recipient sees zero-length DEK and
     ///     knows the grant is retired).
-    ///   - `wrap_algorithm = HpkeRfc9180BaseX25519AesGcm` (CEG 0.3
-    ///     §5.6.8.4).
     ///   - `rotation_chain` extended with the prior grant's
     ///     `contribution_id`.
+    ///
+    /// v34.0.0 (#704) — the `wrap_algorithm =
+    /// HpkeRfc9180BaseX25519AesGcm` line this block carried is gone with
+    /// the variant: the emitter has always copied the prior grant's
+    /// algorithm, and the classical wrap no longer exists to name.
     ///
     /// `actor_key_id` is the `author_id` of the prior grants. `signer`
     /// produces the canonical Ed25519 signature for the new
