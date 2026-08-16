@@ -7,36 +7,101 @@ threat-model citations because this crate's audit story is the point.
 
 ## [34.0.0] - 2026-08-16
 
-**IN PROGRESS — not yet certified.** Entry exists so in-flight code may
-reference the version it will ship in; the gate that enforces that is the reason
-this is written before the work is finished, not after.
+**Unblocks CIRISEdge scoped transit (CIRISEdge#492).** *No configuration
+required* is the feature: CIRIS peers route compliant PQC CEG/RNS traffic
+without an operator distributing a shared secret by hand, which is exactly what
+a rotating PQC grant replaces.
 
-### BREAKING — one epoch-addressing mechanism, and no classical wrap (#704)
+### BREAKING — one epoch-addressing mechanism, not two
 
 `key_grant` addressing generalizes from `(stream_id, stream_epoch)` to
-`(scope_kind, scope_id, epoch)` (V129, both dialects). **The addressing XOR stays
-TWO-WAY** — content-addressed XOR scope-epoch-addressed — with streaming and
-transit membership as two *values* of `scope_kind`. Generalizing removed the
-pressure to ever add a third addressing category rather than adding one.
+`(scope_kind, scope_id, epoch)` — V129, both dialects, with the columns renamed
+in place so existing rows carry.
 
-`KeyGrantScope::TransitMembership` carries the IFAC transit passphrase for
-CIRISEdge#492's scoped transit. It is structurally identical to the streaming
-epoch cascade — an `(id, epoch)` pair, one grant set per epoch, rotated by
-supersession and converged by reading the set — which is why it is a second
-value rather than a parallel implementation.
+**The addressing XOR stays TWO-WAY.** Content-addressed XOR
+scope-epoch-addressed, with streaming and transit membership as two *values* of
+`scope_kind`. Generalizing did not add a third addressing category — it removed
+the pressure to ever add one.
 
-`scope_kind` carries no closed-value CHECK, deliberately: pinning the set would
-mean a migration per future scope kind, which is the cost this removes.
+`KeyGrantScope::TransitMembership` carries the IFAC transit passphrase. It is
+structurally identical to the streaming epoch cascade — an `(id, epoch)` pair,
+one grant set per epoch, rotated by supersession, converged by reading the set —
+which is why it is a second value rather than a parallel implementation. A
+parallel copy would be N implementations of one invariant agreeing only because
+someone diffed them (#663).
 
-**`WrapAlgorithm` v1 (`hpke_rfc9180_base_x25519_aes_gcm`) is GONE** — not
-deprecated, not rejected per-scope. A per-scope rejection rule would imply v1
-still lives somewhere. A stored v1 grant now fails at parse with a message
-naming the algorithm, rather than being folded onto the PQC variant.
+`scope_kind` carries **no closed-value CHECK**, deliberately: pinning the set
+would mean a migration per future scope kind, which is the cost this removes.
 
-**Blocks CIRISEdge until it lands.** *No configuration required* is the feature:
-scoped transit exists so CIRIS peers route compliant PQC CEG/RNS traffic without
-an operator distributing a shared secret by hand, which is exactly what the
-rotating grant replaces.
+**Trait rename, no deprecated alias:**
+
+```
+list_key_grants_for_stream_epoch(stream_id, epoch)
+    -> list_key_grants_for_scope_epoch(scope_kind, scope_id, epoch)
+```
+
+### BREAKING — the classical wrap algorithm is GONE
+
+`WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm` (v1 — X25519 + AES-128-GCM HPKE) is
+removed: variant, wire token, parse arm. Not deprecated, not rejected per-scope.
+
+A per-scope "reject v1" rule was the obvious shape and is the wrong one — it
+implies v1 still lives somewhere. The fleet directive is that classical-only
+paths do not exist to be chosen. A stored v1 grant now fails at parse with a
+message naming the algorithm, rather than being silently folded onto the PQC
+variant.
+
+Three tests asserting "v1 is rejected" were **deleted rather than flipped**:
+that state is now unconstructible, so rewriting them would have produced tests
+whose names no longer described what they checked. The rule they enforced at
+runtime is the type system's.
+
+### Added — `ifac_size`
+
+The IFAC hash-truncation size for a transit grant. **Not wrapped**, deliberately:
+it is not a secret, and a recipient needs it *before* it can unwrap the
+passphrase — folding it into the ciphertext would make the grant unusable by the
+party it is addressed to. A typed `Option<u16>` rather than a value parsed out of
+an identifier, because an identifier carrying a second value inside it is a
+schema hiding in a string that nothing validates.
+
+### The two findings worth reading
+
+**A cross-scope collision the old read could not see.** Without a `scope_kind`
+predicate, a transit `netname` equal to a `stream_id` at the same epoch is
+returned by the *streaming* read. The witness is the collision itself: one id
+used as both, same epoch, both written through the real write door. With the
+predicate deleted that test goes red on both backends — while
+`*_stream_epoch_grant_round_trip_and_filter` and
+`*_put_key_grant_writer_round_trip_epoch_isolation` **stay green**. They use
+distinct `scope_id`s, so they were never witnessing this; the pre-existing tests
+would have carried the defect indefinitely.
+
+**The index claim was measured, and the measurement hides itself.** On a
+200k-row replica:
+
+| | cost | buffers | exec |
+|---|---|---|---|
+| with `scope_kind` | `0.42..8.44` | 6 | 0.028 ms |
+| without | `0.42..2751.89` | 384 | 0.670 ms |
+
+Both plans read `Index Scan using contributions_key_grant_scope_epoch` —
+postgres lists non-leading equality quals under `Index Cond` either way, so **the
+plan node name alone hides the defect**. Only cost and buffers show that without
+the leading column the scan traverses every `scope_kind` partition. On an empty
+table the two plans are byte-identical, so verifying this with a bare `EXPLAIN`
+on a fresh database would show nothing at all.
+
+### One near-miss, recorded
+
+The write path stamps `KeyGrantScope::as_str()` (`stream_epoch`); V129's backfill
+initially stamped `'stream'`. Two vocabularies for one column — and because the
+column is deliberately unconstrained, **both insert happily**. Any later read
+filtering on `scope_kind` would have silently skipped the carried rows, and a
+missing row is not an error anywhere; it just looks like the grant was never
+issued. Aligned to the tokens the code emits, with a note in both migrations
+that any future divergence belongs in Rust beside `as_str()` — never as a second
+spelling agreed by hand across a migration and a writer.
 
 ## [33.0.0] - 2026-08-16
 
