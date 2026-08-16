@@ -778,6 +778,25 @@ pub fn extract_key_grant_payload(
                 .as_deref()
                 .expect("content_addressed => Some");
             validate_hex_64("content_sha256", sha)?;
+
+            // v34.0.0 (#704) — the ADDRESSING and the declared SCOPE must
+            // agree. A content-addressed payload declaring an epoch-addressed
+            // scope projects `scope_kind` NOT NULL beside a NULL `scope_id`,
+            // which the V129 CHECK (postgres) and trigger (sqlite) refuse.
+            //
+            // So it already failed closed — but as an opaque backend error,
+            // raised twice, once per dialect, describing a constraint name
+            // rather than the caller's mistake. The invariant belongs to the
+            // payload, so it is checked once, here, and says what is wrong.
+            if typed.scope.is_epoch_addressed() {
+                return Err(Error::InvalidArgument(format!(
+                    "key_grant: content-addressed grant declares scope={}, which is \
+                     epoch-addressed. A content grant carries no (scope_id, epoch), so \
+                     the two cannot both hold — set scope to a content scope, or address \
+                     the grant by scope_id + epoch",
+                    typed.scope.as_str()
+                )));
+            }
         }
         (false, true) => {
             // Stream/epoch-addressed: both fields present, v2 wrap required.
@@ -795,9 +814,14 @@ pub fn extract_key_grant_payload(
                     typed.wrap_algorithm.as_str()
                 )));
             }
-            if typed.scope != KeyGrantScope::StreamEpoch {
+            // v34.0.0 (#704) — was pinned to `StreamEpoch`, which would now
+            // reject every transit grant. The check is the same one the write
+            // path and the V129 rule use, so all three agree by construction
+            // rather than by three people writing the same `matches!`.
+            if !typed.scope.is_epoch_addressed() {
                 return Err(Error::InvalidArgument(format!(
-                    "key_grant: stream/epoch-addressed grant requires scope=stream_epoch, got {}",
+                    "key_grant: scope-epoch-addressed grant requires an epoch-addressed \
+                     scope (stream_epoch | transit_membership), got {}",
                     typed.scope.as_str()
                 )));
             }
@@ -1269,11 +1293,56 @@ mod tests {
         typed.scope = KeyGrantScope::GroupMember; // wrong scope
         let value = serde_json::to_value(&typed).unwrap();
         let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("scope=stream_epoch")));
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("epoch-addressed scope")),
+            "got: {err:?}"
+        );
+    }
+
+    /// v34.0.0 (#704) — a content-addressed grant declaring an EPOCH-addressed
+    /// scope is refused HERE, with a typed error naming the contradiction.
+    ///
+    /// It already failed closed before this: the projection writes `scope_kind`
+    /// NOT NULL beside a NULL `scope_id`, which the V129 CHECK (postgres) and
+    /// trigger (sqlite) refuse. But that refusal arrives as an opaque backend
+    /// error naming a constraint, raised separately per dialect — two copies of
+    /// one rule, and neither tells the caller what they did wrong.
+    ///
+    /// The invariant belongs to the payload, so it is checked once.
+    #[test]
+    fn content_addressed_grant_may_not_declare_an_epoch_scope_704() {
+        for scope in [KeyGrantScope::StreamEpoch, KeyGrantScope::TransitMembership] {
+            let mut typed = fixture_key_grant(); // content-addressed
+            typed.scope = scope;
+            let value = serde_json::to_value(&typed).unwrap();
+            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(ref m)
+                    if m.contains("epoch-addressed") && m.contains(scope.as_str())),
+                "the refusal must name the offending scope, not a constraint: {err:?}"
+            );
+        }
+    }
+
+    /// The transit scope is accepted on the epoch-addressed path — the point of
+    /// the generalization. Without this leg the widened check above could be
+    /// refusing everything and the negative tests would not notice.
+    #[test]
+    fn a_transit_membership_grant_is_epoch_addressable_704() {
+        let mut typed = fixture_stream_grant();
+        typed.scope = KeyGrantScope::TransitMembership;
+        typed.scope_id = "ciris-transit-net".to_owned();
+        let value = serde_json::to_value(&typed).unwrap();
+        assert!(
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+                .unwrap()
+                .is_some(),
+            "transit membership must validate on the epoch-addressed path"
+        );
     }
 
     #[test]
-    fn content_grant_still_accepts_v1() {
+    fn content_grant_carries_the_pqc_wrap_704() {
         // v34.0.0 (#704) — every grant is v2 now, content-addressed
         // included. The old assertion here pinned the content default to
         // v1, which was the live classical-only path this release removes.
