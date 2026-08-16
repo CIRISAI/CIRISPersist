@@ -5,6 +5,98 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [32.2.0] - 2026-08-15
+
+Additive. One new refusal on a filter that was silently returning nothing, plus
+the CI-infrastructure work banked from `main`.
+
+### Fixed — an open-ended time window selected ZERO rows, silently (#605)
+
+`AttestationFilter::window` is pushed down as a predicate on `asserted_at`,
+which is stored and bound as **RFC-3339 TEXT**. So the comparison is
+*lexicographic*, not temporal — fine for four-digit years, catastrophic outside
+them:
+
+```text
+DateTime::<Utc>::MAX_UTC  ->  "+262143-12-31T23:59:59.999999999+00:00"
+```
+
+It leads with `'+'` (0x2B). Every ordinary row leads with a digit (`'2'`, 0x32).
+So `"2026-08-05T…" < "+262143-…"` is **false**, and **the sentinel meaning "no
+upper bound" is the one value that excludes every row in the table.**
+
+The failure mode is what makes it serious: **an empty result set reads as a
+legitimate answer everywhere.** Nothing errors, nothing logs, and every
+consumer's tests pass. It surfaced only because CIRISServer kept an in-process
+filter as a *witness* and reported which layer had actually applied the
+predicate — an `after:`-only selection went **2 rows → 0** the moment the
+push-down began binding. A declared "pushed down" flag would have said yes and
+confidently returned nothing.
+
+`AttestationFilter::validate` now refuses a bound outside the text-orderable
+range (years 1000–9999), naming both the problem and the remedy, and
+`OPEN_ENDED_WINDOW_END` (`9999-12-31T23:59:59.999999999Z`) is the supported
+sentinel. Inverted and empty windows are refused by the same door, for the same
+reason: they select nothing, silently.
+
+Validated at `Engine::list_attestations` rather than in each backend. The
+predicate is a lexicographic text comparison in all three, so the invariant
+belongs to the filter — a per-backend check is three chances to implement it
+differently, which is the parity gap this codebase keeps finding.
+
+**The witness that mattered is the one about wiring.** The validator's own unit
+tests all passed with the engine's `validate()?` call deleted — a validator that
+is correct and unreachable is a validator that does nothing, and its unit tests
+cannot tell you which one you have. `tests/window_bound_wiring_605.rs` drives
+the public entry point instead, and under that mutation it fails printing
+`AttestationListPage { items: [], next_cursor: None }` — the bug itself, as a
+red test rather than a consumer's wrong answer.
+
+An earlier draft of that test asserted the returned page was empty and went red,
+correctly: a fresh engine carries genesis-baked rows. Worth recording, because
+"empty page" is the #605 symptom, and a test *demanding* emptiness there would
+have gone green on the very bug it guards.
+
+### Changed — CI pulls postgres from GHCR, and the run list is readable again
+
+`ci.yml`'s test matrix declares `services: postgres`, and a service image is
+pulled **once per matrix leg** — eight anonymous Docker Hub pulls per CI run,
+from GitHub's *shared* runner IPs, where the anonymous allowance (100 per 6h per
+IP) is spent by every other customer on that address. Measured: ~23 CI runs in a
+day, so ~180 anonymous pulls.
+
+The failure fed itself, which is why it was worth removing rather than retrying
+harder: a 429 kills the job at "Initialize containers" — before a line of our
+code runs — and `auto-retry.yml` then re-ran it, issuing **eight more pulls**
+against the limit that had just rejected us. The retry was aimed at the thing
+the retry was causing.
+
+`ci-hygiene.yml` mirrors `postgres:16` to GHCR daily (digest-checked, so nothing
+is pushed unless upstream moved) and CI pulls from there. GHCR pulls inside
+Actions are not rate limited, need no secret beyond the built-in token, and are
+same-datacenter. Docker Hub authentication was the alternative and was rejected:
+it raises 100 → 200 per 6h and keeps the class alive.
+
+The same workflow prunes `auto-retry` runs whose conclusion is `skipped`. **Those
+skips cost no runner time** — a job-level `if` that is false never allocates,
+and this release does not claim a saving it did not make. What they cost is
+readability: 22 of 23 entries said nothing, drowning the ones that did in any
+run-list or monitor view. `workflow_run` cannot be filtered by conclusion in
+`on:`, so the entry is unavoidable at creation and can only be removed after.
+`success` (it really caught a flake) and `failure` (the retry logic broke) are
+left alone.
+
+`auto-retry.yml` itself stays: it also covers crates.io index blips, TLS
+timeouts, ENOSPC and setup-action download aborts, none of which the mirror
+touches.
+
+### Changed — CIRISVerify re-pinned v13.2.0 → v13.3.1 (banked from `main`)
+
+Adopted across two upstream releases, all seven pins flipped together. Persist's
+exposure to both is nil — they touch modules it does not reference. Because the
+v13.3.0 re-pin was merged **untagged**, v13.3.1 superseded it cleanly and no
+persist release ever carried the version whose own defect v13.3.1 fixes.
+
 ## [32.1.0] - 2026-08-15
 
 Additive. No breaking surfaces — `TableUsage` gains a field, `TraceEventRow`

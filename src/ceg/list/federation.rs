@@ -179,6 +179,30 @@ pub fn merge_key_predicate(one: Option<&String>, many: &[String]) -> Vec<String>
     out
 }
 
+/// v32.2.0 (CIRISPersist#605) — **the supported open-ended upper bound** for
+/// [`AttestationFilter::window`].
+///
+/// `9999-12-31T23:59:59.999999999Z`. Chosen because the window predicate is a
+/// LEXICOGRAPHIC comparison over RFC-3339 text, so the bound must both be later
+/// than any real row AND sort above it as a string. `9999` is the largest
+/// four-digit year, and four digits is exactly the range over which
+/// `chrono`'s RFC-3339 rendering keeps text order and time order agreeing.
+///
+/// The intuitive choice, `DateTime::<Utc>::MAX_UTC`, is the trap: it renders as
+/// `+262143-12-31T…`, leading with `'+'` (0x2B) where every ordinary row leads
+/// with a digit — so it sorts BELOW every four-digit-year row and selects
+/// nothing. A consumer measured an `after:`-only selection going 2 rows to 0
+/// the moment the push-down began binding.
+pub const OPEN_ENDED_WINDOW_END: &str = "9999-12-31T23:59:59.999999999Z";
+
+/// The inclusive text-orderable range for a window bound: `[1000-01-01,
+/// 9999-12-31]`. Outside it, RFC-3339 rendering stops agreeing with time order
+/// — below year 1000 the year is zero-padded to four digits by `chrono` but a
+/// negative year renders with `'-'`, and above 9999 with `'+'`; both sort
+/// outside the digit range `'0'..='9'`.
+const WINDOW_BOUND_MIN_YEAR: i32 = 1000;
+const WINDOW_BOUND_MAX_YEAR: i32 = 9999;
+
 /// Filter for [`crate::ceg::ReadEngine::list_attestations`] and the
 /// v17.4.0 `scores` read handles. Composes AND-style.
 ///
@@ -292,6 +316,27 @@ pub struct AttestationFilter {
     /// `asserted_at`, for the timeline read. Distinct from `valid_at`
     /// (point-in-time validity incl. expiry); this is a range on when the
     /// attestation was asserted.
+    ///
+    /// # Both bounds are compared as RFC-3339 **TEXT** (v32.2.0, #605)
+    ///
+    /// `asserted_at` is stored and bound as text, so this predicate is a
+    /// LEXICOGRAPHIC comparison, not a temporal one. That is fine for ordinary
+    /// four-digit years and catastrophic outside them:
+    ///
+    /// ```text
+    /// DateTime::<Utc>::MAX_UTC  ->  "+262143-12-31T23:59:59.999999999+00:00"
+    /// ```
+    ///
+    /// It leads with `'+'` (0x2B); every ordinary row leads with a digit
+    /// (`'2'`, 0x32). So `"2026-08-05T…" < "+262143-…"` is **false**, and the
+    /// sentinel meaning "no upper bound" is the one value that excludes every
+    /// row in the table.
+    ///
+    /// Use [`OPEN_ENDED_WINDOW_END`] for an open-ended window. Out-of-range
+    /// bounds are REFUSED by [`Self::validate`] rather than silently returning
+    /// nothing — an empty result set reads as a legitimate answer everywhere,
+    /// which is what made this invisible until a consumer measured which layer
+    /// had actually applied the predicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 
@@ -308,6 +353,59 @@ pub struct AttestationFilter {
     /// = no restriction (equivalent to `AttesterSet::All`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attester_filter: Option<AttesterSet>,
+}
+
+impl AttestationFilter {
+    /// v32.2.0 (CIRISPersist#605) — **refuse a window bound that does not sort
+    /// the way it reads.**
+    ///
+    /// [`Self::window`] is pushed down as a comparison over RFC-3339 TEXT, so
+    /// its correctness depends on the rendered string ordering the same way the
+    /// instant does. That holds for four-digit years and fails outside them:
+    /// `DateTime::<Utc>::MAX_UTC` renders as `+262143-12-31T…`, leading with
+    /// `'+'` (0x2B) where every ordinary row leads with a digit, so it sorts
+    /// BELOW every real row. `asserted_at < MAX_UTC` is false for the entire
+    /// table.
+    ///
+    /// **Refusing beats returning nothing**, which is the entire point. An
+    /// empty result set is a legitimate answer everywhere, so the failure is
+    /// invisible: a consumer's `after:`-only selection went 2 rows to 0 the
+    /// moment the push-down began binding, and nothing in the stack could tell
+    /// "filtered correctly" from "filtered everything out". A loud refusal
+    /// naming the bound converts a silent wrong answer into a fixable one.
+    ///
+    /// Callers wanting an open-ended window should use
+    /// [`OPEN_ENDED_WINDOW_END`].
+    ///
+    /// Also rejects an inverted window (`start >= end`), which would select
+    /// nothing for the same reason and be equally silent.
+    pub fn validate(&self) -> Result<(), crate::ceg::Error> {
+        let Some((start, end)) = self.window else {
+            return Ok(());
+        };
+        for (label, bound) in [("start", start), ("end", end)] {
+            let year = chrono::Datelike::year(&bound);
+            if !(WINDOW_BOUND_MIN_YEAR..=WINDOW_BOUND_MAX_YEAR).contains(&year) {
+                return Err(crate::ceg::Error::InvalidArgument(format!(
+                    "window {label} bound has year {year}, outside the \
+                     text-orderable range {WINDOW_BOUND_MIN_YEAR}..={WINDOW_BOUND_MAX_YEAR}. \
+                     `asserted_at` is compared as RFC-3339 TEXT, so a bound outside \
+                     four-digit years does not sort the way it reads and would select \
+                     ZERO rows rather than the range you asked for (this is what \
+                     `DateTime::MAX_UTC` does — it renders as `+262143-…`, which sorts \
+                     below every ordinary row). For an open-ended window use \
+                     `{OPEN_ENDED_WINDOW_END}`."
+                )));
+            }
+        }
+        if start >= end {
+            return Err(crate::ceg::Error::InvalidArgument(format!(
+                "window is empty or inverted: start {start} is not before end {end}; \
+                 the window is half-open [start, end), so this selects zero rows"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// serde `skip_serializing_if` for the default `LifecycleView::Live` — keeps
@@ -460,4 +558,104 @@ pub struct RevocationListPage {
     pub items: Vec<Revocation>,
     /// Cursor for the next page.
     pub next_cursor: Option<RevocationCursor>,
+}
+
+#[cfg(test)]
+mod window_bound_tests_605 {
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn with_window(start: DateTime<Utc>, end: DateTime<Utc>) -> AttestationFilter {
+        AttestationFilter {
+            window: Some((start, end)),
+            ..Default::default()
+        }
+    }
+
+    /// **THE DEFECT ITSELF, as a property of the rendered text.**
+    ///
+    /// This asserts the thing that makes the issue real: `MAX_UTC` sorts BELOW
+    /// an ordinary row when compared as RFC-3339 text, which is exactly how the
+    /// predicate compares it. Without this, the validator below is an arbitrary
+    /// range check whose motivation lives only in a comment — and a comment
+    /// cannot fail.
+    #[test]
+    fn max_utc_sorts_below_every_ordinary_row_as_text_605() {
+        let sentinel = DateTime::<Utc>::MAX_UTC.to_rfc3339();
+        let ordinary = t("2026-08-15T12:00:00Z").to_rfc3339();
+
+        assert!(
+            sentinel.starts_with('+'),
+            "the trap depends on the leading '+': {sentinel}"
+        );
+        assert!(
+            ordinary.as_str() > sentinel.as_str(),
+            "a 2026 row must sort ABOVE MAX_UTC as text — this inversion IS the \
+             bug: `asserted_at < MAX_UTC` is FALSE for every four-digit-year \
+             row, so the sentinel meaning 'no upper bound' excludes everything. \
+             ordinary={ordinary} sentinel={sentinel}"
+        );
+    }
+
+    /// The recommended sentinel must NOT have that property, or the fix hands
+    /// callers a second trap.
+    #[test]
+    fn the_recommended_sentinel_sorts_above_every_ordinary_row_605() {
+        let ordinary = t("2026-08-15T12:00:00Z").to_rfc3339();
+        assert!(
+            OPEN_ENDED_WINDOW_END > ordinary.as_str(),
+            "OPEN_ENDED_WINDOW_END must sort above real rows as TEXT, or it is \
+             the same defect with a different literal"
+        );
+        let parsed: DateTime<Utc> = OPEN_ENDED_WINDOW_END.parse().expect("parses");
+        assert!(with_window(t("2026-01-01T00:00:00Z"), parsed)
+            .validate()
+            .is_ok());
+    }
+
+    /// The refusal fires, and names the remedy rather than just saying no.
+    #[test]
+    fn max_utc_as_a_bound_is_refused_not_silently_empty_605() {
+        let f = with_window(t("2026-01-01T00:00:00Z"), DateTime::<Utc>::MAX_UTC);
+        let err = f.validate().expect_err("MAX_UTC must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("262143") || msg.contains("year"),
+            "the refusal must name what is wrong with the bound: {msg}"
+        );
+        assert!(
+            msg.contains(OPEN_ENDED_WINDOW_END),
+            "the refusal must name the SUPPORTED sentinel, so the caller's next \
+             step is in the error rather than in an issue thread: {msg}"
+        );
+    }
+
+    /// An ordinary window is untouched — a validator that refused real queries
+    /// would be worse than the bug.
+    #[test]
+    fn an_ordinary_window_still_passes_605() {
+        assert!(
+            with_window(t("2026-01-01T00:00:00Z"), t("2026-12-31T00:00:00Z"))
+                .validate()
+                .is_ok()
+        );
+        assert!(AttestationFilter::default().validate().is_ok());
+    }
+
+    /// An inverted window selects nothing for the same silent reason, so the
+    /// same door refuses it.
+    #[test]
+    fn an_inverted_window_is_refused_605() {
+        let f = with_window(t("2026-12-31T00:00:00Z"), t("2026-01-01T00:00:00Z"));
+        let msg = format!("{}", f.validate().expect_err("inverted must be refused"));
+        assert!(
+            msg.contains("inverted") || msg.contains("zero rows"),
+            "{msg}"
+        );
+        let eq = t("2026-06-01T00:00:00Z");
+        assert!(with_window(eq, eq).validate().is_err());
+    }
 }
