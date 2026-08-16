@@ -507,6 +507,24 @@ pub struct KeyGrantPayload {
     /// Empty for the first grant in a chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotation_chain: Vec<String>,
+
+    /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — the IFAC hash-truncation
+    /// size, for a [`KeyGrantScope::TransitMembership`] grant.
+    ///
+    /// **Required iff the scope is transit membership; refused otherwise.**
+    ///
+    /// NOT WRAPPED, deliberately. It is not a secret — a recipient must size
+    /// the interface (`add_tcp_server_ifac(addr, netname, passphrase, size)`)
+    /// and it needs this BEFORE it can unwrap the passphrase, so folding it
+    /// into the ciphertext would make the grant unusable by the party it is
+    /// addressed to.
+    ///
+    /// A TYPED FIELD rather than a sub-field parsed out of `scope_id`: an
+    /// identifier carrying a second value inside it is a schema hiding in a
+    /// string, and nothing would validate it. `u16` because the IFAC size is a
+    /// bit-count that cannot exceed the hash width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ifac_size: Option<u16>,
 }
 
 /// Closed-set wrap algorithm vocabulary.
@@ -924,6 +942,8 @@ mod tests {
             scope: KeyGrantScope::SingleContent,
             scope_id: fixture_sha256(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         }
     }
 
@@ -1244,6 +1264,8 @@ mod tests {
             scope: KeyGrantScope::StreamEpoch,
             scope_id: "stream-abc".into(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         }
     }
 

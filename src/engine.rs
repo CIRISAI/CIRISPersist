@@ -17329,6 +17329,8 @@ mod tests {
             scope: crate::cirisnode::KeyGrantScope::SingleContent,
             scope_id: sha_hex.to_owned(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         };
         let mut env = ContributionEnvelope {
             contribution_id: uuid::Uuid::new_v4().to_string(),

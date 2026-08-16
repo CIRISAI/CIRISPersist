@@ -1864,6 +1864,8 @@ async fn emit_key_grant_supersession_sqlite(
         scope: prior.scope,
         scope_id: prior.scope_id.clone(),
         rotation_chain,
+        // v34.0.0 (#704) — transit-only; absent on every other scope.
+        ifac_size: None,
     };
     let payload_value = serde_json::to_value(&supersession_payload)
         .map_err(|e| Error::Internal(format!("supersession serialize: {e}")))?;
@@ -2994,6 +2996,8 @@ mod tests {
             scope: crate::cirisnode::KeyGrantScope::SingleContent,
             scope_id: sha_hex.to_owned(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         };
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
@@ -3212,6 +3216,8 @@ mod tests {
             scope,
             scope_id: scope_id.to_owned(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         };
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
