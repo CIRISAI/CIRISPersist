@@ -17314,8 +17314,8 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            stream_id: None,
-            stream_epoch: None,
+            scope_ref: None,
+            epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])

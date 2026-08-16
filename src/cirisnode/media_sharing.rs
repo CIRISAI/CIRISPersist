@@ -458,25 +458,37 @@ pub struct KeyGrantPayload {
 
     /// SHA-256 of the content body the granted key encrypts, hex-encoded.
     /// Present iff the grant is **content-addressed**; `None` for a
-    /// **stream/epoch-addressed** streaming grant (see [`Self::stream_id`]
-    /// / [`Self::stream_epoch`]). Exactly one addressing mode holds —
-    /// enforced by [`extract_key_grant_payload`] (mirrors the V064
+    /// **scope-epoch-addressed** grant (see [`Self::scope_ref`] /
+    /// [`Self::epoch`]). Exactly one addressing mode holds — enforced by
+    /// [`extract_key_grant_payload`] (mirrors the V129
     /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
 
-    /// `federation_streams` stream id the epoch-DEK is scoped to.
-    /// Present iff the grant is **stream/epoch-addressed** (the §10.5.3
-    /// streaming cascade); `None` for a content-addressed grant.
-    /// Projected onto `key_grant_stream_id` (V064) for indexed reads.
+    /// v34.0.0 (CIRISPersist#704) — **was `stream_id` through v33.** The id,
+    /// WITHIN [`Self::scope`], that the epoch-DEK is scoped to: a
+    /// `federation_streams` stream id for [`KeyGrantScope::StreamEpoch`], an
+    /// IFAC `netname` for [`KeyGrantScope::TransitMembership`].
+    ///
+    /// Present iff the grant is **scope-epoch-addressed**; `None` for a
+    /// content-addressed grant. Projected onto `key_grant_scope_id` (V129)
+    /// for indexed reads.
+    ///
+    /// NOT `scope_id` — that name is already taken by a DIFFERENT field on
+    /// this payload ([`Self::scope_id`], the content sha / group id), so the
+    /// wire field carrying the epoch-addressing id is `scope_ref`. The DB
+    /// column it projects onto is `key_grant_scope_id`; the two names differ
+    /// deliberately because the payload has a second `scope_id` and the row
+    /// does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_id: Option<String>,
+    pub scope_ref: Option<String>,
 
-    /// Key-rotation epoch within [`Self::stream_id`] the wrapped DEK
-    /// covers. Present iff stream/epoch-addressed. Projected onto
-    /// `key_grant_stream_epoch` (V064).
+    /// v34.0.0 (CIRISPersist#704) — **was `stream_epoch` through v33.**
+    /// Key-rotation epoch within [`Self::scope_ref`] the wrapped DEK covers.
+    /// Present iff scope-epoch-addressed. Projected onto `key_grant_epoch`
+    /// (V129).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_epoch: Option<u64>,
+    pub epoch: Option<u64>,
 
     /// Base64-encoded wrapped DEK. The wrap algorithm is named below.
     pub wrapped_dek_base64: String,
@@ -617,8 +629,9 @@ pub enum KeyGrantScope {
     SingleContent,
     GroupMember,
     SubscriptionTier,
-    /// One grant per `(stream_id, epoch)` — the streaming epoch-DEK
-    /// cascade (CEG 0.15 §10.5.3). `scope_id` is the `stream_id`.
+    /// One grant per `(stream id, epoch)` — the streaming epoch-DEK
+    /// cascade (CEG 0.15 §10.5.3). [`KeyGrantPayload::scope_ref`] is the
+    /// `federation_streams` stream id.
     StreamEpoch,
     /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — one grant per
     /// `(netname, epoch)`: the IFAC transit passphrase for scoped transit.
@@ -743,16 +756,17 @@ pub fn extract_takedown_notice_payload(
 ///   - `wrapped_dek_base64` is valid base64.
 ///   - `key_validity_window.not_after > not_before`.
 ///
-/// Addressing — **exactly one mode** (mirrors the V064
+/// Addressing — **exactly one mode** (mirrors the V129
 /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c):
 ///   - **content-addressed**: `content_sha256` is `Some` hex-64
-///     lowercase; `stream_id` / `stream_epoch` are `None`.
-///   - **stream/epoch-addressed**: `stream_id` is `Some` non-empty AND
-///     `stream_epoch` is `Some`; `content_sha256` is `None`. The grant
+///     lowercase; `scope_ref` / `epoch` are `None`.
+///   - **scope-epoch-addressed**: `scope_ref` is `Some` non-empty AND
+///     `epoch` is `Some`; `content_sha256` is `None`. The grant
 ///     **MUST** carry `wrap_algorithm: v2` (PQC hybrid) — a v1 wrap on a
 ///     streaming epoch grant is rejected here (CEG §10.5.3: "a Consumer
 ///     MUST reject a streaming epoch grant carrying `wrap_algorithm:
-///     v1`"). `scope` must be [`KeyGrantScope::StreamEpoch`].
+///     v1`"). `scope` must satisfy
+///     [`KeyGrantScope::is_epoch_addressed`].
 pub fn extract_key_grant_payload(
     subject_kind: &str,
     payload: &serde_json::Value,
@@ -771,13 +785,13 @@ pub fn extract_key_grant_payload(
         ));
     }
 
-    // Exactly-one addressing mode (XOR), matching the V064 constraint.
+    // Exactly-one addressing mode (XOR), matching the V129 constraint.
     let content_addressed = typed.content_sha256.is_some();
-    let stream_addressed = typed.stream_id.is_some() || typed.stream_epoch.is_some();
-    match (content_addressed, stream_addressed) {
+    let scope_addressed = typed.scope_ref.is_some() || typed.epoch.is_some();
+    match (content_addressed, scope_addressed) {
         (true, true) => {
             return Err(Error::InvalidArgument(
-                "key_grant: content_sha256 and stream_id/stream_epoch are mutually exclusive \
+                "key_grant: content_sha256 and scope_ref/epoch are mutually exclusive \
                  (exactly one addressing mode; CEG §10.5.3 RC1-1c)"
                     .into(),
             ));
@@ -785,12 +799,12 @@ pub fn extract_key_grant_payload(
         (false, false) => {
             return Err(Error::InvalidArgument(
                 "key_grant: must be addressed — set content_sha256 (content) OR \
-                 stream_id + stream_epoch (streaming epoch)"
+                 scope_ref + epoch (scope-epoch)"
                     .into(),
             ));
         }
         (true, false) => {
-            // Content-addressed: hex-64 sha, no stream fields.
+            // Content-addressed: hex-64 sha, no scope-epoch fields.
             let sha = typed
                 .content_sha256
                 .as_deref()
@@ -809,19 +823,19 @@ pub fn extract_key_grant_payload(
             if typed.scope.is_epoch_addressed() {
                 return Err(Error::InvalidArgument(format!(
                     "key_grant: content-addressed grant declares scope={}, which is \
-                     epoch-addressed. A content grant carries no (scope_id, epoch), so \
+                     epoch-addressed. A content grant carries no (scope_ref, epoch), so \
                      the two cannot both hold — set scope to a content scope, or address \
-                     the grant by scope_id + epoch",
+                     the grant by scope_ref + epoch",
                     typed.scope.as_str()
                 )));
             }
         }
         (false, true) => {
-            // Stream/epoch-addressed: both fields present, v2 wrap required.
-            validate_non_empty("stream_id", typed.stream_id.as_deref().unwrap_or_default())?;
-            if typed.stream_epoch.is_none() {
+            // Scope/epoch-addressed: both fields present, v2 wrap required.
+            validate_non_empty("scope_ref", typed.scope_ref.as_deref().unwrap_or_default())?;
+            if typed.epoch.is_none() {
                 return Err(Error::InvalidArgument(
-                    "key_grant: stream/epoch-addressed grant requires stream_epoch".into(),
+                    "key_grant: scope-epoch-addressed grant requires epoch".into(),
                 ));
             }
             if !typed.wrap_algorithm.is_streaming_pqc_v2() {
@@ -926,8 +940,8 @@ mod tests {
         KeyGrantPayload {
             recipient_key_id: "recipient-1".into(),
             content_sha256: Some(fixture_sha256()),
-            stream_id: None,
-            stream_epoch: None,
+            scope_ref: None,
+            epoch: None,
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
             wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
@@ -1248,8 +1262,8 @@ mod tests {
         KeyGrantPayload {
             recipient_key_id: "recipient-1".into(),
             content_sha256: None,
-            stream_id: Some("stream-abc".into()),
-            stream_epoch: Some(7),
+            scope_ref: Some("stream-abc".into()),
+            epoch: Some(7),
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
             wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
@@ -1302,8 +1316,8 @@ mod tests {
     #[test]
     fn grant_with_no_addressing_is_rejected() {
         let mut typed = fixture_stream_grant();
-        typed.stream_id = None;
-        typed.stream_epoch = None; // neither content nor stream
+        typed.scope_ref = None;
+        typed.epoch = None; // neither content nor scope-epoch
         let value = serde_json::to_value(&typed).unwrap();
         let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("must be addressed")));
@@ -1538,8 +1552,8 @@ mod tests {
         let env = fixture_grant_envelope(&payload);
         let parsed = require_key_grant_envelope(&env).unwrap();
         assert_eq!(parsed, payload);
-        assert_eq!(parsed.stream_id.as_deref(), Some("stream-abc"));
-        assert_eq!(parsed.stream_epoch, Some(7));
+        assert_eq!(parsed.scope_ref.as_deref(), Some("stream-abc"));
+        assert_eq!(parsed.epoch, Some(7));
     }
 
     #[test]

@@ -40,6 +40,25 @@ list_key_grants_for_stream_epoch(stream_id, epoch)
     -> list_key_grants_for_scope_epoch(scope_kind, scope_id, epoch)
 ```
 
+**`KeyGrantPayload` wire rename, no serde alias:**
+
+```
+stream_id    -> scope_ref   (Option<String>)
+stream_epoch -> epoch       (Option<u64>)
+```
+
+The old names were a lie on a public type the moment transit membership landed:
+a `TransitMembership` grant put its IFAC `netname` in a field called `stream_id`.
+No `#[serde(alias)]` — a stored payload written under the old keys now fails to
+address and is refused by the extractor, which is the correct behaviour for a
+major and is visible rather than silent.
+
+`scope_ref`, **not** `scope_id`: the payload already has a distinct `scope_id`
+(the content sha for `SingleContent`, the group id for `GroupMember`). The DB
+column this projects onto is still `key_grant_scope_id` — the names differ
+deliberately, because the payload carries a second `scope_id` and the row does
+not.
+
 ### BREAKING — the classical wrap algorithm is GONE
 
 `WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm` (v1 — X25519 + AES-128-GCM HPKE) is

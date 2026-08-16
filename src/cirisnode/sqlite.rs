@@ -320,8 +320,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             .filter(|p| p.scope.is_epoch_addressed())
             .map(|p| p.scope.as_str().to_owned());
         let key_grant_scope_id: Option<String> =
-            key_grant.as_ref().and_then(|p| p.stream_id.clone());
-        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+            key_grant.as_ref().and_then(|p| p.scope_ref.clone());
+        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.epoch) {
             None => None,
             Some(e) => Some(i64::try_from(e).map_err(|_| {
                 Error::InvalidArgument(
@@ -1852,8 +1852,8 @@ async fn emit_key_grant_supersession_sqlite(
         // Carry the prior grant's addressing + wrap algorithm so a
         // stream/epoch-grant supersession stays stream-addressed + v2
         // (the extractor rejects a v1 streaming grant).
-        stream_id: prior.stream_id.clone(),
-        stream_epoch: prior.stream_epoch,
+        scope_ref: prior.scope_ref.clone(),
+        epoch: prior.epoch,
         wrapped_dek_base64: revocation_dek,
         wrap_algorithm: prior.wrap_algorithm,
         ratchet_version: prior.ratchet_version,
@@ -2981,8 +2981,8 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            stream_id: None,
-            stream_epoch: None,
+            scope_ref: None,
+            epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -3201,8 +3201,8 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: None,
-            stream_id: Some(scope_id.to_owned()),
-            stream_epoch: Some(epoch),
+            scope_ref: Some(scope_id.to_owned()),
+            epoch: Some(epoch),
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -3454,8 +3454,8 @@ mod tests {
             .map(|env| {
                 let p: crate::cirisnode::KeyGrantPayload =
                     serde_json::from_value(env.payload.clone()).unwrap();
-                assert_eq!(p.stream_id.as_deref(), Some(stream.as_str()));
-                assert_eq!(p.stream_epoch, Some(1));
+                assert_eq!(p.scope_ref.as_deref(), Some(stream.as_str()));
+                assert_eq!(p.epoch, Some(1));
                 p.recipient_key_id
             })
             .collect();
@@ -3706,6 +3706,187 @@ mod tests {
     // The V129 rule (all three scope columns together, XOR content-addressed)
     // is unguarded at the DB layer here as a result and wants a deliberately
     // authored V129-named replacement.
+
+    /// v34.0.0 (CIRISPersist#704, V129) — the authored replacement for the
+    /// deleted `sqlite_v064_trigger_admits_both_key_grant_addressing_modes`.
+    ///
+    /// BARE SQL, DELIBERATELY. The subject under test is the recreated
+    /// `cirisnode_contributions_key_grant_asymmetry_ins` trigger, not the Rust
+    /// write path. Routing through `put_contribution` would let
+    /// `extract_key_grant_payload` refuse the half-addressed shapes first and
+    /// the trigger would never run — the test would pass while the DB rule was
+    /// arbitrarily wrong, which is the whole class this test exists to close.
+    ///
+    /// Two ADMITs (the two branches of the XOR) and five REFUSEs (every
+    /// half-addressed shape between them, plus a non-grant row carrying grant
+    /// columns). The refusals assert the ABORT TEXT names the addressing rule:
+    /// a bare `is_err()` would also be satisfied by a typo'd column list or an
+    /// unrelated NOT NULL, and would then keep passing after the trigger was
+    /// dropped.
+    #[tokio::test]
+    async fn sqlite_v129_trigger_admits_scope_epoch_and_refuses_half_addressed() {
+        let (backend, _cn) = fresh_backend().await;
+        let conn = backend.conn_handle();
+
+        // Valid per the V054 single-column CHECK (64 lowercase hex).
+        const SHA: &str = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff2233445566778899aa";
+
+        // ONE insert shape, every addressing column bound by the caller, so
+        // each case below differs from its neighbour in exactly the columns
+        // the rule is about — and nothing else can explain a refusal.
+        let insert = |id: &str,
+                      subject_kind: &str,
+                      recipient: Option<&str>,
+                      sha: Option<&str>,
+                      scope_kind: Option<&str>,
+                      scope_id: Option<&str>,
+                      epoch: Option<i64>|
+         -> rusqlite::Result<usize> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT INTO cirisnode_contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    media_content_sha256, key_grant_recipient_key_id, \
+                    key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
+                 ) VALUES (?1, 'proposal', 'd', 'en', ?2, 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', \
+                           ?4, ?3, ?5, ?6, ?7)",
+                params![
+                    id,
+                    subject_kind,
+                    recipient,
+                    sha,
+                    scope_kind,
+                    scope_id,
+                    epoch
+                ],
+            )
+        };
+
+        // A refusal only counts if the ABORT names THIS rule. The V129
+        // trigger's RAISE text is the only one in the schema carrying
+        // "exactly one addressing mode" — the V054 takedown pair, the V046
+        // accord-carrier pair and the V056 consent pair all say something
+        // else, and a malformed statement says something else again.
+        let expect_v129_abort = |label: &str, err: rusqlite::Error| {
+            let detail = err.to_string();
+            assert!(
+                detail.contains("exactly one addressing mode")
+                    && detail.contains("key_grant_scope_kind"),
+                "{label}: expected the V129 key_grant asymmetry trigger to ABORT; \
+                 got a different failure: {detail}"
+            );
+        };
+
+        // ── ADMIT ───────────────────────────────────────────────────────
+        // (a) content-addressed: sha NOT NULL, all three scope cols NULL.
+        insert(
+            "v129-a",
+            "key_grant",
+            Some("rec-1"),
+            Some(SHA),
+            None,
+            None,
+            None,
+        )
+        .expect("(a) content-addressed key_grant must insert under V129");
+
+        // (b) scope-epoch-addressed: all three NOT NULL, sha NULL. Written
+        //     with the TRANSIT scope kind on purpose — it is the value V064
+        //     could not express, so this row is the one the cut exists for.
+        insert(
+            "v129-b",
+            "key_grant",
+            Some("rec-1"),
+            None,
+            Some(crate::cirisnode::KeyGrantScope::TransitMembership.as_str()),
+            Some("netname-1"),
+            Some(3),
+        )
+        .expect("(b) scope-epoch-addressed key_grant must insert under V129");
+
+        // ── REFUSE — the half-addressed shapes ──────────────────────────
+        // (c) scope_kind + scope_id, epoch NULL.
+        expect_v129_abort(
+            "(c) scope_kind + scope_id, no epoch",
+            insert(
+                "v129-c",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                Some("stream_epoch"),
+                Some("scope-1"),
+                None,
+            )
+            .expect_err("(c) must be refused"),
+        );
+
+        // (d) scope_kind + epoch, scope_id NULL.
+        expect_v129_abort(
+            "(d) scope_kind + epoch, no scope_id",
+            insert(
+                "v129-d",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                Some("stream_epoch"),
+                None,
+                Some(3),
+            )
+            .expect_err("(d) must be refused"),
+        );
+
+        // (e) scope_id + epoch, scope_kind NULL — the exact V064 shape, now
+        //     refused by construction. This is the assertion that inverts the
+        //     deleted test's central positive case.
+        expect_v129_abort(
+            "(e) scope_id + epoch, no scope_kind (the V064 pair)",
+            insert(
+                "v129-e",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                None,
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(e) must be refused"),
+        );
+
+        // (f) BOTH addressing modes populated — the XOR, not an OR.
+        expect_v129_abort(
+            "(f) content AND scope-epoch",
+            insert(
+                "v129-f",
+                "key_grant",
+                Some("rec-1"),
+                Some(SHA),
+                Some("stream_epoch"),
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(f) must be refused"),
+        );
+
+        // (g) a non-key_grant subject_kind carrying key_grant columns. Uses
+        //     the SCOPE columns with a NULL recipient, so it is V129's half
+        //     of the asymmetry and not the recipient half V054 already pins.
+        expect_v129_abort(
+            "(g) non-key_grant row carrying key_grant scope columns",
+            insert(
+                "v129-g",
+                "arc_question",
+                None,
+                None,
+                Some("stream_epoch"),
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(g) must be refused"),
+        );
+    }
 
     // ── v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate on
     // the cirisnode `ModerationEvent` (moderate scope) + `takedown_notice`

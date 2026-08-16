@@ -200,8 +200,8 @@ impl NodeCoreService for PostgresBackend {
             .filter(|p| p.scope.is_epoch_addressed())
             .map(|p| p.scope.as_str().to_owned());
         let key_grant_scope_id: Option<String> =
-            key_grant.as_ref().and_then(|p| p.stream_id.clone());
-        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+            key_grant.as_ref().and_then(|p| p.scope_ref.clone());
+        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.epoch) {
             None => None,
             Some(e) => Some(i64::try_from(e).map_err(|_| {
                 Error::InvalidArgument(
@@ -1443,8 +1443,8 @@ async fn emit_key_grant_supersession(
         content_sha256: prior.content_sha256.clone(),
         // Carry the prior grant's addressing + wrap algorithm so a
         // stream/epoch-grant supersession stays stream-addressed + v2.
-        stream_id: prior.stream_id.clone(),
-        stream_epoch: prior.stream_epoch,
+        scope_ref: prior.scope_ref.clone(),
+        epoch: prior.epoch,
         wrapped_dek_base64: revocation_dek,
         wrap_algorithm: prior.wrap_algorithm,
         ratchet_version: prior.ratchet_version,
@@ -2828,8 +2828,8 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            stream_id: None,
-            stream_epoch: None,
+            scope_ref: None,
+            epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -2893,8 +2893,8 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: None,
-            stream_id: Some(scope_id.to_owned()),
-            stream_epoch: Some(epoch),
+            scope_ref: Some(scope_id.to_owned()),
+            epoch: Some(epoch),
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -3153,8 +3153,8 @@ mod tests {
             .map(|env| {
                 let p: crate::cirisnode::KeyGrantPayload =
                     serde_json::from_value(env.payload.clone()).unwrap();
-                assert_eq!(p.stream_id.as_deref(), Some(stream.as_str()));
-                assert_eq!(p.stream_epoch, Some(1));
+                assert_eq!(p.scope_ref.as_deref(), Some(stream.as_str()));
+                assert_eq!(p.epoch, Some(1));
                 p.recipient_key_id
             })
             .collect();
@@ -3911,4 +3911,209 @@ mod tests {
     // The V129 rule (all three scope columns together, XOR content-addressed)
     // is unguarded at the DB layer here as a result and wants a deliberately
     // authored V129-named replacement.
+
+    /// A refusal only counts if the CHECK that fired is the key_grant one.
+    /// SQLSTATE 23514 alone is satisfied by any of the six other CHECKs on
+    /// `cirisnode.contributions` (the V054 takedown pair, V046's announcement
+    /// enums, V056's `cohort_scope` / stance sets, V054's own hex-64 guard on
+    /// `media_content_sha256`) — so the constraint NAME is asserted too, which
+    /// is what rules out "the insert failed for an unrelated reason".
+    fn assert_v129_key_grant_check(label: &str, err: &tokio_postgres::Error) {
+        let db = err
+            .as_db_error()
+            .unwrap_or_else(|| panic!("{label}: expected a database error; got: {err:?}"));
+        assert_eq!(
+            db.code(),
+            &tokio_postgres::error::SqlState::CHECK_VIOLATION,
+            "{label}: expected a CHECK violation (23514); got {:?}: {db}",
+            db.code()
+        );
+        assert_eq!(
+            db.constraint(),
+            Some("contributions_key_grant_columns_match_subject_kind"),
+            "{label}: a CHECK refused the row, but not the key_grant one — \
+             got constraint {:?}: {db}",
+            db.constraint()
+        );
+    }
+
+    /// v34.0.0 (CIRISPersist#704, V129) — the authored replacement for the
+    /// deleted `v064_check_admits_both_key_grant_addressing_modes`.
+    ///
+    /// BARE SQL, DELIBERATELY. The subject under test is the re-added
+    /// `contributions_key_grant_columns_match_subject_kind` CHECK, not the
+    /// Rust write path. Routing through `put_contribution` would let
+    /// `extract_key_grant_payload` refuse the half-addressed shapes first and
+    /// the CHECK would never be exercised — the test would pass while the DB
+    /// rule was arbitrarily wrong, which is the whole class this test closes.
+    ///
+    /// Two ADMITs (the two branches of the XOR) and five REFUSEs (every
+    /// half-addressed shape between them, plus a non-grant row carrying grant
+    /// columns), each refusal pinned to the constraint by NAME.
+    ///
+    /// Mirrors `sqlite_v129_trigger_admits_scope_epoch_and_refuses_half_addressed`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn v129_check_admits_scope_epoch_and_refuses_half_addressed() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+
+        // Valid per the V054 single-column CHECK (64 lowercase hex).
+        const SHA: &str = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff2233445566778899aa";
+
+        // ONE insert shape, every addressing column bound by the caller, so
+        // each case below differs from its neighbour in exactly the columns
+        // the rule is about — and nothing else can explain a refusal.
+        const SQL: &str = "INSERT INTO cirisnode.contributions (\
+                contribution_id, contribution_type, domain, language, subject_kind, \
+                author_id, payload, witness_set, submitted_at, \
+                signature, signing_key_id, signature_verified, persist_row_hash, \
+                media_content_sha256, key_grant_recipient_key_id, \
+                key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
+             ) VALUES ($1, 'proposal', 'd', 'en', $2, 'a', '{}'::jsonb, NULL, NOW(), \
+                       'sig', 'a', TRUE, 'h', $4, $3, $5, $6, $7)";
+
+        let transit = crate::cirisnode::KeyGrantScope::TransitMembership.as_str();
+
+        // ── ADMIT ───────────────────────────────────────────────────────
+        // (a) content-addressed: sha NOT NULL, all three scope cols NULL.
+        client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &Some(SHA),
+                    &None::<String>,
+                    &None::<String>,
+                    &None::<i64>,
+                ],
+            )
+            .await
+            .expect("(a) content-addressed key_grant must insert under V129");
+
+        // (b) scope-epoch-addressed: all three NOT NULL, sha NULL. Written
+        //     with the TRANSIT scope kind on purpose — it is the value V064
+        //     could not express, so this row is the one the cut exists for.
+        client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &None::<String>,
+                    &Some(transit),
+                    &Some("netname-1"),
+                    &Some(3_i64),
+                ],
+            )
+            .await
+            .expect("(b) scope-epoch-addressed key_grant must insert under V129");
+
+        // ── REFUSE — the half-addressed shapes ──────────────────────────
+        // (c) scope_kind + scope_id, epoch NULL.
+        let err = client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &None::<String>,
+                    &Some("stream_epoch"),
+                    &Some("scope-1"),
+                    &None::<i64>,
+                ],
+            )
+            .await
+            .expect_err("(c) must be refused");
+        assert_v129_key_grant_check("(c) scope_kind + scope_id, no epoch", &err);
+
+        // (d) scope_kind + epoch, scope_id NULL.
+        let err = client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &None::<String>,
+                    &Some("stream_epoch"),
+                    &None::<String>,
+                    &Some(3_i64),
+                ],
+            )
+            .await
+            .expect_err("(d) must be refused");
+        assert_v129_key_grant_check("(d) scope_kind + epoch, no scope_id", &err);
+
+        // (e) scope_id + epoch, scope_kind NULL — the exact V064 shape, now
+        //     refused by construction. This is the assertion that inverts the
+        //     deleted test's central positive case.
+        let err = client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &None::<String>,
+                    &None::<String>,
+                    &Some("scope-1"),
+                    &Some(3_i64),
+                ],
+            )
+            .await
+            .expect_err("(e) must be refused");
+        assert_v129_key_grant_check("(e) scope_id + epoch, no scope_kind (the V064 pair)", &err);
+
+        // (f) BOTH addressing modes populated — the XOR, not an OR.
+        let err = client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"key_grant",
+                    &Some("rec-1"),
+                    &Some(SHA),
+                    &Some("stream_epoch"),
+                    &Some("scope-1"),
+                    &Some(3_i64),
+                ],
+            )
+            .await
+            .expect_err("(f) must be refused");
+        assert_v129_key_grant_check("(f) content AND scope-epoch", &err);
+
+        // (g) a non-key_grant subject_kind carrying key_grant columns. Uses
+        //     the SCOPE columns with a NULL recipient, so it is V129's half
+        //     of the asymmetry and not the recipient half V054 already pins.
+        let err = client
+            .execute(
+                SQL,
+                &[
+                    &Uuid::new_v4(),
+                    &"arc_question",
+                    &None::<String>,
+                    &None::<String>,
+                    &Some("stream_epoch"),
+                    &Some("scope-1"),
+                    &Some(3_i64),
+                ],
+            )
+            .await
+            .expect_err("(g) must be refused");
+        assert_v129_key_grant_check(
+            "(g) non-key_grant row carrying key_grant scope columns",
+            &err,
+        );
+    }
 }
