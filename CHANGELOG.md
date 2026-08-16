@@ -5,6 +5,81 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [33.0.0] - 2026-08-16
+
+### BREAKING — scrubbing moved to the egress boundary (#705, CIRISServer#418)
+
+`receive_and_persist` no longer redacts what it stores. **A node's own record is
+never scrubbed.**
+
+#690 called the scrubber on the ingest envelope in place. But
+`receive_and_persist` is how an agent captures **its own** traces, so the
+original was redacted before it was ever stored and the unscrubbed record
+existed nowhere. CIRISServer wired a real scrubber, watched self-scoped content
+change under it, reverted, and held their pin.
+
+persist's own doctrine already said this — `scrub/mod.rs`: scrubbing happens *"at
+the sender's egress"*. **Local persistence is not egress.** The code and the
+doctrine disagreed and the doctrine was right.
+
+**What actually crosses the wire decided the fix.** `trace_events` is a LOCAL
+projection (`replication_policy::Projection::TraceEvents` — "trace_events from a
+`trace:complete:v1` attestation"), derived on a receiver from an admitted
+attestation and **never replicated itself**. The **attestation** embeds the whole
+trace and is the wire object — and it is already minted at ingest, three lines
+from the storage write.
+
+So the split is exactly the privacy boundary, with no new seam:
+
+* **`env`** — untouched → the stored `trace_events` rows. *The record.*
+* **`scrubbed_env`** — a copy → the minted attestation. *The only thing that
+  ships*, and retained nowhere else.
+
+The #690 refusal now gates **publication**, not storage. Refusing to store a
+node's own record was the wrong lever; refusing to mint a publishable artifact
+from untreated content is the right one.
+
+**For consumers:** a scrubber is no longer applied to locally-persisted content,
+so `Engine(scrubber=…)` is safe to wire — it redacts the federated copy and
+leaves the local one intact. That is the shape CIRISServer#418 asked for and it
+needs nothing from the caller: no scrubber argument, no scope plumbing, no
+per-call decision.
+
+**The stored rows' `scrub_*` columns now describe the record honestly** — the
+content is unmodified, and the treatment fields report what was applied to it,
+which is nothing. The treatment that matters rides the attestation.
+
+Witnessed on the **disagreement** between the two: the stored row must lack the
+scrubber's mark and the attestation must carry it. Either assertion alone passes
+on a no-op scrubber or on the old both-scrubbed behaviour; only the pair
+distinguishes this fix. Mutation-tested — minting from the original trace turns
+it red.
+
+One structural note worth keeping: **scrubbing in place no longer compiles.** The
+borrow checker refuses `scrub_batch(&mut env)` while `env` is still read for the
+rows, so the previous behaviour is not merely untested but unwritable.
+
+### Not in this release
+
+CIRISPersist#704 (the `key_grant` `(scope_kind, scope_id, epoch)` generalization,
+`TransitMembership`, and the v1 `WrapAlgorithm` removal) was planned to ride this
+major and does not. It is its own breaking surface across two migrations, three
+backends and a public enum removal, and splitting it across releases or rushing
+it beside a privacy change would be worse than giving it its own cut. The design
+is settled on #704 and the v1 go/no-go is confirmed; it lands in **v34.0.0**.
+
+**CIRISEdge IS blocked by this deferral, and an earlier draft of this note said
+otherwise.** That draft read Edge's v17.5.0 operator-supplied passphrase as a
+working interim state. It is not one: *no configuration required* is the whole
+feature. Scoped transit exists so CIRIS peers route compliant (PQC CEG/RNS)
+traffic without an operator typing a shared secret into a relay — a passphrase
+someone has to distribute by hand is precisely what the rotating PQC grant
+replaces. Calling the stopgap "unblocked" mistook the absence of the feature for
+a temporary substitute for it.
+
+So #704 is not a nice-to-have riding the next convenient major. It is the
+deliverable, and it is the next thing cut.
+
 ## [32.3.0] - 2026-08-15
 
 Additive. Both items are defects in **v32.0.0's #690**, reported from a staged
