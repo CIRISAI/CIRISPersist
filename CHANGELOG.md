@@ -68,9 +68,17 @@ backends and a public enum removal, and splitting it across releases or rushing
 it beside a privacy change would be worse than giving it its own cut. The design
 is settled on #704 and the v1 go/no-go is confirmed; it lands in **v34.0.0**.
 
-CIRISEdge is not blocked meanwhile — v17.5.0 ships the config-level relay shape
-with an operator-supplied passphrase, and the automated distribution wires onto
-v34.0.0.
+**CIRISEdge IS blocked by this deferral, and an earlier draft of this note said
+otherwise.** That draft read Edge's v17.5.0 operator-supplied passphrase as a
+working interim state. It is not one: *no configuration required* is the whole
+feature. Scoped transit exists so CIRIS peers route compliant (PQC CEG/RNS)
+traffic without an operator typing a shared secret into a relay — a passphrase
+someone has to distribute by hand is precisely what the rotating PQC grant
+replaces. Calling the stopgap "unblocked" mistook the absence of the feature for
+a temporary substitute for it.
+
+So #704 is not a nice-to-have riding the next convenient major. It is the
+deliverable, and it is the next thing cut.
 
 ## [32.3.0] - 2026-08-15
 
