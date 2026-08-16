@@ -75,18 +75,41 @@ detailed treatment, which is the precise lie #690 exists to forbid. Found by
 mutation, not review, and the test helper now returns the envelope so the
 assertion can see it.
 
+### Fixed — `TraceLevel`'s doc restated a spec persist does not own, and had drifted
+
+`context/TRACE_WIRE_FORMAT.md` is a **pointer, not a copy**, and says why: the
+spec once lived in two places, one drifted, and that produced the
+v0.1.18 → v0.1.20 float-canonicalization break.
+
+The enum's own doc comments were still a copy — and had drifted. They described
+`detailed` as carrying "reasoning text fields, override reasons, identified
+sources, sanitized stakeholder lists, prompt hashes". **`detailed` carries no
+content fields at all.**
+
+The drift was wrong in the dangerous direction: it read as though unscrubbed
+content sat on the default ingest path. I reasoned from it and filed an issue
+proposing a new refusal there (#702, now closed as wrong-premise). Nothing gates
+a doc comment, so a vendored paraphrase decays exactly like a vendored file and
+is harder to notice, because it does not look like a copy.
+
+The inventory is removed rather than corrected. What persist **enforces** stays
+in the type; what a level **contains** lives upstream, and a reader is sent to
+the FSD at the pinned commit.
+
 ### Known, not fixed — `detailed` passes through silently
 
-`NullScrubber` redacts nothing and reports honestly, so at `detailed` the #690
-door does not fire and an entirely unscrubbed batch is accepted with only a
-`tracing::warn!`. Production runs `detailed`, which means **the loud refusal
-guards the rare path and the silent pass-through covers the common one.**
+`NullScrubber` redacts nothing, so at `detailed` the #690 door does not fire and
+the batch is accepted with only a `tracing::warn!`.
 
-Not changed here, because the reporter explicitly did not ask for it and a new
-refusal on the default path is a behaviour change that deserves its own
-decision rather than riding a fix. #690 already made `ner_ran` and
-`applied_trace_level` carried, signed facts, which is what makes such a gate
-*possible*; whether to install one is the open question. Filed separately.
+**This is not the leak it first appeared to be.** `detailed` carries no content
+fields, so an unscrubbed `detailed` batch exposes nothing — see the doc-drift
+entry above for how the opposite impression got into this codebase and into a
+filed issue. No gate is needed there, and #702 is closed as wrong-premise.
+
+Recorded rather than dropped because the reasoning is worth keeping: #690 made
+`ner_ran` and `applied_trace_level` carried, signed facts, so *if* a level ever
+does carry content that a scrubber should touch, the enforcement decision is now
+available rather than requiring new plumbing.
 
 ## [32.2.0] - 2026-08-15
 
