@@ -846,6 +846,33 @@ pub fn extract_key_grant_payload(
                     typed.wrap_algorithm.as_str()
                 )));
             }
+            // v34.0.0 (#704) — `scope_ref` and `scope_id` must AGREE on an
+            // epoch-addressed grant.
+            //
+            // They are the same value in every such grant in the tree, and only
+            // `scope_ref` is projected to `key_grant_scope_id`. So a payload
+            // carrying `scope_ref: "netname-a"` with `scope_id: "netname-b"`
+            // was admitted and the row silently kept the first — the signed
+            // payload and the queryable column disagreeing, with nothing
+            // reporting it. A grant is then discoverable under one name and
+            // attested under another.
+            //
+            // Checked rather than collapsed: for SingleContent / GroupMember
+            // the two fields genuinely differ, so merging them is a design
+            // decision, not a rename. Until that decision is made, disagreement
+            // is a caller error and says so.
+            if let Some(reference) = typed.scope_ref.as_deref() {
+                if reference != typed.scope_id {
+                    return Err(Error::InvalidArgument(format!(
+                        "key_grant: scope_ref {reference:?} and scope_id {:?} disagree on an \
+                         epoch-addressed grant. Only scope_ref reaches the queryable column, \
+                         so the row would be discoverable under one name and attested under \
+                         the other — set them to the same value",
+                        typed.scope_id
+                    )));
+                }
+            }
+
             // v34.0.0 (#704) — was pinned to `StreamEpoch`, which would now
             // reject every transit grant. The check is the same one the write
             // path and the V129 rule use, so all three agree by construction
@@ -1360,6 +1387,33 @@ mod tests {
         }
     }
 
+    /// v34.0.0 (#704) — `scope_ref` and `scope_id` must AGREE.
+    ///
+    /// Only `scope_ref` is projected to `key_grant_scope_id`, so before this a
+    /// payload where they differed was admitted and the row silently kept one
+    /// of them: the grant discoverable under one name and attested under the
+    /// other, with nothing reporting the divergence.
+    ///
+    /// The first thing this check refused was a fixture in this very file —
+    /// `a_transit_membership_grant_is_epoch_addressable_704` set `scope_id`
+    /// alone and left `scope_ref` at the stream value. Two fields holding one
+    /// fact diverge by hand at the first opportunity, including in the test
+    /// written to prove the feature works.
+    #[test]
+    fn scope_ref_and_scope_id_must_agree_704() {
+        let mut typed = fixture_stream_grant();
+        typed.scope_ref = Some("netname-a".to_owned());
+        typed.scope_id = "netname-b".to_owned();
+        let value = serde_json::to_value(&typed).unwrap();
+        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m)
+                if m.contains("netname-a") && m.contains("netname-b")),
+            "the refusal must show BOTH values, or the caller cannot tell which \
+             one the row would have kept: {err:?}"
+        );
+    }
+
     /// The transit scope is accepted on the epoch-addressed path — the point of
     /// the generalization. Without this leg the widened check above could be
     /// refusing everything and the negative tests would not notice.
@@ -1367,7 +1421,12 @@ mod tests {
     fn a_transit_membership_grant_is_epoch_addressable_704() {
         let mut typed = fixture_stream_grant();
         typed.scope = KeyGrantScope::TransitMembership;
+        // BOTH, and that is the point: this fixture originally set only
+        // `scope_id` and was the first thing the agreement check refused —
+        // the divergence it guards, authored by hand, in the test asserting
+        // transit works.
         typed.scope_id = "ciris-transit-net".to_owned();
+        typed.scope_ref = Some("ciris-transit-net".to_owned());
         let value = serde_json::to_value(&typed).unwrap();
         assert!(
             extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
