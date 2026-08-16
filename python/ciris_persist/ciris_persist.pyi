@@ -117,11 +117,26 @@ class BatchSummary(TypedDict):
 #:   pass: ``0`` means both "NER ran and found nothing" and "no NER ran".
 #:   Persist will not infer the claim from a nonzero count.
 #:
-#: A legacy callable handed a ``full_traces`` batch is therefore refused with
-#: ``ValueError("scrub_treatment_mismatch", ...)``. The remedies are to return
-#: the 4-tuple, or to scrub at ``detailed`` and relabel the trace ``detailed``.
+#: v32.3.0 (CIRISPersist#701) — the **5-tuple** adds
+#: ``applied_trace_level``: the level the callable actually treated the content
+#: at. Persist relabels the envelope to match, which is what makes "scrub at
+#: ``detailed`` and relabel" — the remedy #690 documents — reachable from
+#: Python at all. Before it, the preservation gate rejected any ``trace_level``
+#: edit and the applied level was read back off the envelope, so at
+#: ``full_traces`` with no model a callable's only options were to claim a pass
+#: it did not run, or be refused.
+#:
+#: The level may only be REDUCED, never raised: raising it would claim the
+#: content is more detailed than what was processed.
+#:
+#: A legacy callable handed a ``full_traces`` batch is refused with
+#: ``ValueError("scrub_treatment_mismatch", ...)``. The remedies are to stage a
+#: model and return ``ner_ran=True``, or to treat at ``detailed`` and say so via
+#: the 5-tuple.
 ScrubberOutcome = (
-    tuple[dict[str, Any], int] | tuple[dict[str, Any], int, bool, str | None]
+    tuple[dict[str, Any], int]
+    | tuple[dict[str, Any], int, bool, str | None]
+    | tuple[dict[str, Any], int, bool, str | None, str]
 )
 ScrubberCallable = Callable[[dict[str, Any]], ScrubberOutcome]
 

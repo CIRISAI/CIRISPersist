@@ -5,6 +5,112 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [32.3.0] - 2026-08-15
+
+Additive. Both items are defects in **v32.0.0's #690**, reported from a staged
+QA run where they appeared as ten `scrub_treatment_mismatch` refusals and **zero
+traces persisted**.
+
+### Fixed — the refusal message could never differ, and omitted the deciding field (#701)
+
+The `ScrubTreatmentMismatch` guard fires when `applied_trace_level ==
+full_traces && !ner_ran`, and then built its error from `label:
+TraceLevel::FullTraces` and `treated: applied_trace_level` — two values the
+branch condition had *just proven equal*. So every occurrence rendered:
+
+```
+('scrub_treatment_mismatch', 'label=full_traces treated_as=full_traces')
+```
+
+The message showed two identical values, implying a comparison that had failed
+between different things, and omitted `ner_ran` — the one fact that decides
+whether the operator stages a model or relabels. My own comment beside it
+claimed the sender "needs to know WHICH level it was treated at", which is
+exactly what the message structurally could not convey.
+
+The variant now carries `treated_as`, `ner_ran` and `model_digest`. The digest
+is the field that genuinely varies, and it separates two situations that
+otherwise look identical: **no model staged at all**, versus **a model that ran
+and still reported no pass** — a configuration gap and a scrubber bug, with
+different owners.
+
+### Fixed — the sanctioned remedy was unreachable from Python (#701)
+
+#690 documented the honest path for a node with no NER model: treat the content
+at `detailed` and **relabel**, so the claim matches the treatment. A Rust
+`Scrubber` can do that — it owns `&mut BatchEnvelope`. A Python callable could
+not:
+
+* the preservation gate rejects any callable that alters `trace_level`;
+* the outcome's `applied_trace_level` was then read back **off the envelope**,
+  pinning it equal to the incoming label by construction.
+
+So at `full_traces` with no model, a Python callable's only options were
+`ner_ran: true` (a lie) or a guaranteed refusal. **The documented remedy was
+structurally unavailable to the primary consumer** — and the PyO3 constructor
+defaults to `NullScrubber`, so this is the default path, not an edge case.
+
+Python scrubbers may now return a **5-tuple**:
+
+```python
+(scrubbed, modified_count, ner_ran, model_digest, applied_trace_level)
+```
+
+The callable states the level it treated at, and persist relabels the envelope
+to match. The preservation gate stays exactly as strict — the returned envelope
+still may not move `trace_level` itself.
+
+**Downgrade only.** Raising the level is refused: it would claim the content is
+more detailed than what was processed, and would let a `detailed` pass be
+laundered into a `full_traces` label. `TraceLevel::detail_rank` makes "is this a
+downgrade" one definition rather than a comparison open-coded per site.
+
+Shapes are tried widest-first, so a callable that states more is taken at its
+word; the 4-tuple and legacy 2-tuple are unchanged.
+
+**The witness that mattered checks the ENVELOPE, not the return value.** An
+outcome-only assertion passed with the relabel deleted — the outcome said
+`detailed` while the stored trace kept its `full_traces` label with only
+detailed treatment, which is the precise lie #690 exists to forbid. Found by
+mutation, not review, and the test helper now returns the envelope so the
+assertion can see it.
+
+### Fixed — `TraceLevel`'s doc restated a spec persist does not own, and had drifted
+
+`context/TRACE_WIRE_FORMAT.md` is a **pointer, not a copy**, and says why: the
+spec once lived in two places, one drifted, and that produced the
+v0.1.18 → v0.1.20 float-canonicalization break.
+
+The enum's own doc comments were still a copy — and had drifted. They described
+`detailed` as carrying "reasoning text fields, override reasons, identified
+sources, sanitized stakeholder lists, prompt hashes". **`detailed` carries no
+content fields at all.**
+
+The drift was wrong in the dangerous direction: it read as though unscrubbed
+content sat on the default ingest path. I reasoned from it and filed an issue
+proposing a new refusal there (#702, now closed as wrong-premise). Nothing gates
+a doc comment, so a vendored paraphrase decays exactly like a vendored file and
+is harder to notice, because it does not look like a copy.
+
+The inventory is removed rather than corrected. What persist **enforces** stays
+in the type; what a level **contains** lives upstream, and a reader is sent to
+the FSD at the pinned commit.
+
+### Known, not fixed — `detailed` passes through silently
+
+`NullScrubber` redacts nothing, so at `detailed` the #690 door does not fire and
+the batch is accepted with only a `tracing::warn!`.
+
+**This is not the leak it first appeared to be.** `detailed` carries no content
+fields, so an unscrubbed `detailed` batch exposes nothing — see the doc-drift
+entry above for how the opposite impression got into this codebase and into a
+filed issue. No gate is needed there, and #702 is closed as wrong-premise.
+
+Recorded rather than dropped because the reasoning is worth keeping: #690 made
+`ner_ran` and `applied_trace_level` carried, signed facts, so *if* a level ever
+does carry content that a scrubber should touch, the enforcement decision is now
+available rather than requiring new plumbing.
+
 ## [32.2.0] - 2026-08-15
 
 Additive. One new refusal on a filter that was silently returning nothing, plus

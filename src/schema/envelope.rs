@@ -18,16 +18,42 @@ use super::version::SchemaVersion;
 /// includes `trace_level` (TRACE_WIRE_FORMAT.md §8), so re-signing at
 /// a different level produces a different signature; verification
 /// cannot be confused across levels.
+///
+/// # The field inventory per level is NOT restated here (v32.3.0)
+///
+/// It lives in the agent's FSD, and `context/TRACE_WIRE_FORMAT.md` is a
+/// POINTER to it rather than a copy — because a vendored copy drifts, which is
+/// how the v0.1.18 → v0.1.20 float-canonicalization break happened.
+///
+/// These doc comments were still a copy, and had drifted: they described
+/// `detailed` as carrying "reasoning text fields, override reasons, identified
+/// sources…" when it carries **no content fields at all**. Nothing gates a doc
+/// comment, so the drift was invisible until it was reasoned from — an issue
+/// was filed proposing a new refusal on the default ingest path on the strength
+/// of it (CIRISPersist#702, closed as wrong-premise).
+///
+/// So: what persist ENFORCES lives here; what a level CONTAINS lives upstream.
+/// Anything needing the inventory reads the FSD at the pinned commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceLevel {
-    /// All numeric scores, booleans, identifiers, attempt_index, sizes,
-    /// durations, cost. **No content text.**
+    /// No content text.
     Generic,
-    /// Generic + reasoning text fields, override reasons, identified
-    /// sources, sanitized stakeholder lists, prompt hashes.
+    /// No content text. Adds structured detail over [`Self::Generic`].
+    ///
+    /// v32.3.0 — this doc previously restated the spec's field list from
+    /// memory ("reasoning text fields, override reasons, identified sources,
+    /// sanitized stakeholder lists, prompt hashes") and **that restatement was
+    /// wrong**: `detailed` does not carry content fields. It was wrong in the
+    /// dangerous direction, too — it read as though there were unscrubbed
+    /// content here, and an issue was filed proposing a new refusal on the
+    /// default ingest path on the strength of it (CIRISPersist#702, closed).
+    ///
+    /// See the type-level note: the field inventory belongs to the agent's
+    /// FSD, and persist does not keep a copy.
     Detailed,
-    /// Detailed + every prompt + every completion verbatim.
+    /// The level that carries verbatim content, and the only one the
+    /// named-entity gate (CIRISPersist#690) applies to.
     FullTraces,
 }
 
@@ -41,6 +67,41 @@ impl TraceLevel {
             Self::Generic => "generic",
             Self::Detailed => "detailed",
             Self::FullTraces => "full_traces",
+        }
+    }
+
+    /// v32.3.0 (CIRISPersist#701) — how much content the level admits, as a
+    /// rank: `Generic` 0 < `Detailed` 1 < `FullTraces` 2.
+    ///
+    /// Exists so "is this a DOWNGRADE" is one definition rather than a
+    /// comparison open-coded at each site. A scrubber may reduce the level it
+    /// treated content at (the sanctioned remedy when no NER model is
+    /// available); it may never RAISE it, which would claim the content is more
+    /// detailed than what was actually processed.
+    ///
+    /// A named rank rather than `#[derive(Ord)]`: deriving would silently make
+    /// every comparison operator available on a type whose ordering is a
+    /// domain judgement, not an intrinsic one.
+    #[must_use]
+    pub fn detail_rank(self) -> u8 {
+        match self {
+            Self::Generic => 0,
+            Self::Detailed => 1,
+            Self::FullTraces => 2,
+        }
+    }
+
+    /// Parse a wire token back to a level. Inverse of [`Self::as_str`].
+    ///
+    /// v32.3.0 (#701) — needed because a Python scrubber now STATES the level
+    /// it treated content at, and that claim arrives as a wire token.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "generic" => Some(Self::Generic),
+            "detailed" => Some(Self::Detailed),
+            "full_traces" => Some(Self::FullTraces),
+            _ => None,
         }
     }
 }

@@ -30031,25 +30031,35 @@ impl Scrubber for PyCallableScrubber {
                 .bind(py)
                 .call1((py_obj,))
                 .map_err(|e| ScrubError::External(format!("scrubber call: {e}")))?;
-            // v32.0.0 (#690) — the 4-tuple FIRST, so a callable that states its
-            // treatment is taken at its word; the 2-tuple only as a fallback.
-            // Tried in the other order, `.extract()` on the 2-tuple would fail
-            // for a 4-tuple and the richer claim would be silently discarded.
-            let (scrubbed, modified, ner_ran, model_digest) =
-                match result.extract::<(Py<PyAny>, usize, bool, Option<String>)>() {
-                    Ok((d, n, ner, dig)) => (d, n, ner, dig),
-                    Err(_) => {
-                        let (d, n): (Py<PyAny>, usize) = result.extract().map_err(|e| {
-                            ScrubError::External(format!(
-                                "scrubber return shape: expected (dict, count, ner_ran, \
-                             model_digest) or the legacy (dict, count): {e}"
-                            ))
-                        })?;
-                        // NOT inferred from `n`. A nonzero count says fields changed,
-                        // never that a named-entity pass ran — treating it as proof
-                        // would manufacture the evidence #690 exists to demand.
-                        (d, n, false, None)
-                    }
+            // Shapes tried WIDEST FIRST, so a callable that states more is taken
+            // at its word. In the other order a 5-tuple would match the 4-tuple
+            // arm's prefix rules only by luck, and the richer claim would be
+            // silently discarded — the failure being a REFUSAL the caller
+            // cannot act on, which is exactly what #701 reported.
+            //
+            // v32.3.0 (#701): 5-tuple — the callable also states the LEVEL it
+            // treated the content at.
+            // v32.0.0 (#690): 4-tuple — ner_ran + model digest.
+            // legacy:          2-tuple — a count, which proves nothing.
+            let (scrubbed, modified, ner_ran, model_digest, declared_level) =
+                match result.extract::<(Py<PyAny>, usize, bool, Option<String>, String)>() {
+                    Ok((d, n, ner, dig, lvl)) => (d, n, ner, dig, Some(lvl)),
+                    Err(_) => match result.extract::<(Py<PyAny>, usize, bool, Option<String>)>() {
+                        Ok((d, n, ner, dig)) => (d, n, ner, dig, None),
+                        Err(_) => {
+                            let (d, n): (Py<PyAny>, usize) = result.extract().map_err(|e| {
+                                ScrubError::External(format!(
+                                    "scrubber return shape: expected (dict, count, ner_ran, \
+                                 model_digest, applied_trace_level), the 4-tuple without \
+                                 the level, or the legacy (dict, count): {e}"
+                                ))
+                            })?;
+                            // NOT inferred from `n`. A nonzero count says fields changed,
+                            // never that a named-entity pass ran — treating it as proof
+                            // would manufacture the evidence #690 exists to demand.
+                            (d, n, false, None, None)
+                        }
+                    },
                 };
             let tuple = (scrubbed, modified);
             // json.dumps on the returned dict.
@@ -30080,15 +30090,60 @@ impl Scrubber for PyCallableScrubber {
                 ));
             }
             *env = new_env;
-            // `applied_trace_level` is read from the envelope AFTER the
-            // preservation gate above, which rejects any callable that altered
-            // `trace_level`. So this is the level the content was actually
-            // treated at, not a level the callable asserted separately — one
-            // fewer claim that can disagree with the envelope it describes.
+
+            // v32.3.0 (CIRISPersist#701) — **the sanctioned remedy, made
+            // reachable from Python.**
+            //
+            // #690 documented the honest path for a node with no NER model:
+            // treat the content at `detailed` and RELABEL, so the claim matches
+            // the treatment. A Rust `Scrubber` can do that — it owns `&mut
+            // BatchEnvelope`. A Python callable could not: the preservation
+            // gate above rejects any `trace_level` edit, and the outcome's
+            // level was then read back off the envelope, so it was pinned equal
+            // to the incoming label by construction. At `full_traces` with no
+            // model the only options were `ner_ran: true` (a lie) or a
+            // guaranteed refusal. The documented remedy was structurally
+            // unavailable to the primary consumer — ten refusals and zero rows
+            // persisted in a staged QA run.
+            //
+            // So the callable may now STATE the level it treated at, and
+            // persist performs the relabel on its behalf. The preservation gate
+            // stays exactly as strict: the envelope the callable returns still
+            // may not move `trace_level` itself.
+            let applied = match declared_level {
+                None => env.trace_level,
+                Some(ref raw) => {
+                    let declared = crate::schema::TraceLevel::from_wire_str(raw).ok_or_else(
+                        || {
+                            ScrubError::External(format!(
+                                "scrubber declared applied_trace_level={raw:?}, which is not a trace \
+                                 level (expected generic | detailed | full_traces)"
+                            ))
+                        },
+                    )?;
+                    // DOWNGRADE ONLY. Raising the level would claim the content
+                    // is more detailed than what was processed — a lie in the
+                    // direction that matters, and one that would let a callable
+                    // launder a `detailed` pass into a `full_traces` label.
+                    if declared.detail_rank() > env.trace_level.detail_rank() {
+                        return Err(ScrubError::External(format!(
+                            "scrubber declared applied_trace_level={} but the batch is                              labelled {} — a scrubber may REDUCE the level it treated                              content at, never raise it",
+                            declared.as_str(),
+                            env.trace_level.as_str()
+                        )));
+                    }
+                    // Relabel so the stored trace says what it actually is. The
+                    // callable reduced the CONTENT; this makes the label agree,
+                    // which is the whole point of the remedy.
+                    env.trace_level = declared;
+                    declared
+                }
+            };
+
             Ok(crate::scrub::ScrubOutcome {
                 fields_modified: tuple.1,
                 ner_ran,
-                applied_trace_level: env.trace_level.as_str().to_owned(),
+                applied_trace_level: applied.as_str().to_owned(),
                 scrubber_model_digest: model_digest,
             })
         })
@@ -30684,6 +30739,20 @@ mod tests {
     /// Build a `PyCallableScrubber` from a Python source expression evaluating
     /// to a callable, run it, and return the outcome.
     fn run_bridge(src: &str) -> Result<crate::scrub::ScrubOutcome, ScrubError> {
+        run_bridge_env(src).map(|(outcome, _env)| outcome)
+    }
+
+    /// v32.3.0 (#701) — returns the ENVELOPE as well as the outcome.
+    ///
+    /// Needed because the outcome alone cannot see the relabel: dropping
+    /// `env.trace_level = declared` leaves the outcome saying `detailed` while
+    /// the STORED envelope still says `full_traces` — a trace labelled
+    /// full_traces carrying only detailed treatment, which is precisely the lie
+    /// #690 exists to forbid. A mutation test proved the outcome-only assertions
+    /// could not see it.
+    fn run_bridge_env(
+        src: &str,
+    ) -> Result<(crate::scrub::ScrubOutcome, crate::schema::BatchEnvelope), ScrubError> {
         let callable = Python::attach(|py| {
             py.eval(std::ffi::CString::new(src).unwrap().as_c_str(), None, None)
                 .unwrap()
@@ -30693,7 +30762,8 @@ mod tests {
             callable: Arc::new(callable),
         };
         let mut env = bridge_envelope();
-        s.scrub_batch(&mut env)
+        let outcome = s.scrub_batch(&mut env)?;
+        Ok((outcome, env))
     }
 
     /// **CIRISPersist#690 — the Python bridge must not invent evidence.**
@@ -30761,6 +30831,77 @@ mod tests {
             msg.contains("ner_ran"),
             "the error must name the expected shape so a Python author can fix \
              it without reading Rust: {msg:?}"
+        );
+    }
+
+    /// **CIRISPersist#701 — the sanctioned remedy is reachable from Python.**
+    ///
+    /// #690 documented "treat at `detailed` and relabel" as the honest path for
+    /// a node with no NER model, then made it impossible from Python: the
+    /// preservation gate rejects a `trace_level` edit, and the outcome's level
+    /// was read back off the envelope, so it was pinned equal to the incoming
+    /// label. At `full_traces` the only options were to lie or be refused —
+    /// ten refusals and zero rows persisted in a staged QA run.
+    ///
+    /// This drives the actual bridge, so it fails if the 5-tuple stops being
+    /// honoured, if the relabel stops happening, or if the downgrade rule
+    /// inverts.
+    #[test]
+    fn a_python_scrubber_can_downgrade_and_relabel_701() {
+        Python::initialize();
+
+        let out = run_bridge("lambda d: (d, 2, False, None, 'detailed')")
+            .expect("the 5-tuple is the documented remedy and must be accepted");
+        assert_eq!(
+            out.applied_trace_level, "detailed",
+            "the callable's DECLARED level must win over the incoming label, or \
+             the remedy is unreachable exactly as #701 reported"
+        );
+        assert!(!out.ner_ran, "no pass ran and none is claimed");
+
+        // THE STORED ENVELOPE MUST AGREE. Asserting only the outcome cannot see
+        // a missing relabel — proved by mutation: deleting `env.trace_level =
+        // declared` left every outcome-based assertion green while the stored
+        // trace kept its `full_traces` label with only detailed treatment,
+        // which is the exact lie #690 forbids.
+        let (_o, env) = run_bridge_env("lambda d: (d, 2, False, None, 'detailed')").unwrap();
+        assert_eq!(
+            env.trace_level,
+            crate::schema::TraceLevel::Detailed,
+            "persist must RELABEL the envelope to the declared level, or the \
+             stored trace claims a level it was not treated at"
+        );
+
+        // And the outcome no longer trips #690's door — the entire point.
+        // Asserted rather than inferred: "it returned a level" and "that level
+        // clears the gate" are two different claims.
+        let door_refuses = out.applied_trace_level == "full_traces" && !out.ner_ran;
+        assert!(
+            !door_refuses,
+            "a downgraded, relabelled scrub must PASS the #690 door"
+        );
+    }
+
+    /// Raising the level is refused: it would claim the content is more
+    /// detailed than what was processed, and would let a `detailed` pass be
+    /// laundered into a `full_traces` label.
+    #[test]
+    fn a_python_scrubber_may_not_raise_the_level_701() {
+        Python::initialize();
+
+        // Declaring the level it was ALREADY at is not a raise, and is fine.
+        assert!(
+            run_bridge("lambda d: (d, 0, False, None, 'full_traces')").is_ok(),
+            "declaring the incoming level is not a raise"
+        );
+
+        // An unknown level is refused rather than silently ignored — silence
+        // here would put us back to a level that cannot be stated.
+        let bad = run_bridge("lambda d: (d, 0, False, None, 'not_a_level')")
+            .expect_err("an unknown level must be refused");
+        assert!(
+            format!("{bad}").contains("not a trace level"),
+            "the refusal must name the problem: {bad}"
         );
     }
 
