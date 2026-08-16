@@ -40,18 +40,10 @@
 //! The lock-in:
 //!
 //!   - [`LegalBasis`] vocabulary: 10 values, 5+4+1 discipline split.
-//!   - [`WrapAlgorithm`]: `HpkeRfc9180BaseX25519AesGcm` is the v1
-//!     algorithm (wire string `hpke_rfc9180_base_x25519_aes_gcm`).
-//!   - `retire_key_grants` emission shape: fresh `key_grant`
-//!     Contribution with `rotation_chain` extended by the prior
-//!     `contribution_id` (CEG §5.6.8.4 option b — supersession, not
-//!     withdraws).
-//!
-//! Substrate-protective takedown override semantics
-//! (`CIRISNodeCore#24`) remain pending — persist defers to
-//! `AdmissionGate` at `put_contribution`. If/when operator-config
-//! admits a takedown-signer bypass, this module gains the override
-//! surface.
+//!   - [`WrapAlgorithm`]: v34.0.0 (#704) leaves ONE variant, the PQC
+//!     hybrid `X25519MlKem768Aes256GcmHkdfSha256`. The classical-only v1
+//!     is GONE rather than superseded — there is no algorithm to choose,
+//!     so there is no wrong choice to make.
 
 use std::collections::HashSet;
 
@@ -542,11 +534,6 @@ pub struct KeyGrantPayload {
 /// [`WrapAlgorithm::from_wire_str`] matches exactly and folds nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WrapAlgorithm {
-    /// HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM. Locked
-    /// by CEG 0.3 §5.6.8.4. The content-addressed-grant default.
-    #[serde(rename = "hpke_rfc9180_base_x25519_aes_gcm")]
-    HpkeRfc9180BaseX25519AesGcm,
-
     /// X25519 + ML-KEM-768 hybrid DEK wrap (FIPS 203), AES-256-GCM +
     /// HKDF-SHA-256. CEG 0.15 §10.5.3; mandatory for streaming epoch
     /// grants. Maps to `ciris-crypto`'s `KEY_GRANT_ALGORITHM_V2`.
@@ -558,7 +545,6 @@ impl WrapAlgorithm {
     /// Wire-shaped string — matches the locked vocabulary.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::HpkeRfc9180BaseX25519AesGcm => "hpke_rfc9180_base_x25519_aes_gcm",
             Self::X25519MlKem768Aes256GcmHkdfSha256 => "x25519_mlkem768_aes256_gcm_hkdf_sha256",
         }
     }
@@ -583,10 +569,14 @@ impl WrapAlgorithm {
         if ciris_crypto::key_grant::key_grant_algorithm_v2_accepts(s, false) {
             return Some(Self::X25519MlKem768Aes256GcmHkdfSha256);
         }
-        match s {
-            "hpke_rfc9180_base_x25519_aes_gcm" => Some(Self::HpkeRfc9180BaseX25519AesGcm),
-            _ => None,
-        }
+        // v34.0.0 (#704) — v1 is GONE, not superseded. The fleet directive is
+        // that classical-only paths do not exist to be chosen; keeping a
+        // per-scope "reject v1" rule would imply v1 still lives somewhere.
+        //
+        // A stored v1 grant now fails HERE, and the caller renders the token it
+        // saw — so an operator sees the algorithm name and this release rather
+        // than a generic parse failure that looks like corruption.
+        None
     }
 
     /// Whether this is the PQC-hybrid v2 wrap (the only algorithm a
@@ -610,9 +600,30 @@ pub enum KeyGrantScope {
     GroupMember,
     SubscriptionTier,
     /// One grant per `(stream_id, epoch)` — the streaming epoch-DEK
-    /// cascade (CEG 0.15 §10.5.3). `scope_id` is the `stream_id`. The
-    /// only scope a stream/epoch-addressed grant may carry.
+    /// cascade (CEG 0.15 §10.5.3). `scope_id` is the `stream_id`.
     StreamEpoch,
+    /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — one grant per
+    /// `(netname, epoch)`: the IFAC transit passphrase for scoped transit.
+    /// `scope_id` is the IFAC `netname`.
+    ///
+    /// Structurally IDENTICAL to [`Self::StreamEpoch`] — an `(id, epoch)` pair
+    /// with one grant set per epoch, rotated by superseding the set and
+    /// converged by reading it. That is why this is a second VALUE of the
+    /// epoch-addressed mechanism rather than a third addressing category: a
+    /// parallel copy would be N implementations of one invariant agreeing only
+    /// because someone diffed them (#663).
+    TransitMembership,
+}
+
+impl KeyGrantScope {
+    /// Does this scope address by `(scope_id, epoch)` rather than by content?
+    ///
+    /// The one definition of "epoch-addressed", so the XOR, the column
+    /// projection and the reads cannot disagree about which scopes are which.
+    #[must_use]
+    pub fn is_epoch_addressed(self) -> bool {
+        matches!(self, Self::StreamEpoch | Self::TransitMembership)
+    }
 }
 
 impl KeyGrantScope {
@@ -623,6 +634,7 @@ impl KeyGrantScope {
             Self::GroupMember => "group_member",
             Self::SubscriptionTier => "subscription_tier",
             Self::StreamEpoch => "stream_epoch",
+            Self::TransitMembership => "transit_membership",
         }
     }
 }
@@ -875,7 +887,7 @@ mod tests {
             stream_id: None,
             stream_epoch: None,
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
-            wrap_algorithm: WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
             key_validity_window: KeyValidityWindow {
                 not_before: DateTime::parse_from_rfc3339("2026-05-29T00:00:00Z")
@@ -1053,18 +1065,36 @@ mod tests {
         );
     }
 
+    /// v34.0.0 (#704) — the surviving algorithm round-trips, and the RETIRED
+    /// v1 token is refused.
+    ///
+    /// Replaces `wrap_algorithm_hpke_rfc9180_wire_str_round_trip`, which pinned
+    /// the v1 wire string as the value `as_str()` returns. After the blanket
+    /// rename that test asserted the v2 variant renders the v1 token — a
+    /// contradiction that would have compiled and failed loudly, but for the
+    /// wrong reason.
+    ///
+    /// The v1 leg is kept as a NEGATIVE: `from_wire_str` must refuse
+    /// `hpke_rfc9180_base_x25519_aes_gcm`, so a stored classical grant is
+    /// rejected at parse rather than silently mapped onto the PQC variant.
     #[test]
-    fn wrap_algorithm_hpke_rfc9180_wire_str_round_trip() {
-        let alg = WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        assert_eq!(alg.as_str(), "hpke_rfc9180_base_x25519_aes_gcm");
+    fn only_the_pqc_wrap_round_trips_and_v1_is_refused_704() {
+        let alg = WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256;
+        assert_eq!(alg.as_str(), "x25519_mlkem768_aes256_gcm_hkdf_sha256");
         assert_eq!(
-            WrapAlgorithm::from_wire_str("hpke_rfc9180_base_x25519_aes_gcm"),
+            WrapAlgorithm::from_wire_str("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
             Some(alg)
         );
-        assert!(WrapAlgorithm::from_wire_str("x25519_aes256_gcm_hkdf_sha256").is_none());
-        // serde round-trip: serialize → string → deserialize.
+
+        // THE RETIREMENT, asserted rather than assumed: the classical token is
+        // no longer a value this type can hold.
+        assert!(
+            WrapAlgorithm::from_wire_str("hpke_rfc9180_base_x25519_aes_gcm").is_none(),
+            "v1 is GONE — a stored classical grant must fail at parse, not be \
+             folded onto the PQC variant"
+        );
+
         let serialized = serde_json::to_string(&alg).unwrap();
-        assert_eq!(serialized, r#""hpke_rfc9180_base_x25519_aes_gcm""#);
         let back: WrapAlgorithm = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back, alg);
     }
@@ -1204,22 +1234,15 @@ mod tests {
         assert!(parsed.wrap_algorithm.is_streaming_pqc_v2());
     }
 
-    #[test]
-    fn stream_grant_with_v1_wrap_is_rejected() {
-        // The normative §10.5.3 check: a streaming epoch grant carrying
-        // wrap_algorithm v1 MUST be rejected.
-        let mut typed = fixture_stream_grant();
-        typed.wrap_algorithm = WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        match err {
-            Error::InvalidArgument(m) => assert!(
-                m.contains("wrap_algorithm v2") && m.contains("v1"),
-                "expected reject-v1 message, got: {m}"
-            ),
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
-    }
+    // v34.0.0 (#704) — `stream_grant_with_v1_wrap_is_rejected` DELETED, not
+    // flipped to v2.
+    //
+    // It asserted "a streaming epoch grant carrying wrap_algorithm v1 MUST be
+    // rejected". With v1 removed from the enum that state is UNCONSTRUCTIBLE,
+    // so the test could only have been rewritten into something that no longer
+    // checks what its name claims. The rule it enforced at runtime is now
+    // enforced by the type system, which is strictly stronger: not "we refuse
+    // it" but "it cannot be expressed".
 
     #[test]
     fn grant_with_both_addressing_modes_is_rejected() {
@@ -1251,12 +1274,13 @@ mod tests {
 
     #[test]
     fn content_grant_still_accepts_v1() {
-        // Backward compat: a content-addressed grant with v1 wrap is
-        // unaffected by the streaming reject-v1 rule.
+        // v34.0.0 (#704) — every grant is v2 now, content-addressed
+        // included. The old assertion here pinned the content default to
+        // v1, which was the live classical-only path this release removes.
         let typed = fixture_key_grant();
         assert_eq!(
             typed.wrap_algorithm,
-            WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm
+            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256
         );
         let value = serde_json::to_value(&typed).unwrap();
         assert!(extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
@@ -1464,17 +1488,16 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
     }
 
-    #[test]
-    fn require_key_grant_envelope_rejects_malformed_payload() {
-        // A v1 wrap on a stream/epoch grant fails the payload
-        // validator inside the gate (same rule as ingest).
-        let mut payload = fixture_stream_grant();
-        payload.wrap_algorithm = WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        let env = fixture_grant_envelope(&payload);
-        let err = require_key_grant_envelope(&env).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidArgument(ref m) if m.contains("wrap_algorithm v2")),
-            "got: {err:?}"
-        );
-    }
+    // v34.0.0 (#704) — `require_key_grant_envelope_rejects_malformed_payload`
+    // DELETED rather than flipped.
+    //
+    // It asserted that a v1 wrap on a stream/epoch grant fails the gate. With
+    // v1 removed from the enum that input is unconstructible, so there is no
+    // malformed payload of this shape left to reject — the gate's rule is now
+    // the type system's.
+    //
+    // Recorded because of HOW it nearly shipped: a blanket
+    // `s.replace(v1_variant, v2_variant)` rewrote it into a test that set v2,
+    // expected a refusal, and failed. A mechanical rename cannot tell a fixture
+    // from an assertion, and this one asserted the thing being deleted.
 }

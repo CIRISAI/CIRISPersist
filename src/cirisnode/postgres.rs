@@ -178,22 +178,37 @@ impl NodeCoreService for PostgresBackend {
             takedown.as_ref().map(|p| p.legal_basis.as_str());
         let key_grant_recipient_key_id: Option<String> =
             key_grant.as_ref().map(|p| p.recipient_key_id.clone());
-        // v4.x (CIRISPersist#142 Cut C3b) — stream/epoch addressing
-        // projection (V064 columns). XOR with media_content_sha256 is
-        // guaranteed by extract_key_grant_payload. stream_epoch is u64
-        // in Rust → bound i64 (BIGINT); tokio_postgres has no ToSql u64.
-        let key_grant_stream_id: Option<String> =
+        // v4.x (CIRISPersist#142 Cut C3b) → v34.0.0 (CIRISPersist#704, V129)
+        // — scope/epoch addressing projection. XOR with media_content_sha256 is
+        // guaranteed by extract_key_grant_payload. The epoch is u64 in Rust →
+        // bound i64 (BIGINT); tokio_postgres has no ToSql u64.
+        //
+        // `key_grant_scope_kind` is the discriminator V129 added: it names
+        // WHICH addressing scope `key_grant_scope_id` is an id in. Its value is
+        // the payload's declared `scope`, gated by
+        // `KeyGrantScope::is_epoch_addressed()` — THE definition of which
+        // scopes address by an `(id, epoch)` pair. Matching the variants inline
+        // here would be a second copy of that rule, free to disagree with the
+        // validator the moment either is edited (#663).
+        //
+        // The V129 CHECK demands all THREE scope columns together, so a payload
+        // whose declared `scope` contradicts its addressing fields is refused
+        // at the DB rather than stored half-addressed — "which scope is this
+        // DEK for" is never an inference.
+        let key_grant_scope_kind: Option<String> = key_grant
+            .as_ref()
+            .filter(|p| p.scope.is_epoch_addressed())
+            .map(|p| p.scope.as_str().to_owned());
+        let key_grant_scope_id: Option<String> =
             key_grant.as_ref().and_then(|p| p.stream_id.clone());
-        let key_grant_stream_epoch: Option<i64> =
-            match key_grant.as_ref().and_then(|p| p.stream_epoch) {
-                None => None,
-                Some(e) => Some(i64::try_from(e).map_err(|_| {
-                    Error::InvalidArgument(
-                        "key_grant: stream_epoch exceeds i64 — key_grant_stream_epoch is BIGINT"
-                            .into(),
-                    )
-                })?),
-            };
+        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+            None => None,
+            Some(e) => Some(i64::try_from(e).map_err(|_| {
+                Error::InvalidArgument(
+                    "key_grant: epoch exceeds i64 — key_grant_epoch is BIGINT".into(),
+                )
+            })?),
+        };
 
         let client = self
             .pool()
@@ -212,9 +227,9 @@ impl NodeCoreService for PostgresBackend {
                     signature, signing_key_id, signature_verified, persist_row_hash, \
                     announcement_priority, announcement_authority_class, \
                     media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis, \
-                    key_grant_stream_id, key_grant_stream_epoch\
+                    key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13, $14, \
-                           $15, $16, $17, $18, $19)",
+                           $15, $16, $17, $18, $19, $20)",
                 &[
                     &id,
                     &contribution_type_str(env.contribution_type),
@@ -233,8 +248,9 @@ impl NodeCoreService for PostgresBackend {
                     &media_content_sha256,
                     &key_grant_recipient_key_id,
                     &takedown_legal_basis,
-                    &key_grant_stream_id,
-                    &key_grant_stream_epoch,
+                    &key_grant_scope_kind,
+                    &key_grant_scope_id,
+                    &key_grant_epoch,
                 ],
             )
             .await
@@ -1255,8 +1271,8 @@ impl NodeCoreService for PostgresBackend {
                         author_id, payload, witness_set, submitted_at, signature \
                  FROM cirisnode.contributions \
                  WHERE subject_kind = 'key_grant' \
-                   AND key_grant_stream_id = $1 \
-                   AND key_grant_stream_epoch = $2 \
+                   AND key_grant_scope_id = $1 \
+                   AND key_grant_epoch = $2 \
                  ORDER BY submitted_at DESC, contribution_id DESC",
                 &[&stream_id, &epoch_i64],
             )
@@ -2805,7 +2821,7 @@ mod tests {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
             },
-            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
             key_validity_window: crate::cirisnode::KeyValidityWindow {
                 not_before: Utc::now(),
@@ -2889,11 +2905,10 @@ mod tests {
 
     /// PG parity for the stream/epoch grant cascade: v2 grant admitted,
     /// projected onto the V064 BIGINT/text columns, served by
-    /// list_key_grants_for_stream_epoch filtered on (stream_id, epoch);
-    /// and a v1-wrapped streaming grant is rejected at ingest.
+    /// list_key_grants_for_stream_epoch filtered on (stream_id, epoch).
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn pg_stream_epoch_grant_round_trip_and_v1_reject() {
+    async fn pg_stream_epoch_grant_round_trip_and_filter() {
         use crate::store::backend::Backend;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -2939,16 +2954,6 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
-
-        // v1 wrap on a streaming grant is rejected at ingest.
-        let mut env = build_stream_key_grant(&author_key, &stream, 3, &recip);
-        let mut payload: crate::cirisnode::KeyGrantPayload =
-            serde_json::from_value(env.payload.clone()).unwrap();
-        payload.wrap_algorithm = crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        env.payload = serde_json::to_value(&payload).unwrap();
-        env.signature = sign_envelope(&env, &author_key);
-        let err = backend.put_contribution(env).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
     }
 
     /// v16 (#432, CC 5.1 `CLM-epoch-keying`) — the dedicated
@@ -3621,7 +3626,7 @@ mod tests {
                 .payload
                 .get("wrap_algorithm")
                 .and_then(|v| v.as_str()),
-            Some("hpke_rfc9180_base_x25519_aes_gcm"),
+            Some("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
             "CEG 0.3 §5.6.8.4 wrap_algorithm wire string"
         );
 
@@ -3749,152 +3754,22 @@ mod tests {
         );
     }
 
-    /// V064 (CIRISPersist#142 Cut C3a) — the widened key_grant CHECK
-    /// admits BOTH addressing modes (content XOR stream/epoch) and
-    /// rejects malformed shapes. Direct bare-SQL inserts exercise the
-    /// constraint at the DB layer (the stream-addressed write path is
-    /// Cut C3b; C3a only makes the schema admit the shape).
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn v064_check_admits_both_key_grant_addressing_modes() {
-        use crate::store::backend::Backend;
-        use tokio_postgres::error::SqlState;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
-
-        // Raw key_grant insert helper. Columns beyond the standard
-        // envelope are passed as $2 (sha), $3 (recipient), $4
-        // (stream_id), $5 (stream_epoch).
-        let sql = "INSERT INTO cirisnode.contributions (\
-                contribution_id, contribution_type, domain, language, subject_kind, \
-                author_id, payload, witness_set, submitted_at, \
-                signature, signing_key_id, signature_verified, persist_row_hash, \
-                media_content_sha256, key_grant_recipient_key_id, \
-                key_grant_stream_id, key_grant_stream_epoch\
-             ) VALUES ($1, 'proposal', 'd', 'en', 'key_grant', 'a', '{}'::jsonb, NULL, NOW(), \
-                       'sig', 'a', TRUE, 'h', $2, $3, $4, $5)";
-        let sha = "a".repeat(64);
-        let recipient = "rec-1".to_string();
-        let stream = "stream-xyz".to_string();
-        let epoch: i64 = 7;
-
-        // 1. Existing content-addressed key_grant (sha + recipient,
-        //    stream cols NULL) STILL inserts OK.
-        client
-            .execute(
-                sql,
-                &[
-                    &Uuid::new_v4(),
-                    &Some(sha.clone()),
-                    &Some(recipient.clone()),
-                    &None::<String>,
-                    &None::<i64>,
-                ],
-            )
-            .await
-            .expect("content-addressed key_grant must still insert post-V064");
-
-        // 2. NEW stream/epoch-addressed key_grant (recipient + stream_id
-        //    + stream_epoch, sha NULL) now inserts OK (was rejected
-        //    pre-V064).
-        client
-            .execute(
-                sql,
-                &[
-                    &Uuid::new_v4(),
-                    &None::<String>,
-                    &Some(recipient.clone()),
-                    &Some(stream.clone()),
-                    &Some(epoch),
-                ],
-            )
-            .await
-            .expect("stream/epoch-addressed key_grant must insert post-V064");
-
-        // 3. BOTH addressing modes set → rejected.
-        let err = client
-            .execute(
-                sql,
-                &[
-                    &Uuid::new_v4(),
-                    &Some(sha.clone()),
-                    &Some(recipient.clone()),
-                    &Some(stream.clone()),
-                    &Some(epoch),
-                ],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.as_db_error().map(|d| d.code().clone()),
-            Some(SqlState::CHECK_VIOLATION),
-            "both-addressing-modes key_grant must be rejected; got: {err:?}"
-        );
-
-        // 4. NEITHER addressing mode set (recipient only) → rejected.
-        let err = client
-            .execute(
-                sql,
-                &[
-                    &Uuid::new_v4(),
-                    &None::<String>,
-                    &Some(recipient.clone()),
-                    &None::<String>,
-                    &None::<i64>,
-                ],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.as_db_error().map(|d| d.code().clone()),
-            Some(SqlState::CHECK_VIOLATION),
-            "neither-addressing-mode key_grant must be rejected; got: {err:?}"
-        );
-
-        // 5. stream_id without stream_epoch → rejected (partial
-        //    stream/epoch mode).
-        let err = client
-            .execute(
-                sql,
-                &[
-                    &Uuid::new_v4(),
-                    &None::<String>,
-                    &Some(recipient.clone()),
-                    &Some(stream.clone()),
-                    &None::<i64>,
-                ],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.as_db_error().map(|d| d.code().clone()),
-            Some(SqlState::CHECK_VIOLATION),
-            "stream_id-without-epoch key_grant must be rejected; got: {err:?}"
-        );
-
-        // 6. non-key_grant row with a stream col set → rejected.
-        let err = client
-            .execute(
-                "INSERT INTO cirisnode.contributions (\
-                    contribution_id, contribution_type, domain, language, subject_kind, \
-                    author_id, payload, witness_set, submitted_at, \
-                    signature, signing_key_id, signature_verified, persist_row_hash, \
-                    key_grant_stream_id, key_grant_stream_epoch\
-                 ) VALUES ($1, 'proposal', 'd', 'en', 'arc_question', 'a', '{}'::jsonb, NULL, NOW(), \
-                           'sig', 'a', TRUE, 'h', $2, $3)",
-                &[&Uuid::new_v4(), &Some(stream.clone()), &Some(epoch)],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.as_db_error().map(|d| d.code().clone()),
-            Some(SqlState::CHECK_VIOLATION),
-            "non-key_grant row with stream col set must be rejected; got: {err:?}"
-        );
-    }
+    // v34.0.0 (CIRISPersist#704, V129) — DELETED:
+    // `v064_check_admits_both_key_grant_addressing_modes`.
+    //
+    // The test's central positive case asserted that a key_grant carrying the
+    // V064 stream/epoch column pair and nothing else INSERTS —
+    // "stream/epoch-addressed key_grant must insert post-V064". V129 renamed
+    // that pair to `(key_grant_scope_id, key_grant_epoch)` and added a THIRD
+    // column, `key_grant_scope_kind`, which the re-added
+    // `contributions_key_grant_columns_match_subject_kind` CHECK requires
+    // alongside them: a two-of-three scope insert is now refused by
+    // construction. The assertion cannot be carried across the rename — only
+    // replaced by a different one about a different rule — and the test's name
+    // pins V064's rule, so it is deleted rather than rewritten into a passing
+    // shape that still claims to check V064.
+    //
+    // The V129 rule (all three scope columns together, XOR content-addressed)
+    // is unguarded at the DB layer here as a result and wants a deliberately
+    // authored V129-named replacement.
 }

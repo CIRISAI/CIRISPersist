@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [34.0.0] - 2026-08-16
+
+**IN PROGRESS — not yet certified.** Entry exists so in-flight code may
+reference the version it will ship in; the gate that enforces that is the reason
+this is written before the work is finished, not after.
+
+### BREAKING — one epoch-addressing mechanism, and no classical wrap (#704)
+
+`key_grant` addressing generalizes from `(stream_id, stream_epoch)` to
+`(scope_kind, scope_id, epoch)` (V129, both dialects). **The addressing XOR stays
+TWO-WAY** — content-addressed XOR scope-epoch-addressed — with streaming and
+transit membership as two *values* of `scope_kind`. Generalizing removed the
+pressure to ever add a third addressing category rather than adding one.
+
+`KeyGrantScope::TransitMembership` carries the IFAC transit passphrase for
+CIRISEdge#492's scoped transit. It is structurally identical to the streaming
+epoch cascade — an `(id, epoch)` pair, one grant set per epoch, rotated by
+supersession and converged by reading the set — which is why it is a second
+value rather than a parallel implementation.
+
+`scope_kind` carries no closed-value CHECK, deliberately: pinning the set would
+mean a migration per future scope kind, which is the cost this removes.
+
+**`WrapAlgorithm` v1 (`hpke_rfc9180_base_x25519_aes_gcm`) is GONE** — not
+deprecated, not rejected per-scope. A per-scope rejection rule would imply v1
+still lives somewhere. A stored v1 grant now fails at parse with a message
+naming the algorithm, rather than being folded onto the PQC variant.
+
+**Blocks CIRISEdge until it lands.** *No configuration required* is the feature:
+scoped transit exists so CIRIS peers route compliant PQC CEG/RNS traffic without
+an operator distributing a shared secret by hand, which is exactly what the
+rotating grant replaces.
+
 ## [33.0.0] - 2026-08-16
 
 ### BREAKING — scrubbing moved to the egress boundary (#705, CIRISServer#418)

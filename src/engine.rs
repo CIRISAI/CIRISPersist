@@ -17320,7 +17320,7 @@ mod tests {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
             },
-            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
             key_validity_window: crate::cirisnode::KeyValidityWindow {
                 not_before: submitted_at,

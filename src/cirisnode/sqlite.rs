@@ -298,22 +298,37 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             takedown.as_ref().map(|p| p.legal_basis.as_str().to_owned());
         let key_grant_recipient_key_id: Option<String> =
             key_grant.as_ref().map(|p| p.recipient_key_id.clone());
-        // v4.x (CIRISPersist#142 Cut C3b) — stream/epoch addressing
-        // projection (V064 columns). Populated iff the grant is
-        // stream/epoch-addressed; the extractor guarantees the XOR with
+        // v4.x (CIRISPersist#142 Cut C3b) → v34.0.0 (CIRISPersist#704, V129)
+        // — scope/epoch addressing projection. Populated iff the grant is
+        // scope-epoch-addressed; the extractor guarantees the XOR with
         // media_content_sha256.
-        let key_grant_stream_id: Option<String> =
+        //
+        // `key_grant_scope_kind` is the discriminator V129 added: it names
+        // WHICH addressing scope `key_grant_scope_id` is an id in. Its value is
+        // the payload's declared `scope`, gated by
+        // `KeyGrantScope::is_epoch_addressed()` — THE definition of which
+        // scopes address by an `(id, epoch)` pair. Matching the variants inline
+        // here would be a second copy of that rule, free to disagree with the
+        // validator the moment either is edited (#663).
+        //
+        // The V129 trigger demands all THREE scope columns together, so a
+        // payload whose declared `scope` contradicts its addressing fields is
+        // refused at the DB rather than stored half-addressed — "which scope is
+        // this DEK for" is never an inference.
+        let key_grant_scope_kind: Option<String> = key_grant
+            .as_ref()
+            .filter(|p| p.scope.is_epoch_addressed())
+            .map(|p| p.scope.as_str().to_owned());
+        let key_grant_scope_id: Option<String> =
             key_grant.as_ref().and_then(|p| p.stream_id.clone());
-        let key_grant_stream_epoch: Option<i64> =
-            match key_grant.as_ref().and_then(|p| p.stream_epoch) {
-                None => None,
-                Some(e) => Some(i64::try_from(e).map_err(|_| {
-                    Error::InvalidArgument(
-                        "key_grant: stream_epoch exceeds i64 — key_grant_stream_epoch is INTEGER"
-                            .into(),
-                    )
-                })?),
-            };
+        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.stream_epoch) {
+            None => None,
+            Some(e) => Some(i64::try_from(e).map_err(|_| {
+                Error::InvalidArgument(
+                    "key_grant: epoch exceeds i64 — key_grant_epoch is INTEGER".into(),
+                )
+            })?),
+        };
 
         let id_str = id.to_string();
         let ct_str = contribution_type_str(env.contribution_type).to_owned();
@@ -342,9 +357,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         signature, signing_key_id, signature_verified, persist_row_hash, \
                         announcement_priority, announcement_authority_class, \
                         media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis, \
-                        key_grant_stream_id, key_grant_stream_epoch\
+                        key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, \
-                               ?15, ?16, ?17, ?18, ?19)",
+                               ?15, ?16, ?17, ?18, ?19, ?20)",
                     params![
                         id_str,
                         ct_str,
@@ -363,8 +378,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         media_content_sha256,
                         key_grant_recipient_key_id,
                         takedown_legal_basis,
-                        key_grant_stream_id,
-                        key_grant_stream_epoch,
+                        key_grant_scope_kind,
+                        key_grant_scope_id,
+                        key_grant_epoch,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
@@ -1602,7 +1618,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         epoch: u64,
     ) -> Result<Vec<ContributionEnvelope>, Error> {
         let stream = stream_id.to_owned();
-        // u64 epoch → bound i64; key_grant_stream_epoch is INTEGER.
+        // u64 epoch → bound i64; key_grant_epoch is INTEGER.
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
             Error::InvalidArgument("list_key_grants_for_stream_epoch: epoch exceeds i64".into())
         })?;
@@ -1615,8 +1631,8 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                             author_id, payload, witness_set, submitted_at, signature \
                      FROM cirisnode_contributions \
                      WHERE subject_kind = 'key_grant' \
-                       AND key_grant_stream_id = ?1 \
-                       AND key_grant_stream_epoch = ?2 \
+                       AND key_grant_scope_id = ?1 \
+                       AND key_grant_epoch = ?2 \
                      ORDER BY submitted_at DESC, contribution_id DESC",
                 )
                 .map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch prepare"))?;
@@ -2956,7 +2972,7 @@ mod tests {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
             },
-            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
             key_validity_window: crate::cirisnode::KeyValidityWindow {
                 not_before: Utc::now(),
@@ -3250,25 +3266,6 @@ mod tests {
         assert!(none.is_empty());
     }
 
-    /// A streaming epoch grant carrying wrap_algorithm v1 is rejected at
-    /// ingest (the normative §10.5.3 consumer-MUST-reject-v1, enforced
-    /// substrate-side).
-    #[tokio::test]
-    async fn sqlite_stream_grant_v1_wrap_rejected_at_ingest() {
-        let (_b, cn) = fresh_backend().await;
-        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
-        let mut env = build_stream_key_grant_sqlite(&author_key, "stream-v1-reject", 1, "rec-1");
-        // Downgrade the wrap to v1 and re-sign.
-        let mut payload: crate::cirisnode::KeyGrantPayload =
-            serde_json::from_value(env.payload.clone()).unwrap();
-        payload.wrap_algorithm = crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        env.payload = serde_json::to_value(&payload).unwrap();
-        env.signature = sign_envelope(&env, &author_key);
-
-        let err = cn.put_contribution(env).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
-    }
-
     /// v16 (#432, CC 5.1 `CLM-epoch-keying`) — SQLite parity for the
     /// dedicated `put_key_grant` writer: (S, n) grant appears in
     /// list(S, n) and NOT in list(S, n+1) / list(S', n); a second
@@ -3487,7 +3484,7 @@ mod tests {
                 .payload
                 .get("wrap_algorithm")
                 .and_then(|v| v.as_str()),
-            Some("hpke_rfc9180_base_x25519_aes_gcm"),
+            Some("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
             "CEG 0.3 §5.6.8.4 wrap_algorithm wire string"
         );
 
@@ -3560,104 +3557,23 @@ mod tests {
         );
     }
 
-    /// V064 (CIRISPersist#142 Cut C3a) — the widened key_grant
-    /// asymmetry triggers admit BOTH addressing modes (content XOR
-    /// stream/epoch) and reject malformed shapes. Direct inserts via
-    /// the shared conn handle exercise the triggers at the DB layer
-    /// (the stream-addressed write path is Cut C3b).
-    #[tokio::test]
-    async fn sqlite_v064_trigger_admits_both_key_grant_addressing_modes() {
-        let (backend, _cn) = fresh_backend().await;
-        let conn = backend.conn_handle();
-
-        // (id, sha, recipient, stream_id, stream_epoch) → Result.
-        let insert = |id: &str,
-                      sha: Option<&str>,
-                      recipient: Option<&str>,
-                      stream: Option<&str>,
-                      epoch: Option<i64>|
-         -> rusqlite::Result<usize> {
-            let guard = conn.lock();
-            guard.execute(
-                "INSERT INTO cirisnode_contributions (\
-                    contribution_id, contribution_type, domain, language, subject_kind, \
-                    author_id, payload, witness_set, submitted_at, \
-                    signature, signing_key_id, signature_verified, persist_row_hash, \
-                    media_content_sha256, key_grant_recipient_key_id, \
-                    key_grant_stream_id, key_grant_stream_epoch\
-                 ) VALUES (?1, 'proposal', 'd', 'en', 'key_grant', 'a', '{}', NULL, \
-                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, sha, recipient, stream, epoch],
-            )
-        };
-        let sha = "a".repeat(64);
-        let recipient = "rec-1";
-        let stream = "stream-xyz";
-        let epoch: i64 = 7;
-
-        // 1. content-addressed (sha + recipient, stream cols NULL) OK.
-        insert("kg-content", Some(&sha), Some(recipient), None, None)
-            .expect("content-addressed key_grant must still insert post-V064");
-
-        // 2. stream/epoch-addressed (recipient + stream_id + epoch, sha
-        //    NULL) now OK (was rejected pre-V064).
-        insert(
-            "kg-stream",
-            None,
-            Some(recipient),
-            Some(stream),
-            Some(epoch),
-        )
-        .expect("stream/epoch-addressed key_grant must insert post-V064");
-
-        // 3. BOTH modes set → rejected.
-        let err = insert(
-            "kg-both",
-            Some(&sha),
-            Some(recipient),
-            Some(stream),
-            Some(epoch),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "both-addressing-modes must be rejected; got: {err}"
-        );
-
-        // 4. NEITHER mode (recipient only) → rejected.
-        let err = insert("kg-neither", None, Some(recipient), None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "neither-addressing-mode must be rejected; got: {err}"
-        );
-
-        // 5. stream_id without epoch → rejected.
-        let err = insert("kg-partial", None, Some(recipient), Some(stream), None).unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "stream_id-without-epoch must be rejected; got: {err}"
-        );
-
-        // 6. non-key_grant row with a stream col set → rejected.
-        let err = (|| -> rusqlite::Result<usize> {
-            let guard = conn.lock();
-            guard.execute(
-                "INSERT INTO cirisnode_contributions (\
-                    contribution_id, contribution_type, domain, language, subject_kind, \
-                    author_id, payload, witness_set, submitted_at, \
-                    signature, signing_key_id, signature_verified, persist_row_hash, \
-                    key_grant_stream_id, key_grant_stream_epoch\
-                 ) VALUES ('kg-nonkg', 'proposal', 'd', 'en', 'arc_question', 'a', '{}', NULL, \
-                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?1, ?2)",
-                rusqlite::params![stream, epoch],
-            )
-        })()
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "non-key_grant row with stream col set must be rejected; got: {err}"
-        );
-    }
+    // v34.0.0 (CIRISPersist#704, V129) — DELETED:
+    // `sqlite_v064_trigger_admits_both_key_grant_addressing_modes`.
+    //
+    // The test's central positive case asserted that a key_grant carrying the
+    // V064 stream/epoch column pair and nothing else INSERTS —
+    // "stream/epoch-addressed key_grant must insert post-V064". V129 renamed
+    // that pair to `(key_grant_scope_id, key_grant_epoch)` and added a THIRD
+    // column, `key_grant_scope_kind`, which the recreated asymmetry triggers
+    // require alongside them: a two-of-three scope insert is now refused by
+    // construction. The assertion cannot be carried across the rename — only
+    // replaced by a different one about a different rule — and the test's name
+    // pins V064's rule, so it is deleted rather than rewritten into a passing
+    // shape that still claims to check V064.
+    //
+    // The V129 rule (all three scope columns together, XOR content-addressed)
+    // is unguarded at the DB layer here as a result and wants a deliberately
+    // authored V129-named replacement.
 
     // ── v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate on
     // the cirisnode `ModerationEvent` (moderate scope) + `takedown_notice`
