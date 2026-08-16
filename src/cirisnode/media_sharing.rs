@@ -458,35 +458,28 @@ pub struct KeyGrantPayload {
 
     /// SHA-256 of the content body the granted key encrypts, hex-encoded.
     /// Present iff the grant is **content-addressed**; `None` for a
-    /// **scope-epoch-addressed** grant (see [`Self::scope_ref`] /
-    /// [`Self::epoch`]). Exactly one addressing mode holds — enforced by
-    /// [`extract_key_grant_payload`] (mirrors the V129
-    /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c).
+    /// **scope-epoch-addressed** grant (see [`Self::epoch`]). Exactly one
+    /// addressing mode holds — enforced by [`extract_key_grant_payload`]
+    /// (mirrors the V129 `cirisnode.contributions` XOR CHECK; CEG 0.15
+    /// §10.5.3 RC1-1c).
+    ///
+    /// This is the ONLY `Option` addressing field on the content side, and
+    /// [`Self::epoch`] is the only one on the scope side. That is what makes
+    /// the XOR a two-field question — see [`Self::scope_id`] for why the id
+    /// itself cannot participate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
 
-    /// v34.0.0 (CIRISPersist#704) — **was `stream_id` through v33.** The id,
-    /// WITHIN [`Self::scope`], that the epoch-DEK is scoped to: a
-    /// `federation_streams` stream id for [`KeyGrantScope::StreamEpoch`], an
-    /// IFAC `netname` for [`KeyGrantScope::TransitMembership`].
-    ///
-    /// Present iff the grant is **scope-epoch-addressed**; `None` for a
-    /// content-addressed grant. Projected onto `key_grant_scope_id` (V129)
-    /// for indexed reads.
-    ///
-    /// NOT `scope_id` — that name is already taken by a DIFFERENT field on
-    /// this payload ([`Self::scope_id`], the content sha / group id), so the
-    /// wire field carrying the epoch-addressing id is `scope_ref`. The DB
-    /// column it projects onto is `key_grant_scope_id`; the two names differ
-    /// deliberately because the payload has a second `scope_id` and the row
-    /// does not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope_ref: Option<String>,
-
     /// v34.0.0 (CIRISPersist#704) — **was `stream_epoch` through v33.**
-    /// Key-rotation epoch within [`Self::scope_ref`] the wrapped DEK covers.
+    /// Key-rotation epoch within [`Self::scope_id`] the wrapped DEK covers.
     /// Present iff scope-epoch-addressed. Projected onto `key_grant_epoch`
     /// (V129).
+    ///
+    /// THE addressing discriminator for the scope-epoch branch: `epoch` is
+    /// `Some` exactly when [`Self::scope`] is
+    /// [`KeyGrantScope::is_epoch_addressed`], and `None` exactly when the
+    /// grant is content-addressed. [`extract_key_grant_payload`] enforces
+    /// that equivalence in both directions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
 
@@ -511,7 +504,28 @@ pub struct KeyGrantPayload {
     /// Scope identifier — interpretation depends on [`Self::scope`].
     /// For [`KeyGrantScope::SingleContent`] this is the
     /// `content_sha256`; for [`KeyGrantScope::GroupMember`] /
-    /// [`KeyGrantScope::SubscriptionTier`] it's the group / tier id.
+    /// [`KeyGrantScope::SubscriptionTier`] it's the group / tier id; for
+    /// [`KeyGrantScope::StreamEpoch`] it's the `federation_streams` stream
+    /// id, and for [`KeyGrantScope::TransitMembership`] the IFAC `netname`.
+    ///
+    /// v34.0.0 (CIRISPersist#704) — **THE SINGLE epoch-addressing id.** A
+    /// separate `scope_ref` (itself renamed from the v33 `stream_id`) carried
+    /// this value alongside `scope_id` for part of this unreleased cut. On
+    /// every epoch-addressed grant the two held the SAME string, only
+    /// `scope_ref` reached the queryable `key_grant_scope_id` column, and a
+    /// runtime check had to be written to force them to agree. Two fields
+    /// holding one fact diverge by hand at the first opportunity — the first
+    /// thing that check refused was a fixture in this file's own test module.
+    /// The check is deleted along with the second field: the values cannot
+    /// disagree because there is only one of them.
+    ///
+    /// NOT an `Option`, and therefore NOT part of the addressing XOR: it is
+    /// REQUIRED on every grant, content-addressed ones included. The XOR is
+    /// [`Self::content_sha256`] against [`Self::epoch`]. Projected onto
+    /// `key_grant_scope_id` (V129) iff [`Self::scope`] is epoch-addressed —
+    /// a content grant's `scope_id` is the sha it already stores in
+    /// `media_content_sha256`, so projecting it too would put one value in
+    /// two columns and re-create the divergence at the row level.
     pub scope_id: String,
 
     /// Rotation chain — prior `attestation_id`s in chronological
@@ -609,11 +623,21 @@ impl WrapAlgorithm {
         None
     }
 
-    /// Whether this is the PQC-hybrid v2 wrap (the only algorithm a
-    /// streaming epoch-DEK grant may carry; CEG §10.5.3).
-    pub fn is_streaming_pqc_v2(self) -> bool {
-        matches!(self, Self::X25519MlKem768Aes256GcmHkdfSha256)
-    }
+    // v34.0.0 (#704) — `is_streaming_pqc_v2()` REMOVED, not deprecated.
+    //
+    // It existed to answer "may this algorithm carry a streaming epoch-DEK
+    // grant?" (CEG §10.5.3) back when the enum had a classical v1 variant to
+    // say no to. v1 was removed earlier in this cut, so the predicate returned
+    // `true` for every value this type can hold: an instrument reporting the
+    // same thing whether or not the defect exists. Its guard branch in
+    // `extract_key_grant_payload` could never fire and the assertion in
+    // `extract_stream_epoch_grant_validates` could never fail.
+    //
+    // A `#[deprecated]` shim returning `true` would have preserved exactly the
+    // false assurance. Removing the method gives every downstream Rust caller a
+    // compile error naming it, which is the loud path: the rule it used to
+    // check is now the type system's, and "there is one algorithm" is the
+    // answer the caller needs to absorb.
 }
 
 /// `key_grant` scope. v1 supports three:
@@ -630,7 +654,7 @@ pub enum KeyGrantScope {
     GroupMember,
     SubscriptionTier,
     /// One grant per `(stream id, epoch)` — the streaming epoch-DEK
-    /// cascade (CEG 0.15 §10.5.3). [`KeyGrantPayload::scope_ref`] is the
+    /// cascade (CEG 0.15 §10.5.3). [`KeyGrantPayload::scope_id`] is the
     /// `federation_streams` stream id.
     StreamEpoch,
     /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — one grant per
@@ -748,6 +772,68 @@ pub fn extract_takedown_notice_payload(
     Ok(Some(typed))
 }
 
+/// v34.0.0 (CIRISPersist#704) — `key_grant` wire keys this cut REMOVED, each
+/// paired with the field that replaces it.
+///
+/// WHY THIS TABLE EXISTS AT ALL. [`KeyGrantPayload`] carries no
+/// `#[serde(deny_unknown_fields)]`, and widening it to one would change how
+/// EVERY unknown key on the payload is treated — a separate decision with its
+/// own compatibility cost. Without it, `serde` silently DROPS a key it does not
+/// recognise. So a caller still emitting the released v33 `stream_id` would
+/// have its grant decode cleanly with `scope_id` absent (`missing field` — the
+/// one case that does error) or, worse for `stream_epoch` and `scope_ref`,
+/// decode into a payload the caller never described: no `epoch`, so the grant
+/// parses as CONTENT-addressed, and it is refused several checks later by a
+/// message about an addressing mode the caller did not choose. The key they
+/// actually sent is never mentioned, in any of it.
+///
+/// Naming the removed key and its replacement is the whole point: a downstream
+/// consumer reading the refusal learns what to change, in one line, without
+/// bisecting a release. These entries are permanent — a key removed once is
+/// removed forever, and a later reader of this list learns the rename history
+/// the wire actually went through.
+const REMOVED_KEY_GRANT_WIRE_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "stream_id",
+        "scope_id",
+        "released through v33; generalized from streams to any epoch-addressed scope",
+    ),
+    (
+        "stream_epoch",
+        "epoch",
+        "released through v33; generalized from streams to any epoch-addressed scope",
+    ),
+    (
+        "scope_ref",
+        "scope_id",
+        "never released; it duplicated scope_id on every epoch-addressed grant and \
+         the two were collapsed into one field before this cut shipped",
+    ),
+];
+
+/// Refuse a `key_grant` payload still carrying a wire key this cut removed.
+///
+/// Runs BEFORE the typed decode so the caller is told about the key they SENT,
+/// rather than about a downstream consequence of it having been dropped.
+fn refuse_removed_key_grant_wire_keys(payload: &serde_json::Value) -> Result<(), Error> {
+    let Some(object) = payload.as_object() else {
+        // Not an object — the typed decode owns that diagnosis.
+        return Ok(());
+    };
+    for (removed, replacement, note) in REMOVED_KEY_GRANT_WIRE_KEYS {
+        if object.contains_key(*removed) {
+            return Err(Error::InvalidArgument(format!(
+                "key_grant: `{removed}` was REMOVED in v34.0.0 (CIRISPersist#704) — \
+                 use `{replacement}` instead ({note}). The payload is NOT read with \
+                 `deny_unknown_fields`, so this key would otherwise be silently \
+                 DROPPED and the grant admitted or refused on an addressing mode you \
+                 did not choose; rename `{removed}` to `{replacement}` and resubmit"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Decode + validate a `key_grant` payload from the JSONB column.
 /// Returns `Ok(None)` for non-grant rows.
 ///
@@ -759,14 +845,24 @@ pub fn extract_takedown_notice_payload(
 /// Addressing — **exactly one mode** (mirrors the V129
 /// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c):
 ///   - **content-addressed**: `content_sha256` is `Some` hex-64
-///     lowercase; `scope_ref` / `epoch` are `None`.
-///   - **scope-epoch-addressed**: `scope_ref` is `Some` non-empty AND
-///     `epoch` is `Some`; `content_sha256` is `None`. The grant
-///     **MUST** carry `wrap_algorithm: v2` (PQC hybrid) — a v1 wrap on a
-///     streaming epoch grant is rejected here (CEG §10.5.3: "a Consumer
-///     MUST reject a streaming epoch grant carrying `wrap_algorithm:
-///     v1`"). `scope` must satisfy
+///     lowercase; `epoch` is `None`, and `scope` must NOT satisfy
 ///     [`KeyGrantScope::is_epoch_addressed`].
+///   - **scope-epoch-addressed**: `epoch` is `Some`; `content_sha256` is
+///     `None`, and `scope` must satisfy
+///     [`KeyGrantScope::is_epoch_addressed`]. The id is
+///     [`KeyGrantPayload::scope_id`], which every grant carries.
+///
+/// v34.0.0 (#704) — the XOR is `content_sha256` XOR `epoch`, two `Option`
+/// fields. `scope_id` is a REQUIRED `String` present on both branches, so it
+/// cannot discriminate between them and deliberately does not appear in the
+/// predicate; the branch it belongs to is decided by `epoch`, and the
+/// arms below force `scope` to agree with that decision in BOTH directions.
+/// The composite result — `epoch.is_some()` ⟺ `scope.is_epoch_addressed()` —
+/// is what lets the two backends project all three V129 scope columns
+/// together or not at all.
+///
+/// Removed wire keys are refused BEFORE decoding, by name — see
+/// [`REMOVED_KEY_GRANT_WIRE_KEYS`].
 pub fn extract_key_grant_payload(
     subject_kind: &str,
     payload: &serde_json::Value,
@@ -774,6 +870,7 @@ pub fn extract_key_grant_payload(
     if subject_kind != KEY_GRANT_SUBJECT_KIND {
         return Ok(None);
     }
+    refuse_removed_key_grant_wire_keys(payload)?;
     let typed: KeyGrantPayload = serde_json::from_value(payload.clone())
         .map_err(|e| Error::InvalidArgument(format!("key_grant payload shape: {e}")))?;
     validate_non_empty("recipient_key_id", &typed.recipient_key_id)?;
@@ -786,12 +883,23 @@ pub fn extract_key_grant_payload(
     }
 
     // Exactly-one addressing mode (XOR), matching the V129 constraint.
+    //
+    // v34.0.0 (#704) — the scope side is `epoch` ALONE. It used to be
+    // `scope_ref.is_some() || epoch.is_some()`, an OR across two fields that
+    // then needed a follow-up check to refuse the half where only one was set.
+    // `scope_ref` is gone and `scope_id` cannot take its place in this
+    // predicate: `scope_id` is a required `String` carried by content grants
+    // too, so `scope_id.is_some()` would be a constant and the XOR would
+    // collapse to "always scope-addressed". The half-addressed shapes the OR
+    // used to catch are now UNREPRESENTABLE — there is no second scope field to
+    // set on its own — and the wire keys that could still express one are
+    // refused by name in `refuse_removed_key_grant_wire_keys` above.
     let content_addressed = typed.content_sha256.is_some();
-    let scope_addressed = typed.scope_ref.is_some() || typed.epoch.is_some();
+    let scope_addressed = typed.epoch.is_some();
     match (content_addressed, scope_addressed) {
         (true, true) => {
             return Err(Error::InvalidArgument(
-                "key_grant: content_sha256 and scope_ref/epoch are mutually exclusive \
+                "key_grant: content_sha256 and epoch are mutually exclusive \
                  (exactly one addressing mode; CEG §10.5.3 RC1-1c)"
                     .into(),
             ));
@@ -799,7 +907,7 @@ pub fn extract_key_grant_payload(
         (false, false) => {
             return Err(Error::InvalidArgument(
                 "key_grant: must be addressed — set content_sha256 (content) OR \
-                 scope_ref + epoch (scope-epoch)"
+                 epoch, alongside an epoch-addressed scope + scope_id (scope-epoch)"
                     .into(),
             ));
         }
@@ -823,55 +931,37 @@ pub fn extract_key_grant_payload(
             if typed.scope.is_epoch_addressed() {
                 return Err(Error::InvalidArgument(format!(
                     "key_grant: content-addressed grant declares scope={}, which is \
-                     epoch-addressed. A content grant carries no (scope_ref, epoch), so \
-                     the two cannot both hold — set scope to a content scope, or address \
-                     the grant by scope_ref + epoch",
+                     epoch-addressed. A content grant carries no epoch, so the two \
+                     cannot both hold — set scope to a content scope, or address the \
+                     grant by epoch + an epoch-addressed scope",
                     typed.scope.as_str()
                 )));
             }
         }
         (false, true) => {
-            // Scope/epoch-addressed: both fields present, v2 wrap required.
-            validate_non_empty("scope_ref", typed.scope_ref.as_deref().unwrap_or_default())?;
-            if typed.epoch.is_none() {
-                return Err(Error::InvalidArgument(
-                    "key_grant: scope-epoch-addressed grant requires epoch".into(),
-                ));
-            }
-            if !typed.wrap_algorithm.is_streaming_pqc_v2() {
-                return Err(Error::InvalidArgument(format!(
-                    "key_grant: streaming epoch grant MUST use wrap_algorithm v2 \
-                     (x25519_mlkem768_aes256_gcm_hkdf_sha256), got {} — CEG §10.5.3 \
-                     rejects wrap_algorithm: v1 on a streaming epoch grant",
-                    typed.wrap_algorithm.as_str()
-                )));
-            }
-            // v34.0.0 (#704) — `scope_ref` and `scope_id` must AGREE on an
-            // epoch-addressed grant.
+            // Scope-epoch-addressed. `scope_id` is already validated non-empty
+            // for EVERY grant at the top of this function, so there is nothing
+            // id-shaped left to check on this branch.
             //
-            // They are the same value in every such grant in the tree, and only
-            // `scope_ref` is projected to `key_grant_scope_id`. So a payload
-            // carrying `scope_ref: "netname-a"` with `scope_id: "netname-b"`
-            // was admitted and the row silently kept the first — the signed
-            // payload and the queryable column disagreeing, with nothing
-            // reporting it. A grant is then discoverable under one name and
-            // attested under another.
+            // v34.0.0 (#704) — THREE checks were deleted here, each because the
+            // state it refused stopped being expressible:
             //
-            // Checked rather than collapsed: for SingleContent / GroupMember
-            // the two fields genuinely differ, so merging them is a design
-            // decision, not a rename. Until that decision is made, disagreement
-            // is a caller error and says so.
-            if let Some(reference) = typed.scope_ref.as_deref() {
-                if reference != typed.scope_id {
-                    return Err(Error::InvalidArgument(format!(
-                        "key_grant: scope_ref {reference:?} and scope_id {:?} disagree on an \
-                         epoch-addressed grant. Only scope_ref reaches the queryable column, \
-                         so the row would be discoverable under one name and attested under \
-                         the other — set them to the same value",
-                        typed.scope_id
-                    )));
-                }
-            }
+            //   * `validate_non_empty("scope_ref", …)` — the field is gone; the
+            //     one id is `scope_id`, checked above for both branches.
+            //   * `if typed.epoch.is_none()` — this arm IS `epoch.is_some()`
+            //     now that the XOR reads `epoch` alone, so the branch could
+            //     never be taken.
+            //   * the `scope_ref`/`scope_id` agreement check — two fields that
+            //     must agree became one field, which is the fix the check was
+            //     standing in for.
+            //
+            // Also deleted: the `wrap_algorithm` v2 guard. `WrapAlgorithm` is
+            // single-variant since v1 was removed earlier in this cut, so
+            // `is_streaming_pqc_v2()` was a constant `true` and its `!` a
+            // constant `false`. CEG §10.5.3's "reject a streaming epoch grant
+            // carrying wrap_algorithm: v1" is now enforced at the parse door
+            // (`WrapAlgorithm::from_wire_str` returns `None` for v1) and by the
+            // type — strictly stronger than a branch that could not run.
 
             // v34.0.0 (#704) — was pinned to `StreamEpoch`, which would now
             // reject every transit grant. The check is the same one the write
@@ -905,7 +995,8 @@ pub fn extract_key_grant_payload(
 ///     [`KEY_GRANT_SUBJECT_KIND`].
 ///   - The payload MUST validate as a [`KeyGrantPayload`] in exactly
 ///     one addressing mode (content-addressed XOR
-///     stream/epoch-addressed) via [`extract_key_grant_payload`].
+///     scope-epoch-addressed) via [`extract_key_grant_payload`] — which
+///     also refuses the wire keys v34.0.0 removed, by name.
 ///
 /// Returns the validated payload so the caller can inspect the
 /// addressing mode without re-decoding. Signature/trust admission is
@@ -967,7 +1058,6 @@ mod tests {
         KeyGrantPayload {
             recipient_key_id: "recipient-1".into(),
             content_sha256: Some(fixture_sha256()),
-            scope_ref: None,
             epoch: None,
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
             wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
@@ -1283,13 +1373,12 @@ mod tests {
 
     // ── Cut C3b: stream/epoch addressing (CEG §10.5.3) ──────────────
 
-    /// A valid stream/epoch-addressed grant: no content_sha256, stream
-    /// fields set, v2 wrap, StreamEpoch scope.
+    /// A valid stream/epoch-addressed grant: no content_sha256, `epoch` +
+    /// `scope_id` set, v2 wrap, StreamEpoch scope.
     fn fixture_stream_grant() -> KeyGrantPayload {
         KeyGrantPayload {
             recipient_key_id: "recipient-1".into(),
             content_sha256: None,
-            scope_ref: Some("stream-abc".into()),
             epoch: Some(7),
             wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
             wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
@@ -1318,7 +1407,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed, typed);
-        assert!(parsed.wrap_algorithm.is_streaming_pqc_v2());
+        // v34.0.0 (#704) — the `assert!(parsed.wrap_algorithm
+        // .is_streaming_pqc_v2())` that stood here is DELETED with the method.
+        // `WrapAlgorithm` is single-variant, so the assertion held for every
+        // value the field could take: it would have passed identically had the
+        // extractor returned a payload with the wrong algorithm, because there
+        // is no wrong algorithm left to return. `assert_eq!(parsed, typed)`
+        // above already pins the whole payload, algorithm included.
     }
 
     // v34.0.0 (#704) — `stream_grant_with_v1_wrap_is_rejected` DELETED, not
@@ -1343,7 +1438,6 @@ mod tests {
     #[test]
     fn grant_with_no_addressing_is_rejected() {
         let mut typed = fixture_stream_grant();
-        typed.scope_ref = None;
         typed.epoch = None; // neither content nor scope-epoch
         let value = serde_json::to_value(&typed).unwrap();
         let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
@@ -1387,32 +1481,22 @@ mod tests {
         }
     }
 
-    /// v34.0.0 (#704) — `scope_ref` and `scope_id` must AGREE.
-    ///
-    /// Only `scope_ref` is projected to `key_grant_scope_id`, so before this a
-    /// payload where they differed was admitted and the row silently kept one
-    /// of them: the grant discoverable under one name and attested under the
-    /// other, with nothing reporting the divergence.
-    ///
-    /// The first thing this check refused was a fixture in this very file —
-    /// `a_transit_membership_grant_is_epoch_addressable_704` set `scope_id`
-    /// alone and left `scope_ref` at the stream value. Two fields holding one
-    /// fact diverge by hand at the first opportunity, including in the test
-    /// written to prove the feature works.
-    #[test]
-    fn scope_ref_and_scope_id_must_agree_704() {
-        let mut typed = fixture_stream_grant();
-        typed.scope_ref = Some("netname-a".to_owned());
-        typed.scope_id = "netname-b".to_owned();
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidArgument(ref m)
-                if m.contains("netname-a") && m.contains("netname-b")),
-            "the refusal must show BOTH values, or the caller cannot tell which \
-             one the row would have kept: {err:?}"
-        );
-    }
+    // v34.0.0 (#704) — `scope_ref_and_scope_id_must_agree_704` DELETED, not
+    // rewritten.
+    //
+    // It asserted that a payload carrying `scope_ref: "netname-a"` beside
+    // `scope_id: "netname-b"` is refused, because only `scope_ref` reached the
+    // queryable `key_grant_scope_id` column and the row would have been
+    // discoverable under one name while attested under the other. With
+    // `scope_ref` deleted there is one field, so the state the test constructed
+    // is UNCONSTRUCTIBLE and the test could only have been re-pointed at some
+    // other rule while keeping a name that promises this one — the exact
+    // mistake this cut already made once and caught.
+    //
+    // The rule is not lost; it is answered structurally. Two fields cannot
+    // disagree when there is one of them. What survives is the WIRE half:
+    // `scope_ref` arriving from an older caller is refused by name — see
+    // `removed_wire_key_scope_ref_is_refused_by_name_704` below.
 
     /// The transit scope is accepted on the epoch-addressed path — the point of
     /// the generalization. Without this leg the widened check above could be
@@ -1421,12 +1505,7 @@ mod tests {
     fn a_transit_membership_grant_is_epoch_addressable_704() {
         let mut typed = fixture_stream_grant();
         typed.scope = KeyGrantScope::TransitMembership;
-        // BOTH, and that is the point: this fixture originally set only
-        // `scope_id` and was the first thing the agreement check refused —
-        // the divergence it guards, authored by hand, in the test asserting
-        // transit works.
         typed.scope_id = "ciris-transit-net".to_owned();
-        typed.scope_ref = Some("ciris-transit-net".to_owned());
         let value = serde_json::to_value(&typed).unwrap();
         assert!(
             extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
@@ -1434,6 +1513,146 @@ mod tests {
                 .is_some(),
             "transit membership must validate on the epoch-addressed path"
         );
+    }
+
+    // ── v34.0.0 (#704): removed wire keys refuse LOUDLY ─────────────
+
+    /// A scope-epoch grant that IS valid on the current wire, as raw JSON —
+    /// the base every removed-key case below mutates.
+    ///
+    /// Returned as `Value` rather than as a typed payload on purpose: the keys
+    /// under test do not exist as struct fields, so they can only be expressed
+    /// by editing the JSON. Each caller asserts this base is ADMITTED before
+    /// mutating it, so a refusal afterwards has exactly one available
+    /// explanation.
+    fn valid_grant_json() -> serde_json::Map<String, serde_json::Value> {
+        let value = serde_json::to_value(fixture_stream_grant()).unwrap();
+        assert!(
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+                .unwrap()
+                .is_some(),
+            "the base payload must be VALID, or a refusal below proves nothing"
+        );
+        value.as_object().unwrap().clone()
+    }
+
+    /// Assert the refusal names the key the caller SENT and the key to send
+    /// instead — pinned as ONE contiguous directive phrase, not as two
+    /// independent `contains` checks.
+    ///
+    /// The two-`contains` form was written first and MUTATION-TESTED: with the
+    /// replacement removed from the message entirely, it still passed two of
+    /// the three cases. `"epoch"` is a substring of `"stream_epoch"`, so the
+    /// removed key satisfies the assertion about its own replacement; and the
+    /// `scope_ref` entry's explanatory note happens to mention `scope_id` in
+    /// prose, so that case passed on the note alone. Both would have reported
+    /// "the replacement is named" about a message that never named it.
+    ///
+    /// Pinning the whole phrase fixes it: it constrains each name's ROLE — what
+    /// to rename, and to what — and no substring relation or nearby prose can
+    /// assemble it by accident.
+    fn assert_names_removed_key_and_replacement(err: &Error, removed: &str, replacement: &str) {
+        let directive = format!("rename `{removed}` to `{replacement}` and resubmit");
+        assert!(
+            matches!(err, Error::InvalidArgument(m) if m.contains(&directive)),
+            "the refusal must tell the caller what to do, naming the removed key \
+             and its replacement in their roles ({directive:?}): {err:?}"
+        );
+    }
+
+    /// `stream_id` — the RELEASED v33 name for the epoch-addressing id.
+    ///
+    /// The silent failure without this guard: v33 also had a `scope_id` field
+    /// meaning something else entirely, so a v33 payload decodes cleanly with
+    /// `stream_id` dropped and `scope_id` carrying whatever the OLD field meant.
+    /// The grant is admitted, and the column every epoch read addresses by
+    /// holds a value the caller never nominated as the stream id.
+    #[test]
+    fn removed_wire_key_stream_id_is_refused_by_name_704() {
+        let mut object = valid_grant_json();
+        object.insert("stream_id".into(), "stream-abc".into());
+        object.insert("scope_id".into(), "a-different-id".into());
+        let err =
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
+                .unwrap_err();
+        assert_names_removed_key_and_replacement(&err, "stream_id", "scope_id");
+    }
+
+    /// `stream_epoch` — the RELEASED v33 name for the epoch.
+    ///
+    /// Modelled as the real old-caller shape: `stream_epoch` present, `epoch`
+    /// absent. Without the guard serde drops `stream_epoch`, the XOR sees no
+    /// `epoch`, and the grant is refused as "must be addressed" — a message
+    /// about an addressing mode the caller did not choose, which never mentions
+    /// the key they actually sent.
+    #[test]
+    fn removed_wire_key_stream_epoch_is_refused_by_name_704() {
+        let mut object = valid_grant_json();
+        object
+            .remove("epoch")
+            .expect("the base grant carries epoch");
+        object.insert("stream_epoch".into(), 7u64.into());
+        let err =
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
+                .unwrap_err();
+        assert_names_removed_key_and_replacement(&err, "stream_epoch", "epoch");
+        // And it is refused for THIS reason, not for the addressing reason the
+        // dropped key would have produced downstream.
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if !m.contains("must be addressed")),
+            "the removed key must be named BEFORE the XOR sees its absence: {err:?}"
+        );
+    }
+
+    /// `scope_ref` — never released, collapsed into `scope_id` in this cut.
+    ///
+    /// Carries what the deleted `scope_ref_and_scope_id_must_agree_704` was
+    /// really protecting: a caller nominating an id under the old key while
+    /// `scope_id` says something else. That divergence is now impossible in the
+    /// struct, so the wire is where it is refused — by name, with the field to
+    /// use instead.
+    #[test]
+    fn removed_wire_key_scope_ref_is_refused_by_name_704() {
+        let mut object = valid_grant_json();
+        object.insert("scope_ref".into(), "netname-a".into());
+        object.insert("scope_id".into(), "netname-b".into());
+        let err =
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
+                .unwrap_err();
+        assert_names_removed_key_and_replacement(&err, "scope_ref", "scope_id");
+    }
+
+    /// The removed-key door must not fire on a payload that carries none of
+    /// them — otherwise every test above would pass with the guard refusing
+    /// unconditionally.
+    #[test]
+    fn a_grant_without_removed_wire_keys_is_admitted_704() {
+        let object = valid_grant_json();
+        for (removed, _, _) in REMOVED_KEY_GRANT_WIRE_KEYS {
+            assert!(
+                !object.contains_key(*removed),
+                "the base fixture must not carry `{removed}`"
+            );
+        }
+        assert!(extract_key_grant_payload(
+            KEY_GRANT_SUBJECT_KIND,
+            &serde_json::Value::Object(object)
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    /// The door is reached through `put_key_grant`'s gate too, not only the
+    /// bare extractor — `require_key_grant_envelope` delegates, so a writer
+    /// submitting an old-shaped envelope gets the same named refusal.
+    #[test]
+    fn removed_wire_keys_are_refused_through_the_put_gate_704() {
+        let mut object = valid_grant_json();
+        object.insert("scope_ref".into(), "netname-a".into());
+        let mut env = fixture_grant_envelope(&fixture_stream_grant());
+        env.payload = serde_json::Value::Object(object);
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert_names_removed_key_and_replacement(&err, "scope_ref", "scope_id");
     }
 
     #[test]
@@ -1611,7 +1830,7 @@ mod tests {
         let env = fixture_grant_envelope(&payload);
         let parsed = require_key_grant_envelope(&env).unwrap();
         assert_eq!(parsed, payload);
-        assert_eq!(parsed.scope_ref.as_deref(), Some("stream-abc"));
+        assert_eq!(parsed.scope_id, "stream-abc");
         assert_eq!(parsed.epoch, Some(7));
     }
 

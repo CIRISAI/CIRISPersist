@@ -195,12 +195,23 @@ impl NodeCoreService for PostgresBackend {
         // whose declared `scope` contradicts its addressing fields is refused
         // at the DB rather than stored half-addressed — "which scope is this
         // DEK for" is never an inference.
-        let key_grant_scope_kind: Option<String> = key_grant
-            .as_ref()
-            .filter(|p| p.scope.is_epoch_addressed())
-            .map(|p| p.scope.as_str().to_owned());
-        let key_grant_scope_id: Option<String> =
-            key_grant.as_ref().and_then(|p| p.scope_ref.clone());
+        //
+        // v34.0.0 (#704) — `scope_kind` and `scope_id` read from ONE binding,
+        // so the pair cannot come apart. `scope_id` used to be projected from a
+        // separate `KeyGrantPayload::scope_ref` with no gate at all; that field
+        // is gone and the single `scope_id` is the id, gated by the same
+        // predicate as the kind beside it.
+        let epoch_addressed = key_grant.as_ref().filter(|p| p.scope.is_epoch_addressed());
+        let key_grant_scope_kind: Option<String> =
+            epoch_addressed.map(|p| p.scope.as_str().to_owned());
+        let key_grant_scope_id: Option<String> = epoch_addressed.map(|p| p.scope_id.clone());
+        // The epoch is deliberately NOT read through `epoch_addressed`. The
+        // extractor guarantees `epoch.is_some()` ⟺ `scope.is_epoch_addressed()`,
+        // so on any payload that got here the two spellings agree. They differ
+        // only if that guarantee is ever broken — and then reading `p.epoch`
+        // directly leaves the row half-addressed, which V129 REFUSES, whereas
+        // gating it would silently rewrite the row into the content branch and
+        // store it. Fail-secure on the same input.
         let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.epoch) {
             None => None,
             Some(e) => Some(i64::try_from(e).map_err(|_| {
@@ -1441,9 +1452,10 @@ async fn emit_key_grant_supersession(
     let supersession_payload = super::media_sharing::KeyGrantPayload {
         recipient_key_id: prior.recipient_key_id.clone(),
         content_sha256: prior.content_sha256.clone(),
-        // Carry the prior grant's addressing + wrap algorithm so a
-        // stream/epoch-grant supersession stays stream-addressed + v2.
-        scope_ref: prior.scope_ref.clone(),
+        // Carry the prior grant's addressing so a scope-epoch supersession
+        // stays scope-epoch-addressed. v34.0.0 (#704): `epoch` is the whole
+        // addressing carry now — the id rides `scope_id` below, which every
+        // grant already copies.
         epoch: prior.epoch,
         wrapped_dek_base64: revocation_dek,
         wrap_algorithm: prior.wrap_algorithm,
@@ -2828,7 +2840,6 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            scope_ref: None,
             epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
@@ -2893,7 +2904,6 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: None,
-            scope_ref: Some(scope_id.to_owned()),
             epoch: Some(epoch),
             wrapped_dek_base64: {
                 use base64::Engine as _;
@@ -3153,7 +3163,7 @@ mod tests {
             .map(|env| {
                 let p: crate::cirisnode::KeyGrantPayload =
                     serde_json::from_value(env.payload.clone()).unwrap();
-                assert_eq!(p.scope_ref.as_deref(), Some(stream.as_str()));
+                assert_eq!(p.scope_id, stream);
                 assert_eq!(p.epoch, Some(1));
                 p.recipient_key_id
             })

@@ -19617,9 +19617,12 @@ impl PyEngine {
     /// (subject_kind) is `key_grant`, and whose payload is a
     /// [`KeyGrantPayload`](crate::cirisnode::KeyGrantPayload) in
     /// exactly ONE addressing mode — scope-epoch-addressed
-    /// (v34.0.0/#704: `scope_ref` + `epoch`, `wrap_algorithm: v2`, and an
-    /// epoch-addressed `scope` — `stream_epoch` or `transit_membership`)
-    /// or content-addressed (`content_sha256`).
+    /// (v34.0.0/#704: `epoch` + `scope_id`, and an epoch-addressed
+    /// `scope` — `stream_epoch` or `transit_membership`) or
+    /// content-addressed (`content_sha256`).
+    /// The v33 wire keys `stream_id` / `stream_epoch` are REFUSED by
+    /// name, with the field that replaces each, rather than silently
+    /// dropped.
     /// Anything else is rejected fail-closed BEFORE any admission
     /// state is touched; a well-shaped grant then runs the full
     /// `put_contribution` discipline (trust gate + hybrid signature
@@ -19627,7 +19630,7 @@ impl PyEngine {
     ///
     /// Conflict semantics: the row PK is `contribution_id` — a
     /// duplicate raises `Conflict`; re-granting the same
-    /// `(scope_ref, epoch, recipient_key_id)` under a fresh
+    /// `(scope_id, epoch, recipient_key_id)` under a fresh
     /// `contribution_id` appends (reads are newest-first; supersession
     /// rides `rotation_chain` / retire, never row mutation).
     #[cfg(feature = "cirisnode")]

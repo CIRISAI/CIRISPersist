@@ -40,24 +40,54 @@ list_key_grants_for_stream_epoch(stream_id, epoch)
     -> list_key_grants_for_scope_epoch(scope_kind, scope_id, epoch)
 ```
 
-**`KeyGrantPayload` wire rename, no serde alias:**
+**`KeyGrantPayload` wire change, no serde alias:**
 
 ```
-stream_id    -> scope_ref   (Option<String>)
+stream_id    -> scope_id    (String, already present — see below)
 stream_epoch -> epoch       (Option<u64>)
 ```
 
 The old names were a lie on a public type the moment transit membership landed:
 a `TransitMembership` grant put its IFAC `netname` in a field called `stream_id`.
-No `#[serde(alias)]` — a stored payload written under the old keys now fails to
-address and is refused by the extractor, which is the correct behaviour for a
-major and is visible rather than silent.
 
-`scope_ref`, **not** `scope_id`: the payload already has a distinct `scope_id`
-(the content sha for `SingleContent`, the group id for `GroupMember`). The DB
-column this projects onto is still `key_grant_scope_id` — the names differ
-deliberately, because the payload carries a second `scope_id` and the row does
-not.
+**There is ONE id field, not two.** An intermediate draft of this cut renamed
+`stream_id` to a new `scope_ref` beside the existing `scope_id`, on the reasoning
+that `scope_id` was a *distinct* field — the content sha for `SingleContent`, the
+group id for `GroupMember`. That reasoning was wrong. It is not a distinct field;
+it is the same slot holding whichever id the declared scope names, and on an
+epoch-addressed grant that id **is** the stream or netname. So the two fields
+held one value, and only `scope_ref` reached the queryable `key_grant_scope_id`
+column — a row discoverable under one name and attested under the other.
+
+The check written to police that divergence refused, as its first act, a fixture
+in this repo's own test module. Two fields that must agree are one field: the
+draft's `scope_ref` is deleted, `scope_id` is the single epoch-addressing id, and
+the agreement check is deleted with it, because the values can no longer differ.
+Preferring *unrepresentable* to *refused* is the same move as the removal of the
+classical wrap algorithm below.
+
+The addressing XOR is therefore `content_sha256` XOR `epoch`. `scope_id` is
+REQUIRED on every grant, content-addressed ones included, so it cannot
+discriminate between the branches and deliberately does not appear in the
+predicate — a mutation making it participate collapses the XOR to
+"always scope-addressed" and kills nine tests. The validator forces
+`epoch.is_some()` ⟺ `scope.is_epoch_addressed()` in **both** directions, which is
+what lets each backend project all three V129 scope columns together or not at
+all.
+
+**Removed wire keys fail loudly.** `KeyGrantPayload` carries no
+`deny_unknown_fields`, so `stream_id`, `stream_epoch` and `scope_ref` would
+otherwise be dropped in silence — and the grant then admitted or refused on an
+addressing mode the caller never chose, with a message about a field they did not
+send. All three are now refused *before* decoding, each naming the field that
+replaces it. No `#[serde(alias)]`: a major should move the caller, not absorb the
+old shape.
+
+A first version of that witness passed against a message that never named the
+replacement — `"epoch"` is a substring of `"stream_epoch"`, so a `contains` check
+matched the key being rejected rather than the field being recommended. The
+witness now pins a contiguous directive phrase per key; before that fix, stripping
+every replacement name from the messages killed one test of four.
 
 ### BREAKING — the classical wrap algorithm is GONE
 
@@ -74,6 +104,37 @@ Three tests asserting "v1 is rejected" were **deleted rather than flipped**:
 that state is now unconstructible, so rewriting them would have produced tests
 whose names no longer described what they checked. The rule they enforced at
 runtime is the type system's.
+
+### BREAKING — `WrapAlgorithm::is_streaming_pqc_v2()` removed
+
+Removing v1 above left the enum single-variant, so this predicate was
+unconditionally `true`: an instrument reporting the same thing whether or not
+the defect existed. Its guard branch in `extract_key_grant_payload` could never
+fire, and the assertion covering it could never fail — the branch and the test
+both *looked* like enforcement while enforcing nothing.
+
+Removed rather than deprecated. A `#[deprecated]` shim returning `true` would
+preserve exactly the false assurance that made it worth removing; downstream Rust
+callers get a compile error naming the method instead. CEG 5.1 §10.5.3's "reject a
+streaming epoch grant carrying `wrap_algorithm: v1`" is now enforced at the parse
+door — `WrapAlgorithm::from_wire_str` returns `None` for v1 — and by the type
+itself. Not "we refuse it" but "it cannot be said".
+
+### Fixed — a DENY-level clippy error no two-feature build could see
+
+`src/engine.rs`'s NodeCore dispatch was a `match` whose postgres arm is
+`#[cfg]`-gated. Under `sqlite,cirisnode` that arm disappears, the remaining
+single arm becomes `clippy::infallible_destructuring_match`, and the whole
+`--all-targets -D warnings` gate fails — while every build carrying **both**
+features passes, because two arms are not an infallible destructuring.
+
+This is the mirror image of the v31.3.0 defect recorded in the comment directly
+above it (#678), where asymmetric gating broke the postgres build for the same
+structural reason: **the arm count is feature-dependent, so the construct has to
+read the same at every arity.** `let`-else does — irrefutable when sqlite is the
+only backend, refutable and panicking when it is not. One more instance of
+"certify per feature SET, never a union": the union of features is the one
+configuration in which this class is invisible.
 
 ### Added — `ifac_size`
 

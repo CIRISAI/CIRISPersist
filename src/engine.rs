@@ -8737,15 +8737,22 @@ mod tests {
             .expect("construct engine");
 
         let dispatch = engine.node_core_service();
-        let backend = match dispatch {
-            // v31.3.0 (CIRISPersist#678) — the POSTGRES arm was gated and the
-            // SQLITE arm was not, so `--features cirisnode,postgres` referenced
-            // a variant that does not exist there. Asymmetric gating on the two
-            // arms of one match is invisible to any build that has both.
-            #[cfg(feature = "sqlite")]
-            NodeCoreDispatch::Sqlite(b) => b,
-            #[cfg(feature = "postgres")]
-            NodeCoreDispatch::Postgres(_) => panic!("expected sqlite NodeCore variant"),
+        // v31.3.0 (CIRISPersist#678) — the POSTGRES arm was gated and the
+        // SQLITE arm was not, so `--features cirisnode,postgres` referenced a
+        // variant that does not exist there. Asymmetric gating on the two arms
+        // of one match is invisible to any build that has both.
+        //
+        // v34.0.0 — and the SYMMETRIC form had the mirror-image blindness: as a
+        // `match`, the postgres arm disappears under `sqlite,cirisnode` and the
+        // remaining single arm is `clippy::infallible_destructuring_match`, a
+        // DENY-level error that no build carrying both features can see. The
+        // arm count here is feature-dependent, so the construct must be one
+        // that reads the same at every arity. `let`-else is: irrefutable when
+        // sqlite is the only backend, refutable and panicking when it is not.
+        #[allow(irrefutable_let_patterns)]
+        let NodeCoreDispatch::Sqlite(backend) = dispatch
+        else {
+            panic!("expected sqlite NodeCore variant")
         };
 
         // Build + sign a Contribution envelope (the contributor's
@@ -17314,7 +17321,6 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            scope_ref: None,
             epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
