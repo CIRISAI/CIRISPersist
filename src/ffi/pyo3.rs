@@ -19542,30 +19542,78 @@ impl PyEngine {
         })
     }
 
-    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — list every
-    /// stream/epoch-addressed key_grant Contribution for
-    /// `(stream_id, epoch)`, newest-first. JSON array of
+    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) → v34.0.0
+    /// (CIRISPersist#704, CIRISEdge#492) — list every
+    /// **scope-epoch-addressed** `key_grant` Contribution for
+    /// `(scope_kind, scope_id, epoch)`, newest-first. JSON array of
     /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
     /// The consumer (LensCore) applies its own P4 catch-up depth cap.
     ///
-    /// v34.0.0 (CIRISPersist#704) — the substrate read this delegates to
-    /// is now the general
-    /// [`list_key_grants_for_scope_epoch`](crate::cirisnode::NodeCoreService::list_key_grants_for_scope_epoch);
-    /// this Python surface pins `scope_kind =
-    /// KeyGrantScope::StreamEpoch`, so it is the STREAMING half and only
-    /// that half. A transit-membership grant whose `netname` collides
-    /// with `stream_id` at the same epoch is no longer returned here.
+    /// `scope_kind` is a
+    /// [`KeyGrantScope::as_str`](crate::cirisnode::KeyGrantScope::as_str)
+    /// token — the same string the write path projects onto
+    /// `key_grant_scope_kind`:
+    ///
+    ///   - `"stream_epoch"` — the streaming epoch-DEK cascade;
+    ///     `scope_id` is the `federation_streams` stream id.
+    ///   - `"transit_membership"` — the IFAC transit passphrase
+    ///     (CIRISEdge#492); `scope_id` is the IFAC `netname`.
+    ///
+    /// **Replaces `cirisnode_list_key_grants_for_stream_epoch_json`,
+    /// with no alias.** That method pinned `scope_kind` to
+    /// `StreamEpoch` at both backend arms, so the ONLY Python entry
+    /// point for epoch-addressed grants could not reach a
+    /// transit-membership grant at all — this cut's headline feature was
+    /// code-path-exists / no-host-can-call-it. A `#[deprecated]` shim
+    /// forwarding to the streaming half would have kept exactly that:
+    /// a caller asking for transit grants would get `[]` and read it as
+    /// "none issued". Removing the name gives a Python caller an
+    /// immediate `AttributeError` that says which method is gone.
+    ///
+    /// # `scope_kind` is REFUSED, not silently queried
+    ///
+    /// An unknown token, or a known-but-not-epoch-addressed one
+    /// (`single_content`, `group_member`, `subscription_tier`), raises
+    /// `ValueError`. `key_grant_scope_kind` is projected ONLY for
+    /// epoch-addressed grants, so such a query matches no row *by
+    /// construction* and returns `[]` — indistinguishable from "no
+    /// grants issued for this scope". A read whose empty result cannot
+    /// be told from a typo is a fail-open on key delivery: the caller
+    /// concludes it has no key material and moves on. The accepted
+    /// tokens are named in the error, derived from
+    /// [`KeyGrantScope::epoch_addressed_tokens`](crate::cirisnode::KeyGrantScope::epoch_addressed_tokens).
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_list_key_grants_for_stream_epoch_json(
+    fn cirisnode_list_key_grants_for_scope_epoch_json(
         &self,
         py: Python<'_>,
-        stream_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
         epoch: u64,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let stream = stream_id.to_owned();
+            // Refuse BEFORE any backend work: the token is validated against
+            // the enum's own vocabulary, never re-spelled here.
+            let kind =
+                crate::cirisnode::KeyGrantScope::from_wire_str(scope_kind).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "scope_kind {scope_kind:?} is not a key_grant scope; an \
+                         epoch-addressed read accepts: {}",
+                        crate::cirisnode::KeyGrantScope::epoch_addressed_tokens()
+                    ))
+                })?;
+            if !kind.is_epoch_addressed() {
+                return Err(PyValueError::new_err(format!(
+                    "scope_kind {:?} is not epoch-addressed — no grant is ever stored \
+                     under it in the (scope_kind, scope_id, epoch) index, so this read \
+                     could only ever return []; accepts: {}",
+                    kind.as_str(),
+                    crate::cirisnode::KeyGrantScope::epoch_addressed_tokens()
+                )));
+            }
+            let kind = kind.as_str();
+            let scope = scope_id.to_owned();
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -19573,11 +19621,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
                         let rows = backend
-                            .list_key_grants_for_scope_epoch(
-                                crate::cirisnode::KeyGrantScope::StreamEpoch.as_str(),
-                                &stream,
-                                epoch,
-                            )
+                            .list_key_grants_for_scope_epoch(kind, &scope, epoch)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&rows)
@@ -19591,11 +19635,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
                         let rows = backend
-                            .list_key_grants_for_scope_epoch(
-                                crate::cirisnode::KeyGrantScope::StreamEpoch.as_str(),
-                                &stream,
-                                epoch,
-                            )
+                            .list_key_grants_for_scope_epoch(kind, &scope, epoch)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                         serde_json::to_string(&rows)
@@ -19608,7 +19648,7 @@ impl PyEngine {
 
     /// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — the
     /// dedicated `key_grant` WRITER; the emission half of
-    /// [`cirisnode_list_key_grants_for_stream_epoch_json`](Self::cirisnode_list_key_grants_for_stream_epoch_json)
+    /// [`cirisnode_list_key_grants_for_scope_epoch_json`](Self::cirisnode_list_key_grants_for_scope_epoch_json)
     /// (and of the content-addressed grant readers).
     ///
     /// `envelope_json` is a full signed
