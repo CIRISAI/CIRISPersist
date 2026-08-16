@@ -565,7 +565,10 @@ where
 
         // 1. Schema parse — typed envelope. Schema-version gate fires
         //    here.
-        let mut env = BatchEnvelope::from_json(bytes)?;
+        // v33.0.0 (#705) — no longer `mut`: the scrub works on a copy now, so
+        // nothing mutates the envelope that becomes the stored record. The
+        // compiler noticing this is the change being real.
+        let env = BatchEnvelope::from_json(bytes)?;
 
         // 2. Verify each CompleteTrace signature. Mission constraint
         //    (MISSION.md §3 anti-pattern #2): verify before any
@@ -599,9 +602,31 @@ where
         //    held briefly; dropped after step 3.5.
         let pre_scrub_hashes = self.compute_pre_scrub_hashes(&env)?;
 
-        // 4. Scrub. By the time we get here every signature has been
-        //    accepted, so we know the bytes are real agent testimony.
-        let scrub_outcome = self.scrubber.scrub_batch(&mut env)?;
+        // 4. Scrub — ON A COPY, for the PUBLISHABLE artifact only.
+        //
+        // v33.0.0 (CIRISPersist#705, CIRISServer#418) — **the node's own record
+        // is never redacted.** Scrubbing is an EGRESS act, which persist's own
+        // doctrine already said (`scrub/mod.rs`: "at the sender's egress") while
+        // the code did it at rest. `receive_and_persist` is how an agent
+        // captures ITS OWN traces, so scrubbing `env` in place destroyed the
+        // original — Server wired a real scrubber, watched self-scoped content
+        // change under it, and reverted.
+        //
+        // What actually leaves this node is the ATTESTATION. `trace_events` is a
+        // LOCAL projection (`replication_policy::Projection::TraceEvents` —
+        // "trace_events from a trace:complete:v1 attestation"), derived on a
+        // receiver from an admitted attestation and never replicated itself.
+        // The attestation embeds the whole trace, and it is the wire object.
+        //
+        // So the split is exactly the privacy boundary:
+        //   * `env`          — untouched, becomes the stored rows. The record.
+        //   * `scrubbed_env` — the copy the attestation is minted from. Derived,
+        //                      transient, and the only thing that ships.
+        //
+        // The scrubbed copy is not retained separately; it lives inside the
+        // attestation envelope and nowhere else.
+        let mut scrubbed_env = env.clone();
+        let scrub_outcome = self.scrubber.scrub_batch(&mut scrubbed_env)?;
         let scrubbed_fields = scrub_outcome.fields_modified;
 
         // 4a. v32.0.0 (#690) — REFUSE a full_traces batch that did not get a
@@ -613,6 +638,9 @@ where
         //     at, not the incoming label, so a node that downgrades to
         //     `detailed` and relabels passes honestly while one that keeps the
         //     `full_traces` label without the pass does not.
+        // v33.0.0 (#705) — this gates PUBLICATION, not storage. Refusing to
+        // store a node's own record was always the wrong lever; refusing to mint
+        // a publishable artifact from untreated content is the right one.
         if scrub_outcome.applied_trace_level == TraceLevel::FullTraces.as_str()
             && !scrub_outcome.ner_ran
         {
@@ -645,7 +673,7 @@ where
         // signs every component of a batch in this pipeline, so the cache
         // is hit for every row after the first family/community one.
         let mut writer_admission_cache: Option<(String, crate::scope::CallerAdmission)> = None;
-        for event in &env.events {
+        for (i, event) in env.events.iter().enumerate() {
             match event {
                 BatchEvent::CompleteTrace { trace, .. } => {
                     // v0.4.6 (CIRISPersist#22) — typed Schema/Store
@@ -779,10 +807,32 @@ where
                         env_idx += 1;
                     }
                     // v18.0.0 (#473) — ENVELOPE-NATIVE: collect the trace's
-                    // attestation mint (its canonical CEG home). Runs
-                    // post-scrub (the envelope carries the scrubbed trace,
-                    // consistent with what the projection rows store).
-                    trace_attestation_inputs.push(self.build_trace_attestation_input(trace)?);
+                    // attestation mint (its canonical CEG home).
+                    //
+                    // v33.0.0 (#705) — minted from the SCRUBBED copy, while the
+                    // rows above come from the original. This is the whole fix:
+                    // the attestation is what crosses to federation, so it
+                    // carries redacted content; `trace_events` is this node's
+                    // own record and keeps full fidelity.
+                    //
+                    // Indexed rather than zipped because the scrubber's
+                    // preservation gate guarantees `events[]` count and order
+                    // are unchanged — a scrubber altering either is refused
+                    // before this point, so index `i` is the same trace in both.
+                    let scrubbed_trace = match scrubbed_env.events.get(i) {
+                        Some(BatchEvent::CompleteTrace { trace: t, .. }) => t,
+                        _ => {
+                            return Err(IngestError::PipelineInvariant {
+                                kind: "scrub_envelope_shape_drift",
+                                detail: format!(
+                                    "scrubbed copy lost the CompleteTrace at index {i}; the \
+                                     preservation gate should have refused this scrubber"
+                                ),
+                            })
+                        }
+                    };
+                    trace_attestation_inputs
+                        .push(self.build_trace_attestation_input(scrubbed_trace)?);
                     events_to_insert.extend(d.events);
                     llm_calls_to_insert.extend(d.llm_calls);
                 }
@@ -1868,6 +1918,115 @@ mod tests {
         assert!(
             row0.scrub_model_digest.is_none(),
             "no model ran, so none may be named"
+        );
+    }
+
+    /// **CIRISPersist#705 / CIRISServer#418 — the record keeps what the wire
+    /// does not.**
+    ///
+    /// #690 scrubbed inside `receive_and_persist`, which is how an agent
+    /// captures ITS OWN traces — so the original was redacted before it was
+    /// ever stored and the unscrubbed record existed nowhere. Server wired a
+    /// real scrubber, watched self-scoped content change under it, reverted,
+    /// and held their pin.
+    ///
+    /// The privacy boundary is not ingest. `trace_events` is a LOCAL
+    /// projection (`Projection::TraceEvents` — derived on a receiver from an
+    /// admitted attestation) and is never replicated; the ATTESTATION embeds
+    /// the whole trace and is the wire object. So the stored rows come from the
+    /// original envelope and the attestation is minted from a scrubbed copy.
+    ///
+    /// **The assertion is the DISAGREEMENT between them.** Checking only the
+    /// row would pass on a no-op scrubber; checking only the attestation would
+    /// pass on the old both-scrubbed behaviour. Only the pair distinguishes
+    /// this fix from either.
+    #[tokio::test]
+    async fn the_record_keeps_what_the_wire_does_not_705() {
+        const MARKER: &str = "SECRET-MARKER-705";
+
+        /// Redacts the marker and honestly claims a pass, so the #690
+        /// publication gate is satisfied and this test isolates WHERE the
+        /// scrub lands rather than whether the gate fires.
+        struct MarkerScrubber;
+        impl crate::scrub::Scrubber for MarkerScrubber {
+            fn scrub_batch(
+                &self,
+                env: &mut BatchEnvelope,
+            ) -> Result<crate::scrub::ScrubOutcome, crate::scrub::ScrubError> {
+                let mut n = 0usize;
+                for event in &mut env.events {
+                    // `BatchEvent` is single-variant today; an `else` arm
+                    // would be unreachable, so this destructures directly and
+                    // will fail to compile if a variant is ever added — which
+                    // is the right prompt to decide what a scrubber does with it.
+                    let BatchEvent::CompleteTrace { trace, .. } = event;
+                    for c in &mut trace.components {
+                        // Stamps a sentinel instead of redacting a planted one:
+                        // planting would require re-signing the fixture, and the
+                        // property under test is "the copy differs from the
+                        // record", which a stamp witnesses exactly as well.
+                        c.data
+                            .insert(MARKER.to_owned(), serde_json::Value::Bool(true));
+                        n += 1;
+                    }
+                }
+                let lvl = env.trace_level.as_str().to_owned();
+                Ok(crate::scrub::ScrubOutcome {
+                    fields_modified: n,
+                    ner_ran: true,
+                    applied_trace_level: lvl,
+                    scrubber_model_digest: Some("test-model-705".to_owned()),
+                })
+            }
+        }
+
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &MarkerScrubber,
+            signer: signer.as_ref(),
+            signer_key_id: &signer_key_id,
+        };
+        pipeline
+            .receive_and_persist(&bytes)
+            .await
+            .expect("ingest succeeds");
+
+        // THE RECORD: the stored row still carries the marker. This is the node's
+        // own capture and must retain full fidelity.
+        let rows = backend.snapshot_events();
+        let stored = serde_json::to_string(&rows).expect("serialize rows");
+        assert!(
+            !stored.contains(MARKER),
+            "the STORED row must be the UNTOUCHED original — if the scrubber's \
+             mark is here, ingest is still redacting the node's own record, \
+             which is exactly what CIRISServer#418 reverted over"
+        );
+
+        // THE WIRE: the minted attestation does not.
+        // The mint lands local-tier; this is the only reader for it, and it is
+        // the same one `promote_consented_backlog` walks before publishing.
+        let atts = {
+            use crate::federation::FederationDirectory as _;
+            backend
+                .list_local_tier_attestations(None, 64)
+                .await
+                .expect("list local-tier attestations")
+        };
+        let published = serde_json::to_string(&atts).expect("serialize attestations");
+        assert!(
+            !published.is_empty(),
+            "a trace attestation must be minted, or this test proves nothing"
+        );
+        assert!(
+            published.contains(MARKER),
+            "the ATTESTATION is the wire object and must carry the SCRUBBED \
+             copy — if the scrubber's mark is absent here, nothing was \
+             scrubbed on the way out and unredacted content ships to federation"
         );
     }
 
