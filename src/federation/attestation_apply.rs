@@ -751,13 +751,50 @@ mod tests {
                 .expect("fresh apply"),
             ReplicatedAttestationOutcome::Inserted
         );
-        // Any OTHER get_attestation failure is NOT a licence to proceed:
-        // "could not ask" stays an error unless it is the typed Unsupported.
-        // (Guarded by the arm itself; witnessed here so collapsing
-        // `Err(Unsupported) => plan-free` into `Err(_) => plan-free` has a
-        // red to answer to would require a fault kind the double does not
-        // inject — the Unsupported double IS the sanctioned fault, so this
-        // witness pins the sanctioned side.)
+        // The UNSANCTIONED side is witnessed separately — see
+        // `a_generic_get_failure_propagates_and_does_not_degrade_624`.
+    }
+
+    /// v36.0.0 (CIRISPersist#624 M6) — **a generic `get_attestation` failure
+    /// must PROPAGATE, never degrade to the plan-free path.**
+    ///
+    /// This is the witness the #624 stream reported as inexpressible and
+    /// named the remediation for: the fault double could inject exactly one
+    /// error kind (`Unsupported`), which is the SANCTIONED degrade signal, so
+    /// the mutation collapsing `Err(Unsupported) => plan-free` into
+    /// `Err(_) => plan-free` survived every test. A surviving mutation is a
+    /// claim about the instrument, and the instrument was the gap.
+    ///
+    /// `FaultInjectingDirectory::erroring` (added with this witness) injects
+    /// `Error::Backend`. The distinction is load-bearing: `Unsupported` means
+    /// *this directory cannot answer*, and proceeding plan-free is correct;
+    /// `Backend` means *the answer was attempted and failed*, and proceeding
+    /// would decide a convergence conflict on evidence the node never read.
+    #[tokio::test]
+    async fn a_generic_get_failure_propagates_and_does_not_degrade_624() {
+        let author = "att-apply-geterr-author";
+        let dir = std::sync::Arc::new(memory_with_author(author).await);
+        let failing = crate::federation::directory_double::FaultInjectingDirectory::new(
+            dir.clone() as std::sync::Arc<dyn FederationDirectory>,
+        )
+        .erroring("get_attestation");
+        assert!(
+            failing.error_faults().contains("get_attestation"),
+            "fixture must actually declare the fault it is testing"
+        );
+
+        let row = sealed_row(
+            &uuid::Uuid::new_v4().to_string(),
+            author,
+            envelope("identity_binding:v1", serde_json::json!({})),
+        );
+        let result = failing
+            .apply_replicated_attestation(SignedAttestation { attestation: row })
+            .await;
+        assert!(
+            result.is_err(),
+            "a failed read must not become an outcome — got {result:?}"
+        );
     }
 
     /// `Deduplicated` — the CEG §6.1 structural-composer replay: a second

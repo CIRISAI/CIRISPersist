@@ -60,12 +60,14 @@ use std::sync::Arc;
 pub struct FaultInjectingDirectory {
     inner: Arc<dyn FederationDirectory>,
     unsupported: BTreeSet<&'static str>,
+    erroring: BTreeSet<&'static str>,
 }
 
 impl std::fmt::Debug for FaultInjectingDirectory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FaultInjectingDirectory")
             .field("unsupported", &self.unsupported)
+            .field("erroring", &self.erroring)
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +80,7 @@ impl FaultInjectingDirectory {
         Self {
             inner,
             unsupported: BTreeSet::new(),
+            erroring: BTreeSet::new(),
         }
     }
 
@@ -100,10 +103,34 @@ impl FaultInjectingDirectory {
         &self.unsupported
     }
 
+    /// v36.0.0 (CIRISPersist#624) — declare that `method` answers a
+    /// GENERIC backend failure, not `Unsupported`.
+    ///
+    /// The two kinds are not interchangeable: `Unsupported` means *this
+    /// directory cannot answer*, which several trait defaults treat as a
+    /// sanctioned degrade-to-plan-free path. `Backend` means *the answer
+    /// was attempted and FAILED*, which must propagate. Without this
+    /// second kind a mutation collapsing a typed `Unsupported` arm into
+    /// `Err(_)` survives every witness — measured on #624 (M6).
+    #[must_use]
+    pub fn erroring(mut self, method: &'static str) -> Self {
+        self.erroring.insert(method);
+        self
+    }
+
+    /// The declared generic-failure set — so a fixture can assert setup.
+    #[must_use]
+    pub fn error_faults(&self) -> &BTreeSet<&'static str> {
+        &self.erroring
+    }
+
     fn faulted(&self, method: &'static str) -> Option<Error> {
-        self.unsupported
+        if self.unsupported.contains(method) {
+            return Some(Error::Unsupported { method });
+        }
+        self.erroring
             .contains(method)
-            .then_some(Error::Unsupported { method })
+            .then(|| Error::Backend(format!("injected backend failure: {method}")))
     }
 }
 
