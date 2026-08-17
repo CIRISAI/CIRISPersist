@@ -1307,6 +1307,39 @@ pub const PERSIST_AUTHORED_ABSENCE_FALSIFIERS: &[(&str, &str, &[&str], &str)] = 
     ),
 ];
 
+/// v35.0.0 (CIRISPersist#713) — manifest citation PARENTHETICALS that describe
+/// a cited symbol's SEMANTICS which have since MOVED. Same governance as every
+/// `PERSIST_AUTHORED_*` table above: the vendored manifest is a
+/// Registry-of-Record produced by a walk with no generator to re-run, so the
+/// correction lands OUTSIDE it and GATED — hand-editing the walk's prose would
+/// forge the research artifact, while shipping a semantic change and leaving
+/// the manifest asserting the old rule with no on-record correction would be a
+/// lying record. This table is the third option: the manifest keeps saying
+/// what the walk saw, and persist keeps ON RECORD, build-gated, what is true
+/// now.
+///
+/// `(cited_symbol, stale_parenthetical, correction)`. The gate
+/// (`tests::stale_citation_semantics_are_declared_and_really_stale`) holds
+/// both directions: the stale text must still be IN the manifest (else the
+/// re-vendor landed and the entry must be deleted), and the shipping code must
+/// really contradict it (a correction entry is a PROOF, exactly like a
+/// `falsified` entry in [`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`]).
+pub const STALE_CITATION_SEMANTICS_PENDING_REVENDOR: &[(&str, &str, &str)] = &[(
+    "projection_for",
+    "(Cohort ceiling for ProducerSteward; tombstone -> Global)",
+    "Since v35.0.0 (CIRISPersist#713) `projection_for` is PER-PLANE — \
+     `projection_for(plane: ObjectClass, cohort_scope, authority, is_tombstone)` — and \
+     `tombstone -> Global` is no longer unconditional: a tombstone projects at \
+     `tombstone_ceiling(plane, authority)`, its plane's row-max (Global unconditionally only \
+     for KeyRecord and the deferred Attestation plane; trust-root-only for \
+     TransportDestination / FountainContent; infra-role-only for HardCaseEvent). \
+     Anti-rollback holds within the record's maximal disclosure set — beyond it there is no \
+     copy to roll back — and widening a tombstone past that set would disclose more than the \
+     original fact. The walk's separate 'no observed live call site' flag on this symbol \
+     remains TRUE in-crate: the consumers are CIRISEdge/CIRISServer at their #713 re-pin. \
+     Correction owed at the next manifest re-vendor (tracked CIRISPersist#520).",
+)];
+
 /// Recursively collect every **structured absence claim** in `value`.
 ///
 /// The marker is `asymmetry_kind == "logical_defect"` **and** a non-empty
@@ -1777,8 +1810,13 @@ mod tests {
         // `FederationDirectory` trait method — the consent-SLA watcher a host
         // schedules (#146); persist ships it, the operator drives it.
         "run_consent_sla_watch",
-        // `pub fn` — the namespace projection predicate consumed by the
-        // conformance/render side (#519 manifest surface).
+        // `pub fn` — the per-plane projection resolver (#713). Zero in-crate
+        // non-test callers BY DESIGN: the consumers are CIRISEdge's publish
+        // loop and CIRISServer (cross-repo, adopted at their re-pin,
+        // coordinated on #713); the in-repo hot-path proxy is
+        // `benches/projection.rs`. Its manifest citation carries a stale
+        // SEMANTICS parenthetical — see
+        // `STALE_CITATION_SEMANTICS_PENDING_REVENDOR`.
         "projection_for",
         // `pub fn` — the pinned extraction-manifest digest served by
         // CIRISServer's `/v1/health` (the contract's cross-repo pin).
@@ -1976,6 +2014,44 @@ mod tests {
              DEAD: {dead:?}\n  TEST-ONLY: {test_only:?}\n\
              Fix by WIRING the processor at its real chokepoint (preferred — that is what #543 did \
              for check_capacity_not_self_attested), or by correcting the manifest citation."
+        );
+    }
+
+    /// v35.0.0 (CIRISPersist#713) — every declared stale-semantics citation
+    /// is BOTH still present in the vendored manifest (else the re-vendor
+    /// landed and the entry must be deleted) and genuinely contradicted by
+    /// the shipping code (the correction-is-a-proof discipline of
+    /// [`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`]'s `falsified` entries). A
+    /// table nobody checks would let a correction outlive the falsehood it
+    /// corrects — or, worse, let the falsehood outlive the correction.
+    #[test]
+    fn stale_citation_semantics_are_declared_and_really_stale() {
+        for (symbol, stale, correction) in STALE_CITATION_SEMANTICS_PENDING_REVENDOR {
+            assert!(
+                SUPERSETS_JSON.contains(stale),
+                "{symbol}: the manifest no longer contains the stale parenthetical {stale:?} — \
+                 the re-vendor landed; delete this STALE_CITATION_SEMANTICS_PENDING_REVENDOR \
+                 entry (its correction read: {correction})"
+            );
+        }
+        // The PROOF for the projection_for entry: the exact cell that
+        // falsifies the manifest's "tombstone -> Global" — a non-root route
+        // tombstone projects Cohort, not Global (#713's arbitrated cell).
+        use crate::federation::namespace::{
+            projection_for, AuthorityClass, ObjectClass, Projection,
+        };
+        assert_eq!(
+            projection_for(
+                ObjectClass::TransportDestination,
+                "self",
+                AuthorityClass::ProducerSteward,
+                true,
+            ),
+            Projection::Cohort,
+            "the manifest's 'tombstone -> Global' parenthetical would be TRUE again. If the \
+             ceiling deliberately reverted, delete the projection_for entry in \
+             STALE_CITATION_SEMANTICS_PENDING_REVENDOR; otherwise this gate just caught a \
+             regression of #713's narrowed tombstone ceiling."
         );
     }
 
