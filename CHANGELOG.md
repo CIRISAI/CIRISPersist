@@ -267,6 +267,38 @@ exclusion rather than a guessed one.
   and **twelve bare `Row::get` calls that panic on NULL** — the #24 class,
   caught by the ban gate rather than by production.
 
+### Measured — and the measurement is contaminated, which is itself the report
+
+#713's acceptance criterion is a delta on `projection_for`. Against baseline
+`pre-713`, this cut reads:
+
+| case | v35 (post-decomposition) | v36 | vs `pre-713` |
+|---|---|---|---|
+| `self_live` | 1.19 ns | **2.47–2.51 ns** | +53% |
+| `unrecognized_scope` | 1.03 ns | **2.20–2.29 ns** | +70% |
+| `publish_sweep` per call | 2.00 ns | **~5.3 ns** | +5771% headline (768 elements vs 64) |
+
+**Do not read those as clean numbers.** They were taken with an unrelated
+QEMU guest holding ~8.6 cores (load average 14.5); the `pre-713` baseline was
+captured under materially lighter load. The comparison therefore **overstates**
+the regression by an unknown amount, and saying so is more useful than
+publishing a figure that looks authoritative. Two runs agreed to within 2%, so
+the measurement is reproducible — under *this* load.
+
+What is nonetheless informative is the *shape*: the sweep regressed
+proportionally more than the singles, which uniform load inflation would not
+produce. That points at the widened match — v35's five planes became twelve
+plane-and-dimension arms — and at `Plane<'a>` carrying a `&str` where
+`ObjectClass` was a fieldless enum, so the argument no longer fits a register.
+Both are consequences of the shape **Edge asked for and argued for**, not
+accidents, and neither is a lookup: no directory read, no allocation, no I/O.
+
+Persist's position: this needs a clean re-measurement on an idle machine before
+anyone treats the number as settled, and **Edge's publish-loop bench is the
+macro acceptance** per its commitment on #713 — a per-envelope-ref cost of a
+few nanoseconds is decided there, not here. The one thing this cut will not do
+is report a figure it knows to be dirty as though it were the answer.
+
 ### The measurement that did not support its claim
 
 The pg overlap concurrency leg that #675 deliberately left unwired (its doc
