@@ -5,6 +5,101 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [36.1.0] - 2026-08-17
+
+**MINOR, not a patch: this adds public API.** `attestation_family()` and
+`AttestationFamily` become public so a consumer's capability overlay can key on
+the family — see the adopt-map correction below. Additive surface is a minor
+bump even when the reason for it is a defect.
+
+### Fixed — `provenance:build_manifest:*` is decided, and it is ✱ at every commons tier (#713)
+
+v36.0.0 shipped this family under the conservative default, capping it at
+`Cohort`. That was flagged in the v36.0.0 entry as a chosen consequence needing
+a decided row; **CIRISEdge decided it back**, and the reasoning is worth keeping:
+
+- It is the **binary-verification surface**. Edge's bundle gate
+  (CIRISEdge#436/#437) admits a peer at `Rooted` only if its build attestation
+  verifies against a trust-root-blessed manifest, so a `Cohort` cap silently
+  degrades **cross-cohort first contact** to `Advisory` — the safe-mesh path.
+- Contextual integrity does not argue for the narrowing: **a build manifest is a
+  statement about an ARTIFACT, not about a subject**, so the presence-directory
+  reasoning that narrowed reachability has no purchase here.
+- **And the narrowing was invisible downstream.** Edge's advertise gate maps
+  `Global | Cohort => true`, so v36.0.0's cap was compiler-green *and* test-green
+  on edge. A default whose harm the consumer cannot observe is precisely why this
+  had to be a decided row rather than an inherited one.
+
+The row is the `KeyRecord` shape — ✱ at species, biosphere **and** federation
+(not the commons-health shape's federation-only ✱). Non-root emitters stay
+`Cohort`: the ✱ is the trust root's reach, not the family's. The ceiling is the
+row-max, unchanged in value.
+
+**The stem is `provenance:build_manifest:`, not `provenance:`.** A family earns
+its row by being argued for, not by sharing a namespace with one that was —
+`provenance:signature_chain:*` and every other sibling stay on the conservative
+row, and the witness pins that distinction in both directions.
+
+Two mutations, both killed: collapsing the row back to the commons-health shape
+reds the new witness; widening the stem to `provenance:` reds **two** tests —
+the new witness's sibling check and the conservative-default witness — which is
+the pair that holds "the deeper stem earned it, the namespace did not inherit
+it."
+
+### CORRECTION to the v36.0.0 adopt map — the overlay fold was UNSAFE as written (#713)
+
+v36.0.0's adopt map told consumers: *"Delete the two bespoke overlay gates.
+`peer_has_serve_capability` folds onto `Capability(token)`."* **That instruction
+is wrong, it shipped, and CIRISEdge caught it while adopting.**
+
+**A capability gate is a FAMILY question. A projection is a FAMILY-AND-SCOPE
+answer.** `trace:*` resolves `Capability(InfraServe)` only at `species` /
+`biosphere` / `federation`; at `self` / `family` / `community` / `affiliations`
+the same family resolves `SelfOwn`. A consumer replacing
+`dimension.starts_with("trace:")` with
+`matches!(projection, Projection::Capability(_))` therefore **stops gating below
+the commons tiers** — and on the direct-fetch path that is a hole rather than a
+narrower advertisement, because E3 requires `infra:serve` even for a subject
+pulling its own `trace:*` row. `recipient_capability_withholds` → `Subject`
+carries the identical coupling (`scores:*` is `SelfOwn` at `self`/`family`).
+
+**Fix, per edge's ask:** `attestation_family()` and `AttestationFamily` are now
+**public**. The correct fold is
+`matches!(attestation_family(dimension), AttestationFamily::Trace)` — scope-free,
+1:1 with the overlay it replaces, and the classification has exactly one owner,
+which was the actual point. `#[non_exhaustive]`, because the decided set grows
+as policy lands and a new family is additive policy, not a contract change.
+
+The enum's doc previously said it was *"private on purpose… the family is a
+resolver internal."* That rationale is rewritten, not quietly flipped: keeping it
+private did not prevent half-consulting the registry — it forced consumers to
+re-spell the prefix rule, which is the second-spelling shape removed everywhere
+else in this repo.
+
+`a_capability_overlay_keys_on_family_not_on_projection_713` pins the trap in both
+directions, so the unsafe fold cannot be performed later without a red naming it.
+
+Until a consumer can take the export, **keeping the duplicated prefix rule
+annotated is correct** — a duplicated-but-correct rule beats a silently-disabled
+capability gate.
+
+### Decided, no change needed
+
+- **`trace_manifest:*` stays SEPARATE** — deliberately not folded into
+  `trace:*`. Edge's live gate is `dimension.starts_with("trace:")`, which does
+  **not** match `trace_manifest:*` (the sixth byte is `_`, not `:`), and edge
+  references it nowhere else. Folding would make the registry assert an audience
+  edge does not enforce. If it should be gated it gets its own decided row with
+  the same `Capability(InfraServe)` value, and edge widens its prefix in the same
+  cut — a coordinated change, not a substrate one.
+
+### Still open with Server
+
+`accord:*` (edge recommends Global on the same artifact-not-subject reasoning,
+and ships the `AccordQuorumEvidence` cursor plane, but Server co-owns) and
+`moderation:*` (no edge stake — Server's call). Both remain on the conservative
+row until decided, which is the correct state for an undecided family.
+
 ## [36.0.0] - 2026-08-17
 
 **The consolidation break.** Every remaining breaking change that did not wait

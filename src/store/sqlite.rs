@@ -20653,6 +20653,19 @@ mod accord_tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v36.1.0 (CIRISPersist#713) — cohort_scope survives write→read, sqlite
+    /// leg. The backend reads it from the typed COLUMN; this asserts the
+    /// column is populated on the paths a consumer advertises from.
+    #[tokio::test]
+    async fn cohort_scope_survives_the_read_path_sqlite_713() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::ungated_doors_test_support::exercise_cohort_scope_survives_the_read_path(
+            &backend, "sq",
+        )
+        .await;
+    }
+
     /// v36.0.0 (CIRISPersist#668) — the V130 late-admit witness on a
     /// converted plane (attestations), sqlite leg.
     #[tokio::test]
