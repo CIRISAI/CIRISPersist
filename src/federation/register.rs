@@ -2510,6 +2510,54 @@ mod tests {
     use crate::federation::types::{algorithm, identity_type};
     use crate::federation::{KeyRecord, SignedKeyRecord};
     use crate::signing::LocalSigner;
+
+    /// v36.0.0 (CIRISPersist#718) — every outcome must survive the FFI's
+    /// encoder, INCLUDING the refusal arm.
+    ///
+    /// The pyo3 door used to render the outcome with
+    /// `to_value(..).as_str()`, which is `None` for `Refused { reason }`
+    /// because #565 made it an OBJECT, not a bare token. So every key-plane
+    /// refusal raised `ValueError("outcome serialize")` — the arm #565 exists
+    /// to make countable was unreachable on the surface Edge and Server
+    /// actually consume, and presented as a serialization bug.
+    ///
+    /// This pins the mechanism rather than the door: the bare-token render
+    /// returning `None` for a refusal is asserted directly, so a future
+    /// "simplification" back to `as_str()` reds here even though the FFI
+    /// itself is not reachable from a Rust test.
+    #[test]
+    fn every_replicated_key_outcome_encodes_including_refusals_718() {
+        for outcome in [
+            ReplicatedKeyOutcome::Inserted,
+            ReplicatedKeyOutcome::Upgraded,
+            ReplicatedKeyOutcome::Unchanged,
+        ] {
+            let json = serde_json::to_string(&outcome).expect("encode");
+            assert!(!json.is_empty(), "{outcome:?} must encode");
+        }
+
+        for reason in KeyRefusalReason::ALL {
+            let refused = ReplicatedKeyOutcome::Refused { reason: *reason };
+
+            // The fix: canonical JSON carries the refusal AND its reason.
+            let json = serde_json::to_string(&refused).expect("refusal must encode");
+            assert!(
+                json.contains(reason.as_str()),
+                "refusal JSON must name the reason; got {json}"
+            );
+
+            // The defect: the bare-token render cannot express this arm. If
+            // this assertion ever fails, `Refused` became a bare string and
+            // the FFI's encoder choice should be revisited deliberately.
+            assert!(
+                serde_json::to_value(refused)
+                    .expect("to_value")
+                    .as_str()
+                    .is_none(),
+                "Refused renders as an object, not a bare token — the #718 defect"
+            );
+        }
+    }
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use ciris_keyring::PqcSigner as _;

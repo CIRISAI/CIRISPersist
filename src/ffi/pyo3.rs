@@ -6020,12 +6020,17 @@ impl PyEngine {
                     })
                 }
             })?;
-            serde_json::to_value(outcome)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .ok_or_else(|| {
-                    PyValueError::new_err("apply_replicated_key_record outcome serialize")
-                })
+            // v36.0.0 (CIRISPersist#718) — was `to_value(..).as_str()`, which is
+            // `None` for `Refused { reason }` (an OBJECT since #565), so every
+            // key-plane REFUSAL raised `ValueError("outcome serialize")` instead
+            // of returning. #565 exists to make refusals typed and countable;
+            // on the surface Edge and Server actually consume, the refusal arm
+            // was unreachable and read as a serialization bug. Now canonical
+            // JSON, matching this cut's `apply_replicated_attestation` door —
+            // one shape for both apply planes.
+            serde_json::to_string(&outcome).map_err(|e| {
+                PyValueError::new_err(format!("apply_replicated_key_record outcome encode: {e}"))
+            })
         })
     }
 
