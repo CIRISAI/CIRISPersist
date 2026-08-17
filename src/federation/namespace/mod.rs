@@ -538,6 +538,25 @@ pub fn projection_for(
                 cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
                 _ => Projection::Subject,
             },
+            // provenance:build_manifest:* — the binary-verification surface
+            // (v36.0.1, #713, decided by edge). The KeyRecord shape, ✱ at
+            // EVERY commons tier: a trust-root-blessed manifest must be
+            // resolvable wherever a peer's build attestation travels, exactly
+            // as a key must be resolvable wherever its signatures travel.
+            // Non-root emitters stay Cohort — the ✱ is the trust root's
+            // reach, not the family's.
+            AttestationFamily::ProvenanceBuildManifest => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
+                cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
+                    if authority.is_trust_root() {
+                        Projection::Global
+                    } else {
+                        Projection::Cohort
+                    }
+                }
+                _ => Projection::Cohort,
+            },
             // transport:* + the EXACT system:audit_chain:hash_continuity —
             // substrate self-reports with no third-party subject and
             // federation-wide consumers: SubstrateSelf at commons scopes
@@ -584,11 +603,40 @@ pub fn projection_for(
 const SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY: &str = "system:audit_chain:hash_continuity";
 
 /// The dimension-FAMILY axis of the Attestation plane (#713 decomposition) —
-/// the closed set of decided rows plus the conservative default. Private on
-/// purpose: consumers ask [`projection_for`]; the family is a resolver
-/// internal, so the registry cannot be consulted half-way.
+/// the decided rows plus the conservative default.
+///
+/// # v36.0.1 — this was private, and the reason it gave was wrong
+///
+/// It read *"consumers ask [`projection_for`]; the family is a resolver
+/// internal, so the registry cannot be consulted half-way."* CIRISEdge
+/// disproved that while adopting v36.0.0, and the v36.0.0 adopt map's
+/// instruction to fold a capability overlay onto
+/// [`Projection::Capability`] was UNSAFE because of it.
+///
+/// **A capability gate is a FAMILY question; a projection is a
+/// FAMILY-AND-SCOPE answer.** `trace:*` resolves
+/// [`Capability`](Projection::Capability) only at the commons tiers — at
+/// `community` / `affiliations` the same family resolves
+/// [`SelfOwn`](Projection::SelfOwn). So a consumer replacing
+/// `dimension.starts_with("trace:")` with `matches!(p, Projection::Capability(_))`
+/// stops gating below the commons, and on a DIRECT-FETCH path that is a hole
+/// rather than a narrower advertisement: E3 requires `infra:serve` even for a
+/// subject pulling its own `trace:*` row. The same coupling applies to
+/// `scores:*` → [`Subject`](Projection::Subject).
+///
+/// Keeping this private did not prevent half-consulting the registry — it
+/// forced consumers to re-spell the prefix rule instead, which is the
+/// second-spelling shape this repo removes everywhere else. Public, so the
+/// classification has exactly one owner.
+///
+/// `#[non_exhaustive]` deliberately: the decided set GROWS as policy lands
+/// (`accord:*` and `moderation:*` are open with CIRISServer as of this
+/// release), and a new decided family is additive policy, not a contract
+/// change — it must not break a consumer's build. Consumers match the
+/// variants they gate on and let the rest fall through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttestationFamily {
+#[non_exhaustive]
+pub enum AttestationFamily {
     /// `consent:*` — the routing editor (Global ceiling).
     Consent,
     /// `trace:*` — capability-gated (E3), never widens by cohort.
@@ -603,6 +651,25 @@ enum AttestationFamily {
     /// [`SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY`] — substrate self-reports whose
     /// SubstrateSelf commons cells are Global.
     SubstrateHealth,
+    /// v36.0.1 (CIRISPersist#713) — `provenance:build_manifest:*`, the
+    /// BINARY-VERIFICATION surface, decided by edge after v36.0.0 shipped it
+    /// under the conservative default.
+    ///
+    /// **Why it is not `Unknown`.** Edge's bundle gate (CIRISEdge#436/#437)
+    /// admits a peer at `Rooted` only if its build attestation verifies
+    /// against a trust-root-blessed manifest. Capping this family at `Cohort`
+    /// silently degrades cross-cohort FIRST CONTACT to `Advisory` — the
+    /// safe-mesh path — and contextual integrity does not argue for the
+    /// narrowing: **a build manifest is a statement about an ARTIFACT, not
+    /// about a subject**, so the presence-directory reasoning that narrowed
+    /// reachability has no purchase here.
+    ///
+    /// **Why it had to be decided rather than defaulted.** Edge's advertise
+    /// gate maps `Global | Cohort => true`, so the v36.0.0 narrowing was
+    /// compiler-green AND test-green downstream — invisible exactly where it
+    /// mattered. A default that cannot be observed by the consumer it harms
+    /// is the reason this row exists.
+    ProvenanceBuildManifest,
     /// Any dimension outside the decided families — the conservative row.
     Unknown,
 }
@@ -621,8 +688,17 @@ fn under(dimension: &str, stem: &str) -> bool {
 /// pure O(1) on the hot path (the general
 /// [`family_for_dimension`](crate::federation::load_bearing::family_for_dimension)
 /// walks the whole manifest and allocates — deliberately NOT used here).
+///
+/// # v36.0.1 — public (CIRISPersist#713, CIRISEdge adoption)
+///
+/// This is the surface a capability or subject overlay is 1:1 with. A
+/// consumer gating on "does this dimension require `infra:serve`?" asks
+/// `matches!(attestation_family(d), AttestationFamily::Trace)` — NOT
+/// `matches!(projection_for(..), Projection::Capability(_))`, which is only
+/// true at the commons tiers and silently stops gating below them. See
+/// [`AttestationFamily`] for why the private-by-default rationale was wrong.
 #[inline]
-fn attestation_family(dimension: &str) -> AttestationFamily {
+pub fn attestation_family(dimension: &str) -> AttestationFamily {
     // The exact-value gate FIRST — the value earns the row, the `system:*`
     // namespace never does.
     if dimension == SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY {
@@ -645,6 +721,15 @@ fn attestation_family(dimension: &str) -> AttestationFamily {
     }
     if under(dimension, "transport:") {
         return AttestationFamily::SubstrateHealth;
+    }
+    // v36.0.1 (#713) — the DEEPER stem is decided; the rest of `provenance:*`
+    // stays `Unknown` until someone decides it. Checked after the shallower
+    // stems above cannot match it, and deliberately NOT widened to
+    // `provenance:` — edge's argument is about build manifests specifically,
+    // and a family earns its row by being argued for, not by sharing a
+    // namespace with one that was.
+    if under(dimension, "provenance:build_manifest:") {
+        return AttestationFamily::ProvenanceBuildManifest;
     }
     AttestationFamily::Unknown
 }
@@ -756,7 +841,12 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
             AttestationFamily::Consent => Projection::Global,
             AttestationFamily::Trace => Projection::Capability(CapabilityToken::InfraServe),
             AttestationFamily::Scores => Projection::Subject,
-            AttestationFamily::Capacity | AttestationFamily::ContentClass => {
+            // Row-max for all three: ✱ at their widest live cell. The
+            // provenance row reaches ✱ at three commons tiers rather than one,
+            // but the MAX is the same value, so the ceiling arm is shared.
+            AttestationFamily::Capacity
+            | AttestationFamily::ContentClass
+            | AttestationFamily::ProvenanceBuildManifest => {
                 if authority.is_trust_root() {
                     Projection::Global
                 } else {
@@ -1306,6 +1396,126 @@ mod tests {
         }
     }
 
+    /// v36.0.1 (#713, CIRISEdge adoption) — **the capability overlay is a
+    /// FAMILY question and the projection is a FAMILY-AND-SCOPE answer; they
+    /// are NOT interchangeable.**
+    ///
+    /// v36.0.0's adopt map told consumers to delete their
+    /// `starts_with("trace:")` overlay and gate on
+    /// `matches!(projection, Projection::Capability(_))`. That is unsafe:
+    /// below the commons tiers the same family resolves `SelfOwn`, so the
+    /// folded gate stops firing — and on a direct-fetch path E3 still
+    /// requires `infra:serve`, so it is a hole, not a narrower advertisement.
+    ///
+    /// This pins the trap in both directions so nobody performs that fold
+    /// later without a red in front of them, and pins that
+    /// [`attestation_family`] IS scope-independent — the surface an overlay
+    /// should actually key on.
+    #[test]
+    fn a_capability_overlay_keys_on_family_not_on_projection_713() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
+        let dim = "trace:reasoning:v1";
+        let plane = Plane::Attestation { dimension: dim };
+
+        // The family answer is scope-free — every scope, every authority.
+        assert_eq!(attestation_family(dim), AttestationFamily::Trace);
+
+        // The projection answer is NOT. This is the whole finding.
+        for scope in ["self", "family", "community", "affiliations"] {
+            assert_eq!(
+                projection_for(plane, scope, ProducerSteward, false),
+                Projection::SelfOwn,
+                "trace:* below the commons is SelfOwn at {scope} — a gate folded \
+                 onto Projection::Capability would STOP FIRING here, and E3 \
+                 requires infra:serve even for a subject's own row"
+            );
+        }
+        for scope in ["species", "biosphere", "federation"] {
+            assert!(
+                matches!(
+                    projection_for(plane, scope, AccordCoScrub, false),
+                    Projection::Capability(_)
+                ),
+                "trace:* is Capability only at the commons tiers ({scope})"
+            );
+        }
+
+        // scores:* carries the identical coupling for a Subject overlay.
+        let s = "scores:capacity:v1";
+        assert_eq!(attestation_family(s), AttestationFamily::Scores);
+        let splane = Plane::Attestation { dimension: s };
+        assert_eq!(
+            projection_for(splane, "family", ProducerSteward, false),
+            Projection::SelfOwn,
+            "scores:* at family is SelfOwn, not Subject — same trap"
+        );
+        assert_eq!(
+            projection_for(splane, "community", ProducerSteward, false),
+            Projection::Subject
+        );
+    }
+
+    /// v36.0.1 (#713) — `provenance:build_manifest:*` is ✱ at EVERY commons
+    /// tier, not just federation. LITERALS.
+    ///
+    /// This is the row that v36.0.0 shipped under the conservative default,
+    /// capping it at Cohort. Edge decided it back: its bundle gate
+    /// (CIRISEdge#436/#437) admits a peer at `Rooted` only against a
+    /// trust-root-blessed manifest, so a Cohort cap silently degrades
+    /// cross-cohort first contact to `Advisory`.
+    ///
+    /// The species/biosphere cells are the whole point — they are what
+    /// distinguish this row from the commons-health shape below, and they are
+    /// where the narrowing bit. A witness that only checked `federation`
+    /// would pass against the defaulted row and prove nothing.
+    #[test]
+    fn provenance_build_manifest_is_star_at_every_commons_tier_713() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
+        use Projection::{Cohort, Global, SelfOwn};
+        let plane = Plane::Attestation {
+            dimension: "provenance:build_manifest:v1",
+        };
+        assert_eq!(
+            projection_for(plane, "self", ProducerSteward, false),
+            SelfOwn
+        );
+        assert_eq!(
+            projection_for(plane, "family", ProducerSteward, false),
+            SelfOwn
+        );
+        assert_eq!(
+            projection_for(plane, "community", AccordCoScrub, false),
+            Cohort
+        );
+        // The three cells the default got wrong.
+        for scope in ["species", "biosphere", "federation"] {
+            assert_eq!(
+                projection_for(plane, scope, AccordCoScrub, false),
+                Global,
+                "trust-root build manifest must reach the commons at {scope}"
+            );
+            assert_eq!(
+                projection_for(plane, scope, ProducerSteward, false),
+                Cohort,
+                "the ✱ is the trust root's reach, not the family's, at {scope}"
+            );
+        }
+        // The DEEPER stem earns the row; `provenance:*` broadly does not.
+        // A family earns its row by being argued for, not by sharing a
+        // namespace with one that was.
+        let sibling = Plane::Attestation {
+            dimension: "provenance:signature_chain:v1",
+        };
+        assert_eq!(
+            projection_for(sibling, "species", AccordCoScrub, false),
+            Cohort,
+            "undecided provenance siblings stay on the conservative row"
+        );
+        // Ceiling is the row-max, not above it.
+        assert_eq!(tombstone_ceiling(plane, AccordCoScrub), Global);
+        assert_eq!(tombstone_ceiling(plane, ProducerSteward), Cohort);
+    }
+
     /// capacity:* / content_class:* — the commons-health shape (self-report
     /// about own substrate / flags whose subject is the content): ✱ at
     /// federation only. LITERALS.
@@ -1445,7 +1655,13 @@ mod tests {
         use Projection::{Cohort, SelfOwn};
         for dim in [
             "ratchet:flag:out_of_distribution_voting",
-            "provenance:build_manifest:linux-x86_64", // undecided on #713 — chosen, flagged there
+            // v36.0.1 (#713) — `provenance:build_manifest:*` was HERE as an
+            // undecided example until edge decided it back to ✱ (see
+            // `provenance_build_manifest_is_star_at_every_commons_tier_713`).
+            // Its undecided SIBLING replaces it, which is the stronger case
+            // anyway: it pins that the DEEPER stem earned the row and the
+            // namespace did not inherit it.
+            "provenance:signature_chain:v1",
             "moderation:harassment",
             "trace_manifest:v1", // trace-ADJACENT but not trace:* — undecided
             "capacity_assurance:rung_3", // capacity-ADJACENT but not capacity:*
