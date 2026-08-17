@@ -20855,7 +20855,7 @@ pub(crate) mod ungated_doors_test_support {
     /// The tie-paging leg is planted per backend (a tie cannot be produced
     /// through the write path — the allocator is strictly increasing under
     /// one lock) and lives in the backend test modules.
-    /// v36.0.1 (CIRISPersist#713, CIRISEdge adoption) — **does `cohort_scope`
+    /// v36.1.0 (CIRISPersist#713, CIRISEdge adoption) — **does `cohort_scope`
     /// survive the write→read round trip on the path a consumer advertises
     /// from?**
     ///

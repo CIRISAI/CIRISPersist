@@ -20653,7 +20653,7 @@ mod accord_tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
-    /// v36.0.1 (CIRISPersist#713) — cohort_scope survives write→read, sqlite
+    /// v36.1.0 (CIRISPersist#713) — cohort_scope survives write→read, sqlite
     /// leg. The backend reads it from the typed COLUMN; this asserts the
     /// column is populated on the paths a consumer advertises from.
     #[tokio::test]

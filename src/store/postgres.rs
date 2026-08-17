@@ -22085,7 +22085,7 @@ mod tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
-    /// v36.0.1 (CIRISPersist#713) — cohort_scope survives write→read,
+    /// v36.1.0 (CIRISPersist#713) — cohort_scope survives write→read,
     /// postgres leg. The third backend of the answer to edge's blocking
     /// question: "it works in memory" and "it works on the path edge
     /// advertises from" are different claims, and so is each backend.

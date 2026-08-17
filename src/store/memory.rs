@@ -14185,7 +14185,7 @@ mod tests {
     }
 
     /// v36.0.0 (CIRISPersist#668) — the V130 late-admit witness on a
-    /// v36.0.1 (CIRISPersist#713) — cohort_scope survives write→read, memory
+    /// v36.1.0 (CIRISPersist#713) — cohort_scope survives write→read, memory
     /// leg. Edge reported it empty here; under #713 an empty scope resolves
     /// `Trace` to `SelfOwn` and silently halts trace replication.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

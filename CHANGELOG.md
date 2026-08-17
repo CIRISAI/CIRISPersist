@@ -5,7 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [36.0.1] - 2026-08-17
+## [36.1.0] - 2026-08-17
+
+**MINOR, not a patch: this adds public API.** `attestation_family()` and
+`AttestationFamily` become public so a consumer's capability overlay can key on
+the family — see the adopt-map correction below. Additive surface is a minor
+bump even when the reason for it is a defect.
 
 ### Fixed — `provenance:build_manifest:*` is decided, and it is ✱ at every commons tier (#713)
 

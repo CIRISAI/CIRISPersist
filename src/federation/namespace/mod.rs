@@ -539,7 +539,7 @@ pub fn projection_for(
                 _ => Projection::Subject,
             },
             // provenance:build_manifest:* — the binary-verification surface
-            // (v36.0.1, #713, decided by edge). The KeyRecord shape, ✱ at
+            // (v36.1.0, #713, decided by edge). The KeyRecord shape, ✱ at
             // EVERY commons tier: a trust-root-blessed manifest must be
             // resolvable wherever a peer's build attestation travels, exactly
             // as a key must be resolvable wherever its signatures travel.
@@ -605,7 +605,7 @@ const SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY: &str = "system:audit_chain:hash_contin
 /// The dimension-FAMILY axis of the Attestation plane (#713 decomposition) —
 /// the decided rows plus the conservative default.
 ///
-/// # v36.0.1 — this was private, and the reason it gave was wrong
+/// # v36.1.0 — this was private, and the reason it gave was wrong
 ///
 /// It read *"consumers ask [`projection_for`]; the family is a resolver
 /// internal, so the registry cannot be consulted half-way."* CIRISEdge
@@ -651,7 +651,7 @@ pub enum AttestationFamily {
     /// [`SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY`] — substrate self-reports whose
     /// SubstrateSelf commons cells are Global.
     SubstrateHealth,
-    /// v36.0.1 (CIRISPersist#713) — `provenance:build_manifest:*`, the
+    /// v36.1.0 (CIRISPersist#713) — `provenance:build_manifest:*`, the
     /// BINARY-VERIFICATION surface, decided by edge after v36.0.0 shipped it
     /// under the conservative default.
     ///
@@ -689,7 +689,7 @@ fn under(dimension: &str, stem: &str) -> bool {
 /// [`family_for_dimension`](crate::federation::load_bearing::family_for_dimension)
 /// walks the whole manifest and allocates — deliberately NOT used here).
 ///
-/// # v36.0.1 — public (CIRISPersist#713, CIRISEdge adoption)
+/// # v36.1.0 — public (CIRISPersist#713, CIRISEdge adoption)
 ///
 /// This is the surface a capability or subject overlay is 1:1 with. A
 /// consumer gating on "does this dimension require `infra:serve`?" asks
@@ -722,7 +722,7 @@ pub fn attestation_family(dimension: &str) -> AttestationFamily {
     if under(dimension, "transport:") {
         return AttestationFamily::SubstrateHealth;
     }
-    // v36.0.1 (#713) — the DEEPER stem is decided; the rest of `provenance:*`
+    // v36.1.0 (#713) — the DEEPER stem is decided; the rest of `provenance:*`
     // stays `Unknown` until someone decides it. Checked after the shallower
     // stems above cannot match it, and deliberately NOT widened to
     // `provenance:` — edge's argument is about build manifests specifically,
@@ -1396,7 +1396,7 @@ mod tests {
         }
     }
 
-    /// v36.0.1 (#713, CIRISEdge adoption) — **the capability overlay is a
+    /// v36.1.0 (#713, CIRISEdge adoption) — **the capability overlay is a
     /// FAMILY question and the projection is a FAMILY-AND-SCOPE answer; they
     /// are NOT interchangeable.**
     ///
@@ -1455,7 +1455,7 @@ mod tests {
         );
     }
 
-    /// v36.0.1 (#713) — `provenance:build_manifest:*` is ✱ at EVERY commons
+    /// v36.1.0 (#713) — `provenance:build_manifest:*` is ✱ at EVERY commons
     /// tier, not just federation. LITERALS.
     ///
     /// This is the row that v36.0.0 shipped under the conservative default,
@@ -1655,7 +1655,7 @@ mod tests {
         use Projection::{Cohort, SelfOwn};
         for dim in [
             "ratchet:flag:out_of_distribution_voting",
-            // v36.0.1 (#713) — `provenance:build_manifest:*` was HERE as an
+            // v36.1.0 (#713) — `provenance:build_manifest:*` was HERE as an
             // undecided example until edge decided it back to ✱ (see
             // `provenance_build_manifest_is_star_at_every_commons_tier_713`).
             // Its undecided SIBLING replaces it, which is the stronger case
