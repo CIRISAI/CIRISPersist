@@ -4403,12 +4403,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 record.role, record.key_id
             )));
         }
-        client
+        // v36.0.0 (CIRISPersist#719, second site) — the SELECT above is a
+        // check-then-act window on a pooled connection with no transaction,
+        // exactly like `put_accord_participation`. Two writers recording the
+        // same withdrawal both saw no row; the loser hit the `(role, key_id)`
+        // PK and surfaced `Error::Backend("duplicate key …")` where the branch
+        // above promises an idempotent no-op. FOUND BY CERTIFY, on the pg
+        // overlap leg wired in this same cut — the leg that could not witness
+        // its own fix caught a sibling defect one door over.
+        //
+        // As at the other site, `DO NOTHING` alone would be WRONG: it silently
+        // accepts a DIFFERING record where this door raises `Conflict`. The
+        // zero-row path re-reads and applies the same rule the pre-check does.
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_role_withdrawals (\
                     role, key_id, withdrawn_at, authority_decision_digest, superseded_by, \
                     persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (role, key_id) DO NOTHING",
                 &[
                     &record.role,
                     &record.key_id,
@@ -4422,6 +4435,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("record_role_withdrawal: {e}"))
             })?;
+        if inserted == 0 {
+            let raced = client
+                .query_opt(
+                    "SELECT superseded_by, authority_decision_digest \
+                     FROM cirislens.federation_role_withdrawals WHERE role = $1 AND key_id = $2",
+                    &[&record.role, &record.key_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "record_role_withdrawal race re-read: {e}"
+                    ))
+                })?;
+            let Some(row) = raced else {
+                return Err(crate::federation::Error::Backend(
+                    "record_role_withdrawal: insert conflicted but no row is present".to_owned(),
+                ));
+            };
+            let raced_superseded: Option<String> =
+                row.safe_get_with("superseded_by", crate::federation::Error::Backend)?;
+            let raced_auth: String = row.safe_get_with(
+                "authority_decision_digest",
+                crate::federation::Error::Backend,
+            )?;
+            if raced_superseded == record.superseded_by
+                && raced_auth == record.authority_decision_digest
+            {
+                return Ok(());
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "role_withdrawal ({}, {}) already exists with different content \
+                 (decided on the concurrent-insert path)",
+                record.role, record.key_id
+            )));
+        }
         Ok(())
     }
 
