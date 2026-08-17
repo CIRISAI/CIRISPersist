@@ -148,7 +148,18 @@ AXIS_KEYS=""
 for _a in $AXES; do
     AXIS_KEYS="$AXIS_KEYS axis-${_a}-none axis-${_a}-sqlite axis-${_a}-pg"
 done
-ALL_KEYS="$LEGS default fmt clippy pyi featmatrix docver pyo3sqlite dirdouble$AXIS_KEYS"
+# v35.0.0 (CIRISPersist#669/#710) — `python` is the leg that runs the ARTIFACT
+# USERS INSTALL: a maturin dev-wheel built with the feature line DERIVED from
+# pyproject's shipped list (`scripts/wheel_features.py line`), then pytest over
+# tests/python/. Until now this script — THE release gate — could not run
+# tests/python at all, so v34.0.0 was certified "EVERY CI LEG GREEN BY EXIT
+# CODE" on a tree whose only Python-reachability witness lived exactly there;
+# CI's wheel job caught it instead, by luck. `wheelfeat` is the matching fast
+# gate: tested-wheel ⊇ shipped-wheel, seconds, before anything compiles.
+# The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
+# verdict table carries a SKIPPED line and the run stops claiming full
+# certification.
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -288,6 +299,9 @@ run_bg pyi        python3 scripts/pyi_surface.py check
 run_bg featmatrix python3 scripts/ci_feature_matrix.py check
 run_bg docver     python3 scripts/doc_version_refs.py
 run_bg dirdouble  python3 scripts/gen_directory_double.py --check
+# v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
+# hand-spells a `maturin develop --features` list (here or in ci.yml).
+run_bg wheelfeat  python3 scripts/wheel_features.py check
 # v30.4.1 (CIRISPersist#618) — the SUBSET compile leg: `_pyffi` WITHOUT `pyo3`.
 # `--all-features` is totality by union and structurally cannot omit a feature,
 # so it is blind to "A without B". v30.4.0 shipped a `#[cfg(feature = "pyo3")]`
@@ -325,7 +339,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix docver pyo3sqlite dirdouble$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.
@@ -483,6 +497,21 @@ fi
 warm_template
 
 : > "$LOG_DIR/queue"
+# v35.0.0 (#669) — `python` queues FIRST: its release-profile wheel build is
+# the longest single compile in the run, so it should be in the opening wave
+# where it overlaps the other legs instead of tailing the whole gate.
+#
+# CERTIFY_SKIP_PYTHON=1 is the ONLY way not to run it, and it is loud twice:
+# here at dispatch, and as a SKIPPED row in the verdict — after which this run
+# refuses to call itself a full certification. A leg that can be skipped
+# silently is the #669 defect with an env var for a fig leaf.
+if [ "${CERTIFY_SKIP_PYTHON:-0}" = "1" ]; then
+    echo "  !! CERTIFY_SKIP_PYTHON=1 — the python leg (dev-wheel + pytest tests/python) WILL NOT RUN."
+    echo "  !! This run cannot vouch for the artifact users install."
+    : > "$LOG_DIR/python.skip"
+else
+    echo "python" >> "$LOG_DIR/queue"
+fi
 for leg in $LEGS; do echo "$leg" >> "$LOG_DIR/queue"; done
 echo "default" >> "$LOG_DIR/queue"
 echo "clippy"  >> "$LOG_DIR/queue"
@@ -501,6 +530,32 @@ run_job() {
         default)
             NEXTEST_TEST_THREADS="$PER_LANE" cargo nextest run >"$log" 2>&1
             ;;
+        python)
+            # v35.0.0 (#669/#710) — the artifact users install, tested. The
+            # feature line is DERIVED (`wheel_features.py line` = pyproject's
+            # shipped list − written exclusions + test-only riders); the venv
+            # persists in target/ so pip/maturin/pytest install once, and
+            # `maturin develop` matches CI's wheel-pytest step: --release,
+            # under the same derived RUSTFLAGS as every other leg. pytest runs
+            # as `python -m pytest` so it is the VENV's interpreter — the one
+            # the wheel was installed into — never a system pytest that would
+            # import nothing and report it green. First run needs the network
+            # (pip: maturin+pytest; maturin develop: ciris-verify).
+            bash -c '
+                set -euo pipefail
+                WF="$(python3 scripts/wheel_features.py line)"
+                [ -n "$WF" ] || { echo "EMPTY derived wheel feature line" >&2; exit 1; }
+                echo "tested dev-wheel: --features \"$WF\""
+                VENV="target/certify-pyvenv"
+                [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+                # shellcheck disable=SC1091
+                . "$VENV/bin/activate"
+                python -m pytest --version >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1 \
+                    || python -m pip install maturin pytest
+                maturin develop --release --features "$WF"
+                python -m pytest tests/python/ -v
+            ' >"$log" 2>&1
+            ;;
         *)
             local csv
             csv="$(feature_csv "$name")" || {
@@ -516,8 +571,10 @@ run_job() {
     esac
     rc=$?; t1=$(date +%s)
     echo "$rc" > "$LOG_DIR/$name.rc"; echo "$(( t1 - t0 ))" > "$LOG_DIR/$name.secs"
+    # Two count shapes: nextest ("N tests run: N passed") and pytest's summary
+    # ("N passed in N.NNs") for the python leg.
     printf '  %-22s exit=%-3s %4ss  %s\n' "$name" "$rc" "$(( t1 - t0 ))" \
-        "$(grep -oE '[0-9]+ tests run: [0-9]+ passed' "$log" | tail -1)"
+        "$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$log" | tail -1)"
 }
 
 echo
@@ -588,11 +645,17 @@ fi
 # ── verdict ──────────────────────────────────────────────────────────────
 echo
 echo "================ FULL CERTIFICATION VERDICT ================"
-fail=0; oom=0
+fail=0; oom=0; skipped=0
 for k in $ALL_KEYS; do
+    if [ -f "$LOG_DIR/$k.skip" ]; then
+        # Only CERTIFY_SKIP_PYTHON writes a .skip marker. Loud on purpose:
+        # a skipped leg must cost the reader a sentence, not vanish.
+        printf '  SKIP   %-22s SKIPPED (CERTIFY_SKIP_PYTHON=1) — the Python surface was NOT certified\n' "$k"
+        skipped=1; continue
+    fi
     rc="$(cat "$LOG_DIR/$k.rc" 2>/dev/null || echo 99)"
     secs="$(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo -)"
-    cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
+    cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
     if [ "$rc" -eq 99 ]; then
         # 99 is this script's sentinel for a missing .rc — the leg never ran.
         # Calling that RED would claim a failure nobody observed.
@@ -610,7 +673,7 @@ for k in $ALL_KEYS; do
 done
 echo "------------------------------------------------------------"
 SUM=0
-for k in $LEGS default clippy; do SUM=$(( SUM + $(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo 0) )); done
+for k in $LEGS default clippy python; do SUM=$(( SUM + $(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo 0) )); done
 # SUM is the sum of leg times AS RUN — under contention, not in isolation. It
 # GROWS with the lane count, because wider lanes make every leg individually
 # slower. So SUM/wall is NOT a speedup: at 8x4 it printed "6.57x" for a run that
@@ -627,6 +690,13 @@ if [ "$oom" -ne 0 ]; then
 fi
 if [ "$fail" -ne 0 ]; then
     echo "NOT CERTIFIED. Logs in $LOG_DIR"; echo "SCRIPT_EXIT=1"; exit 1
+fi
+if [ "$skipped" -ne 0 ]; then
+    # Explicitly requested, explicitly not certified. The one thing this
+    # branch must never print is the unqualified verdict below.
+    echo "EVERY LEG THAT RAN IS GREEN BY EXIT CODE — but 'python' was SKIPPED (CERTIFY_SKIP_PYTHON=1)."
+    echo "The artifact users install was not run. NOT a full certification; do not tag on this run."
+    echo "SCRIPT_EXIT=0"; exit 0
 fi
 echo "EVERY CI LEG GREEN BY EXIT CODE. Logs in $LOG_DIR"
 echo "SCRIPT_EXIT=0"

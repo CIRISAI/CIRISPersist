@@ -123,6 +123,15 @@ Issues = "https://github.com/CIRISAI/CIRISPersist/issues"
 # ~3-5 MB to the wheel vs the v0.8.3 postgres-only shape.
 # Acceptable given the deployment-ergonomics win: one
 # `pip install`, every backend + every module, zero source-build.
+#
+# v35.0.0 (CIRISPersist#710) — THIS LIST IS THE SHIPPED ARTIFACT, and it is
+# read, never restated: `scripts/wheel_features.py line` derives the tested
+# dev-wheel's feature line from it (minus written exclusions like
+# `extension-module`, plus test-only riders like `test-panic`), and
+# `scripts/wheel_features.py check` — a ci.yml gate AND a certify.sh fast
+# gate — fails the build if the tested wheel stops being a superset of this
+# list. Add a feature here and the wheel pytest suite tests it with nothing
+# to remember; that is the point.
 features = [
     "pyo3",
     # v1.13.0 (CIRISPersist#92) — `extension-module` is its own crate
