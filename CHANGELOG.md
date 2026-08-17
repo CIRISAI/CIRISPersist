@@ -5,6 +5,287 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [35.0.0] - 2026-08-17
+
+**Per-plane replication projection (CIRISPersist#713).** Contextual integrity
+is per-plane; the projection now is too. *Who may learn a subject's
+reachability* is not the same norm as *who may learn about their key* — and
+until this cut, `projection_for` could not tell the difference: a self-scoped
+`KeyRecord` and a self-scoped `TransportDestination` projected identically, one
+subject set drove every plane, and a subject's reachability was published as a
+side effect of a decision about their key (the CIRISEdge#311 collapse; the
+named prerequisite for CIRISEdge#489 scope-privacy and #492 scoped transit).
+
+### BREAKING — `projection_for` takes the plane
+
+```
+projection_for(cohort_scope, authority, is_tombstone)
+    -> projection_for(plane: ObjectClass, cohort_scope, authority, is_tombstone)
+```
+
+No default parameter, no compat shim — the old arity does not compile. The
+plane is `load_bearing::ObjectClass` (re-exported as `namespace::ObjectClass`):
+the same closed five-plane enum `is_load_bearing` already dispatches over, so
+the predicate axis and the projection axis cannot drift apart. The body is an
+exhaustive `match` — a new plane variant is a compile error until its row
+exists (#636's discipline: the gate sees the table itself, not a copy). Still
+pure, O(1), and measured (below). Consumers (CIRISEdge's publish loop,
+CIRISServer riding it) adopt at their re-pin, coordinated on #713.
+
+The decided table (edge answer + server relay + operator arbitration on #713;
+✱ = Global iff trust root):
+
+| plane | self | family | community | affiliations | species | biosphere | federation |
+|---|---|---|---|---|---|---|---|
+| KeyRecord | SelfOwn | SelfOwn | Cohort | Cohort | ✱ | ✱ | ✱ |
+| TransportDestination | SelfOwn | SelfOwn | Cohort | Cohort | **Cohort** | **Cohort** | ✱ |
+| FountainContent | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | ✱ |
+| HardCaseEvent | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | **Cohort** |
+| Attestation | *deferred — pre-#713 behavior held (see below)* |
+
+The cut that decides the narrowed cells: **content may travel wider than the
+reachability of its author.** Keys must resolve wherever their signatures
+travel, so `KeyRecord` keeps ✱ at every commons tier. Routes need only reach
+those with a delivery relationship — Global gossip of non-infra reachability is
+a presence directory, the surveillance surface #713 exists to close (federation
+keeps ✱: a relay's role is to be reachable). `HardCaseEvent` rows are adverse
+statements about a party; Global gossip of those is a reputation directory, so
+no live cell widens past Cohort.
+
+`ReplicatedKind::projection_plane()` bridges the fetch-kind enum onto the five
+planes explicitly (the occurrence kinds ride the KeyRecord row —
+behavior-preserving; the thread did not re-decide them). An unrecognized scope
+stays Cohort on every plane.
+
+### BREAKING — the tombstone ceiling replaces unconditional Global
+
+`is_tombstone` no longer forces `Global`. A tombstone projects at
+`tombstone_ceiling(plane, authority)` — pure, two inputs — the row-max across
+ALL scopes for that plane and authority: **anti-rollback holds within the
+record's maximal disclosure set; beyond it there is no copy to roll back.**
+`tombstone_ceiling_dominates_every_live_cell` asserts row-max-ness against the
+registry itself.
+
+- `KeyRecord` → Global, unconditional (kept: verify-relevance of a revoked key
+  is unbounded).
+- `TransportDestination` / `FountainContent` → Global iff trust root, else
+  Cohort. **This is the cell the thread arbitrated**: widening a tombstone
+  discloses MORE than the original fact — a Global withdrawal of a
+  Cohort-scoped route tells parties who never knew the route existed that it
+  did. The erasure machinery must not manufacture the disclosure it exists to
+  prevent.
+- `HardCaseEvent` → Global iff the authority carries an infra role (the
+  de-admission of a relay must be globally unlearnable for the same reason it
+  was globally discoverable), else Cohort. `is_trust_root` stands in for
+  "carries an infra role" — the closest predicate `AuthorityClass` can express,
+  stated as an approximation in the doc.
+- `Attestation` → Global, unconditional — held with the deferral below.
+
+The tombstone witnesses pin the NARROWED cells (a non-root
+`TransportDestination` tombstone → Cohort), because `KeyRecord`'s unchanged
+Global ceiling cannot distinguish the old rule from the new one — a witness on
+the unmoved row would be the adjacent-gate defect again. Expectations are
+hand-written literals, never derived from the registry under test.
+
+### Deferred, on the record: the Attestation row
+
+The server relay showed the Attestation row cannot be *a* row: the
+contextual-integrity information type is the `dimension`, and at minimum
+`trace:*` is capability-gated while `scores:*` is subject-gated — audience
+kinds (`Capability`, `Subject`) the four inputs cannot express. The arm holds
+the exact pre-#713 scope-only behavior, documented as awaiting the
+per-dimension-family decomposition (CIRISEdge owes the shape answer). Two cells
+of that decomposition are already decided on the thread and recorded in the
+doc — SubstrateSelf commons attestations project Global for `transport:*` and
+for the exact dimension `system:audit_chain:hash_continuity`, NOT the open
+`system:*` prefix — but they need the dimension, which the resolver
+deliberately does not take; the decomposition will bring it properly.
+
+### Measured — the acceptance number (#713: "correct and it did not move the publish path")
+
+The baseline was captured BEFORE the resolver moved (`benches/projection.rs`
+landed first, on the unmodified function — a baseline taken after the change is
+a number with nothing to compare against, and no bench covered `projection_for`
+at all). Against baseline `pre-713`: `self_live` 1.556 ns → 1.19 ns (−23.3%),
+`unrecognized_scope` 1.302 ns → 1.03 ns (−21.4%) — the per-call floor DROPPED
+(`projection_for` / `tombstone_ceiling` are `#[inline]`, so the cross-crate
+consumer pays no call overhead). The heterogeneous `publish_sweep` (now 5
+planes × the original mix, same per-element accounting) reads 1.04 → 2.00
+ns/call: branch-predictor cost of a maximally heterogeneous plane × tombstone
+stream, stated and accepted — the singles dropping BELOW baseline is the proof
+no lookup, allocation, or I/O snuck in. Numbers and analysis on #713; edge's
+publish-loop bench is the macro acceptance per its own commitment there.
+`bench.yml` now actually invokes `projection` (a bench compiled by `--no-run`
+but never invoked reports nothing — the #694 shape; `calibration` and
+`encrypted_kv` have that gap today, flagged on #713 rather than silently
+changing CI cost).
+
+### Manifest correction, through the sanctioned path
+
+The vendored supersets manifest cites `projection_for` with the parenthetical
+"(Cohort ceiling for ProducerSteward; tombstone -> Global)" — now false, and
+the manifest is a Registry-of-Record that is never hand-edited. New
+`STALE_CITATION_SEMANTICS_PENDING_REVENDOR` table + gate
+(`stale_citation_semantics_are_declared_and_really_stale`): the entry must
+name stale text still present in the manifest AND the shipping code must
+really contradict it (the proof assertion is the arbitrated cell itself — a
+non-root route tombstone projecting Cohort). Correction owed at the #520
+re-vendor; the walk's "no observed live call site" flag stays true in-crate.
+
+### BREAKING — the wheel no longer mints what its own gate refuses (#715)
+
+`Engine.wrap_dek_for_recipient_b64` / `Engine.unwrap_dek_b64` (v3.8.0, the
+classical v1 `key_grant` wrap) are REMOVED from the Python surface — methods,
+stub entries, taxonomy rows. 522 exported symbols become 520.
+
+v34.0.0 removed the classical wrap from admission — `WrapAlgorithm` variant,
+wire token, parse arm — and this cut's decode door refuses the retired
+spellings BY NAME. But `src/ffi/wheel_key_grant.rs` (last touched v25.1.0)
+kept minting them: a consumer following the wheel's own surface wrapped a DEK
+under `algorithm: "x25519-aes256-gcm-hkdf-sha256"` — the exact literal
+`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS` refuses, hyphens beside the underscore v2
+on one shipped wheel. Not cosmetic: a long-lived DEK wrapped X25519-only is a
+harvest-now-decrypt-later hole (CC 5.1), which is why classical-only paths do
+not exist to be chosen.
+
+**Removed, not replaced, and not aliased.** The v2 wrap requires the
+recipient's ML-KEM-768 public key, which the v1 signature cannot express —
+there is no in-place replacement to forward to. The v2 pair
+(`wrap_dek_for_recipient_v2_b64` / `unwrap_dek_v2_b64`) has been on this wheel
+since Cut C3b and is the surface to call; a stale caller gets an
+`AttributeError` naming the method.
+
+**The legacy unwrap door does not survive here.** Stored v1-wrapped grants can
+exist in pre-v34 cirisnode stores, and v34 chose refusal-without-migration for
+them. Keeping a v1 unwrap on this wheel would quietly reopen that decision one
+surface over. Anyone draining pre-v34 material does it against `ciris-crypto`'s
+still-exported v1 primitives or CIRISVerify's own wheel sidecar — off-substrate,
+deliberately.
+
+**`unwrap_dek_v2_b64` now reads the label it is handed.** It used to ignore the
+envelope's `algorithm` field entirely — quietly accepting the retired hyphenated
+spelling, and any other label, on a surface whose admission counterpart refuses
+retired spellings by name. The field is now REQUIRED and validated through the
+one sanctioned comparison; the hyphenated legacy gets its disposition and the
+exact token to send.
+
+**The mint is witnessed at the gate it must satisfy.**
+`wheel_minted_algorithm_round_trips_the_admission_door` pulls the token out of
+the envelope the wheel actually mints and runs it through the REAL
+`extract_key_grant_payload` — wired through the minted envelope, not the shared
+constant both sides import, so the two cannot agree by construction while the
+wire disagrees. Three mutations, three kills.
+
+**Cross-repo:** CIRISConformance's `test_250_key_grant_pqc.py` pins the v1
+pair's existence AND the hyphenated v2 spelling, so it needs a reshape to run
+against a v35 wheel — its own docstring (CC 5.1, HNDL) argues for exactly this
+removal. Detailed on #715.
+
+### Fixed — retired wrap spellings refuse BY NAME (#715)
+
+Between the CC 1.0-rc2 floor and v32.3.0 the v2 hybrid wrap token was respelled
+hyphens → underscores, and nothing recorded the convention or offered the old
+spelling anything better than serde's generic unknown-variant — an error that
+renders BOTH tokens with no directive, which is also why a fragment-`contains`
+witness would have passed against the wrong message (the mutation run proved
+exactly that; the contiguous respell-directive is what kills it).
+
+Three retired spellings now refuse by name at `extract_key_grant_payload`,
+before the typed decode, the single door both backends reach token parsing
+through: the rc2 hyphenated v2 (named as RESPELLED, with the exact token to
+send), and the two v1 spellings (named as REMOVED in v34.0.0, not respelled —
+re-wrap under v2 is the way forward). The separator convention (wire tokens
+are underscore-separated; future variants follow it) is pinned beside
+`as_str()` and enforced by a test that restates the token set as literals —
+never derived from `as_str()`, which is the thing under test.
+
+### Fixed — the entry point NAMED for signing mints bytes the gate rebuilds (#714)
+
+Since the v4.15.0 JCS flip, `canonicalize_envelope_for_signing` hand-built
+`PythonJsonDumpsCanonicalizer` while every admission gate re-canonicalizes via
+`ceg_produce_canonicalize`. Signing through the entry point named for signing
+produced bytes no gate would reconstruct; on non-ASCII or non-ES-float-token
+payloads (`1e-05` diverges — floats, not just unicode) the failure surfaced
+later as a generic `federation_tier_unverified`, a key/registration-shaped
+error for a canonicalization defect. Filed by CIRISConformance.
+
+Routed through the gate, keeping only the distinguishing
+`signature`/`signature_pqc` strip. The `.pyi`'s "same canonicalizer as
+`canonicalize_envelope`" is now true by construction, and a parity witness
+pins it — red against the unfixed code (verified before fixing),
+mutation-tested 3/3.
+
+**The audit plane is PINNED, not flipped — no flag day ships.** Stored audit
+rows re-verify FROM STORAGE (`verify_chain` re-derives `entry_hash` +
+`signature`; the RFC 6962 leaves hash the same bytes), so routing that plane
+through the gate would take every existing audit chain dark on the first
+divergent payload. It now calls an explicitly-named
+`canonicalize_envelope_for_signing_v1_pinned`, byte-identical to the old rule,
+with its own witness that reds if anyone "cleans it up" onto the gate.
+Federation admission already gate-canonicalized (old-path signatures over
+divergent payloads ALREADY failed — nothing that works today breaks); cirisnode
+doors verify at admission time only, signer and door flip together in-build;
+derived detections verify producer-carried bytes verbatim, immune.
+
+Known remaining instance, deliberately untouched: `server/pipeline.rs`'s
+`canonicalize_for_edge_signing` is the edge inbound WIRE PIN — edge signs V1
+today, so a unilateral flip breaks the fleet at admission. Filed as #716 for a
+coordinated flip; until then it should get the audit plane's pinned-and-
+witnessed treatment so a future sweep cannot "fix" it into an outage.
+
+Also fixed en route: `engine.rs`'s `infallible_destructuring_match` under
+`postgres,cirisaudit` WITHOUT `sqlite` — the third cfg-combination hole of this
+class, invisible to every build carrying both backends.
+
+### Build/CI — the release gate can now see the artifact users install (#669, #710)
+
+Two issues, one defect: the tested wheel and the shipped wheel were two
+different artifacts, and nothing compared them.
+
+`maturin develop --features` REPLACES pyproject's `[tool.maturin] features`
+rather than unioning, so CI's pytest wheel carried a hand-maintained 4-feature
+subset of the ~28-feature wheel users install — cirisgraph, cirisaudit,
+telemetry, secrets, extract, classify, scrub, encrypted-kv and the whole
+`cirislens_*` family shipped in every release and were never imported under
+pytest (#710). And `certify.sh full` — the release gate — did not run
+tests/python at all: it printed EVERY CI LEG GREEN BY EXIT CODE on v34's tree
+while structurally unable to run the only witness that the release's headline
+feature was host-reachable (#669). CI's wheel job caught it instead: a
+different gate covered the one being trusted.
+
+Fix, derive-never-restate: **`scripts/wheel_features.py` is the one source.**
+`line` = pyproject's shipped features − written exclusions (one on record:
+`extension-module`, cdylib linking metadata, gates no symbol) + test-only
+riders (`test-panic`; `check` fails if it ever ships). ci.yml and certify.sh
+both call it; neither restates the list. `check` fails BY NAME when tested ⊉
+shipped, when an exclusion goes stale or unexplained, or when a
+`maturin develop --features` list is hand-spelled again anywhere.
+
+`certify.sh` gains the **`python` leg** — maturin dev-wheel on the derived
+line, CI's RUSTFLAGS, then pytest tests/python — registered and READ in the
+verdict table like every other leg (#694's lesson). Skippable only by explicit
+`CERTIFY_SKIP_PYTHON=1`, which prints a SKIP row and WITHHOLDS the
+certification verdict: a partial run cannot print the full gate's sentence.
+`wheelfeat` joins the fast static gates. Seven mutations, all red — after one
+survivor was fixed: the certify witness grepped raw text and was satisfied by
+comments; hardened to comment-stripped lines requiring the actual command
+substitution.
+
+Also in this cut: `evidence/cc_impl.tsv`'s 67 persist `src/` rows re-stamped
+`ciris-persist@34.0.0` → `35.0.0` (the version-pin gate demands it at every
+version bump).
+
+### Open with consumers, tracked
+
+- **#713** — the Attestation dimension-family decomposition: Edge owes the
+  shape answer (`Capability`/`Subject` audience kinds vs a dimension-keyed
+  sibling structure).
+- **#704 Ask 3** — transit convergence signaling: the grant-visibility
+  derivation is proposed on the thread, marked BELIEVED, awaiting Edge's
+  verdict against leviculum's straggler semantics.
+- **#716** — the edge-signing canonicalizer flip, which persist cannot schedule
+  alone.
+
 ## [34.0.0] - 2026-08-16
 
 **Unblocks CIRISEdge scoped transit (CIRISEdge#492).** *No configuration

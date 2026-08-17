@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "34.0.0"
+version = "35.0.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -969,6 +969,14 @@ required-features = ["sqlite", "cirislens_sequence"]
 name = "encrypted_kv"
 harness = false
 required-features = ["encrypted-kv"]
+
+# v35.0.0 (CIRISPersist#713) — `projection_for` publish-path baseline,
+# captured BEFORE the per-plane replication projection change. Pure
+# compute, no deps beyond criterion; `federation::namespace` is
+# feature-free, so no required-features.
+[[bench]]
+name = "projection"
+harness = false
 
 # v1.10.0 — keep `target/` from ballooning. The full debuginfo
 # (`debug = 2`, the default) is the dominant cost in dev/test builds,

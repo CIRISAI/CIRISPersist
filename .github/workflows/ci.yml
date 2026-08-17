@@ -403,7 +403,7 @@ jobs:
             sleep $((attempt * 5))
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
-      - name: maturin develop (test-panic + sqlite)
+      - name: maturin develop (derived tested-wheel feature set)
         if: matrix.substrate.name == 'core-1'
         run: |
           python -m venv .venv
@@ -439,7 +439,20 @@ jobs:
           # test_transit_key_grant_surface.py` is the reachability witness for
           # this cut's headline feature; without this feature it would skip,
           # which is the failure it exists to catch.
-          maturin develop --features test-panic,pyo3,sqlite,cirisnode --release
+          #
+          # v35.0.0 (CIRISPersist#710) — the list is DERIVED, not typed out a
+          # third time. The v34 line above was the fix's own defect class: a
+          # hand-appended member of a hand-maintained SUBSET of the wheel users
+          # install. cirisgraph, cirisaudit, telemetry, secrets, extract,
+          # classify, scrub, encrypted-kv and the whole cirislens_* family were
+          # shipped and never imported under pytest. `wheel_features.py line`
+          # emits (pyproject [tool.maturin] features − written exclusions) +
+          # test-only riders, and `wheel_features.py check` (the wheel-coverage
+          # gate below, and a certify.sh fast gate) fails this workflow if this
+          # step ever goes back to spelling the list by hand.
+          WHEEL_FEATURES="$(python3 scripts/wheel_features.py line)"
+          echo "tested dev-wheel → --features \"${WHEEL_FEATURES}\""
+          maturin develop --release --features "${WHEEL_FEATURES}"
       - name: pytest tests/python/
         if: matrix.substrate.name == 'core-1'
         run: |
@@ -1186,6 +1199,16 @@ jobs:
       # error, where before it was silence.
       - name: feature-matrix coverage gate
         run: python3 scripts/ci_feature_matrix.py check
+      # v35.0.0 (CIRISPersist#710) — the wheel-coverage gate, same shape and
+      # same reason as the feature-matrix gate above, one artifact further
+      # downstream: the wheel pytest tests must be a SUPERSET of the wheel
+      # users install (pyproject [tool.maturin] features minus written
+      # exclusions, plus test-only riders). The v34 tested wheel was a
+      # hand-maintained 4-feature subset of a ~27-feature release wheel;
+      # this fails, by name, the first time either list drifts or a
+      # `maturin develop --features` line is hand-spelled again.
+      - name: wheel-coverage gate (tested wheel ⊇ shipped wheel)
+        run: python3 scripts/wheel_features.py check
       # CIRISPersist#595 — the FFI-surface gate. Same shape and same reason as
       # the feature-matrix gate above: pure Python over src/ffi/ + the pinned
       # taxonomy + the stub, ~0.3 s, no compilation, so it fails first and names

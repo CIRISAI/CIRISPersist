@@ -8909,6 +8909,9 @@ mod tests {
             .await
             .expect("construct postgres engine");
 
+        // Only "infallible" when the sqlite feature is off — the match must
+        // stay a match so the postgres+sqlite build still compiles.
+        #[allow(clippy::infallible_destructuring_match)]
         let backend = match engine.audit_service() {
             AuditDispatch::Postgres(b) => b,
             #[cfg(feature = "sqlite")]

@@ -486,10 +486,14 @@ pub struct KeyGrantPayload {
     /// Base64-encoded wrapped DEK. The wrap algorithm is named below.
     pub wrapped_dek_base64: String,
 
-    /// Wrap algorithm identifier. Content grants use v1; **stream/epoch
-    /// grants MUST use v2** (PQC hybrid — see [`WrapAlgorithm`] and CEG
-    /// §10.5.3: "a Consumer MUST reject a streaming epoch grant carrying
-    /// `wrap_algorithm: v1`", enforced at ingest).
+    /// Wrap algorithm identifier. v34.0.0 (#704) removed the classical v1,
+    /// so EVERY grant — content-addressed included — carries the sole live
+    /// token, `x25519_mlkem768_aes256_gcm_hkdf_sha256` (PQC hybrid — see
+    /// [`WrapAlgorithm`] and CEG §10.5.3).
+    ///
+    /// v35.0.0 (#715) — retired spellings of this field are refused BY NAME
+    /// at the decode door, before the typed decode sees them: see
+    /// [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
     pub wrap_algorithm: WrapAlgorithm,
 
     /// Symmetric-ratchet version the key was wrapped under.
@@ -597,6 +601,18 @@ pub enum WrapAlgorithm {
 
 impl WrapAlgorithm {
     /// Wire-shaped string — matches the locked vocabulary.
+    ///
+    /// # Separator convention (v35.0.0, CIRISPersist#715)
+    ///
+    /// Wire tokens are **underscore-separated**. CC 5.1 (CIRISVerify#234)
+    /// ratified `x25519_mlkem768_aes256_gcm_hkdf_sha256` as the single wire
+    /// identifier for the v2 construction; the CC 1.0-rc2 hyphen spellings
+    /// are refused BY NAME at the decode door — see
+    /// [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`] — never accepted, never
+    /// normalized, and never folded onto a live token. Any future variant
+    /// follows the underscore convention;
+    /// `wrap_algorithm_tokens_are_underscore_separated_715` pins the live
+    /// set (as literals) against a hyphen sneaking back in.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::X25519MlKem768Aes256GcmHkdfSha256 => "x25519_mlkem768_aes256_gcm_hkdf_sha256",
@@ -630,6 +646,12 @@ impl WrapAlgorithm {
         // A stored v1 grant now fails HERE, and the caller renders the token it
         // saw — so an operator sees the algorithm name and this release rather
         // than a generic parse failure that looks like corruption.
+        //
+        // v35.0.0 (#715) — for the wire spellings with a KNOWN history (the
+        // removed v1 tokens and the CC 1.0-rc2 hyphenated v2), the decode door
+        // does better than rendering the token: it names the token AND its
+        // disposition — removed vs respelled, with the exact replacement — see
+        // `refuse_retired_wrap_algorithm_wire_tokens`.
         None
     }
 
@@ -979,6 +1001,81 @@ fn refuse_removed_key_grant_wire_keys(payload: &serde_json::Value) -> Result<(),
     Ok(())
 }
 
+/// v35.0.0 (CIRISPersist#715) — `wrap_algorithm` wire spellings with a KNOWN
+/// history, each refused BY NAME with its disposition and the exact token to
+/// send instead.
+///
+/// WHY A TABLE AND NOT THE GENERIC PATH. `WrapAlgorithm` is a closed serde
+/// enum, so an unknown token already fails the typed decode — but as `unknown
+/// variant`, which cannot say WHY the token is wrong. These three spellings
+/// are not typos: each was once a live identifier somewhere in the fleet, and
+/// the fix differs by token — the rc2 hyphenated v2 is RESPELLED (same
+/// construction, one conformant spelling), while the v1 tokens are REMOVED
+/// (the construction itself is gone; there is no respelling to switch to).
+/// A peer or a stored grant carrying one deserves the one-line answer, not a
+/// bisect through release notes.
+///
+/// Like [`REMOVED_KEY_GRANT_WIRE_KEYS`], entries are PERMANENT wire history,
+/// spelled as literals — they must outlive any constant that once named them.
+/// The tokens:
+///
+///   - `x25519-mlkem768-aes256-gcm-hkdf-sha256` — the CC 1.0-rc2 spelling of
+///     the live v2 token (verify's `KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED`);
+///     respelled with underscores at v25.1.0 (#582, CC 5.1 / CIRISVerify#234).
+///   - `hpke_rfc9180_base_x25519_aes_gcm` — THIS surface's v1 wire token
+///     (CEG 0.3 §5.6.8.4); removed in v34.0.0 (#704).
+///   - `x25519-aes256-gcm-hkdf-sha256` — the classical v1 wrap as the
+///     CC 1.0-rc2 floor spells it (verify's `KEY_GRANT_ALGORITHM_V1`); never a
+///     token of THIS enum, but the spelling a floor-pinned peer would send for
+///     a construction v34.0.0 removed.
+const RETIRED_WRAP_ALGORITHM_WIRE_TOKENS: &[(&str, &str)] = &[
+    (
+        "x25519-mlkem768-aes256-gcm-hkdf-sha256",
+        "is the CC 1.0-rc2 hyphen-separated spelling of the v2 hybrid wrap. CC 5.1 \
+         (CIRISVerify#234) ratified the underscore-separated token as the SINGLE \
+         wire identifier and nothing accepts both spellings: respell \
+         `x25519-mlkem768-aes256-gcm-hkdf-sha256` as \
+         `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit",
+    ),
+    (
+        "hpke_rfc9180_base_x25519_aes_gcm",
+        "names the classical v1 HPKE wrap (CEG 0.3 §5.6.8.4), REMOVED in v34.0.0 \
+         (CIRISPersist#704), not respelled — no spelling of v1 exists to switch \
+         to; re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` and \
+         resubmit",
+    ),
+    (
+        "x25519-aes256-gcm-hkdf-sha256",
+        "names the classical v1 wrap as the CC 1.0-rc2 floor spells it, REMOVED in \
+         v34.0.0 (CIRISPersist#704), not respelled — no spelling of v1 exists to \
+         switch to; re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` \
+         and resubmit",
+    ),
+];
+
+/// Refuse a `key_grant` payload whose `wrap_algorithm` carries a retired wire
+/// spelling — see [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
+///
+/// Runs BEFORE the typed decode, mirroring
+/// [`refuse_removed_key_grant_wire_keys`]: the caller is told the token they
+/// SENT and its disposition, rather than serde's `unknown variant`, which can
+/// name the token but never the reason.
+fn refuse_retired_wrap_algorithm_wire_tokens(payload: &serde_json::Value) -> Result<(), Error> {
+    let Some(token) = payload.get("wrap_algorithm").and_then(|v| v.as_str()) else {
+        // Absent, non-string, or not an object — the typed decode owns that
+        // diagnosis.
+        return Ok(());
+    };
+    for (retired, disposition) in RETIRED_WRAP_ALGORITHM_WIRE_TOKENS {
+        if token == *retired {
+            return Err(Error::InvalidArgument(format!(
+                "key_grant: wrap_algorithm `{retired}` {disposition}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Decode + validate a `key_grant` payload from the JSONB column.
 /// Returns `Ok(None)` for non-grant rows.
 ///
@@ -1011,7 +1108,8 @@ fn refuse_removed_key_grant_wire_keys(payload: &serde_json::Value) -> Result<(),
 /// together or not at all.
 ///
 /// Removed wire keys are refused BEFORE decoding, by name — see
-/// [`REMOVED_KEY_GRANT_WIRE_KEYS`].
+/// [`REMOVED_KEY_GRANT_WIRE_KEYS`]. Likewise (v35.0.0, #715) the retired
+/// `wrap_algorithm` spellings — see [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
 pub fn extract_key_grant_payload(
     subject_kind: &str,
     payload: &serde_json::Value,
@@ -1020,6 +1118,7 @@ pub fn extract_key_grant_payload(
         return Ok(None);
     }
     refuse_removed_key_grant_wire_keys(payload)?;
+    refuse_retired_wrap_algorithm_wire_tokens(payload)?;
     let typed: KeyGrantPayload = serde_json::from_value(payload.clone())
         .map_err(|e| Error::InvalidArgument(format!("key_grant payload shape: {e}")))?;
     validate_non_empty("recipient_key_id", &typed.recipient_key_id)?;
@@ -2028,6 +2127,159 @@ mod tests {
         env.payload = serde_json::Value::Object(object);
         let err = require_key_grant_envelope(&env).unwrap_err();
         assert_names_removed_key_and_replacement(&err, "scope_ref", "scope_id");
+    }
+
+    // ── v35.0.0 (#715): retired wrap_algorithm spellings refuse BY NAME ──
+
+    /// The separator convention, pinned: every live wire token is
+    /// underscore-separated.
+    ///
+    /// The expected tokens are restated as LITERALS — never derived from
+    /// `as_str()`, which is the thing under test. A witness derived from the
+    /// checked value can only see relations, never a wrong value: if `as_str`
+    /// were respelled with hyphens, `!as_str().contains('-')` would be the
+    /// only assertion to fire, and deriving the list from `as_str` would
+    /// silently bless the new spelling everywhere else.
+    #[test]
+    fn wrap_algorithm_tokens_are_underscore_separated_715() {
+        const EXPECTED_TOKENS: &[&str] = &["x25519_mlkem768_aes256_gcm_hkdf_sha256"];
+
+        // The convention, asserted on the LITERALS.
+        for token in EXPECTED_TOKENS {
+            assert!(
+                !token.contains('-'),
+                "wire tokens are underscore-separated; `{token}` carries a hyphen"
+            );
+            assert!(
+                token.contains('_'),
+                "wire tokens are underscore-separated; `{token}` has no separator \
+                 at all"
+            );
+        }
+
+        // The live vocabulary IS the literal list, element for element. The
+        // match arm forces a compile break when a variant is added, so a
+        // future token cannot dodge the convention by dodging this list.
+        let live = [WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256];
+        for alg in live {
+            match alg {
+                WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256 => {}
+            }
+        }
+        assert_eq!(live.len(), EXPECTED_TOKENS.len());
+        for (alg, expected) in live.iter().zip(EXPECTED_TOKENS) {
+            assert_eq!(alg.as_str(), *expected);
+        }
+    }
+
+    /// The CC 1.0-rc2 hyphenated spelling of v2 — the #715 headline. Refused
+    /// BY NAME as a RESPELLING: same construction, one conformant spelling,
+    /// stated exactly.
+    ///
+    /// The witness pins ONE contiguous directive phrase carrying BOTH
+    /// spellings in their roles. The substring trap this dodges: `x25519`
+    /// (and most other fragments) appear in BOTH spellings, and serde's
+    /// generic `unknown variant \`…\`, expected \`…\`` message ALSO renders
+    /// both tokens — so any pair of independent `contains` checks on
+    /// fragments can pass against the generic message the named door exists
+    /// to replace.
+    #[test]
+    fn rc2_hyphenated_v2_spelling_is_refused_by_name_715() {
+        let mut object = valid_grant_json();
+        object.insert(
+            "wrap_algorithm".into(),
+            "x25519-mlkem768-aes256-gcm-hkdf-sha256".into(),
+        );
+        let err =
+            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
+                .unwrap_err();
+        let directive = "respell `x25519-mlkem768-aes256-gcm-hkdf-sha256` as \
+                         `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit";
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains(directive)),
+            "the refusal must state the exact replacement spelling as one \
+             contiguous directive ({directive:?}): {err:?}"
+        );
+        // Named at the DOOR, not diagnosed by the typed decode.
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if !m.contains("payload shape")),
+            "the retired token must be named BEFORE serde sees it: {err:?}"
+        );
+        // And named as a RESPELLING — the construction lives; claiming
+        // removal would send the caller re-wrapping a DEK that only needs
+        // its label fixed.
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if !m.contains("REMOVED")),
+            "the rc2 v2 spelling is respelled, not removed: {err:?}"
+        );
+    }
+
+    /// Both v1 spellings — this surface's `hpke_rfc9180_base_x25519_aes_gcm`
+    /// and the CC 1.0-rc2 floor's `x25519-aes256-gcm-hkdf-sha256` — are
+    /// refused BY NAME as REMOVED, not respelled: the construction is gone
+    /// (v34.0.0/#704), so the directive is to re-wrap under v2, never to
+    /// respell.
+    #[test]
+    fn removed_v1_wrap_tokens_are_refused_by_name_715() {
+        for v1_token in [
+            "hpke_rfc9180_base_x25519_aes_gcm",
+            "x25519-aes256-gcm-hkdf-sha256",
+        ] {
+            let mut object = valid_grant_json();
+            object.insert("wrap_algorithm".into(), v1_token.into());
+            let err = extract_key_grant_payload(
+                KEY_GRANT_SUBJECT_KIND,
+                &serde_json::Value::Object(object),
+            )
+            .unwrap_err();
+            // The token the caller sent, in its role — backtick-delimited so
+            // no other token can satisfy it by substring.
+            let named = format!("wrap_algorithm `{v1_token}` names the classical v1");
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains(&named)),
+                "the refusal must name the v1 token the caller sent \
+                 ({named:?}): {err:?}"
+            );
+            // Its disposition: REMOVED, not respelled — one contiguous phrase.
+            assert!(
+                matches!(&err, Error::InvalidArgument(m)
+                    if m.contains("REMOVED in v34.0.0 (CIRISPersist#704), not respelled")),
+                "v1's disposition is removal, stated as such: {err:?}"
+            );
+            // And the way forward, with the live token spelled exactly.
+            let forward =
+                "re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit";
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains(forward)),
+                "the refusal must state the exact live token ({forward:?}): {err:?}"
+            );
+        }
+    }
+
+    /// The retired table must never shadow the LIVE vocabulary — a live token
+    /// listed there would make the door refuse every valid grant — and its
+    /// rc2 entry must stay byte-equal to verify's constant for as long as
+    /// verify carries one.
+    #[test]
+    fn retired_wrap_tokens_never_shadow_the_live_vocabulary_715() {
+        for (retired, _) in RETIRED_WRAP_ALGORITHM_WIRE_TOKENS {
+            assert_eq!(
+                WrapAlgorithm::from_wire_str(retired),
+                None,
+                "`{retired}` is retired wire history and must not parse as a \
+                 live token"
+            );
+        }
+        assert!(
+            RETIRED_WRAP_ALGORITHM_WIRE_TOKENS
+                .iter()
+                .any(|(retired, _)| *retired
+                    == ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
+            "the rc2 hyphenated v2 entry must match verify's \
+             KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED byte-for-byte"
+        );
+        // The base fixture clears the door (valid_grant_json asserts
+        // admission), so the refusals above have exactly one explanation.
     }
 
     #[test]

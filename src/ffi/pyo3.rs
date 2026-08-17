@@ -4280,12 +4280,17 @@ impl PyEngine {
         })
     }
 
-    /// v0.2.1 — Canonicalize a federation envelope (KeyRecord
-    /// registration_envelope, or any JSON object you intend to sign
-    /// as part of a federation row's scrub envelope) using persist's
-    /// `PythonJsonDumpsCanonicalizer` shape: sorted keys, no
-    /// whitespace, `ensure_ascii=True`. Returns the exact byte
-    /// sequence that should be signed.
+    /// Canonicalize an envelope through the CEG produce gate (ceg_produce_canonicalize
+    /// — RFC 8785 JCS at the current produce epoch): the exact bytes to sign.
+    ///
+    /// Use for any KeyRecord registration_envelope or JSON object you
+    /// intend to sign as part of a federation row's scrub envelope.
+    ///
+    /// (v0.2.1 shipped this over the Python-compat canonicalizer;
+    /// v4.15.0 #871 flipped the produce gate to JCS. This doc said
+    /// "`PythonJsonDumpsCanonicalizer` shape: sorted keys, no
+    /// whitespace, `ensure_ascii=True`" until v35.0.0 #714 — stale
+    /// since the flip: JCS emits raw UTF-8 for non-ASCII.)
     ///
     /// Lens team's preferred shape per the v0.2.x ask: hides the
     /// canonicalization rules inside persist (where they live
@@ -14189,10 +14194,17 @@ impl PyEngine {
         })
     }
 
-    /// v0.4.1 (CIRISEdge ask) — Strip-then-canonicalize an envelope
-    /// for signing/verifying. Removes top-level `signature` and
-    /// `signature_pqc` fields, applies PythonJsonDumpsCanonicalizer.
-    /// Wraps `crate::verify::canonicalize_envelope_for_signing`.
+    /// Strip-then-canonicalize for signing: removes top-level signature /
+    /// signature_pqc, then the SAME produce gate as canonicalize_envelope (#714).
+    ///
+    /// From v4.15.0 to v34.x this method bypassed the produce gate
+    /// (hand-built `PythonJsonDumpsCanonicalizer`), so bytes signed
+    /// through it failed every admission gate on non-ASCII /
+    /// non-ES-float-token payloads, surfacing as a generic
+    /// `federation_tier_unverified`. The strip is the method's whole
+    /// distinguishing behavior versus [`Self::canonicalize_envelope`];
+    /// the canonicalizer is now identical by construction. Wraps
+    /// `crate::verify::canonicalize_envelope_for_signing`.
     fn canonicalize_envelope_for_signing<'py>(
         &self,
         py: Python<'py>,
@@ -27886,24 +27898,19 @@ impl PyEngine {
     // thin delegates so the Rust-side surface can be exercised by
     // `cargo test --lib ffi::wheel_*` without a Python interpreter.
 
-    // ── key_grant (HPKE-shape DEK wrap/unwrap, CIRISVerify v4.4.0) ──
-
-    /// v3.8.0 — wrap a 32-byte DEK for an X25519 recipient. Returns
-    /// the `KeyGrantWrap` JSON envelope. Composes with the substrate's
-    /// `subject_kind: key_grant` Contribution shape (CIRISPersist#134).
-    fn wrap_dek_for_recipient_b64(
-        &self,
-        recipient_x25519_pub_b64: &str,
-        dek_b64: &str,
-    ) -> PyResult<String> {
-        crate::ffi::wheel_key_grant::wrap_dek_for_recipient_json(recipient_x25519_pub_b64, dek_b64)
-    }
-
-    /// v3.8.0 — unwrap a `KeyGrantWrap` JSON envelope using the
-    /// recipient's X25519 private key. Returns the recovered DEK b64.
-    fn unwrap_dek_b64(&self, recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyResult<String> {
-        crate::ffi::wheel_key_grant::unwrap_dek_json(recipient_x25519_priv_b64, wrap_json)
-    }
+    // ── key_grant (DEK wrap/unwrap — v2 hybrid PQC ONLY) ──
+    //
+    // v35.0.0 (#715): the classical v1 pair
+    // (`wrap_dek_for_recipient_b64` / `unwrap_dek_b64`, v3.8.0) is
+    // REMOVED, not aliased. v34.0.0 (#704) removed the classical wrap
+    // from admission, so the v1 mint emitted an `algorithm` token
+    // `extract_key_grant_payload` refuses BY NAME — a wheel minting
+    // what its own gate refuses. The v2 wrap needs the recipient's
+    // ML-KEM-768 public key, which the v1 signature cannot express, so
+    // there is no in-place replacement: a stale caller gets an
+    // `AttributeError` naming the method, and the module doc of
+    // `src/ffi/wheel_key_grant.rs` names the off-substrate doors for
+    // draining pre-v34 v1-wrapped material.
 
     /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK
     /// under `wrap_algorithm: v2` (X25519 + ML-KEM-768 hybrid PQC), the

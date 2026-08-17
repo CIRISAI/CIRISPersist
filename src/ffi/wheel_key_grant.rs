@@ -1,115 +1,56 @@
-//! v3.8.0 — PyO3 surface for CIRISVerify v4.7.0's `key_grant` HPKE-shape
-//! DEK wrap/unwrap primitive.
+//! PyO3 surface for the `key_grant` DEK wrap/unwrap primitive — **v2
+//! (X25519 + ML-KEM-768 hybrid) only**.
 //!
 //! Verify ships its own Python sidecar (`_wheel_key_grant.py` grafts
 //! onto its `CIRISVerify` class). This file is persist's parallel
-//! surface — PyEngine exposes `wrap_dek_for_recipient_b64` /
-//! `unwrap_dek_b64` so Python users of `ciris-persist` get the
+//! surface — PyEngine exposes `wrap_dek_for_recipient_v2_b64` /
+//! `unwrap_dek_v2_b64` so Python users of `ciris-persist` get the
 //! methods natively (Eric's "if it ain't on the FFI/Python interface,
 //! it doesn't exist" discipline; CIRISVerify#50).
 //!
-//! Composes with `subject_kind: key_grant` substrate work
-//! (CIRISPersist#134) — the same x25519-aes256-gcm-hkdf-sha256
-//! shape used in CEG 0.3 §5.6.8.4 `key_grant` payloads.
+//! # The classical v1 pair is GONE (v35.0.0, CIRISPersist#715)
 //!
-//! # Wiring (already done by the orchestrator)
+//! v34.0.0 (#704) removed the classical v1 wrap from admission —
+//! `WrapAlgorithm` variant, wire token, parse arm — yet this file kept
+//! minting it: `wrap_dek_for_recipient_b64` emitted
+//! `algorithm: "x25519-aes256-gcm-hkdf-sha256"`, a token
+//! `extract_key_grant_payload` refuses BY NAME
+//! (`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`). A consumer following the
+//! wheel's own surface wrapped a DEK the substrate's gate then refused,
+//! and a classical-only X25519 wrap of a long-lived DEK is a
+//! harvest-now-decrypt-later hole (CC 5.1) — the fleet directive is that
+//! classical-only paths do not exist to be chosen.
 //!
-//! - `Cargo.toml`: enable `ciris-crypto/key-grant` feature.
-//! - `src/ffi/mod.rs`: `#[cfg(feature = "pyo3")] pub mod wheel_key_grant;`
-//! - `src/ffi/pyo3.rs`: add two thin `#[pymethods]` on `PyEngine`
-//!   delegating to `wrap_dek_for_recipient_json` / `unwrap_dek_json`.
+//! Removed, not replaced: the v2 wrap needs the recipient's ML-KEM-768
+//! public key, which the v1 signature `(recipient_x25519_pub, dek)`
+//! cannot express — and the v2 pair has been on this wheel since Cut
+//! C3b. A stale caller gets an `AttributeError` naming the method, the
+//! same disposition v34 gave `cirisnode_list_key_grants_for_stream_epoch_json`.
+//! Anyone draining pre-v34 v1-wrapped material does it against
+//! `ciris-crypto`'s still-exported v1 primitives (`unwrap_dek`,
+//! `KEY_GRANT_ALGORITHM_V1`) or CIRISVerify's own wheel sidecar, which
+//! retains the pair — a deliberate off-substrate door: persist's
+//! admission chose refusal-without-migration for stored v1 grants at
+//! v34, and its wheel does not reopen that decision.
+//!
+//! # Wiring
+//!
+//! - `Cargo.toml`: `ciris-crypto/key-grant` feature.
+//! - `src/ffi/mod.rs`: `#[cfg(feature = "_pyffi")] pub mod wheel_key_grant;`
+//! - `src/ffi/pyo3.rs`: two thin `#[pymethods]` on `PyEngine`
+//!   delegating to `wrap_dek_for_recipient_v2_json` / `unwrap_dek_v2_json`.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::key_grant::{
-    unwrap_dek, unwrap_dek_v2, wrap_dek_for_recipient, wrap_dek_for_recipient_v2, KeyGrantWrap,
-    KeyGrantWrapV2, KEY_GRANT_ALGORITHM_V2,
+    key_grant_algorithm_v2_accepts, unwrap_dek_v2, wrap_dek_for_recipient_v2, KeyGrantWrapV2,
+    KEY_GRANT_ALGORITHM_V2, KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 const X25519_KEY_LEN: usize = 32;
 const DEK_LEN: usize = 32;
-
-/// Wrap a 32-byte DEK for an X25519 recipient. Returns a JSON string:
-///
-/// ```json
-/// {
-///   "algorithm": "x25519-aes256-gcm-hkdf-sha256",
-///   "ephemeral_public_key_b64": "...",
-///   "nonce_b64": "...",
-///   "ciphertext_b64": "..."
-/// }
-/// ```
-///
-/// Inputs are base64 (consistent with persist's `_b64` PyO3 idiom).
-pub fn wrap_dek_for_recipient_json(
-    recipient_x25519_pub_b64: &str,
-    dek_b64: &str,
-) -> PyResult<String> {
-    let recipient_pub =
-        decode_fixed_b64::<X25519_KEY_LEN>(recipient_x25519_pub_b64, "recipient_x25519_pub_b64")?;
-    let dek = decode_fixed_b64::<DEK_LEN>(dek_b64, "dek_b64")?;
-
-    let wrap = wrap_dek_for_recipient(&recipient_pub, &dek)
-        .map_err(|e| PyRuntimeError::new_err(format!("key_grant wrap: {e}")))?;
-
-    let envelope = serde_json::json!({
-        "algorithm": "x25519-aes256-gcm-hkdf-sha256",
-        "ephemeral_public_key_b64": B64.encode(wrap.ephemeral_public_key),
-        "nonce_b64": B64.encode(wrap.nonce),
-        "ciphertext_b64": B64.encode(&wrap.ciphertext),
-    });
-    serde_json::to_string(&envelope)
-        .map_err(|e| PyRuntimeError::new_err(format!("key_grant envelope encode: {e}")))
-}
-
-/// Unwrap a `KeyGrantWrap`-shaped JSON envelope using the recipient's
-/// X25519 private key. Returns the 32-byte DEK as base64.
-///
-/// `wrap_json` accepts the shape produced by
-/// [`wrap_dek_for_recipient_json`] — exact key names + base64 fields.
-pub fn unwrap_dek_json(recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyResult<String> {
-    let recipient_priv =
-        decode_fixed_b64::<X25519_KEY_LEN>(recipient_x25519_priv_b64, "recipient_x25519_priv_b64")?;
-
-    let envelope: serde_json::Value = serde_json::from_str(wrap_json)
-        .map_err(|e| PyValueError::new_err(format!("wrap_json decode: {e}")))?;
-
-    let ephemeral_b64 = envelope
-        .get("ephemeral_public_key_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| PyValueError::new_err("wrap_json: missing ephemeral_public_key_b64"))?;
-    let nonce_b64 = envelope
-        .get("nonce_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| PyValueError::new_err("wrap_json: missing nonce_b64"))?;
-    let ciphertext_b64 = envelope
-        .get("ciphertext_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| PyValueError::new_err("wrap_json: missing ciphertext_b64"))?;
-
-    let ephemeral_public_key =
-        decode_fixed_b64::<X25519_KEY_LEN>(ephemeral_b64, "ephemeral_public_key_b64")?;
-    let nonce_vec = B64
-        .decode(nonce_b64)
-        .map_err(|e| PyValueError::new_err(format!("nonce_b64 decode: {e}")))?;
-    let nonce: [u8; 12] = nonce_vec.try_into().map_err(|v: Vec<u8>| {
-        PyValueError::new_err(format!("nonce must be 12 bytes, got {}", v.len()))
-    })?;
-    let ciphertext = B64
-        .decode(ciphertext_b64)
-        .map_err(|e| PyValueError::new_err(format!("ciphertext_b64 decode: {e}")))?;
-
-    let wrap = KeyGrantWrap {
-        ephemeral_public_key,
-        nonce,
-        ciphertext,
-    };
-    let dek = unwrap_dek(&recipient_priv, &wrap)
-        .map_err(|e| PyRuntimeError::new_err(format!("key_grant unwrap: {e}")))?;
-    Ok(B64.encode(dek))
-}
 
 /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK for
 /// a recipient under **`wrap_algorithm: v2`** (X25519 + ML-KEM-768 hybrid,
@@ -165,6 +106,15 @@ pub fn wrap_dek_for_recipient_v2_json(
 /// JSON envelope (the shape [`wrap_dek_for_recipient_v2_json`] produces)
 /// using the recipient's X25519 private key + ML-KEM-768 private/public
 /// keys. Returns the 32-byte DEK as base64.
+///
+/// v35.0.0 (#715) — the envelope's `algorithm` field is REQUIRED and
+/// validated through `key_grant_algorithm_v2_accepts(token, false)`, the
+/// only sanctioned comparison for the identifier. This unwrap used to
+/// ignore the field entirely, which quietly accepted the retired CC
+/// 1.0-rc2 hyphenated spelling — and any other label — on a surface
+/// whose admission-door counterpart refuses retired spellings BY NAME
+/// and never normalizes. The refusal here mirrors that door: the
+/// hyphenated legacy gets its disposition and the exact token to send.
 pub fn unwrap_dek_v2_json(
     recipient_x25519_priv_b64: &str,
     recipient_ml_kem_priv_b64: &str,
@@ -182,6 +132,28 @@ pub fn unwrap_dek_v2_json(
 
     let envelope: serde_json::Value = serde_json::from_str(wrap_json)
         .map_err(|e| PyValueError::new_err(format!("wrap_json decode: {e}")))?;
+
+    let algorithm = envelope
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PyValueError::new_err("wrap_json: missing algorithm"))?;
+    if !key_grant_algorithm_v2_accepts(algorithm, false) {
+        return Err(if algorithm == KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED {
+            PyValueError::new_err(format!(
+                "wrap_json: algorithm `{algorithm}` is the CC 1.0-rc2 hyphenated \
+                 spelling of the v2 hybrid wrap; CC 5.1 (CIRISVerify#234) ratified \
+                 `{KEY_GRANT_ALGORITHM_V2}` as the single wire identifier and nothing \
+                 accepts both spellings — respell and resubmit"
+            ))
+        } else {
+            PyValueError::new_err(format!(
+                "wrap_json: algorithm `{algorithm}` is not the v2 hybrid wrap \
+                 identifier `{KEY_GRANT_ALGORITHM_V2}` — this surface unwraps v2 \
+                 envelopes only (the classical v1 wrap was removed in v34.0.0, \
+                 CIRISPersist#704)"
+            ))
+        });
+    }
 
     let ephemeral_b64 = envelope
         .get("ephemeral_x25519_public_key_b64")
@@ -247,36 +219,25 @@ mod tests {
     use super::*;
     use ciris_crypto::x25519;
 
-    #[test]
-    fn wrap_unwrap_round_trip_recovers_dek() {
-        let recipient_priv: [u8; 32] = [0x42; 32];
-        let recipient_pub = x25519::public_from_secret(&recipient_priv);
-        let dek: [u8; 32] = [0xAA; 32];
-
-        let wrap_json = wrap_dek_for_recipient_json(&B64.encode(recipient_pub), &B64.encode(dek))
-            .expect("wrap succeeds");
-        let unwrapped_b64 =
-            unwrap_dek_json(&B64.encode(recipient_priv), &wrap_json).expect("unwrap succeeds");
-        let unwrapped = B64.decode(&unwrapped_b64).unwrap();
-        assert_eq!(unwrapped, dek, "DEK survives round-trip");
-    }
-
-    #[test]
-    fn wrap_unwrap_v2_round_trip_recovers_dek() {
-        // X25519 half.
+    fn v2_wrap_fixture() -> (String, [u8; 32], Vec<u8>, Vec<u8>, [u8; 32]) {
         let recipient_x_priv: [u8; 32] = [0x42; 32];
         let recipient_x_pub = x25519::public_from_secret(&recipient_x_priv);
         // ML-KEM-768 half — generate_keypair() returns (private, public).
         let (ml_kem_priv, ml_kem_pub) =
             ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
         let dek: [u8; 32] = [0xCC; 32];
-
         let wrap_json = wrap_dek_for_recipient_v2_json(
             &B64.encode(recipient_x_pub),
             &B64.encode(&ml_kem_pub),
             &B64.encode(dek),
         )
         .expect("v2 wrap succeeds");
+        (wrap_json, recipient_x_priv, ml_kem_priv, ml_kem_pub, dek)
+    }
+
+    #[test]
+    fn wrap_unwrap_v2_round_trip_recovers_dek() {
+        let (wrap_json, recipient_x_priv, ml_kem_priv, ml_kem_pub, dek) = v2_wrap_fixture();
         // The envelope advertises the v2 algorithm string. Assert against the
         // CONSTANT, never a spelling (v25.1.0 / #582, CC 5.1): the identifier
         // is verify's to ratify, and pinning the literal here is what turns a
@@ -297,19 +258,55 @@ mod tests {
         assert_eq!(unwrapped, dek, "DEK survives the v2 hybrid round-trip");
     }
 
+    /// v35.0.0 (#715) — the mint-refused-by-your-own-gate witness. The token
+    /// the wheel mints must be the token `extract_key_grant_payload` — the
+    /// REAL admission door every `put_key_grant` passes through — admits as
+    /// `wrap_algorithm`. Wired through the minted ENVELOPE, not through the
+    /// constant both sides import: a wheel that drifted to any other spelling
+    /// (the hyphenated rc2 legacy is refused BY NAME at that door) reds this
+    /// test even though its own round-trip stays green.
+    #[test]
+    #[cfg(feature = "cirisnode")]
+    fn wheel_minted_algorithm_round_trips_the_admission_door() {
+        let (wrap_json, ..) = v2_wrap_fixture();
+        let envelope: serde_json::Value = serde_json::from_str(&wrap_json).unwrap();
+        let minted_algorithm = envelope
+            .get("algorithm")
+            .and_then(|v| v.as_str())
+            .expect("wheel envelope names its algorithm")
+            .to_owned();
+
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let payload = serde_json::json!({
+            "recipient_key_id": "recipient-1",
+            "content_sha256": sha,
+            "wrapped_dek_base64": B64.encode([0u8; 48]),
+            "wrap_algorithm": minted_algorithm,
+            "ratchet_version": 1,
+            "key_validity_window": {
+                "not_before": "2026-05-29T00:00:00Z",
+                "not_after": "2027-05-29T00:00:00Z",
+            },
+            "scope": "single_content",
+            "scope_id": sha,
+            "rotation_chain": [],
+        });
+        let admitted = crate::cirisnode::extract_key_grant_payload(
+            crate::cirisnode::KEY_GRANT_SUBJECT_KIND,
+            &payload,
+        )
+        .expect("a grant naming the wheel-minted algorithm is admitted")
+        .expect("subject_kind key_grant decodes to a grant");
+        assert_eq!(
+            admitted.wrap_algorithm.as_str(),
+            minted_algorithm,
+            "the admitted wrap_algorithm is the one the wheel minted"
+        );
+    }
+
     #[test]
     fn unwrap_v2_rejects_wrong_x25519_key() {
-        let recipient_x_priv: [u8; 32] = [0x42; 32];
-        let recipient_x_pub = x25519::public_from_secret(&recipient_x_priv);
-        let (ml_kem_priv, ml_kem_pub) =
-            ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
-        let dek: [u8; 32] = [0xCC; 32];
-        let wrap_json = wrap_dek_for_recipient_v2_json(
-            &B64.encode(recipient_x_pub),
-            &B64.encode(&ml_kem_pub),
-            &B64.encode(dek),
-        )
-        .unwrap();
+        let (wrap_json, _, ml_kem_priv, ml_kem_pub, _) = v2_wrap_fixture();
         // A different X25519 private key must fail the hybrid unwrap
         // (AEAD tag mismatch — opaque WrapUnverified).
         let wrong_x_priv: [u8; 32] = [0x99; 32];
@@ -322,15 +319,53 @@ mod tests {
         .unwrap_err();
     }
 
+    /// v35.0.0 (#715) — the retired hyphenated rc2 spelling is refused, never
+    /// folded onto the live token. Structural fields are all valid — the
+    /// label alone is the defect, so a pass here can only come from the
+    /// algorithm check.
     #[test]
-    fn wrap_rejects_short_recipient_pub() {
+    fn unwrap_v2_refuses_the_legacy_hyphenated_spelling() {
+        let (wrap_json, recipient_x_priv, ml_kem_priv, ml_kem_pub, _) = v2_wrap_fixture();
+        let mut envelope: serde_json::Value = serde_json::from_str(&wrap_json).unwrap();
+        envelope["algorithm"] =
+            serde_json::Value::String(KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED.into());
+        let _err = unwrap_dek_v2_json(
+            &B64.encode(recipient_x_priv),
+            &B64.encode(&ml_kem_priv),
+            &B64.encode(&ml_kem_pub),
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap_err();
+    }
+
+    /// v35.0.0 (#715) — an envelope with NO algorithm label is not the shape
+    /// [`wrap_dek_for_recipient_v2_json`] produces and is refused, not
+    /// unwrapped on faith.
+    #[test]
+    fn unwrap_v2_refuses_a_missing_algorithm() {
+        let (wrap_json, recipient_x_priv, ml_kem_priv, ml_kem_pub, _) = v2_wrap_fixture();
+        let mut envelope: serde_json::Value = serde_json::from_str(&wrap_json).unwrap();
+        envelope.as_object_mut().unwrap().remove("algorithm");
+        let _err = unwrap_dek_v2_json(
+            &B64.encode(recipient_x_priv),
+            &B64.encode(&ml_kem_priv),
+            &B64.encode(&ml_kem_pub),
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn wrap_v2_rejects_short_recipient_x25519_pub() {
         // PyErr message content isn't introspectable from cargo test
         // without a Python interpreter in PyO3 0.28+. The wrap path's
         // contract here is just "non-32-byte input is an error" —
         // unwrap_err() captures that. Detailed message text is checked
         // at the Python-pytest layer.
         let too_short = B64.encode([0u8; 16]);
+        let (_, ml_kem_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
         let dek = B64.encode([0u8; 32]);
-        let _err = wrap_dek_for_recipient_json(&too_short, &dek).unwrap_err();
+        let _err =
+            wrap_dek_for_recipient_v2_json(&too_short, &B64.encode(&ml_kem_pub), &dek).unwrap_err();
     }
 }

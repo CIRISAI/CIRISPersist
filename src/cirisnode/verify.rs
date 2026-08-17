@@ -22,8 +22,12 @@
 //! — the same canonicalizer the agent / lens / edge envelopes use.
 //! Persist owns one canonicalization rule across all envelope tracks.
 //! The rule: serialize to JSON Value, strip the `signature` and
-//! `signature_pqc` top-level fields, then run the Python-compatible
-//! canonicalizer.
+//! `signature_pqc` top-level fields, then canonicalize through the
+//! CEG produce gate (`ceg_produce_canonicalize` — RFC 8785 JCS at the
+//! current produce epoch; #714 routed this track through the gate
+//! with the rest of the mesh). Contributions verify at the door only
+//! — stored rows are never re-verified from storage — so signer and
+//! door move through the flip together within a build.
 //!
 //! Everything security-relevant lives outside the signature field:
 //! `contribution_id`, `author_id`, `subject`, `payload`,
