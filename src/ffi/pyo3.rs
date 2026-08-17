@@ -4280,12 +4280,17 @@ impl PyEngine {
         })
     }
 
-    /// v0.2.1 — Canonicalize a federation envelope (KeyRecord
-    /// registration_envelope, or any JSON object you intend to sign
-    /// as part of a federation row's scrub envelope) using persist's
-    /// `PythonJsonDumpsCanonicalizer` shape: sorted keys, no
-    /// whitespace, `ensure_ascii=True`. Returns the exact byte
-    /// sequence that should be signed.
+    /// Canonicalize an envelope through the CEG produce gate (ceg_produce_canonicalize
+    /// — RFC 8785 JCS at the current produce epoch): the exact bytes to sign.
+    ///
+    /// Use for any KeyRecord registration_envelope or JSON object you
+    /// intend to sign as part of a federation row's scrub envelope.
+    ///
+    /// (v0.2.1 shipped this over the Python-compat canonicalizer;
+    /// v4.15.0 #871 flipped the produce gate to JCS. This doc said
+    /// "`PythonJsonDumpsCanonicalizer` shape: sorted keys, no
+    /// whitespace, `ensure_ascii=True`" until v35.0.0 #714 — stale
+    /// since the flip: JCS emits raw UTF-8 for non-ASCII.)
     ///
     /// Lens team's preferred shape per the v0.2.x ask: hides the
     /// canonicalization rules inside persist (where they live
@@ -14189,10 +14194,17 @@ impl PyEngine {
         })
     }
 
-    /// v0.4.1 (CIRISEdge ask) — Strip-then-canonicalize an envelope
-    /// for signing/verifying. Removes top-level `signature` and
-    /// `signature_pqc` fields, applies PythonJsonDumpsCanonicalizer.
-    /// Wraps `crate::verify::canonicalize_envelope_for_signing`.
+    /// Strip-then-canonicalize for signing: removes top-level signature /
+    /// signature_pqc, then the SAME produce gate as canonicalize_envelope (#714).
+    ///
+    /// From v4.15.0 to v34.x this method bypassed the produce gate
+    /// (hand-built `PythonJsonDumpsCanonicalizer`), so bytes signed
+    /// through it failed every admission gate on non-ASCII /
+    /// non-ES-float-token payloads, surfacing as a generic
+    /// `federation_tier_unverified`. The strip is the method's whole
+    /// distinguishing behavior versus [`Self::canonicalize_envelope`];
+    /// the canonicalizer is now identical by construction. Wraps
+    /// `crate::verify::canonicalize_envelope_for_signing`.
     fn canonicalize_envelope_for_signing<'py>(
         &self,
         py: Python<'py>,

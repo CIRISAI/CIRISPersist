@@ -292,15 +292,34 @@ fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
 }
 
 /// v0.4.1 (CIRISEdge ask) — Strip signature components from an
-/// envelope and canonicalize. Returns the bytes the sender signed
-/// — what the verifier needs to reproduce.
+/// envelope and canonicalize **through the produce gate**. Returns the
+/// bytes the sender signs — what every admission gate reproduces.
 ///
-/// Rule: top-level `signature` and `signature_pqc` fields removed
-/// before applying [`PythonJsonDumpsCanonicalizer`]. Same shape as
-/// [`crate::federation::types::compute_persist_row_hash`]'s
-/// `persist_row_hash` strip — a row's signed canonical bytes never
-/// include the signature itself (else the hash would depend on
-/// itself).
+/// Rule: top-level `signature` and `signature_pqc` fields removed —
+/// exactly the fields the verify paths treat as non-covered (a row's
+/// signed canonical bytes never include the signature itself, else the
+/// hash would depend on itself; same shape as
+/// [`crate::federation::types::compute_persist_row_hash`]'s strip) —
+/// then [`ceg_produce_canonicalize`].
+///
+/// # v35.0.0 (CIRISPersist#714) — routed through the gate
+///
+/// From v4.15.0 (the JCS produce flip) to v34.x this function built
+/// [`PythonJsonDumpsCanonicalizer`] by hand, bypassing
+/// [`ceg_produce_canonicalize`] — so the entry point NAMED for signing
+/// minted bytes that no admission gate would rebuild
+/// (`verify_envelope_hybrid_signature` re-canonicalizes with the gate).
+/// On any non-ASCII or non-ES-float-token payload the signature then
+/// failed LATER, as a generic `hybrid-verify: …
+/// (federation_tier_unverified)`, misdirecting the caller toward
+/// key/registration problems. Routing through the gate restores the
+/// one-line-flip property the gate exists for; the strip is this
+/// function's whole distinguishing behavior. Parity is witnessed by
+/// `for_signing_matches_the_produce_gate_byte_for_byte`.
+///
+/// The ONE plane that must NOT follow the produce epoch — the audit
+/// chain, whose stored corpus re-verifies from storage — is pinned via
+/// [`canonicalize_envelope_for_signing_v1_pinned`].
 ///
 /// Used by:
 /// - Edge's verify pipeline (strip-then-canonicalize-then-verify)
@@ -308,6 +327,10 @@ fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
 ///   wrapper (calls this directly)
 /// - Federation peers verifying inbound envelopes from gossip /
 ///   direct send
+/// - The cirisnode envelope doors
+///   ([`crate::cirisnode::verify::verify_envelope_signed`], admission-
+///   time only — stored contributions are never re-verified from
+///   storage, so the plane rides the produce epoch)
 ///
 /// **One implementation of the strip rule**: edge no longer
 /// re-implements which fields to strip; persist owns the rule.
@@ -321,7 +344,44 @@ pub fn canonicalize_envelope_for_signing(
         obj.remove("signature");
         obj.remove("signature_pqc");
     }
-    PythonJsonDumpsCanonicalizer
+    ceg_produce_canonicalize(&value)
+}
+
+/// v35.0.0 (CIRISPersist#714) — the V1Python-PINNED strip-then-canonicalize
+/// rule, for the ONE plane whose stored corpus binds the pre-flip
+/// canonicalization permanently: the audit chain.
+///
+/// Audit rows are the only place a signature minted over V1Python bytes
+/// lives in a STORED row that persist RE-VERIFIES later:
+/// `AuditService::verify_chain` re-derives `entry_hash` and re-checks
+/// `signature` from the stored row, and the RFC 6962 Merkle tree's leaf
+/// hashes ([`crate::audit::merkle_leaf`]) are SHA-256 over these same
+/// bytes. Rebuilding a stored row's preimage requires the rule that
+/// minted it (feedback: every preimage field must be recoverable FROM THE
+/// STORED ROW) — so this function is pinned to
+/// [`CanonVersion::V1Python`] and MUST NOT be routed through
+/// [`ceg_produce_canonicalize`]: doing so would take every existing audit
+/// chain and Merkle tree dark on the first non-ASCII or
+/// non-ES-float-token payload. The pin has its own witness
+/// (`v1_pinned_preserves_the_stored_audit_corpus_rule`).
+///
+/// Every other plane verifies at ADMISSION time (federation gates,
+/// cirisnode doors, edge inbound) or carries the producer's signed bytes
+/// verbatim (derived detections), and therefore rides
+/// [`canonicalize_envelope_for_signing`] through the produce gate.
+///
+/// Flipping the audit plane to V2Jcs, if ever wanted, is a per-row
+/// version-gate migration (a signed epoch discriminator on the entry,
+/// like [`canonicalizer_for`] keyed on trace schema) — not an edit here.
+pub fn canonicalize_envelope_for_signing_v1_pinned(
+    envelope: &serde_json::Value,
+) -> Result<Vec<u8>, super::Error> {
+    let mut value = envelope.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("signature");
+        obj.remove("signature_pqc");
+    }
+    canonicalizer_for(CanonVersion::V1Python)
         .canonicalize_value(&value)
         .map_err(|e| super::Error::Canonicalization(format!("{e}")))
 }
@@ -758,6 +818,122 @@ mod tests {
         // And the result is the standard sorted Python json.dumps shape.
         let expected = r#"{"agent_role":"ally","deployment_domain":"general","trace_id":"abc"}"#;
         assert_eq!(bytes_unsigned, expected.as_bytes());
+    }
+
+    /// v35.0.0 (CIRISPersist#714) — THE PARITY WITNESS. The entry point
+    /// NAMED for signing must produce the bytes the admission gates
+    /// reconstruct. Every gate re-canonicalizes through
+    /// [`ceg_produce_canonicalize`] (`verify_envelope_hybrid_signature`
+    /// does exactly this, with the signature carried in row columns —
+    /// i.e. over the post-strip object). So for every envelope:
+    ///
+    /// `canonicalize_envelope_for_signing(env)` ==
+    /// `ceg_produce_canonicalize(env minus signature/signature_pqc)`
+    ///
+    /// Before the #714 fix, `canonicalize_envelope_for_signing` built
+    /// `PythonJsonDumpsCanonicalizer` by hand — bypassing the produce
+    /// gate — and this test FAILS on the non-ASCII and wire-float
+    /// fixtures (verified red against the unfixed code). A signer using
+    /// the for-signing entry point minted bytes no gate would ever
+    /// rebuild, surfacing later as a generic
+    /// `hybrid-verify: … (federation_tier_unverified)`.
+    ///
+    /// The `expect_v1_divergence` flag keeps the corpus honest: it
+    /// asserts the fixture ACTUALLY exercises the V1/V2 divergence, so
+    /// this witness can never rot into an all-ASCII check that cannot
+    /// fail (feedback: a check that cannot fail is a report).
+    #[test]
+    fn for_signing_matches_the_produce_gate_byte_for_byte() {
+        let corpus: Vec<(serde_json::Value, bool)> = vec![
+            // Structured-ASCII wire shape (key_ids / hex / ISO stamps):
+            // V1 ≡ V2 here, which is why the existing corpus kept working.
+            (
+                json!({
+                    "agent_role": "ally",
+                    "deployment_domain": "general",
+                    "trace_id": "abc",
+                    "signature": "0x1234567890abcdef",
+                    "signature_pqc": "0xfedcba0987654321",
+                }),
+                false,
+            ),
+            // The multilingual corpus — raw UTF-8 (JCS) vs \uXXXX escapes
+            // (Python-compat) — the CIRISAgent#174-measured breaking set.
+            (
+                json!({
+                    "rationale": "用户推理",
+                    "note": "h\u{00e9}llo",
+                    "warn": "⚠️ WARNING: attestation",
+                    "signature": "c2ln",
+                }),
+                true,
+            ),
+            // Wire float tokens: arbitrary_precision preserves the parsed
+            // token; RFC 8785 re-serializes per ECMAScript rules.
+            (
+                serde_json::from_str::<serde_json::Value>(
+                    r#"{"cost_usd":0.0031992000000000006,"score":1e-05,"signature":"c2ln"}"#,
+                )
+                .unwrap(),
+                true,
+            ),
+        ];
+        for (env, expect_v1_divergence) in corpus {
+            let mut stored = env.clone();
+            if let Some(obj) = stored.as_object_mut() {
+                obj.remove("signature");
+                obj.remove("signature_pqc");
+            }
+            let gate = ceg_produce_canonicalize(&stored).unwrap();
+            let for_signing = canonicalize_envelope_for_signing(&env).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&for_signing),
+                String::from_utf8_lossy(&gate),
+                "the for-signing entry point must mint the bytes the gates rebuild: {env}"
+            );
+            if expect_v1_divergence {
+                let v1 = PythonJsonDumpsCanonicalizer
+                    .canonicalize_value(&stored)
+                    .unwrap();
+                assert_ne!(
+                    v1, gate,
+                    "fixture must actually exercise the V1/V2 divergence \
+                     (an all-agreeing corpus is a witness that cannot fail): {env}"
+                );
+            }
+        }
+    }
+
+    /// v35.0.0 (CIRISPersist#714) — the companion pin: the audit plane's
+    /// rule must NOT move. Stored audit rows re-verify from storage
+    /// (`verify_chain` + Merkle leaf hashes), so their preimage rule is
+    /// bound by the corpus, not by the produce epoch. Routing
+    /// [`canonicalize_envelope_for_signing_v1_pinned`] through the
+    /// produce gate reds this test — by design.
+    #[test]
+    fn v1_pinned_preserves_the_stored_audit_corpus_rule() {
+        // Non-ASCII payload + wire float token: the shapes a stored audit
+        // row can carry that diverge between the two rules.
+        let env = serde_json::from_str::<serde_json::Value>(
+            r#"{"action_type":"dsar_export","payload":{"msg":"用户 ⚠️","score":1e-05},"signature":"c2ln"}"#,
+        )
+        .unwrap();
+        let mut stripped = env.clone();
+        stripped.as_object_mut().unwrap().remove("signature");
+        let pinned = canonicalize_envelope_for_signing_v1_pinned(&env).unwrap();
+        assert_eq!(
+            pinned,
+            PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&stripped)
+                .unwrap(),
+            "the pinned rule IS the pre-#714 rule, byte-for-byte"
+        );
+        assert_ne!(
+            pinned,
+            ceg_produce_canonicalize(&stripped).unwrap(),
+            "routing the audit pin through the produce gate would take \
+             every stored audit chain and Merkle tree dark"
+        );
     }
 
     /// v0.4.1 (CIRISEdge ask) — `body_sha256` returns SHA-256 of the

@@ -3,12 +3,25 @@
 //!
 //! # Canonical-bytes shape
 //!
-//! Reuses `crate::verify::canonical::canonicalize_envelope_for_signing`
-//! — the persist-wide canonicalizer. The rule strips the
-//! `signature` field at the top level of the JSON object; everything
+//! Reuses
+//! `crate::verify::canonical::canonicalize_envelope_for_signing_v1_pinned`
+//! — the V1Python-PINNED strip-then-canonicalize rule. The rule strips
+//! the `signature` field at the top level of the JSON object; everything
 //! else (entry_id, sequence_number, tenant_id, actor_id, action_type,
 //! subject_kind, subject_id, payload, prev_hash, entry_hash,
 //! recorded_at) participates in the signed body.
+//!
+//! **Why pinned (v35.0.0, CIRISPersist#714):** audit is the one plane
+//! where signatures minted over V1Python bytes live in STORED rows that
+//! persist RE-VERIFIES later — `verify_chain` re-derives `entry_hash`
+//! and re-checks `signature` from the stored row, and the Merkle tree's
+//! leaf hashes are over these same bytes. When #714 routed
+//! `canonicalize_envelope_for_signing` through the produce gate
+//! (`ceg_produce_canonicalize`, V2Jcs), following it would have taken
+//! every existing audit chain dark on the first non-ASCII or
+//! non-ES-float-token payload. The stored corpus binds the rule; a
+//! future flip is a per-row version-gate migration, not a canonicalizer
+//! edit.
 //!
 //! Note: `entry_hash` IS part of the signed body. That binds the
 //! signature to the chain position — a chain-rewrite that flipped
@@ -26,19 +39,21 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::verify::canonical::canonicalize_envelope_for_signing;
+use crate::verify::canonical::canonicalize_envelope_for_signing_v1_pinned;
 use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
 
 use super::types::AuditEntry;
 use super::Error;
 
 /// Produce canonical bytes for an audit entry (or any other
-/// signable shape that uses the persist-wide `signature` strip
-/// rule).
+/// signable shape that uses the audit-plane `signature` strip
+/// rule). PINNED to the V1Python canonicalization — see the module
+/// doc: the stored chain + Merkle corpus re-verifies from storage,
+/// so this plane does not follow the produce epoch.
 pub fn canonical_bytes_for_entry<T: Serialize>(entry: &T) -> Result<Vec<u8>, Error> {
     let value = serde_json::to_value(entry)
         .map_err(|e| Error::Internal(format!("entry serialize: {e}")))?;
-    canonicalize_envelope_for_signing(&value)
+    canonicalize_envelope_for_signing_v1_pinned(&value)
         .map_err(|e| Error::Internal(format!("canonicalize: {e}")))
 }
 

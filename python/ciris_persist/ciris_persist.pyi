@@ -1973,24 +1973,10 @@ class Engine:
         """
 
     def canonicalize_envelope(self, envelope_json: str) -> bytes:
-        """Canonicalize an arbitrary envelope via the production
-        ``PythonJsonDumpsCanonicalizer`` (sorted keys, no whitespace,
-        ``ensure_ascii=True``). Returns the canonical bytes the
-        substrate signs and verifies.
-
-        **Do not use** ``serde_json_canonicalizer`` (JCS RFC 8785) on
-        downstream — it is ``#[cfg(test)]`` only and produces different
-        bytes for non-ASCII envelopes. Use this canonicalizer
-        end-to-end so signature verify holds across the cohabitation
-        boundary (v3.3.0 #121 trap discipline).
-        """
+        """(derived) nomological — Canonicalize an envelope through the CEG produce gate (ceg_produce_canonicalize — RFC 8785 JCS at the current produce epoch): the exact bytes to sign."""
 
     def canonicalize_envelope_for_signing(self, envelope_json: str) -> bytes:
-        """Canonicalize for signing — same canonicalizer as
-        :meth:`canonicalize_envelope`. Separate entry point preserved
-        for callers (CIRISEdge, CIRISConformance) that key off the
-        function name semantically.
-        """
+        """(derived) nomological — Strip-then-canonicalize for signing: removes top-level signature / signature_pqc, then the SAME produce gate as canonicalize_envelope (#714)."""
 
     def cohort_scope_crypto_tier(self, cohort_scope: str, cohort_subkind: str | None = None) -> str:
         """(derived) nomological — CC 4.4.3.2.8 / #308 — resolve a cohort_scope wire token to its at-rest crypto tier, exposing [crate::federation::types::cohort_scope::crypto_tier]..."""
