@@ -22085,6 +22085,26 @@ mod tests {
         .expect("547 wire-index-follows-mutators exercise");
     }
 
+    /// v36.0.1 (CIRISPersist#713) — cohort_scope survives write→read,
+    /// postgres leg. The third backend of the answer to edge's blocking
+    /// question: "it works in memory" and "it works on the path edge
+    /// advertises from" are different claims, and so is each backend.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn cohort_scope_survives_the_read_path_postgres_713() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::admission::ungated_doors_test_support::exercise_cohort_scope_survives_the_read_path(
+            &backend,
+            &format!("pg{}", uuid_like()),
+        )
+        .await;
+    }
+
     /// v36.0.0 (CIRISPersist#668) — the V130 late-admit witness on a
     /// converted plane (attestations), postgres leg.
     #[tokio::test]

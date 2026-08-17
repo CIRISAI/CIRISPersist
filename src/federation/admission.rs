@@ -20855,6 +20855,77 @@ pub(crate) mod ungated_doors_test_support {
     /// The tie-paging leg is planted per backend (a tie cannot be produced
     /// through the write path — the allocator is strictly increasing under
     /// one lock) and lives in the backend test modules.
+    /// v36.0.1 (CIRISPersist#713, CIRISEdge adoption) — **does `cohort_scope`
+    /// survive the write→read round trip on the path a consumer advertises
+    /// from?**
+    ///
+    /// Edge reported it reading back EMPTY through `MemoryBackend`, which
+    /// matters now in a way it never did before: pre-v36 an unrecognized scope
+    /// resolved `Cohort` for every family, so an empty string was harmless. In
+    /// v36 the `Trace` family resolves an unrecognized scope to `SelfOwn`, so
+    /// an empty scope would stop `trace:*` being advertised by anyone but its
+    /// producer — a LIVENESS failure that presents as silence, with nothing to
+    /// alarm on because the advertise gate maps every non-`SelfOwn` projection
+    /// to `true`.
+    ///
+    /// This asserts the round trip on EVERY backend, on both the by-subject
+    /// read and the since-cursor read, because "it works in memory" and "it
+    /// works on the path edge uses" are different claims.
+    pub(crate) async fn exercise_cohort_scope_survives_the_read_path(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let author = format!("cs713-{suffix}");
+        register(dir, &author, crate::federation::types::identity_type::NODE).await;
+
+        let id = format!("cs713-row-{suffix}");
+        // A PLAIN dimension on purpose: `cohort_scope` is one typed column
+        // read by one mapper, so the round trip is family-INDEPENDENT, and
+        // `trace:*` carries its own admission rules (E3 self-emission, a
+        // required `trace_id`) that would make this witness about those rules
+        // instead. `trace:*` is merely the family for which an empty result is
+        // FATAL under #713 — that is why the round trip is worth asserting,
+        // not what is being asserted.
+        let mut row = federation_row(&id, &author, "cs713:probe:v1");
+        row.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        seal_row_in_place(&author, &mut row);
+        dir.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("a federation-scoped trace row admits");
+
+        // The since-cursor read — the replication path.
+        let served = dir
+            .list_attestations_since(None, u32::MAX)
+            .await
+            .expect("cursor read");
+        let mine = served
+            .iter()
+            .find(|s| s.attestation.attestation_id == id)
+            .expect("the row we just wrote must be served");
+        assert_eq!(
+            mine.attestation.cohort_scope,
+            cohort_scope::FEDERATION,
+            "({suffix}) cohort_scope must survive write->read on the CURSOR path. \
+             An empty value here resolves Trace to SelfOwn under #713 and silently \
+             stops trace replication with no error and no counter"
+        );
+
+        // And the by-subject read, which advertisement also walks.
+        let by_subject = dir
+            .list_attestations_by(&author)
+            .await
+            .expect("by-author read");
+        let same = by_subject
+            .iter()
+            .find(|a| a.attestation_id == id)
+            .expect("present by author");
+        assert_eq!(
+            same.cohort_scope,
+            cohort_scope::FEDERATION,
+            "({suffix}) cohort_scope must survive write->read on the BY-SUBJECT path too"
+        );
+    }
+
     pub(crate) async fn exercise_late_admitted_attestation_is_served(
         dir: &dyn FederationDirectory,
         suffix: &str,
