@@ -1324,21 +1324,38 @@ pub const PERSIST_AUTHORED_ABSENCE_FALSIFIERS: &[(&str, &str, &[&str], &str)] = 
 /// re-vendor landed and the entry must be deleted), and the shipping code must
 /// really contradict it (a correction entry is a PROOF, exactly like a
 /// `falsified` entry in [`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`]).
-pub const STALE_CITATION_SEMANTICS_PENDING_REVENDOR: &[(&str, &str, &str)] = &[(
-    "projection_for",
-    "(Cohort ceiling for ProducerSteward; tombstone -> Global)",
-    "Since v35.0.0 (CIRISPersist#713) `projection_for` is PER-PLANE — \
-     `projection_for(plane: ObjectClass, cohort_scope, authority, is_tombstone)` — and \
-     `tombstone -> Global` is no longer unconditional: a tombstone projects at \
-     `tombstone_ceiling(plane, authority)`, its plane's row-max (Global unconditionally only \
-     for KeyRecord and the deferred Attestation plane; trust-root-only for \
-     TransportDestination / FountainContent; infra-role-only for HardCaseEvent). \
-     Anti-rollback holds within the record's maximal disclosure set — beyond it there is no \
-     copy to roll back — and widening a tombstone past that set would disclose more than the \
-     original fact. The walk's separate 'no observed live call site' flag on this symbol \
-     remains TRUE in-crate: the consumers are CIRISEdge/CIRISServer at their #713 re-pin. \
-     Correction owed at the next manifest re-vendor (tracked CIRISPersist#520).",
-)];
+pub const STALE_CITATION_SEMANTICS_PENDING_REVENDOR: &[(&str, &str, &str)] = &[
+    (
+        "projection_for",
+        "(Cohort ceiling for ProducerSteward; tombstone -> Global)",
+        "Since v35.0.0 (CIRISPersist#713) `projection_for` is PER-PLANE — and since v36.0.0 \
+         per DIMENSION FAMILY on the Attestation plane: \
+         `projection_for(plane: Plane, cohort_scope, authority, is_tombstone)`, where \
+         `Plane::Attestation` carries the envelope `dimension`. `tombstone -> Global` is no \
+         longer unconditional: a tombstone projects at `tombstone_ceiling(plane, authority)` \
+         (Global unconditionally only for KeyRecord and the consent:* attestation family; \
+         trust-root-only for TransportDestination / FountainContent; infra-role-only for \
+         HardCaseEvent; Capability(infra:serve) for trace:*, Subject for scores:*, and Cohort \
+         for undecided attestation families — this walk's own ratchet:* included). \
+         Anti-rollback holds within the record's maximal disclosure set — beyond it there is no \
+         copy to roll back — and widening a tombstone past that set would disclose more than the \
+         original fact. The walk's separate 'no observed live call site' flag on this symbol \
+         remains TRUE in-crate: the consumers are CIRISEdge/CIRISServer at their #713 re-pin. \
+         Correction owed at the next manifest re-vendor (tracked CIRISPersist#520).",
+    ),
+    (
+        "projection_for|ratchet:flag:out_of_distribution_voting tombstone asymmetry",
+        "a tombstone always projects Global though the live flag was capped at Cohort",
+        "FALSE since v36.0.0 (CIRISPersist#713 second half): the Attestation plane's tombstone \
+         ceiling is per dimension family, and ratchet:* has no decided row, so it takes the \
+         conservative default's row-max — a ratchet flag's retraction now projects Cohort, \
+         exactly as wide as any live copy could ever have traveled, for every authority. The \
+         walk's WA-quorum-slashing consumer note ('its retraction always gossips \
+         federation-wide') inherits the same staleness: the quorum must sit inside the flag's \
+         cohort for the LIVE row and now for the retraction too. Same re-vendor owed \
+         (CIRISPersist#520).",
+    ),
+];
 
 /// Recursively collect every **structured absence claim** in `value`.
 ///
@@ -2037,12 +2054,10 @@ mod tests {
         // The PROOF for the projection_for entry: the exact cell that
         // falsifies the manifest's "tombstone -> Global" — a non-root route
         // tombstone projects Cohort, not Global (#713's arbitrated cell).
-        use crate::federation::namespace::{
-            projection_for, AuthorityClass, ObjectClass, Projection,
-        };
+        use crate::federation::namespace::{projection_for, AuthorityClass, Plane, Projection};
         assert_eq!(
             projection_for(
-                ObjectClass::TransportDestination,
+                Plane::TransportDestination,
                 "self",
                 AuthorityClass::ProducerSteward,
                 true,
@@ -2052,6 +2067,24 @@ mod tests {
              ceiling deliberately reverted, delete the projection_for entry in \
              STALE_CITATION_SEMANTICS_PENDING_REVENDOR; otherwise this gate just caught a \
              regression of #713's narrowed tombstone ceiling."
+        );
+        // The PROOF for the ratchet tombstone-asymmetry entry (v36.0.0): the
+        // walk's own family, on the decomposed Attestation plane — its
+        // retraction no longer gossips federation-wide.
+        assert_eq!(
+            projection_for(
+                Plane::Attestation {
+                    dimension: "ratchet:flag:out_of_distribution_voting"
+                },
+                "community",
+                AuthorityClass::ProducerSteward,
+                true,
+            ),
+            Projection::Cohort,
+            "the manifest's 'a tombstone always projects Global' note would be TRUE again for \
+             ratchet:* — if the Attestation decomposition deliberately reverted, delete the \
+             ratchet entry in STALE_CITATION_SEMANTICS_PENDING_REVENDOR; otherwise this gate \
+             just caught a regression of the v36.0.0 conservative-default ceiling."
         );
     }
 

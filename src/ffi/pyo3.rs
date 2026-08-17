@@ -6029,6 +6029,72 @@ impl PyEngine {
         })
     }
 
+    /// v36.0.0 (CIRISPersist#624) — **typed, pre-write replicated
+    /// Attestation-plane apply**. FFI mirror of
+    /// [`Engine::apply_replicated_attestation`](crate::engine::Engine::apply_replicated_attestation)
+    /// — the apply a replication bridge routes an incoming attestation to
+    /// instead of raw `put_attestation` (which keeps its insert-only
+    /// semantics for direct writes).
+    ///
+    /// `signed_attestation_json` is the replicated `SignedAttestation` (the
+    /// same shape `put_attestation` takes). Returns the
+    /// `ReplicatedAttestationOutcome` as canonical JSON — parse with
+    /// `json.loads`: `"inserted"` (new id, every `put_attestation` admission
+    /// gate intact), `"unchanged"` (byte-identical re-offer — the baked
+    /// genesis-id case), `"deduplicated"` (CEG §6.1 structural-composer
+    /// replay: an equivalent withdraws/recants/supersedes already exists, no
+    /// row written), or `{"refused": {"reason": "<token>"}}` with `reason` ∈
+    /// {`conflicting_attestation`, `already_present_identical`,
+    /// `store_conflict`} — decided BEFORE the write, so a same-id convergence
+    /// conflict is a countable outcome, never a `federation_backend` storage
+    /// error. Refusals are outcomes, not exceptions, so an apply loop stays
+    /// total.
+    fn apply_replicated_attestation(
+        &self,
+        py: Python<'_>,
+        signed_attestation_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let att: crate::federation::SignedAttestation =
+                serde_json::from_str(signed_attestation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
+                })?;
+            let outcome = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_attestation(
+                            backend.as_ref(),
+                            att,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_attestation(
+                            backend.as_ref(),
+                            att,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&outcome).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "apply_replicated_attestation outcome serialize: {e}"
+                ))
+            })
+        })
+    }
+
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? Returns `True` iff its `federation_keys`
     /// row's `identity_type` set contains `canonical`. Because the substrate
@@ -7712,40 +7778,61 @@ impl PyEngine {
     /// the-start, else an RFC-3339 timestamp (rows with `asserted_at >
     /// since`). Returns a JSON array of `Organization` ordered by
     /// `(asserted_at, attestation_id)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_organizations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
-        self.operational_list_since(py, since_rfc3339, limit, OperationalKind::Organization)
+        self.operational_list_since(
+            py,
+            since_rfc3339,
+            since_id,
+            limit,
+            OperationalKind::Organization,
+        )
     }
 
     /// Federation directory: bulk-list `org_membership` rows since a
     /// cursor. Same contract as
     /// [`list_organizations_since`](Self::list_organizations_since).
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_org_memberships_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
-        self.operational_list_since(py, since_rfc3339, limit, OperationalKind::OrgMembership)
+        self.operational_list_since(
+            py,
+            since_rfc3339,
+            since_id,
+            limit,
+            OperationalKind::OrgMembership,
+        )
     }
 
     /// Federation directory: bulk-list `partner_record` rows since a
     /// cursor. Same contract as
     /// [`list_organizations_since`](Self::list_organizations_since).
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_partner_records_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
-        self.operational_list_since(py, since_rfc3339, limit, OperationalKind::PartnerRecord)
+        self.operational_list_since(
+            py,
+            since_rfc3339,
+            since_id,
+            limit,
+            OperationalKind::PartnerRecord,
+        )
     }
 
     /// v31.1.0 (CIRISPersist#655) — bulk-list `ServedRevocation`s since a
@@ -7758,15 +7845,16 @@ impl PyEngine {
     /// order, not the producer's `scrub_timestamp` — resume from the last
     /// element's `admitted_at`. Keying on the signed instant would hide a
     /// revocation that was signed before your cursor and replicated after it.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_revocations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = parse_since_rfc3339(since_rfc3339)?;
+        let since = parse_pair_cursor("list_signed_revocations_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -7806,15 +7894,20 @@ impl PyEngine {
     /// no signature of their own, so shipping them would be shipping a verdict
     /// to be trusted. A receiver calls `apply_replicated_accord_evidence`,
     /// which re-tallies, and derives its own tombstones locally.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_accord_quorum_evidence_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = parse_since_rfc3339(since_rfc3339)?;
+        let since = parse_pair_cursor(
+            "list_signed_accord_quorum_evidence_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -7851,10 +7944,18 @@ impl PyEngine {
     /// re-deriving this node's own withdrawal tombstones.
     ///
     /// Returns the admission report as JSON: the YES count THIS node counted,
-    /// the threshold it had to clear, the roster size, and the `(role,
+    /// the threshold it had to clear, the roster size, the per-admission
+    /// `effect` (v36.0.0, CIRISPersist#675 — `{"kind": "supplied",
+    /// "novel_proposal": bool, "novel_participations": n}` when the bundle
+    /// carried evidence this node lacked at check time, `{"kind":
+    /// "duplicate"}` on a replay; the Admitted-vs-Duplicate signal, exact
+    /// under concurrent admissions), and the `(role,
     /// key_id)` tombstones the admit re-derived. `ValueError` (fail-closed)
     /// if the receiver's own re-tally does not authorize the bundle — the
-    /// sender's verdict is not consulted.
+    /// sender's verdict is not consulted — or, v36.0.0 (CIRISPersist#674),
+    /// if the bundle is refused pre-tally for what the carrier sent
+    /// (`accord_evidence_carrier_malformed`: more participations than the
+    /// roster has seats / duplicate `member_id`s).
     fn apply_replicated_accord_evidence(
         &self,
         py: Python<'_>,
@@ -7948,17 +8049,12 @@ impl PyEngine {
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since =
+            parse_pair_cursor("list_signed_partner_records_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -7996,22 +8092,16 @@ impl PyEngine {
     /// ASC)`. **Signed rows only** — a `put_family_local` genesis-bake row
     /// (legitimately unsigned) is never emitted; serving one would hand the
     /// edge responder empty signature bytes.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_families_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor("list_signed_families_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8047,22 +8137,16 @@ impl PyEngine {
     /// contract as
     /// [`list_signed_families_since`](Self::list_signed_families_since);
     /// ordered `(founded_at ASC, community_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_communities_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor("list_signed_communities_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8098,22 +8182,17 @@ impl PyEngine {
     /// contract as
     /// [`list_signed_families_since`](Self::list_signed_families_since);
     /// ordered `(asserted_at ASC, subject_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_location_proofs_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since =
+            parse_pair_cursor("list_signed_location_proofs_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8150,22 +8229,20 @@ impl PyEngine {
     /// [`list_signed_families_since`](Self::list_signed_families_since);
     /// ordered `(removed_at ASC, family_key_id ASC,
     /// removed_identity_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_family_membership_revocations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor(
+            "list_signed_family_membership_revocations_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8202,22 +8279,20 @@ impl PyEngine {
     /// [`list_signed_families_since`](Self::list_signed_families_since);
     /// ordered `(removed_at ASC, community_key_id ASC,
     /// removed_identity_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_community_membership_revocations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor(
+            "list_signed_community_membership_revocations_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8325,22 +8400,20 @@ impl PyEngine {
     /// `SignedIdentityOccurrence` wrappers since a cursor, as a JSON array.
     /// Signed rows only (trusted-local rows omitted); ordered `(asserted_at
     /// ASC, identity_key_id ASC, occurrence_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_identity_occurrences_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor(
+            "list_signed_identity_occurrences_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8376,22 +8449,20 @@ impl PyEngine {
     /// array. Signed rows only; RETIRED rows ARE included (tombstones must
     /// gossip); ordered `(asserted_at ASC, occurrence_key_id ASC,
     /// transport_kind ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_transport_destinations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor(
+            "list_signed_transport_destinations_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8426,22 +8497,16 @@ impl PyEngine {
     /// cursor, as a JSON array, **federation tier only** (the E5
     /// invariant — a local-tier row must never reach the advertise/serve
     /// wire surface). Ordered `(asserted_at ASC, attestation_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_attestations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor("list_attestations_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -8476,22 +8541,20 @@ impl PyEngine {
     /// `SignedIdentityOccurrenceRevocation` wrappers since a cursor, as a
     /// JSON array. Signed rows only; ordered `(revoked_at ASC,
     /// identity_key_id ASC, occurrence_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, limit))]
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_identity_occurrence_revocations_since(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor(
+            "list_signed_identity_occurrence_revocations_since",
+            since_rfc3339,
+            since_id,
+        )?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -19780,14 +19843,28 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — emit a `supersedes` Contribution
-    /// against every prior `key_grant` Contribution issued by
-    /// `actor_key_id`. Uses the engine's composed signer; the
-    /// supersession Contributions carry the prior contribution_ids in
-    /// `rotation_chain` per CEG 0.3 §5.6.8.4 (option b).
+    /// Retire prior key_grants issued by actor_key_id. Returns
+    /// outcome-tagged JSON; "partial" = grants in `failed` are STILL LIVE
+    /// and does NOT raise — branch on `outcome`, never on the non-raise.
     ///
-    /// Returns a JSON-encoded [`RetireKeyGrantsReport`](crate::cirisnode::RetireKeyGrantsReport):
-    /// `{"grants_seen": u, "supersedes_emitted": u, "supersedes_failed": u}`.
+    /// v3.6.0 (CIRISPersist#134) — emits a supersession `key_grant`
+    /// Contribution against every prior `key_grant` Contribution issued by
+    /// `actor_key_id`, using the engine's composed signer; the supersession
+    /// Contributions carry the prior contribution_ids in `rotation_chain`
+    /// per CEG 0.3 §5.6.8.4 (option b).
+    ///
+    /// Returns a JSON-encoded [`RetireKeyGrantsOutcome`](crate::cirisnode::RetireKeyGrantsOutcome),
+    /// tagged on `outcome` — v36.0.0 (#711), replacing the flat
+    /// `{grants_seen, supersedes_emitted, supersedes_failed}` report whose
+    /// failure count was skippable:
+    /// `{"outcome": "complete", "retired": u}` — every prior grant was
+    /// superseded — or `{"outcome": "partial", "retired": u, "failed":
+    /// [{"contribution_id": s, "stage": "prior_payload_decode" |
+    /// "supersession_emission", "error": s}, ...]}`. **`"partial"` means the
+    /// named grants are STILL LIVE** (on a transit grant: the IFAC passphrase
+    /// is NOT revoked); the call raises only for failures BEFORE the batch
+    /// (bad `now_iso`, listing query), so the caller MUST branch on
+    /// `outcome` and never treat a non-raise as retirement.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_retire_key_grants_json(
         &self,
@@ -19814,11 +19891,11 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
-                        let report = backend
+                        let outcome = backend
                             .retire_key_grants(&actor, &*signer, now)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&report).map_err(|e| {
+                        serde_json::to_string(&outcome).map_err(|e| {
                             PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
                         })
                     })
@@ -19829,11 +19906,11 @@ impl PyEngine {
                         crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
                     runtime.block_on(async move {
                         use crate::cirisnode::NodeCoreService;
-                        let report = backend
+                        let outcome = backend
                             .retire_key_grants(&actor, &*signer, now)
                             .await
                             .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&report).map_err(|e| {
+                        serde_json::to_string(&outcome).map_err(|e| {
                             PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
                         })
                     })
@@ -28156,18 +28233,12 @@ impl PyEngine {
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
         limit: u32,
         kind: OperationalKind,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
-            Some(s) => Some(
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            None => None,
-        };
+        let since = parse_pair_cursor("operational_list_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -28179,21 +28250,21 @@ impl PyEngine {
                             match kind {
                                 OperationalKind::Organization => {
                                     let rows = b
-                                        .list_organizations_since(since, limit)
+                                        .list_organizations_since(since.clone(), limit)
                                         .await
                                         .map_err(federation_err_to_py)?;
                                     serde_json::to_string(&rows)
                                 }
                                 OperationalKind::OrgMembership => {
                                     let rows = b
-                                        .list_org_memberships_since(since, limit)
+                                        .list_org_memberships_since(since.clone(), limit)
                                         .await
                                         .map_err(federation_err_to_py)?;
                                     serde_json::to_string(&rows)
                                 }
                                 OperationalKind::PartnerRecord => {
                                     let rows = b
-                                        .list_partner_records_since(since, limit)
+                                        .list_partner_records_since(since.clone(), limit)
                                         .await
                                         .map_err(federation_err_to_py)?;
                                     serde_json::to_string(&rows)
@@ -29059,20 +29130,39 @@ fn rate_limited_message(
     )
 }
 
-/// v31.1.0 (CIRISPersist#655/#662) — the shared `since_rfc3339` decode every
-/// `list_*_since` binding does: an empty string reads as "from the start",
-/// same as `None`, and a malformed instant is a `ValueError` rather than a
-/// silent full scan.
-fn parse_since_rfc3339(
+// v36.0.0 (CIRISPersist#668) — `parse_since_rfc3339` (v31.1.0, #655/#662) is
+// DELETED, not kept: it decoded a bare instant, and after this cut no
+// `list_*_since` binding takes one. Its replacement is `parse_pair_cursor`
+// below. A superseded helper left in place is the next reader's trap — it
+// reads as a supported cursor shape that nothing accepts.
+
+/// v36.0.0 (CIRISPersist#668) — the PAIR cursor every `list_*_since` binding
+/// takes: `(since_rfc3339, since_id)`, both or neither. A half-cursor is
+/// refused rather than guessed — it would page from the start of that
+/// instant and re-serve every row tied at it. `since_id` is the value the
+/// last returned element's resume id field carries (a plane-specific id, or
+/// an opaque compound token for multi-column planes) and is handed back
+/// verbatim.
+fn parse_pair_cursor(
+    method: &str,
     since_rfc3339: Option<&str>,
-) -> PyResult<Option<chrono::DateTime<chrono::Utc>>> {
-    match since_rfc3339.filter(|s| !s.is_empty()) {
-        Some(s) => Ok(Some(
+    since_id: Option<&str>,
+) -> PyResult<Option<(chrono::DateTime<chrono::Utc>, String)>> {
+    let since_at = since_rfc3339.filter(|s| !s.is_empty());
+    let since_id = since_id.filter(|s| !s.is_empty());
+    match (since_at, since_id) {
+        (Some(s), Some(k)) => Ok(Some((
             chrono::DateTime::parse_from_rfc3339(s)
                 .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
                 .with_timezone(&chrono::Utc),
-        )),
-        None => Ok(None),
+            k.to_owned(),
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(format!(
+            "{method}: the cursor is the PAIR (#668) — supply both since_rfc3339 and since_id, \
+             or neither. Half a cursor would page from the start of that instant and re-serve \
+             every row tied at it."
+        ))),
     }
 }
 
@@ -29267,6 +29357,16 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // authority that does not hold" — a partition and a forgery attempt
         // want different operator responses.
         crate::federation::Error::AccordEvidenceUnverified { .. } => PyValueError::new_err(kind),
+        // v36.0.0 (CIRISPersist#674) — the CARRIER-fault sibling: a bundle
+        // structurally impossible against any roster of the declared size
+        // (more participations than seats / two entries for one seat),
+        // refused before any signature verification. Caller-fault input;
+        // ValueError (4xx). Distinct `kind()` from
+        // `accord_evidence_unverified` so a host can tell a malformed
+        // carrier from a partition or a forgery attempt.
+        crate::federation::Error::AccordEvidenceCarrierMalformed { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root

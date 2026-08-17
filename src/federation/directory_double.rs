@@ -430,9 +430,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_organizations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Organization>, Error> {
+    ) -> Result<Vec<ServedOrganization>, Error> {
         if let Some(e) = self.faulted("list_organizations_since") {
             return Err(e);
         }
@@ -440,9 +440,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_org_memberships_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<OrgMembership>, Error> {
+    ) -> Result<Vec<ServedOrgMembership>, Error> {
         if let Some(e) = self.faulted("list_org_memberships_since") {
             return Err(e);
         }
@@ -450,9 +450,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<PartnerRecord>, Error> {
+    ) -> Result<Vec<ServedPartnerRecord>, Error> {
         if let Some(e) = self.faulted("list_partner_records_since") {
             return Err(e);
         }
@@ -460,9 +460,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedPartnerRecord>, Error> {
+    ) -> Result<Vec<ServedSignedPartnerRecord>, Error> {
         if let Some(e) = self.faulted("list_signed_partner_records_since") {
             return Err(e);
         }
@@ -472,9 +472,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_families_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamily>, Error> {
+    ) -> Result<Vec<ServedFamily>, Error> {
         if let Some(e) = self.faulted("list_signed_families_since") {
             return Err(e);
         }
@@ -482,9 +482,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_communities_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunity>, Error> {
+    ) -> Result<Vec<ServedCommunity>, Error> {
         if let Some(e) = self.faulted("list_signed_communities_since") {
             return Err(e);
         }
@@ -492,9 +492,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_location_proofs_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedLocationProof>, Error> {
+    ) -> Result<Vec<ServedLocationProof>, Error> {
         if let Some(e) = self.faulted("list_signed_location_proofs_since") {
             return Err(e);
         }
@@ -504,9 +504,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_family_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamilyMembershipRevocation>, Error> {
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
         if let Some(e) = self.faulted("list_signed_family_membership_revocations_since") {
             return Err(e);
         }
@@ -516,9 +516,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_community_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error> {
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
         if let Some(e) = self.faulted("list_signed_community_membership_revocations_since") {
             return Err(e);
         }
@@ -538,9 +538,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_identity_occurrences_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrence>, Error> {
+    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
         if let Some(e) = self.faulted("list_signed_identity_occurrences_since") {
             return Err(e);
         }
@@ -550,9 +550,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_transport_destinations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+    ) -> Result<Vec<ServedTransportDestination>, Error> {
         if let Some(e) = self.faulted("list_signed_transport_destinations_since") {
             return Err(e);
         }
@@ -562,9 +562,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_attestations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Attestation>, Error> {
+    ) -> Result<Vec<ServedAttestation>, Error> {
         if let Some(e) = self.faulted("list_attestations_since") {
             return Err(e);
         }
@@ -572,9 +572,9 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_identity_occurrence_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error> {
+    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error> {
         if let Some(e) = self.faulted("list_signed_identity_occurrence_revocations_since") {
             return Err(e);
         }
@@ -584,7 +584,7 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedRevocation>, Error> {
         if let Some(e) = self.faulted("list_signed_revocations_since") {
@@ -594,7 +594,7 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     async fn list_signed_accord_quorum_evidence_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error> {
         if let Some(e) = self.faulted("list_signed_accord_quorum_evidence_since") {

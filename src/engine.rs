@@ -6304,6 +6304,35 @@ impl Engine {
         }
     }
 
+    /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
+    /// ATTESTATION-plane apply**: the Key plane's
+    /// [`apply_replicated_key_record`](Self::apply_replicated_key_record)
+    /// twin, for the plane that had none. The apply a replication bridge
+    /// routes an incoming attestation to instead of raw `put_attestation`
+    /// (which keeps its insert-only `Result<(), Error>` semantics for direct
+    /// writes).
+    ///
+    /// Pure dispatch to
+    /// [`FederationDirectory::apply_replicated_attestation`](crate::federation::FederationDirectory::apply_replicated_attestation)
+    /// — the decision core is
+    /// [`plan_replicated_attestation_apply`](crate::federation::attestation_apply)
+    /// (pre-write, pure over `(existing, incoming)`, backend-uniform), so a
+    /// same-id convergence conflict is a typed
+    /// [`AttestationRefusalReason`](crate::federation::attestation_apply::AttestationRefusalReason)
+    /// outcome rather than a `federation_backend` storage error.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_attestation(
+        &self,
+        attestation: crate::federation::SignedAttestation,
+    ) -> Result<
+        crate::federation::attestation_apply::ReplicatedAttestationOutcome,
+        crate::federation::Error,
+    > {
+        self.federation_directory()
+            .apply_replicated_attestation(attestation)
+            .await
+    }
+
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? True iff its `federation_keys` row's
     /// `identity_type` set contains `canonical`. Because the admission gate
@@ -6459,10 +6488,15 @@ impl Engine {
     /// self-authenticating, so serving it ships evidence — the receiver
     /// re-verifies the hybrid scrub signature against its own directory
     /// inside [`Self::deregister_federation_key`].
+    /// v36.0.0 (CIRISPersist#668) — `since` is the
+    /// `(admitted_at, revocation_id)` PAIR from
+    /// [`ServedRevocation::resume_pair`](crate::federation::ServedRevocation::resume_pair):
+    /// resumed on the instant alone, a tie larger than one page silently
+    /// dropped its remainder — on the exclusion plane.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn list_signed_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         self.federation_directory()
@@ -6499,10 +6533,14 @@ impl Engine {
     /// NOT served and never will be — see
     /// [`accord_carriage`](crate::federation::accord_carriage) for why a plane
     /// with no signature of its own must not be replicated.
+    /// v36.0.0 (CIRISPersist#668) — `since` is the
+    /// `(evidence_at, proposal.digest())` PAIR: two proposals whose latest
+    /// vote landed in one instant tie, and a resume on the instant alone
+    /// dropped the tie's remainder at a page boundary.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn list_signed_accord_quorum_evidence_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<
         Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
@@ -6522,7 +6560,11 @@ impl Engine {
     /// serve side is safe: nothing is stored that this node has not re-tallied
     /// itself. Returns what the re-tally found, so a carrier logs a supply
     /// decision rather than inferring one from `Ok(())`. Fail-closed with
-    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified).
+    /// [`Error::AccordEvidenceUnverified`](crate::federation::Error::AccordEvidenceUnverified),
+    /// or — v36.0.0 (CIRISPersist#674) — with
+    /// [`Error::AccordEvidenceCarrierMalformed`](crate::federation::Error::AccordEvidenceCarrierMalformed)
+    /// when the bundle is refused pre-tally for what the carrier sent (more
+    /// participations than the roster has seats / duplicate `member_id`s).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn apply_replicated_accord_quorum_evidence(
         &self,
@@ -13350,14 +13392,16 @@ mod tests {
         );
 
         let delta = sq
-            .list_attestations_since(Some(since), 100)
+            .list_attestations_since(Some((since, trace_id.clone())), 100)
             .await
             .expect("delta read");
         assert!(
-            delta.iter().any(|a| a.attestation_id == trace_id),
+            delta
+                .iter()
+                .any(|a| a.attestation.attestation_id == trace_id),
             "a row promoted after the consumer's cursor passed its asserted_at \
-             must appear in the visibility delta (cursor = COALESCE(promoted_at, \
-             asserted_at))"
+             must appear in the visibility delta (the promote sweep re-stamps \
+             the serve position)"
         );
     }
 

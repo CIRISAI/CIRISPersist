@@ -1316,12 +1316,17 @@ impl NodeCoreService for PostgresBackend {
         actor_key_id: &str,
         signer: &dyn ciris_keyring::HardwareSigner,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<super::RetireKeyGrantsReport, Error> {
+    ) -> Result<super::RetireKeyGrantsOutcome, Error> {
         // CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b
         // from CIRISRegistry#38): each prior grant is retired by
         // emitting a fresh key_grant Contribution whose rotation_chain
         // is extended by the prior contribution_id, with an empty
         // wrapped_dek_base64 as the revocation sentinel.
+        //
+        // v36.0.0 (#711): a per-grant failure never aborts the batch
+        // (the rest still get retired) and never folds into an `Ok`
+        // count a caller can ignore — every unretired grant is carried
+        // in the typed outcome, by id, with stage + error.
         let client = self
             .pool()
             .get()
@@ -1336,10 +1341,8 @@ impl NodeCoreService for PostgresBackend {
             )
             .await
             .map_err(|e| map_pg_error(e, "retire_key_grants list"))?;
-        let mut report = super::RetireKeyGrantsReport {
-            grants_seen: rows.len(),
-            ..Default::default()
-        };
+        let mut retired = 0usize;
+        let mut failed: Vec<super::RetireGrantFailure> = Vec::new();
         for row in rows {
             let contribution_id: String = row.get(0);
             let domain: String = row.get(1);
@@ -1349,13 +1352,17 @@ impl NodeCoreService for PostgresBackend {
                 match serde_json::from_value(payload_json.clone()) {
                     Ok(p) => p,
                     Err(e) => {
-                        report.supersedes_failed += 1;
                         tracing::warn!(
                             error = %e,
                             actor = %actor_key_id,
                             contribution_id = %contribution_id,
                             "ciris-persist v3.6.0 retire_key_grants: prior payload decode failed"
                         );
+                        failed.push(super::RetireGrantFailure {
+                            contribution_id,
+                            stage: super::RetireFailureStage::PriorPayloadDecode,
+                            error: e.to_string(),
+                        });
                         continue;
                     }
                 };
@@ -1371,19 +1378,23 @@ impl NodeCoreService for PostgresBackend {
             )
             .await;
             match outcome {
-                Ok(()) => report.supersedes_emitted += 1,
+                Ok(()) => retired += 1,
                 Err(e) => {
-                    report.supersedes_failed += 1;
                     tracing::warn!(
                         error = %e,
                         actor = %actor_key_id,
                         contribution_id = %contribution_id,
                         "ciris-persist v3.6.0 retire_key_grants: supersession emission failed"
                     );
+                    failed.push(super::RetireGrantFailure {
+                        contribution_id,
+                        stage: super::RetireFailureStage::SupersessionEmission,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
-        Ok(report)
+        Ok(super::RetireKeyGrantsOutcome::from_batch(retired, failed))
     }
 }
 
@@ -3758,13 +3769,16 @@ mod tests {
             None,
         ));
         let signer = LocalSignerHardwareAdapter::new(local);
-        let report = backend
+        let outcome = backend
             .retire_key_grants(&author, &signer, Utc::now())
             .await
             .unwrap();
-        assert_eq!(report.grants_seen, 2);
-        assert_eq!(report.supersedes_emitted, 2);
-        assert_eq!(report.supersedes_failed, 0);
+        assert_eq!(
+            outcome,
+            crate::cirisnode::RetireKeyGrantsOutcome::Complete { retired: 2 },
+            "both prior grants must be retired, and the outcome must SAY so as \
+             the Complete variant — v36.0.0 (#711): Ok alone proves nothing"
+        );
 
         // Confirm the supersession Contributions exist and carry the
         // expected rotation_chain shape + empty wrapped_dek sentinel.
@@ -3816,10 +3830,10 @@ mod tests {
     /// emitter under its own validator: the sentinel copies `scope` from the
     /// prior grant, so it declares `transit_membership` and must satisfy the
     /// same rule. With `ifac_size: None` hard-coded there, `put_contribution`
-    /// refuses the sentinel — and `retire_key_grants` does not propagate that:
-    /// it counts the row into `supersedes_failed`, logs a warning, and returns
-    /// `Ok`. The caller sees a successful retirement that retired nothing,
-    /// which is why `supersedes_failed` is asserted and not just the `Ok`.
+    /// refuses the sentinel — v36.0.0 (#711) made that refusal a distinct
+    /// VARIANT (`Partial`, naming the grant) instead of a skippable counter
+    /// inside `Ok`, so this witness asserts the `Complete` variant and not
+    /// just the `Ok`.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn retire_key_grants_supersedes_a_transit_grant_704() {
@@ -3860,18 +3874,18 @@ mod tests {
             None,
         ));
         let signer = LocalSignerHardwareAdapter::new(local);
-        let report = backend
+        let outcome = backend
             .retire_key_grants(&author, &signer, Utc::now())
             .await
             .unwrap();
-        assert_eq!(report.grants_seen, 1);
         assert_eq!(
-            report.supersedes_failed, 0,
-            "the transit supersession must be EMITTED, not swallowed into \
-             supersedes_failed — a retirement that fails quietly leaves the \
-             passphrase live"
+            outcome,
+            crate::cirisnode::RetireKeyGrantsOutcome::Complete { retired: 1 },
+            "the transit supersession must be EMITTED and the outcome must be \
+             the Complete variant — a retirement that fails quietly leaves the \
+             passphrase live (v36.0.0 #711: the failure set is now in the \
+             type, not a skippable counter)"
         );
-        assert_eq!(report.supersedes_emitted, 1);
 
         // The sentinel is addressed exactly like its prior, so the transit read
         // at the same (netname, epoch) serves both.
@@ -3904,6 +3918,130 @@ mod tests {
             "the sentinel must carry the PRIOR grant's ifac_size — it describes \
              the same interface on the same netname"
         );
+    }
+
+    /// v36.0.0 (#711) — THE PARTIAL VARIANT, WITNESSED. Twin of the sqlite
+    /// witness: one retirable grant plus one legacy transit grant with no
+    /// `ifac_size` (pre-v34.0.0 row class, injected under the write door
+    /// exactly as it exists in a production store). Its supersession
+    /// sentinel copies `ifac_size: None` and the validator refuses it; the
+    /// outcome MUST be `Partial`, naming that grant at the emission stage,
+    /// while the retirable grant is STILL retired. The old shape folded this
+    /// into `Ok` + `supersedes_failed: 1` — indistinguishable from success
+    /// to a `?`-style caller.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn retire_key_grants_partial_names_the_live_grant_711() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut seed = [0u8; 32];
+        let bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
+        seed[..16].copy_from_slice(&bytes);
+        seed[16..].copy_from_slice(&bytes);
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let author = pubkey_b64(&author_key);
+        seed_actor_federation_key(&backend, &author, &author_key).await;
+
+        // The retirable prior — content-addressed, valid under today's door.
+        let sha = fixture_sha_hex(0x71);
+        let good = build_key_grant_contribution(&author_key, &sha, "rec-good");
+        backend.put_contribution(good).await.unwrap();
+
+        // The legacy transit prior: transit_membership scope, NO ifac_size.
+        let netname = format!("ciris-transit-{}", uuid::Uuid::new_v4());
+        let legacy_payload = serde_json::to_value(crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: "rec-legacy".into(),
+            content_sha256: None,
+            epoch: Some(9),
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::TransitMembership,
+            scope_id: netname.clone(),
+            rotation_chain: vec![],
+            ifac_size: None,
+        })
+        .unwrap();
+        let legacy_uuid = uuid::Uuid::new_v4();
+        let client = backend.pool().get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirisnode.contributions (\
+                    contribution_id, contribution_type, domain, language, subject_kind, \
+                    author_id, payload, witness_set, submitted_at, \
+                    signature, signing_key_id, signature_verified, persist_row_hash, \
+                    key_grant_recipient_key_id, key_grant_scope_kind, \
+                    key_grant_scope_id, key_grant_epoch\
+                 ) VALUES ($1, 'proposal', $2, 'en', 'key_grant', $3, $4, NULL, NOW(), \
+                           'sig', $3, TRUE, 'h', 'rec-legacy', 'transit_membership', $5, 9)",
+                &[
+                    &legacy_uuid,
+                    &format!("transit-{netname}"),
+                    &author,
+                    &legacy_payload,
+                    &netname,
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            author_key.clone(),
+            author.clone(),
+            None,
+            None,
+        ));
+        let signer = LocalSignerHardwareAdapter::new(local);
+        let outcome = backend
+            .retire_key_grants(&author, &signer, Utc::now())
+            .await
+            .unwrap();
+        match outcome {
+            crate::cirisnode::RetireKeyGrantsOutcome::Partial { retired, failed } => {
+                assert_eq!(
+                    retired, 1,
+                    "the retirable prior must STILL be retired — one refused \
+                     sentinel must not abort the rest of the batch"
+                );
+                assert_eq!(
+                    failed.len(),
+                    1,
+                    "exactly the legacy grant fails: {failed:?}"
+                );
+                let f = &failed[0];
+                assert_eq!(
+                    f.contribution_id,
+                    legacy_uuid.to_string(),
+                    "the failure must NAME the grant whose material is still live"
+                );
+                assert_eq!(
+                    f.stage,
+                    crate::cirisnode::RetireFailureStage::SupersessionEmission,
+                    "the prior decodes fine; it is the SENTINEL the validator refuses"
+                );
+                assert!(
+                    f.error.contains("ifac_size"),
+                    "the WHY must surface the refusing rule, got: {}",
+                    f.error
+                );
+            }
+            other => panic!("a batch with a refused sentinel must be Partial, got: {other:?}"),
+        }
     }
 
     /// Helper used by retire_key_grants_emits_withdraws_for_actor —

@@ -37,6 +37,10 @@ pub mod accord_quorum;
 pub mod admission;
 pub mod age;
 pub mod at_rest_cascade;
+/// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
+/// ATTESTATION-plane apply (`AttestationRefusalReason` /
+/// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
+pub mod attestation_apply;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
@@ -398,8 +402,12 @@ pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
     EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedKeyRecord, ServedRevocation,
-    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
+    ServedCommunityMembershipRevocation, ServedFamily, ServedFamilyMembershipRevocation,
+    ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation, ServedKeyRecord,
+    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
+    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
+    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
     SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm,
     TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
@@ -875,6 +883,98 @@ pub trait FederationDirectory: Send + Sync {
 
     /// Insert a new attestation row.
     async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error>;
+
+    /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
+    /// Attestation-plane apply**: the Key plane's #565 twin
+    /// ([`Self::apply_replicated_key_record`]), for the plane that had none.
+    ///
+    /// Decides against the currently-stored row BEFORE any write
+    /// ([`attestation_apply::plan_replicated_attestation_apply`], a pure
+    /// function of `(existing, incoming)`), so the verdict does not depend on
+    /// a storage constraint existing (#624 problem 3) and classifies
+    /// identically on every backend (memory / sqlite / postgres run THIS
+    /// default body — none overrides):
+    ///
+    /// - absent id ⇒ `put_attestation` (every admission gate intact) ⇒
+    ///   [`Inserted`](attestation_apply::ReplicatedAttestationOutcome::Inserted) —
+    ///   or, for a CEG §6.1 structural composer whose
+    ///   `(references_attestation_id, type, attester)` triple the store
+    ///   resolved as an idempotent-replay no-op,
+    ///   [`Deduplicated`](attestation_apply::ReplicatedAttestationOutcome::Deduplicated)
+    ///   (verified by re-reading the id: an outcome must not claim an insert
+    ///   that never happened);
+    /// - byte-identical re-offer (the baked-genesis case) ⇒
+    ///   [`Unchanged`](attestation_apply::ReplicatedAttestationOutcome::Unchanged);
+    /// - same id, same signed assertion, same producer, unsigned decoration
+    ///   differs ⇒ `Refused { AlreadyPresentIdentical }`;
+    /// - same id, anything else ⇒ `Refused { ConflictingAttestation }` —
+    ///   first-seen wins, the CIRISEdge#459 convergence conflict, finally a
+    ///   countable mesh fact;
+    /// - a duplicate key the plan did not see (lost plan/act race) ⇒
+    ///   `Refused { StoreConflict }` — fail-closed, safe to re-offer.
+    ///
+    /// A directory that CANNOT answer [`Self::get_attestation`]
+    /// ([`Error::Unsupported`] — the #603 arm) falls back to plan-free apply:
+    /// `put_attestation` + the duplicate-key mapping, exactly the plan-free
+    /// default body of the Key twin. Any OTHER `get_attestation` failure
+    /// propagates as `Err` — *could not ask* is never *absent* (#604).
+    ///
+    /// Refusals are outcomes, not errors, so an apply loop stays total over
+    /// unsolicited rows. Admission-gate failures on a fresh insert keep their
+    /// typed [`Error`]s (each already carries a stable `kind()` token — a
+    /// second copy of that taxonomy here would be the two-lists-that-disagree
+    /// class).
+    async fn apply_replicated_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
+        use attestation_apply::{
+            plan_replicated_attestation_apply, AttestationRefusalReason,
+            ReplicatedAttestationOutcome as Outcome, ReplicatedAttestationPlan as Plan,
+        };
+        let incoming = &attestation.attestation;
+        let attestation_id = incoming.attestation_id.clone();
+        // The §6.1 silent-no-op door only exists for structural composers
+        // that actually carry a references target — precompute the predicate
+        // while `incoming` is still borrowed.
+        let dedup_possible = precedence::is_structural_composer(&incoming.attestation_type)
+            && precedence::references_attestation_id_from_envelope(&incoming.attestation_envelope)
+                .is_some();
+        let planned = match self.get_attestation(&attestation_id).await {
+            Ok(existing) => Some(plan_replicated_attestation_apply(
+                existing.as_ref(),
+                incoming,
+            )?),
+            // The #603 arm: this directory cannot answer, so apply plan-free.
+            Err(Error::Unsupported { .. }) => None,
+            // Every other failure is *could not ask*, which is never *absent*.
+            Err(e) => return Err(e),
+        };
+        match planned {
+            Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
+            Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
+            Some(Plan::Insert) | None => {}
+        }
+        match self.put_attestation(attestation).await {
+            Ok(()) => {
+                // §6.1: a structural-composer replay is a silent `Ok` with NO
+                // row written. Ask the store what it actually did, so
+                // `Inserted` keeps meaning inserted. Skipped on the plan-free
+                // fallback (this directory cannot be asked).
+                if dedup_possible
+                    && planned.is_some()
+                    && self.get_attestation(&attestation_id).await?.is_none()
+                {
+                    return Ok(Outcome::Deduplicated);
+                }
+                Ok(Outcome::Inserted)
+            }
+            Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
+                reason: AttestationRefusalReason::StoreConflict,
+            }),
+            Err(e) => Err(e),
+        }
+    }
 
     /// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — **upsert** a local-tier
     /// self-attestation (singleton current-state): replace any prior
@@ -2084,33 +2184,41 @@ pub trait FederationDirectory: Send + Sync {
 
     /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
     /// `organization` rows since a cursor, for the anti-entropy carrier.
-    /// `since` filters on `asserted_at > since` (None = from the start);
-    /// rows are returned ordered by `(asserted_at ASC, attestation_id
-    /// ASC)` so the cursor is a stable resumption point. `limit` caps the
-    /// page.
+    ///
+    /// v36.0.0 (CIRISPersist#668) — **BREAKING: resumes on THIS node's serve
+    /// position, as a PAIR.** `since` is the `(admitted_at, attestation_id)`
+    /// pair the last-returned row's
+    /// [`ServedOrganization::resume_pair`](crate::federation::ServedOrganization::resume_pair)
+    /// yields (`None` = from the start); the page is ordered by that pair and
+    /// the filter is strictly greater than it, so a tie larger than one page
+    /// resumes correctly instead of skipping its remainder, and a row
+    /// replicated late is stamped ahead of every existing cursor instead of
+    /// sorting under the producer's `asserted_at`, permanently behind it.
+    /// Every remaining `list_*_since` cursor on this trait carries the same
+    /// contract — learn this one, know them all.
     async fn list_organizations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Organization>, Error>;
+    ) -> Result<Vec<ServedOrganization>, Error>;
 
     /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
-    /// `org_membership` rows since a cursor. Same ordering + cursor
-    /// contract as [`Self::list_organizations_since`].
+    /// `org_membership` rows since a cursor. Same ordering + pair-cursor
+    /// contract as [`Self::list_organizations_since`] (#668).
     async fn list_org_memberships_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<OrgMembership>, Error>;
+    ) -> Result<Vec<ServedOrgMembership>, Error>;
 
     /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
-    /// `partner_record` rows since a cursor. Same ordering + cursor
-    /// contract as [`Self::list_organizations_since`].
+    /// `partner_record` rows since a cursor. Same ordering + pair-cursor
+    /// contract as [`Self::list_organizations_since`] (#668).
     async fn list_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<PartnerRecord>, Error>;
+    ) -> Result<Vec<ServedPartnerRecord>, Error>;
 
     /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the
     /// **full [`SignedPartnerRecord`] wrappers** (row + the M-of-N steward
@@ -2124,19 +2232,22 @@ pub trait FederationDirectory: Send + Sync {
     /// `envelope_hash` from JCS bytes identical to the sender's — the
     /// property anti-entropy convergence depends on. Records admitted before
     /// v5.2.0 (admit-only era) carry an empty signature set + `threshold: 0`.
+    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
+    /// `admitted_at` rides on [`ServedSignedPartnerRecord`], never inside
+    /// the signed wrapper.
     async fn list_signed_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedPartnerRecord>, Error>;
+    ) -> Result<Vec<ServedSignedPartnerRecord>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR, CIRISEdge advertise/serve bridge) —
     /// bulk-list the full [`SignedFamily`] wrappers (row + the V110 authority
     /// signature the CIRISPersist#502 E4 gate verified at admission) since a
-    /// cursor. `since` filters on `founded_at > since` (`None` = from the
-    /// start); rows are ordered by `(founded_at ASC, family_key_id ASC)` so
-    /// the cursor is a stable resumption point, mirroring
-    /// [`Self::list_organizations_since`]'s contract. `limit` caps the page.
+    /// cursor. Pair-cursor contract per [`Self::list_organizations_since`]
+    /// (#668): `since` is the `(admitted_at, family_key_id)` pair from
+    /// [`ServedFamily::resume_pair`](crate::federation::ServedFamily::resume_pair).
+    /// `limit` caps the page.
     ///
     /// **Signed rows only.** A `put_family_local` genesis-bake row is
     /// legitimately unsigned (`authority_key_id` NULL) and is never emitted
@@ -2145,53 +2256,57 @@ pub trait FederationDirectory: Send + Sync {
     /// reopens the exact keyless-declaration forgery class E4 closed.
     async fn list_signed_families_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamily>, Error>;
+    ) -> Result<Vec<ServedFamily>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunity`] wrappers since a cursor. Structural mirror of
-    /// [`Self::list_signed_families_since`]: cursor is `founded_at`
-    /// (`founded_at ASC, community_key_id ASC`), signed-rows-only contract
+    /// [`Self::list_signed_families_since`]: pair-cursor on
+    /// `(admitted_at, community_key_id)` (#668), signed-rows-only contract
     /// identical.
     async fn list_signed_communities_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunity>, Error>;
+    ) -> Result<Vec<ServedCommunity>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedLocationProof`] wrappers since a cursor. Structural mirror of
-    /// [`Self::list_signed_families_since`]: cursor is `asserted_at`
-    /// (`asserted_at ASC, subject_key_id ASC`), signed-rows-only contract
-    /// identical.
+    /// [`Self::list_signed_families_since`]: pair-cursor (#668) whose resume
+    /// id is the [`compound_resume_id`](crate::federation::types::compound_resume_id)
+    /// of `(subject_key_id, persist_row_hash)` — the table PK is
+    /// `(subject_key_id, asserted_at)`, one subject holds many proofs —
+    /// signed-rows-only contract identical.
     async fn list_signed_location_proofs_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedLocationProof>, Error>;
+    ) -> Result<Vec<ServedLocationProof>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedFamilyMembershipRevocation`] wrappers since a cursor.
-    /// Structural mirror of [`Self::list_signed_families_since`]: cursor is
-    /// `removed_at` (`removed_at ASC, family_key_id ASC,
-    /// removed_identity_key_id ASC`), signed-rows-only contract identical.
+    /// Structural mirror of [`Self::list_signed_families_since`]:
+    /// pair-cursor (#668) whose resume id is the compound of
+    /// `(family_key_id, removed_identity_key_id)`; signed-rows-only
+    /// contract identical.
     async fn list_signed_family_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamilyMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunityMembershipRevocation`] wrappers since a cursor.
-    /// Structural mirror of [`Self::list_signed_families_since`]: cursor is
-    /// `removed_at` (`removed_at ASC, community_key_id ASC,
-    /// removed_identity_key_id ASC`), signed-rows-only contract identical.
+    /// Structural mirror of [`Self::list_signed_families_since`]:
+    /// pair-cursor (#668) whose resume id is the compound of
+    /// `(community_key_id, removed_identity_key_id)`; signed-rows-only
+    /// contract identical.
     async fn list_signed_community_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error>;
 
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes (edge advertise/serve bridge; extends the
@@ -2244,34 +2359,38 @@ pub trait FederationDirectory: Send + Sync {
     /// `{attesting_key_id, signed_envelope, signature}` container V102
     /// added) since a cursor — the bulk-read mirror of
     /// [`Self::list_signed_identity_occurrences_for`] (which is per-subject).
-    /// `since` filters on `asserted_at > since`; rows are ordered by
-    /// `(asserted_at ASC, identity_key_id ASC, occurrence_key_id ASC)`.
-    /// `limit` caps the page.
+    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
+    /// the resume id is the compound of
+    /// `(identity_key_id, occurrence_key_id)`. `limit` caps the page.
     ///
     /// **Signed rows only**: a [`Self::put_identity_occurrence_local`]
     /// trusted-local row (NULL signature columns) is never emitted — same
     /// contract as the per-subject read.
     async fn list_signed_identity_occurrences_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrence>, Error>;
+    ) -> Result<Vec<ServedIdentityOccurrence>, Error>;
 
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`self_at_login::SignedTransportDestination`] wrappers since a
     /// cursor — the bulk-read mirror of
-    /// [`Self::list_signed_transport_destinations_for`]. `since` filters on
-    /// `asserted_at > since`; rows are ordered by `(asserted_at ASC,
-    /// occurrence_key_id ASC, transport_kind ASC)`. `limit` caps the page.
+    /// [`Self::list_signed_transport_destinations_for`]. Pair-cursor
+    /// contract per [`Self::list_organizations_since`] (#668); the resume id
+    /// is the compound of `(occurrence_key_id, transport_kind)`. `limit`
+    /// caps the page.
     ///
     /// **Signed rows only** (trusted-local NULL-signature rows omitted).
     /// RETIRED rows ARE included — tombstones must gossip, matching
-    /// [`Self::list_signed_transport_destinations_for`].
+    /// [`Self::list_signed_transport_destinations_for`] — and v36.0.0
+    /// (#668) the retire doors MOVE the serve position, so a consumer whose
+    /// cursor had already passed the row is served the tombstone rather than
+    /// keeping the live route forever.
     async fn list_signed_transport_destinations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error>;
+    ) -> Result<Vec<ServedTransportDestination>, Error>;
 
     /// v21.2.0 (CIRISPersist#507c) — bulk-list [`Attestation`] rows since a
     /// cursor, **federation tier only** (`WHERE tier = 'federation'`) — the
@@ -2279,46 +2398,48 @@ pub trait FederationDirectory: Send + Sync {
     /// never reach the advertise/serve wire surface (see
     /// [`replication_policy::WireTier`]).
     ///
-    /// The cursor is the **visibility timestamp**
-    /// `COALESCE(promoted_at, asserted_at)` — filtered `> since`, ordered
-    /// `(visibility ASC, attestation_id ASC)`, mirroring
-    /// [`Self::list_organizations_since`] otherwise. `asserted_at` alone
-    /// would be wrong here (unlike every other `_since` read): a
-    /// consent-promoted row (#509) becomes federation-visible at
-    /// `promoted_at`, possibly long after it was asserted — a pure-delta
-    /// consumer cursoring past its `asserted_at` would otherwise never see
-    /// it. `limit` caps the page.
+    /// The cursor was always half local on this plane —
+    /// `COALESCE(promoted_at, asserted_at)`, because a consent-promoted row
+    /// (#509) becomes federation-visible at `promoted_at`, possibly long
+    /// after it was asserted. v36.0.0 (#668) completes it: the position is
+    /// the V130 `admitted_at` serve position (stamped at admission,
+    /// RE-stamped by the promote sweep and every other consumer-visible
+    /// rewrite), and the resume is the `(admitted_at, attestation_id)` PAIR
+    /// per [`Self::list_organizations_since`]. `limit` caps the page.
     ///
     /// The `Attestation` row carries its own hybrid scrub-signature fields
-    /// inline (same shape as [`KeyRecord`]) — it IS the signed wrapper; no
-    /// separate `SignedAttestation`-shaped read type exists for the bulk
-    /// surface (`SignedAttestation` is write-input-only, `{ attestation:
-    /// Attestation }`).
+    /// inline (same shape as [`KeyRecord`]) — it IS the signed wrapper;
+    /// [`ServedAttestation`] adds only this node's serve position beside it.
     async fn list_attestations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Attestation>, Error>;
+    ) -> Result<Vec<ServedAttestation>, Error>;
 
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
     /// bulk-read mirror of
-    /// [`Self::list_signed_identity_occurrence_revocations_for`]. `since`
-    /// filters on `revoked_at > since`; rows are ordered by `(revoked_at ASC,
-    /// identity_key_id ASC, occurrence_key_id ASC)`. `limit` caps the page.
+    /// [`Self::list_signed_identity_occurrence_revocations_for`].
+    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
+    /// the resume id is the compound of
+    /// `(identity_key_id, occurrence_key_id)`. `limit` caps the page.
     ///
     /// **Signed rows only** (trusted-local NULL-signature rows omitted),
     /// same contract as the per-subject read.
     async fn list_signed_identity_occurrence_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error>;
+    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error>;
 
     /// v31.1.0 (CIRISPersist#655) — bulk-list [`ServedRevocation`]s (one per
-    /// `federation_revocations` row) since a cursor. `since` filters on
-    /// `admitted_at > since` (`None` = from the start); rows are ordered by
-    /// `(admitted_at ASC, revocation_id ASC)`. `limit` caps the page.
+    /// `federation_revocations` row) since a cursor. v36.0.0 (#668) —
+    /// `since` is the `(admitted_at, revocation_id)` PAIR from
+    /// [`ServedRevocation::resume_pair`]; rows are ordered by that pair and
+    /// filtered strictly greater than it. V123 gave this plane the right
+    /// CLOCK; the pair gives it the right RESUME — half-fixed was worse than
+    /// untouched, because a tie larger than one page silently dropped its
+    /// remainder on the EXCLUSION plane. `limit` caps the page.
     ///
     /// # The cursor is THIS NODE's admission order, not the producer's clock
     ///
@@ -2368,20 +2489,21 @@ pub trait FederationDirectory: Send + Sync {
     /// match.
     async fn list_signed_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedRevocation>, Error>;
 
     /// v31.1.0 (CIRISPersist#662) — bulk-list the
     /// [`accord_carriage::AccordQuorumEvidence`] bundles (V091
     /// `accord_proposal` + its `accord_participation` set) since a cursor.
-    /// `since` filters on
-    /// [`AccordQuorumEvidence::evidence_at`](accord_carriage::AccordQuorumEvidence)
-    /// `> since` (`None` = from the start); bundles are ordered by
-    /// `(evidence_at ASC, proposal_digest ASC)`. `limit` caps the page
+    /// v36.0.0 (#668) — `since` is the
+    /// `(evidence_at, proposal.digest())` PAIR (`None` = from the start);
+    /// bundles are ordered by `(evidence_at ASC, proposal_digest ASC)` and
+    /// filtered strictly greater than the pair. `limit` caps the page
     /// (counted in PROPOSALS, not participations). **Resume from the last
-    /// element's `evidence_at`** — it is the only field a caller can resume
-    /// from, and the only one that is correct.
+    /// element's `(evidence_at, proposal.digest())`** — two proposals whose
+    /// latest vote landed in one instant tie, and a resume on the instant
+    /// alone dropped the tie's remainder at a page boundary.
     ///
     /// It is emphatically NOT the proposal's `created_at`: that value is not
     /// on the bundle at all, and cursoring on it would pin a bundle at the
@@ -2408,14 +2530,18 @@ pub trait FederationDirectory: Send + Sync {
     /// serialization is deterministic across backends.
     async fn list_signed_accord_quorum_evidence_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error>;
 
     /// v31.1.0 (CIRISPersist#662) — the RECEIVE half of the evidence plane:
     /// admit a bundle by re-tallying it against this node's own accord roster,
     /// then re-derive this node's own withdrawal tombstones. Fail-closed with
-    /// [`Error::AccordEvidenceUnverified`]; idempotent on replay. See
+    /// [`Error::AccordEvidenceUnverified`] — or, since v36.0.0
+    /// (CIRISPersist#674), [`Error::AccordEvidenceCarrierMalformed`] when the
+    /// bundle is refused pre-tally for what the CARRIER sent (more
+    /// participations than the roster has seats / duplicate `member_id`s);
+    /// idempotent on replay. See
     /// [`accord_carriage::admit_replicated_accord_evidence`], which is the
     /// shared body every backend delegates to.
     ///
@@ -6526,6 +6652,45 @@ pub enum Error {
         reason: String,
     },
 
+    /// v36.0.0 (CIRISPersist#674) — a replicated **accord evidence bundle**
+    /// was REFUSED for what the CARRIER sent, before any signature was
+    /// verified: its participation list is structurally impossible against
+    /// ANY roster of the declared size (more entries than the roster has
+    /// seats, or two entries for one `member_id`).
+    ///
+    /// The distinction from [`Error::AccordEvidenceUnverified`] is the point
+    /// of the variant (the CIRISPersist#565 typed-refusal family): that token
+    /// means "we re-derived the quorum ourselves and it did not hold" — a
+    /// partition, a stale roster, or a forgery attempt. This one means "no
+    /// tally was attempted, because no legitimate serve side can produce this
+    /// bundle" — the serve side orders participations by `member_id`, which
+    /// M6 dedup makes unique within a bundle, and a bundle cannot carry more
+    /// votes than there are seats. An operator hunting a partition must not
+    /// be sent there by a malformed carrier, and vice versa.
+    ///
+    /// Decided BEFORE the re-tally, before roster resolution, and before
+    /// anything lands (fail-closed, nothing stored) — so the hybrid
+    /// Ed25519 + ML-DSA-65 verification work an already-authenticated carrier
+    /// can demand from one bundle is bounded by the declared seat count as a
+    /// structural property, not as a side effect of the tally erroring on
+    /// its first anomaly. Stable `kind()` token
+    /// `accord_evidence_carrier_malformed`.
+    #[error(
+        "replicated accord evidence for proposal {proposal_digest:?} refused BEFORE \
+         verification — the carrier's bundle is malformed ({participations} participation(s) \
+         against {roster_seats} declared accord seat(s)): {reason}"
+    )]
+    AccordEvidenceCarrierMalformed {
+        /// The content-derived digest of the refused proposal.
+        proposal_digest: String,
+        /// How many participations the bundle carried.
+        participations: usize,
+        /// How many seats the declared accord roster has.
+        roster_seats: usize,
+        /// Which structural rule the bundle broke.
+        reason: String,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -6880,6 +7045,7 @@ impl Error {
                 "canonical_withdrawal_authority_invalid"
             }
             Error::AccordEvidenceUnverified { .. } => "accord_evidence_unverified",
+            Error::AccordEvidenceCarrierMalformed { .. } => "accord_evidence_carrier_malformed",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
@@ -6898,6 +7064,13 @@ impl Error {
     /// The one predicate for *"the row is already there, written by somebody
     /// else"*, so that every caller which must treat a duplicate as SUCCESS
     /// asks the same question in the same words.
+    ///
+    /// v36.0.0 (CIRISPersist#624) — also the store-step arm of
+    /// [`FederationDirectory::apply_replicated_attestation`], which maps a
+    /// duplicate the pre-write plan did not see to the typed
+    /// `Refused { StoreConflict }` outcome. The semantic classification #624
+    /// asked for lives THERE (decided pre-write, above the backends); this
+    /// predicate stays the single spelling of the raw storage fact.
     ///
     /// # Why a string predicate and not a typed variant
     ///
