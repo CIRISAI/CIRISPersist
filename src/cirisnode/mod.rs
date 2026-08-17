@@ -79,7 +79,9 @@ pub use media_sharing::{
     MultimediaConfigWire, TakedownNoticePayload, WrapAlgorithm, IFAC_SIZE_MAX_BITS,
     IFAC_SIZE_MIN_BITS, KEY_GRANT_SUBJECT_KIND, TAKEDOWN_NOTICE_SUBJECT_KIND,
 };
-pub use service::{NodeCoreService, RetireKeyGrantsReport};
+pub use service::{
+    NodeCoreService, RetireFailureStage, RetireGrantFailure, RetireKeyGrantsOutcome,
+};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use takedown_handler::{
     process_takedown_admission, process_takedown_admission_with_config, TakedownReport,

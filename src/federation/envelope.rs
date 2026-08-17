@@ -46,6 +46,43 @@ pub mod paths {
     pub const SUCCESSOR_KEYS: &str = "successor_keys";
     /// Withdraws composer: the producer's stated reason.
     pub const WITHDRAWAL_REASON: &str = "withdrawal_reason";
+    /// v36.0.0 (CIRISPersist#642) — **the CONSENT-CAUSAL EDGE**: the
+    /// `attestation_id` of the prior `consent:state:*` statement this one
+    /// supersedes. Read by [`crate::federation::consent::causal_edge`] and by
+    /// nothing else.
+    ///
+    /// # Why this is a NEW key and not [`REFERENCES_ATTESTATION_ID`]
+    ///
+    /// The obvious implementation of #642 reuses the CEG §3.2 composer pointer
+    /// — same meaning ("the row I replace"), same reader, no envelope cost.
+    /// **It was written that way first and a gate refused it**, which is the
+    /// reason this constant exists rather than a fourth reading of that one.
+    ///
+    /// CC 4.5.1.1 (rc3) admits `references_attestation_id`'s polysemy only as
+    /// an OP SPLIT: the pointer's meaning is enumerated per emitting operation,
+    /// and persist's table
+    /// ([`crate::federation::namespace::supersets::PERSIST_AUTHORED_AXIS_CLASSIFICATIONS`])
+    /// carries exactly three rows — `withdraws`, `recants`, `supersedes`. A
+    /// `consent:state:*` row is a `scores` row, so reading the pointer there is
+    /// a FOURTH operation, and the ruling attaches a falsifier to precisely
+    /// that: *"if any processor is found reading the pointer without the
+    /// discriminator, op-separation has failed empirically and the remedy is
+    /// the field split, envelope cost accepted."*
+    /// [`every_pointer_read_is_discriminator_guarded`](crate::federation::namespace::supersets)
+    /// is that falsifier made mechanical, and it fired on the first attempt.
+    ///
+    /// So the remedy the constitution names is the one taken here: a separate
+    /// wire field, envelope cost accepted. The consent plane gets its own slot,
+    /// the composer pointer keeps its three admitted readings, and persist adds
+    /// no unilateral fourth. The name is PLANE-SCOPED (`consent_`) on purpose —
+    /// a generic `supersedes_attestation_id` would invite the next plane to
+    /// reuse it, which is how the field being split here became polysemous in
+    /// the first place.
+    ///
+    /// Unlike [`ASSERTED_AT`] this key needs no binding gate and no migration:
+    /// it exists ONLY inside the signed envelope and has no row-column twin, so
+    /// a relay cannot add, remove or repoint it without breaking the signature.
+    pub const CONSENT_SUPERSEDES: &str = "consent_supersedes";
     /// v21.9.0 (CIRISPersist#519 item 2 field-hoist) — the CI
     /// recipient-RECEIVE axis: how a consented payload is delivered
     /// (edge-owned processor `reachability.rs`; persist types it). Hoisted
@@ -303,6 +340,15 @@ pub struct EnvelopeCore {
     /// [`paths::WITHDRAWAL_REASON`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_reason: Option<String>,
+    /// [`paths::CONSENT_SUPERSEDES`] — v36.0.0 (#642). The `attestation_id` of
+    /// the prior consent statement this `consent:state:*` row supersedes.
+    /// Typed here so a local producer that stamps a non-string is refused at
+    /// the emit door; a FOREIGN row carrying junk is stored verbatim and fails
+    /// CLOSED at the fold instead (see
+    /// [`crate::federation::consent::ConsentCausalEdge::Unusable`]).
+    /// Byte-invariant: `None` ⇒ no key ⇒ identical JCS bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_supersedes: Option<String>,
     /// [`paths::DELIVERY_MODE`] — v21.9.0 (#519 field-hoist). Typed here
     /// (was untyped `extra`); the PROCESSOR is edge's
     /// (`reachability.rs#ReachabilityTracker`). Byte-invariant: `None` ⇒ no
@@ -745,6 +791,7 @@ fn fully_populated_core() -> EnvelopeCore {
         recovers: Some("old-root".into()),
         successor_keys: Some(vec!["k1".into()]),
         withdrawal_reason: Some("test".into()),
+        consent_supersedes: Some("prior-consent-1".into()),
         delivery_mode: Some("mandatory".into()),
         deletion_window: Some("2027-01-01T00:00:00Z".into()),
         asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
@@ -785,6 +832,7 @@ mod tests {
             (paths::RECOVERS, true),
             (paths::SUCCESSOR_KEYS, true),
             (paths::WITHDRAWAL_REASON, true),
+            (paths::CONSENT_SUPERSEDES, true),
             (paths::DELIVERY_MODE, true),
             (paths::DELETION_WINDOW, true),
             (paths::ASSERTED_AT, true),
@@ -906,6 +954,16 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             paths::RECOVERS,
             paths::SUCCESSOR_KEYS,
             paths::WITHDRAWAL_REASON,
+            // v36.0.0 (CIRISPersist#642) — the CONSENT-CAUSAL EDGE. Added
+            // DELIBERATELY, re-pinning `ENVELOPE_VOCABULARY_SHA256` for the
+            // same reason #598 added `asserted_at`: this key DECIDES which of
+            // two consent statements wins, and an ordering key that decides
+            // consent must be part of the vocabulary both sides agree on
+            // rather than an extension one side invented. Consumers asserting
+            // the old hash break loudly, which is the point — a producer that
+            // has not adopted keeps emitting edgeless revocations and keeps the
+            // 300s race it thinks it does not have.
+            paths::CONSENT_SUPERSEDES,
             // v31.0.0 (CIRISPersist#658) — the two v21.9.0 field-hoists, five
             // releases late. `delivery_mode` and `deletion_window` became
             // TYPED `EnvelopeCore` fields in v21.9.0 (#519 item 2) and were
@@ -984,8 +1042,21 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// moving twice in this cut and the consumers that break (`/v1/health`, the
 /// cross-repo harness) are the same ones. Deferring would have broken them a
 /// THIRD time for two keys.
+/// v36.0.0 (CIRISPersist#642) — **RE-PINNED**, and the reason is #598's
+/// verbatim: an ordering key that decides consent must be part of the
+/// vocabulary both sides agree on. [`paths::CONSENT_SUPERSEDES`] joined
+/// `universal_paths` — the key a revocation names its grant with, which is what
+/// replaces a 300s wall-clock race with a causal edge. Consumers asserting the
+/// old hash BREAK, deliberately: a consumer that has not adopted is a consumer
+/// still emitting edgeless revocations, and it should learn that loudly rather
+/// than keep a race it believes it has closed.
+///
+/// The key is a NEW field rather than a fourth reading of
+/// `references_attestation_id` because CC 4.5.1.1's revision condition says so
+/// — see [`paths::CONSENT_SUPERSEDES`] for the ruling and the gate that
+/// enforced it.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "1213fd3cf3109df92805cb1f6b0e39ae7637812b4fba23206a7860ba381107b2";
+    "c159bc2ec76176c8573b24b4052c5f0b93e3dae75d615f2d221c1f460a2d7cac";
 
 #[cfg(test)]
 mod vocab_tests {

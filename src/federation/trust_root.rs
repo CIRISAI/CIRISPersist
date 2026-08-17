@@ -595,35 +595,27 @@ pub(crate) fn scope_contains(envelope: &serde_json::Value, token: &str) -> bool 
         .is_some_and(|s| s.contains(token))
 }
 
-/// Fold the CEG tombstones over `rows`: an attestation is DEAD when a
-/// `withdraws` / `recants` composer (precedence-winning, same-attester
-/// authority is enforced at composer admission) references its id.
-/// Returns the set of dead `attestation_id`s. `pub(crate)` so the composed
-/// [`capability_roots_to_trusted_root`] walk shares the ONE tombstone fold
-/// (the module's single-authority discipline — never forked, per #483).
+/// Fold the CEG tombstones over `rows`: an attestation is DEAD when an
+/// ENTITLED `withdraws` / `recants` composer wins §6.1 precedence against
+/// its id. Returns the set of dead `attestation_id`s. `pub(crate)` so the
+/// composed [`capability_roots_to_trusted_root`] walk shares the ONE
+/// tombstone fold (the module's single-authority discipline — never forked,
+/// per #483).
+///
+/// v36.0.0 (CIRISPersist#686) — delegates to the CONSOLIDATED fold
+/// [`precedence::retired_ids`]. This fold used to apply precedence with NO
+/// entitlement check, and its own doc claimed "same-attester authority is
+/// enforced at composer admission" — which was true only for a locally
+/// PRESENT target; a `withdraws` admitted through the out-of-order deferral
+/// window carried no resolved authority, and on this module's two
+/// many-attester `list_attestations_for` slices that let a foreign,
+/// unentitled key sever a conferral (`capability_roots_to_trusted_root_over_roster`)
+/// or silently empty a family charter's quorum candidate set BEFORE the
+/// tally ran (`about_dead` → `charter_shaped`). Both are pinned by the #686
+/// witnesses (`exercise_foreign_retraction_cannot_sever_conferral` /
+/// `exercise_foreign_retraction_cannot_sever_charter`).
 pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet<String> {
-    use std::collections::HashMap;
-    let mut by_target: HashMap<&str, Vec<&Attestation>> = HashMap::new();
-    for row in rows {
-        if precedence::is_structural_composer(&row.attestation_type) {
-            if let Some(target) =
-                precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
-            {
-                by_target.entry(target).or_default().push(row);
-            }
-        }
-    }
-    let mut dead = std::collections::HashSet::new();
-    for (target, composers) in by_target {
-        if let Some(winner) = precedence::precedence_winner(&composers) {
-            if winner.attestation_type == attestation_type::WITHDRAWS
-                || winner.attestation_type == attestation_type::RECANTS
-            {
-                dead.insert(target.to_owned());
-            }
-        }
-    }
-    dead
+    precedence::retired_ids(rows)
 }
 
 /// v24.0.0 (CIRISPersist#557) — does `root_ref` name a constitutional family

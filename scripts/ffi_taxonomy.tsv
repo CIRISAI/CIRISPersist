@@ -121,6 +121,7 @@ Engine	aggregate_scoring_factors_batch	axiotic
 Engine	aggregate_scoring_factors_stream	axiotic	
 Engine	aggregate_scrub_stats	axiotic	
 Engine	apply_replicated_accord_evidence	deontic
+Engine	apply_replicated_attestation	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	attach_attestation_pqc_signature	ontological
 Engine	attach_key_pqc_signature	ontological	

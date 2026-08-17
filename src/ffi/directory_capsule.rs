@@ -206,6 +206,31 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// compatibility, would keep the vulnerability alive in exactly the
 /// consumers slowest to upgrade.
 ///
+/// v3 (v36.0.0, CIRISPersist#675) is the payload-type form of the same
+/// break: [`DirectoryOpResult::AccordEvidenceAdmitted`] kept its name, but
+/// its payload
+/// [`AccordEvidenceAdmission`](crate::federation::accord_carriage::AccordEvidenceAdmission)
+/// replaced `participations_admitted` — a differencing count that
+/// mis-attributed under concurrent admissions — with the check-time-novelty
+/// [`effect`](crate::federation::accord_carriage::AccordAdmissionEffect)
+/// enum, which is what a consumer actually keyed the counter for
+/// (Admitted-vs-Duplicate, per admission). An older consumer deserializes
+/// the old struct with a non-defaulted field the new host no longer sends,
+/// so its well-formed op fails on the hot path unless the load-time gate
+/// says so first. The same version also carries growth that rides free:
+/// [`DirectoryOpResult::AccordEvidenceCarrierRefused`] (CIRISPersist#674).
+///
+/// v3 also carries the v2 break applied to the WHOLE cursor family
+/// (v36.0.0, CIRISPersist#668): every remaining `List*Since` op takes the
+/// `(serve position, resume id)` pair instead of a bare instant, and every
+/// cursor result variant carries `Served*` wrappers (the record plus THIS
+/// node's `admitted_at` beside it, never inside it). Broken in place for
+/// the v2 reason verbatim: the old instant-only cursors ARE the #668/#682
+/// defect (a tie larger than one page loses its remainder; a row
+/// replicated late is never served past its producer's timestamp), and
+/// preserving a reachable path to a known under-serving read would keep
+/// the vulnerability alive in exactly the consumers slowest to upgrade.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -218,7 +243,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 2;
+pub const DIRECTORY_ABI_VERSION: u32 = 3;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -330,14 +355,14 @@ pub enum DirectoryOp {
     /// [`FederationDirectory::list_org_memberships_since`].
     ListOrgMembershipsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
     /// [`FederationDirectory::list_organizations_since`].
     ListOrganizationsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -690,7 +715,7 @@ pub enum DirectoryOp {
     /// advertise/serve responder. Result rides `SignedFamilies`. APPEND-ONLY.
     ListSignedFamiliesSince {
         /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -700,7 +725,7 @@ pub enum DirectoryOp {
     /// APPEND-ONLY.
     ListSignedCommunitiesSince {
         /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -710,7 +735,7 @@ pub enum DirectoryOp {
     /// APPEND-ONLY.
     ListSignedLocationProofsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -720,7 +745,7 @@ pub enum DirectoryOp {
     /// `SignedFamilyMembershipRevocations`. APPEND-ONLY.
     ListSignedFamilyMembershipRevocationsSince {
         /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -730,7 +755,7 @@ pub enum DirectoryOp {
     /// `SignedCommunityMembershipRevocations`. APPEND-ONLY.
     ListSignedCommunityMembershipRevocationsSince {
         /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -757,7 +782,7 @@ pub enum DirectoryOp {
     /// `SignedIdentityOccurrences`. APPEND-ONLY.
     ListSignedIdentityOccurrencesSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -767,7 +792,7 @@ pub enum DirectoryOp {
     /// `SignedTransportDestinationsSince`. APPEND-ONLY.
     ListSignedTransportDestinationsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -776,7 +801,7 @@ pub enum DirectoryOp {
     /// invariant). Result rides `Attestations`. APPEND-ONLY.
     ListAttestationsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -786,7 +811,7 @@ pub enum DirectoryOp {
     /// `SignedIdentityOccurrenceRevocationsSince`. APPEND-ONLY.
     ListSignedIdentityOccurrenceRevocationsSince {
         /// Cursor: rows with `revoked_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -831,7 +856,7 @@ pub enum DirectoryOp {
     /// `SignedRevocations`. APPEND-ONLY.
     ListSignedRevocationsSince {
         /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
     },
@@ -840,7 +865,7 @@ pub enum DirectoryOp {
     /// Result rides `AccordQuorumEvidence`. APPEND-ONLY.
     ListSignedAccordQuorumEvidenceSince {
         /// Cursor: bundles with `evidence_at > since` (None ⇒ from start).
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap, counted in PROPOSALS.
         limit: u32,
     },
@@ -898,9 +923,9 @@ pub enum DirectoryOpResult {
     /// `peer_metadata_for`.
     PeerMetadata(Option<PeerMetadataRow>),
     /// `list_org_memberships_since`.
-    OrgMemberships(Vec<OrgMembership>),
+    OrgMemberships(Vec<crate::federation::ServedOrgMembership>),
     /// `list_organizations_since`.
-    Organizations(Vec<Organization>),
+    Organizations(Vec<crate::federation::ServedOrganization>),
     /// `list_held_fountain_content`.
     FountainHeld(Vec<FountainHeldMeta>),
     /// `evict_fountain_content_to_tier`,
@@ -976,34 +1001,38 @@ pub enum DirectoryOpResult {
     /// `list_signed_families_since` (v21.0.0, CIRISPersist#504 FLOOR) — the
     /// full signed-family wrappers (row + V110 authority signature) for the
     /// edge advertise/serve responder. APPEND-ONLY.
-    SignedFamilies(Vec<SignedFamily>),
+    SignedFamilies(Vec<crate::federation::ServedFamily>),
     /// `list_signed_communities_since` (v21.0.0, CIRISPersist#504 FLOOR).
     /// APPEND-ONLY.
-    SignedCommunities(Vec<SignedCommunity>),
+    SignedCommunities(Vec<crate::federation::ServedCommunity>),
     /// `list_signed_location_proofs_since` (v21.0.0, CIRISPersist#504 FLOOR).
     /// APPEND-ONLY.
-    SignedLocationProofs(Vec<SignedLocationProof>),
+    SignedLocationProofs(Vec<crate::federation::ServedLocationProof>),
     /// `list_signed_family_membership_revocations_since` (v21.0.0,
     /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedFamilyMembershipRevocations(Vec<SignedFamilyMembershipRevocation>),
+    SignedFamilyMembershipRevocations(Vec<crate::federation::ServedFamilyMembershipRevocation>),
     /// `list_signed_community_membership_revocations_since` (v21.0.0,
     /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedCommunityMembershipRevocations(Vec<SignedCommunityMembershipRevocation>),
+    SignedCommunityMembershipRevocations(
+        Vec<crate::federation::ServedCommunityMembershipRevocation>,
+    ),
     /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
     SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
     /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
-    SignedIdentityOccurrencesSince(Vec<SignedIdentityOccurrence>),
+    SignedIdentityOccurrencesSince(Vec<crate::federation::ServedIdentityOccurrence>),
     /// `list_signed_transport_destinations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
-    SignedTransportDestinationsSince(Vec<self_at_login::SignedTransportDestination>),
+    SignedTransportDestinationsSince(Vec<crate::federation::ServedTransportDestination>),
     /// `list_attestations_since` (v21.1.0, CIRISPersist#507c) — federation-
     /// tier-only rows. APPEND-ONLY.
-    Attestations(Vec<Attestation>),
+    Attestations(Vec<crate::federation::ServedAttestation>),
     /// `list_signed_identity_occurrence_revocations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
-    SignedIdentityOccurrenceRevocationsSince(Vec<SignedIdentityOccurrenceRevocation>),
+    SignedIdentityOccurrenceRevocationsSince(
+        Vec<crate::federation::ServedIdentityOccurrenceRevocation>,
+    ),
     /// `lookup_signed_record_by_content_hash` (v21.1.0, CIRISPersist#507b) —
     /// the re-serialized record bytes, or `None` on a miss/index-mismatch.
     /// APPEND-ONLY.
@@ -1040,6 +1069,23 @@ pub enum DirectoryOpResult {
         /// The content-derived digest of the refused proposal.
         proposal_digest: String,
         /// Why the receiver's own re-derivation failed.
+        reason: String,
+    },
+    /// v36.0.0 (CIRISPersist#674) — the CARRIER-fault refusal of replicated
+    /// accord evidence, carried across the ABI as itself for the same reason
+    /// as [`DirectoryOpResult::AccordEvidenceRefused`]: the whole point of
+    /// [`Error::AccordEvidenceCarrierMalformed`](crate::federation::Error::AccordEvidenceCarrierMalformed)
+    /// is that an operator can tell a malformed carrier from a partition,
+    /// and a kind that flattens crossing the capsule cannot draw that line.
+    /// APPEND-ONLY.
+    AccordEvidenceCarrierRefused {
+        /// The content-derived digest of the refused proposal.
+        proposal_digest: String,
+        /// How many participations the bundle carried.
+        participations: usize,
+        /// How many seats the declared accord roster has.
+        roster_seats: usize,
+        /// Which structural rule the bundle broke.
         reason: String,
     },
 }
@@ -1344,13 +1390,25 @@ pub async fn dispatch_directory_op(
             .await
             {
                 Ok(v) => DirectoryOpResult::AccordEvidenceAdmitted(v),
-                // The typed refusal crosses as itself; everything else
-                // flattens. See `AccordEvidenceRefused`.
+                // The typed refusals cross as themselves; everything else
+                // flattens. See `AccordEvidenceRefused` /
+                // `AccordEvidenceCarrierRefused`.
                 Err(Error::AccordEvidenceUnverified {
                     proposal_digest,
                     reason,
                 }) => DirectoryOpResult::AccordEvidenceRefused {
                     proposal_digest,
+                    reason,
+                },
+                Err(Error::AccordEvidenceCarrierMalformed {
+                    proposal_digest,
+                    participations,
+                    roster_seats,
+                    reason,
+                }) => DirectoryOpResult::AccordEvidenceCarrierRefused {
+                    proposal_digest,
+                    participations,
+                    roster_seats,
                     reason,
                 },
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2220,9 +2278,9 @@ impl FederationDirectory for OpsDirectory {
 
     async fn list_organizations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Organization>, Error> {
+    ) -> Result<Vec<crate::federation::ServedOrganization>, Error> {
         match self
             .run_op(&DirectoryOp::ListOrganizationsSince { since, limit })
             .await?
@@ -2237,9 +2295,9 @@ impl FederationDirectory for OpsDirectory {
 
     async fn list_org_memberships_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<OrgMembership>, Error> {
+    ) -> Result<Vec<crate::federation::ServedOrgMembership>, Error> {
         match self
             .run_op(&DirectoryOp::ListOrgMembershipsSince { since, limit })
             .await?
@@ -3053,9 +3111,9 @@ impl FederationDirectory for OpsDirectory {
     /// via the capsule, for the edge advertise/serve responder.
     async fn list_signed_families_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamily>, Error> {
+    ) -> Result<Vec<crate::federation::ServedFamily>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedFamiliesSince { since, limit })
             .await?
@@ -3072,9 +3130,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_families_since`].
     async fn list_signed_communities_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunity>, Error> {
+    ) -> Result<Vec<crate::federation::ServedCommunity>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedCommunitiesSince { since, limit })
             .await?
@@ -3091,9 +3149,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_families_since`].
     async fn list_signed_location_proofs_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedLocationProof>, Error> {
+    ) -> Result<Vec<crate::federation::ServedLocationProof>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedLocationProofsSince { since, limit })
             .await?
@@ -3110,9 +3168,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_families_since`].
     async fn list_signed_family_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedFamilyMembershipRevocation>, Error> {
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipRevocation>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit })
             .await?
@@ -3129,9 +3187,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_families_since`].
     async fn list_signed_community_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error> {
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipRevocation>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit })
             .await?
@@ -3167,7 +3225,7 @@ impl FederationDirectory for OpsDirectory {
     /// routed. Structural mirror of [`Self::list_signed_key_records_since`].
     async fn list_signed_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::ServedRevocation>, Error> {
         match self
@@ -3185,7 +3243,7 @@ impl FederationDirectory for OpsDirectory {
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor, routed.
     async fn list_signed_accord_quorum_evidence_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::accord_carriage::AccordQuorumEvidence>, Error> {
         match self
@@ -3215,14 +3273,26 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::AccordEvidenceAdmitted(v) => Ok(v),
-            // Reconstructed as the SAME typed error the far side raised, so
-            // `kind()` is `accord_evidence_unverified` on both sides of the
-            // ABI. A carrier keys its retry/quarantine decision on that token.
+            // Reconstructed as the SAME typed errors the far side raised, so
+            // `kind()` reads `accord_evidence_unverified` /
+            // `accord_evidence_carrier_malformed` on both sides of the ABI.
+            // A carrier keys its retry/quarantine decision on those tokens.
             DirectoryOpResult::AccordEvidenceRefused {
                 proposal_digest,
                 reason,
             } => Err(Error::AccordEvidenceUnverified {
                 proposal_digest,
+                reason,
+            }),
+            DirectoryOpResult::AccordEvidenceCarrierRefused {
+                proposal_digest,
+                participations,
+                roster_seats,
+                reason,
+            } => Err(Error::AccordEvidenceCarrierMalformed {
+                proposal_digest,
+                participations,
+                roster_seats,
                 reason,
             }),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
@@ -3236,9 +3306,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_key_records_since`].
     async fn list_signed_identity_occurrences_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrence>, Error> {
+    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit })
             .await?
@@ -3255,9 +3325,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_key_records_since`].
     async fn list_signed_transport_destinations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+    ) -> Result<Vec<crate::federation::ServedTransportDestination>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedTransportDestinationsSince { since, limit })
             .await?
@@ -3275,9 +3345,9 @@ impl FederationDirectory for OpsDirectory {
     /// (the E5 invariant).
     async fn list_attestations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<Attestation>, Error> {
+    ) -> Result<Vec<crate::federation::ServedAttestation>, Error> {
         match self
             .run_op(&DirectoryOp::ListAttestationsSince { since, limit })
             .await?
@@ -3294,9 +3364,9 @@ impl FederationDirectory for OpsDirectory {
     /// [`Self::list_signed_key_records_since`].
     async fn list_signed_identity_occurrence_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error> {
+    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, Error> {
         match self
             .run_op(&DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit })
             .await?
@@ -3407,18 +3477,18 @@ impl FederationDirectory for OpsDirectory {
     }
     async fn list_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<PartnerRecord>, Error> {
+    ) -> Result<Vec<crate::federation::ServedPartnerRecord>, Error> {
         Err(Error::Unsupported {
             method: "list_partner_records_since",
         })
     }
     async fn list_signed_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<SignedPartnerRecord>, Error> {
+    ) -> Result<Vec<crate::federation::ServedSignedPartnerRecord>, Error> {
         Err(Error::Unsupported {
             method: "list_signed_partner_records_since",
         })
@@ -3893,25 +3963,159 @@ mod tests {
         assert!(format!("{rebuilt}").contains("digest-abc"));
     }
 
+    /// v36.0.0 (CIRISPersist#674) — the CARRIER-fault refusal kind survives
+    /// the ABI too, counts included. Same shape as
+    /// [`accord_refusal_kind_survives_the_capsule_662`]: the whole point of
+    /// the variant is that an operator can tell a malformed carrier from a
+    /// partition, and a kind that flattens to `federation_backend` crossing
+    /// the capsule cannot draw that line.
+    #[test]
+    fn accord_carrier_refusal_kind_survives_the_capsule_674() {
+        let refused = DirectoryOpResult::AccordEvidenceCarrierRefused {
+            proposal_digest: "digest-def".into(),
+            participations: 4,
+            roster_seats: 3,
+            reason: "a bundle cannot carry more participations than the accord roster has seats"
+                .into(),
+        };
+        // The exact reconstruction the proxy arm performs.
+        let rebuilt = match refused {
+            DirectoryOpResult::AccordEvidenceCarrierRefused {
+                proposal_digest,
+                participations,
+                roster_seats,
+                reason,
+            } => Error::AccordEvidenceCarrierMalformed {
+                proposal_digest,
+                participations,
+                roster_seats,
+                reason,
+            },
+            other => panic!("expected AccordEvidenceCarrierRefused, got {other:?}"),
+        };
+        assert_eq!(
+            rebuilt.kind(),
+            "accord_evidence_carrier_malformed",
+            "a malformed carrier and a partition want different operator responses"
+        );
+        let msg = format!("{rebuilt}");
+        assert!(
+            msg.contains("digest-def")
+                && msg.contains("4 participation(s)")
+                && msg.contains("3 declared accord seat(s)"),
+            "the counts survive the crossing: {msg}"
+        );
+    }
+
+    /// v36.0.0 (CIRISPersist#674) — the carrier refusal END TO END: proxy →
+    /// C-ABI → host dispatch → the pre-tally carrier bound → typed result →
+    /// proxy reconstruction. The two unit tests above each replicate ONE arm
+    /// by hand, so deleting the real dispatch arm (or the proxy's) would
+    /// leave them green while every capsule consumer read
+    /// `federation_backend` — the witness-measures-a-neighbouring-gate trap.
+    /// This one goes red under exactly those deletions.
+    #[test]
+    fn accord_carrier_refusal_round_trips_the_capsule_674() {
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        // One resolvable accord seat, so the step-(0) posture gate passes and
+        // the refusal under test is the one that answers.
+        let seat = crate::federation::admission::accord_holder_roster_key_ids()[0].clone();
+        rt.block_on(dir.put_public_key(SignedKeyRecord {
+            record: sample_key_record(&seat),
+        }))
+        .expect("register one accord seat");
+
+        // Four participations against three declared seats — junk on purpose:
+        // the bound is decided before any signature is verified, so nothing
+        // here needs to (or could) verify.
+        let proposal = ciris_verify_core::accord_live_quorum::AccordProposal {
+            family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+                .to_owned(),
+            action: ciris_verify_core::accord_live_quorum::AccordAction::RosterChange,
+            nonce: "carrier-capsule-nonce".into(),
+            window_until: "2031-01-01T00:00:00Z".into(),
+            prior_family_digest: "prior".into(),
+            payload_sha256: "00".repeat(32),
+        };
+        let digest = proposal.digest();
+        let participations: Vec<_> = (0..4)
+            .map(
+                |i| ciris_verify_core::accord_live_quorum::AccordParticipation {
+                    family_key_id: proposal.family_key_id.clone(),
+                    proposal_digest: digest.clone(),
+                    member_id: format!("ghost-{i}"),
+                    vote: ciris_verify_core::accord_live_quorum::Vote::Yes,
+                    window_until: proposal.window_until.clone(),
+                    signed_at: "2025-06-01T00:00:00Z".into(),
+                    signature: ciris_verify_core::threshold::ThresholdSignature {
+                        member_id: format!("ghost-{i}"),
+                        ed25519_signature_base64: String::new(),
+                        mldsa65_signature_base64: None,
+                    },
+                },
+            )
+            .collect();
+        let evidence = crate::federation::accord_carriage::AccordQuorumEvidence {
+            proposal,
+            authority_signature: None,
+            participations,
+            evidence_at: chrono::Utc::now(),
+        };
+
+        let err = rt
+            .block_on(proxy.apply_replicated_accord_evidence(&evidence))
+            .expect_err("an overbroad bundle must be refused through the capsule too");
+        assert_eq!(
+            err.kind(),
+            "accord_evidence_carrier_malformed",
+            "the CARRIER kind must survive the full ABI round trip: {err}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("4 participation(s)") && msg.contains("3 declared accord seat(s)"),
+            "and it still names the counts: {msg}"
+        );
+        // Pre-write through this door as well.
+        assert!(
+            rt.block_on(dir.get_accord_proposal(&digest))
+                .expect("direct read")
+                .is_none(),
+            "a carrier-refused bundle stores nothing, whichever door offered it"
+        );
+    }
+
     /// v32.0.0 (CIRISPersist#682) — bumped 1 → 2 because
     /// `ListSignedKeyRecordsSince` changed SHAPE in place (bare instant →
     /// `(admitted_at, key_id)` pair; `SignedKeyRecord` → `ServedKeyRecord`).
+    /// v36.0.0 (CIRISPersist#675) — bumped 2 → 3 because
+    /// `AccordEvidenceAdmitted`'s payload struct replaced
+    /// `participations_admitted` (which an older consumer deserializes as a
+    /// required field) with the `effect` enum; see the
+    /// [`DIRECTORY_ABI_VERSION`] doc.
     ///
     /// The pin is deliberately two assertions on two different things: the
     /// constant consumers compile against, and the value this build actually
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_2() {
+    fn abi_version_pinned_at_3() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 2,
-            "an existing DirectoryOp variant's shape changed in v32.0.0; the \
+            DIRECTORY_ABI_VERSION, 3,
+            "an existing DirectoryOp variant's shape changed in v36.0.0; the \
              load-time gate is the only signal a consumer gets BEFORE it \
              dispatches an op, so a shape break must move this or the gate \
              certifies a contract the consumer was not built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 2,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 3,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -3980,7 +4184,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "2ff162ee23d3d9bde2339a370c0751a061285ffed59d19d976e61ab6b76c2025",
+            "147a19b5650ce9f3ed45ec0c8f729f62b60b9af8302d5ed931c2fd99acd1cbdb",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -3992,11 +4196,21 @@ mod tests {
     /// Companion to [`directory_op_wire_contract_is_pinned_682`] for the result
     /// half. Pinned separately so a red names which side of the call moved —
     /// a consumer can be forward-compatible on ops and not on results.
+    ///
+    /// Re-pinned in v36.0.0 for two changes riding one release: GROWTH
+    /// (`AccordEvidenceCarrierRefused` appended, CIRISPersist#674) and the
+    /// serve-cursor BREAK (the `list_*_since` cursor pairs). The release
+    /// ALSO breaks an existing variant's payload OUTSIDE this digest's sight
+    /// — `AccordEvidenceAdmitted`'s struct replaced a field
+    /// (CIRISPersist#675) — which is why [`DIRECTORY_ABI_VERSION`] moved to
+    /// 3: this gate reads the enum body only, so a payload-type's own shape
+    /// is the version pin's job, not the digest's. All v36 breaks share the
+    /// one 2 → 3 bump.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "b76ec943a4caebe1f0ff7c481e5aa22d893e19a3261c07f74cf0d867d40173f5",
+            "f3dbfcfd6747d72c343b4e475270be861aeb0f83f804eeb2541effd51ca579d9",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

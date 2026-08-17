@@ -17,10 +17,77 @@ use super::types::{
 };
 use super::Error;
 
-/// v3.6.0 (CIRISPersist#134) — report from [`NodeCoreService::retire_key_grants`].
-/// Counts the prior `key_grant` Contributions the caller's
-/// `actor_key_id` issued, and how many supersession-grant Contributions
-/// the method emitted against them.
+/// v36.0.0 (CIRISPersist#711) — **which step of retiring ONE grant
+/// failed**, for a [`RetireGrantFailure`].
+///
+/// Closed, and every variant corresponds to exactly ONE branch in the
+/// backends' `retire_key_grants` loop — no `Other` catch-all, per the
+/// #565 `KeyRefusalReason` discipline: a catch-all reintroduces the
+/// disjunction one name deeper. Serde tokens are snake_case and
+/// [`Self::as_str`] returns the SAME token, so a consumer keys on a
+/// program constant and never on a message string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetireFailureStage {
+    /// The prior grant's stored `payload` did not decode as a
+    /// `KeyGrantPayload`, so no supersession sentinel could even be
+    /// composed against it.
+    PriorPayloadDecode,
+    /// Composing/emitting the supersession sentinel failed — signer
+    /// error, or the sentinel refused by persist's own `key_grant`
+    /// validator (the #704 shape: a legacy transit grant with no
+    /// `ifac_size` yields a sentinel the v34.0.0 rule refuses).
+    SupersessionEmission,
+}
+
+impl RetireFailureStage {
+    /// The **stable program token** for this stage — identical to the
+    /// serde token (bound together by a test), so a consumer that reads
+    /// the FFI JSON and a consumer that holds the typed value key on
+    /// the same constant. Append-only; never re-spell a token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PriorPayloadDecode => "prior_payload_decode",
+            Self::SupersessionEmission => "supersession_emission",
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set.
+    pub const ALL: &'static [Self] = &[Self::PriorPayloadDecode, Self::SupersessionEmission];
+}
+
+/// v36.0.0 (CIRISPersist#711) — one prior grant that
+/// [`NodeCoreService::retire_key_grants`] could **not** retire: WHICH
+/// grant (so an operator can act on the row that is still live) and WHY
+/// (stage + the underlying error text, the same facts the warn log
+/// carries — but in the type, where a caller cannot miss them).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetireGrantFailure {
+    /// `contribution_id` of the prior grant whose material is STILL
+    /// LIVE — on a transit grant, a passphrase revocation that did not
+    /// happen.
+    pub contribution_id: String,
+    /// Which step failed. See [`RetireFailureStage`].
+    pub stage: RetireFailureStage,
+    /// Rendered error from the failing step. Diagnostic text — key on
+    /// [`Self::stage`], never on this string.
+    pub error: String,
+}
+
+/// v36.0.0 (CIRISPersist#711) — outcome of
+/// [`NodeCoreService::retire_key_grants`]. **Replaces
+/// `RetireKeyGrantsReport`**, whose `supersedes_failed` counter let a
+/// `?`-style caller read a retirement that retired nothing as success
+/// (the passphrase-stays-live shape: revocation reported `Ok`, red
+/// signal nowhere).
+///
+/// The two cases are distinct VARIANTS, so partial failure is
+/// unrepresentable-as-success: there is no count to forget to check —
+/// extracting anything from the value forces the caller to have chosen
+/// what `Partial` means for it. Counts, not row echoes, in `Complete`:
+/// the sentinels are ordinary contributions and readable back through
+/// the list surfaces.
 ///
 /// CEG 0.3 §5.6.8.4 — rotation_chain supersession (option b from
 /// CIRISRegistry#38): each prior grant is retired by issuing a FRESH
@@ -28,14 +95,58 @@ use super::Error;
 /// prior `contribution_id`. The fresh grant's `wrapped_dek_base64` is
 /// an empty/zero marker (revocation sentinel: recipient sees zero-length
 /// DEK and knows the prior grant is retired).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RetireKeyGrantsReport {
-    /// Number of prior `key_grant` Contributions found for the actor.
-    pub grants_seen: usize,
-    /// Number of supersession-grant Contributions successfully emitted.
-    pub supersedes_emitted: usize,
-    /// Number of supersession-grant emissions that failed (signer / FK).
-    pub supersedes_failed: usize,
+///
+/// Serde shape (the FFI JSON contract) is internally tagged on
+/// `outcome`: `{"outcome":"complete","retired":N}` or
+/// `{"outcome":"partial","retired":N,"failed":[{"contribution_id":…,
+/// "stage":…,"error":…}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+#[must_use = "a Partial outcome means prior grants are STILL LIVE — match on the variant \
+              before treating the retirement as done"]
+pub enum RetireKeyGrantsOutcome {
+    /// EVERY prior grant seen was retired — a supersession sentinel was
+    /// emitted against each of the `retired` grants found for the
+    /// actor. Vacuously complete when the actor had no grants
+    /// (`retired == 0`).
+    Complete {
+        /// Prior grants found AND superseded.
+        retired: usize,
+    },
+    /// At least one prior grant was NOT retired — its material is
+    /// still live. `failed` is non-empty by construction
+    /// ([`Self::from_batch`] is the only builder the backends use) and
+    /// names every unretired grant.
+    Partial {
+        /// Prior grants that WERE superseded in this call.
+        retired: usize,
+        /// The grants that were not, each with stage + error.
+        failed: Vec<RetireGrantFailure>,
+    },
+}
+
+impl RetireKeyGrantsOutcome {
+    /// Fold a batch tally into the outcome: `Complete` iff `failed` is
+    /// empty. The single build point both backends use, so
+    /// `Partial { failed: vec![] }` — a partial outcome asserting no
+    /// failures — is never constructed.
+    pub fn from_batch(retired: usize, failed: Vec<RetireGrantFailure>) -> Self {
+        if failed.is_empty() {
+            Self::Complete { retired }
+        } else {
+            Self::Partial { retired, failed }
+        }
+    }
+
+    /// Number of prior grants retired (superseded) by this call,
+    /// whichever variant. NOT a success test — `Partial` also retires
+    /// grants; match on the variant for that.
+    #[must_use]
+    pub const fn retired(&self) -> usize {
+        match self {
+            Self::Complete { retired } | Self::Partial { retired, .. } => *retired,
+        }
+    }
 }
 
 /// Federation-consensus substrate trait. 8 typed-write methods + 5
@@ -401,10 +512,102 @@ pub trait NodeCoreService: Send + Sync {
     /// produces the canonical Ed25519 signature for the new
     /// Contribution envelope. `now` pins the wall-clock for the new
     /// rows.
+    ///
+    /// # Partial failure is a variant, not an error — and not success
+    ///
+    /// v36.0.0 (#711): a per-grant failure (payload decode, signer,
+    /// sentinel refused by the validator) does NOT abort the batch —
+    /// the remaining grants are still attempted, because retiring nine
+    /// of ten is strictly safer than retiring four and stopping. But
+    /// it is not representable as success either: the call returns
+    /// [`RetireKeyGrantsOutcome::Partial`] naming every unretired
+    /// grant. `Err(_)` is reserved for failures BEFORE the batch (the
+    /// listing query). A `?`-style caller therefore holds an outcome it
+    /// must match — the previous shape (a `supersedes_failed` counter
+    /// inside an `Ok` report) read as a successful retirement that
+    /// retired nothing, which on a transit grant leaves the IFAC
+    /// passphrase live with no red signal anywhere.
     fn retire_key_grants(
         &self,
         actor_key_id: &str,
         signer: &dyn ciris_keyring::HardwareSigner,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> impl Future<Output = Result<RetireKeyGrantsReport, Error>> + Send;
+    ) -> impl Future<Output = Result<RetireKeyGrantsOutcome, Error>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetireFailureStage, RetireGrantFailure, RetireKeyGrantsOutcome};
+
+    /// #565 discipline — the typed constant and the serde token are the
+    /// SAME spelling, so a consumer keying on `as_str()` and a consumer
+    /// reading the FFI JSON cannot drift apart.
+    #[test]
+    fn retire_failure_stage_tokens_match_serde() {
+        for stage in RetireFailureStage::ALL {
+            let wire = serde_json::to_value(stage).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::Value::String(stage.as_str().to_owned()),
+                "serde token and as_str() diverged for {stage:?}"
+            );
+        }
+    }
+
+    /// [`RetireKeyGrantsOutcome::from_batch`] is the single build point:
+    /// empty failures fold to `Complete`, any failure folds to
+    /// `Partial` — so a `Partial` with an empty `failed` is never built.
+    #[test]
+    fn from_batch_folds_on_the_failure_set_711() {
+        assert_eq!(
+            RetireKeyGrantsOutcome::from_batch(2, vec![]),
+            RetireKeyGrantsOutcome::Complete { retired: 2 }
+        );
+        let failure = RetireGrantFailure {
+            contribution_id: "cid-1".into(),
+            stage: RetireFailureStage::SupersessionEmission,
+            error: "refused".into(),
+        };
+        let outcome = RetireKeyGrantsOutcome::from_batch(1, vec![failure.clone()]);
+        assert_eq!(
+            outcome,
+            RetireKeyGrantsOutcome::Partial {
+                retired: 1,
+                failed: vec![failure],
+            }
+        );
+        assert_eq!(outcome.retired(), 1);
+    }
+
+    /// The FFI JSON contract, pinned byte-for-byte on the tag + field
+    /// names: `cirisnode_retire_key_grants_json`'s docstring promises
+    /// this exact shape to Python consumers.
+    #[test]
+    fn outcome_wire_shape_is_the_documented_contract_711() {
+        let complete = RetireKeyGrantsOutcome::Complete { retired: 2 };
+        assert_eq!(
+            serde_json::to_value(&complete).unwrap(),
+            serde_json::json!({"outcome": "complete", "retired": 2})
+        );
+        let partial = RetireKeyGrantsOutcome::Partial {
+            retired: 1,
+            failed: vec![RetireGrantFailure {
+                contribution_id: "cid-9".into(),
+                stage: RetireFailureStage::PriorPayloadDecode,
+                error: "bad json".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap(),
+            serde_json::json!({
+                "outcome": "partial",
+                "retired": 1,
+                "failed": [{
+                    "contribution_id": "cid-9",
+                    "stage": "prior_payload_decode",
+                    "error": "bad json",
+                }],
+            })
+        );
+    }
 }

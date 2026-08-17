@@ -319,8 +319,9 @@ pub mod test_support {
             .list_signed_families_since(None, u32::MAX)
             .await?
             .into_iter()
-            .find(|f| f.family.family_key_id == fam)
-            .expect("the grown family is served on the signed read surface");
+            .find(|f| f.family.family.family_key_id == fam)
+            .expect("the grown family is served on the signed read surface")
+            .family;
         assert_eq!(signed_fam.family.members.len(), 2, "({tag})");
         crate::federation::verify_family_admission(directory, &signed_fam)
             .await
@@ -395,8 +396,9 @@ pub mod test_support {
             .list_signed_communities_since(None, u32::MAX)
             .await?
             .into_iter()
-            .find(|c| c.community.community_key_id == comm)
-            .expect("the grown community is served on the signed read surface");
+            .find(|c| c.community.community.community_key_id == comm)
+            .expect("the grown community is served on the signed read surface")
+            .community;
         assert_eq!(signed_comm.community.members.len(), 2, "({tag})");
         crate::federation::verify_community_admission(directory, &signed_comm)
             .await

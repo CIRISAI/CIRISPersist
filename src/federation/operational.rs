@@ -4275,6 +4275,191 @@ pub mod test_support {
     /// — which is the shape a production mesh actually has.
     ///
     /// Kept as its own body rather than a ninth witness inside
+    /// **CIRISPersist#686 — a foreign, unentitled `withdraws` against a FAMILY
+    /// CHARTER candidate.** Lifted verbatim from the #686 evidence thread
+    /// (comment 5312289784), written to PASS once the consolidated fold
+    /// carries an entitlement gate.
+    ///
+    /// The sibling witness
+    /// (`ungated_doors_test_support::exercise_foreign_retraction_cannot_sever_conferral`)
+    /// drives the conferral walk. This one drives `about_dead`, which filters
+    /// the family-root CHARTER candidates **upstream of the quorum tally** —
+    /// a retraction landing there does not merely unroot one edge: it thins
+    /// the candidate set a quorum decision is computed over, before
+    /// `family_quorum_over` ever counts a seat, and the operator-facing
+    /// shortfall (#557's `distinct_holders: 0 of required`) then reads as a
+    /// roster problem rather than an attack.
+    ///
+    /// The family arm reads the ABOUT set by construction — a family is
+    /// keyless and cannot sign its own charter — so a foreign row is in
+    /// scope by design, and no slice tightening can close this: only the
+    /// fold's entitlement gate can. Cast and shape mirror
+    /// [`exercise_transit_eligibility_family_root`] exactly, so any
+    /// divergence is the retraction and not the fixture.
+    ///
+    /// Three legs, matching the conferral witness: CONTROL (chartered family,
+    /// valid), LEG A (in-order foreign withdraws → write-door refusal, root
+    /// stays valid — load-bearing), LEG B (out-of-order deferred window, then
+    /// the charter lands — the root must still be valid).
+    pub async fn exercise_foreign_retraction_cannot_sever_charter(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{
+            trust_root_valid, RootKind, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+            TRUST_CHARTER_DIMENSION,
+        };
+        use crate::federation::types::{attestation_type, identity_type};
+
+        let user = format!("{tag}-user");
+        let foreign = format!("{tag}-foreign");
+        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+
+        for who in &holders {
+            register_typed_key(directory, who, identity_type::NODE).await?;
+        }
+        register_typed_key(directory, &user, identity_type::NODE).await?;
+        // The attacker is a registered, well-formed NODE holding no seat in
+        // either family and no authority over either charter. Nothing about it
+        // is malformed — only unentitled.
+        register_typed_key(directory, &foreign, identity_type::NODE).await?;
+
+        let build_charter = |accord: &str,
+                             charter_id: &str|
+         -> Result<
+            crate::federation::Attestation,
+            crate::federation::Error,
+        > {
+            let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
+            let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("#686 pre_rotation_commitment: {e}"))
+                })?;
+            Ok(co_signed_trust_attestation(
+                charter_id,
+                &holders[0],
+                accord,
+                attestation_type::DELEGATES_TO,
+                json!({
+                    "references_attestation_id": charter_id,
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                    "pre_rotation_commitment": commitment,
+                }),
+                &[&holders[1]],
+            ))
+        };
+        let foreign_withdraws = |id: &str, target_id: &str, accord: &str| {
+            signed_trust_attestation(
+                id,
+                &foreign,
+                accord,
+                attestation_type::WITHDRAWS,
+                json!({
+                    "references_attestation_id": target_id,
+                    "dimension": "cw:charter-retract:v1",
+                }),
+            )
+        };
+
+        // ── CONTROL — a chartered family root, untouched. ────────────────────
+        let accord_ctl = format!("{tag}-accord-ctl");
+        seed_test_family(directory, &accord_ctl, &holders, "quorum:2/3").await?;
+        let ctl_charter_id = format!("{tag}-charter-ctl");
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: build_charter(&accord_ctl, &ctl_charter_id)?,
+            })
+            .await?;
+        emit_trust_edge(directory, &user, &accord_ctl, None).await?;
+
+        let v = trust_root_valid(directory, &user, &accord_ctl).await?;
+        assert_eq!(
+            v.root_kind,
+            RootKind::Family,
+            "({tag}) CONTROL: this must be the keyless FAMILY arm — the key arm reads a \
+             different slice and would not exercise `about_dead`: {v:?}"
+        );
+        assert!(
+            v.valid,
+            "({tag}) CONTROL: the chartered family root must be valid before any attack, or \
+             the legs below prove nothing: {v:?}"
+        );
+
+        // ── LEG A — IN ORDER. The charter is already stored, so the write door
+        //    can resolve authority and must REFUSE. This guard is the only
+        //    thing making the read-side fold unreachable in the ordinary case.
+        let inorder_id = format!("{tag}-inorder-withdraws");
+        let err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: foreign_withdraws(&inorder_id, &ctl_charter_id, &accord_ctl),
+            })
+            .await
+            .expect_err(
+                "LEG A: with the charter PRESENT, an unentitled foreign `withdraws` must be \
+                 refused at the write door",
+            );
+        assert!(
+            matches!(err, crate::federation::Error::WithdrawsNotAdmitted { .. }),
+            "({tag}) LEG A: expected WithdrawsNotAdmitted, got {err:?}"
+        );
+        let after_a = trust_root_valid(directory, &user, &accord_ctl).await?;
+        assert!(
+            after_a.valid,
+            "({tag}) LEG A: a refused withdraws must leave the charter standing: {after_a:?}"
+        );
+
+        // ── LEG B — OUT OF ORDER, the deferred window. ────────────────────────
+        //
+        // `check_withdraws_admission` returns `Ok(None)` — admit, no rule —
+        // when the target is "not locally present … defer authority to read
+        // side". The read side is `tombstoned_ids`, which (pre-#686) never
+        // re-checked it.
+        let accord_atk = format!("{tag}-accord-atk");
+        seed_test_family(directory, &accord_atk, &holders, "quorum:2/3").await?;
+        let atk_charter_id = format!("{tag}-charter-atk");
+        let early_id = format!("{tag}-early-withdraws");
+
+        // The retraction lands FIRST, naming a charter that does not exist yet.
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: foreign_withdraws(&early_id, &atk_charter_id, &accord_atk),
+            })
+            .await?;
+        let stored = directory
+            .get_attestation(&early_id)
+            .await?
+            .expect("the early withdraws is stored");
+        assert!(
+            stored.withdraws_admission_rule.is_none(),
+            "({tag}) LEG B measures the DEFERRED path — a stamped rule means the write door \
+             resolved authority and this witness proves something else. Got {:?}",
+            stored.withdraws_admission_rule
+        );
+
+        // NOW the charter arrives, and the family is chartered exactly as the
+        // control is.
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: build_charter(&accord_atk, &atk_charter_id)?,
+            })
+            .await?;
+        emit_trust_edge(directory, &user, &accord_atk, None).await?;
+
+        let after_b = trust_root_valid(directory, &user, &accord_atk).await?;
+        assert!(
+            after_b.valid,
+            "({tag}) #686 HOLE IS LIVE ON THE CHARTER PLANE: a `withdraws` from `{foreign}` — \
+             holding no seat in the family, not the charter's attester, not one of its \
+             subject_key_ids, carrying no admission rule, admitted only because it arrived \
+             BEFORE its target — removed the family's ONLY charter candidate from \
+             `charter_shaped` via trust_root::tombstoned_ids (`about_dead`), \
+             so `family_quorum_over` never counted a seat. The quorum did not fail; it was \
+             never reached. Verdict: {after_b:?}"
+        );
+        Ok(())
+    }
+
     /// [`exercise_transit_eligibility`]: the cast is different (three seated
     /// holders and a keyless family instead of one key root), and the point is
     /// precisely that NOTHING in the transit walk is arm-aware. If this needed
@@ -4490,6 +4675,190 @@ pub mod test_support {
         Ok(())
     }
 
+    /// v36.0.0 (CIRISPersist#707) — **a consumer-visible key mutation MOVES
+    /// THE SERVE POSITION.**
+    ///
+    /// #682 fixed the row that ARRIVES late; this witnesses the row that
+    /// MUTATES after arrival. Wire-index coverage (#547, the sibling exercise
+    /// above) only proves a peer that already knows the new content hash can
+    /// fetch it — the CURSOR is how a peer learns a hash exists, and before
+    /// #707 the five mutating doors left every consumer's cursor past the
+    /// row, permanently unaware.
+    ///
+    /// Per door: a consumer reads the key stream to the end and keeps the
+    /// PAIR cursor; the door rewrites the row; resuming from the old cursor
+    /// MUST re-serve the row, carrying the NEW bytes, at a position strictly
+    /// above the old cursor — while `admitted_at` (first admission, V126)
+    /// stays put, because the mutation position is `mutated_at` (V131), not a
+    /// re-stamp of history.
+    ///
+    /// Doors driven here: `adopt_scrub_upgrade` (skipped where the backend
+    /// does not implement it — memory), `set_consent_role`,
+    /// `attach_key_pqc_signature`, plus the NEGATIVE leg: `grant_trust` /
+    /// `revoke_trust` write only `trust_*` columns — bytes no consumer ever
+    /// received — and must NOT move the position, or every trust flip churns
+    /// the stream for changes no peer can observe.
+    /// (`supersede_canonical_record` and `adopt_genesis_reanchor` re-stamp
+    /// through the identical allocator call in the same statement; their
+    /// fixtures need an m-of-n quorum / genesis bundle and are not driven
+    /// here — stated rather than implied.)
+    pub async fn exercise_key_mutation_moves_serve_position(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+
+        let anchor = format!("{tag}-707-anchor");
+        let node = format!("{tag}-707-node");
+        ts::register_hybrid_key(directory, &anchor).await;
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "boot"),
+            })
+            .await?;
+
+        // One consumer read-to-end + resume, shared by every door leg.
+        let cursor_at_end = |rows: &[crate::federation::ServedKeyRecord]| {
+            rows.last()
+                .map(crate::federation::ServedKeyRecord::resume_pair)
+                .expect("the stream cannot be empty after a put")
+        };
+        let all = directory
+            .list_signed_key_records_since(None, u32::MAX)
+            .await?;
+        let first_admitted = all
+            .iter()
+            .find(|r| r.record.key_id == node)
+            .expect("the boot row is served")
+            .admitted_at;
+        let mut cursor = cursor_at_end(&all);
+
+        // ── door: adopt_scrub_upgrade (where implemented) ──────────────────
+        match directory
+            .adopt_scrub_upgrade(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(
+                    &node,
+                    identity_type::NODE,
+                    &anchor,
+                    &anchor,
+                    "boot",
+                ),
+            })
+            .await
+        {
+            Ok(_) => {
+                let resumed = directory
+                    .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
+                    .await?;
+                let served = resumed.iter().find(|r| r.record.key_id == node).expect(
+                    "#707 adopt_scrub_upgrade: the re-rooted row must be re-served past the \
+                         consumer's cursor — its whole purpose is to re-root the key, and a \
+                         consumer past the cursor kept the pre-anchor row forever",
+                );
+                assert_eq!(
+                    served.record.scrub_key_id, anchor,
+                    "({tag}) and the re-served bytes are the NEW (anchored) bytes"
+                );
+                cursor = cursor_at_end(
+                    &directory
+                        .list_signed_key_records_since(None, u32::MAX)
+                        .await?,
+                );
+            }
+            Err(crate::federation::Error::InvalidArgument(detail))
+                if detail.contains("not supported on this backend") => {}
+            Err(e) => return Err(e),
+        }
+
+        // ── door: set_consent_role ─────────────────────────────────────────
+        directory.set_consent_role(&node, Some("peer")).await?;
+        let resumed = directory
+            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
+            .await?;
+        let served = resumed.iter().find(|r| r.record.key_id == node).expect(
+            "#707 set_consent_role: `consent_role` IS in the served bytes, so the row must \
+                 be re-served past the consumer's cursor",
+        );
+        assert_eq!(
+            served.record.consent_role.as_deref(),
+            Some("peer"),
+            "({tag}) the re-served bytes carry the NEW role"
+        );
+        assert!(
+            served.admitted_at > cursor.0,
+            "({tag}) the serve position moved strictly forward"
+        );
+        // First admission is NOT rewritten: the position that moved is
+        // `mutated_at` (V131); `admitted_at` keeps its V126 meaning. Observable
+        // here because `ServedKeyRecord::admitted_at` reports the SERVE
+        // position (the max), which must exceed the original first-admission
+        // instant rather than replace it in place — the row's own history
+        // question ("how long held?") stays answerable from the column.
+        assert!(
+            served.admitted_at > first_admitted,
+            "({tag}) the serve position is above first admission, not a rewrite of it"
+        );
+        cursor = cursor_at_end(
+            &directory
+                .list_signed_key_records_since(None, u32::MAX)
+                .await?,
+        );
+
+        // ── NEGATIVE leg: grant_trust / revoke_trust must NOT move it ──────
+        directory
+            .grant_trust(crate::federation::TrustGrant {
+                key: node.clone(),
+                trust_type: crate::federation::TrustType::Temporary,
+                trust_relationship: crate::federation::TrustRelationship::Direct,
+                trust_domains: None,
+                trusted_by: anchor.clone(),
+                expires_at: None,
+            })
+            .await?;
+        directory.revoke_trust(&node, &anchor).await?;
+        let after_trust = directory
+            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
+            .await?;
+        assert!(
+            !after_trust.iter().any(|r| r.record.key_id == node),
+            "({tag}) #707 negative leg: grant_trust/revoke_trust write only `trust_*` columns — \
+             bytes no consumer ever received — and must NOT re-serve the row. Re-stamping on \
+             every UPDATE would churn the stream for changes no peer can observe."
+        );
+
+        // ── door: attach_key_pqc_signature ─────────────────────────────────
+        let pending = format!("{tag}-707-pending");
+        let (rec, pqc_pubkey, pqc_sig) =
+            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
+                &pending,
+                identity_type::NODE,
+            );
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await?;
+        let cursor = cursor_at_end(
+            &directory
+                .list_signed_key_records_since(None, u32::MAX)
+                .await?,
+        );
+        directory
+            .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
+            .await?;
+        let resumed = directory
+            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
+            .await?;
+        let served = resumed.iter().find(|r| r.record.key_id == pending).expect(
+            "#707 attach_key_pqc_signature: the hybrid-completion rewrites FOUR served \
+                 columns and must re-serve the row past the consumer's cursor",
+        );
+        assert!(
+            served.record.pqc_completed_at.is_some(),
+            "({tag}) the re-served bytes are the completed (post-attach) bytes"
+        );
+        Ok(())
+    }
+
     /// v31.0.0 (CIRISPersist#657) — **THE ATTESTATION PLANE'S INSTANCE OF THE
     /// SAME ROUND TRIP.**
     ///
@@ -4562,8 +4931,9 @@ pub mod test_support {
             .list_attestations_since(None, 10_000)
             .await?
             .into_iter()
-            .find(|a| a.attestation_id == attestation_id)
-            .unwrap_or_else(|| panic!("({tag}) {attestation_id} is advertised after {after}"));
+            .find(|a| a.attestation.attestation_id == attestation_id)
+            .unwrap_or_else(|| panic!("({tag}) {attestation_id} is advertised after {after}"))
+            .attestation;
         let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
         let served = directory
             .lookup_signed_record_by_content_hash("Attestation", &hash)

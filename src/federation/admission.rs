@@ -5052,27 +5052,19 @@ impl DelegationWalkPolicy {
 /// `withdraws_admission_rule` is `None` for several distinct reasons (deferred,
 /// malformed, non-`withdraws`, `holds_bytes` target), so it is used only as an
 /// admitting arm and never as the sole test.
+/// v36.0.0 (CIRISPersist#686) — delegates to the CONSOLIDATED fold
+/// [`crate::federation::precedence::retired_ids`]. This fold contributed the
+/// #656 entitlement gate (now hoisted to
+/// [`crate::federation::precedence::retraction_entitled`]) and gains §6.1
+/// PRECEDENCE from the merge: an entitled retraction no longer kills
+/// unconditionally — the precedence winner among the target's composers
+/// decides, exactly as the trust-root plane always resolved it. `recants`
+/// and `withdraws` both outrank `supersedes`, so nothing a retraction used
+/// to kill is resurrected by the change; what changes is only that the three
+/// former folds can no longer disagree.
 fn retracted_edge_ids(rows: &[super::Attestation]) -> std::collections::HashSet<String> {
-    let by_id: std::collections::HashMap<&str, &super::Attestation> = rows
-        .iter()
-        .map(|r| (r.attestation_id.as_str(), r))
-        .collect();
-    rows.iter()
-        .filter(|g| {
-            g.attestation_type == attestation_type::WITHDRAWS
-                || g.attestation_type == attestation_type::RECANTS
-        })
-        .filter_map(|g| {
-            let target_id = crate::federation::precedence::references_attestation_id_from_envelope(
-                &g.attestation_envelope,
-            )?;
-            let target = by_id.get(target_id)?;
-            let entitled = g.attesting_key_id == target.attesting_key_id
-                || target.subject_key_ids.contains(&g.attesting_key_id)
-                || g.withdraws_admission_rule.is_some();
-            entitled.then(|| target_id.to_owned())
-        })
-        .collect()
+    let refs: Vec<&super::Attestation> = rows.iter().collect();
+    crate::federation::precedence::retired_ids(&refs)
 }
 
 /// (CIRISPersist#593) — everything the ONE scoped-delegation BFS observes.
@@ -20846,6 +20838,172 @@ pub(crate) mod ungated_doors_test_support {
         }
     }
 
+    /// v36.0.0 (CIRISPersist#668) — **the V130 pattern, witnessed on a
+    /// converted plane** (attestations — the plane whose legacy cursor was
+    /// already half local, so a regression here is the subtlest).
+    ///
+    /// The #682 witness set, replayed one plane over:
+    /// 1. **late-admit-still-served** — a row whose PRODUCER instant
+    ///    (`asserted_at`) is a year old, admitted after the consumer's
+    ///    cursor, is still served: the cursor keys on THIS node's V130
+    ///    `admitted_at`, not the producer's clock.
+    /// 2. **the served position is this node's**, strictly past the cursor,
+    ///    while `asserted_at` is untouched (it keeps every other job).
+    /// 3. **the pair excludes exactly the read prefix** — resuming from the
+    ///    last element's `resume_pair()` re-serves nothing.
+    ///
+    /// The tie-paging leg is planted per backend (a tie cannot be produced
+    /// through the write path — the allocator is strictly increasing under
+    /// one lock) and lives in the backend test modules.
+    pub(crate) async fn exercise_late_admitted_attestation_is_served(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let author = format!("la668-{suffix}");
+        register(dir, &author, crate::federation::types::identity_type::NODE).await;
+
+        // (1) a fresh row; the consumer reads to the end and keeps the PAIR.
+        let early_id = format!("la668-early-{suffix}");
+        let mut early = federation_row(&early_id, &author, "la:score:v1");
+        seal_row_in_place(&author, &mut early);
+        dir.put_attestation(SignedAttestation { attestation: early })
+            .await
+            .expect("the fresh row admits");
+        let all = dir
+            .list_attestations_since(None, u32::MAX)
+            .await
+            .expect("read to end");
+        let cursor = all.last().expect("non-empty after a put").resume_pair();
+
+        // (2) THE LATE REPLICATION: asserted (producer clock) a year ago,
+        // admitted NOW. The everyday reconnect case, not an attack.
+        let late_id = format!("la668-late-{suffix}");
+        let mut late = federation_row(&late_id, &author, "la:score:v1");
+        late.asserted_at =
+            truncate_to_substrate_resolution(Utc::now() - chrono::Duration::days(365));
+        late.scrub_timestamp = late.asserted_at;
+        seal_row_in_place(&author, &mut late);
+        let late_asserted = late.asserted_at;
+        assert!(
+            late_asserted < cursor.0,
+            "({suffix}) the late row's producer instant must be BELOW the consumer's cursor, \
+             or this witness cannot distinguish the two rows"
+        );
+        dir.put_attestation(SignedAttestation { attestation: late })
+            .await
+            .expect("an old producer instant is admissible");
+
+        // (3) the consumer resumes from exactly where it stopped.
+        let resumed = dir
+            .list_attestations_since(Some(cursor.clone()), u32::MAX)
+            .await
+            .expect("resume");
+        let served = resumed
+            .iter()
+            .find(|a| a.attestation.attestation_id == late_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) #668: an attestation asserted a year ago and admitted NOW must \
+                     still be served to a consumer resuming from {cursor:?} — keyed on the \
+                     producer's instant it sorts a year back and is never served again. \
+                     Served: {:?}",
+                    resumed
+                        .iter()
+                        .map(|a| &a.attestation.attestation_id)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            served.admitted_at > cursor.0,
+            "({suffix}) the served position is THIS node's, strictly past the cursor"
+        );
+        assert_eq!(
+            served.attestation.asserted_at, late_asserted,
+            "({suffix}) `asserted_at` keeps its job — the fix adds a position beside it"
+        );
+
+        // (4) and the pair excludes exactly the read prefix: resuming from the
+        // new end re-serves nothing.
+        let end = dir
+            .list_attestations_since(None, u32::MAX)
+            .await
+            .expect("re-read")
+            .last()
+            .expect("non-empty")
+            .resume_pair();
+        assert!(
+            dir.list_attestations_since(Some(end), u32::MAX)
+                .await
+                .expect("resume at end")
+                .is_empty(),
+            "({suffix}) `since` at the stream's own end must serve nothing"
+        );
+    }
+
+    /// v36.0.0 (CIRISPersist#668) — **a tie larger than one page resumes
+    /// instead of losing its remainder**, on the attestation plane. Call
+    /// AFTER planting `expected` (every id already sharing ONE `admitted_at`;
+    /// `expected.len() > page`). The mirror of the key plane's
+    /// `assert_one_admission_instant_pages_exactly_once`.
+    pub(crate) async fn assert_attestation_tie_pages_exactly_once(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+        expected: &[String],
+        page: u32,
+    ) {
+        assert!(
+            expected.len() > page as usize,
+            "({suffix}) the tie must be LARGER than one page or this cannot fail"
+        );
+        let all = dir
+            .list_attestations_since(None, u32::MAX)
+            .await
+            .expect("read all");
+        let tied: Vec<_> = all
+            .iter()
+            .filter(|a| expected.contains(&a.attestation.attestation_id))
+            .collect();
+        assert_eq!(tied.len(), expected.len(), "({suffix}) plant incomplete");
+        let instants: std::collections::BTreeSet<_> = tied.iter().map(|a| a.admitted_at).collect();
+        assert_eq!(
+            instants.len(),
+            1,
+            "({suffix}) the planted rows must share ONE instant, or this measures nothing"
+        );
+
+        let mut cursor: Option<(chrono::DateTime<Utc>, String)> = None;
+        let mut seen: Vec<String> = Vec::new();
+        let ceiling = all.len() * 2 + 8;
+        let mut pages = 0usize;
+        loop {
+            assert!(pages < ceiling, "({suffix}) the cursor stopped advancing");
+            pages += 1;
+            let rows = dir
+                .list_attestations_since(cursor.clone(), page)
+                .await
+                .expect("page");
+            let Some(last) = rows.last() else { break };
+            for a in &rows {
+                if expected.contains(&a.attestation.attestation_id) {
+                    seen.push(a.attestation.attestation_id.clone());
+                }
+            }
+            cursor = Some(last.resume_pair());
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        let mut want = expected.to_vec();
+        want.sort();
+        assert_eq!(
+            sorted,
+            want,
+            "({suffix}) #668: paging a tie of {} rows {page} at a time must yield every row \
+             EXACTLY once — resumed on the instant alone the tie's remainder is skipped, \
+             silently and forever",
+            expected.len()
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // FINDING 1 — THE SEVENTH SITE
     // ─────────────────────────────────────────────────────────────────────
@@ -21500,6 +21658,191 @@ pub(crate) mod ungated_doors_test_support {
                  gate — that would make the assertion above vacuous: {e}"
             );
         }
+    }
+
+    /// **CIRISPersist#686 — a foreign, unentitled `withdraws` against a
+    /// CONFERRAL, in and out of order.** Lifted verbatim from the #686
+    /// evidence thread (comment 5312260080), written to PASS once the
+    /// consolidated fold carries the entitlement gate to the trust-root
+    /// plane. Three legs: leg A pins the WRITE-door refusal (load-bearing —
+    /// it is the only thing keeping the read-side fold unreachable for
+    /// locally-present targets), the control proves the hand-built conferral
+    /// shape roots at all, and leg B drives the out-of-order deferral window
+    /// (`check_withdraws_admission` → `Ok(None)`, "defer authority to read
+    /// side") into `trust_root::tombstoned_ids` at
+    /// `capability_roots_to_trusted_root_over_roster`'s inbound
+    /// many-attester slice.
+    pub(crate) async fn exercise_foreign_retraction_cannot_sever_conferral(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::operational::test_support::establish_trust_root;
+        use crate::federation::trust_root::{capability_roots_to_trusted_root, INFRA_SERVE_SCOPE};
+        use crate::federation::types::identity_type;
+
+        let user = format!("cw-user-{suffix}");
+        let root = format!("cw-root-{suffix}");
+        let subject = format!("cw-subject-{suffix}");
+        let foreign = format!("cw-foreign-{suffix}");
+
+        register(dir, &user, identity_type::NODE).await;
+        register(dir, &subject, identity_type::NODE).await;
+        register(dir, &foreign, identity_type::AGENT).await;
+
+        establish_trust_root(dir, &user, &root, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("#536 fixture stands up all four legs + the scope edge");
+
+        // POSITIVE CONTROL — the walk holds before the attack. Without this a
+        // `None` after the attack would prove nothing (it could always have
+        // been None).
+        let before = capability_roots_to_trusted_root(dir, &user, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("walk")
+            .expect("CONTROL: the subject's infra:serve must root BEFORE the attack");
+        assert_eq!(
+            before.root_key_id, root,
+            "the winning root is the one we established"
+        );
+
+        // The conferral row the attack will name: delegates_to(root → subject).
+        let about = dir
+            .list_attestations_for(&subject)
+            .await
+            .expect("inbound rows about the subject");
+        let conferral_id = about
+            .iter()
+            .find(|a| {
+                a.attestation_type == attestation_type::DELEGATES_TO && a.attesting_key_id == root
+            })
+            .map(|a| a.attestation_id.clone())
+            .expect("the root→subject conferral edge is present");
+
+        // LEG A — IN-ORDER. The target conferral is already stored, so
+        // `check_withdraws_admission` can resolve authority and REFUSES. This
+        // leg pins that guard: it is what makes the read-side fold unreachable
+        // in the ordinary case, and a regression here silently re-opens leg B's
+        // hole for every row, not just absent ones.
+        let inorder_id = format!("cw-inorder-withdraws-{suffix}");
+        let mut w = federation_row(&inorder_id, &foreign, "cw:retract:v1");
+        w.attestation_type = attestation_type::WITHDRAWS.to_owned();
+        w.attested_key_id = subject.clone();
+        w.attestation_envelope = serde_json::json!({
+            "dimension": "cw:retract:v1",
+            "references_attestation_id": conferral_id.clone(),
+        });
+        seal_row_in_place(&foreign, &mut w);
+        let err = dir
+            .put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect_err(
+                "LEG A: with the target PRESENT, the write door must refuse an unentitled \
+                 foreign `withdraws` — if it admits, the read-side fold (which has no attester \
+                 check) decides alone",
+            );
+        assert!(
+            matches!(err, Error::WithdrawsNotAdmitted { .. }),
+            "LEG A: expected WithdrawsNotAdmitted, got {err:?}"
+        );
+        assert!(
+            capability_roots_to_trusted_root(dir, &user, &subject, INFRA_SERVE_SCOPE)
+                .await
+                .expect("walk")
+                .is_some(),
+            "LEG A: the refused withdraws must leave the conferral standing"
+        );
+
+        // ── LEG B — OUT OF ORDER, the window the door DEFERS on ──────────────
+        //
+        // `check_withdraws_admission` returns `Ok(None)` — admit, no rule —
+        // when the target is "not locally present … defer authority to read
+        // side". This is the same window #656's BFS witness uses. Here the
+        // read side is `tombstoned_ids`, which (pre-#686) applied NO attester
+        // check, so the question is whether anything else stops it.
+        //
+        // Both subjects get a conferral built by hand so its id is known BEFORE
+        // it is written; they are otherwise byte-identical in shape.
+        let subj_ctl = format!("cw-subj-ctl-{suffix}");
+        let subj_atk = format!("cw-subj-atk-{suffix}");
+        register(dir, &subj_ctl, identity_type::NODE).await;
+        register(dir, &subj_atk, identity_type::NODE).await;
+
+        // `grant_scope`'s exact envelope shape — the conferral's
+        // `references_attestation_id` is SELF-referential.
+        let conferral_row = |id: &str, subject_key: &str| {
+            let mut row = federation_row(id, &root, "cw:conferral:v1");
+            row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            row.attested_key_id = subject_key.to_owned();
+            row.attestation_envelope = serde_json::json!({
+                "references_attestation_id": id,
+                "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
+                "scope": [INFRA_SERVE_SCOPE],
+            });
+            seal_row_in_place(&root, &mut row);
+            row
+        };
+
+        // CONTROL — same hand-built conferral, NO retraction. Proves the shape
+        // itself roots, so a `None` on the attack arm is the withdraws and not
+        // a malformed fixture.
+        let ctl_id = format!("cw-conferral-ctl-{suffix}");
+        dir.put_attestation(SignedAttestation {
+            attestation: conferral_row(&ctl_id, &subj_ctl),
+        })
+        .await
+        .expect("the hand-built conferral lands");
+        assert!(
+            capability_roots_to_trusted_root(dir, &user, &subj_ctl, INFRA_SERVE_SCOPE)
+                .await
+                .expect("walk")
+                .is_some(),
+            "CONTROL: the hand-built conferral must root — otherwise the attack arm proves nothing"
+        );
+
+        // THE ATTACK — the retraction lands FIRST, naming an id that does not
+        // exist yet.
+        let atk_id = format!("cw-conferral-atk-{suffix}");
+        let early_id = format!("cw-early-withdraws-{suffix}");
+        let mut early = federation_row(&early_id, &foreign, "cw:retract:v1");
+        early.attestation_type = attestation_type::WITHDRAWS.to_owned();
+        early.attested_key_id = subj_atk.clone();
+        early.attestation_envelope = serde_json::json!({
+            "dimension": "cw:retract:v1",
+            "references_attestation_id": atk_id.clone(),
+        });
+        seal_row_in_place(&foreign, &mut early);
+        dir.put_attestation(SignedAttestation { attestation: early })
+            .await
+            .expect("the door defers when the target is absent, so this admits");
+        assert!(
+            dir.get_attestation(&early_id)
+                .await
+                .expect("read")
+                .expect("row")
+                .withdraws_admission_rule
+                .is_none(),
+            "LEG B measures the DEFERRED path — a stamped rule means the door resolved authority"
+        );
+
+        // NOW the conferral arrives.
+        dir.put_attestation(SignedAttestation {
+            attestation: conferral_row(&atk_id, &subj_atk),
+        })
+        .await
+        .expect("the conferral lands");
+
+        let after = capability_roots_to_trusted_root(dir, &user, &subj_atk, INFRA_SERVE_SCOPE)
+            .await
+            .expect("walk after the out-of-order foreign withdraws");
+        assert!(
+            after.is_some(),
+            "#686 HOLE IS LIVE: a `withdraws` from `{foreign}` — not the conferral's attester, \
+             not one of its subject_key_ids, carrying no admission rule, admitted only because \
+             it arrived BEFORE its target — retired the delegates_to({root} → {subj_atk}) \
+             conferral through trust_root::tombstoned_ids, which applies no attester check. \
+             #656 gave retracted_edge_ids an entitlement gate for exactly this; the trust-root \
+             fold never got one."
+        );
     }
 }
 

@@ -2890,11 +2890,16 @@ mod put_blob_binding_tests {
             "#652: put_blob must STATE the tier it publishes at"
         );
         let since = sq
-            .list_attestations_since(Some(asserted_at - chrono::Duration::minutes(5)), 100)
+            .list_attestations_since(
+                Some((asserted_at - chrono::Duration::minutes(5), String::new())),
+                100,
+            )
             .await
             .expect("list_attestations_since");
         assert!(
-            since.iter().any(|r| r.attestation_id == attestation_id),
+            since
+                .iter()
+                .any(|r| r.attestation.attestation_id == attestation_id),
             "#652: the holder announcement must appear on the REPLICATION surface — that is              what makes the tier load-bearing rather than cosmetic, and what turned an              unbound row into something every peer in the mesh refused"
         );
 

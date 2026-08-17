@@ -429,6 +429,42 @@ fn classify(
     }
 }
 
+/// v36.0.0 (CIRISPersist#552) — **the audit plane's handle on the REAL band
+/// classifier.**
+///
+/// [`super::scores_read_audit::feasible_bands`] asks which bands remain possible
+/// once a redacted view's retained marginals are fixed. That question is only
+/// worth asking about the classifier persist actually ships, so the feasibility
+/// program calls straight through to [`classify`] rather than modelling it.
+///
+/// **This exists because a re-implementation would be a witness that measures a
+/// neighbouring gate.** A copy of `classify` inside the audit module would keep
+/// answering the pinning question correctly about a fold nobody runs, and the
+/// census would stay green through any change to the real thresholds — the
+/// precise shape this repo has paid for more than once. The `bool` in place of
+/// the private [`Polarity`] keeps that enum private while still letting the
+/// program ask both folds.
+#[must_use]
+pub(crate) fn classify_for_audit(
+    signed_mean: bool,
+    contributor_count: u32,
+    aggregate: f64,
+    open_contradictions: u32,
+    witness_diversity: Option<f64>,
+) -> ConfidenceBand {
+    classify(
+        if signed_mean {
+            Polarity::SignedMean
+        } else {
+            Polarity::BooleanMin
+        },
+        contributor_count,
+        aggregate,
+        open_contradictions,
+        witness_diversity,
+    )
+}
+
 /// Build the derivation trace (the OPEN escape hatch). Every future fold input
 /// appears as a NEW field here — never a signature change.
 #[allow(clippy::too_many_arguments)]

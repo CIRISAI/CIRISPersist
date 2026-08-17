@@ -147,6 +147,25 @@ pub struct AccordQuorumEvidence {
 /// v31.1.0 (CIRISPersist#662) — what an [`admit_replicated_accord_evidence`]
 /// call actually did, so a carrier can log a supply decision instead of
 /// guessing from `Ok(())`.
+///
+/// # v36.0.0 (CIRISPersist#675) — `participations_admitted` is REPLACED by [`AccordAdmissionEffect`]
+///
+/// The struct used to carry "participations that landed", derived by
+/// differencing two `list_accord_participations` reads around the put loop.
+/// Two carriers admitting overlapping bundles for the same proposal
+/// interleave those reads, so each attributes the other's inserts to itself —
+/// a caller could read 4 having stored 2, or 0 having stored 2. Differencing
+/// cannot be made correct without serialising the whole admission across
+/// every writer (including other processes on the same postgres), so the
+/// counter is gone; what a consumer actually keyed on it for — "was this
+/// admission a duplicate?" (CIRISEdge's replication bridge derives its
+/// Admitted-vs-Duplicate supply decision from it) — is carried instead by
+/// [`Self::effect`], whose two answers are each exact under concurrency
+/// because neither claims physical row insertion. Physical
+/// inserted-vs-no-op attribution remains the store's private knowledge; the
+/// honest path to exposing it is `put_accord_participation` reporting its
+/// outcome per row (each backend already computes that internally and
+/// discards it), which is #675's follow-through on the store surface.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccordEvidenceAdmission {
     /// The admitted proposal's content-derived digest.
@@ -157,14 +176,63 @@ pub struct AccordEvidenceAdmission {
     pub threshold: usize,
     /// The roster size the threshold was derived from.
     pub roster_size: usize,
-    /// Participations that landed (a byte-identical re-PUT is idempotent, so
-    /// this can be lower than `evidence.participations.len()` on a replay).
-    pub participations_admitted: usize,
+    /// v36.0.0 (CIRISPersist#675) — whether this admission was a duplicate,
+    /// as a fact about (this bundle, this node's state when THIS admission
+    /// checked) — see [`AccordAdmissionEffect`] for the exact semantics.
+    pub effect: AccordAdmissionEffect,
     /// `(role, key_id)` tombstones this admit re-derived locally — the
     /// [`Projection::RoleWithdrawals`](super::replication_policy::Projection::RoleWithdrawals)
     /// fan-out. Empty is the common case: most proposals are not withdrawals,
     /// and a withdrawal for a key this node does not hold projects nothing.
     pub withdrawals_projected: Vec<(String, String)>,
+}
+
+/// v36.0.0 (CIRISPersist#675) — the per-admission Admitted-vs-Duplicate
+/// signal, defined as **check-time novelty**: what this node lacked at the
+/// instant THIS admission read its state, immediately before its writes.
+///
+/// # Why this definition, and not "rows I inserted"
+///
+/// Physical insertion is decided inside each backend's
+/// `put_accord_participation` (M6: insert / idempotent no-op / conflict),
+/// which returns `()` — so no composition of directory calls can attribute
+/// an insert to one of several racing writers, and the differencing counter
+/// this replaces was wrong in exactly that window (#675). Check-time novelty
+/// is decidable from a pre-write read, and each answer is sound on its own
+/// terms:
+///
+/// * [`Duplicate`](Self::Duplicate) is **deterministically correct**: every
+///   row the bundle carried already existed before this admission began, and
+///   rows on this plane are append-only (no delete path), so this
+///   admission's puts were provably byte-identical no-ops. A true replay —
+///   re-offering a bundle a prior admission completed — always reports this.
+/// * [`Supplied`](Self::Supplied) claims the node verifiably LACKED some of
+///   this bundle's evidence when the admission began — never that this
+///   caller's puts physically inserted it. Under a dead-heat race, two
+///   carriers offering the same evidence may BOTH report `Supplied`; both
+///   statements are true, and which one's put landed first is deliberately
+///   unclaimed. What `Supplied` can never do is count another bundle's rows
+///   (`novel_participations` is bounded by this bundle's own length) or
+///   fire on a completed prior admission's rows — the two lies the
+///   differencing counter told.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AccordAdmissionEffect {
+    /// The bundle carried evidence this node lacked at check time: the
+    /// proposal itself (`novel_proposal`) and/or `novel_participations` of
+    /// its votes.
+    Supplied {
+        /// The proposal was not yet stored when this admission checked.
+        novel_proposal: bool,
+        /// How many of THIS bundle's participations were not yet stored
+        /// (byte-compared against the stored rows; never more than the
+        /// bundle carries).
+        novel_participations: usize,
+    },
+    /// Everything the bundle carried — proposal and every participation —
+    /// was already stored before this admission began: an idempotent
+    /// re-verification that changed nothing.
+    Duplicate,
 }
 
 /// The strict-majority destructive threshold for a roster of `n` holders —
@@ -224,6 +292,14 @@ pub async fn admit_replicated_accord_evidence(
 /// 1. Family scope: only the HUMANITY_ACCORD family, the same scope the
 ///    withdrawal authority accepts. A bundle for any other family is refused
 ///    here rather than stored and ignored.
+///
+///    1b. v36.0.0 (CIRISPersist#674) — the CARRIER bound: a bundle carrying
+///    more participations than the declared roster has seats, or two entries
+///    for one `member_id`, is refused with the typed
+///    [`Error::AccordEvidenceCarrierMalformed`] BEFORE any signature is
+///    verified and before the roster is resolved. No legitimate serve side
+///    can produce such a bundle, and the refusal names the carrier rather
+///    than the evidence.
 /// 2. Roster resolution: `roster_key_ids` → PINNED pubkeys from OUR
 ///    `federation_keys`. Sender-supplied key material is unrepresentable.
 /// 3. **The re-tally.** `tally_live_quorum(&proposal, &participations,
@@ -301,6 +377,56 @@ pub async fn admit_replicated_accord_evidence_over_roster(
         )));
     }
 
+    // (1b) v36.0.0 (CIRISPersist#674) — THE CARRIER BOUND, decided before any
+    // signature is verified, before the roster is resolved, and before
+    // anything lands. Both checks are pure functions of the input and the
+    // declared seat list: a bundle cannot legitimately carry more votes than
+    // the roster has seats, and cannot carry two entries for one seat — the
+    // serve side ([`assemble_evidence_page`]) orders by `member_id`, which M6
+    // dedup makes unique within a bundle.
+    //
+    // Like step (1), each rule is ALSO enforced one level down: the step-(3)
+    // tally fails closed on an unknown seat and on a duplicate member. The
+    // two refusals say different things, though — the tally's collapses into
+    // "the receiver's re-tally did not authorize it", which sends an operator
+    // hunting a partition or a forgery, when the actual fault is a carrier
+    // shipping a bundle no legitimate serve side can produce. And unlike
+    // step (1), this layer carries a bound of its own: the hybrid
+    // verification work one bundle can demand stays bounded by the seat
+    // count even if the tally's error-on-first-anomaly shape ever drifts
+    // toward skip-and-continue.
+    //
+    // The bound is the DECLARED seat count, not the resolved roster: the
+    // step-(0) posture gate admits a partially-seated directory (>= 1 seat
+    // resolves), and a full bundle offered to such a node is stale-roster
+    // evidence for step (3) to refuse honestly — not a malformed carrier.
+    let declared_seats = roster_key_ids.len();
+    if evidence.participations.len() > declared_seats {
+        return Err(Error::AccordEvidenceCarrierMalformed {
+            proposal_digest: proposal_digest.clone(),
+            participations: evidence.participations.len(),
+            roster_seats: declared_seats,
+            reason: "a bundle cannot carry more participations than the accord roster has seats"
+                .to_owned(),
+        });
+    }
+    let mut seats_seen: Vec<&str> = Vec::with_capacity(evidence.participations.len());
+    for p in &evidence.participations {
+        if seats_seen.contains(&p.member_id.as_str()) {
+            return Err(Error::AccordEvidenceCarrierMalformed {
+                proposal_digest: proposal_digest.clone(),
+                participations: evidence.participations.len(),
+                roster_seats: declared_seats,
+                reason: format!(
+                    "duplicate participation for seat {member_id:?} — a bundle carries at most \
+                     one entry per member_id",
+                    member_id = p.member_id
+                ),
+            });
+        }
+        seats_seen.push(p.member_id.as_str());
+    }
+
     // (2) Roster from OUR directory.
     let roster = roster_from_own_directory(directory, roster_key_ids).await?;
 
@@ -326,6 +452,34 @@ pub async fn admit_replicated_accord_evidence_over_roster(
         )));
     }
 
+    // (4-pre) CHECK-TIME NOVELTY (v36.0.0, CIRISPersist#675) — read BEFORE
+    // anything lands, so `Duplicate` is a statement about state this
+    // admission verifiably observed, not a differencing of shared state
+    // across the writes (the removed `participations_admitted` bug). Byte
+    // compare against the stored rows: a same-member row with DIFFERING
+    // bytes counts as novel here, and the put below then refuses it as an
+    // M6 conflict, so `effect` is never returned for it.
+    let novel_proposal = directory
+        .get_accord_proposal(&proposal_digest)
+        .await?
+        .is_none();
+    let stored_before = directory
+        .list_accord_participations(&proposal_digest)
+        .await?;
+    let novel_participations = evidence
+        .participations
+        .iter()
+        .filter(|p| !stored_before.iter().any(|s| s.participation == **p))
+        .count();
+    let effect = if novel_proposal || novel_participations > 0 {
+        AccordAdmissionEffect::Supplied {
+            novel_proposal,
+            novel_participations,
+        }
+    } else {
+        AccordAdmissionEffect::Duplicate
+    };
+
     // (4) Now — and only now — store. See the doc note on M4.
     directory
         .issue_accord_nonce(&evidence.proposal.family_key_id, &evidence.proposal.nonce)
@@ -336,10 +490,6 @@ pub async fn admit_replicated_accord_evidence_over_roster(
             evidence.authority_signature.clone(),
         )
         .await?;
-    let before = directory
-        .list_accord_participations(&proposal_digest)
-        .await?
-        .len();
     for participation in &evidence.participations {
         // Re-verified a second time, per row, as it lands: the member must be
         // in the roster and `AccordParticipation::verify` must pass.
@@ -347,10 +497,6 @@ pub async fn admit_replicated_accord_evidence_over_roster(
             .put_accord_participation(participation.clone(), &roster)
             .await?;
     }
-    let after = directory
-        .list_accord_participations(&proposal_digest)
-        .await?
-        .len();
 
     // (5) Re-derive OUR OWN withdrawal projection. This is why (4) is safe.
     let withdrawals_projected =
@@ -362,7 +508,7 @@ pub async fn admit_replicated_accord_evidence_over_roster(
         yes: tally.yes,
         threshold: policy.m,
         roster_size: policy.n,
-        participations_admitted: after.saturating_sub(before),
+        effect,
         withdrawals_projected,
     })
 }
@@ -1029,6 +1175,14 @@ pub(crate) mod carriage_tests {
         assert_eq!(admission.threshold, 2, "(3) strict majority of 3");
         assert_eq!(admission.roster_size, 3);
         assert_eq!(
+            admission.effect,
+            AccordAdmissionEffect::Supplied {
+                novel_proposal: true,
+                novel_participations: 2,
+            },
+            "(3) B lacked all of it when the admission checked — a supply, exactly bounded"
+        );
+        assert_eq!(
             admission.withdrawals_projected,
             vec![(roles::INFRA_ATTEST.to_owned(), ci.clone())],
             "(3) the admit re-derived exactly the one tombstone its evidence supports"
@@ -1055,11 +1209,26 @@ pub(crate) mod carriage_tests {
         );
 
         // ── (5) Idempotent replay: a carrier re-offering the same bundle
-        //        changes nothing. ──
+        //        changes nothing. Asserted through the STORE, not through a
+        //        counter in the admission report — v36.0.0 (#675) removed
+        //        `participations_admitted` because differencing reads around
+        //        the put loop mis-attributes under concurrent admissions. ──
+        let stored_before_replay = b.list_accord_participations(&digest).await.unwrap().len();
+        assert_eq!(stored_before_replay, 2, "(5) both votes are already home");
         let again = admit_replicated_accord_evidence_over_roster(b, &bundle, &nb.roster_key_ids)
             .await
             .expect("(5) replay must be idempotent");
-        assert_eq!(again.participations_admitted, 0, "(5) nothing new landed");
+        assert_eq!(
+            again.effect,
+            AccordAdmissionEffect::Duplicate,
+            "(5) a completed admission's replay is deterministically a Duplicate — \
+             this is the signal a carrier keys its supply decision on"
+        );
+        assert_eq!(
+            b.list_accord_participations(&digest).await.unwrap().len(),
+            stored_before_replay,
+            "(5) nothing new landed"
+        );
         assert_eq!(again.withdrawals_projected.len(), 1);
 
         // ── (6) THE REPAIR DOOR. The exclusion is rebuildable from evidence
@@ -1427,6 +1596,149 @@ pub(crate) mod carriage_tests {
             "(13) and still report the exclusion as in place: {swept_again:?}"
         );
         assert!(!is_infra_attest_effective(b, &ci).await.unwrap());
+
+        // ── (14) THE CARRIER BOUND (v36.0.0, CIRISPersist#674). A bundle no
+        //        legitimate serve side can produce — more entries than the
+        //        roster has seats, or two entries for one seat — is refused
+        //        with the CARRIER-fault kind, before any signature is
+        //        verified and before anything lands.
+        //
+        //   Like leg (9), the discriminating assertion is the DIAGNOSIS: the
+        //   step-(3) tally already fails closed on an unknown seat and on a
+        //   duplicate member, so deleting the carrier checks leaves these
+        //   bundles refused anyway — as `accord_evidence_unverified`, the
+        //   token that sends an operator hunting a partition. The kind
+        //   assertions below go red under exactly that mutation. ──
+        let ci_over = format!("over-{tag}");
+        let over_digest = seed_quorum(
+            a,
+            &na,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci_over,
+            &[0, 1],
+            &format!("ov-{tag}"),
+        )
+        .await;
+        let clean = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == over_digest)
+            .expect("(14) the clean 2-of-3 bundle is servable");
+
+        // (14a) OVERBROAD: pad past the seat count with entries naming seats
+        // that do not exist. Their signatures are garbage-by-construction —
+        // if anything verified them the refusal would come out of the tally
+        // instead, and the kind assertion below would say so.
+        let mut padded = clean.clone();
+        for ghost in ["ghost-a", "ghost-b"] {
+            let mut junk = clean.participations[0].clone();
+            junk.member_id = format!("{ghost}-{tag}");
+            junk.signature.member_id = junk.member_id.clone();
+            padded.participations.push(junk);
+        }
+        assert_eq!(padded.participations.len(), 4, "(14a) 4 entries, 3 seats");
+        let oerr = admit_replicated_accord_evidence_over_roster(b, &padded, &nb.roster_key_ids)
+            .await
+            .expect_err("(14a) an overbroad bundle must be refused");
+        assert_eq!(
+            oerr.kind(),
+            "accord_evidence_carrier_malformed",
+            "(14a) the refusal names the CARRIER, not the evidence: {oerr}"
+        );
+        let omsg = format!("{oerr}");
+        assert!(
+            omsg.contains("4 participation(s)") && omsg.contains("3 declared accord seat(s)"),
+            "(14a) the refusal names the counts: {omsg}"
+        );
+        assert!(
+            b.get_accord_proposal(&over_digest).await.unwrap().is_none(),
+            "(14a) decided PRE-WRITE: a carrier-refused bundle stores nothing"
+        );
+
+        // (14b) DUPLICATE SEAT, within the cap: 3 entries against 3 seats,
+        // two of them for one member_id.
+        let mut duped = clean.clone();
+        duped.participations.push(clean.participations[0].clone());
+        assert_eq!(duped.participations.len(), 3, "(14b) inside the cap");
+        let derr = admit_replicated_accord_evidence_over_roster(b, &duped, &nb.roster_key_ids)
+            .await
+            .expect_err("(14b) a duplicate-seat bundle must be refused");
+        assert_eq!(
+            derr.kind(),
+            "accord_evidence_carrier_malformed",
+            "(14b) duplicate seats are a carrier fault too: {derr}"
+        );
+        let dmsg = format!("{derr}");
+        assert!(
+            dmsg.contains("duplicate participation for seat")
+                && dmsg.contains(&clean.participations[0].member_id),
+            "(14b) the refusal names the duplicated seat: {dmsg}"
+        );
+        assert!(
+            b.get_accord_proposal(&over_digest).await.unwrap().is_none(),
+            "(14b) still nothing stored"
+        );
+
+        // (14a') THE SAME EVIDENCE, UNPADDED, IS ADMISSIBLE — the two
+        // refusals above were about the carrier's framing, never the votes.
+        let ok = admit_replicated_accord_evidence_over_roster(b, &clean, &nb.roster_key_ids)
+            .await
+            .expect("(14a') the identical evidence without the padding admits");
+        assert_eq!(ok.yes, 2);
+        assert_eq!(
+            ok.effect,
+            AccordAdmissionEffect::Supplied {
+                novel_proposal: true,
+                novel_participations: 2,
+            },
+            "(14a') and the carrier refusals stored nothing, so this is the first supply"
+        );
+
+        // (14c) THE BOUNDARY: a FULL bundle — exactly one entry per seat —
+        // is the legitimate maximum, not an overflow. This is the leg that
+        // goes red if the cap ever tightens from `>` to `>=`.
+        let ci_full = format!("full-{tag}");
+        confer_infra_attest(b, &nb, &ci_full).await;
+        let full_digest = seed_quorum(
+            a,
+            &na,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci_full,
+            &[0, 1, 2],
+            &format!("fl-{tag}"),
+        )
+        .await;
+        let full = a
+            .list_signed_accord_quorum_evidence_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.proposal.digest() == full_digest)
+            .expect("(14c) the full-roster bundle is servable");
+        assert_eq!(
+            full.participations.len(),
+            nb.roster_key_ids.len(),
+            "(14c) exactly the seat count"
+        );
+        let fadm = admit_replicated_accord_evidence_over_roster(b, &full, &nb.roster_key_ids)
+            .await
+            .expect("(14c) a full-roster bundle is NOT overbroad — the bound is >, never >=");
+        assert_eq!(fadm.yes, 3, "(14c) every seat's vote counted");
+        assert_eq!(
+            fadm.effect,
+            AccordAdmissionEffect::Supplied {
+                novel_proposal: true,
+                novel_participations: 3,
+            },
+            "(14c) novelty is bounded by the bundle's own length — the full set, once"
+        );
+        assert_eq!(
+            fadm.withdrawals_projected,
+            vec![(roles::INFRA_ATTEST.to_owned(), ci_full.clone())],
+            "(14c) and the projection landed"
+        );
     }
 
     /// PR #667 round-3 review P2 — **an `_over_roster` gate projects against
@@ -1592,8 +1904,12 @@ pub(crate) mod carriage_tests {
         )
         .await;
 
+        // v36.0.0 (#668) — the resume is the PAIR; the empty id is the
+        // infimum at that instant, so this resumes exactly where the old
+        // instant-only cursor did (plus any same-instant tie remainder,
+        // which is the pair's whole point).
         let resumed = dir
-            .list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+            .list_signed_accord_quorum_evidence_since(Some((cursor, String::new())), u32::MAX)
             .await
             .unwrap();
         let served = resumed
@@ -1637,10 +1953,11 @@ pub(crate) mod carriage_tests {
             .expect("the one-vote bundle is servable");
         assert_eq!(first.participations.len(), 1);
 
-        // A peer reads to here and pins its cursor — the ordinary thing to do.
-        let cursor = first.evidence_at;
+        // A peer reads to here and pins its cursor — the ordinary thing to
+        // do. v36.0.0 (#668) — the cursor is the PAIR (evidence_at, digest).
+        let cursor = (first.evidence_at, digest.clone());
         assert!(
-            !dir.list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+            !dir.list_signed_accord_quorum_evidence_since(Some(cursor.clone()), u32::MAX)
                 .await
                 .unwrap()
                 .iter()
@@ -1664,7 +1981,7 @@ pub(crate) mod carriage_tests {
         .expect("the second YES lands");
 
         let resumed = dir
-            .list_signed_accord_quorum_evidence_since(Some(cursor), u32::MAX)
+            .list_signed_accord_quorum_evidence_since(Some(cursor.clone()), u32::MAX)
             .await
             .unwrap();
         let again = resumed
@@ -1673,7 +1990,7 @@ pub(crate) mod carriage_tests {
             .expect("the quorum-bearing version must be re-offered past the old cursor");
         assert_eq!(again.participations.len(), 2, "and it carries both votes");
         assert!(
-            again.evidence_at > cursor,
+            again.evidence_at > cursor.0,
             "the bundle's visibility instant advanced with the vote"
         );
     }
@@ -1751,11 +2068,12 @@ pub(crate) mod carriage_tests {
             .expect("the stored revocation must be served");
         assert_eq!(served.revocation.revoked_key_id, subject);
 
-        // ── The cursor is a cursor: `since` at the row's own position excludes
-        //    it, so a caller resuming from its last page does not re-read. ──
-        let position = served.admitted_at;
+        // ── The cursor is a cursor: `since` at the row's own resume PAIR
+        //    excludes it, so a caller resuming from its last page does not
+        //    re-read (#668). ──
+        let position = served.resume_pair();
         let after = dir
-            .list_signed_revocations_since(Some(position), u32::MAX)
+            .list_signed_revocations_since(Some(position.clone()), u32::MAX)
             .await
             .unwrap();
         assert!(
@@ -1830,7 +2148,7 @@ pub(crate) mod carriage_tests {
             persist_row_hash: String::new(),
         });
         assert!(
-            late_row.scrub_timestamp < position,
+            late_row.scrub_timestamp < position.0,
             "the fixture must be signed BEFORE the consumer's cursor, or it proves nothing"
         );
         // The instant AS SEALED, not the one this fixture started from: the
@@ -1848,7 +2166,7 @@ pub(crate) mod carriage_tests {
         );
 
         let resumed = dir
-            .list_signed_revocations_since(Some(position), u32::MAX)
+            .list_signed_revocations_since(Some(position.clone()), u32::MAX)
             .await
             .unwrap();
         let late_served = resumed
@@ -1859,7 +2177,7 @@ pub(crate) mod carriage_tests {
                  its signature — keying on the producer's clock hides it forever",
             );
         assert!(
-            late_served.admitted_at > position,
+            late_served.admitted_at > position.0,
             "and its position is THIS node's admission order, not the producer's instant"
         );
         assert_eq!(
@@ -1915,6 +2233,425 @@ pub(crate) mod carriage_tests {
                 .unwrap(),
             revocation_id
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v36.0.0 (CIRISPersist#674 / CIRISPersist#675) — the MULTI-WRITER
+    // witnesses. A serial pass proves one sample (the parallel-hunt lesson):
+    // #675's defect was invisible to every single-writer fixture, because
+    // differencing two reads around the put loop is only wrong when another
+    // admission interleaves. These drive genuinely concurrent admissions on
+    // a multi-thread runtime and assert per-admission facts plus store truth.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// v36.0.0 (CIRISPersist#675) — the effect's WIRE shape, pinned: it
+    /// crosses the pyo3 door as JSON and the FFI capsule inside
+    /// `AccordEvidenceAdmitted`, and CIRISEdge's replication bridge keys its
+    /// Admitted-vs-Duplicate supply decision on `kind`. A serde-attribute
+    /// edit that moves these names is a consumer break, not a refactor.
+    #[test]
+    fn admission_effect_wire_shape_pinned_675() {
+        assert_eq!(
+            serde_json::to_value(AccordAdmissionEffect::Supplied {
+                novel_proposal: true,
+                novel_participations: 2,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "supplied",
+                "novel_proposal": true,
+                "novel_participations": 2,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AccordAdmissionEffect::Duplicate).unwrap(),
+            serde_json::json!({ "kind": "duplicate" })
+        );
+        let round: AccordAdmissionEffect =
+            serde_json::from_value(serde_json::json!({ "kind": "duplicate" })).unwrap();
+        assert_eq!(round, AccordAdmissionEffect::Duplicate);
+    }
+
+    /// A multi-thread runtime with 8MB worker stacks — hybrid ML-DSA-65
+    /// verification runs inside the spawned admissions, and the default 2MB
+    /// tokio worker stack is the known overflow (see the verify-crate stack
+    /// note); the serial witnesses never hit it because `#[tokio::test]`'s
+    /// current-thread flavor runs on the test thread itself.
+    fn concurrent_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .thread_stack_size(8 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("concurrent test runtime")
+    }
+
+    /// One proposal, signed off-store: the three holders' YES votes plus the
+    /// pieces every concurrent-admission leg needs.
+    async fn concurrent_fixture<B>(
+        dir: &B,
+        tag: &str,
+        target: &str,
+    ) -> (Node, AccordProposal, Vec<AccordParticipation>)
+    where
+        B: FederationDirectory,
+    {
+        let node = seed_node(dir).await;
+        let payload_sha256 =
+            canonical_withdrawal_payload_sha256(OP_WITHDRAW_INFRA_ATTEST, target, None)
+                .expect("payload sha256");
+        let proposal = AccordProposal {
+            family_key_id: HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+            action: AccordAction::RosterChange,
+            nonce: format!("cc-{tag}"),
+            window_until: "2031-01-01T00:00:00Z".to_owned(),
+            prior_family_digest: "prior-family-digest".to_owned(),
+            payload_sha256,
+        };
+        let votes: Vec<AccordParticipation> = node
+            .holders
+            .iter()
+            .map(|h| signed_participation(h, &proposal, Vote::Yes))
+            .collect();
+        (node, proposal, votes)
+    }
+
+    /// **THE #675 WITNESS.** N carriers concurrently admit OVERLAPPING
+    /// quorate bundles for ONE proposal — the exact interleave under which
+    /// the removed `participations_admitted` differencing attributed one
+    /// carrier's inserts to another. Asserts:
+    ///
+    /// * every admission succeeds (an idempotent replay racing an insert is
+    ///   an `Ok`, never a spurious conflict),
+    /// * every admission's report is a function of ITS OWN offered bundle —
+    ///   `yes` equals that bundle's vote count exactly, regardless of what
+    ///   the other writers stored first (per-admission attribution), and
+    /// * store truth read from the store: exactly one row per holder (M6
+    ///   under concurrency), and the tombstone projected.
+    pub(crate) async fn run_concurrent_overlap_matrix<B>(dir: std::sync::Arc<B>, tag: &str)
+    where
+        B: FederationDirectory + 'static,
+    {
+        let target = format!("cc-{tag}");
+        let (node, proposal, votes) = concurrent_fixture(dir.as_ref(), tag, &target).await;
+        confer_infra_attest(dir.as_ref(), &node, &target).await;
+        let digest = proposal.digest();
+
+        // Overlapping quorate subsets — every pair, plus the full set.
+        let subsets: [&[usize]; 4] = [&[0, 1], &[1, 2], &[0, 2], &[0, 1, 2]];
+        let mut handles = Vec::new();
+        for round in 0..3 {
+            for subset in subsets {
+                let bundle = AccordQuorumEvidence {
+                    proposal: proposal.clone(),
+                    authority_signature: None,
+                    participations: subset.iter().map(|&j| votes[j].clone()).collect(),
+                    evidence_at: chrono::Utc::now(),
+                };
+                let dir = dir.clone();
+                let roster_key_ids = node.roster_key_ids.clone();
+                let offered = subset.len();
+                handles.push(tokio::spawn(async move {
+                    let result = admit_replicated_accord_evidence_over_roster(
+                        dir.as_ref(),
+                        &bundle,
+                        &roster_key_ids,
+                    )
+                    .await;
+                    (round, offered, result)
+                }));
+            }
+        }
+        let mut supplied = 0usize;
+        for handle in handles {
+            let (round, offered, result) = handle.await.expect("admission task must not panic");
+            let admission = result.unwrap_or_else(|e| {
+                panic!(
+                    "a quorate bundle must be admitted however its writers interleave \
+                     (round {round}, {offered} votes offered): {e}"
+                )
+            });
+            assert_eq!(admission.proposal_digest, digest);
+            assert_eq!(admission.threshold, 2);
+            assert_eq!(admission.roster_size, 3);
+            // Per-admission attribution: the report describes the bundle THIS
+            // call re-tallied — never state another writer stored first.
+            assert_eq!(
+                admission.yes, offered,
+                "an admission's YES count is its OWN bundle's re-tally, not a read of \
+                 concurrently-shared store state (round {round})"
+            );
+            // The #675 replacement's bound: `Supplied` may fire on any racer
+            // (each verifiably lacked evidence at ITS check instant), but its
+            // novelty can never exceed the bundle's own length — the
+            // differencing counter violated exactly this, attributing OTHER
+            // bundles' inserts to whichever reader raced past them.
+            match admission.effect {
+                AccordAdmissionEffect::Supplied {
+                    novel_proposal: _,
+                    novel_participations,
+                } => {
+                    supplied += 1;
+                    assert!(
+                        novel_participations <= offered,
+                        "check-time novelty is a fact about THIS bundle: \
+                         {novel_participations} novel > {offered} offered (round {round})"
+                    );
+                }
+                AccordAdmissionEffect::Duplicate => {}
+            }
+        }
+        assert!(
+            supplied >= 1,
+            "the store started empty, so whichever admission read first verifiably supplied"
+        );
+
+        // Post-join, the effect is DETERMINISTIC again: everything is stored,
+        // so a replay of any subset — or the full set — is a Duplicate.
+        for subset in subsets {
+            let replay = AccordQuorumEvidence {
+                proposal: proposal.clone(),
+                authority_signature: None,
+                participations: subset.iter().map(|&j| votes[j].clone()).collect(),
+                evidence_at: chrono::Utc::now(),
+            };
+            let again = admit_replicated_accord_evidence_over_roster(
+                dir.as_ref(),
+                &replay,
+                &node.roster_key_ids,
+            )
+            .await
+            .expect("post-join replay is idempotent");
+            assert_eq!(
+                again.effect,
+                AccordAdmissionEffect::Duplicate,
+                "after every writer joined, any replay is deterministically a Duplicate"
+            );
+        }
+
+        // Store truth, read from the store.
+        let stored = dir.list_accord_participations(&digest).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            3,
+            "M6 under concurrency: each holder exactly once, however many writers raced"
+        );
+        let mut pinned: Vec<&str> = stored.iter().map(|s| s.pinned_pubkey.as_str()).collect();
+        pinned.sort_unstable();
+        pinned.dedup();
+        assert_eq!(pinned.len(), 3, "three DISTINCT pinned pubkeys");
+        let mut members: Vec<String> = stored
+            .iter()
+            .map(|s| s.participation.member_id.clone())
+            .collect();
+        members.sort();
+        let mut expected = node.roster_key_ids.clone();
+        expected.sort();
+        assert_eq!(members, expected, "exactly the roster's seats, no ghosts");
+        assert!(
+            dir.lookup_role_withdrawal(roles::INFRA_ATTEST, &target)
+                .await
+                .unwrap()
+                .is_some(),
+            "the projection landed"
+        );
+        assert!(
+            !is_infra_attest_effective(dir.as_ref(), &target)
+                .await
+                .unwrap(),
+            "and the exclusion holds"
+        );
+
+        // ── The effect TRANSITIONS, serially deterministic, on a fresh
+        //    proposal — the Admitted-vs-Duplicate ladder a replication bridge
+        //    (CIRISEdge bridge.rs) climbs: first supply, a vote's arrival,
+        //    then replays from either side. ──
+        let target2 = format!("cc2-{tag}");
+        confer_infra_attest(dir.as_ref(), &node, &target2).await;
+        let payload2 =
+            canonical_withdrawal_payload_sha256(OP_WITHDRAW_INFRA_ATTEST, &target2, None)
+                .expect("payload sha256");
+        let proposal2 = AccordProposal {
+            family_key_id: HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+            action: AccordAction::RosterChange,
+            nonce: format!("cc2-{tag}"),
+            window_until: "2031-01-01T00:00:00Z".to_owned(),
+            prior_family_digest: "prior-family-digest".to_owned(),
+            payload_sha256: payload2,
+        };
+        let votes2: Vec<AccordParticipation> = node
+            .holders
+            .iter()
+            .map(|h| signed_participation(h, &proposal2, Vote::Yes))
+            .collect();
+        let sub2 = |idx: &[usize]| AccordQuorumEvidence {
+            proposal: proposal2.clone(),
+            authority_signature: None,
+            participations: idx.iter().map(|&j| votes2[j].clone()).collect(),
+            evidence_at: chrono::Utc::now(),
+        };
+        let admit2 = |bundle: AccordQuorumEvidence| {
+            let dir = dir.clone();
+            let roster_key_ids = node.roster_key_ids.clone();
+            async move {
+                admit_replicated_accord_evidence_over_roster(dir.as_ref(), &bundle, &roster_key_ids)
+                    .await
+                    .expect("serial-effect admission")
+                    .effect
+            }
+        };
+        assert_eq!(
+            admit2(sub2(&[0, 1])).await,
+            AccordAdmissionEffect::Supplied {
+                novel_proposal: true,
+                novel_participations: 2,
+            },
+            "first supply: proposal and both votes were absent"
+        );
+        assert_eq!(
+            admit2(sub2(&[0, 1, 2])).await,
+            AccordAdmissionEffect::Supplied {
+                novel_proposal: false,
+                novel_participations: 1,
+            },
+            "a vote's arrival: only the third vote is novel — never the two re-carried"
+        );
+        assert_eq!(
+            admit2(sub2(&[0, 1, 2])).await,
+            AccordAdmissionEffect::Duplicate,
+            "full replay after completion"
+        );
+        assert_eq!(
+            admit2(sub2(&[1, 2])).await,
+            AccordAdmissionEffect::Duplicate,
+            "a subset of stored evidence supplies nothing"
+        );
+    }
+
+    /// **THE #674 BOUND UNDER CONCURRENCY.** N carriers concurrently offer
+    /// the SAME overbroad bundle: every one must be refused with the typed
+    /// carrier kind, and — because the bound is decided pre-write — the
+    /// proposal must not exist afterwards, no matter how the refusals
+    /// interleaved. No store write happens on this path, so this leg runs on
+    /// every backend.
+    pub(crate) async fn run_concurrent_carrier_bound_matrix<B>(dir: std::sync::Arc<B>, tag: &str)
+    where
+        B: FederationDirectory + 'static,
+    {
+        let target = format!("cb-{tag}");
+        let (node, proposal, votes) = concurrent_fixture(dir.as_ref(), tag, &target).await;
+        let digest = proposal.digest();
+
+        let mut overbroad: Vec<AccordParticipation> = votes.clone();
+        let mut ghost = votes[0].clone();
+        ghost.member_id = format!("ghost-{tag}");
+        ghost.signature.member_id = ghost.member_id.clone();
+        overbroad.push(ghost);
+        assert_eq!(overbroad.len(), 4, "4 entries against 3 seats");
+        let bundle = AccordQuorumEvidence {
+            proposal: proposal.clone(),
+            authority_signature: None,
+            participations: overbroad,
+            evidence_at: chrono::Utc::now(),
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let dir = dir.clone();
+            let bundle = bundle.clone();
+            let roster_key_ids = node.roster_key_ids.clone();
+            handles.push(tokio::spawn(async move {
+                admit_replicated_accord_evidence_over_roster(dir.as_ref(), &bundle, &roster_key_ids)
+                    .await
+            }));
+        }
+        for handle in handles {
+            let err = handle
+                .await
+                .expect("refusal task must not panic")
+                .expect_err("every concurrent offer of an overbroad bundle is refused");
+            assert_eq!(err.kind(), "accord_evidence_carrier_malformed", "{err}");
+        }
+        assert!(
+            dir.get_accord_proposal(&digest).await.unwrap().is_none(),
+            "decided pre-write under concurrency: no interleaving stores the proposal"
+        );
+    }
+
+    #[test]
+    fn accord_concurrent_admissions_memory() {
+        use crate::store::memory::MemoryBackend;
+        concurrent_runtime().block_on(async {
+            run_concurrent_overlap_matrix(std::sync::Arc::new(MemoryBackend::new()), "ccm").await;
+            run_concurrent_carrier_bound_matrix(std::sync::Arc::new(MemoryBackend::new()), "cbm")
+                .await;
+        });
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn accord_concurrent_admissions_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        concurrent_runtime().block_on(async {
+            let a = SqliteBackend::open_in_memory().await.unwrap();
+            a.run_migrations().await.unwrap();
+            run_concurrent_overlap_matrix(std::sync::Arc::new(a), "ccs").await;
+            let b = SqliteBackend::open_in_memory().await.unwrap();
+            b.run_migrations().await.unwrap();
+            run_concurrent_carrier_bound_matrix(std::sync::Arc::new(b), "cbs").await;
+        });
+    }
+
+    /// Postgres runs BOTH legs — carrier-bound and overlap.
+    ///
+    /// v36.0.0 (CIRISPersist#719): the overlap leg was withheld here because
+    /// pg's `put_accord_participation` M6 dedup was a SELECT-then-INSERT on
+    /// pooled connections with no transaction, so two carriers admitting the
+    /// same vote concurrently both passed the check and the loser surfaced the
+    /// `(proposal_digest, pinned_pubkey)` PK violation as `Error::Backend` —
+    /// a spurious failure where the contract says idempotent no-op. Integrity
+    /// always held (the PK is the backstop); the error path did not. Wiring
+    /// the leg then would have been a flaky witness measuring a neighbouring
+    /// gate, so the defect was reported instead and the leg deferred.
+    ///
+    /// That insert now absorbs the race (`ON CONFLICT … DO NOTHING`, with a
+    /// zero-row re-read deciding no-op vs the M6 conflict — `DO NOTHING`
+    /// alone would silently accept a DIFFERING concurrent vote, which is what
+    /// M6 exists to refuse), so the leg is live.
+    ///
+    /// **It is NOT a witness for that fix, and the distinction is recorded
+    /// because it was measured.** Reverting the `ON CONFLICT` clause and
+    /// re-running this leg leaves it GREEN: the matrix drives the overlap
+    /// through the carriage door, whose own admission work widens the window
+    /// between pg's dedup SELECT and its INSERT far too little to lose the
+    /// race reliably in a 3-second run. What this leg pins is that concurrent
+    /// overlapping admissions CONVERGE on pg — real coverage the plane did not
+    /// have. The race itself is argued from the code (check-then-act on a
+    /// pooled connection outside a transaction) and closed by construction;
+    /// a deterministic witness for it needs a fault point between the SELECT
+    /// and the INSERT, which this backend has no seam for. Do not read this
+    /// leg's green as evidence the race is fixed — read the SQL.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn accord_concurrent_carrier_bound_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!(
+                "skipping accord_concurrent_carrier_bound_postgres: CIRIS_PERSIST_TEST_PG_URL unset"
+            );
+            return;
+        };
+        concurrent_runtime().block_on(async {
+            crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
+                run_concurrent_carrier_bound_matrix(std::sync::Arc::new(a), "cbp").await;
+            })
+            .await;
+            crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
+                run_concurrent_overlap_matrix(std::sync::Arc::new(a), "ccp").await;
+            })
+            .await;
+        });
     }
 
     #[cfg(feature = "sqlite")]

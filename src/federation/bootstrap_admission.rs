@@ -202,6 +202,10 @@ pub mod test_support {
     /// so a tie resolves to the restrictive stance on all three backends and
     /// the fixture no longer has to keep the sequence advancing to be
     /// meaningful.
+    ///
+    /// v36.0.0 (CIRISPersist#642) — delegates to
+    /// [`consent_scope_row_superseding`] with no causal edge, which is the
+    /// pre-#642 wire shape every existing caller means.
     pub fn consent_scope_row(
         id: &str,
         subject: &str,
@@ -210,11 +214,98 @@ pub mod test_support {
         scopes: &[&str],
         asserted_at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
+        consent_scope_row_superseding(
+            id,
+            subject,
+            covers,
+            stance_dimension,
+            scopes,
+            asserted_at,
+            None,
+        )
+    }
+
+    /// v36.0.0 (CIRISPersist#642) — [`consent_scope_row`] plus **the causal
+    /// edge**: `supersedes` names, through the consent plane's own
+    /// [`consent_supersedes`](crate::federation::envelope::paths::CONSENT_SUPERSEDES)
+    /// key, the prior consent statement this row supersedes. NOT the composer
+    /// pointer — see that constant for why CC 4.5.1.1 made this a field split.
+    ///
+    /// `supersedes` takes any JSON value on purpose — the fail-closed arms of
+    /// [`crate::federation::consent::causal_edge`] are about a pointer that is
+    /// present and UNUSABLE (a number, `""`, a self-reference), and a fixture
+    /// that can only express well-formed strings cannot drive them. `None`
+    /// omits the member entirely.
+    pub fn consent_scope_row_superseding(
+        id: &str,
+        subject: &str,
+        covers: &str,
+        stance_dimension: &str,
+        scopes: &[&str],
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        supersedes: Option<serde_json::Value>,
+    ) -> Attestation {
+        let asserted_at =
+            crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
+        let mut envelope = serde_json::json!({
+            "dimension": stance_dimension,
+            "scope": scopes,
+            crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
+        });
+        if let Some(target) = supersedes {
+            envelope[crate::federation::envelope::paths::CONSENT_SUPERSEDES] = target;
+        }
+        let envelope = envelope;
+        let (och, sc, sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(subject, &envelope);
+        let mut sealed_row_ = Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: subject.to_owned(),
+            attested_key_id: covers.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: sc,
+            scrub_signature_pqc: sp,
+            scrub_key_id: subject.to_owned(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![subject.to_owned()],
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::tier_ingest::test_support::seal_row_in_place(subject, &mut sealed_row_);
+        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
+        sealed_row_
+    }
+
+    /// v36.0.0 (CIRISPersist#642) — the subject's own `withdraws` against one
+    /// of its consent statements, filed against the SAME target so it lands in
+    /// the `list_attestations_for(covers)` slice the consent fold reads.
+    ///
+    /// Admitted under `withdraws` rule 1 (the target's own attester retracts
+    /// it), which is what makes it reach
+    /// [`crate::federation::precedence::retired_ids`] as an entitled
+    /// retraction rather than being dropped by the #686 entitlement gate.
+    pub fn consent_withdraws_row(
+        id: &str,
+        subject: &str,
+        covers: &str,
+        target_attestation_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Attestation {
         let asserted_at =
             crate::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = serde_json::json!({
-            "dimension": stance_dimension,
-            "scope": scopes,
+            crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID: target_attestation_id,
+            crate::federation::envelope::paths::WITHDRAWAL_REASON: "consent-plane retraction",
             crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
         });
         let (och, sc, sp) =
@@ -223,7 +314,7 @@ pub mod test_support {
             attestation_id: id.to_owned(),
             attesting_key_id: subject.to_owned(),
             attested_key_id: covers.to_owned(),
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
             weight: None,
             asserted_at,
             expires_at: None,
@@ -2359,6 +2450,446 @@ pub mod test_support {
             ConsentState::Revoked,
             "({tag}) B10-b: …and the verdict they converge on is the subject's actual latest \
              stance, not a shared blank"
+        );
+    }
+
+    /// **B12 (CIRISPersist#642) — THE CLOCK SAYS GRANT, THE EDGE SAYS REVOKED,
+    /// AND THE CLOCK-ORDERED FOLD LOSES.**
+    ///
+    /// #598 bound `asserted_at` to the signed envelope, so a peer can no longer
+    /// FORGE the instant — but the producer still chooses it, and
+    /// [`crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW`] (300s) is the
+    /// width of the remaining race: a grant minted ahead out-sorts the
+    /// revocation issued inside that window. This drives the fix through the
+    /// REAL write path on every backend: a revocation that NAMES the grant it
+    /// supersedes (the signed `consent_supersedes` key, read by
+    /// [`crate::federation::consent::causal_edge`]) wins regardless of the
+    /// clock.
+    ///
+    /// Six legs, each on its own `(subject, attester)` pair so the folds cannot
+    /// contaminate each other:
+    ///
+    /// - **A — the witness**, plus the CONTROL that makes it mean something:
+    ///   the identical pair of rows with the pointer REMOVED must read
+    ///   `Granted`. Without the control a green A could just be a fold that
+    ///   never saw the grant. Both entry points (`resolve_consent_state` and
+    ///   `resolve_scoped_consent`) are pinned, and so is the gate downstream of
+    ///   them — a verdict that does not reach `capacity:*` admission is a
+    ///   verdict no consumer feels.
+    /// - **B — fail-closed**: an edge naming a row this node cannot resolve
+    ///   (absent, or junk) does not fall back to clock ordering in the
+    ///   direction that favours the grant.
+    /// - **C — the asymmetry**: the same pointer on a GRANT confers nothing.
+    /// - **D — the ratchet**: a back-dated revocation naming the real
+    ///   revocation must not hand the fold to the grant underneath it.
+    /// - **E — the §6.1 retraction fold reaches the consent plane**: the
+    ///   subject's own `withdraws` against its only grant leaves no live
+    ///   statement (`Unspecified`, not `Granted`).
+    /// - **F — a door, not a wall**: an affirmative later grant still re-opens.
+    pub async fn exercise_consent_causal_supersedes(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::consent::consent_dimension;
+        use crate::federation::hard_case::ConsentState;
+
+        let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
+        let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
+        let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        // The forward mint: 120s ahead of the revocation and INSIDE the 300s
+        // skew tolerance, so `check_instant_binding` admits it. This is the
+        // race #642 is about — not a rejected row, an admitted one that wins.
+        let ahead = now + chrono::Duration::seconds(120);
+        let earlier = now - chrono::Duration::seconds(120);
+        let earliest = now - chrono::Duration::seconds(240);
+
+        // Per-leg key pair. Registering fresh keys per leg is what keeps the
+        // folds independent (the fold is keyed on `(target, subject)`).
+        async fn keys(dir: &dyn FederationDirectory, tag: &str, leg: &str) -> (String, String) {
+            let subject = format!("{tag}-642{leg}-subject");
+            let attester = format!("{tag}-642{leg}-attester");
+            for k in [&subject, &attester] {
+                crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+            }
+            (subject, attester)
+        }
+        let put = |row: Attestation, what: &'static str| async move {
+            dir.put_attestation(SignedAttestation { attestation: row })
+                .await
+                .unwrap_or_else(|e| panic!("B12: {what} must admit: {e}"));
+        };
+
+        // ── A — THE WITNESS ──────────────────────────────────────────────
+        let (subject, attester) = keys(dir, tag, "a").await;
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(&grant_id, &subject, &attester, &granted, &[analyze], ahead),
+            "the forward-minted grant",
+        )
+        .await;
+        put(
+            consent_scope_row_superseding(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                now,
+                Some(serde_json::Value::String(grant_id.clone())),
+            ),
+            "the revocation naming its grant",
+        )
+        .await;
+        for (entry, got) in [
+            (
+                "resolve_scoped_consent",
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("scoped fold reads"),
+            ),
+            (
+                "resolve_consent_state",
+                dir.resolve_consent_state(&attester, &subject, chrono::Utc::now())
+                    .await
+                    .expect("unscoped fold reads"),
+            ),
+        ] {
+            assert_eq!(
+                got,
+                ConsentState::Revoked,
+                "({tag}) B12-A/{entry}: the revocation NAMES the grant it revokes, so causality \
+                 decides — a grant minted 120s ahead is still the latest by `asserted_at` and \
+                 must NOT win (CIRISPersist#642)"
+            );
+        }
+        // …and the verdict reaches the gate a consumer actually feels.
+        dir.put_attestation(SignedAttestation {
+            attestation: capacity_claim(&attester, &subject),
+        })
+        .await
+        .expect_err(&format!(
+            "({tag}) B12-A: the causally-ordered revocation must CLOSE the capacity gate — a \
+             fold the admission path does not inherit changes nothing"
+        ));
+
+        // ── A' — THE CONTROL. Same two rows, no pointer: the clock genuinely
+        //    favours the grant, which is what makes A a measurement.
+        let (subject, attester) = keys(dir, tag, "actl").await;
+        put(
+            consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                ahead,
+            ),
+            "the control grant",
+        )
+        .await;
+        put(
+            consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                now,
+            ),
+            "the control revocation",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Granted,
+            "({tag}) B12-A': WITHOUT the edge this is the #642 defect itself — the forward-minted \
+             grant out-sorts the revocation. If this leg reads Revoked the fixture is not \
+             reproducing the race and leg A proves nothing about the edge"
+        );
+
+        // ── B — FAIL-CLOSED on an edge nobody can resolve ────────────────
+        for (leg, pointer, what) in [
+            (
+                "b1",
+                serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+                "a grant this node has never seen",
+            ),
+            ("b2", serde_json::json!(42), "a junk pointer"),
+        ] {
+            let (subject, attester) = keys(dir, tag, leg).await;
+            put(
+                consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &granted,
+                    &[analyze],
+                    ahead,
+                ),
+                "the forward-minted grant",
+            )
+            .await;
+            put(
+                consent_scope_row_superseding(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &revoked,
+                    &[analyze],
+                    now,
+                    Some(pointer),
+                ),
+                "the revocation with an unresolvable edge",
+            )
+            .await;
+            assert_eq!(
+                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                    .await
+                    .expect("fold reads"),
+                ConsentState::Revoked,
+                "({tag}) B12-B/{leg}: a revocation naming {what} means this node's view is \
+                 INCOMPLETE. Degrading to the clock there hands the answer to the grant minted \
+                 ahead — the defect reached through the fix (CIRISPersist#642)"
+            );
+        }
+
+        // ── C — THE ASYMMETRY: a GRANT's pointer confers nothing ─────────
+        //
+        // Recorded honestly: this OUTCOME is defended TWICE — by `causal_edge`
+        // refusing to read a grant's pointer at all, and independently by the
+        // ratchet, which would discard the looser answer even if it did.
+        // Removing either mechanism alone leaves this leg GREEN, so it is not a
+        // witness for the asymmetry itself; that is pinned directly, on the
+        // function's own contract, in
+        // `consent::causal_fold_tests::causal_edge_is_asymmetric_and_never_degrades_silently`.
+        // What this leg proves is the property a consumer depends on: the
+        // outcome holds through the real write path on every backend.
+        let (subject, attester) = keys(dir, tag, "c").await;
+        let revoke_id = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(&revoke_id, &subject, &attester, &revoked, &[analyze], now),
+            "the revocation",
+        )
+        .await;
+        put(
+            consent_scope_row_superseding(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                earlier,
+                Some(serde_json::Value::String(revoke_id)),
+            ),
+            "an earlier grant naming the revocation",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B12-C: `granted` is the sole fail-OPEN stance and carries no causal \
+             authority here — an earlier grant naming the revocation must not delete it"
+        );
+
+        // ── D — THE RATCHET ──────────────────────────────────────────────
+        let (subject, attester) = keys(dir, tag, "d").await;
+        let real_revoke = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                earlier,
+            ),
+            "the grant underneath",
+        )
+        .await;
+        put(
+            consent_scope_row(&real_revoke, &subject, &attester, &revoked, &[analyze], now),
+            "the real revocation",
+        )
+        .await;
+        put(
+            consent_scope_row_superseding(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                earliest,
+                Some(serde_json::Value::String(real_revoke)),
+            ),
+            "a back-dated revocation naming the real one",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B12-D: eliminating the real revocation leaves {{grant, back-dated revoke}} \
+             and the grant is the later of those. The causal plane may only TIGHTEN — consent is \
+             re-opened by an affirmative later grant, never by deleting a refusal"
+        );
+
+        // ── E — THE §6.1 RETRACTION FOLD REACHES THIS PLANE ──────────────
+        let (subject, attester) = keys(dir, tag, "e").await;
+        let only_grant = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(
+                &only_grant,
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                earlier,
+            ),
+            "the subject's only grant",
+        )
+        .await;
+        put(
+            consent_withdraws_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &only_grant,
+                now,
+            ),
+            "the subject's own withdraws (rule 1)",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Unspecified,
+            "({tag}) B12-E: the grant was retracted through the substrate's OWN retraction \
+             primitive (`precedence::retired_ids`, entitlement-gated). Before #642 the consent \
+             fold could not see `withdraws` at all and kept answering Granted"
+        );
+
+        // ── F — A DOOR, NOT A WALL ───────────────────────────────────────
+        let (subject, attester) = keys(dir, tag, "f").await;
+        let first_grant = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(
+                &first_grant,
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                earliest,
+            ),
+            "the first grant",
+        )
+        .await;
+        put(
+            consent_scope_row_superseding(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[analyze],
+                earlier,
+                Some(serde_json::Value::String(first_grant)),
+            ),
+            "the revocation naming it",
+        )
+        .await;
+        put(
+            consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                now,
+            ),
+            "the affirmative re-grant",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Granted,
+            "({tag}) B12-F: a later grant re-opens consent exactly as it did before the causal \
+             plane existed — the edge orders history, it does not freeze it"
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: capacity_claim(&attester, &subject),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) B12-F: …and the gate re-opens with it: {e}"));
+
+        // ── G — THE RESOLUTION UNIVERSE IS THE SUBJECT'S WHOLE HISTORY ────
+        //
+        // A blanket revocation naming a grant that answers a DIFFERENT scope.
+        // The named grant is filtered out of the scoped slice, so a fold that
+        // resolved edges against the SLICE would call this an incomplete view
+        // and freeze the subject out of a scope it never revoked. Resolving
+        // against the subject's whole consent history for the target is what
+        // keeps the later `view` grant winning on its own instant.
+        let (subject, attester) = keys(dir, tag, "g").await;
+        let export_grant = uuid::Uuid::new_v4().to_string();
+        put(
+            consent_scope_row(
+                &export_grant,
+                &subject,
+                &attester,
+                &granted,
+                &["export"],
+                earliest,
+            ),
+            "the export grant",
+        )
+        .await;
+        put(
+            consent_scope_row_superseding(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &revoked,
+                &[],
+                earlier,
+                Some(serde_json::Value::String(export_grant)),
+            ),
+            "a BLANKET revocation naming the export grant",
+        )
+        .await;
+        put(
+            consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &attester,
+                &granted,
+                &[analyze],
+                now,
+            ),
+            "a later analyze grant",
+        )
+        .await;
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Granted,
+            "({tag}) B12-G: the blanket revocation's edge RESOLVES against the subject's own \
+             history (the export grant is in it), so it carries no unresolved-view restriction \
+             and the later grant wins on the clock as it always did"
+        );
+        assert_eq!(
+            dir.resolve_scoped_consent(&attester, &subject, "export", None, chrono::Utc::now())
+                .await
+                .expect("fold reads"),
+            ConsentState::Revoked,
+            "({tag}) B12-G: …and on the scope it DID revoke, the blanket revocation still closes \
+             the gate — resolving the edge widens nothing"
         );
     }
 

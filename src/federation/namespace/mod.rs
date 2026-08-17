@@ -29,14 +29,115 @@ pub mod supersets;
 
 use crate::federation::types::{attestation_type, cohort_scope};
 
-/// The projection PLANE parameter (v35.0.0, CIRISPersist#713) — re-exported
-/// from [`load_bearing`](crate::federation::load_bearing) so the projection
-/// surface ([`projection_for`] / [`tombstone_ceiling`]) and the predicate
-/// surface ([`is_load_bearing`](crate::federation::load_bearing::is_load_bearing))
-/// dispatch over the SAME closed five-plane enum. One enum, two axes: the
-/// predicate answers *may this copy be released*, the projection answers *how
-/// far does this record travel* — both per plane.
+/// The object-CLASS axis (v35.0.0, CIRISPersist#713) — re-exported from
+/// [`load_bearing`](crate::federation::load_bearing) so the predicate surface
+/// ([`is_load_bearing`](crate::federation::load_bearing::is_load_bearing)) and
+/// the projection surface share one closed five-class vocabulary. Since
+/// v36.0.0 the projection surface ([`projection_for`] /
+/// [`tombstone_ceiling`]) dispatches over [`Plane`] — this same class set,
+/// with the Attestation class additionally carrying its envelope `dimension`
+/// (the #713 decomposition's information-type parameter). [`Plane::class`]
+/// bridges back; `tests::every_object_class_has_a_projection_plane` holds the
+/// two enums 1:1 at compile time.
 pub use crate::federation::load_bearing::ObjectClass;
+
+/// **The projection plane parameter** (v36.0.0, CIRISPersist#713 second half)
+/// — [`ObjectClass`], with the Attestation class carrying its envelope
+/// `dimension`.
+///
+/// Under contextual integrity the information-type parameter of the
+/// Attestation plane IS the `dimension` (consent_grammar.rs, v21.2.0 #509): a
+/// single Attestation row would be one selector serving many
+/// information-types — the CIRISEdge#311 collapse repeated a level down. So
+/// the plane parameter carries the dimension FOR THAT PLANE ONLY, and the
+/// type refuses the two misuse shapes outright (house doctrine: contradictions
+/// are refused — here at COMPILE time):
+///
+/// - a `dimension` supplied with a non-Attestation plane is UNREPRESENTABLE
+///   (no other variant has the field), and
+/// - an Attestation projection query WITHOUT its dimension is equally
+///   unrepresentable (the field is mandatory) — the "forget the call, silently
+///   over-advertise" drift class (#663/#710) closed by type rather than by
+///   convention, exactly as edge's #713 shape answer asked.
+///
+/// Non-Attestation planes therefore pay nothing: no `Option` check, no
+/// dimension read, no allocation — [`projection_for`] stays pure O(1) on
+/// every arm. The dimension is an envelope field like `cohort_scope`, already
+/// extracted at edge's dispatch site for
+/// [`registry::authority_for`], so passing it costs nothing on the hot path.
+///
+/// Deliberately NO `From<ObjectClass>` impl: it could not be total (the
+/// Attestation arm has no dimension to invent), and a partial bridge is the
+/// misuse door this type exists to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Plane<'a> {
+    /// [`ObjectClass::KeyRecord`] — the identity plane.
+    KeyRecord,
+    /// [`ObjectClass::TransportDestination`] — the reachability plane.
+    TransportDestination,
+    /// [`ObjectClass::FountainContent`] — the bytes plane.
+    FountainContent,
+    /// [`ObjectClass::HardCaseEvent`] — the adverse-evidence plane.
+    HardCaseEvent,
+    /// [`ObjectClass::Attestation`], value-keyed by its envelope `dimension`
+    /// — the #713 decomposition's per-family registry input.
+    Attestation {
+        /// The envelope `dimension` (CC 2.1) the registry resolves the
+        /// audience from. Family-classified internally; an unrecognized
+        /// dimension resolves the conservative default row.
+        dimension: &'a str,
+    },
+}
+
+impl Plane<'_> {
+    /// The [`ObjectClass`] this plane projects — the bridge back to the
+    /// predicate axis. Exhaustive over [`Plane`]; the reverse direction is
+    /// held by `tests::every_object_class_has_a_projection_plane`.
+    #[must_use]
+    pub const fn class(self) -> ObjectClass {
+        match self {
+            Plane::KeyRecord => ObjectClass::KeyRecord,
+            Plane::TransportDestination => ObjectClass::TransportDestination,
+            Plane::FountainContent => ObjectClass::FountainContent,
+            Plane::HardCaseEvent => ObjectClass::HardCaseEvent,
+            Plane::Attestation { .. } => ObjectClass::Attestation,
+        }
+    }
+}
+
+/// **The const-typed capability token a [`Projection::Capability`] audience
+/// carries** (v36.0.0, CIRISPersist#713 second half).
+///
+/// A closed enum rather than a string ON PURPOSE: edge shipped the
+/// bare-string version of this bug once (CIRISEdge#379's `"observer"`, which
+/// was not a capability token anywhere in the stack, corrected in CIRISEdge
+/// v13.11.0 to the conferral const) — carrying the authority's const inside the variant
+/// makes that failure unrepresentable. Each variant resolves to an EXISTING
+/// delegation-scope constant via [`Self::as_scope`]; this type never mints a
+/// second spelling of a token
+/// ([`delegation_scope`](crate::federation::types::delegation_scope) stays
+/// the single source), and the serde form is pinned to the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CapabilityToken {
+    /// [`delegation_scope::INFRA_SERVE`](crate::federation::types::delegation_scope::INFRA_SERVE)
+    /// — the E3 trace-serve audience: `trace:*` serves to holders of
+    /// `infra:serve` ONLY (CIRISEdge#386 / CC 4.4.3.4.3, the
+    /// `SERVE_ADVERTISE_POLICY_HASH`-pinned policy; edge's
+    /// `peer_has_serve_capability` overlay folds onto this variant).
+    #[serde(rename = "infra:serve")]
+    InfraServe,
+}
+
+impl CapabilityToken {
+    /// The delegation-scope token this capability audience is gated on — BY
+    /// CONST, never respelled.
+    #[must_use]
+    pub const fn as_scope(self) -> &'static str {
+        match self {
+            CapabilityToken::InfraServe => crate::federation::types::delegation_scope::INFRA_SERVE,
+        }
+    }
+}
 
 /// **Who may emit under a namespace** — the authority class a `dimension`'s
 /// reserved-prefix rule (CC 3.4) demands. Resolved from the vendored CC-3.1
@@ -130,6 +231,19 @@ pub enum Projection {
     /// have traveled would starve holders, silently un-revoking. Since #713 the
     /// ceiling is per-plane: Global exactly where copies could have gone Global).
     Global,
+    /// **Capability-gated serve** (v36.0.0, #713 decomposition) — the record's
+    /// audience is the holders of the carried [`CapabilityToken`], selected by
+    /// ROLE rather than by cohort, and it never widens with scope. The E3
+    /// `trace:*` cell: serves to `infra:serve` holders only. Not comparable to
+    /// [`Cohort`](Projection::Cohort) (role-keyed vs roster-keyed); the
+    /// ceiling-domination test uses an explicit partial order.
+    Capability(CapabilityToken),
+    /// **Subject-gated** (v36.0.0, #713 decomposition) — the record's audience
+    /// past the subject node itself is its DATA-SUBJECT's grant, at every
+    /// scope. The CC#46 `scores:*` cell: admission is cheap (self-signed
+    /// hybrid PoP), so the authority is the subject's — "a node can be fully
+    /// consented for replication and still have no right to score you."
+    Subject,
 }
 
 /// **The lifetime class of a lifecycle relation** — whether an envelope is a
@@ -174,7 +288,9 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 }
 
 /// **The per-plane projection resolver** —
-/// `f(plane, cohort_scope, authority, is_tombstone)` (v35.0.0, CIRISPersist#713).
+/// `f(plane, cohort_scope, authority, is_tombstone)`, with the Attestation
+/// plane value-keyed by its `dimension` (v35.0.0 #713; decomposed v36.0.0,
+/// #713 second half).
 ///
 /// Persist owns this so the anti-rollback rule and the trust-root commons rule
 /// live in exactly ONE tested place; an edge engine calls it rather than
@@ -187,7 +303,10 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 /// plane, and a subject's reachability was published as a side effect of a
 /// decision about their key (the CIRISEdge#311 collapse). The predicate side
 /// ([`is_load_bearing`](crate::federation::load_bearing::is_load_bearing))
-/// already dispatched per [`ObjectClass`]; the projection side now does too.
+/// already dispatched per [`ObjectClass`]; the projection side now does too —
+/// and on the Attestation plane, per DIMENSION FAMILY, because the
+/// information-type parameter of that plane is the `dimension` and one row
+/// would repeat the #311 collapse a level down (#713 server relay).
 ///
 /// # The decided norm table (#713: edge answer + server relay + operator arbitration)
 ///
@@ -201,7 +320,7 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 /// | `TransportDestination` | SelfOwn | SelfOwn | Cohort | Cohort | **Cohort** | **Cohort** | ✱ |
 /// | `FountainContent` | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | ✱ |
 /// | `HardCaseEvent` | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | **Cohort** |
-/// | `Attestation` | *DEFERRED — the pre-#713 scope-only behavior, held; see below* |
+/// | `Attestation` | *per dimension FAMILY — the table below* |
 ///
 /// The cut that decides the narrowed cells: **content may travel wider than
 /// the reachability of its author.** A key's audience is everyone who must
@@ -220,48 +339,80 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 /// infra-role de-admission reach rides the TOMBSTONE ceiling
 /// ([`tombstone_ceiling`]) BY ROLE, not a live cell.
 ///
-/// # The deferred `Attestation` row (NOT a silent default)
+/// # The `Attestation` decomposition (v36.0.0 — #713's second half, decided)
 ///
-/// [`ObjectClass::Attestation`] holds today's scope-only behavior — the exact
-/// pre-#713 rule — because #713's server relay showed the row cannot be *a*
-/// row: the contextual-integrity information-type parameter is the
-/// `dimension`, and at minimum `trace:*` is capability-gated (serves to
-/// `capability:infra:serve` only; never widens with scope) while `scores:*`
-/// is subject-gated (CC#46), which need audience kinds (`Capability`,
-/// `Subject`) the four inputs cannot express. The per-dimension-family
-/// decomposition is #713's open half; CIRISEdge owes the shape answer. Until
-/// it lands, this arm is the old behavior, documented as DEFERRED — awaiting
-/// a decision, not making one.
+/// [`Plane::Attestation`] resolves per dimension FAMILY, value-keyed by the
+/// envelope `dimension` the plane parameter carries. Two families need
+/// audience kinds the scope axis cannot express — [`Projection::Capability`]
+/// (role-keyed) and [`Projection::Subject`] (subject-keyed) — which is why
+/// the row could never be *a* row:
 ///
-/// Two cells of that decomposition ARE already decided on the thread and are
-/// recorded here because this signature cannot yet resolve them (they need
-/// the `dimension`, which the four inputs deliberately do not carry — the
-/// decomposition will bring it properly, not as a bolt-on parameter):
-/// [`AuthorityClass::SubstrateSelf`] at commons scopes projects
-/// [`Global`](Projection::Global) on the Attestation plane for `transport:*`
-/// dimensions and for the EXACT dimension `system:audit_chain:hash_continuity`
-/// — NOT the open `system:*` prefix. A future subject-carrying dimension must
+/// | family | self / family | community / affiliations | species / biosphere | federation | ceiling |
+/// |---|---|---|---|---|---|
+/// | `consent:*` | SelfOwn | Cohort | Cohort | ✱ | **Global** |
+/// | `trace:*` | SelfOwn | **SelfOwn** | Capability(`infra:serve`) | Capability(`infra:serve`) | Capability(`infra:serve`) |
+/// | `scores:*` | SelfOwn | **Subject** | Subject | Subject | Subject |
+/// | `capacity:*` | SelfOwn | Cohort | Cohort | ✱ | row-max (✱) |
+/// | `content_class:*` | SelfOwn | Cohort | Cohort | ✱ | row-max (✱) |
+/// | `transport:*` † | SelfOwn | Cohort | Global if SubstrateSelf, else Cohort | Global if SubstrateSelf, else ✱ | row-max |
+/// | *unknown* | SelfOwn | Cohort | Cohort | **Cohort** | Cohort |
+///
+/// † and the EXACT dimension `system:audit_chain:hash_continuity` — the VALUE,
+/// never the open `system:*` prefix. A future subject-carrying dimension must
 /// never inherit Global from a namespace; a new member has to EARN Global,
-/// not inherit it (#713 server relay, declining the open prefix).
+/// not inherit it (#713 server relay, declining the open prefix). Every other
+/// `system:*` dimension resolves the unknown-family conservative row.
+///
+/// The family reasoning, from the thread: `consent:*` is the routing editor —
+/// it must reach any holder who might rely on it, so its CEILING is Global
+/// (KeyRecord's anti-rollback logic) while its live commons cells stay
+/// bounded. `trace:*` is capability-gated, NOT scope-gated (E3, pinned by
+/// `SERVE_ADVERTISE_POLICY_HASH`): recipient selection is by ROLE and never
+/// widens by cohort — its community/affiliations cells stay SelfOwn, and no
+/// authority (not even a trust root) widens it past the `infra:serve` set.
+/// `scores:*` is subject-gated (CC#46): admission is cheap, so past `family`
+/// the authority is the SUBJECT's grant at every scope — for every emitter
+/// authority. `capacity:*` / `content_class:*` are commons-health shapes
+/// (self-report about own substrate / flags whose subject is the content).
+/// `transport:*` + the exact audit-chain dimension are substrate self-reports
+/// with no third-party subject and federation-wide consumers (mesh healing,
+/// ALM capacity), so [`AuthorityClass::SubstrateSelf`] at commons scopes
+/// projects Global — decided on the thread, landed here as registry rows with
+/// no resolver special-casing.
+///
+/// An UNKNOWN dimension family resolves the conservative default (negative
+/// default doctrine): SelfOwn at the structurally-invisible tier, Cohort
+/// everywhere else, for EVERY authority — never Global, so a new family
+/// earns its commons reach by landing a decided row rather than inheriting
+/// one. Note the consequence, chosen not discovered: families the thread did
+/// not decide (`provenance:*`, `accord:*`, `moderation:*`,
+/// `trace_manifest:*`, …) resolve this row on the ATTESTATION REPLICATION
+/// plane until a row is decided on #713 — including their tombstones
+/// (Cohort ceiling), and including trust-root-authored records.
+///
+/// An unrecognized SCOPE within a known family resolves that family's
+/// community-tier cell — the bounded relay answer, never wider (`trace:*` →
+/// SelfOwn, `scores:*` → Subject, everything else → Cohort): a future scope
+/// never silently widens, on any axis.
 ///
 /// # Structure
 ///
 /// - **Total registry, compiler-checked** (#636's lesson — the gate sees the
 ///   table itself, not a copy): the body is an exhaustive `match` on
-///   [`ObjectClass`], so a new plane variant is a COMPILE ERROR until its row
-///   exists.
+///   [`Plane`], and the dimension axis an exhaustive `match` on the family
+///   classifier, so a new plane variant or family variant is a COMPILE ERROR
+///   until its row exists. `tests::every_object_class_has_a_projection_plane`
+///   holds [`ObjectClass`] ↔ [`Plane`] 1:1.
 /// - **Pure and O(1)**: no directory read, no allocation, no O(members)
-///   anything; `benches/projection.rs` holds the number against the `pre-713`
-///   baseline.
-/// - **Any unrecognized scope** → [`Cohort`](Projection::Cohort) on every
-///   plane — the conservative negative default, unchanged; a future scope
-///   never silently GLOBAL-gossips.
+///   anything — the dimension is classified by a fixed set of prefix
+///   comparisons; `benches/projection.rs` holds the number against the
+///   `pre-713` baseline.
 /// - **`is_tombstone`** (see [`is_withdraw_or_revocation`]) projects at
-///   [`tombstone_ceiling`]`(plane, authority)` — no longer an unconditional
-///   Global; see there for the invariant and the rows.
+///   [`tombstone_ceiling`]`(plane, authority)` — per-plane AND per-family;
+///   see there for the invariant and the rows.
 #[inline]
 pub fn projection_for(
-    plane: ObjectClass,
+    plane: Plane<'_>,
     cohort_scope: &str,
     authority: AuthorityClass,
     is_tombstone: bool,
@@ -276,7 +427,7 @@ pub fn projection_for(
     match plane {
         // KeyRecord — unchanged, reaffirmed by #713: keys must resolve
         // wherever their signatures travel, so every commons tier stays ✱.
-        ObjectClass::KeyRecord => match cohort_scope {
+        Plane::KeyRecord => match cohort_scope {
             cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
             cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
@@ -292,7 +443,7 @@ pub fn projection_for(
         // Cohort even for a trust root (routes need only reach those with a
         // delivery relationship; Global non-infra reachability is a presence
         // directory). federation keeps ✱ — infra's role is to be reachable.
-        ObjectClass::TransportDestination => match cohort_scope {
+        Plane::TransportDestination => match cohort_scope {
             cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
             cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE => Projection::Cohort,
@@ -308,7 +459,7 @@ pub fn projection_for(
         // FountainContent — the route row's logic at the bytes layer:
         // advertisement ≠ availability; ✱ only on federation so a canonical
         // corpus (trust-root build artifacts) is widely advertised.
-        ObjectClass::FountainContent => match cohort_scope {
+        Plane::FountainContent => match cohort_scope {
             cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
             cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE => Projection::Cohort,
@@ -326,7 +477,7 @@ pub fn projection_for(
         // federation scope stays Cohort ON THE LIVE PATH regardless of
         // authority. The infra-role de-admission Global reach is the
         // tombstone ceiling's, BY ROLE.
-        ObjectClass::HardCaseEvent => match cohort_scope {
+        Plane::HardCaseEvent => match cohort_scope {
             cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
             cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
@@ -334,24 +485,168 @@ pub fn projection_for(
             }
             _ => Projection::Cohort,
         },
-        // Attestation — DEFERRED (#713): the pre-#713 scope-only behavior,
-        // held verbatim pending the per-dimension-family decomposition (needs
-        // Capability + Subject audience kinds; CIRISEdge owes the shape
-        // answer). See the function doc for the two already-decided
-        // SubstrateSelf commons cells this signature cannot yet resolve.
-        ObjectClass::Attestation => match cohort_scope {
-            cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
-            cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
-            cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
-                if authority.is_trust_root() {
-                    Projection::Global
-                } else {
-                    Projection::Cohort
+        // Attestation — per dimension FAMILY (v36.0.0, #713 second half).
+        // The information-type parameter of this plane IS the dimension; one
+        // row would repeat the #311 collapse a level down.
+        Plane::Attestation { dimension } => match attestation_family(dimension) {
+            // consent:* / capacity:* / content_class:* share the LIVE shape
+            // (SelfOwn | Cohort | Cohort | ✱ at federation only) — they
+            // split at the CEILING: consent's is Global (the routing editor
+            // must reach any holder who might rely on it — KeyRecord's
+            // anti-rollback logic), the other two take the row-max. See
+            // `tombstone_ceiling`.
+            AttestationFamily::Consent
+            | AttestationFamily::Capacity
+            | AttestationFamily::ContentClass => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS
+                | cohort_scope::SPECIES
+                | cohort_scope::BIOSPHERE => Projection::Cohort,
+                cohort_scope::FEDERATION => {
+                    if authority.is_trust_root() {
+                        Projection::Global
+                    } else {
+                        Projection::Cohort
+                    }
                 }
-            }
-            _ => Projection::Cohort,
+                _ => Projection::Cohort,
+            },
+            // trace:* — capability-gated, NOT scope-gated (E3): recipient
+            // selection is by ROLE and never widens by cohort. Community and
+            // affiliations stay SelfOwn; the commons tiers serve to the
+            // `infra:serve` set for EVERY authority — a trust root's trace
+            // does not widen past the capability audience either. An
+            // unrecognized scope resolves the family's community-tier cell
+            // (SelfOwn) — never wider.
+            AttestationFamily::Trace => match cohort_scope {
+                cohort_scope::SELF
+                | cohort_scope::FAMILY
+                | cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS => Projection::SelfOwn,
+                cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
+                    Projection::Capability(CapabilityToken::InfraServe)
+                }
+                _ => Projection::SelfOwn,
+            },
+            // scores:* — subject-gated (CC#46): past `family` the audience is
+            // the SUBJECT's grant at every scope, for every emitter
+            // authority. An unrecognized scope resolves the community-tier
+            // cell (Subject) — bounded to the one party with a standing
+            // right, never a roster.
+            AttestationFamily::Scores => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                _ => Projection::Subject,
+            },
+            // transport:* + the EXACT system:audit_chain:hash_continuity —
+            // substrate self-reports with no third-party subject and
+            // federation-wide consumers: SubstrateSelf at commons scopes
+            // projects Global (#713 question 3, decided). Other authorities
+            // follow the commons-health shape (✱ at federation only).
+            AttestationFamily::SubstrateHealth => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
+                cohort_scope::SPECIES | cohort_scope::BIOSPHERE => {
+                    if matches!(authority, AuthorityClass::SubstrateSelf) {
+                        Projection::Global
+                    } else {
+                        Projection::Cohort
+                    }
+                }
+                cohort_scope::FEDERATION => {
+                    if matches!(authority, AuthorityClass::SubstrateSelf)
+                        || authority.is_trust_root()
+                    {
+                        Projection::Global
+                    } else {
+                        Projection::Cohort
+                    }
+                }
+                _ => Projection::Cohort,
+            },
+            // Unknown family — the conservative default (negative default
+            // doctrine): never Global, for ANY authority. A new family earns
+            // its commons reach by landing a decided row on #713.
+            AttestationFamily::Unknown => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                _ => Projection::Cohort,
+            },
         },
     }
+}
+
+/// The EXACT `system:*` member the #713 thread co-signed for the
+/// substrate-health Global cells — the VALUE, never the namespace. Every
+/// other `system:*` dimension resolves [`AttestationFamily::Unknown`]: the
+/// open prefix at Global would be a standing invitation for a future
+/// subject-carrying dimension to inherit a scope nobody chose for it (#713
+/// server relay, declining the open prefix).
+const SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY: &str = "system:audit_chain:hash_continuity";
+
+/// The dimension-FAMILY axis of the Attestation plane (#713 decomposition) —
+/// the closed set of decided rows plus the conservative default. Private on
+/// purpose: consumers ask [`projection_for`]; the family is a resolver
+/// internal, so the registry cannot be consulted half-way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttestationFamily {
+    /// `consent:*` — the routing editor (Global ceiling).
+    Consent,
+    /// `trace:*` — capability-gated (E3), never widens by cohort.
+    Trace,
+    /// `scores:*` — subject-gated (CC#46).
+    Scores,
+    /// `capacity:*` — substrate self-report, commons-health shape.
+    Capacity,
+    /// `content_class:*` — flags whose subject is the content.
+    ContentClass,
+    /// `transport:*` and the EXACT
+    /// [`SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY`] — substrate self-reports whose
+    /// SubstrateSelf commons cells are Global.
+    SubstrateHealth,
+    /// Any dimension outside the decided families — the conservative row.
+    Unknown,
+}
+
+/// `true` iff `dimension` sits UNDER `stem` — the stem plus a non-empty tail,
+/// mirroring the manifest's own prefix grammar (`consent:*` describes
+/// `consent:replication:v1`, not a bare `consent` or an empty-tailed
+/// `consent:`). Pure byte comparison; no allocation.
+#[inline]
+fn under(dimension: &str, stem: &str) -> bool {
+    dimension.len() > stem.len() && dimension.starts_with(stem)
+}
+
+/// Classify a `dimension` into its decided [`AttestationFamily`] — a fixed
+/// set of prefix comparisons plus ONE exact-value gate, so the resolver stays
+/// pure O(1) on the hot path (the general
+/// [`family_for_dimension`](crate::federation::load_bearing::family_for_dimension)
+/// walks the whole manifest and allocates — deliberately NOT used here).
+#[inline]
+fn attestation_family(dimension: &str) -> AttestationFamily {
+    // The exact-value gate FIRST — the value earns the row, the `system:*`
+    // namespace never does.
+    if dimension == SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY {
+        return AttestationFamily::SubstrateHealth;
+    }
+    if under(dimension, "consent:") {
+        return AttestationFamily::Consent;
+    }
+    if under(dimension, "trace:") {
+        return AttestationFamily::Trace;
+    }
+    if under(dimension, "scores:") {
+        return AttestationFamily::Scores;
+    }
+    if under(dimension, "capacity:") {
+        return AttestationFamily::Capacity;
+    }
+    if under(dimension, "content_class:") {
+        return AttestationFamily::ContentClass;
+    }
+    if under(dimension, "transport:") {
+        return AttestationFamily::SubstrateHealth;
+    }
+    AttestationFamily::Unknown
 }
 
 /// **The per-plane tombstone ceiling** — the projection a withdraw / recant /
@@ -399,11 +694,27 @@ pub fn projection_for(
 ///   [`AccordCoScrub`](AuthorityClass::AccordCoScrub) IS the accord-blessed
 ///   canonical/infra class — so that predicate stands in for the thread's
 ///   "by role" language until an infra-role-precise authority input exists.
-/// - [`Attestation`](ObjectClass::Attestation) → `Global`, unconditional —
-///   today's behavior HELD under the same deferral as the live row: the
-///   per-dimension decomposition will assign per-family ceilings (#713's
-///   server relay already names `consent:*` ceiling Global, "same
-///   anti-rollback logic as KeyRecord").
+/// - [`Attestation`](Plane::Attestation) → per dimension FAMILY (v36.0.0,
+///   #713 second half):
+///   - `consent:*` → `Global`, unconditional — the thread's decided
+///     exception: the routing editor must reach any holder who might rely on
+///     it ("same anti-rollback logic as KeyRecord"), so this family alone
+///     keeps a ceiling ABOVE its live row-max.
+///   - `trace:*` → [`Capability`](Projection::Capability)(`infra:serve`) —
+///     the row-max: copies only ever existed at the serve set (or on the
+///     subject itself), so the retraction goes exactly there. A trace
+///     retraction gossiped wider would disclose that a trace existed to
+///     parties the trace itself never reached.
+///   - `scores:*` → [`Subject`](Projection::Subject) — the row-max: past
+///     self, only the subject's grant ever held a copy.
+///   - `capacity:*` / `content_class:*` → `Global` if trust-root, else
+///     `Cohort` (the ✱-at-federation row-max).
+///   - `transport:*` and the EXACT `system:audit_chain:hash_continuity` →
+///     `Global` for [`SubstrateSelf`](AuthorityClass::SubstrateSelf) or a
+///     trust root, else `Cohort` (the row-max of the substrate-health row).
+///   - *unknown family* → `Cohort` for EVERY authority — the conservative
+///     row's max. An undecided family's retraction cannot gossip wider than
+///     any copy of it could ever have traveled.
 ///
 /// # Residuals (chosen on the thread, not discovered later)
 ///
@@ -416,14 +727,14 @@ pub fn projection_for(
 ///    quoted INSIDE a Global record of another plane is the embedding record's
 ///    plane. Neither reopens a rollback window here.
 #[inline]
-pub fn tombstone_ceiling(plane: ObjectClass, authority: AuthorityClass) -> Projection {
+pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Projection {
     match plane {
         // Verify-relevance is unbounded: signatures by a revoked key may ride
         // records that traveled Global.
-        ObjectClass::KeyRecord => Projection::Global,
+        Plane::KeyRecord => Projection::Global,
         // Row max: a non-root route/corpus never projected beyond Cohort
         // under any scope.
-        ObjectClass::TransportDestination | ObjectClass::FountainContent => {
+        Plane::TransportDestination | Plane::FountainContent => {
             if authority.is_trust_root() {
                 Projection::Global
             } else {
@@ -432,15 +743,35 @@ pub fn tombstone_ceiling(plane: ObjectClass, authority: AuthorityClass) -> Proje
         }
         // Global BY ROLE (infra de-admission); is_trust_root is the closest
         // AuthorityClass approximation of "carries an infra role" — see doc.
-        ObjectClass::HardCaseEvent => {
+        Plane::HardCaseEvent => {
             if authority.is_trust_root() {
                 Projection::Global
             } else {
                 Projection::Cohort
             }
         }
-        // DEFERRED with the live row — today's unconditional Global, held.
-        ObjectClass::Attestation => Projection::Global,
+        // Per dimension FAMILY (v36.0.0) — consent is the decided
+        // above-row-max exception; every other family takes its row-max.
+        Plane::Attestation { dimension } => match attestation_family(dimension) {
+            AttestationFamily::Consent => Projection::Global,
+            AttestationFamily::Trace => Projection::Capability(CapabilityToken::InfraServe),
+            AttestationFamily::Scores => Projection::Subject,
+            AttestationFamily::Capacity | AttestationFamily::ContentClass => {
+                if authority.is_trust_root() {
+                    Projection::Global
+                } else {
+                    Projection::Cohort
+                }
+            }
+            AttestationFamily::SubstrateHealth => {
+                if matches!(authority, AuthorityClass::SubstrateSelf) || authority.is_trust_root() {
+                    Projection::Global
+                } else {
+                    Projection::Cohort
+                }
+            }
+            AttestationFamily::Unknown => Projection::Cohort,
+        },
     }
 }
 
@@ -488,7 +819,11 @@ impl ReplicatedKind {
     /// projection registry. The two enums are NOT 1:1: this enum has no
     /// `FountainContent` / `HardCaseEvent` fetch kinds, and the projection
     /// registry has no occurrence planes — so the bridge is spelled here,
-    /// once, instead of being re-derived per consumer.
+    /// once, instead of being re-derived per consumer. For
+    /// [`ObjectClass::Attestation`] the projection call additionally needs
+    /// the envelope `dimension` the consumer already holds
+    /// ([`Plane::Attestation`]) — the v36.0.0 decomposition's
+    /// information-type axis.
     ///
     /// The occurrence kinds ride the KeyRecord row DELIBERATELY: an identity
     /// occurrence is the same structurally-invisible identity plane as the
@@ -614,11 +949,47 @@ mod tests {
         "some-future-scope",
     ];
 
+    /// One representative dimension per decided Attestation family, plus one
+    /// resolving the conservative default — LITERALS, never derived from the
+    /// classifier under test.
+    const FAMILY_DIMS: [&str; 8] = [
+        "consent:replication:v1",
+        "trace:complete:v1",
+        "scores:medical",
+        "capacity:integrity",
+        "content_class:violence",
+        "transport:reticulum",
+        "system:audit_chain:hash_continuity",
+        "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
+    ];
+
+    /// The four dimension-less planes — for sweeps whose expected cell is the
+    /// same LITERAL across them.
+    const DIMLESS_PLANES: [Plane<'static>; 4] = [
+        Plane::KeyRecord,
+        Plane::TransportDestination,
+        Plane::FountainContent,
+        Plane::HardCaseEvent,
+    ];
+
+    /// Every plane, with the Attestation plane fanned across [`FAMILY_DIMS`]
+    /// — the projection registry's full extent, for property sweeps.
+    fn all_planes() -> Vec<Plane<'static>> {
+        let mut v = DIMLESS_PLANES.to_vec();
+        v.extend(
+            FAMILY_DIMS
+                .iter()
+                .map(|&d| Plane::Attestation { dimension: d }),
+        );
+        v
+    }
+
     #[test]
     fn projection_self_and_family_are_publish_own() {
         // Every plane's self/family cells are SelfOwn — the structurally-
-        // invisible identity tier is publish-own on every plane.
-        for plane in ObjectClass::ALL {
+        // invisible identity tier is publish-own on every plane, and on every
+        // Attestation dimension family including the conservative default.
+        for plane in all_planes() {
             for s in ["self", "family"] {
                 assert_eq!(
                     projection_for(plane, s, AuthorityClass::SelfIdentity, false),
@@ -631,7 +1002,11 @@ mod tests {
 
     #[test]
     fn projection_community_and_affiliations_relay_over_cohort() {
-        for plane in ObjectClass::ALL {
+        // The four dimension-less planes relay community/affiliations over
+        // the cohort roster. The Attestation plane's cells moved to the
+        // per-family row tests below: trace:* stays SelfOwn there and
+        // scores:* is Subject — the #713 decomposition's whole point.
+        for plane in DIMLESS_PLANES {
             for s in ["community", "affiliations"] {
                 assert_eq!(
                     projection_for(plane, s, AuthorityClass::ProducerSteward, false),
@@ -648,34 +1023,19 @@ mod tests {
         // on the KEY plane: keys must resolve wherever their signatures travel.
         for s in ["species", "biosphere", "federation"] {
             assert_eq!(
-                projection_for(
-                    ObjectClass::KeyRecord,
-                    s,
-                    AuthorityClass::AccordCoScrub,
-                    false
-                ),
+                projection_for(Plane::KeyRecord, s, AuthorityClass::AccordCoScrub, false),
                 Projection::Global,
                 "trust-root {s} key record"
             );
             // a plain producer's commons record relays over the cohort.
             assert_eq!(
-                projection_for(
-                    ObjectClass::KeyRecord,
-                    s,
-                    AuthorityClass::ProducerSteward,
-                    false
-                ),
+                projection_for(Plane::KeyRecord, s, AuthorityClass::ProducerSteward, false),
                 Projection::Cohort,
                 "producer {s} key record"
             );
             // substrate-self is NOT a trust root → cohort (documented surface).
             assert_eq!(
-                projection_for(
-                    ObjectClass::KeyRecord,
-                    s,
-                    AuthorityClass::SubstrateSelf,
-                    false
-                ),
+                projection_for(Plane::KeyRecord, s, AuthorityClass::SubstrateSelf, false),
                 Projection::Cohort,
                 "substrate-self {s} key record"
             );
@@ -692,7 +1052,7 @@ mod tests {
         for s in ["species", "biosphere"] {
             assert_eq!(
                 projection_for(
-                    ObjectClass::TransportDestination,
+                    Plane::TransportDestination,
                     s,
                     AuthorityClass::AccordCoScrub,
                     false
@@ -708,8 +1068,8 @@ mod tests {
     #[test]
     fn transport_destination_row_matches_the_decided_table() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
-        use ObjectClass::TransportDestination as TD;
         use Projection::{Cohort, Global, SelfOwn};
+        const TD: Plane<'static> = Plane::TransportDestination;
         assert_eq!(projection_for(TD, "self", ProducerSteward, false), SelfOwn);
         assert_eq!(
             projection_for(TD, "family", ProducerSteward, false),
@@ -752,8 +1112,8 @@ mod tests {
     #[test]
     fn fountain_content_row_matches_the_decided_table() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
-        use ObjectClass::FountainContent as FC;
         use Projection::{Cohort, Global, SelfOwn};
+        const FC: Plane<'static> = Plane::FountainContent;
         assert_eq!(projection_for(FC, "self", ProducerSteward, false), SelfOwn);
         assert_eq!(
             projection_for(FC, "family", ProducerSteward, false),
@@ -791,7 +1151,7 @@ mod tests {
     fn hard_case_event_federation_is_cohort_even_for_trust_root() {
         assert_eq!(
             projection_for(
-                ObjectClass::HardCaseEvent,
+                Plane::HardCaseEvent,
                 "federation",
                 AuthorityClass::AccordCoScrub,
                 false
@@ -805,8 +1165,8 @@ mod tests {
     #[test]
     fn hard_case_event_row_matches_the_decided_table() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
-        use ObjectClass::HardCaseEvent as HCE;
         use Projection::{Cohort, SelfOwn};
+        const HCE: Plane<'static> = Plane::HardCaseEvent;
         assert_eq!(projection_for(HCE, "self", ProducerSteward, false), SelfOwn);
         assert_eq!(
             projection_for(HCE, "family", ProducerSteward, false),
@@ -835,35 +1195,281 @@ mod tests {
         );
     }
 
-    /// The Attestation row is DEFERRED: it must hold the exact pre-#713
-    /// scope-only behavior until the per-dimension-family decomposition
-    /// lands (#713's open half). LITERALS of the old rule.
+    /// The consent:* row — the routing editor. LITERALS: live shape is
+    /// SelfOwn | Cohort | Cohort | ✱-at-federation; its Global CEILING is
+    /// witnessed separately.
     #[test]
-    fn attestation_row_holds_the_pre_713_scope_only_behavior() {
-        use AuthorityClass::{AccordCoScrub, ProducerSteward, SubstrateSelf};
-        use ObjectClass::Attestation as AT;
+    fn attestation_consent_row_matches_the_decided_table() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
         use Projection::{Cohort, Global, SelfOwn};
-        assert_eq!(projection_for(AT, "self", ProducerSteward, false), SelfOwn);
+        const CONSENT: Plane<'static> = Plane::Attestation {
+            dimension: "consent:replication:v1",
+        };
         assert_eq!(
-            projection_for(AT, "family", ProducerSteward, false),
+            projection_for(CONSENT, "self", ProducerSteward, false),
             SelfOwn
         );
         assert_eq!(
-            projection_for(AT, "community", ProducerSteward, false),
+            projection_for(CONSENT, "family", ProducerSteward, false),
+            SelfOwn
+        );
+        assert_eq!(
+            projection_for(CONSENT, "community", ProducerSteward, false),
             Cohort
         );
         assert_eq!(
-            projection_for(AT, "affiliations", ProducerSteward, false),
+            projection_for(CONSENT, "affiliations", ProducerSteward, false),
             Cohort
         );
-        for s in ["species", "biosphere", "federation"] {
-            assert_eq!(projection_for(AT, s, AccordCoScrub, false), Global, "{s}");
-            assert_eq!(projection_for(AT, s, ProducerSteward, false), Cohort, "{s}");
-            // The SubstrateSelf commons cells the thread DID decide (Global
-            // for transport:* + system:audit_chain:hash_continuity) need the
-            // dimension, which this signature cannot see — so the held
-            // behavior is still Cohort here, per the deferral note.
-            assert_eq!(projection_for(AT, s, SubstrateSelf, false), Cohort, "{s}");
+        // species/biosphere stay Cohort even for a trust root — federation
+        // is the ONLY ✱ cell.
+        assert_eq!(
+            projection_for(CONSENT, "species", AccordCoScrub, false),
+            Cohort
+        );
+        assert_eq!(
+            projection_for(CONSENT, "biosphere", AccordCoScrub, false),
+            Cohort
+        );
+        assert_eq!(
+            projection_for(CONSENT, "federation", AccordCoScrub, false),
+            Global
+        );
+        assert_eq!(
+            projection_for(CONSENT, "federation", ProducerSteward, false),
+            Cohort
+        );
+    }
+
+    /// THE capability cell (#713 server relay, E3): trace:* is
+    /// capability-gated, NOT scope-gated. Community/affiliations stay
+    /// SelfOwn (never widens by cohort), the commons tiers serve to the
+    /// `infra:serve` set — for EVERY authority, a trust root included.
+    /// LITERALS.
+    #[test]
+    fn attestation_trace_row_is_capability_gated_not_scope_gated() {
+        use Projection::{Capability, SelfOwn};
+        const TRACE: Plane<'static> = Plane::Attestation {
+            dimension: "trace:complete:v1",
+        };
+        for a in AUTHORITIES {
+            for s in ["self", "family", "community", "affiliations"] {
+                assert_eq!(
+                    projection_for(TRACE, s, a, false),
+                    SelfOwn,
+                    "trace {s}/{a:?} must stay SelfOwn — trace never widens by cohort"
+                );
+            }
+            for s in ["species", "biosphere", "federation"] {
+                assert_eq!(
+                    projection_for(TRACE, s, a, false),
+                    Capability(CapabilityToken::InfraServe),
+                    "trace {s}/{a:?} serves to the infra:serve set ONLY — by role, not cohort"
+                );
+            }
+            // An unrecognized scope resolves the community-tier cell.
+            assert_eq!(
+                projection_for(TRACE, "some-future-scope", a, false),
+                SelfOwn,
+                "{a:?}"
+            );
+        }
+    }
+
+    /// THE subject cell (CC#46): scores:* past `family` is the SUBJECT's
+    /// grant at every scope, for every emitter authority — "a node can be
+    /// fully consented for replication and still have no right to score
+    /// you." LITERALS.
+    #[test]
+    fn attestation_scores_row_is_subject_gated_past_self() {
+        use Projection::{SelfOwn, Subject};
+        const SCORES: Plane<'static> = Plane::Attestation {
+            dimension: "scores:medical",
+        };
+        for a in AUTHORITIES {
+            assert_eq!(projection_for(SCORES, "self", a, false), SelfOwn, "{a:?}");
+            assert_eq!(projection_for(SCORES, "family", a, false), SelfOwn, "{a:?}");
+            for s in [
+                "community",
+                "affiliations",
+                "species",
+                "biosphere",
+                "federation",
+                "some-future-scope",
+            ] {
+                assert_eq!(
+                    projection_for(SCORES, s, a, false),
+                    Subject,
+                    "scores {s}/{a:?} must be Subject — never a roster, never Global"
+                );
+            }
+        }
+    }
+
+    /// capacity:* / content_class:* — the commons-health shape (self-report
+    /// about own substrate / flags whose subject is the content): ✱ at
+    /// federation only. LITERALS.
+    #[test]
+    fn attestation_capacity_and_content_class_rows_match_commons_health() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
+        use Projection::{Cohort, Global, SelfOwn};
+        for dim in ["capacity:integrity", "content_class:violence"] {
+            let plane = Plane::Attestation { dimension: dim };
+            assert_eq!(
+                projection_for(plane, "self", ProducerSteward, false),
+                SelfOwn
+            );
+            assert_eq!(
+                projection_for(plane, "family", ProducerSteward, false),
+                SelfOwn
+            );
+            assert_eq!(
+                projection_for(plane, "community", ProducerSteward, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "affiliations", ProducerSteward, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "species", AccordCoScrub, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "biosphere", AccordCoScrub, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "federation", AccordCoScrub, false),
+                Global,
+                "{dim}"
+            );
+            assert_eq!(
+                projection_for(plane, "federation", ProducerSteward, false),
+                Cohort,
+                "{dim}"
+            );
+        }
+    }
+
+    /// The decided SubstrateSelf commons cells (#713 question 3): transport:*
+    /// and the EXACT system:audit_chain:hash_continuity project Global at
+    /// commons scopes for SubstrateSelf — real registry rows, no resolver
+    /// special-casing. Other authorities keep the commons-health shape.
+    /// LITERALS.
+    #[test]
+    fn attestation_substrate_self_commons_cells_are_global() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward, SubstrateSelf};
+        use Projection::{Cohort, Global, SelfOwn};
+        for dim in ["transport:reticulum", "system:audit_chain:hash_continuity"] {
+            let plane = Plane::Attestation { dimension: dim };
+            assert_eq!(projection_for(plane, "self", SubstrateSelf, false), SelfOwn);
+            assert_eq!(
+                projection_for(plane, "community", SubstrateSelf, false),
+                Cohort,
+                "{dim}: commons means species+, not community"
+            );
+            for s in ["species", "biosphere", "federation"] {
+                assert_eq!(
+                    projection_for(plane, s, SubstrateSelf, false),
+                    Global,
+                    "{dim} {s}: the substrate's self-report about itself is federation-consumed"
+                );
+            }
+            // Non-substrate authorities: the commons-health shape.
+            assert_eq!(
+                projection_for(plane, "species", ProducerSteward, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "federation", ProducerSteward, false),
+                Cohort
+            );
+            assert_eq!(
+                projection_for(plane, "federation", AccordCoScrub, false),
+                Global,
+                "{dim}"
+            );
+        }
+    }
+
+    /// THE open-prefix refusal (#713 server relay): Global is earned by the
+    /// VALUE `system:audit_chain:hash_continuity`, never by the `system:*`
+    /// namespace. Any other system:* dimension — including a suffixed
+    /// spelling of the blessed value — resolves the conservative default.
+    #[test]
+    fn system_prefix_never_inherits_global_only_the_exact_value_does() {
+        use AuthorityClass::SubstrateSelf;
+        use Projection::{Cohort, Global};
+        assert_eq!(
+            projection_for(
+                Plane::Attestation {
+                    dimension: "system:audit_chain:hash_continuity"
+                },
+                "federation",
+                SubstrateSelf,
+                false
+            ),
+            Global,
+            "the exact co-signed dimension IS Global"
+        );
+        for dim in [
+            "system:some_future:subject_carrying",
+            "system:audit_chain:hash_continuity:v2",
+            "system:audit_chain",
+            "system:health",
+        ] {
+            for s in ["species", "biosphere", "federation"] {
+                assert_eq!(
+                    projection_for(
+                        Plane::Attestation { dimension: dim },
+                        s,
+                        SubstrateSelf,
+                        false
+                    ),
+                    Cohort,
+                    "{dim} {s}: a system:* member must EARN Global, not inherit it"
+                );
+            }
+        }
+    }
+
+    /// The conservative default: a dimension with no decided row — including
+    /// families that EXIST but were not decided on #713 (provenance:*,
+    /// moderation:*, trace_manifest:*, …) — never projects past Cohort, for
+    /// ANY authority. The negative-default doctrine: a new family earns its
+    /// commons reach by landing a decided row, and until then even a
+    /// trust-root-authored record relays over its cohort.
+    #[test]
+    fn attestation_unknown_dimension_is_the_conservative_default() {
+        use Projection::{Cohort, SelfOwn};
+        for dim in [
+            "ratchet:flag:out_of_distribution_voting",
+            "provenance:build_manifest:linux-x86_64", // undecided on #713 — chosen, flagged there
+            "moderation:harassment",
+            "trace_manifest:v1", // trace-ADJACENT but not trace:* — undecided
+            "capacity_assurance:rung_3", // capacity-ADJACENT but not capacity:*
+            "brand_new_scoring_family:leaf",
+        ] {
+            let plane = Plane::Attestation { dimension: dim };
+            for a in AUTHORITIES {
+                assert_eq!(projection_for(plane, "self", a, false), SelfOwn, "{dim}");
+                assert_eq!(projection_for(plane, "family", a, false), SelfOwn, "{dim}");
+                for s in [
+                    "community",
+                    "affiliations",
+                    "species",
+                    "biosphere",
+                    "federation",
+                    "some-future-scope",
+                ] {
+                    assert_eq!(
+                        projection_for(plane, s, a, false),
+                        Cohort,
+                        "{dim} {s}/{a:?}: an undecided family must never gossip past Cohort"
+                    );
+                }
+            }
         }
     }
 
@@ -875,7 +1481,7 @@ mod tests {
         for s in SCOPES {
             for a in AUTHORITIES {
                 assert_eq!(
-                    projection_for(ObjectClass::KeyRecord, s, a, true),
+                    projection_for(Plane::KeyRecord, s, a, true),
                     Projection::Global,
                     "key tombstone {s}/{a:?} must be GLOBAL — verify-relevance is unbounded"
                 );
@@ -896,7 +1502,7 @@ mod tests {
                 AuthorityClass::ProducerSteward,
             ] {
                 assert_eq!(
-                    projection_for(ObjectClass::TransportDestination, s, a, true),
+                    projection_for(Plane::TransportDestination, s, a, true),
                     Projection::Cohort,
                     "non-root route tombstone {s}/{a:?} must stay Cohort"
                 );
@@ -912,7 +1518,7 @@ mod tests {
         for s in ["self", "federation", "some-future-scope"] {
             assert_eq!(
                 projection_for(
-                    ObjectClass::TransportDestination,
+                    Plane::TransportDestination,
                     s,
                     AuthorityClass::AccordCoScrub,
                     true
@@ -929,7 +1535,7 @@ mod tests {
     fn fountain_content_tombstone_ceiling_follows_trust_root() {
         assert_eq!(
             projection_for(
-                ObjectClass::FountainContent,
+                Plane::FountainContent,
                 "self",
                 AuthorityClass::ProducerSteward,
                 true
@@ -938,7 +1544,7 @@ mod tests {
         );
         assert_eq!(
             projection_for(
-                ObjectClass::FountainContent,
+                Plane::FountainContent,
                 "self",
                 AuthorityClass::AccordCoScrub,
                 true
@@ -959,14 +1565,14 @@ mod tests {
             AuthorityClass::ProducerSteward,
         ] {
             assert_eq!(
-                projection_for(ObjectClass::HardCaseEvent, "federation", a, true),
+                projection_for(Plane::HardCaseEvent, "federation", a, true),
                 Projection::Cohort,
                 "non-infra hard-case tombstone {a:?} must stay Cohort"
             );
         }
         assert_eq!(
             projection_for(
-                ObjectClass::HardCaseEvent,
+                Plane::HardCaseEvent,
                 "federation",
                 AuthorityClass::AccordCoScrub,
                 true
@@ -976,47 +1582,168 @@ mod tests {
         );
     }
 
-    /// The Attestation ceiling holds today's unconditional Global, under the
-    /// same deferral as its live row.
+    /// The consent:* ceiling — Global for every authority at every scope,
+    /// the thread's decided above-row-max exception ("same anti-rollback
+    /// logic as KeyRecord": the routing editor must reach any holder who
+    /// might rely on it).
     #[test]
-    fn attestation_tombstone_stays_global_pending_decomposition() {
-        for a in AUTHORITIES {
+    fn consent_tombstone_is_global_regardless() {
+        const CONSENT: Plane<'static> = Plane::Attestation {
+            dimension: "consent:replication:v1",
+        };
+        for s in SCOPES {
+            for a in AUTHORITIES {
+                assert_eq!(
+                    projection_for(CONSENT, s, a, true),
+                    Projection::Global,
+                    "consent tombstone {s}/{a:?}"
+                );
+            }
+        }
+    }
+
+    /// The trace:* ceiling is the CAPABILITY set, not Global and not Cohort:
+    /// copies only ever existed at the serve set, and a retraction gossiped
+    /// wider would disclose that a trace existed to parties the trace never
+    /// reached — the widening-discloses-more principle on the role axis.
+    #[test]
+    fn trace_tombstone_projects_to_the_serve_capability_set() {
+        const TRACE: Plane<'static> = Plane::Attestation {
+            dimension: "trace:complete:v1",
+        };
+        for s in SCOPES {
+            for a in AUTHORITIES {
+                assert_eq!(
+                    projection_for(TRACE, s, a, true),
+                    Projection::Capability(CapabilityToken::InfraServe),
+                    "trace tombstone {s}/{a:?}"
+                );
+            }
+        }
+    }
+
+    /// The scores:* ceiling is the SUBJECT: past self, only the subject's
+    /// grant ever held a copy.
+    #[test]
+    fn scores_tombstone_projects_to_the_subject() {
+        const SCORES: Plane<'static> = Plane::Attestation {
+            dimension: "scores:medical",
+        };
+        for s in SCOPES {
+            for a in AUTHORITIES {
+                assert_eq!(
+                    projection_for(SCORES, s, a, true),
+                    Projection::Subject,
+                    "scores tombstone {s}/{a:?}"
+                );
+            }
+        }
+    }
+
+    /// capacity:* / content_class:* ceilings take the row-max (✱ at
+    /// federation): Global for a trust root, Cohort otherwise.
+    #[test]
+    fn capacity_and_content_class_tombstones_follow_trust_root() {
+        for dim in ["capacity:integrity", "content_class:violence"] {
+            let plane = Plane::Attestation { dimension: dim };
             assert_eq!(
-                projection_for(ObjectClass::Attestation, "self", a, true),
+                projection_for(plane, "self", AuthorityClass::ProducerSteward, true),
+                Projection::Cohort,
+                "{dim}"
+            );
+            assert_eq!(
+                projection_for(plane, "self", AuthorityClass::AccordCoScrub, true),
                 Projection::Global,
-                "{a:?}"
+                "{dim}"
             );
         }
     }
 
-    /// THE CEILING IS THE ROW MAX (#713's stated invariant: "anti-rollback
+    /// The substrate-health ceiling: Global for SubstrateSelf (whose live
+    /// commons cells are Global) and for a trust root (✱ at federation);
+    /// Cohort for everyone else.
+    #[test]
+    fn substrate_health_tombstone_is_global_for_substrate_self_and_infra() {
+        for dim in ["transport:reticulum", "system:audit_chain:hash_continuity"] {
+            let plane = Plane::Attestation { dimension: dim };
+            assert_eq!(
+                projection_for(plane, "self", AuthorityClass::SubstrateSelf, true),
+                Projection::Global,
+                "{dim}"
+            );
+            assert_eq!(
+                projection_for(plane, "self", AuthorityClass::AccordCoScrub, true),
+                Projection::Global,
+                "{dim}"
+            );
+            for a in [
+                AuthorityClass::SelfIdentity,
+                AuthorityClass::ProducerSteward,
+            ] {
+                assert_eq!(
+                    projection_for(plane, "self", a, true),
+                    Projection::Cohort,
+                    "{dim}/{a:?}"
+                );
+            }
+        }
+    }
+
+    /// An undecided family's ceiling stays Cohort for EVERY authority — a
+    /// trust root included: no copy of it could ever have traveled wider, and
+    /// a wider retraction would disclose more than the original fact.
+    #[test]
+    fn unknown_dimension_tombstone_stays_cohort_even_for_trust_root() {
+        const UNKNOWN: Plane<'static> = Plane::Attestation {
+            dimension: "ratchet:flag:out_of_distribution_voting",
+        };
+        for s in SCOPES {
+            for a in AUTHORITIES {
+                assert_eq!(
+                    projection_for(UNKNOWN, s, a, true),
+                    Projection::Cohort,
+                    "unknown-family tombstone {s}/{a:?}"
+                );
+            }
+        }
+    }
+
+    /// THE CEILING DOMINATES THE ROW (#713's stated invariant: "anti-rollback
     /// holds within the record's maximal disclosure set; beyond it there is
-    /// no copy to roll back"). For every (plane, authority) the tombstone
-    /// ceiling must dominate every LIVE cell in that row — over the seven
-    /// closed scopes AND the unrecognized-scope default — or a tombstone
-    /// could fail to reach a holder a live version legitimately reached.
+    /// no copy to roll back"). For every (plane, authority) — the Attestation
+    /// plane fanned across every decided dimension family AND the
+    /// conservative default — the tombstone ceiling must dominate every LIVE
+    /// cell in that row, over the seven closed scopes and the
+    /// unrecognized-scope default, or a tombstone could fail to reach a
+    /// holder a live version legitimately reached.
+    ///
+    /// Domination is a PARTIAL order on purpose: `Global` reaches everyone
+    /// and everything reaches the record's own node (`SelfOwn`), but
+    /// `Capability` (role-keyed), `Subject` (subject-keyed) and `Cohort`
+    /// (roster-keyed) select by different axes and are deliberately
+    /// incomparable — a row whose ceiling and live cells sat on different
+    /// axes would be a registry bug this test should refuse, not reconcile
+    /// with an invented total order.
     ///
     /// This test reads the registry ON PURPOSE: it is a property OVER the
     /// table, not a per-cell expectation derived FROM it (those are the
     /// literal row tests above).
     #[test]
     fn tombstone_ceiling_dominates_every_live_cell() {
-        fn rank(p: Projection) -> u8 {
-            match p {
-                Projection::SelfOwn => 0,
-                Projection::Cohort => 1,
-                Projection::Global => 2,
-            }
+        fn dominates(ceiling: Projection, live: Projection) -> bool {
+            ceiling == live
+                || matches!(ceiling, Projection::Global)
+                || matches!(live, Projection::SelfOwn)
         }
-        for plane in ObjectClass::ALL {
+        for plane in all_planes() {
             for authority in AUTHORITIES {
                 let ceiling = tombstone_ceiling(plane, authority);
                 for s in SCOPES {
                     let live = projection_for(plane, s, authority, false);
                     assert!(
-                        rank(ceiling) >= rank(live),
-                        "{plane:?}/{authority:?}: ceiling {ceiling:?} is BELOW the live cell \
-                         {live:?} at scope {s:?} — a tombstone would starve a holder a live \
+                        dominates(ceiling, live),
+                        "{plane:?}/{authority:?}: ceiling {ceiling:?} does not dominate the live \
+                         cell {live:?} at scope {s:?} — a tombstone would starve a holder a live \
                          version reached (anti-rollback broken); stop and re-read #713 rather \
                          than reconciling silently"
                     );
@@ -1061,9 +1788,22 @@ mod tests {
 
     #[test]
     fn unknown_scope_is_conservative_relay_never_global() {
-        // On EVERY plane, even for a trust root, an unrecognized scope relays
-        // over the cohort — a future scope never silently GLOBAL-gossips.
-        for plane in ObjectClass::ALL {
+        // On EVERY plane, even for a trust root, an unrecognized scope
+        // resolves the family's bounded community-tier cell — a future scope
+        // never silently GLOBAL-gossips, on any dimension family. LITERAL
+        // expectations per plane: Cohort everywhere except the two families
+        // whose community tier is narrower than a roster (trace:* → SelfOwn,
+        // scores:* → Subject).
+        for plane in all_planes() {
+            let expected = match plane {
+                Plane::Attestation {
+                    dimension: "trace:complete:v1",
+                } => Projection::SelfOwn,
+                Plane::Attestation {
+                    dimension: "scores:medical",
+                } => Projection::Subject,
+                _ => Projection::Cohort,
+            };
             assert_eq!(
                 projection_for(
                     plane,
@@ -1071,10 +1811,65 @@ mod tests {
                     AuthorityClass::AccordCoScrub,
                     false
                 ),
-                Projection::Cohort,
+                expected,
                 "{plane:?}"
             );
         }
+    }
+
+    /// The [`ObjectClass`] ↔ [`Plane`] coupling, held by the COMPILER in the
+    /// direction [`Plane::class`] cannot: this match is exhaustive over
+    /// `ObjectClass`, so a new object class fails to compile HERE until its
+    /// projection plane is named — the #713 "a new plane is a registry row,
+    /// not a silently-inherited default" property, preserved across the
+    /// v36.0.0 split of the two enums.
+    #[test]
+    fn every_object_class_has_a_projection_plane() {
+        for class in ObjectClass::ALL {
+            let plane = match class {
+                ObjectClass::KeyRecord => Plane::KeyRecord,
+                ObjectClass::TransportDestination => Plane::TransportDestination,
+                ObjectClass::FountainContent => Plane::FountainContent,
+                ObjectClass::HardCaseEvent => Plane::HardCaseEvent,
+                ObjectClass::Attestation => Plane::Attestation {
+                    dimension: "consent:replication:v1",
+                },
+            };
+            assert_eq!(plane.class(), class);
+        }
+    }
+
+    /// The capability token is the EXISTING delegation-scope constant — by
+    /// value here (the literal, per witness discipline) and by const identity
+    /// (no second spelling minted anywhere between the variant and the
+    /// token).
+    #[test]
+    fn capability_token_is_the_existing_delegation_scope_constant() {
+        assert_eq!(CapabilityToken::InfraServe.as_scope(), "infra:serve");
+        assert_eq!(
+            CapabilityToken::InfraServe.as_scope(),
+            crate::federation::types::delegation_scope::INFRA_SERVE
+        );
+    }
+
+    /// The wire form of the new audience kinds pins the SAME spelling — a
+    /// serialized `Capability` carries the delegation-scope token verbatim,
+    /// not a re-cased enum name (the CIRISEdge#379 bare-"observer" class,
+    /// closed at the serde layer too).
+    #[test]
+    fn projection_wire_form_pins_the_token_spelling() {
+        assert_eq!(
+            serde_json::to_value(Projection::Capability(CapabilityToken::InfraServe)).unwrap(),
+            serde_json::json!({ "capability": "infra:serve" })
+        );
+        assert_eq!(
+            serde_json::to_value(Projection::Subject).unwrap(),
+            serde_json::json!("subject")
+        );
+        assert_eq!(
+            serde_json::to_value(Projection::SelfOwn).unwrap(),
+            serde_json::json!("self_own")
+        );
     }
 
     #[test]

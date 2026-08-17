@@ -5,6 +5,397 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [36.0.0] - 2026-08-17
+
+**The consolidation break.** Every remaining breaking change that did not wait
+on a consumer lands here, so Edge and Server absorb **one** re-pin instead of
+four. After this cut persist's only known outstanding breaks are #716 (now
+persist-internal — see below) and #415 (waits on Server 0.6).
+
+Two issues on the v36 list needed **no code at all**, and finding that out was
+the work: **#645** (the JSONB preimage break) shipped five majors ago in
+v31.0.0's V122 and was re-certified and closed by verification; **#552**'s
+proposed read gate was **refused by ratified CC 3.4.5**, and what shipped is
+the ruling's own remedy instead. An open issue is a claim about the code, and
+nothing checks it — the same shape as `Closes #N` (#708), pointing the other
+way.
+
+### BREAKING — fifteen cursors resume across a tie (#668)
+
+The remaining 15 `list_signed_*_since` cursors resumed on a bare instant and
+could not cross a timestamp tie, so a row sharing an instant with the cursor
+was skipped **permanently**. All 15 now take
+`Option<(DateTime<Utc>, String)>` and compare the **pair** on all three
+backends, per the pattern #682 settled for the sixteenth. 13 new `Served*`
+wrappers carry a node-local `admitted_at` beside the record; it never enters a
+content hash — `wire_index` hashes the inner record on every plane, because a
+node-local value in a wire hash means the advertised ref does not resolve.
+
+**V130** (both dialects, 12 tables) backfills from each legacy cursor
+expression and adds the pair indexes — pg `NOT NULL` after backfill, sqlite
+nullable with the Rust writer as enforcement, the V123/V126 dialect split
+stated in both files. 17 sqlite insert doors, 17 pg, ~20 memory sites stamp
+through one shared allocator per plane, and **the allocator reads the
+expression the reader reads**.
+
+### BREAKING — five doors move the serve position (#707)
+
+Five `federation_keys` UPDATE doors rewrote consumer-visible bytes without
+moving the serve position, so a consumer past the cursor never learned the row
+changed. **V131** adds `mutated_at` — never a re-stamp of `admitted_at`, one
+column one meaning — and cursors and allocators read
+`GREATEST(admitted_at, mutated_at)`.
+
+An **independent blind census** (posted on #707, produced without contact with
+the implementing work) agreed exactly: seven UPDATE doors per backend, five
+consumer-visible. `wire_index`'s stale three-door list from #547 is corrected
+to the census. The two out-of-class doors it surfaced — `grant_trust` /
+`revoke_trust`, which appear ungated — are filed as **#721** with the DELETE
+doors that remove served rows unannounced.
+
+### BREAKING — one fold decides "retracted", and it closes two live holes (#686)
+
+Three folds decided retraction and disagreed. `precedence::retired_ids` is a
+**synthesis, not a selection**: neither prior fold had both halves. It carries
+#656's entitlement gate **and** §6.1 precedence; `tombstoned_ids` and
+`retracted_edge_ids` both delegate.
+
+Two authorization holes were **TESTED red before the fix** on memory, sqlite
+and live postgres by an independent evidence session, whose witnesses this cut
+lifts verbatim:
+
+- `trust_root.rs:1179` — the capability-conferral walk, severed by a foreign
+  unentitled `withdraws`.
+- `trust_root.rs:880` — the family charter, and **worse**: the retraction
+  erases the candidate at `charter_shaped`, which runs *before*
+  `family_quorum_over`. **The quorum never ran.** The verdict reports
+  `distinct_holders: 0 of required: 2` over a roster of 3 whose charter was
+  co-signed and never touched — so #557's operator-facing shortfall number
+  reads as a roster problem while an unentitled key holding no seat empties the
+  candidate set.
+
+The exposure is **structural**: a keyless family cannot sign its own charter,
+so `charter_shaped` is evaluated over `list_attestations_for` — the *about*
+set, written by others. No slice tightening closes it; only the entitlement
+gate does. The write door refuses in-order (`WithdrawsNotAdmitted`, a leg
+nothing else asserted); the hole was the deferred window where the target is
+not yet locally present.
+
+`attestation_type::ALL` and its two ungated siblings are **gated, not
+deleted**: it is a declared export (v30.7.0/#625), and zero in-repo consumers
+is the expected reading for an export, not evidence of death.
+
+### BREAKING — the Attestation plane decomposes per dimension family (#713)
+
+v35 shipped per-plane projection with the Attestation row **deferred on the
+record**. Edge answered the shape question: audience kinds **on** the
+projection enum, not a dimension-keyed sibling — a sibling recreates the
+forget-the-second-call drift class; an enum variant fails to compile instead.
+
+```
+projection_for(plane: Plane<'_>, cohort_scope, authority, is_tombstone)
+```
+
+`Plane` is `ObjectClass` with `Attestation { dimension }`, so **both misuse
+shapes are unrepresentable**: a dimension on a non-Attestation plane cannot be
+written, and an Attestation query without its dimension cannot be written. The
+refuse-vs-ignore question dissolves at the type level.
+
+`Projection` gains `Capability(CapabilityToken)` and `Subject`.
+`CapabilityToken::InfraServe.as_scope()` **is** `delegation_scope::INFRA_SERVE`
+by const — no second spelling minted, serde pinned to the same token. Edge
+shipped the bare-string version of this bug once; the variant makes it
+unrepresentable.
+
+The decided family registry lands thread-verbatim: `consent:*` Global ceiling,
+`trace:*` Capability and never widening by cohort (E3), `scores:*` Subject past
+self (CC#46), `capacity:*` / `content_class:*` commons-health, `transport:*`
+SubstrateSelf-Global at commons, and the **exact** dimension
+`system:audit_chain:hash_continuity` — checked first, so the open `system:*`
+prefix resolves unknown and a future subject-carrying dimension cannot inherit
+Global from a namespace.
+
+**Chosen, not discovered, and flagged for operator review:** undecided families
+(`provenance:*` including trust-root build manifests, `accord:*`,
+`moderation:*`, `trace_manifest:*`) now cap at **Cohort** on this plane,
+tombstones included. Pre-v36 a trust-root provenance attestation projected
+Global here. That is the negative default doing what it says; families that
+should keep their reach need decided rows.
+
+### BREAKING — the accord carrier is bounded, and its counter stopped lying (#674, #675)
+
+A bundle carrying more participations than the declared roster has seats, or
+two entries for one `member_id`, is refused **before roster resolution, before
+any signature verification, before any write** —
+`AccordEvidenceCarrierMalformed`, typed across the FFI capsule, naming the
+counts. A malformed carrier no longer reads as a partition.
+
+`AccordEvidenceAdmission.participations_admitted` was a **differencing count**
+that attributed concurrent carriers' inserts to each other. It is replaced by
+`effect: AccordAdmissionEffect` — **check-time novelty**, sound because the
+plane is append-only: `Duplicate` is deterministic for true replays, and
+`Supplied { novel_proposal, novel_participations }` claims only what the node
+verifiably lacked, bounded by the bundle's own length. The mutation restoring
+differencing reported *"3 novel > 2 offered"* under the 12-writer witness
+**while every serial witness stayed green**.
+
+`DIRECTORY_ABI_VERSION` **2 → 3**, covering this and #668's wire breaks in one
+bump.
+
+### BREAKING — a retirement that retired nothing can no longer report success (#711)
+
+`retire_key_grants` counted failures into `supersedes_failed`, logged a
+warning, and returned `Ok`: a caller checking the `Result` — which is what `?`
+does — saw a successful retirement that retired **nothing**, and on a transit
+grant the passphrase stayed live. `RetireKeyGrantsOutcome` is
+`Complete | Partial { failed: [{contribution_id, stage, error}] }`,
+`#[must_use]`, built through one `from_batch` so `Partial` with no failures is
+**unconstructible**. The witness plants a legacy pre-v34 transit grant — a real
+production row class — and asserts the failed grant is *named*.
+
+### BREAKING — consent ordering is CAUSAL (#642)
+
+`fold_ordering_key` was `(asserted_at, restriction_rank, attestation_id)`: a
+wall clock the **producer chooses**. #598 bound the instant to the signed
+envelope so it cannot be forged; it did not stop it being chosen, and
+`DEFAULT_MAX_TOUCH_SKEW` (300s) is the width of the remaining race — a grant
+minted five minutes ahead out-sorts the revocation issued inside it.
+
+**300s is not the bug and 60s is not the fix.** 300s is the consensus
+*freshness* default (Kerberos, JWT leeway, SigV4), and every one of those asks
+*"is this credential recent enough to accept?"* — refusal is fail-closed, worst
+case a retried request. This fold asks *"which of two signed statements is
+later?"*: last-writer-wins on a producer-chosen key, where the answer is not a
+tuned tolerance but **do not order on wall clock at all**.
+`DEFAULT_MAX_TOUCH_SKEW` is unchanged and remains a freshness bound.
+
+**The repo's own gate forced the wire shape.** Reusing the CEG §3.2 pointer
+`references_attestation_id` was written first and
+`every_pointer_read_is_discriminator_guarded` refused it: CC 4.5.1.1 (rc3)
+admits that pointer's polysemy only as an op split over exactly three
+operations, and a consent statement is a `scores` row — a fourth reading. The
+ruling names its own remedy ("the field split, envelope cost accepted"), so
+consent got **`consent_supersedes`**, plane-scoped on purpose because a generic
+name would invite the next plane to reuse it, which is how the field it
+replaces became polysemous.
+
+**`ENVELOPE_VOCABULARY_SHA256` re-pinned** →
+`c159bc2ec76176c8573b24b4052c5f0b93e3dae75d615f2d221c1f460a2d7cac`, on #598's
+precedent. No migration and no binding gate: the key lives only inside the
+signed envelope, so it has no unsigned column twin to diverge from.
+
+`resolve_consent_state` and `resolve_scoped_consent` now share **one** body —
+they carried two copies of the filter chain, and a causal plane bolted onto two
+copies is the #663 class. Retraction **reuses** `precedence::retired_ids`
+rather than growing a second spelling, which closes a live gap:
+`withdraws`/`recants` were **invisible** to the consent fold, so a subject's
+own retraction of a grant read as `Granted`.
+
+**Fail-closed:** a non-grant whose edge names a row this node cannot resolve
+sorts above every clock-ordered row — an incomplete view never reads as a
+grant, and it self-heals when the named row replicates. Reachable only for
+non-grants, so no phantom pointer can lift a grant.
+
+**The ratchet:** the answer is the more restrictive of the causal and clock
+folds. The causal plane can turn Granted into Revoked, never Revoked into
+Granted. **Consent is re-opened by an affirmative later grant, never by
+deleting a refusal.**
+
+### Added — the Attestation plane's typed, pre-write apply (#624)
+
+`apply_replicated_attestation` returns `inserted` | `unchanged` |
+`deduplicated` | `refused{conflicting_attestation | already_present_identical |
+store_conflict}`. A same-id convergence conflict was
+`Error::Backend("UNIQUE constraint failed…")` — CIRISEdge#459 saw 94 in six
+minutes in one bucket. `deduplicated` names the CEG §6.1 composer replay that
+was previously a silent `Ok` **indistinguishable from an insert**, which made
+the outcome type lie. One default trait body: the three backends cannot
+diverge. **Additive** — `put_attestation` is unchanged and no error string
+moved. The issue guessed 2 causes; the code yielded 3 reasons + 4 outcomes, the
+#565 nine-where-six-were-expected shape again.
+
+### Added — the scores-plane read log, and a feasibility program that found something (#552)
+
+CC 3.4.5 **refused** this issue's proposed `caller == subject` read gate, four
+ways — the categories are not disjoint; the permitted read contains the
+withheld quantity; redaction and CC 2.6 JCS verifiability are exclusive; and
+the gate has **no enforceable operand**, since a class-keyed rule relocates the
+band to the agent's steward rather than withholding it. What ships is the
+ruling's own remedy.
+
+`log_scores_read` is the **first statement** in all six doors, recording caller
+key id (or the literal `unauthenticated`), subject and dimension filters,
+whether `confidence_floor` was supplied, and the timestamp. It returns `()` and
+**cannot fail** — a fallible read log is a read gate under another noun. To
+`tracing`, not a table: CC's ratified mechanism is "trace audit", and a durable
+read corpus would be *more* invasive than the gate that was refused.
+
+The marginal-pinning feasibility program ships as a live CI test over the
+vendored registry's 114 declared polarities. Its result:
+`prohibited:{category}`, `revocation:{entity_type}:{reason}` and
+`rollback_detected:{revision_field}` declare a single-signed range, so their
+`ConfidenceBand` is **fully determined by the dimension the caller names** —
+band redaction withholds nothing there. That is CC's own finding 2 arriving by
+a route the clause did not name. Retaining `open_contradictions` would pin
+**107 of 114** families, so the reserved token's retained set has a computed
+exclusion rather than a guessed one.
+`FEDERATION_READ_PREDICATE_REDACTED` is reserved and held unwired by test.
+
+### Fixed
+
+- **#718** — the pyo3 `apply_replicated_key_record` door rendered its outcome
+  with `to_value(..).as_str()`, which is `None` for `Refused{reason}` (an
+  object since #565), so **every key-plane refusal raised
+  `ValueError("outcome serialize")` instead of returning**. On the surface Edge
+  and Server actually consume, the arm #565 exists to make countable was
+  unreachable and presented as a serialization bug. Now canonical JSON, the
+  same shape #624's door chose after finding it.
+- **#719** — pg `put_accord_participation`'s M6 dedup was SELECT-then-INSERT on
+  a pooled connection with no transaction: two carriers relaying the same
+  evidence both passed the check and the loser surfaced a PK violation where the
+  contract promises an idempotent no-op. `ON CONFLICT … DO NOTHING` **alone
+  would have been wrong** — it silently accepts a *differing* concurrent vote,
+  which is what M6 exists to refuse — so a zero-row result re-reads to decide.
+- **#624 M6** — the mutation that survived every witness is dead. The fault
+  double could inject exactly one error kind (`Unsupported`, the *sanctioned*
+  degrade signal), so collapsing `Err(Unsupported) => plan-free` into
+  `Err(_) => plan-free` passed everything. `FaultInjectingDirectory::erroring`
+  injects `Error::Backend`; re-running the original mutation now reds exactly
+  the new witness.
+- A `v13.11.0` doc citation that named **CIRISEdge's** version in persist's
+  namespace, a superseded `parse_since_rfc3339` helper whose premise dissolved,
+  and **twelve bare `Row::get` calls that panic on NULL** — the #24 class,
+  caught by the ban gate rather than by production.
+
+### Measured — and the measurement is contaminated, which is itself the report
+
+#713's acceptance criterion is a delta on `projection_for`. Against baseline
+`pre-713`, this cut reads:
+
+| case | v35 (post-decomposition) | v36 | vs `pre-713` |
+|---|---|---|---|
+| `self_live` | 1.19 ns | **2.47–2.51 ns** | +53% |
+| `unrecognized_scope` | 1.03 ns | **2.20–2.29 ns** | +70% |
+| `publish_sweep` per call | 2.00 ns | **~5.3 ns** | +5771% headline (768 elements vs 64) |
+
+**Do not read those as clean numbers.** They were taken with an unrelated
+QEMU guest holding ~8.6 cores (load average 14.5); the `pre-713` baseline was
+captured under materially lighter load. The comparison therefore **overstates**
+the regression by an unknown amount, and saying so is more useful than
+publishing a figure that looks authoritative. Two runs agreed to within 2%, so
+the measurement is reproducible — under *this* load.
+
+What is nonetheless informative is the *shape*: the sweep regressed
+proportionally more than the singles, which uniform load inflation would not
+produce. That points at the widened match — v35's five planes became twelve
+plane-and-dimension arms — and at `Plane<'a>` carrying a `&str` where
+`ObjectClass` was a fieldless enum, so the argument no longer fits a register.
+Both are consequences of the shape **Edge asked for and argued for**, not
+accidents, and neither is a lookup: no directory read, no allocation, no I/O.
+
+Persist's position: this needs a clean re-measurement on an idle machine before
+anyone treats the number as settled, and **Edge's publish-loop bench is the
+macro acceptance** per its commitment on #713 — a per-envelope-ref cost of a
+few nanoseconds is decided there, not here. The one thing this cut will not do
+is report a figure it knows to be dirty as though it were the answer.
+
+### The measurement that did not support its claim
+
+The pg overlap concurrency leg that #675 deliberately left unwired (its doc
+named #719 as the reason) is now wired and green. **Reverting the `ON CONFLICT`
+clause leaves it green too** — measured, not assumed. The carriage door's own
+admission work does not widen the SELECT/INSERT window enough to lose the race
+in a three-second run. Its real contribution is convergence coverage this plane
+lacked, and the code now says plainly that its green is **not** evidence the
+race is fixed: the race is argued from the SQL and closed by construction, and
+a deterministic witness needs a fault point this backend has no seam for. A
+green leg beside a fix it cannot detect is the shape this cut spent itself
+removing.
+
+### THE ADOPT MAP
+
+Consumer call sites were inventoried read-only at pinned SHAs (CIRISEdge
+`89b19e6`, CIRISServer `c054d8f`, CIRISConformance `3ab8b75`) and posted on
+#713. Persist's half below is what each surface *does now*.
+
+**CIRISEdge**
+
+| surface | at re-pin |
+|---|---|
+| `projection_for` / `tombstone_ceiling` | pass `Plane`; non-Attestation sites go through `ReplicatedKind::projection_plane()` unchanged; Attestation sites pass `Plane::Attestation { dimension }` — **the dimension edge already extracts for `authority_for`, no new read** |
+| `Projection` matches | two new arms, compile-forced |
+| the two bespoke overlay gates | **delete them** — `peer_has_serve_capability` folds onto `Capability(token)` (gate on `token.as_scope()`), `recipient_capability_withholds` folds onto `Subject`. That deletion is the point of the decomposition |
+| the 15 `list_signed_*_since` cursors | resume **only** from `resume_pair()`; compound ids are opaque; duplicates are possible on resume so callers must be idempotent by id; `admitted_at` is node-local and **not portable across nodes** |
+| the `Served*` wrappers | Edge already ships the pattern (`KeyAdvertiseRow`, `#[serde(skip)] admitted_at`, hash-parity test) — the other 12 planes copy it, **and must also move their seq off producer clocks** (`asserted_at`/`revoked_at`) onto `admitted_at`, which is the point of #668 |
+| `admission.participations_admitted` (`bridge.rs:2757`) | `match admission.effect { Supplied{..} => Admitted, Duplicate => Duplicate }`; JSON `effect.kind == "supplied"`. Strictly better: replays are deterministically Duplicate, and a dead-heat first delivery may read Supplied on both racers — each verifiably supplied at its own check instant |
+| `retire_key_grants` | `{outcome, retired}` / `{outcome, retired, failed:[…]}`; **`supersedes_failed` is gone** (folded into `failed`'s length); `stage ∈ prior_payload_decode \| supersession_emission` |
+| consent producers | on a revocation of a specific grant, stamp `consent_supersedes` **before signing**; omit or `null` for blanket revocations; an edgeless revocation still works and simply keeps the 300s race |
+| anyone asserting `ENVELOPE_VOCABULARY_SHA256` | re-pin to `c159bc2e…` |
+| `apply_replicated_key_record` (pyo3) | returns canonical JSON, not a bare token — **refusals now arrive instead of raising** |
+
+**CIRISServer** — pinned at v32.3.0, i.e. **three majors back, not one**.
+Its projection adopt is *stacked*: `federation_delivery.rs:438` still calls the
+pre-v35 three-argument form and crosses both v35's plane parameter and v36's
+dimension + audience kinds. Recommendation from the inventory, which I concur
+with: **do not land the v35 spelling separately** — at v35 the Attestation row
+was deferred, so a v35-only adopt there is pure spelling that is *correct and
+misleading*, teaching a reviewer the site is behaviour-neutral. Rewrite once
+against v36. Note also that **v33 is the release Server wants, not a cost** —
+its pin is a deliberate hold pending the egress-scrub cut — and that the v33
+adopt is **compiler-invisible** (+191/−21 in bodies, zero signature change), so
+its validation must be a behavioural witness; Server wrote that lesson into its
+own source after being burned by the same class. **v34 is a total no-op for
+Server** (zero call sites across all five breaking surfaces). Server's vendored
+`namespace_supersets.json` carries the stale `projection_for` citation v35
+registered as false, and `VENDORED_MANIFEST_VERSION` did not move, so Server's
+own gates cannot see it — re-vendor in the same cut as the projection adopt.
+
+**CIRISConformance** — its own CI stays green through this tag (it pins persist
+17.8.0); the reds surface only in **persist's** wheel-substitution run, against
+a suite ~18 majors behind, so without this list a reader cannot tell "v36 moved
+a token" from "this pin is ancient". The re-pin totals **2 restates + 12 rows of
+pre-existing v34/v35 debt** — because #624 shipped additive, all eight
+attestation-plane token pins **survive verbatim** (they drive emit/put-path
+gates, which keep their existing `Error::kind()` tokens deliberately; a second
+copy of that taxonomy would be the two-lists class). Two notes carried from the
+sweep: widen `test_240:72`'s `str(exc)[:80]` regardless — a longer typed prefix
+can fail an assertion whose token did not move, and that red misdirects — and
+**leave the ~12 cross-wheel byte-equality assertions untouched**: they survive
+#714 and are the cheapest existing detector for whatever #716 does next.
+
+**Coverage gap, stated:** zero Conformance vectors touch the new apply door,
+its three reasons, or its four outcomes — and none touch projection or the
+tombstone ceiling. **Green there is absence-of-test, not evidence.** Five of
+the seven apply arms are deterministically drivable; `store_conflict` is not
+honestly reachable from Conformance and should be disclosed as such rather than
+simulated.
+
+### #716 is now persist-internal
+
+The inventory found `edge_signature` has **zero hits** across all three
+consumer repos — it exists only inside persist. Edge's one signing entry point
+routes through `canonicalize_envelope_for_signing`, the #714-flipped function,
+coherent with what every admission gate rebuilds. So the coordinated-flip
+constraint dissolves: the remaining V1 rebuild at `pipeline.rs:427` verifies a
+field only persist writes, and the flip can be scheduled unilaterally after the
+pin-and-witness treatment v35 gave the audit plane.
+
+### Filed, not fixed — with the evidence
+
+**#720** LifecycleView is a fourth "retracted" decider (same-attester, so *not*
+the #686 hole, but precedence-free — and a SQL predicate carrying pagination,
+so folding it is a real refactor with a short-paging trap, not a rename).
+**#721** the two apparently-ungated trust doors and the DELETE doors that
+remove served rows unannounced. **#722** six cursor planes are
+BELIEVED-by-shape rather than witnessed, plus the index-swallow sites and two
+#707 doors. **#723** `witness_diversity` ships a raw float while `scores.rs`
+states "the float never crosses the wire". **#724** the vendored registry has
+carried a `polarity` column **unread since #425** — five weeks, three
+vendorings — and nothing can notice an unread manifest column. **#709** gained
+its actual mechanism: not fixture collision but **roster inflation** (`2/33:
+not a strict majority`), which may be a production defect rather than a test
+one.
+
 ## [35.0.0] - 2026-08-17
 
 **Per-plane replication projection (CIRISPersist#713).** Contextual integrity

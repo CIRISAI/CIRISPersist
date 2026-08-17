@@ -594,6 +594,9 @@ class Engine:
     def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
         """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
 
+    def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
+        """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
+
     def apply_replicated_key_record(
         self,
         signed_key_record_json: str,
@@ -697,7 +700,7 @@ class Engine:
         """(derived) deontic — v0.7.0 — Verify-and-insert a SlashingAttestation. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_retire_key_grants_json(self, actor_key_id: str, now_iso: str) -> str:
-        """(derived) deontic — v3.6.0 (CIRISPersist#134) — emit a supersedes Contribution against every prior key_grant Contribution issued by actor_key_id. Uses the engine's com... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) deontic — Retire prior key_grants issued by actor_key_id. Returns outcome-tagged JSON; "partial" = grants in failed are STILL LIVE and does NOT raise — branc... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def clear_active_halt(self, family_key_id: str, active_halt_id: str) -> None:
         """(derived) deontic — #302 (H2) — clear the active halt iff it matches (a resume)."""
@@ -2030,43 +2033,43 @@ class Engine:
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
 
-    def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE bundles (proposal + its hybrid-signed participations) since a cursor, as a JSON a..."""
 
-    def list_signed_communities_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_communities_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunity wrappers since a cursor, as a JSON array. Same contract as [list_signed_famil..."""
 
-    def list_signed_community_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_community_membership_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunityMembershipRevocation wrappers since a cursor, as a JSON array. Same contract a..."""
 
-    def list_signed_families_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_families_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) — bulk-list the full SignedFamily wrappers (row + the V110 authority signature put_fa..."""
 
-    def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedFamilyMembershipRevocation wrappers since a cursor, as a JSON array. Same contract as [..."""
 
-    def list_signed_identity_occurrence_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_identity_occurrence_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrenceRevocation wrappers since a cursor, as a JSON array. Signed rows only; ord..."""
 
     def list_signed_identity_occurrences_for_json(self, identity_key_id: str) -> str:
         """(derived) epistemic — v14.1.0 (CIRISPersist#418, replication read) — the signed-put occurrences of identity_key_id, each as a full SignedIdentityOccurrence JSON object (..."""
 
-    def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
 
     def list_signed_key_records_since(self, since_rfc3339: str | None, since_key_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.4.0 (CIRISPersist#682, #668) — bulk-list ServedKeyRecords since a cursor, as a JSON array, ordered (admitted_at ASC, key_id ASC). Every federat..."""
 
-    def list_signed_location_proofs_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_location_proofs_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
 
-    def list_signed_partner_records_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_partner_records_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
 
-    def list_signed_revocations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.1.0 (CIRISPersist#655) — bulk-list ServedRevocations since a cursor, as a JSON array, ordered (admitted_at ASC, revocation_id ASC). The key-lev..."""
 
-    def list_signed_transport_destinations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_signed_transport_destinations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""
 
     def node_state_json(self, self_key_id: str | None = None, root_key_id: str | None = None, now: str | None = None, sla_seconds: int | None = None) -> str:
@@ -2743,7 +2746,7 @@ class Engine:
     def list_attestations_for(self, target_key_id: str, cursor_json: str | None = None, limit: int = 100, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) empirical — #135 + part of #150 — list every attestation whose subject is target_key_id (attested_key_id = target_key_id), newest-first, cursor-paged. Scope is..."""
 
-    def list_attestations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_attestations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
     def list_canonical_servers(self) -> str:
@@ -2841,13 +2844,13 @@ class Engine:
     def list_org_memberships_for(self, org_id: str) -> str:
         """(derived) empirical — Federation directory: list all org_membership rows for one org_id. Returns a JSON array of OrgMembership."""
 
-    def list_org_memberships_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_org_memberships_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — Federation directory: bulk-list org_membership rows since a cursor. Same contract as [list_organizations_since](Self::list_organizations_since)."""
 
     def list_organizations_for(self, org_id: str) -> str:
         """(derived) empirical — Federation directory: list all organization rows for org_id (full history; callers resolve current state). Returns a JSON array of Organization."""
 
-    def list_organizations_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_organizations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — Federation directory: bulk-list organization rows since a cursor (CIRISEdge#65 v2 bridge). since_rfc3339 = None/empty for from- the-start, else an..."""
 
     def list_outbound(self, limit: int = 100, status: str | None = None, destination_key_id: str | None = None, sender_key_id: str | None = None, message_type: str | None = None, enqueued_after_rfc3339: str | None = None) -> list[Any]:
@@ -2856,7 +2859,7 @@ class Engine:
     def list_partner_records_for(self, license_id: str) -> str:
         """(derived) empirical — Federation directory: list all partner_record rows for license_id. Returns a JSON array of PartnerRecord."""
 
-    def list_partner_records_since(self, since_rfc3339: str | None, limit: int) -> str:
+    def list_partner_records_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — Federation directory: bulk-list partner_record rows since a cursor. Same contract as [list_organizations_since](Self::list_organizations_since)."""
 
     def list_retention(self) -> str:

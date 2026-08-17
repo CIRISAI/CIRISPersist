@@ -146,11 +146,19 @@ pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
 ///
 /// # Why this is one function and not thirteen
 ///
-/// v24.1.0 (CIRISPersist#547) fixed index-key COVERAGE: three `UPDATE
-/// federation_keys` paths — `adopt_scrub_upgrade`, `supersede_canonical_record`,
-/// `adopt_genesis_reanchor` — mutated the row and left the index holding the
-/// PRE-mutation hash, so a node scrub-upgraded while running advertised the
-/// hash of its NEW row and could not serve it. v31.0.0 (CIRISPersist#640)
+/// v24.1.0 (CIRISPersist#547) fixed index-key COVERAGE for the `UPDATE
+/// federation_keys` doors. The full production set is SEVEN per SQL backend
+/// (#707's census): FIVE rewrite consumer-visible `KeyRecord` bytes and
+/// re-index — `adopt_scrub_upgrade`, `supersede_canonical_record`,
+/// `adopt_genesis_reanchor`, `set_consent_role`,
+/// `attach_key_pqc_signature` — while `grant_trust` / `revoke_trust` write
+/// only `trust_*` columns outside `KeyRecord` and correctly touch neither
+/// the index nor (v36.0.0, #707) the serve position. #547's own prose named
+/// only the first three; a short list beside a complete implementation is
+/// the next reader's trap, so the census count lives here now. Before #547,
+/// a mutated row left the index holding the PRE-mutation hash, so a node
+/// scrub-upgraded while running advertised the hash of its NEW row and
+/// could not serve it. v31.0.0 (CIRISPersist#640)
 /// then fixed the index-hash DERIVATION, on ONE plane (`Key`), by reloading
 /// and hashing what the read returns. Both remedies were applied to the site
 /// that had failed and nowhere else, which is how the same defect arrived a
@@ -325,14 +333,19 @@ pub async fn reload_record_bytes(
                 None => None,
             }
         }
+        // v36.0.0 (CIRISPersist#668) — the `_since` reads now return Served*
+        // wrappers carrying this node's `admitted_at`. The wire hash is taken
+        // over the INNER signed record ONLY: a node-local instant in the
+        // hashed bytes would make the advertised ref unresolvable on every
+        // other node (the ServedKeyRecord wire-hash lesson).
         "Family" => {
             let family_key_id = record_key_field(record_key_json, "family_key_id")?;
             let rows = dir.list_signed_families_since(None, u32::MAX).await?;
             match rows
                 .into_iter()
-                .find(|r| r.family.family_key_id == family_key_id)
+                .find(|r| r.family.family.family_key_id == family_key_id)
             {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "Family"))?),
+                Some(r) => Some(serde_json::to_vec(&r.family).map_err(|e| to_bytes(e, "Family"))?),
                 None => None,
             }
         }
@@ -341,9 +354,11 @@ pub async fn reload_record_bytes(
             let rows = dir.list_signed_communities_since(None, u32::MAX).await?;
             match rows
                 .into_iter()
-                .find(|r| r.community.community_key_id == community_key_id)
+                .find(|r| r.community.community.community_key_id == community_key_id)
             {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "Community"))?),
+                Some(r) => {
+                    Some(serde_json::to_vec(&r.community).map_err(|e| to_bytes(e, "Community"))?)
+                }
                 None => None,
             }
         }
@@ -359,10 +374,12 @@ pub async fn reload_record_bytes(
             // comparison could not match on postgres, whose `TIMESTAMPTZ`
             // hands back a rounded `asserted_at`.
             match rows.into_iter().find(|r| {
-                r.location_proof.subject_key_id == subject_key_id
-                    && locator_instant(&r.location_proof.asserted_at) == asserted_at
+                r.proof.location_proof.subject_key_id == subject_key_id
+                    && locator_instant(&r.proof.location_proof.asserted_at) == asserted_at
             }) {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "LocationProof"))?),
+                Some(r) => {
+                    Some(serde_json::to_vec(&r.proof).map_err(|e| to_bytes(e, "LocationProof"))?)
+                }
                 None => None,
             }
         }
@@ -374,12 +391,14 @@ pub async fn reload_record_bytes(
                 .list_signed_family_membership_revocations_since(None, u32::MAX)
                 .await?;
             match rows.into_iter().find(|r| {
-                r.family_membership_revocation.family_key_id == family_key_id
-                    && r.family_membership_revocation.removed_identity_key_id
+                r.revocation.family_membership_revocation.family_key_id == family_key_id
+                    && r.revocation
+                        .family_membership_revocation
+                        .removed_identity_key_id
                         == removed_identity_key_id
             }) {
                 Some(r) => Some(
-                    serde_json::to_vec(&r)
+                    serde_json::to_vec(&r.revocation)
                         .map_err(|e| to_bytes(e, "FamilyMembershipRevocation"))?,
                 ),
                 None => None,
@@ -393,12 +412,17 @@ pub async fn reload_record_bytes(
                 .list_signed_community_membership_revocations_since(None, u32::MAX)
                 .await?;
             match rows.into_iter().find(|r| {
-                r.community_membership_revocation.community_key_id == community_key_id
-                    && r.community_membership_revocation.removed_identity_key_id
+                r.revocation
+                    .community_membership_revocation
+                    .community_key_id
+                    == community_key_id
+                    && r.revocation
+                        .community_membership_revocation
+                        .removed_identity_key_id
                         == removed_identity_key_id
             }) {
                 Some(r) => Some(
-                    serde_json::to_vec(&r)
+                    serde_json::to_vec(&r.revocation)
                         .map_err(|e| to_bytes(e, "CommunityMembershipRevocation"))?,
                 ),
                 None => None,
@@ -409,9 +433,11 @@ pub async fn reload_record_bytes(
             let rows = dir.list_organizations_since(None, u32::MAX).await?;
             match rows
                 .into_iter()
-                .find(|r| r.attestation_id == attestation_id)
+                .find(|r| r.organization.attestation_id == attestation_id)
             {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "Organization"))?),
+                Some(r) => Some(
+                    serde_json::to_vec(&r.organization).map_err(|e| to_bytes(e, "Organization"))?,
+                ),
                 None => None,
             }
         }
@@ -420,9 +446,12 @@ pub async fn reload_record_bytes(
             let rows = dir.list_org_memberships_since(None, u32::MAX).await?;
             match rows
                 .into_iter()
-                .find(|r| r.attestation_id == attestation_id)
+                .find(|r| r.org_membership.attestation_id == attestation_id)
             {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "OrgMembership"))?),
+                Some(r) => Some(
+                    serde_json::to_vec(&r.org_membership)
+                        .map_err(|e| to_bytes(e, "OrgMembership"))?,
+                ),
                 None => None,
             }
         }
@@ -433,9 +462,11 @@ pub async fn reload_record_bytes(
                 .await?;
             match rows
                 .into_iter()
-                .find(|r| r.partner_record.attestation_id == attestation_id)
+                .find(|r| r.record.partner_record.attestation_id == attestation_id)
             {
-                Some(r) => Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "PartnerRecord"))?),
+                Some(r) => {
+                    Some(serde_json::to_vec(&r.record).map_err(|e| to_bytes(e, "PartnerRecord"))?)
+                }
                 None => None,
             }
         }
@@ -644,9 +675,13 @@ pub async fn all_kind_hash_keys(
         out.push(("Key", content_hash_of(&wrapped)?, rk));
     }
     // Federation-tier-only by construction (the E5 invariant).
+    // v36.0.0 (#668) — hashed as the bare `Attestation`, never the
+    // `ServedAttestation` wrapper: `admitted_at` is node-local and must stay
+    // out of every content hash (the ServedKeyRecord wire-hash lesson). The
+    // same rule applies to every Served* plane below.
     for a in dir.list_attestations_since(None, u32::MAX).await? {
-        let rk = record_key(&[("attestation_id", &a.attestation_id)]);
-        out.push(("Attestation", content_hash_of(&a)?, rk));
+        let rk = record_key(&[("attestation_id", &a.attestation.attestation_id)]);
+        out.push(("Attestation", content_hash_of(&a.attestation)?, rk));
     }
     // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Hashed as
     // the `SignedRevocation` wrapper, NOT as the `ServedRevocation` the cursor
@@ -667,111 +702,117 @@ pub async fn all_kind_hash_keys(
         .list_signed_identity_occurrences_since(None, u32::MAX)
         .await?
     {
+        let o = &r.occurrence;
         let rk = record_key(&[
-            ("identity_key_id", &r.identity_occurrence.identity_key_id),
+            ("identity_key_id", &o.identity_occurrence.identity_key_id),
             (
                 "occurrence_key_id",
-                &r.identity_occurrence.occurrence_key_id,
+                &o.identity_occurrence.occurrence_key_id,
             ),
         ]);
-        out.push(("IdentityOccurrence", content_hash_of(&r)?, rk));
+        out.push(("IdentityOccurrence", content_hash_of(o)?, rk));
     }
     for r in dir
         .list_signed_transport_destinations_since(None, u32::MAX)
         .await?
     {
+        let d = &r.destination;
         let rk = record_key(&[
             (
                 "occurrence_key_id",
-                &r.transport_destination.occurrence_key_id,
+                &d.transport_destination.occurrence_key_id,
             ),
-            ("transport_kind", &r.transport_destination.transport_kind),
+            ("transport_kind", &d.transport_destination.transport_kind),
         ]);
-        out.push(("TransportDestination", content_hash_of(&r)?, rk));
+        out.push(("TransportDestination", content_hash_of(d)?, rk));
     }
     for r in dir
         .list_signed_identity_occurrence_revocations_since(None, u32::MAX)
         .await?
     {
+        let v = &r.revocation;
         let rk = record_key(&[
             (
                 "identity_key_id",
-                &r.identity_occurrence_revocation.identity_key_id,
+                &v.identity_occurrence_revocation.identity_key_id,
             ),
             (
                 "occurrence_key_id",
-                &r.identity_occurrence_revocation.occurrence_key_id,
+                &v.identity_occurrence_revocation.occurrence_key_id,
             ),
         ]);
-        out.push(("IdentityOccurrenceRevocation", content_hash_of(&r)?, rk));
+        out.push(("IdentityOccurrenceRevocation", content_hash_of(v)?, rk));
     }
     for r in dir.list_signed_families_since(None, u32::MAX).await? {
-        let rk = record_key(&[("family_key_id", &r.family.family_key_id)]);
-        out.push(("Family", content_hash_of(&r)?, rk));
+        let rk = record_key(&[("family_key_id", &r.family.family.family_key_id)]);
+        out.push(("Family", content_hash_of(&r.family)?, rk));
     }
     for r in dir.list_signed_communities_since(None, u32::MAX).await? {
-        let rk = record_key(&[("community_key_id", &r.community.community_key_id)]);
-        out.push(("Community", content_hash_of(&r)?, rk));
+        let rk = record_key(&[("community_key_id", &r.community.community.community_key_id)]);
+        out.push(("Community", content_hash_of(&r.community)?, rk));
     }
     for r in dir
         .list_signed_location_proofs_since(None, u32::MAX)
         .await?
     {
+        let p = &r.proof;
         let rk = record_key(&[
-            ("subject_key_id", &r.location_proof.subject_key_id),
+            ("subject_key_id", &p.location_proof.subject_key_id),
             (
                 "asserted_at",
-                &locator_instant(&r.location_proof.asserted_at),
+                &locator_instant(&p.location_proof.asserted_at),
             ),
         ]);
-        out.push(("LocationProof", content_hash_of(&r)?, rk));
+        out.push(("LocationProof", content_hash_of(p)?, rk));
     }
     for r in dir
         .list_signed_family_membership_revocations_since(None, u32::MAX)
         .await?
     {
+        let v = &r.revocation;
         let rk = record_key(&[
             (
                 "family_key_id",
-                &r.family_membership_revocation.family_key_id,
+                &v.family_membership_revocation.family_key_id,
             ),
             (
                 "removed_identity_key_id",
-                &r.family_membership_revocation.removed_identity_key_id,
+                &v.family_membership_revocation.removed_identity_key_id,
             ),
         ]);
-        out.push(("FamilyMembershipRevocation", content_hash_of(&r)?, rk));
+        out.push(("FamilyMembershipRevocation", content_hash_of(v)?, rk));
     }
     for r in dir
         .list_signed_community_membership_revocations_since(None, u32::MAX)
         .await?
     {
+        let v = &r.revocation;
         let rk = record_key(&[
             (
                 "community_key_id",
-                &r.community_membership_revocation.community_key_id,
+                &v.community_membership_revocation.community_key_id,
             ),
             (
                 "removed_identity_key_id",
-                &r.community_membership_revocation.removed_identity_key_id,
+                &v.community_membership_revocation.removed_identity_key_id,
             ),
         ]);
-        out.push(("CommunityMembershipRevocation", content_hash_of(&r)?, rk));
+        out.push(("CommunityMembershipRevocation", content_hash_of(v)?, rk));
     }
     for r in dir.list_organizations_since(None, u32::MAX).await? {
-        let rk = record_key(&[("attestation_id", &r.attestation_id)]);
-        out.push(("Organization", content_hash_of(&r)?, rk));
+        let rk = record_key(&[("attestation_id", &r.organization.attestation_id)]);
+        out.push(("Organization", content_hash_of(&r.organization)?, rk));
     }
     for r in dir.list_org_memberships_since(None, u32::MAX).await? {
-        let rk = record_key(&[("attestation_id", &r.attestation_id)]);
-        out.push(("OrgMembership", content_hash_of(&r)?, rk));
+        let rk = record_key(&[("attestation_id", &r.org_membership.attestation_id)]);
+        out.push(("OrgMembership", content_hash_of(&r.org_membership)?, rk));
     }
     for r in dir
         .list_signed_partner_records_since(None, u32::MAX)
         .await?
     {
-        let rk = record_key(&[("attestation_id", &r.partner_record.attestation_id)]);
-        out.push(("PartnerRecord", content_hash_of(&r)?, rk));
+        let rk = record_key(&[("attestation_id", &r.record.partner_record.attestation_id)]);
+        out.push(("PartnerRecord", content_hash_of(&r.record)?, rk));
     }
     Ok(out)
 }

@@ -315,22 +315,29 @@ pub async fn run_deletion_window_watch(
     type RetractionCache = HashMap<String, HashSet<String>>;
     let mut retracted: RetractionCache = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut cursor: Option<DateTime<Utc>> = None;
+    // v36.0.0 (CIRISPersist#668) — the cursor is the `(position, id)` PAIR,
+    // so a page boundary landing inside a group of rows sharing one instant
+    // resumes exactly where it stopped. The old one-microsecond step-back
+    // (and the re-fetch overlap it created) existed only to paper over the
+    // instant-only resume and is gone with it; `seen` stays as a cheap
+    // belt-and-braces dedup.
+    let mut cursor: Option<(DateTime<Utc>, String)> = None;
     let mut truncated = true;
 
     for _page in 0..MAX_SCAN_PAGES {
         let page = dir
-            .list_attestations_since(cursor, DELETION_WINDOW_SCAN_CAP)
+            .list_attestations_since(cursor.clone(), DELETION_WINDOW_SCAN_CAP)
             .await?;
         let Some(last) = page.last() else {
             truncated = false;
             break;
         };
         let page_full = page.len() as u32 >= DELETION_WINDOW_SCAN_CAP;
-        let last_visible = last.promoted_at.unwrap_or(last.asserted_at);
+        let next_cursor = last.resume_pair();
 
-        for row in &page {
-            // The overlap the cursor step-back below deliberately creates.
+        for served in &page {
+            let row = &served.attestation;
+            // Belt-and-braces dedup (the pair cursor no longer re-fetches).
             if !seen.insert(row.attestation_id.clone()) {
                 continue;
             }
@@ -384,13 +391,9 @@ pub async fn run_deletion_window_watch(
             truncated = false;
             break;
         }
-        // Step the cursor BACK one microsecond rather than to `last_visible`
-        // exactly: the read filters `visibility > since`, so a page boundary
-        // that lands inside a group of rows sharing one visibility instant
-        // would silently drop the rest of that group — on a BREACH sweep, the
-        // worst possible way to be green. The re-fetched overlap is free
-        // because `seen` already dedups it.
-        cursor = Some(last_visible - chrono::Duration::microseconds(1));
+        // Resume from the last row's PAIR — every row after it is served
+        // exactly once, including the rest of any tie the page cut (#668).
+        cursor = Some(next_cursor);
     }
 
     report.scan_truncated = truncated;
