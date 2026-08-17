@@ -166,6 +166,24 @@ struct State {
     /// node keeps its own arrival order — the same separation `ServedRevocation`
     /// makes (#682).
     key_record_admitted_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// v36.0.0 (CIRISPersist#707) — `federation_keys.mutated_at` (V131): when
+    /// THIS node last rewrote a key row's consumer-visible bytes through a
+    /// mutating door. Keyed by `key_id`; absent = never mutated. The serve
+    /// cursor keys on the GREATER of this and the admission position, so a
+    /// consumer whose cursor passed the row is served the new bytes again.
+    /// `admitted_at` above keeps its V126 meaning (first admission) untouched.
+    key_record_mutated_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// v36.0.0 (CIRISPersist#668) — the in-memory mirror of the V130
+    /// `admitted_at` columns, for EVERY remaining serve-cursor plane: plane
+    /// kind (the wire-index token) → resume id → THIS node's serve position
+    /// on the row. A row with no entry falls back to its legacy producer
+    /// instant, exactly as the sqlite dialect's
+    /// `COALESCE(admitted_at, <legacy>)` does for a pre-V130 row. One nested
+    /// map rather than twelve named fields because the planes share one
+    /// contract; the key-record and revocation planes keep their own maps
+    /// (they predate this one and carry extra prose).
+    serve_positions:
+        HashMap<&'static str, std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
     /// v3.1.0 (CIRISPersist#117) — Federation peer metadata, sibling
     /// to `federation_keys`. Keyed by `key_id`. Memory backend
     /// mirrors the V051 PG/SQLite shape: same fields, same soft-
@@ -425,13 +443,22 @@ struct MemScopeBlob {
 /// the row stamped with that value would sort behind a cursor that had already
 /// passed. That is #682 itself, re-entering through the allocator.
 fn key_record_position(
-    admitted: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    state: &State,
     record: &crate::federation::KeyRecord,
 ) -> chrono::DateTime<chrono::Utc> {
-    admitted
+    let admitted = state
+        .key_record_admitted_at
         .get(&record.key_id)
         .copied()
-        .unwrap_or(record.scrub_timestamp)
+        .unwrap_or(record.scrub_timestamp);
+    // v36.0.0 (CIRISPersist#707) — the serve position is the GREATER of the
+    // admission position and the last consumer-visible mutation, the memory
+    // analogue of the SQL `GREATEST(admitted_at, mutated_at)` / V131
+    // expression. A mutated row moves FORWARD in the stream.
+    match state.key_record_mutated_at.get(&record.key_id).copied() {
+        Some(mutated) if mutated > admitted => mutated,
+        _ => admitted,
+    }
 }
 
 /// v31.4.0 (CIRISPersist#682) — allocate THIS node's next admission position on
@@ -446,9 +473,236 @@ fn next_key_admission_position(state: &State) -> chrono::DateTime<chrono::Utc> {
     let last = state
         .federation_keys
         .values()
-        .map(|k| key_record_position(&state.key_record_admitted_at, k))
+        .map(|k| key_record_position(state, k))
         .max();
     crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+}
+
+// ─── v36.0.0 (CIRISPersist#668) — the V130 serve-position machinery, memory
+//     twin. Plane tokens are the wire-index kind strings, so the side map
+//     reads like the shared index does.
+
+const PLANE_ORGANIZATION: &str = "Organization";
+const PLANE_ORG_MEMBERSHIP: &str = "OrgMembership";
+const PLANE_PARTNER_RECORD: &str = "PartnerRecord";
+const PLANE_FAMILY: &str = "Family";
+const PLANE_COMMUNITY: &str = "Community";
+const PLANE_LOCATION_PROOF: &str = "LocationProof";
+const PLANE_FAMILY_MEMBERSHIP_REVOCATION: &str = "FamilyMembershipRevocation";
+const PLANE_COMMUNITY_MEMBERSHIP_REVOCATION: &str = "CommunityMembershipRevocation";
+const PLANE_IDENTITY_OCCURRENCE: &str = "IdentityOccurrence";
+const PLANE_IDENTITY_OCCURRENCE_REVOCATION: &str = "IdentityOccurrenceRevocation";
+const PLANE_TRANSPORT_DESTINATION: &str = "TransportDestination";
+const PLANE_ATTESTATION: &str = "Attestation";
+
+/// One row's serve position: the stamped V130 instant, or the plane's legacy
+/// producer instant when no stamp exists — the memory analogue of
+/// `COALESCE(admitted_at, <legacy>)`, defined once because the cursor and
+/// the allocator MUST read the same expression (#682's invariant).
+fn plane_position(
+    state: &State,
+    plane: &'static str,
+    id: &str,
+    fallback: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    state
+        .serve_positions
+        .get(plane)
+        .and_then(|m| m.get(id))
+        .copied()
+        .unwrap_or(fallback)
+}
+
+/// Allocate the next serve position on one plane, strictly above every
+/// position already handed out. `rows` yields `(resume_id, legacy fallback)`
+/// for every stored row of the plane, so the allocator sees exactly what the
+/// cursor sees. Callers hold the state lock, so allocation is strictly
+/// increasing on this backend.
+fn next_plane_position(
+    state: &State,
+    plane: &'static str,
+    rows: impl Iterator<Item = (String, chrono::DateTime<chrono::Utc>)>,
+) -> chrono::DateTime<chrono::Utc> {
+    let last = rows
+        .map(|(id, fallback)| plane_position(state, plane, &id, fallback))
+        .max();
+    crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
+}
+
+/// Stamp (or RE-stamp, for a consumer-visible rewrite — #707's class) one
+/// row's serve position.
+fn stamp_plane_position(
+    state: &mut State,
+    plane: &'static str,
+    id: String,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    state
+        .serve_positions
+        .entry(plane)
+        .or_default()
+        .insert(id, at);
+}
+
+/// Allocate-and-stamp in one call, for the common door shape: compute the
+/// next position over the plane's CURRENT rows (immutable pass), then stamp
+/// `id` with it (mutable pass). Callers hold the state lock throughout, so
+/// the two passes are one atomic step from any reader's point of view.
+fn allocate_and_stamp(
+    state: &mut State,
+    plane: &'static str,
+    id: String,
+    rows: Vec<(String, chrono::DateTime<chrono::Utc>)>,
+) -> chrono::DateTime<chrono::Utc> {
+    let at = next_plane_position(state, plane, rows.into_iter());
+    stamp_plane_position(state, plane, id, at);
+    at
+}
+
+/// The `(resume id, legacy fallback)` inventory per plane — what the
+/// allocator reads so it sees exactly what the cursor sees.
+fn organization_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_organizations
+        .values()
+        .map(|o| (o.attestation_id.clone(), o.asserted_at))
+        .collect()
+}
+fn org_membership_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_org_memberships
+        .values()
+        .map(|m| (m.attestation_id.clone(), m.asserted_at))
+        .collect()
+}
+fn partner_record_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_partner_records
+        .values()
+        .map(|p| (p.attestation_id.clone(), p.asserted_at))
+        .collect()
+}
+fn family_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_families
+        .values()
+        .map(|f| (f.family_key_id.clone(), f.founded_at))
+        .collect()
+}
+fn community_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_communities
+        .values()
+        .map(|c| (c.community_key_id.clone(), c.founded_at))
+        .collect()
+}
+fn location_proof_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_location_proofs
+        .values()
+        .map(|p| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &p.subject_key_id,
+                    &p.persist_row_hash,
+                ]),
+                p.asserted_at,
+            )
+        })
+        .collect()
+}
+fn family_membership_revocation_rows(
+    state: &State,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_family_membership_revocations
+        .values()
+        .map(|r| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &r.family_key_id,
+                    &r.removed_identity_key_id,
+                ]),
+                r.removed_at,
+            )
+        })
+        .collect()
+}
+fn community_membership_revocation_rows(
+    state: &State,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_community_membership_revocations
+        .values()
+        .map(|r| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &r.community_key_id,
+                    &r.removed_identity_key_id,
+                ]),
+                r.removed_at,
+            )
+        })
+        .collect()
+}
+fn identity_occurrence_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_identity_occurrences
+        .values()
+        .map(|o| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &o.identity_key_id,
+                    &o.occurrence_key_id,
+                ]),
+                o.asserted_at,
+            )
+        })
+        .collect()
+}
+fn identity_occurrence_revocation_rows(
+    state: &State,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_identity_occurrence_revocations
+        .values()
+        .map(|r| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &r.identity_key_id,
+                    &r.occurrence_key_id,
+                ]),
+                r.revoked_at,
+            )
+        })
+        .collect()
+}
+fn transport_destination_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .transport_destinations
+        .values()
+        .map(|t| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &t.occurrence_key_id,
+                    &t.transport_kind,
+                ]),
+                t.asserted_at,
+            )
+        })
+        .collect()
+}
+fn attestation_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_attestations
+        .iter()
+        .map(|a| {
+            (
+                a.attestation_id.clone(),
+                a.promoted_at.unwrap_or(a.asserted_at),
+            )
+        })
+        .collect()
 }
 
 impl Default for MemoryBackend {
@@ -466,6 +720,8 @@ impl Default for MemoryBackend {
                 federation_revocations: Vec::new(),
                 revocation_admitted_at: HashMap::new(),
                 key_record_admitted_at: HashMap::new(),
+                key_record_mutated_at: HashMap::new(),
+                serve_positions: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
                 federation_goals: HashMap::new(),
@@ -550,19 +806,37 @@ impl MemoryBackend {
     /// The state `Mutex` is not reentrant and the reload takes it, so every
     /// caller must have released its guard before awaiting this — which is also
     /// what keeps these futures `Send`.
+    /// v36.0.0 (CIRISPersist#668) — **a failure here is LOUD, never fatal**,
+    /// matching the SQL twins: the primary write is already durable, so an
+    /// index error must not be reported as a write failure the caller cannot
+    /// repair (the admission gates refuse an identical resubmission). Memory's
+    /// own upsert is infallible; the reload through the read path is the only
+    /// thing that can error, and it is logged rather than propagated so the
+    /// contract is uniform across all three backends.
     async fn index_stored_record(
         &self,
         kind: &str,
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
-        if let Some(content_hash) =
-            crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
-        {
-            self.state
-                .lock()
-                .expect("memory backend lock")
-                .signed_wire_index
-                .insert((kind.to_owned(), content_hash), record_key_json.to_owned());
+        match crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await {
+            Ok(Some(content_hash)) => {
+                self.state
+                    .lock()
+                    .expect("memory backend lock")
+                    .signed_wire_index
+                    .insert((kind.to_owned(), content_hash), record_key_json.to_owned());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(
+                    kind,
+                    record_key = record_key_json,
+                    error = %e,
+                    "signed_wire_index update failed AFTER a durable primary write (#668): the \
+                     row is stored but absent from incremental content-hash lookup until \
+                     rebuild_signed_wire_index or the self-healing point read repairs it"
+                );
+            }
         }
         Ok(())
     }
@@ -1067,7 +1341,18 @@ impl MemoryBackend {
                 .or_default()
                 .push(row.attestation_id.clone());
         }
+        // v36.0.0 (#668) — serve position (V130 mirror). A local-tier row is
+        // not served by `list_attestations_since`, but one column has one
+        // meaning across tiers (#541's preserve-set rule; the promote sweep
+        // re-stamps at federation admission).
+        let admitted_at = next_plane_position(
+            &state,
+            PLANE_ATTESTATION,
+            attestation_rows(&state).into_iter(),
+        );
+        let id_for_stamp = row.attestation_id.clone();
         state.federation_attestations.push(row);
+        stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
         Ok(attestation_id)
     }
 
@@ -2185,7 +2470,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // row through EVERY mutator, not only `put_public_key`.
             // v31.0.0 (CIRISPersist#640/#646) — from the STORED row; see
             // `MemoryBackend::index_stored_record`.
+            // v36.0.0 (CIRISPersist#707) — a re-anchor rewrites the whole
+            // consumer-visible record; the serve position must move or a
+            // consumer past the cursor keeps the pre-anchor row forever.
+            // `key_record_admitted_at` stays untouched ON PURPOSE (first
+            // admission is a fact this node keeps); the mutation position is
+            // the one that moves, matching the SQL doors' `mutated_at`.
+            let mutated_at = next_key_admission_position(&state);
             let key_id = row.key_id.clone();
+            state
+                .key_record_mutated_at
+                .insert(key_id.clone(), mutated_at);
             state.federation_keys.insert(key_id.clone(), row);
             key_id
         };
@@ -2249,10 +2544,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .map(str::to_owned);
         {
             let mut state = self.state.lock().expect("memory backend lock");
-            let Some(row) = state.federation_keys.get_mut(key_id) else {
+            if !state.federation_keys.contains_key(key_id) {
                 return Err(crate::federation::Error::InvalidArgument(format!(
                     "set_consent_role: no federation_keys row for {key_id}"
                 )));
+            }
+            // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
+            // bytes, so this rewrite moves the serve position. Allocated
+            // BEFORE the row mutation so the new position sorts above every
+            // position the cursor could already have served.
+            let mutated_at = next_key_admission_position(&state);
+            state
+                .key_record_mutated_at
+                .insert(key_id.to_owned(), mutated_at);
+            let Some(row) = state.federation_keys.get_mut(key_id) else {
+                unreachable!("presence checked above under the same lock");
             };
             row.consent_role = normalized;
             // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
@@ -2950,7 +3256,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         &row.attestation_id,
                     )])
                 });
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
+            let id_for_stamp = row.attestation_id.clone();
             state.federation_attestations.push(row);
+            stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
             // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
             // `trace:complete:v1` attestation materializes its `trace_events`
             // rows (via the SAME decompose the ingest path uses), so a
@@ -3489,6 +3803,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
+            // the serve position moves with them. Allocated before the mutable
+            // row borrow below, stamped after it ends.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
             let Some(row) = state
                 .federation_attestations
                 .iter_mut()
@@ -3526,12 +3848,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // The wire index moves WITH the row (#610): the re-seal recomputes
             // `persist_row_hash`, so without re-indexing the row advertises a
             // hash the index does not hold.
-            (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
-                crate::federation::wire_index::record_key(&[(
-                    "attestation_id",
-                    &row.attestation_id,
-                )])
-            })
+            let wik =
+                (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                    crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &row.attestation_id,
+                    )])
+                });
+            stamp_plane_position(
+                &mut state,
+                PLANE_ATTESTATION,
+                resealed.attestation_id.clone(),
+                admitted_at,
+            );
+            wik
         };
         if let Some(wire_index_key) = wire_index_key {
             self.index_stored_record("Attestation", &wire_index_key)
@@ -3620,6 +3950,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668/#707-class) — a re-scope rewrites the served
+            // bytes; the serve position moves with them.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
             let row = state
                 .federation_attestations
                 .iter_mut()
@@ -3674,12 +4011,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // the index does not hold and the pack path cannot serve what the offer
             // path offered. Federation-tier only, per the E5 invariant that governs
             // the put path's own indexing.
-            (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
-                crate::federation::wire_index::record_key(&[(
-                    "attestation_id",
-                    &row.attestation_id,
-                )])
-            })
+            let wik =
+                (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                    crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &row.attestation_id,
+                    )])
+                });
+            stamp_plane_position(
+                &mut state,
+                PLANE_ATTESTATION,
+                attestation_id.to_owned(),
+                admitted_at,
+            );
+            wik
         };
         if let Some(wire_index_key) = wire_index_key {
             self.index_stored_record("Attestation", &wire_index_key)
@@ -3971,7 +4316,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         occurrence.signature,
                     ),
                 );
+                // v36.0.0 (#668) — serve position (V130 mirror): stamped on
+                // admission, RE-stamped on a last-signed-wins supersede.
+                let admitted_at = next_plane_position(
+                    &state,
+                    PLANE_IDENTITY_OCCURRENCE,
+                    identity_occurrence_rows(&state).into_iter(),
+                );
+                let resume = crate::federation::types::compound_resume_id(&[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                ]);
                 state.federation_identity_occurrences.insert(key, row);
+                stamp_plane_position(&mut state, PLANE_IDENTITY_OCCURRENCE, resume, admitted_at);
                 indexed = Some(wire_index_key);
             }
             projected_route
@@ -4028,10 +4385,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .as_ref()
                 .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
                 .transpose()?;
+            // v36.0.0 (#668) — serve position (V130 mirror), the local twin.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_IDENTITY_OCCURRENCE,
+                identity_occurrence_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &row.identity_key_id,
+                &row.occurrence_key_id,
+            ]);
             state.federation_identity_occurrences.insert(
                 (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
                 row,
             );
+            stamp_plane_position(&mut state, PLANE_IDENTITY_OCCURRENCE, resume, admitted_at);
             projected_route
         };
         if let Some(route) = &projected_route {
@@ -4092,13 +4460,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // guards.
         if clock_newer && (!stored_signed || same_material_content) {
             if stored_signed {
+                // v36.0.0 (#668) — `last_seen_at` alone (advisory liveness,
+                // outside the verifier's nine fields): the serve position
+                // deliberately does NOT move, matching the SQL twins.
                 if let Some(row) = state.transport_destinations.get_mut(&key) {
                     row.last_seen_at = destination.last_seen_at;
                 }
             } else {
+                // v36.0.0 (#668) — serve position (V130 mirror): stamped on
+                // insert and re-stamped on an unsigned-row rewrite.
+                let admitted_at = next_plane_position(
+                    &state,
+                    PLANE_TRANSPORT_DESTINATION,
+                    transport_destination_rows(&state).into_iter(),
+                );
+                let resume = crate::federation::types::compound_resume_id(&[&key.0, &key.1]);
                 state
                     .transport_destinations
                     .insert(key, destination.clone());
+                stamp_plane_position(&mut state, PLANE_TRANSPORT_DESTINATION, resume, admitted_at);
             }
         }
         Ok(())
@@ -4151,7 +4531,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     signed.signature.clone(),
                 ),
             );
+            // v36.0.0 (#668) — serve position (V130 mirror): a signed apply
+            // always stamps/re-stamps.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_TRANSPORT_DESTINATION,
+                transport_destination_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[&key.0, &key.1]);
             state.transport_destinations.insert(key.clone(), d.clone());
+            stamp_plane_position(&mut state, PLANE_TRANSPORT_DESTINATION, resume, admitted_at);
             // v21.1.0 (CIRISPersist#507b) — `signed` IS the exact value
             // `list_signed_transport_destinations_since` re-serializes.
             let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -4405,11 +4794,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // genesis-bake bypass) is untouched — its rows are legitimately
         // unsigned; this side-map entry is written only on the signed,
         // gate-verified path.
-        self.state
-            .lock()
-            .expect("memory backend lock")
-            .federation_family_authority_sigs
-            .insert(
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            state.federation_family_authority_sigs.insert(
                 family_key_id.clone(),
                 (
                     authority_key_id.clone(),
@@ -4417,6 +4804,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     scrub_signature_pqc.clone(),
                 ),
             );
+            // v36.0.0 (#668) — attaching the authority signature is what makes
+            // the row visible to the signed serve cursor; re-stamp the serve
+            // position here (V130 mirror).
+            let rows = family_rows(&state);
+            allocate_and_stamp(&mut state, PLANE_FAMILY, family_key_id.clone(), rows);
+        }
         // v21.1.0 (CIRISPersist#507b) — wire-index the FULL `SignedFamily`
         // shape `list_signed_families_since` re-serializes. Reload rather
         // than reuse the pre-write `Family` value: `put_family_local` stamps
@@ -4450,9 +4843,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // here as "the one backend where a family trust root cannot exist".
         let mut state = self.state.lock().expect("memory backend lock");
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v36.0.0 (#668) — serve position (V130 mirror), allocated over the
+        // pre-existing rows and stamped after the insert lands.
+        let admitted_at =
+            next_plane_position(&state, PLANE_FAMILY, family_rows(&state).into_iter());
+        let id_for_stamp = row.family_key_id.clone();
         state
             .federation_families
             .insert(row.family_key_id.clone(), row);
+        stamp_plane_position(&mut state, PLANE_FAMILY, id_for_stamp, admitted_at);
         Ok(())
     }
 
@@ -4491,6 +4890,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     spec.scrub_signature_pqc.clone(),
                 ),
             );
+            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
+            // bytes; the serve position moves with them.
+            let rows = family_rows(&state);
+            allocate_and_stamp(&mut state, PLANE_FAMILY, family_key_id.to_owned(), rows);
         }
         // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
         self.index_stored_record(
@@ -4544,6 +4947,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     spec.scrub_signature_classical.clone(),
                     spec.scrub_signature_pqc.clone(),
                 ),
+            );
+            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
+            // bytes; the serve position moves with them.
+            let rows = community_rows(&state);
+            allocate_and_stamp(
+                &mut state,
+                PLANE_COMMUNITY,
+                community_key_id.to_owned(),
+                rows,
             );
         }
         // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
@@ -4633,6 +5045,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         scrub_signature_pqc,
                     ),
                 );
+                // v36.0.0 (#668/#707-class) — a supersede rewrites the served
+                // bytes; the serve position moves with them.
+                let rows = family_rows(&state);
+                allocate_and_stamp(&mut state, PLANE_FAMILY, key.clone(), rows);
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
@@ -4690,6 +5106,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         scrub_signature_pqc,
                     ),
                 );
+                // v36.0.0 (#668/#707-class) — see the family arm.
+                let rows = community_rows(&state);
+                allocate_and_stamp(&mut state, PLANE_COMMUNITY, key.clone(), rows);
                 let next = cur_ver + 1;
                 state
                     .federation_group_current_version
@@ -4823,9 +5242,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     community.scrub_signature_pqc,
                 ),
             );
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at =
+                next_plane_position(&state, PLANE_COMMUNITY, community_rows(&state).into_iter());
+            let id_for_stamp = row.community_key_id.clone();
             state
                 .federation_communities
                 .insert(row.community_key_id.clone(), row);
+            stamp_plane_position(&mut state, PLANE_COMMUNITY, id_for_stamp, admitted_at);
             wire_index_key
         };
         self.index_stored_record("Community", &wire_index_key)
@@ -5208,9 +5632,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
             let revoked_at = row.revoked_at;
             let occurrence_key_id = row.occurrence_key_id.clone();
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
+                identity_occurrence_revocation_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[&key.0, &key.1]);
             state
                 .federation_identity_occurrence_revocations
                 .insert(key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
+                resume,
+                admitted_at,
+            );
             // #446 de-projection (the projection's inverse): retire the LOCAL
             // derived route materialized from this occurrence's binding. Narrow
             // on purpose: only the signature-free projected/local row; a live
@@ -5220,9 +5657,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
             );
             if !state.transport_destination_sigs.contains_key(&route_key) {
+                // v36.0.0 (#668/#707-class) — a retirement is a
+                // consumer-visible rewrite (tombstones must gossip); the
+                // route's serve position moves with it.
+                let route_admitted_at = next_plane_position(
+                    &state,
+                    PLANE_TRANSPORT_DESTINATION,
+                    transport_destination_rows(&state).into_iter(),
+                );
+                let route_resume =
+                    crate::federation::types::compound_resume_id(&[&route_key.0, &route_key.1]);
                 if let Some(route) = state.transport_destinations.get_mut(&route_key) {
                     if route.retired_at.is_none() {
                         route.retired_at = Some(revoked_at);
+                        stamp_plane_position(
+                            &mut state,
+                            PLANE_TRANSPORT_DESTINATION,
+                            route_resume,
+                            route_admitted_at,
+                        );
                     }
                 }
             }
@@ -5268,18 +5721,46 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let revoked_at = row.revoked_at;
         let occurrence_key_id = row.occurrence_key_id.clone();
+        // v36.0.0 (#668) — serve position (V130 mirror), the local twin.
+        let admitted_at = next_plane_position(
+            &state,
+            PLANE_IDENTITY_OCCURRENCE_REVOCATION,
+            identity_occurrence_revocation_rows(&state).into_iter(),
+        );
+        let resume = crate::federation::types::compound_resume_id(&[&pk.0, &pk.1]);
         state
             .federation_identity_occurrence_revocations
             .insert(pk, row);
+        stamp_plane_position(
+            &mut state,
+            PLANE_IDENTITY_OCCURRENCE_REVOCATION,
+            resume,
+            admitted_at,
+        );
         // #446 de-projection — mirrors the signed revocation path.
         let route_key = (
             occurrence_key_id,
             crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
         );
         if !state.transport_destination_sigs.contains_key(&route_key) {
+            // v36.0.0 (#668/#707-class) — the retirement moves the route's
+            // serve position; see the signed twin.
+            let route_admitted_at = next_plane_position(
+                &state,
+                PLANE_TRANSPORT_DESTINATION,
+                transport_destination_rows(&state).into_iter(),
+            );
+            let route_resume =
+                crate::federation::types::compound_resume_id(&[&route_key.0, &route_key.1]);
             if let Some(route) = state.transport_destinations.get_mut(&route_key) {
                 if route.retired_at.is_none() {
                     route.retired_at = Some(revoked_at);
+                    stamp_plane_position(
+                        &mut state,
+                        PLANE_TRANSPORT_DESTINATION,
+                        route_resume,
+                        route_admitted_at,
+                    );
                 }
             }
         }
@@ -5339,9 +5820,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_REVOCATION,
+                family_membership_revocation_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &revocation_key.0,
+                &revocation_key.1,
+            ]);
             state
                 .federation_family_membership_revocations
                 .insert(revocation_key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_FAMILY_MEMBERSHIP_REVOCATION,
+                resume,
+                admitted_at,
+            );
             wire_index_key
         };
         self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
@@ -5447,9 +5944,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
+                community_membership_revocation_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &revocation_key.0,
+                &revocation_key.1,
+            ]);
             state
                 .federation_community_membership_revocations
                 .insert(revocation_key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
+                resume,
+                admitted_at,
+            );
             wire_index_key
         };
         self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
@@ -5757,7 +6270,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     proof.scrub_signature_pqc,
                 ),
             );
+            // v36.0.0 (#668) — serve position (V130 mirror). Resume id is
+            // (subject_key_id, persist_row_hash), matching the SQL twins.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_LOCATION_PROOF,
+                location_proof_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &row.subject_key_id,
+                &row.persist_row_hash,
+            ]);
             state.federation_location_proofs.insert(proof_key, row);
+            stamp_plane_position(&mut state, PLANE_LOCATION_PROOF, resume, admitted_at);
             wire_index_key
         };
         self.index_stored_record("LocationProof", &wire_index_key)
@@ -5841,12 +6366,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "attestation_id",
                 &row.attestation_id,
             )]);
+            // v36.0.0 (#668) — THIS node's serve position (V130 mirror),
+            // allocated before the insert so the allocator reads only
+            // pre-existing rows, stamped after it lands.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ORGANIZATION,
+                organization_rows(&state).into_iter(),
+            );
+            let id_for_stamp = row.attestation_id.clone();
             memory_idempotent_insert(
                 &mut state.federation_organizations,
                 row.attestation_id.clone(),
                 row,
                 "organization",
             )?;
+            stamp_plane_position(&mut state, PLANE_ORGANIZATION, id_for_stamp, admitted_at);
             wire_index_key
         };
         self.index_stored_record("Organization", &wire_index_key)
@@ -5890,12 +6425,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "attestation_id",
                 &row.attestation_id,
             )]);
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ORG_MEMBERSHIP,
+                org_membership_rows(&state).into_iter(),
+            );
+            let id_for_stamp = row.attestation_id.clone();
             memory_idempotent_insert(
                 &mut state.federation_org_memberships,
                 row.attestation_id.clone(),
                 row,
                 "org_membership",
             )?;
+            stamp_plane_position(&mut state, PLANE_ORG_MEMBERSHIP, id_for_stamp, admitted_at);
             wire_index_key
         };
         self.index_stored_record("OrgMembership", &wire_index_key)
@@ -5944,12 +6487,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // Computed before the moves below.
             let wire_index_key =
                 crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]);
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_PARTNER_RECORD,
+                partner_record_rows(&state).into_iter(),
+            );
             memory_idempotent_insert(
                 &mut state.federation_partner_records,
                 attestation_id.clone(),
                 row,
                 "partner_record",
             )?;
+            stamp_plane_position(
+                &mut state,
+                PLANE_PARTNER_RECORD,
+                attestation_id.clone(),
+                admitted_at,
+            );
             state
                 .federation_partner_record_sigs
                 .insert(attestation_id, (steward_signatures, threshold));
@@ -6005,22 +6560,39 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    // v36.0.0 (CIRISPersist#668) — every cursor below reads THIS node's
+    // serve position (the `serve_positions` side map, falling back to the
+    // plane's legacy producer instant exactly as the sqlite COALESCE does)
+    // and resumes on the `(position, id)` PAIR.
+
     async fn list_organizations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedOrganization>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |o: &crate::federation::operational::Organization| {
+            plane_position(&state, PLANE_ORGANIZATION, &o.attestation_id, o.asserted_at)
+        };
         let mut rows: Vec<_> = state
             .federation_organizations
             .values()
-            .filter(|o| since.is_none_or(|s| o.asserted_at > s))
-            .cloned()
+            .filter(|o| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(o), o.attestation_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
+            .map(|o| crate::federation::ServedOrganization {
+                admitted_at: position(o),
+                organization: o.clone(),
+            })
             .collect();
         rows.sort_by(|a, b| {
-            a.asserted_at
-                .cmp(&b.asserted_at)
-                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.organization
+                    .attestation_id
+                    .cmp(&b.organization.attestation_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6028,20 +6600,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_org_memberships_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedOrgMembership>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |m: &crate::federation::operational::OrgMembership| {
+            plane_position(
+                &state,
+                PLANE_ORG_MEMBERSHIP,
+                &m.attestation_id,
+                m.asserted_at,
+            )
+        };
         let mut rows: Vec<_> = state
             .federation_org_memberships
             .values()
-            .filter(|m| since.is_none_or(|s| m.asserted_at > s))
-            .cloned()
+            .filter(|m| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(m), m.attestation_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
+            .map(|m| crate::federation::ServedOrgMembership {
+                admitted_at: position(m),
+                org_membership: m.clone(),
+            })
             .collect();
         rows.sort_by(|a, b| {
-            a.asserted_at
-                .cmp(&b.asserted_at)
-                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.org_membership
+                    .attestation_id
+                    .cmp(&b.org_membership.attestation_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6049,20 +6638,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedPartnerRecord>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |p: &crate::federation::operational::PartnerRecord| {
+            plane_position(
+                &state,
+                PLANE_PARTNER_RECORD,
+                &p.attestation_id,
+                p.asserted_at,
+            )
+        };
         let mut rows: Vec<_> = state
             .federation_partner_records
             .values()
-            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
-            .cloned()
+            .filter(|p| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(p), p.attestation_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
+            .map(|p| crate::federation::ServedPartnerRecord {
+                admitted_at: position(p),
+                partner_record: p.clone(),
+            })
             .collect();
         rows.sort_by(|a, b| {
-            a.asserted_at
-                .cmp(&b.asserted_at)
-                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.partner_record
+                    .attestation_id
+                    .cmp(&b.partner_record.attestation_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6070,19 +6676,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_partner_records_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedPartnerRecord>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedSignedPartnerRecord>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |p: &crate::federation::operational::PartnerRecord| {
+            plane_position(
+                &state,
+                PLANE_PARTNER_RECORD,
+                &p.attestation_id,
+                p.asserted_at,
+            )
+        };
         let mut rows: Vec<_> = state
             .federation_partner_records
             .values()
-            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
+            .filter(|p| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(p), p.attestation_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
-            a.asserted_at
-                .cmp(&b.asserted_at)
+            position(a)
+                .cmp(&position(b))
                 .then_with(|| a.attestation_id.cmp(&b.attestation_id))
         });
         rows.truncate(limit as usize);
@@ -6094,10 +6712,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .get(&partner_record.attestation_id)
                     .cloned()
                     .unwrap_or_default();
-                crate::federation::SignedPartnerRecord {
-                    partner_record,
-                    steward_signatures,
-                    threshold,
+                crate::federation::ServedSignedPartnerRecord {
+                    admitted_at: position(&partner_record),
+                    record: crate::federation::SignedPartnerRecord {
+                        partner_record,
+                        steward_signatures,
+                        threshold,
+                    },
                 }
             })
             .collect())
@@ -6113,32 +6734,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_families_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedFamily>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedFamily>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |f: &crate::federation::types::Family| {
+            plane_position(&state, PLANE_FAMILY, &f.family_key_id, f.founded_at)
+        };
         let mut rows: Vec<_> = state
             .federation_families
             .values()
-            .filter(|f| since.is_none_or(|s| f.founded_at > s))
+            .filter(|f| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(f), f.family_key_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
             .filter_map(|f| {
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_family_authority_sigs
                     .get(&f.family_key_id)?
                     .clone();
-                Some(crate::federation::SignedFamily {
-                    family: f.clone(),
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                Some(crate::federation::ServedFamily {
+                    admitted_at: position(f),
+                    family: crate::federation::SignedFamily {
+                        family: f.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    },
                 })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.family
-                .founded_at
-                .cmp(&b.family.founded_at)
-                .then_with(|| a.family.family_key_id.cmp(&b.family.family_key_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.family
+                    .family
+                    .family_key_id
+                    .cmp(&b.family.family.family_key_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6146,36 +6779,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_communities_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedCommunity>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedCommunity>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let position = |c: &crate::federation::types::Community| {
+            plane_position(&state, PLANE_COMMUNITY, &c.community_key_id, c.founded_at)
+        };
         let mut rows: Vec<_> = state
             .federation_communities
             .values()
-            .filter(|c| since.is_none_or(|s| c.founded_at > s))
+            .filter(|c| {
+                since.as_ref().is_none_or(|(s_at, s_id)| {
+                    (position(c), c.community_key_id.as_str()) > (*s_at, s_id.as_str())
+                })
+            })
             .filter_map(|c| {
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_community_authority_sigs
                     .get(&c.community_key_id)?
                     .clone();
-                Some(crate::federation::SignedCommunity {
-                    community: c.clone(),
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                Some(crate::federation::ServedCommunity {
+                    admitted_at: position(c),
+                    community: crate::federation::SignedCommunity {
+                        community: c.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    },
                 })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.community
-                .founded_at
-                .cmp(&b.community.founded_at)
-                .then_with(|| {
-                    a.community
-                        .community_key_id
-                        .cmp(&b.community.community_key_id)
-                })
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.community
+                    .community
+                    .community_key_id
+                    .cmp(&b.community.community.community_key_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6183,36 +6824,65 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_location_proofs_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedLocationProof>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedLocationProof>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        // The row-unique resume id is (subject_key_id, persist_row_hash) —
+        // the PK carries an instant, which stays out of the token.
+        let resume_id = |p: &crate::federation::types::LocationProof| {
+            crate::federation::types::compound_resume_id(&[&p.subject_key_id, &p.persist_row_hash])
+        };
+        let position = |p: &crate::federation::types::LocationProof| {
+            plane_position(&state, PLANE_LOCATION_PROOF, &resume_id(p), p.asserted_at)
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         let mut rows: Vec<_> = state
             .federation_location_proofs
             .values()
-            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
+            .filter(|p| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(p),
+                        p.subject_key_id.as_str(),
+                        p.persist_row_hash.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|p| {
                 let key = (p.subject_key_id.clone(), p.asserted_at);
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_location_proof_authority_sigs
                     .get(&key)?
                     .clone();
-                Some(crate::federation::SignedLocationProof {
-                    location_proof: p.clone(),
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                Some(crate::federation::ServedLocationProof {
+                    admitted_at: position(p),
+                    proof: crate::federation::SignedLocationProof {
+                        location_proof: p.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    },
                 })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.location_proof
-                .asserted_at
-                .cmp(&b.location_proof.asserted_at)
+            a.admitted_at
+                .cmp(&b.admitted_at)
                 .then_with(|| {
-                    a.location_proof
+                    a.proof
+                        .location_proof
                         .subject_key_id
-                        .cmp(&b.location_proof.subject_key_id)
+                        .cmp(&b.proof.location_proof.subject_key_id)
+                })
+                .then_with(|| {
+                    a.proof
+                        .location_proof
+                        .persist_row_hash
+                        .cmp(&b.proof.location_proof.persist_row_hash)
                 })
         });
         rows.truncate(limit as usize);
@@ -6221,43 +6891,65 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_family_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedFamilyMembershipRevocation>, crate::federation::Error>
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipRevocation>, crate::federation::Error>
     {
         let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |r: &crate::federation::types::FamilyMembershipRevocation| {
+            crate::federation::types::compound_resume_id(&[
+                &r.family_key_id,
+                &r.removed_identity_key_id,
+            ])
+        };
+        let position = |r: &crate::federation::types::FamilyMembershipRevocation| {
+            plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_REVOCATION,
+                &resume_id(r),
+                r.removed_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         let mut rows: Vec<_> = state
             .federation_family_membership_revocations
             .values()
-            .filter(|r| since.is_none_or(|s| r.removed_at > s))
+            .filter(|r| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(r),
+                        r.family_key_id.as_str(),
+                        r.removed_identity_key_id.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|r| {
                 let key = (r.family_key_id.clone(), r.removed_identity_key_id.clone());
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_family_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
-                Some(crate::federation::SignedFamilyMembershipRevocation {
-                    family_membership_revocation: r.clone(),
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                Some(crate::federation::ServedFamilyMembershipRevocation {
+                    admitted_at: position(r),
+                    revocation: crate::federation::SignedFamilyMembershipRevocation {
+                        family_membership_revocation: r.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    },
                 })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.family_membership_revocation
-                .removed_at
-                .cmp(&b.family_membership_revocation.removed_at)
-                .then_with(|| {
-                    a.family_membership_revocation
-                        .family_key_id
-                        .cmp(&b.family_membership_revocation.family_key_id)
-                })
-                .then_with(|| {
-                    a.family_membership_revocation
-                        .removed_identity_key_id
-                        .cmp(&b.family_membership_revocation.removed_identity_key_id)
-                })
+            let ar = &a.revocation.family_membership_revocation;
+            let br = &b.revocation.family_membership_revocation;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| ar.family_key_id.cmp(&br.family_key_id))
+                .then_with(|| ar.removed_identity_key_id.cmp(&br.removed_identity_key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6265,15 +6957,41 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_community_membership_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedCommunityMembershipRevocation>, crate::federation::Error>
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipRevocation>, crate::federation::Error>
     {
         let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |r: &crate::federation::types::CommunityMembershipRevocation| {
+            crate::federation::types::compound_resume_id(&[
+                &r.community_key_id,
+                &r.removed_identity_key_id,
+            ])
+        };
+        let position = |r: &crate::federation::types::CommunityMembershipRevocation| {
+            plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
+                &resume_id(r),
+                r.removed_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         let mut rows: Vec<_> = state
             .federation_community_membership_revocations
             .values()
-            .filter(|r| since.is_none_or(|s| r.removed_at > s))
+            .filter(|r| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(r),
+                        r.community_key_id.as_str(),
+                        r.removed_identity_key_id.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|r| {
                 let key = (
                     r.community_key_id.clone(),
@@ -6283,28 +7001,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_community_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
-                Some(crate::federation::SignedCommunityMembershipRevocation {
-                    community_membership_revocation: r.clone(),
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                Some(crate::federation::ServedCommunityMembershipRevocation {
+                    admitted_at: position(r),
+                    revocation: crate::federation::SignedCommunityMembershipRevocation {
+                        community_membership_revocation: r.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                    },
                 })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.community_membership_revocation
-                .removed_at
-                .cmp(&b.community_membership_revocation.removed_at)
-                .then_with(|| {
-                    a.community_membership_revocation
-                        .community_key_id
-                        .cmp(&b.community_membership_revocation.community_key_id)
-                })
-                .then_with(|| {
-                    a.community_membership_revocation
-                        .removed_identity_key_id
-                        .cmp(&b.community_membership_revocation.removed_identity_key_id)
-                })
+            let ar = &a.revocation.community_membership_revocation;
+            let br = &b.revocation.community_membership_revocation;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| ar.community_key_id.cmp(&br.community_key_id))
+                .then_with(|| ar.removed_identity_key_id.cmp(&br.removed_identity_key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6329,9 +7043,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // the V126 column; a row without an entry falls back to
         // `scrub_timestamp`, matching the sqlite dialect's
         // `COALESCE(admitted_at, scrub_timestamp)`.
-        let position = |k: &crate::federation::KeyRecord| {
-            key_record_position(&state.key_record_admitted_at, k)
-        };
+        let position = |k: &crate::federation::KeyRecord| key_record_position(&state, k);
         // v31.4.0 (#668) — compare the PAIR. Resuming on the instant alone
         // skips the remainder of any tie larger than one page, silently.
         let mut rows: Vec<_> = state
@@ -6370,7 +7082,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// made the signed instant permanently hide a stored exclusion.
     async fn list_signed_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
@@ -6386,8 +7098,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .get(&r.revocation_id)
                     .copied()
                     .unwrap_or(r.scrub_timestamp);
+                // v36.0.0 (#668) — the PAIR, not the instant alone.
                 since
-                    .is_none_or(|s| admitted_at > s)
+                    .as_ref()
+                    .is_none_or(|(s_at, s_id)| {
+                        (admitted_at, r.revocation_id.as_str()) > (*s_at, s_id.as_str())
+                    })
                     .then(|| crate::federation::ServedRevocation {
                         revocation: r.clone(),
                         admitted_at,
@@ -6410,7 +7126,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// so the `member_id` sort order is identical on all three backends.
     async fn list_signed_accord_quorum_evidence_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<
         Vec<crate::federation::accord_carriage::AccordQuorumEvidence>,
@@ -6437,11 +7153,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // with each row, never recomputed at assembly time; see
             // `assemble_evidence_page` for the torn read that would otherwise
             // let a consumer's cursor skip a page-limited proposal.
+            // v36.0.0 (#668) — the PAIR: two proposals whose latest vote
+            // landed in one instant tie, and the digest is the tie-break.
             let mut rows: Vec<_> = state
                 .accord_proposals
                 .values()
                 .map(|p| (p.clone(), evidence_at(p)))
-                .filter(|(_, at)| since.is_none_or(|s| *at > s))
+                .filter(|(p, at)| {
+                    since.as_ref().is_none_or(|(s_at, s_id)| {
+                        (*at, p.proposal.digest()) > (*s_at, s_id.clone())
+                    })
+                })
                 .collect();
             rows.sort_by(|(a, a_at), (b, b_at)| {
                 a_at.cmp(b_at)
@@ -6464,43 +7186,65 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_identity_occurrences_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |o: &crate::federation::IdentityOccurrence| {
+            crate::federation::types::compound_resume_id(&[
+                &o.identity_key_id,
+                &o.occurrence_key_id,
+            ])
+        };
+        let position = |o: &crate::federation::IdentityOccurrence| {
+            plane_position(
+                &state,
+                PLANE_IDENTITY_OCCURRENCE,
+                &resume_id(o),
+                o.asserted_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         // Signed-put rows only (join against the sig side-map); trusted-
         // local rows (no sig entry) are omitted.
-        let mut rows: Vec<crate::federation::SignedIdentityOccurrence> = state
+        let mut rows: Vec<crate::federation::ServedIdentityOccurrence> = state
             .federation_identity_occurrences
             .iter()
-            .filter(|(_, occ)| since.is_none_or(|s| occ.asserted_at > s))
+            .filter(|(_, occ)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(occ),
+                        occ.identity_key_id.as_str(),
+                        occ.occurrence_key_id.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|(key, occ)| {
                 state.federation_identity_occurrence_sigs.get(key).map(
                     |(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::SignedIdentityOccurrence {
-                            identity_occurrence: occ.clone(),
-                            attesting_key_id: attesting_key_id.clone(),
-                            signed_envelope: signed_envelope.clone(),
-                            signature: signature.clone(),
+                        crate::federation::ServedIdentityOccurrence {
+                            admitted_at: position(occ),
+                            occurrence: crate::federation::SignedIdentityOccurrence {
+                                identity_occurrence: occ.clone(),
+                                attesting_key_id: attesting_key_id.clone(),
+                                signed_envelope: signed_envelope.clone(),
+                                signature: signature.clone(),
+                            },
                         }
                     },
                 )
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.identity_occurrence
-                .asserted_at
-                .cmp(&b.identity_occurrence.asserted_at)
-                .then_with(|| {
-                    a.identity_occurrence
-                        .identity_key_id
-                        .cmp(&b.identity_occurrence.identity_key_id)
-                })
-                .then_with(|| {
-                    a.identity_occurrence
-                        .occurrence_key_id
-                        .cmp(&b.identity_occurrence.occurrence_key_id)
-                })
+            let ao = &a.occurrence.identity_occurrence;
+            let bo = &b.occurrence.identity_occurrence;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| ao.identity_key_id.cmp(&bo.identity_key_id))
+                .then_with(|| ao.occurrence_key_id.cmp(&bo.occurrence_key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6508,43 +7252,63 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_transport_destinations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedTransportDestination>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |t: &crate::federation::TransportDestination| {
+            crate::federation::types::compound_resume_id(&[&t.occurrence_key_id, &t.transport_kind])
+        };
+        let position = |t: &crate::federation::TransportDestination| {
+            plane_position(
+                &state,
+                PLANE_TRANSPORT_DESTINATION,
+                &resume_id(t),
+                t.asserted_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         // Signed-put rows only; RETIRED rows ARE included — tombstones must
-        // gossip, matching `list_signed_transport_destinations_for`.
-        let mut rows: Vec<crate::federation::SignedTransportDestination> = state
+        // gossip, matching `list_signed_transport_destinations_for` — and
+        // v36.0.0 (#668) the retire doors MOVE the serve position.
+        let mut rows: Vec<crate::federation::ServedTransportDestination> = state
             .transport_destinations
             .iter()
-            .filter(|(_, td)| since.is_none_or(|s| td.asserted_at > s))
+            .filter(|(_, td)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(td),
+                        td.occurrence_key_id.as_str(),
+                        td.transport_kind.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|(key, td)| {
                 state.transport_destination_sigs.get(key).map(
                     |(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::SignedTransportDestination {
-                            transport_destination: td.clone(),
-                            attesting_key_id: attesting_key_id.clone(),
-                            signed_envelope: signed_envelope.clone(),
-                            signature: signature.clone(),
+                        crate::federation::ServedTransportDestination {
+                            admitted_at: position(td),
+                            destination: crate::federation::SignedTransportDestination {
+                                transport_destination: td.clone(),
+                                attesting_key_id: attesting_key_id.clone(),
+                                signed_envelope: signed_envelope.clone(),
+                                signature: signature.clone(),
+                            },
                         }
                     },
                 )
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.transport_destination
-                .asserted_at
-                .cmp(&b.transport_destination.asserted_at)
-                .then_with(|| {
-                    a.transport_destination
-                        .occurrence_key_id
-                        .cmp(&b.transport_destination.occurrence_key_id)
-                })
-                .then_with(|| {
-                    a.transport_destination
-                        .transport_kind
-                        .cmp(&b.transport_destination.transport_kind)
-                })
+            let ad = &a.destination.transport_destination;
+            let bd = &b.destination.transport_destination;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| ad.occurrence_key_id.cmp(&bd.occurrence_key_id))
+                .then_with(|| ad.transport_kind.cmp(&bd.transport_kind))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6552,33 +7316,45 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_attestations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         // E5 invariant: federation-tier rows only — a local-tier row must
         // never reach the advertise/serve wire surface.
         //
-        // v21.2.0 (#507 × #509) — the cursor is the VISIBILITY timestamp
-        // `COALESCE(promoted_at, asserted_at)`: a consent-promoted row
-        // (#509) becomes wire-visible at `promoted_at`, which can be long
-        // after `asserted_at` — cursoring on `asserted_at` alone would make
-        // late promotions invisible to pure-delta consumers forever.
-        let visible_at =
-            |a: &crate::federation::Attestation| a.promoted_at.unwrap_or(a.asserted_at);
+        // v36.0.0 (#668) — the position falls back to the legacy visibility
+        // timestamp `COALESCE(promoted_at, asserted_at)` for an unstamped
+        // row, and every writer (including the promote sweep) stamps the
+        // serve position going forward.
+        let position = |a: &crate::federation::Attestation| {
+            plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                &a.attestation_id,
+                a.promoted_at.unwrap_or(a.asserted_at),
+            )
+        };
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
             .filter(|a| {
-                since.is_none_or(|s| visible_at(a) > s)
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && since.as_ref().is_none_or(|(s_at, s_id)| {
+                        (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
+                    })
             })
-            .cloned()
+            .map(|a| crate::federation::ServedAttestation {
+                admitted_at: position(a),
+                attestation: a.clone(),
+            })
             .collect();
         rows.sort_by(|a, b| {
-            visible_at(a)
-                .cmp(&visible_at(b))
-                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
+                a.attestation
+                    .attestation_id
+                    .cmp(&b.attestation.attestation_id)
+            })
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6586,45 +7362,67 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     async fn list_signed_identity_occurrence_revocations_since(
         &self,
-        since: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, crate::federation::Error>
     {
         let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |r: &crate::federation::IdentityOccurrenceRevocation| {
+            crate::federation::types::compound_resume_id(&[
+                &r.identity_key_id,
+                &r.occurrence_key_id,
+            ])
+        };
+        let position = |r: &crate::federation::IdentityOccurrenceRevocation| {
+            plane_position(
+                &state,
+                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
+                &resume_id(r),
+                r.revoked_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
+            (*s_at, a.to_owned(), b.to_owned())
+        });
         // Signed-put rows only — same contract as
         // `list_signed_identity_occurrence_revocations_for`.
-        let mut rows: Vec<crate::federation::SignedIdentityOccurrenceRevocation> = state
+        let mut rows: Vec<crate::federation::ServedIdentityOccurrenceRevocation> = state
             .federation_identity_occurrence_revocations
             .iter()
-            .filter(|(_, rev)| since.is_none_or(|s| rev.revoked_at > s))
+            .filter(|(_, rev)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                    (
+                        position(rev),
+                        rev.identity_key_id.as_str(),
+                        rev.occurrence_key_id.as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                })
+            })
             .filter_map(|(key, rev)| {
                 state
                     .federation_identity_occurrence_revocation_sigs
                     .get(key)
                     .map(|(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::SignedIdentityOccurrenceRevocation {
-                            identity_occurrence_revocation: rev.clone(),
-                            attesting_key_id: attesting_key_id.clone(),
-                            signed_envelope: signed_envelope.clone(),
-                            signature: signature.clone(),
+                        crate::federation::ServedIdentityOccurrenceRevocation {
+                            admitted_at: position(rev),
+                            revocation: crate::federation::SignedIdentityOccurrenceRevocation {
+                                identity_occurrence_revocation: rev.clone(),
+                                attesting_key_id: attesting_key_id.clone(),
+                                signed_envelope: signed_envelope.clone(),
+                                signature: signature.clone(),
+                            },
                         }
                     })
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.identity_occurrence_revocation
-                .revoked_at
-                .cmp(&b.identity_occurrence_revocation.revoked_at)
-                .then_with(|| {
-                    a.identity_occurrence_revocation
-                        .identity_key_id
-                        .cmp(&b.identity_occurrence_revocation.identity_key_id)
-                })
-                .then_with(|| {
-                    a.identity_occurrence_revocation
-                        .occurrence_key_id
-                        .cmp(&b.identity_occurrence_revocation.occurrence_key_id)
-                })
+            let ar = &a.revocation.identity_occurrence_revocation;
+            let br = &b.revocation.identity_occurrence_revocation;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| ar.identity_key_id.cmp(&br.identity_key_id))
+                .then_with(|| ar.occurrence_key_id.cmp(&br.occurrence_key_id))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -6707,11 +7505,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         {
             let mut state = self.state.lock().expect("memory backend lock");
-            let row = state.federation_keys.get_mut(key_id).ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
+            if !state.federation_keys.contains_key(key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
                     "federation_keys row {key_id} does not exist"
-                ))
-            })?;
+                )));
+            }
+            // v36.0.0 (CIRISPersist#707) — the hybrid-completion write rewrites
+            // FOUR served columns; the serve position must move with them.
+            // Allocated before the mutation, under the same lock.
+            let mutated_at = next_key_admission_position(&state);
+            let Some(row) = state.federation_keys.get_mut(key_id) else {
+                unreachable!("presence checked above under the same lock");
+            };
             if row.is_pqc_complete() {
                 return Err(crate::federation::Error::Conflict(format!(
                     "federation_keys row {key_id} is already PQC-complete"
@@ -6724,6 +7529,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let mut for_hash = row.clone();
             for_hash.persist_row_hash = String::new();
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            state
+                .key_record_mutated_at
+                .insert(key_id.to_owned(), mutated_at);
             // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
             // the wire content hash moved with them.
             // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
@@ -6740,6 +7548,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     ) -> Result<(), crate::federation::Error> {
         {
             let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+            // served columns; the serve position moves with them.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
             let row = state
                 .federation_attestations
                 .iter_mut()
@@ -6759,6 +7574,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let mut for_hash = row.clone();
             for_hash.persist_row_hash = String::new();
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+            stamp_plane_position(
+                &mut state,
+                PLANE_ATTESTATION,
+                attestation_id.to_owned(),
+                admitted_at,
+            );
         }
         // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. Done
         // AFTER the guard is released, the same shape `attach_key_pqc_signature`
@@ -6825,6 +7646,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668) — promotion IS this plane's admission into the
+            // federation stream; re-stamp the serve position through the
+            // allocator (superseding `promoted_at` as the cursor key).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
             let row = state
                 .federation_attestations
                 .iter_mut()
@@ -6865,7 +7694,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
             // tier and therefore wire-servable; index it under its final
             // post-promotion shape (matches `list_attestations_since`).
-            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)])
+            let wik = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            stamp_plane_position(
+                &mut state,
+                PLANE_ATTESTATION,
+                attestation_id.to_owned(),
+                admitted_at,
+            );
+            wik
         };
         self.index_stored_record("Attestation", &wire_index_key)
             .await?;
@@ -9766,7 +10605,7 @@ mod tests {
             .expect("second revocation");
 
         let served = backend
-            .list_signed_revocations_since(Some(future), u32::MAX)
+            .list_signed_revocations_since(Some((future, "rvm-1".to_owned())), u32::MAX)
             .await
             .unwrap();
         assert!(
@@ -13318,6 +14157,70 @@ mod tests {
         )
         .await
         .expect("547 wire-index-follows-mutators exercise");
+    }
+
+    /// v36.0.0 (CIRISPersist#668) — the V130 late-admit witness on a
+    /// converted plane (attestations), memory leg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn late_admitted_attestation_is_served_memory_668() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_late_admitted_attestation_is_served(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// v36.0.0 (CIRISPersist#668) — an attestation tie larger than one page
+    /// resumes instead of losing its remainder, memory leg (planted through
+    /// the `serve_positions` side map — the V130 column's mirror).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn attestation_tie_pages_exactly_once_memory_668() {
+        use crate::federation::admission::ungated_doors_test_support as ts;
+        let backend = MemoryBackend::new();
+        let author = "tie668-mem".to_string();
+        ts::register(
+            &backend,
+            &author,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let ids: Vec<String> = (0..5).map(|i| format!("tie668-mem-{i}")).collect();
+        for id in &ids {
+            let mut row = ts::federation_row(id, &author, "tie:score:v1");
+            crate::federation::tier_ingest::test_support::seal_row_in_place(&author, &mut row);
+            backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .unwrap();
+        }
+        let tied_at = chrono::Utc::now();
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            let planted: Vec<String> = st
+                .federation_attestations
+                .iter()
+                .map(|a| a.attestation_id.clone())
+                .collect();
+            for id in planted {
+                stamp_plane_position(&mut st, PLANE_ATTESTATION, id, tied_at);
+            }
+        }
+        ts::assert_attestation_tie_pages_exactly_once(&backend, "mem", &ids, 3).await;
+    }
+
+    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
+    /// SERVE POSITION on memory (adopt_scrub_upgrade skips — unimplemented
+    /// here); grant/revoke_trust do not.
+    #[tokio::test]
+    async fn key_mutation_moves_serve_position_memory_707() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
+            &backend, "mem",
+        )
+        .await
+        .expect("707 serve-position exercise");
     }
 
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
@@ -20252,6 +21155,31 @@ mod tests {
     // of these findings was a door that had a gate on some backends (or some
     // doors) and not others. A witness written into ONE backend's test module
     // is how that class comes back.
+
+    /// #686 — the MEMORY leg of the CONFERRAL-PLANE foreign-retraction
+    /// question (lifted from the issue thread; passes with the consolidated
+    /// entitlement+precedence fold).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn foreign_retraction_cannot_sever_conferral_memory_686() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever_conferral(
+            &backend, "mem686",
+        )
+        .await;
+    }
+
+    /// #686 — the MEMORY leg of the CHARTER-PLANE foreign-retraction question.
+    #[tokio::test]
+    async fn foreign_retraction_cannot_sever_charter_memory_686() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_foreign_retraction_cannot_sever_charter(
+            &backend, "mem686c",
+        )
+        .await
+        .expect("686 charter-plane foreign-retraction exercise");
+    }
 
     /// The MEMORY leg of the SEVENTH-SITE witness: the transit branch of the
     /// local write door CHECKS the typed-column mirror it deliberately does not

@@ -445,10 +445,6 @@ impl VocabularyTighteningReport {
 
 // ─── the sweep ─────────────────────────────────────────────────────────────
 
-fn visible_at(a: &crate::federation::Attestation) -> DateTime<Utc> {
-    a.promoted_at.unwrap_or(a.asserted_at)
-}
-
 /// Build the `supersedes` composer envelope for one retired row. Carries the
 /// tightening provenance so the retirement explains itself from the row.
 fn supersedes_envelope(
@@ -534,32 +530,28 @@ where
     let t0 = std::time::Instant::now();
 
     // ── scan ──────────────────────────────────────────────────────────────
+    // v36.0.0 (CIRISPersist#668) — the cursor is the `(position, id)` PAIR,
+    // so a full page whose rows all share one instant resumes mid-tie instead
+    // of stopping: the boundary-search-and-bail dance below it existed only
+    // to survive the instant-only resume, and `scan_complete` can no longer
+    // go false at a tie (the loop always makes progress because the pair is
+    // strictly increasing along the stream).
     let mut rows: Vec<crate::federation::Attestation> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut cursor: Option<DateTime<Utc>> = None;
-    let mut scan_complete = true;
+    let mut cursor: Option<(DateTime<Utc>, String)> = None;
+    let scan_complete = true;
     loop {
         let page = dir
-            .list_attestations_since(cursor, SCAN_PAGE)
+            .list_attestations_since(cursor.clone(), SCAN_PAGE)
             .await
             .map_err(|e| super::Error::Backend(format!("vocabulary tightening scan: {e}")))?;
         if page.is_empty() {
             break;
         }
         let full = page.len() as u32 >= SCAN_PAGE;
-        let last_visible = visible_at(page.last().expect("non-empty page"));
-        // The cursor is a TIMESTAMP and the filter is strict `>`, so advancing
-        // it to the page's last visibility timestamp would silently skip any
-        // row sharing that timestamp that the page's `limit` truncated away.
-        // Advance instead to the last timestamp BOUNDARY strictly below it:
-        // the trailing group is re-read next page and deduped by `seen`, and
-        // no row can fall between two pages.
-        let boundary = page
-            .iter()
-            .map(visible_at)
-            .filter(|t| *t < last_visible)
-            .max();
-        for a in page {
+        let next_cursor = page.last().expect("non-empty page").resume_pair();
+        for served in page {
+            let a = served.attestation;
             if seen.insert(a.attestation_id.clone()) {
                 rows.push(a);
             }
@@ -567,19 +559,7 @@ where
         if !full {
             break;
         }
-        match boundary {
-            // Strictly greater than the old cursor (every page row is), so the
-            // loop always makes progress.
-            Some(b) => cursor = Some(b),
-            // A full page whose rows ALL share one visibility timestamp: there
-            // may be more at that timestamp than a page can carry, and no
-            // cursor value can reach them without skipping some. Stop rather
-            // than spin or lie — the report SAYS the scan covered a prefix.
-            None => {
-                scan_complete = false;
-                break;
-            }
-        }
+        cursor = Some(next_cursor);
     }
 
     // Every upstream id already named by ANY structural composer. A row named
@@ -1090,6 +1070,9 @@ mod sweep_tests {
         dir.list_attestations_since(None, 10_000)
             .await
             .expect("scan")
+            .into_iter()
+            .map(|a| a.attestation)
+            .collect()
     }
 
     /// RED-FIRST, then green, then green-again:

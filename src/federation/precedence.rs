@@ -6,8 +6,8 @@
 //! Persist stores the four structural composers
 //! ([`super::types::attestation_type::DELEGATES_TO`] /
 //! [`super::types::attestation_type::SUPERSEDES`] /
-//! [`super::types::attestation_type::WITHDRAWS`] /
-//! [`super::types::attestation_type::RECANTS`]) on
+//! [`attestation_type::WITHDRAWS`] /
+//! [`attestation_type::RECANTS`]) on
 //! `federation_attestations` as audit-trail rows. Each composer
 //! references an upstream attestation via its envelope's
 //! `references_attestation_id` field
@@ -172,6 +172,102 @@ fn wins(a: &Attestation, b: &Attestation) -> bool {
     // is the inversion: a < b means a wins. Matches CEG §6.1 rule 3
     // verbatim.
     a.attestation_id < b.attestation_id
+}
+
+/// v36.0.0 (CIRISPersist#686) — is `g` (a `withdraws`/`recants` composer)
+/// ENTITLED to retract `target`?
+///
+/// The #656 entitlement predicate, hoisted out of
+/// `admission::retracted_edge_ids` so the consolidated fold below and every
+/// future fold share ONE spelling:
+///
+/// 1. the target's own attester (self-retraction — §6.1 rule 1);
+/// 2. a member of the target's `subject_key_ids` (subject-side revocation —
+///    rule 2);
+/// 3. a key the WRITE door already resolved authority for
+///    (`withdraws_admission_rule.is_some()` — the BFS-derived rules 3/4 that
+///    no sync fold can recompute).
+///
+/// `withdraws_admission_rule` is `None` for several distinct reasons
+/// (deferred out-of-order admission, malformed, non-`withdraws`), so arm 3
+/// is only ever an ADMITTING arm, never the sole test.
+pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
+    g.attesting_key_id == target.attesting_key_id
+        || target.subject_key_ids.contains(&g.attesting_key_id)
+        || g.withdraws_admission_rule.is_some()
+}
+
+/// v36.0.0 (CIRISPersist#686) — **THE consolidated retraction fold.**
+///
+/// Three folds used to decide "retracted" and disagreed:
+/// `trust_root::tombstoned_ids` had §6.1 precedence but NO entitlement check
+/// (so on the two many-attester trust-root slices — the conferral walk and
+/// the family-charter filter — a foreign, unentitled `withdraws` admitted
+/// through the out-of-order window severed a conferral or silently emptied a
+/// charter quorum's candidate set); `admission::retracted_edge_ids` had the
+/// #656 entitlement gate but no precedence (any entitled retraction killed,
+/// with no §6.1 winner). Neither alone was sufficient, so the consolidated
+/// fold is a SYNTHESIS, not a selection. Both former folds now delegate here.
+///
+/// The rule, per target id:
+///
+/// 1. collect every structural composer in `rows` naming the target;
+/// 2. drop a `withdraws`/`recants` whose attester is not
+///    [`retraction_entitled`] against the target row — resolved from THIS
+///    same slice, adding no read. A retraction whose target is not in the
+///    slice is dropped too (*a retraction I cannot resolve is a retraction I
+///    do not apply* — membership tests at every call site made such an entry
+///    inert already, so this is behaviour-preserving there and fail-secure
+///    everywhere else). `supersedes` rows are not filtered: they rank BELOW
+///    both retraction forms, so an unentitled `supersedes` can never flip a
+///    target dead;
+/// 3. the §6.1 [`precedence_winner`] of what remains decides: dead iff the
+///    winner is `withdraws` or `recants`.
+///
+/// The WRITE-door refusal (`check_withdraws_admission` →
+/// `WithdrawsNotAdmitted` for an unentitled retraction of a locally-present
+/// target) is deliberately unchanged and load-bearing: it is what keeps this
+/// read-side fold unreachable for in-order traffic, and the #686 witnesses
+/// pin it as leg A on both trust-root planes.
+pub fn retired_ids(rows: &[&Attestation]) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+    let by_id: HashMap<&str, &Attestation> = rows
+        .iter()
+        .map(|r| (r.attestation_id.as_str(), *r))
+        .collect();
+    let mut by_target: HashMap<&str, Vec<&Attestation>> = HashMap::new();
+    for row in rows {
+        if !is_structural_composer(&row.attestation_type) {
+            continue;
+        }
+        let Some(target) = references_attestation_id_from_envelope(&row.attestation_envelope)
+        else {
+            continue;
+        };
+        let is_retraction = row.attestation_type == attestation_type::WITHDRAWS
+            || row.attestation_type == attestation_type::RECANTS;
+        if is_retraction {
+            // The entitlement gate (#686/#656). Fail-secure toward RETENTION:
+            // an unresolvable or unentitled retraction does not enter the
+            // precedence group at all.
+            match by_id.get(target) {
+                Some(target_row) if retraction_entitled(row, target_row) => {}
+                _ => continue,
+            }
+        }
+        by_target.entry(target).or_default().push(row);
+    }
+    let mut dead = std::collections::HashSet::new();
+    for (target, composers) in by_target {
+        if let Some(winner) = precedence_winner(&composers) {
+            if winner.attestation_type == attestation_type::WITHDRAWS
+                || winner.attestation_type == attestation_type::RECANTS
+            {
+                dead.insert(target.to_owned());
+            }
+        }
+    }
+    dead
 }
 
 /// CIRISPersist#579 (CC 4.5.1.1, rc3) — the shared, backend-agnostic witness

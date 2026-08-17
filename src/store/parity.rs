@@ -239,6 +239,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
     ("memory_idempotent_insert", Class::Delegates),
+    // v36.0.0 (CIRISPersist#668) — visible because the cursor family's row
+    // mappers are now direct calls (see the `pg_row_to_*` note): these are
+    // the mappers' own decode helpers. Plumbing — they fail only on the
+    // substrate's own stored bytes (a corrupt column), never on caller input.
+    ("decode_witness_set", Class::Plumbing),
+    ("pg_witness_set", Class::Plumbing),
+    ("strict_ts", Class::Plumbing),
     ("mint_content_kem_keypair", Class::Plumbing),
     // v31.4.0 (CIRISPersist#682). Plumbing, deliberately: it allocates THIS
     // node's next `federation_keys.admitted_at` and fails only when the `MAX`
@@ -248,6 +255,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the call out reds the late-replication witness on that backend), which is
     // where that belongs.
     ("next_key_admission_position", Class::Plumbing),
+    // v36.0.0 (CIRISPersist#707) — the postgres spelling of the same
+    // allocator after the serve-position widening (`GREATEST(admitted_at,
+    // mutated_at)`). Plumbing for the identical #682 reason: it allocates and
+    // refuses nothing; its ABSENCE from a door is what the re-serve/late-
+    // admit witnesses red on.
+    ("next_key_serve_position", Class::Plumbing),
+    // v36.0.0 (CIRISPersist#668) — the V130 per-plane allocator (postgres +
+    // memory spelling). Plumbing: reads a MAX and fails only on substrate
+    // error; the per-plane #668 witnesses catch a door that skips it.
+    ("next_plane_position", Class::Plumbing),
     ("ok_or_else", Class::Plumbing),
     ("optional", Class::Plumbing),
     ("parse_from_rfc3339", Class::Plumbing),
@@ -258,11 +275,48 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_load_stream_chunk_hashes", Class::Delegates),
     ("pg_project_attestation_subjects", Class::Delegates),
     ("pg_project_consent_peer_set", Class::Delegates),
+    // v36.0.0 (CIRISPersist#668) — newly VISIBLE rather than newly written,
+    // the whole cursor family this time: every `list_*_since` used to pass
+    // its row mapper as a bare function reference to `query`/`query_map`;
+    // the pair cursor reads `admitted_at`/`_pos` alongside the row, so the
+    // mappers are now called explicitly inside the closure and propagate.
+    // Same class as every previously-listed `*_row_to_*` sibling.
+    ("pg_row_to_attestation", Class::Delegates),
     ("pg_row_to_community", Class::Delegates),
+    (
+        "pg_row_to_community_membership_revocation",
+        Class::Delegates,
+    ),
     ("pg_row_to_family", Class::Delegates),
+    ("pg_row_to_family_membership_revocation", Class::Delegates),
+    ("pg_row_to_identity_occurrence", Class::Delegates),
+    ("pg_row_to_identity_occurrence_revocation", Class::Delegates),
+    ("pg_row_to_location_proof", Class::Delegates),
+    ("pg_row_to_transport_destination", Class::Delegates),
     ("pg_row_to_key_record", Class::Delegates),
+    ("pg_row_to_org_membership", Class::Delegates),
+    ("pg_row_to_organization", Class::Delegates),
+    ("pg_row_to_partner_record", Class::Delegates),
     ("pg_row_to_peer_metadata_for_hash", Class::Delegates),
     ("pg_row_to_revocation", Class::Delegates),
+    ("pg_row_to_signed_community", Class::Delegates),
+    (
+        "pg_row_to_signed_community_membership_revocation",
+        Class::Delegates,
+    ),
+    ("pg_row_to_signed_family", Class::Delegates),
+    (
+        "pg_row_to_signed_family_membership_revocation",
+        Class::Delegates,
+    ),
+    ("pg_row_to_signed_identity_occurrence", Class::Delegates),
+    (
+        "pg_row_to_signed_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
+    ("pg_row_to_signed_location_proof", Class::Delegates),
+    ("pg_row_to_signed_partner_record", Class::Delegates),
+    ("pg_row_to_signed_transport_destination", Class::Delegates),
     ("pg_row_to_stored_proposal", Class::Delegates),
     ("pg_upsert_wire_index", Class::Delegates),
     ("prepare", Class::Plumbing),
@@ -296,10 +350,56 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("serialize_witness_signatures", Class::Plumbing),
     ("spawn_blocking", Class::Plumbing),
     ("sqlite_load_stream_chunk_hashes", Class::Delegates),
+    // v36.0.0 (CIRISPersist#707/#668) — the sqlite allocator spellings.
+    // Plumbing, same rationale as `next_key_admission_position` above.
+    ("sqlite_next_key_serve_position", Class::Plumbing),
+    ("sqlite_next_plane_position", Class::Plumbing),
     ("sqlite_project_attestation_subjects", Class::Delegates),
     ("sqlite_project_consent_peer_set", Class::Delegates),
+    // v36.0.0 (CIRISPersist#668) — newly VISIBLE for the whole cursor
+    // family; see the `pg_row_to_*` block's note.
+    ("sqlite_row_to_attestation", Class::Delegates),
     ("sqlite_row_to_community", Class::Delegates),
+    (
+        "sqlite_row_to_community_membership_revocation",
+        Class::Delegates,
+    ),
     ("sqlite_row_to_family", Class::Delegates),
+    (
+        "sqlite_row_to_family_membership_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_identity_occurrence", Class::Delegates),
+    (
+        "sqlite_row_to_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_location_proof", Class::Delegates),
+    ("sqlite_row_to_transport_destination", Class::Delegates),
+    ("sqlite_row_to_org_membership", Class::Delegates),
+    ("sqlite_row_to_organization", Class::Delegates),
+    ("sqlite_row_to_partner_record", Class::Delegates),
+    ("sqlite_row_to_signed_community", Class::Delegates),
+    (
+        "sqlite_row_to_signed_community_membership_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_signed_family", Class::Delegates),
+    (
+        "sqlite_row_to_signed_family_membership_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_signed_identity_occurrence", Class::Delegates),
+    (
+        "sqlite_row_to_signed_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_signed_location_proof", Class::Delegates),
+    ("sqlite_row_to_signed_partner_record", Class::Delegates),
+    (
+        "sqlite_row_to_signed_transport_destination",
+        Class::Delegates,
+    ),
     // v31.4.0 (CIRISPersist#682) — newly VISIBLE rather than newly written.
     // `list_signed_key_records_since` used to pass this as a bare function
     // reference to `query_map`; the pair cursor reads `_pos` alongside the row,

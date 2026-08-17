@@ -3381,6 +3381,356 @@ pub struct ServedRevocation {
     pub admitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl ServedKeyRecord {
+    /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
+    /// resumes [`list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since)
+    /// from. The pair, never the instant alone: a page ordered by
+    /// `(instant, id)` and resumed by instant alone skips the remainder of any
+    /// tie larger than one page.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.record.key_id.clone())
+    }
+}
+
+impl ServedRevocation {
+    /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
+    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
+    /// from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.revocation.revocation_id.clone())
+    }
+}
+
+// ─── v36.0.0 (CIRISPersist#668) — the Served* family for every remaining
+//     serve cursor.
+//
+// #682 converted ONE of the sixteen `list_*_since` cursors
+// ([`ServedKeyRecord`]); these are the other fourteen record shapes (the
+// accord evidence plane carries its own instant on
+// [`AccordQuorumEvidence`](crate::federation::accord_carriage::AccordQuorumEvidence)).
+// Every wrapper is the same statement, once per plane:
+//
+//   - `admitted_at` is THIS node's serve position on the row — stamped by the
+//     receiver through `monotonic_admission_instant`, never read from the
+//     wire, and NEVER part of the record's bytes or any content hash. One
+//     record hashes identically on every node; each node keeps its own
+//     arrival order. (The wire-hash lesson: a node-local instant that leaks
+//     into the Key wire hash makes the advertised ref unresolvable.)
+//   - `resume_pair()` is the `(admitted_at, id)` PAIR the caller hands back.
+//     The pair, never the instant alone: a page ordered by `(instant, id)`
+//     and resumed by instant alone skips the remainder of any tie larger
+//     than one page — silently, and permanently (#668).
+//
+// Planes whose rows are identified by MORE than one column compose their
+// resume id with [`compound_resume_id`]; the backends compare the
+// components tuple-wise, so the join is an opaque token to the caller.
+
+/// v36.0.0 (CIRISPersist#668) — join the components of a multi-column resume
+/// id into the single opaque token the `since` pair carries.
+///
+/// `'\n'` as the separator because no id vocabulary on these planes carries a
+/// newline. The token is OPAQUE to callers — they receive it from
+/// `resume_pair()` and hand it back — and the backends split it again and
+/// compare components tuple-wise, so even a pathological id could only make a
+/// resume land slightly EARLY (duplicates, the safe direction for an
+/// idempotent replication consumer), never skip.
+#[must_use]
+pub fn compound_resume_id(parts: &[&str]) -> String {
+    parts.join("\n")
+}
+
+/// v36.0.0 (CIRISPersist#668) — split a [`compound_resume_id`] token back
+/// into `N` components. Missing components come back empty, which sorts
+/// FIRST — a malformed token resumes early (duplicates), never skips.
+#[must_use]
+pub fn split_resume_id<const N: usize>(token: &str) -> [&str; N] {
+    let mut out = [""; N];
+    let mut parts = token.splitn(N, '\n');
+    for slot in &mut out {
+        match parts.next() {
+            Some(p) => *slot = p,
+            None => break,
+        }
+    }
+    out
+}
+
+/// One `organization` row as the serve cursor returns it (#668). See the
+/// family note above and [`ServedKeyRecord`] for the full reasoning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedOrganization {
+    /// The organization row itself, unchanged.
+    pub organization: crate::federation::operational::Organization,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedOrganization {
+    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.organization.attestation_id.clone())
+    }
+}
+
+/// One `org_membership` row as the serve cursor returns it (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedOrgMembership {
+    /// The membership row itself, unchanged.
+    pub org_membership: crate::federation::operational::OrgMembership,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedOrgMembership {
+    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.org_membership.attestation_id.clone())
+    }
+}
+
+/// One `partner_record` row as the projection-read serve cursor returns it
+/// (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedPartnerRecord {
+    /// The partner record itself, unchanged.
+    pub partner_record: crate::federation::operational::PartnerRecord,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedPartnerRecord {
+    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.partner_record.attestation_id.clone())
+    }
+}
+
+/// One `partner_record` row with its steward quorum signatures, as the
+/// signed serve cursor returns it (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedSignedPartnerRecord {
+    /// The signed partner record itself, unchanged.
+    pub record: crate::federation::operational::SignedPartnerRecord,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedSignedPartnerRecord {
+    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (
+            self.admitted_at,
+            self.record.partner_record.attestation_id.clone(),
+        )
+    }
+}
+
+/// One `federation_families` row as the serve cursor returns it (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedFamily {
+    /// The signed family row itself, unchanged.
+    pub family: SignedFamily,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedFamily {
+    /// The `(admitted_at, family_key_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.family.family.family_key_id.clone())
+    }
+}
+
+/// One `federation_communities` row as the serve cursor returns it (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedCommunity {
+    /// The signed community row itself, unchanged.
+    pub community: SignedCommunity,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedCommunity {
+    /// The `(admitted_at, community_key_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (
+            self.admitted_at,
+            self.community.community.community_key_id.clone(),
+        )
+    }
+}
+
+/// One `federation_location_proofs` row as the serve cursor returns it
+/// (#668). The table's PK is `(subject_key_id, asserted_at)` — one subject
+/// holds MANY proofs — so the resume id is a [`compound_resume_id`] of
+/// `subject_key_id` and the row's `persist_row_hash`: the hash is row-unique,
+/// already served, and avoids folding an instant's serialization into the
+/// token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedLocationProof {
+    /// The signed location proof itself, unchanged.
+    pub proof: SignedLocationProof,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedLocationProof {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let p = &self.proof.location_proof;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&p.subject_key_id, &p.persist_row_hash]),
+        )
+    }
+}
+
+/// One `federation_family_membership_revocations` row as the serve cursor
+/// returns it (#668). Rows are identified by `(family_key_id,
+/// removed_identity_key_id)`, so the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedFamilyMembershipRevocation {
+    /// The signed membership revocation itself, unchanged.
+    pub revocation: SignedFamilyMembershipRevocation,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedFamilyMembershipRevocation {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let r = &self.revocation.family_membership_revocation;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&r.family_key_id, &r.removed_identity_key_id]),
+        )
+    }
+}
+
+/// One `federation_community_membership_revocations` row as the serve cursor
+/// returns it (#668). Rows are identified by `(community_key_id,
+/// removed_identity_key_id)`, so the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedCommunityMembershipRevocation {
+    /// The signed membership revocation itself, unchanged.
+    pub revocation: SignedCommunityMembershipRevocation,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedCommunityMembershipRevocation {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let r = &self.revocation.community_membership_revocation;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&r.community_key_id, &r.removed_identity_key_id]),
+        )
+    }
+}
+
+/// One signed `federation_identity_occurrences` row as the serve cursor
+/// returns it (#668). Rows are identified by `(identity_key_id,
+/// occurrence_key_id)`, so the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedIdentityOccurrence {
+    /// The signed occurrence itself, unchanged.
+    pub occurrence: SignedIdentityOccurrence,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedIdentityOccurrence {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let o = &self.occurrence.identity_occurrence;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&o.identity_key_id, &o.occurrence_key_id]),
+        )
+    }
+}
+
+/// One signed `transport_destinations` row as the serve cursor returns it
+/// (#668). Rows are identified by `(occurrence_key_id, transport_kind)`, so
+/// the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedTransportDestination {
+    /// The signed route row itself, unchanged. RETIRED rows are served too —
+    /// tombstones must gossip.
+    pub destination: crate::federation::self_at_login::SignedTransportDestination,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedTransportDestination {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let d = &self.destination.transport_destination;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&d.occurrence_key_id, &d.transport_kind]),
+        )
+    }
+}
+
+/// One federation-tier `federation_attestations` row as the serve cursor
+/// returns it (#668).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedAttestation {
+    /// The attestation row itself, unchanged.
+    pub attestation: Attestation,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    /// Stamped at admission AND moved forward when the promote sweep lifts a
+    /// local-tier row to the federation tier — promotion is this plane's
+    /// admission into the federation stream.
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedAttestation {
+    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        (self.admitted_at, self.attestation.attestation_id.clone())
+    }
+}
+
+/// One signed `federation_identity_occurrence_revocations` row as the serve
+/// cursor returns it (#668). Rows are identified by `(identity_key_id,
+/// occurrence_key_id)`, so the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedIdentityOccurrenceRevocation {
+    /// The signed occurrence revocation itself, unchanged.
+    pub revocation: SignedIdentityOccurrenceRevocation,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedIdentityOccurrenceRevocation {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let r = &self.revocation.identity_occurrence_revocation;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&r.identity_key_id, &r.occurrence_key_id]),
+        )
+    }
+}
+
 // ─── Freshness floor (v21.6.0, CIRISPersist#519 item 2a-iii) ───────
 //
 // `namespace_supersets.json` § `freshness_floor`: a SIGNED temporal LOWER
@@ -4722,6 +5072,86 @@ mod tests {
     /// `infra:record_hard_case`, `infra:publish_rating`). A fifth that nobody
     /// adds to `ALL` is silently missing from every operator screen — a
     /// carried-but-unoffered gap, invisible from downstream.
+    /// v36.0.0 (CIRISPersist#686) — **the other three declared `ALL` exports
+    /// get an exhaustiveness gate too.**
+    ///
+    /// `attestation_type::ALL`, `identity_type::ALL` and `cohort_scope::ALL`
+    /// were declared exports (v30.7.0/#625 — "CIRISServer's operator
+    /// pickers") with ZERO in-crate consumers and NO gate: only
+    /// `delegation_scope::ALL` had one. The #686 sweep counted the zero
+    /// consumers and proposed deletion; the sharper hazard is the inverse —
+    /// a newly minted token that silently reaches no picker — so the class
+    /// decision is to GATE all three rather than delete a declared export.
+    ///
+    /// The scan is MODULE-scoped, unlike the delegation-scope gate's
+    /// whole-crate walk, and that difference is the contract, not a
+    /// shortcut: each of these three vocabularies is CLOSED and defined
+    /// entirely inside its own module (`attestation_type` is CC 1.7's "1+4
+    /// lockdown", closed by constitutional rule), whereas delegation scopes
+    /// are minted crate-wide. The open vocabularies that share the
+    /// `attestation_type` COLUMN (`age_assurance:*`, `capacity_assurance:*`)
+    /// are prefix families, not consts, and are outside `ALL`'s documented
+    /// claim. Set-over-members consts (`AUTHORITY_CONFERRING_IDENTITY_TYPES`
+    /// and friends) are `&[&str]`/`[&str; N]`-typed and therefore invisible
+    /// to the `&str`-const scan by construction.
+    #[test]
+    fn every_closed_vocabulary_const_is_in_its_all_686() {
+        let src = include_str!("types.rs");
+        let module_consts = |module_open: &str| -> std::collections::BTreeSet<String> {
+            let body = src.split(module_open).nth(1).unwrap_or_else(|| {
+                panic!("`{module_open}` not found — the gate's recognizer broke")
+            });
+            // The module body ends at the first line that is exactly `}`.
+            let body = body
+                .split("\n}\n")
+                .next()
+                .expect("unterminated module body");
+            let mut out = std::collections::BTreeSet::new();
+            for line in body.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("pub const ") {
+                    if let Some((name, tail)) = rest.split_once(':') {
+                        // `&str` consts only — set-over-members consts are
+                        // slices/arrays and deliberately out of scope.
+                        if tail.trim_start().starts_with("&str") && name != "ALL" {
+                            if let Some(v) = tail.split('"').nth(1) {
+                                out.insert(v.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                !out.is_empty(),
+                "no consts found under `{module_open}` — the scan is broken and proves nothing"
+            );
+            out
+        };
+        let cases: [(&str, &[&str]); 3] = [
+            ("pub mod attestation_type {", attestation_type::ALL),
+            ("pub mod identity_type {", identity_type::ALL),
+            ("pub mod cohort_scope {", cohort_scope::ALL),
+        ];
+        for (module_open, all) in cases {
+            let declared = module_consts(module_open);
+            let listed: std::collections::BTreeSet<String> =
+                all.iter().map(|s| (*s).to_owned()).collect();
+            let missing: Vec<_> = declared.difference(&listed).collect();
+            assert!(
+                missing.is_empty(),
+                "{module_open} declares token(s) absent from its `ALL` export: {missing:?}. \
+                 `ALL` is what CIRISServer's operator pickers enumerate (v30.7.0/#625) — a \
+                 token missing here silently reaches no picker. Add it to `ALL`, or move it \
+                 out of the closed vocabulary with a recorded reason."
+            );
+            let phantom: Vec<_> = listed.difference(&declared).collect();
+            assert!(
+                phantom.is_empty(),
+                "{module_open}'s `ALL` lists token(s) no module const declares: {phantom:?}"
+            );
+        }
+    }
+
     ///
     /// Non-members are NAMED with a reason rather than merely absent, so
     /// "not a scope value" is a recorded decision. The two prefixes are the
