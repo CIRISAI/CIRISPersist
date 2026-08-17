@@ -1422,9 +1422,6 @@ class Engine:
         and read ``["valid"]``. Read-only.
         """
 
-    def unwrap_dek_b64(self, recipient_x25519_priv_b64: str, wrap_json: str) -> str:
-        """(derived) deontic — v3.8.0 — unwrap a KeyGrantWrap JSON envelope using the recipient's X25519 private key. Returns the recovered DEK b64."""
-
     def unwrap_dek_v2_b64(self, recipient_x25519_priv_b64: str, recipient_ml_kem_priv_b64: str, recipient_ml_kem_pub_b64: str, wrap_json: str) -> str:
         """(derived) deontic — v4.x (CIRISPersist#142 Cut C3b) — unwrap a KeyGrantWrapV2 JSON envelope using the recipient's X25519 private key + ML-KEM-768 private/public keys...."""
 
@@ -1526,9 +1523,6 @@ class Engine:
 
     def withdraw_canonical_role(self, key_id: str, proposal_digest: str) -> None:
         """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — withdraw the canonical role from key_id (the DESTRUCTIVE Trust Root op). proposal_digest..."""
-
-    def wrap_dek_for_recipient_b64(self, recipient_x25519_pub_b64: str, dek_b64: str) -> str:
-        """(derived) deontic — v3.8.0 — wrap a 32-byte DEK for an X25519 recipient. Returns the KeyGrantWrap JSON envelope. Composes with the substrate's subject_kind: key_grant..."""
 
     def wrap_dek_for_recipient_v2_b64(self, recipient_x25519_pub_b64: str, recipient_ml_kem_pub_b64: str, dek_b64: str) -> str:
         """(derived) deontic — v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK under wrap_algorithm: v2 (X25519 + ML-KEM-768 hybrid PQC), the mandatory wrap for..."""

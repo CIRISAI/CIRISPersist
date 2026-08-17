@@ -576,7 +576,6 @@ Engine	tsdb_prune_summaries	testimonial	erasure_effect
 Engine	tsdb_query_summaries	empirical	
 Engine	tsdb_query_summary_nodes	empirical	
 Engine	unsubscribe	structural	
-Engine	unwrap_dek_b64	deontic	
 Engine	unwrap_dek_v2_b64	deontic	
 Engine	update_peer_alias	empirical	
 Engine	update_peer_notes	empirical	
@@ -605,7 +604,6 @@ Engine	wa_cert_update_last_login	empirical
 Engine	wa_cert_upsert	deontic	
 Engine	wholeness_witness_root_hex	pragmatic	
 Engine	withdraw_canonical_role	deontic	
-Engine	wrap_dek_for_recipient_b64	deontic	
 Engine	wrap_dek_for_recipient_v2_b64	deontic	
 MODULE	_test_inject_panic	structural	
 MODULE	engine_teardown_wait	structural	

@@ -27898,24 +27898,19 @@ impl PyEngine {
     // thin delegates so the Rust-side surface can be exercised by
     // `cargo test --lib ffi::wheel_*` without a Python interpreter.
 
-    // ── key_grant (HPKE-shape DEK wrap/unwrap, CIRISVerify v4.4.0) ──
-
-    /// v3.8.0 — wrap a 32-byte DEK for an X25519 recipient. Returns
-    /// the `KeyGrantWrap` JSON envelope. Composes with the substrate's
-    /// `subject_kind: key_grant` Contribution shape (CIRISPersist#134).
-    fn wrap_dek_for_recipient_b64(
-        &self,
-        recipient_x25519_pub_b64: &str,
-        dek_b64: &str,
-    ) -> PyResult<String> {
-        crate::ffi::wheel_key_grant::wrap_dek_for_recipient_json(recipient_x25519_pub_b64, dek_b64)
-    }
-
-    /// v3.8.0 — unwrap a `KeyGrantWrap` JSON envelope using the
-    /// recipient's X25519 private key. Returns the recovered DEK b64.
-    fn unwrap_dek_b64(&self, recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyResult<String> {
-        crate::ffi::wheel_key_grant::unwrap_dek_json(recipient_x25519_priv_b64, wrap_json)
-    }
+    // ── key_grant (DEK wrap/unwrap — v2 hybrid PQC ONLY) ──
+    //
+    // v35.0.0 (#715): the classical v1 pair
+    // (`wrap_dek_for_recipient_b64` / `unwrap_dek_b64`, v3.8.0) is
+    // REMOVED, not aliased. v34.0.0 (#704) removed the classical wrap
+    // from admission, so the v1 mint emitted an `algorithm` token
+    // `extract_key_grant_payload` refuses BY NAME — a wheel minting
+    // what its own gate refuses. The v2 wrap needs the recipient's
+    // ML-KEM-768 public key, which the v1 signature cannot express, so
+    // there is no in-place replacement: a stale caller gets an
+    // `AttributeError` naming the method, and the module doc of
+    // `src/ffi/wheel_key_grant.rs` names the off-substrate doors for
+    // draining pre-v34 v1-wrapped material.
 
     /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK
     /// under `wrap_algorithm: v2` (X25519 + ML-KEM-768 hybrid PQC), the
