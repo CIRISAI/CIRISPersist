@@ -625,24 +625,79 @@ async fn av26_concurrent_boot_advisory_lock() {
 
     use ciris_persist::store::{Backend, PostgresBackend};
 
-    // Cold-start simulation: drop both the lens schema and the
-    // migration history table so every worker sees an unmigrated
-    // DB. (Don't drop the schema in normal test runs — production
-    // never starts here.)
+    // Cold-start simulation: drop every application schema AND the migration
+    // history table, so each worker really does see an unmigrated DB. (Don't
+    // drop schemas in normal test runs — production never starts here.)
+    //
+    // v34.0.0 (CIRISPersist#704) — THIS DROPPED ONE SCHEMA BY NAME
+    // (`cirislens`) while this comment claimed it left an unmigrated DB. The
+    // lens tree creates FIVE; `cirisnode`, `cirisgraph`, `cirislens_derived`
+    // and `cirislens_secrets` all survived. So refinery, seeing an empty
+    // history, re-ran from V001 against a HALF-MIGRATED `cirisnode`: V064
+    // re-added `key_grant_stream_id` (which V129 had renamed away), and V129
+    // then renamed it onto the `key_grant_scope_id` still sitting there —
+    // 42701 duplicate_column, all ten workers.
+    //
+    // The precondition had been false since the first non-`cirislens` schema
+    // appeared. It cost nothing only because every cirisnode migration until
+    // V129 happened to be re-runnable, so the test kept passing while
+    // simulating a warm start under the name of a cold one.
+    //
+    // DERIVED, not listed. A hand-maintained schema list is the same defect
+    // one layer up: it goes stale the first time a migration adds a schema and
+    // nobody edits this test — which is exactly how this one got here.
     {
         let backend = PostgresBackend::connect(&dsn)
             .await
             .expect("scenario H setup: connect");
         let client = backend.pool().get().await.expect("setup: client");
-        let _ = client
-            .execute("DROP SCHEMA IF EXISTS cirislens CASCADE", &[])
-            .await;
-        let _ = client
+
+        const APP_SCHEMAS: &str = "SELECT nspname FROM pg_namespace \
+             WHERE nspname NOT IN ('public', 'information_schema') \
+               AND nspname NOT LIKE 'pg\\_%'";
+
+        let list = |rows: Vec<tokio_postgres::Row>| {
+            rows.iter()
+                .map(|r| r.try_get::<_, String>(0).expect("setup: nspname"))
+                .collect::<Vec<_>>()
+        };
+
+        let before = list(
+            client
+                .query(APP_SCHEMAS, &[])
+                .await
+                .expect("setup: enumerate application schemas"),
+        );
+        for schema in before {
+            // Not `let _ =`: a drop that fails silently leaves the warm state
+            // that caused this, and the next reader sees a green test.
+            client
+                .execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE"#), &[])
+                .await
+                .unwrap_or_else(|e| panic!("setup: drop schema {schema}: {e}"));
+        }
+        client
             .execute(
                 "DROP TABLE IF EXISTS public.ciris_persist_schema_history",
                 &[],
             )
-            .await;
+            .await
+            .expect("setup: drop migration history");
+
+        // The precondition is now CHECKED, not narrated. Without this the test
+        // reports on whatever state it happens to inherit.
+        let residual = list(
+            client
+                .query(APP_SCHEMAS, &[])
+                .await
+                .expect("setup: re-enumerate application schemas"),
+        );
+        assert!(
+            residual.is_empty(),
+            "scenario H is a COLD start: {residual:?} survived the drop, so the \
+             workers below would migrate over existing objects and this test \
+             would measure a warm boot under a cold boot's name"
+        );
     }
 
     const N_WORKERS: usize = 10;

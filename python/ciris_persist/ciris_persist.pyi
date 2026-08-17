@@ -679,7 +679,7 @@ class Engine:
         """
 
     def cirisnode_put_key_grant_json(self, envelope_json: str) -> None:
-        """(derived) deontic — v16 (CIRISPersist#432, CC 5.1 CLM-epoch-keying) — the dedicated key_grant WRITER; the emission half of [cirisnode_list_key_grants_for_stream_epoch_... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) deontic — v16 (CIRISPersist#432, CC 5.1 CLM-epoch-keying) — the dedicated key_grant WRITER; the emission half of [cirisnode_list_key_grants_for_scope_epoch_j... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_put_moderation_event(self, event_json: str) -> None:
         """(derived) deontic — v0.7.0 — Verify-and-insert a ModerationEvent. [build-conditional: #[cfg(feature = "cirisnode")]]"""
@@ -2412,8 +2412,8 @@ class Engine:
     def cirisnode_list_key_grants_for_json(self, recipient_key_id: str) -> str:
         """(derived) empirical — List key_grant Contributions for recipient_key_id. JSON array of [ContributionEnvelope](crate::cirisnode::ContributionEnvelope). [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_list_key_grants_for_stream_epoch_json(self, stream_id: str, epoch: int) -> str:
-        """(derived) empirical — v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — list every stream/epoch-addressed key_grant Contribution for (stream_id, epoch), newest-first. JSON... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_list_key_grants_for_scope_epoch_json(self, scope_kind: str, scope_id: str, epoch: int) -> str:
+        """(derived) empirical — v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) → v34.0.0 (CIRISPersist#704, CIRISEdge#492) — list every scope-epoch-addressed key_grant Contribution... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_list_takedowns_for_filtered_json(self, target_content_sha256: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
         """(derived) empirical — v6.3.0 (CIRISPersist#135, Lane C) — takedowns against target_content_sha256, cursor-paged + filtered. JSON-encoded [TakedownListPage](crate::cirisn... [build-conditional: #[cfg(feature = "cirisnode")]]"""

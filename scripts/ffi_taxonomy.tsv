@@ -183,7 +183,7 @@ Engine	cirisnode_list_goals_json	empirical
 Engine	cirisnode_list_key_grants_for_content_json	empirical	
 Engine	cirisnode_list_key_grants_for_filtered_json	empirical	
 Engine	cirisnode_list_key_grants_for_json	empirical	
-Engine	cirisnode_list_key_grants_for_stream_epoch_json	empirical	
+Engine	cirisnode_list_key_grants_for_scope_epoch_json	empirical
 Engine	cirisnode_list_takedowns_for_filtered_json	empirical	
 Engine	cirisnode_list_takedowns_for_json	empirical	
 Engine	cirisnode_list_votes	empirical	

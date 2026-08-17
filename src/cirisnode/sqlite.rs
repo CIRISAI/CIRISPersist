@@ -298,22 +298,48 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             takedown.as_ref().map(|p| p.legal_basis.as_str().to_owned());
         let key_grant_recipient_key_id: Option<String> =
             key_grant.as_ref().map(|p| p.recipient_key_id.clone());
-        // v4.x (CIRISPersist#142 Cut C3b) — stream/epoch addressing
-        // projection (V064 columns). Populated iff the grant is
-        // stream/epoch-addressed; the extractor guarantees the XOR with
+        // v4.x (CIRISPersist#142 Cut C3b) → v34.0.0 (CIRISPersist#704, V129)
+        // — scope/epoch addressing projection. Populated iff the grant is
+        // scope-epoch-addressed; the extractor guarantees the XOR with
         // media_content_sha256.
-        let key_grant_stream_id: Option<String> =
-            key_grant.as_ref().and_then(|p| p.stream_id.clone());
-        let key_grant_stream_epoch: Option<i64> =
-            match key_grant.as_ref().and_then(|p| p.stream_epoch) {
-                None => None,
-                Some(e) => Some(i64::try_from(e).map_err(|_| {
-                    Error::InvalidArgument(
-                        "key_grant: stream_epoch exceeds i64 — key_grant_stream_epoch is INTEGER"
-                            .into(),
-                    )
-                })?),
-            };
+        //
+        // `key_grant_scope_kind` is the discriminator V129 added: it names
+        // WHICH addressing scope `key_grant_scope_id` is an id in. Its value is
+        // the payload's declared `scope`, gated by
+        // `KeyGrantScope::is_epoch_addressed()` — THE definition of which
+        // scopes address by an `(id, epoch)` pair. Matching the variants inline
+        // here would be a second copy of that rule, free to disagree with the
+        // validator the moment either is edited (#663).
+        //
+        // The V129 trigger demands all THREE scope columns together, so a
+        // payload whose declared `scope` contradicts its addressing fields is
+        // refused at the DB rather than stored half-addressed — "which scope is
+        // this DEK for" is never an inference.
+        //
+        // v34.0.0 (#704) — `scope_kind` and `scope_id` read from ONE binding,
+        // so the pair cannot come apart. `scope_id` used to be projected from a
+        // separate `KeyGrantPayload::scope_ref` with no gate at all; that field
+        // is gone and the single `scope_id` is the id, gated by the same
+        // predicate as the kind beside it.
+        let epoch_addressed = key_grant.as_ref().filter(|p| p.scope.is_epoch_addressed());
+        let key_grant_scope_kind: Option<String> =
+            epoch_addressed.map(|p| p.scope.as_str().to_owned());
+        let key_grant_scope_id: Option<String> = epoch_addressed.map(|p| p.scope_id.clone());
+        // The epoch is deliberately NOT read through `epoch_addressed`. The
+        // extractor guarantees `epoch.is_some()` ⟺ `scope.is_epoch_addressed()`,
+        // so on any payload that got here the two spellings agree. They differ
+        // only if that guarantee is ever broken — and then reading `p.epoch`
+        // directly leaves the row half-addressed, which V129 REFUSES, whereas
+        // gating it would silently rewrite the row into the content branch and
+        // store it. Fail-secure on the same input.
+        let key_grant_epoch: Option<i64> = match key_grant.as_ref().and_then(|p| p.epoch) {
+            None => None,
+            Some(e) => Some(i64::try_from(e).map_err(|_| {
+                Error::InvalidArgument(
+                    "key_grant: epoch exceeds i64 — key_grant_epoch is INTEGER".into(),
+                )
+            })?),
+        };
 
         let id_str = id.to_string();
         let ct_str = contribution_type_str(env.contribution_type).to_owned();
@@ -342,9 +368,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         signature, signing_key_id, signature_verified, persist_row_hash, \
                         announcement_priority, announcement_authority_class, \
                         media_content_sha256, key_grant_recipient_key_id, takedown_legal_basis, \
-                        key_grant_stream_id, key_grant_stream_epoch\
+                        key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, \
-                               ?15, ?16, ?17, ?18, ?19)",
+                               ?15, ?16, ?17, ?18, ?19, ?20)",
                     params![
                         id_str,
                         ct_str,
@@ -363,8 +389,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         media_content_sha256,
                         key_grant_recipient_key_id,
                         takedown_legal_basis,
-                        key_grant_stream_id,
-                        key_grant_stream_epoch,
+                        key_grant_scope_kind,
+                        key_grant_scope_id,
+                        key_grant_epoch,
                     ],
                 )
                 .map_err(|e| map_sqlite_error(e, "put_contribution"))?;
@@ -1596,35 +1623,48 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         rows.into_iter().map(materialize_contribution).collect()
     }
 
-    async fn list_key_grants_for_stream_epoch(
+    async fn list_key_grants_for_scope_epoch(
         &self,
-        stream_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
         epoch: u64,
     ) -> Result<Vec<ContributionEnvelope>, Error> {
-        let stream = stream_id.to_owned();
-        // u64 epoch → bound i64; key_grant_stream_epoch is INTEGER.
+        let kind = scope_kind.to_owned();
+        let scope = scope_id.to_owned();
+        // u64 epoch → bound i64; key_grant_epoch is INTEGER.
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-            Error::InvalidArgument("list_key_grants_for_stream_epoch: epoch exceeds i64".into())
+            Error::InvalidArgument("list_key_grants_for_scope_epoch: epoch exceeds i64".into())
         })?;
         let conn = self.conn.clone();
         let rows = (move || -> Result<Vec<ContributionRow>, Error> {
             let guard = conn.lock();
+            // v34.0.0 (#704, V129) — the three predicates are written in
+            // the leading order of `contributions_key_grant_scope_epoch`
+            // (scope_kind, scope_id, epoch) so the partial index is a
+            // prefix match, not a scan.
+            //
+            // `key_grant_scope_kind` is NOT decoration: `scope_id` is an
+            // id WITHIN a scope kind, so a transit `netname` and a
+            // `stream_id` may collide as strings. Without this predicate
+            // a transit grant at the same epoch is returned to a
+            // STREAMING reader.
             let mut stmt = guard
                 .prepare(
                     "SELECT contribution_id, contribution_type, domain, language, subject_kind, \
                             author_id, payload, witness_set, submitted_at, signature \
                      FROM cirisnode_contributions \
                      WHERE subject_kind = 'key_grant' \
-                       AND key_grant_stream_id = ?1 \
-                       AND key_grant_stream_epoch = ?2 \
+                       AND key_grant_scope_kind = ?1 \
+                       AND key_grant_scope_id = ?2 \
+                       AND key_grant_epoch = ?3 \
                      ORDER BY submitted_at DESC, contribution_id DESC",
                 )
-                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch prepare"))?;
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_scope_epoch prepare"))?;
             let rows = stmt
-                .query_map(params![stream, epoch_i64], read_contribution_row)
-                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch query"))?;
+                .query_map(params![kind, scope, epoch_i64], read_contribution_row)
+                .map_err(|e| map_sqlite_error(e, "list_key_grants_for_scope_epoch query"))?;
             let out: Result<Vec<_>, _> = rows.collect();
-            out.map_err(|e| map_sqlite_error(e, "list_key_grants_for_stream_epoch collect"))
+            out.map_err(|e| map_sqlite_error(e, "list_key_grants_for_scope_epoch collect"))
         })()?;
         rows.into_iter().map(materialize_contribution).collect()
     }
@@ -1820,11 +1860,11 @@ async fn emit_key_grant_supersession_sqlite(
     let supersession_payload = super::media_sharing::KeyGrantPayload {
         recipient_key_id: prior.recipient_key_id.clone(),
         content_sha256: prior.content_sha256.clone(),
-        // Carry the prior grant's addressing + wrap algorithm so a
-        // stream/epoch-grant supersession stays stream-addressed + v2
-        // (the extractor rejects a v1 streaming grant).
-        stream_id: prior.stream_id.clone(),
-        stream_epoch: prior.stream_epoch,
+        // Carry the prior grant's addressing so a scope-epoch supersession
+        // stays scope-epoch-addressed. v34.0.0 (#704): `epoch` is the whole
+        // addressing carry now — the id rides `scope_id` below, which every
+        // grant already copies.
+        epoch: prior.epoch,
         wrapped_dek_base64: revocation_dek,
         wrap_algorithm: prior.wrap_algorithm,
         ratchet_version: prior.ratchet_version,
@@ -1835,6 +1875,14 @@ async fn emit_key_grant_supersession_sqlite(
         scope: prior.scope,
         scope_id: prior.scope_id.clone(),
         rotation_chain,
+        // v34.0.0 (#704) — CARRIED, exactly as `scope` and `scope_id` above
+        // are. The sentinel describes the SAME interface on the same netname;
+        // there is no reading in which its scope carries over and its interface
+        // size does not. Hard-coding `None` here made `retire_key_grants` on a
+        // transit grant emit a payload `extract_key_grant_payload` refuses —
+        // and `retire_key_grants` swallows that into `supersedes_failed` with a
+        // warn log, so the retirement would have failed QUIETLY.
+        ifac_size: prior.ifac_size,
     };
     let payload_value = serde_json::to_value(&supersession_payload)
         .map_err(|e| Error::Internal(format!("supersession serialize: {e}")))?;
@@ -2950,13 +2998,12 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: Some(sha_hex.to_owned()),
-            stream_id: None,
-            stream_epoch: None,
+            epoch: None,
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
             },
-            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
             ratchet_version: 1,
             key_validity_window: crate::cirisnode::KeyValidityWindow {
                 not_before: Utc::now(),
@@ -2965,6 +3012,8 @@ mod tests {
             scope: crate::cirisnode::KeyGrantScope::SingleContent,
             scope_id: sha_hex.to_owned(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — transit-only; absent on every other scope.
+            ifac_size: None,
         };
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
@@ -3143,11 +3192,30 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
-    // ── Cut C3b: stream/epoch-addressed grant cascade (CEG §10.5.3) ──
+    // ── Cut C3b: scope/epoch-addressed grant cascade (CEG §10.5.3) ──
 
-    fn build_stream_key_grant_sqlite(
+    /// The `scope_kind` tokens the reads are addressed by, taken from
+    /// [`KeyGrantScope::as_str`] rather than spelled as literals — the
+    /// tests must not be able to agree with themselves on a token the
+    /// write path does not stamp (V129 header, #704).
+    fn stream_kind() -> &'static str {
+        crate::cirisnode::KeyGrantScope::StreamEpoch.as_str()
+    }
+
+    fn transit_kind() -> &'static str {
+        crate::cirisnode::KeyGrantScope::TransitMembership.as_str()
+    }
+
+    /// v34.0.0 (#704) — the IFAC hash-truncation size every transit fixture
+    /// here carries, in BITS. 128 = 16 bytes, leviculum's convention for a
+    /// network (TCP/UDP) interface, and inside the
+    /// `IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS` range the extractor enforces.
+    const FIXTURE_IFAC_SIZE_BITS: u16 = 128;
+
+    fn build_scope_key_grant_sqlite(
         author_key: &ed25519_dalek::SigningKey,
-        stream_id: &str,
+        scope: crate::cirisnode::KeyGrantScope,
+        scope_id: &str,
         epoch: u64,
         recipient_key_id: &str,
     ) -> ContributionEnvelope {
@@ -3155,8 +3223,7 @@ mod tests {
         let payload = crate::cirisnode::KeyGrantPayload {
             recipient_key_id: recipient_key_id.to_owned(),
             content_sha256: None,
-            stream_id: Some(stream_id.to_owned()),
-            stream_epoch: Some(epoch),
+            epoch: Some(epoch),
             wrapped_dek_base64: {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode([0u8; 48])
@@ -3167,9 +3234,16 @@ mod tests {
                 not_before: Utc::now(),
                 not_after: Utc::now() + chrono::Duration::days(30),
             },
-            scope: crate::cirisnode::KeyGrantScope::StreamEpoch,
-            scope_id: stream_id.to_owned(),
+            scope,
+            scope_id: scope_id.to_owned(),
             rotation_chain: vec![],
+            // v34.0.0 (#704) — DERIVED from `scope`, never passed in: the
+            // extractor requires it iff the scope is transit membership and
+            // refuses it otherwise, so a fixture that set one half by hand
+            // would stop describing a grant the write path admits. 128 bits =
+            // 16 bytes, leviculum's convention for a network interface.
+            ifac_size: (scope == crate::cirisnode::KeyGrantScope::TransitMembership)
+                .then_some(FIXTURE_IFAC_SIZE_BITS),
         };
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
@@ -3193,9 +3267,109 @@ mod tests {
         env
     }
 
-    /// A v2 stream/epoch grant is admitted, projected onto the V064
-    /// columns, and served by list_key_grants_for_stream_epoch filtered
-    /// on (stream_id, epoch) — and only that pair.
+    fn build_stream_key_grant_sqlite(
+        author_key: &ed25519_dalek::SigningKey,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> ContributionEnvelope {
+        build_scope_key_grant_sqlite(
+            author_key,
+            crate::cirisnode::KeyGrantScope::StreamEpoch,
+            stream_id,
+            epoch,
+            recipient_key_id,
+        )
+    }
+
+    /// v34.0.0 (#704, CIRISEdge#492) — THE COLLISION WITNESS.
+    ///
+    /// `scope_id` is an id WITHIN a `scope_kind`, so the two vocabularies
+    /// are free to collide: an IFAC `netname` may be spelled exactly like
+    /// a `stream_id`. Two grants at the SAME `scope_id` and the SAME
+    /// `epoch`, differing ONLY in `scope_kind`, must not see each other —
+    /// the streaming reader gets the streaming grant, the transit reader
+    /// gets the transit grant, and neither gets both.
+    ///
+    /// This is the ONLY shape that witnesses the `key_grant_scope_kind`
+    /// predicate. Every other test on this read uses distinct
+    /// `scope_id`s, and so passes with the predicate present or absent —
+    /// which is the whole defect being fixed here. Delete
+    /// `AND key_grant_scope_kind = ?1` from the sqlite read and this test
+    /// goes red on both assertions; the neighbouring tests stay green.
+    #[tokio::test]
+    async fn sqlite_scope_kind_separates_colliding_scope_ids_at_same_epoch() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xD4; 32]);
+        // ONE id string, used as a stream_id AND as a transit netname.
+        let colliding_id = format!("collide-{}", Uuid::new_v4());
+        let epoch = 7u64;
+        let stream_recip = format!("rec-stream-{}", Uuid::new_v4());
+        let transit_recip = format!("rec-transit-{}", Uuid::new_v4());
+
+        let stream_grant = build_scope_key_grant_sqlite(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::StreamEpoch,
+            &colliding_id,
+            epoch,
+            &stream_recip,
+        );
+        let transit_grant = build_scope_key_grant_sqlite(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::TransitMembership,
+            &colliding_id,
+            epoch,
+            &transit_recip,
+        );
+        let stream_id_pk = stream_grant.contribution_id.clone();
+        let transit_id_pk = transit_grant.contribution_id.clone();
+        cn.put_contribution(stream_grant).await.unwrap();
+        cn.put_contribution(transit_grant).await.unwrap();
+
+        // The STREAMING read sees exactly the streaming grant.
+        let streaming = cn
+            .list_key_grants_for_scope_epoch(stream_kind(), &colliding_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming.len(),
+            1,
+            "streaming read must not see the transit grant at the same (scope_id, epoch); got {:?}",
+            streaming
+                .iter()
+                .map(|e| e.contribution_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(streaming[0].contribution_id, stream_id_pk);
+        let p: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(streaming[0].payload.clone()).unwrap();
+        assert_eq!(p.scope, crate::cirisnode::KeyGrantScope::StreamEpoch);
+        assert_eq!(p.recipient_key_id, stream_recip);
+
+        // The TRANSIT read sees exactly the transit grant.
+        let transit = cn
+            .list_key_grants_for_scope_epoch(transit_kind(), &colliding_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            transit.len(),
+            1,
+            "transit read must not see the streaming grant at the same (scope_id, epoch); got {:?}",
+            transit
+                .iter()
+                .map(|e| e.contribution_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(transit[0].contribution_id, transit_id_pk);
+        let p: crate::cirisnode::KeyGrantPayload =
+            serde_json::from_value(transit[0].payload.clone()).unwrap();
+        assert_eq!(p.scope, crate::cirisnode::KeyGrantScope::TransitMembership);
+        assert_eq!(p.recipient_key_id, transit_recip);
+    }
+
+    /// A v2 stream/epoch grant is admitted, projected onto the V129
+    /// columns, and served by list_key_grants_for_scope_epoch filtered
+    /// on (scope_kind, scope_id, epoch) — and only that triple.
     #[tokio::test]
     async fn sqlite_stream_epoch_grant_round_trip_and_filter() {
         let (_b, cn) = fresh_backend().await;
@@ -3232,41 +3406,22 @@ mod tests {
 
         // (stream, epoch 1) returns exactly the one grant.
         let rows = cn
-            .list_key_grants_for_stream_epoch(&stream, 1)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "exactly the (stream, epoch=1) grant");
         // A different epoch of the same stream is a distinct authorization.
         let rows2 = cn
-            .list_key_grants_for_stream_epoch(&stream, 2)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 2)
             .await
             .unwrap();
         assert_eq!(rows2.len(), 1);
         // An epoch with no grant is empty (LensCore sees this and pulls).
         let none = cn
-            .list_key_grants_for_stream_epoch(&stream, 99)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 99)
             .await
             .unwrap();
         assert!(none.is_empty());
-    }
-
-    /// A streaming epoch grant carrying wrap_algorithm v1 is rejected at
-    /// ingest (the normative §10.5.3 consumer-MUST-reject-v1, enforced
-    /// substrate-side).
-    #[tokio::test]
-    async fn sqlite_stream_grant_v1_wrap_rejected_at_ingest() {
-        let (_b, cn) = fresh_backend().await;
-        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC4; 32]);
-        let mut env = build_stream_key_grant_sqlite(&author_key, "stream-v1-reject", 1, "rec-1");
-        // Downgrade the wrap to v1 and re-sign.
-        let mut payload: crate::cirisnode::KeyGrantPayload =
-            serde_json::from_value(env.payload.clone()).unwrap();
-        payload.wrap_algorithm = crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
-        env.payload = serde_json::to_value(&payload).unwrap();
-        env.signature = sign_envelope(&env, &author_key);
-
-        let err = cn.put_contribution(env).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
     }
 
     /// v16 (#432, CC 5.1 `CLM-epoch-keying`) — SQLite parity for the
@@ -3316,7 +3471,7 @@ mod tests {
 
         // list(S, 1) = both grantees, and ONLY epoch-1 rows.
         let rows = cn
-            .list_key_grants_for_stream_epoch(&stream, 1)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both (S,1) grantees listed");
@@ -3325,8 +3480,8 @@ mod tests {
             .map(|env| {
                 let p: crate::cirisnode::KeyGrantPayload =
                     serde_json::from_value(env.payload.clone()).unwrap();
-                assert_eq!(p.stream_id.as_deref(), Some(stream.as_str()));
-                assert_eq!(p.stream_epoch, Some(1));
+                assert_eq!(p.scope_id, stream);
+                assert_eq!(p.epoch, Some(1));
                 p.recipient_key_id
             })
             .collect();
@@ -3334,21 +3489,21 @@ mod tests {
         // Epoch isolation: (S, 2) and (S', 1) see only their own
         // grants; (S, 3) is empty.
         assert_eq!(
-            cn.list_key_grants_for_stream_epoch(&stream, 2)
+            cn.list_key_grants_for_scope_epoch(stream_kind(), &stream, 2)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            cn.list_key_grants_for_stream_epoch(&other_stream, 1)
+            cn.list_key_grants_for_scope_epoch(stream_kind(), &other_stream, 1)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert!(cn
-            .list_key_grants_for_stream_epoch(&stream, 3)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 3)
             .await
             .unwrap()
             .is_empty());
@@ -3366,7 +3521,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            cn.list_key_grants_for_stream_epoch(&stream, 1)
+            cn.list_key_grants_for_scope_epoch(stream_kind(), &stream, 1)
                 .await
                 .unwrap()
                 .len(),
@@ -3393,7 +3548,7 @@ mod tests {
             "got: {err:?}"
         );
         assert!(cn
-            .list_key_grants_for_stream_epoch(&stream, 5)
+            .list_key_grants_for_scope_epoch(stream_kind(), &stream, 5)
             .await
             .unwrap()
             .is_empty());
@@ -3487,7 +3642,7 @@ mod tests {
                 .payload
                 .get("wrap_algorithm")
                 .and_then(|v| v.as_str()),
-            Some("hpke_rfc9180_base_x25519_aes_gcm"),
+            Some("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
             "CEG 0.3 §5.6.8.4 wrap_algorithm wire string"
         );
 
@@ -3500,6 +3655,126 @@ mod tests {
                 .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_b_id.as_str())))
                 .unwrap_or(false)),
             "supersession grant referencing prior_b_id"
+        );
+    }
+
+    /// Seed `federation_keys` for an actor so `put_contribution`'s
+    /// signature-verify path clears. Same record shape the retire test above
+    /// builds inline.
+    async fn seed_actor_federation_key_sqlite(backend: &SqliteBackend, author: &str) {
+        use crate::federation::FederationDirectory;
+        let record = crate::federation::types::KeyRecord {
+            key_id: author.to_owned(),
+            pubkey_ed25519_base64: author.to_owned(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: author.to_owned(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": author }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.to_owned(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
+            .unwrap();
+    }
+
+    /// v34.0.0 (#704) — THE CASE THAT WOULD HAVE BROKEN. Retiring a
+    /// `transit_membership` grant succeeds end-to-end, and the sentinel carries
+    /// the prior grant's `ifac_size`.
+    ///
+    /// Making `ifac_size` required on transit grants puts the supersession
+    /// emitter under its own validator: the sentinel copies `scope` from the
+    /// prior grant, so it declares `transit_membership` and must satisfy the
+    /// same rule the prior did. With `ifac_size: None` hard-coded there,
+    /// `put_contribution` refuses the sentinel — and `retire_key_grants` does
+    /// not propagate that: it counts the row into `supersedes_failed`, logs a
+    /// warning, and returns `Ok`. The caller sees a successful retirement that
+    /// retired nothing, which is why `supersedes_failed` is asserted here and
+    /// not just the `Ok`.
+    #[tokio::test]
+    async fn sqlite_retire_key_grants_supersedes_a_transit_grant_704() {
+        let (backend, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]);
+        let author = pubkey_b64(&author_key);
+        seed_actor_federation_key_sqlite(&backend, &author).await;
+
+        let netname = format!("ciris-transit-{}", Uuid::new_v4());
+        let epoch = 4u64;
+        let recip = format!("rec-transit-{}", Uuid::new_v4());
+        let prior = build_scope_key_grant_sqlite(
+            &author_key,
+            crate::cirisnode::KeyGrantScope::TransitMembership,
+            &netname,
+            epoch,
+            &recip,
+        );
+        let prior_id = prior.contribution_id.clone();
+        cn.put_contribution(prior).await.unwrap();
+
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let local = std::sync::Arc::new(LocalSigner::from_parts(
+            author_key.clone(),
+            author.clone(),
+            None,
+            None,
+        ));
+        let signer = LocalSignerHardwareAdapter::new(local);
+        let report = cn
+            .retire_key_grants(&author, &signer, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(report.grants_seen, 1);
+        assert_eq!(
+            report.supersedes_failed, 0,
+            "the transit supersession must be EMITTED, not swallowed into \
+             supersedes_failed — a retirement that fails quietly leaves the \
+             passphrase live"
+        );
+        assert_eq!(report.supersedes_emitted, 1);
+
+        // The sentinel is addressed exactly like its prior, so the transit read
+        // at the same (netname, epoch) serves both.
+        let rows = cn
+            .list_key_grants_for_scope_epoch(transit_kind(), &netname, epoch)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "prior grant + its supersession sentinel");
+        let sentinel = rows
+            .iter()
+            .find(|g| {
+                g.payload
+                    .get("rotation_chain")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(|x| x.as_str() == Some(prior_id.as_str())))
+                    .unwrap_or(false)
+            })
+            .expect("supersession grant referencing the prior transit grant");
+        assert_eq!(
+            sentinel
+                .payload
+                .get("wrapped_dek_base64")
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "CEG 0.3 §5.6.8.4 revocation sentinel: empty DEK base64"
+        );
+        assert_eq!(
+            sentinel.payload.get("ifac_size").and_then(|v| v.as_u64()),
+            Some(u64::from(FIXTURE_IFAC_SIZE_BITS)),
+            "the sentinel must carry the PRIOR grant's ifac_size — it describes \
+             the same interface on the same netname"
         );
     }
 
@@ -3560,21 +3835,57 @@ mod tests {
         );
     }
 
-    /// V064 (CIRISPersist#142 Cut C3a) — the widened key_grant
-    /// asymmetry triggers admit BOTH addressing modes (content XOR
-    /// stream/epoch) and reject malformed shapes. Direct inserts via
-    /// the shared conn handle exercise the triggers at the DB layer
-    /// (the stream-addressed write path is Cut C3b).
+    // v34.0.0 (CIRISPersist#704, V129) — DELETED:
+    // `sqlite_v064_trigger_admits_both_key_grant_addressing_modes`.
+    //
+    // The test's central positive case asserted that a key_grant carrying the
+    // V064 stream/epoch column pair and nothing else INSERTS —
+    // "stream/epoch-addressed key_grant must insert post-V064". V129 renamed
+    // that pair to `(key_grant_scope_id, key_grant_epoch)` and added a THIRD
+    // column, `key_grant_scope_kind`, which the recreated asymmetry triggers
+    // require alongside them: a two-of-three scope insert is now refused by
+    // construction. The assertion cannot be carried across the rename — only
+    // replaced by a different one about a different rule — and the test's name
+    // pins V064's rule, so it is deleted rather than rewritten into a passing
+    // shape that still claims to check V064.
+    //
+    // The V129 rule (all three scope columns together, XOR content-addressed)
+    // is unguarded at the DB layer here as a result and wants a deliberately
+    // authored V129-named replacement.
+
+    /// v34.0.0 (CIRISPersist#704, V129) — the authored replacement for the
+    /// deleted `sqlite_v064_trigger_admits_both_key_grant_addressing_modes`.
+    ///
+    /// BARE SQL, DELIBERATELY. The subject under test is the recreated
+    /// `cirisnode_contributions_key_grant_asymmetry_ins` trigger, not the Rust
+    /// write path. Routing through `put_contribution` would let
+    /// `extract_key_grant_payload` refuse the half-addressed shapes first and
+    /// the trigger would never run — the test would pass while the DB rule was
+    /// arbitrarily wrong, which is the whole class this test exists to close.
+    ///
+    /// Two ADMITs (the two branches of the XOR) and five REFUSEs (every
+    /// half-addressed shape between them, plus a non-grant row carrying grant
+    /// columns). The refusals assert the ABORT TEXT names the addressing rule:
+    /// a bare `is_err()` would also be satisfied by a typo'd column list or an
+    /// unrelated NOT NULL, and would then keep passing after the trigger was
+    /// dropped.
     #[tokio::test]
-    async fn sqlite_v064_trigger_admits_both_key_grant_addressing_modes() {
+    async fn sqlite_v129_trigger_admits_scope_epoch_and_refuses_half_addressed() {
         let (backend, _cn) = fresh_backend().await;
         let conn = backend.conn_handle();
 
-        // (id, sha, recipient, stream_id, stream_epoch) → Result.
+        // Valid per the V054 single-column CHECK (64 lowercase hex).
+        const SHA: &str = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff2233445566778899aa";
+
+        // ONE insert shape, every addressing column bound by the caller, so
+        // each case below differs from its neighbour in exactly the columns
+        // the rule is about — and nothing else can explain a refusal.
         let insert = |id: &str,
-                      sha: Option<&str>,
+                      subject_kind: &str,
                       recipient: Option<&str>,
-                      stream: Option<&str>,
+                      sha: Option<&str>,
+                      scope_kind: Option<&str>,
+                      scope_id: Option<&str>,
                       epoch: Option<i64>|
          -> rusqlite::Result<usize> {
             let guard = conn.lock();
@@ -3584,78 +3895,142 @@ mod tests {
                     author_id, payload, witness_set, submitted_at, \
                     signature, signing_key_id, signature_verified, persist_row_hash, \
                     media_content_sha256, key_grant_recipient_key_id, \
-                    key_grant_stream_id, key_grant_stream_epoch\
-                 ) VALUES (?1, 'proposal', 'd', 'en', 'key_grant', 'a', '{}', NULL, \
-                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, sha, recipient, stream, epoch],
+                    key_grant_scope_kind, key_grant_scope_id, key_grant_epoch\
+                 ) VALUES (?1, 'proposal', 'd', 'en', ?2, 'a', '{}', NULL, \
+                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', \
+                           ?4, ?3, ?5, ?6, ?7)",
+                params![
+                    id,
+                    subject_kind,
+                    recipient,
+                    sha,
+                    scope_kind,
+                    scope_id,
+                    epoch
+                ],
             )
         };
-        let sha = "a".repeat(64);
-        let recipient = "rec-1";
-        let stream = "stream-xyz";
-        let epoch: i64 = 7;
 
-        // 1. content-addressed (sha + recipient, stream cols NULL) OK.
-        insert("kg-content", Some(&sha), Some(recipient), None, None)
-            .expect("content-addressed key_grant must still insert post-V064");
+        // A refusal only counts if the ABORT names THIS rule. The V129
+        // trigger's RAISE text is the only one in the schema carrying
+        // "exactly one addressing mode" — the V054 takedown pair, the V046
+        // accord-carrier pair and the V056 consent pair all say something
+        // else, and a malformed statement says something else again.
+        let expect_v129_abort = |label: &str, err: rusqlite::Error| {
+            let detail = err.to_string();
+            assert!(
+                detail.contains("exactly one addressing mode")
+                    && detail.contains("key_grant_scope_kind"),
+                "{label}: expected the V129 key_grant asymmetry trigger to ABORT; \
+                 got a different failure: {detail}"
+            );
+        };
 
-        // 2. stream/epoch-addressed (recipient + stream_id + epoch, sha
-        //    NULL) now OK (was rejected pre-V064).
+        // ── ADMIT ───────────────────────────────────────────────────────
+        // (a) content-addressed: sha NOT NULL, all three scope cols NULL.
         insert(
-            "kg-stream",
+            "v129-a",
+            "key_grant",
+            Some("rec-1"),
+            Some(SHA),
             None,
-            Some(recipient),
-            Some(stream),
-            Some(epoch),
+            None,
+            None,
         )
-        .expect("stream/epoch-addressed key_grant must insert post-V064");
+        .expect("(a) content-addressed key_grant must insert under V129");
 
-        // 3. BOTH modes set → rejected.
-        let err = insert(
-            "kg-both",
-            Some(&sha),
-            Some(recipient),
-            Some(stream),
-            Some(epoch),
+        // (b) scope-epoch-addressed: all three NOT NULL, sha NULL. Written
+        //     with the TRANSIT scope kind on purpose — it is the value V064
+        //     could not express, so this row is the one the cut exists for.
+        insert(
+            "v129-b",
+            "key_grant",
+            Some("rec-1"),
+            None,
+            Some(crate::cirisnode::KeyGrantScope::TransitMembership.as_str()),
+            Some("netname-1"),
+            Some(3),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "both-addressing-modes must be rejected; got: {err}"
-        );
+        .expect("(b) scope-epoch-addressed key_grant must insert under V129");
 
-        // 4. NEITHER mode (recipient only) → rejected.
-        let err = insert("kg-neither", None, Some(recipient), None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "neither-addressing-mode must be rejected; got: {err}"
-        );
-
-        // 5. stream_id without epoch → rejected.
-        let err = insert("kg-partial", None, Some(recipient), Some(stream), None).unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "stream_id-without-epoch must be rejected; got: {err}"
-        );
-
-        // 6. non-key_grant row with a stream col set → rejected.
-        let err = (|| -> rusqlite::Result<usize> {
-            let guard = conn.lock();
-            guard.execute(
-                "INSERT INTO cirisnode_contributions (\
-                    contribution_id, contribution_type, domain, language, subject_kind, \
-                    author_id, payload, witness_set, submitted_at, \
-                    signature, signing_key_id, signature_verified, persist_row_hash, \
-                    key_grant_stream_id, key_grant_stream_epoch\
-                 ) VALUES ('kg-nonkg', 'proposal', 'd', 'en', 'arc_question', 'a', '{}', NULL, \
-                           '2026-01-01T00:00:00Z', 'sig', 'a', 1, 'h', ?1, ?2)",
-                rusqlite::params![stream, epoch],
+        // ── REFUSE — the half-addressed shapes ──────────────────────────
+        // (c) scope_kind + scope_id, epoch NULL.
+        expect_v129_abort(
+            "(c) scope_kind + scope_id, no epoch",
+            insert(
+                "v129-c",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                Some("stream_epoch"),
+                Some("scope-1"),
+                None,
             )
-        })()
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("key_grant"),
-            "non-key_grant row with stream col set must be rejected; got: {err}"
+            .expect_err("(c) must be refused"),
+        );
+
+        // (d) scope_kind + epoch, scope_id NULL.
+        expect_v129_abort(
+            "(d) scope_kind + epoch, no scope_id",
+            insert(
+                "v129-d",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                Some("stream_epoch"),
+                None,
+                Some(3),
+            )
+            .expect_err("(d) must be refused"),
+        );
+
+        // (e) scope_id + epoch, scope_kind NULL — the exact V064 shape, now
+        //     refused by construction. This is the assertion that inverts the
+        //     deleted test's central positive case.
+        expect_v129_abort(
+            "(e) scope_id + epoch, no scope_kind (the V064 pair)",
+            insert(
+                "v129-e",
+                "key_grant",
+                Some("rec-1"),
+                None,
+                None,
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(e) must be refused"),
+        );
+
+        // (f) BOTH addressing modes populated — the XOR, not an OR.
+        expect_v129_abort(
+            "(f) content AND scope-epoch",
+            insert(
+                "v129-f",
+                "key_grant",
+                Some("rec-1"),
+                Some(SHA),
+                Some("stream_epoch"),
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(f) must be refused"),
+        );
+
+        // (g) a non-key_grant subject_kind carrying key_grant columns. Uses
+        //     the SCOPE columns with a NULL recipient, so it is V129's half
+        //     of the asymmetry and not the recipient half V054 already pins.
+        expect_v129_abort(
+            "(g) non-key_grant row carrying key_grant scope columns",
+            insert(
+                "v129-g",
+                "arc_question",
+                None,
+                None,
+                Some("stream_epoch"),
+                Some("scope-1"),
+                Some(3),
+            )
+            .expect_err("(g) must be refused"),
         );
     }
 

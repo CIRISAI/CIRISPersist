@@ -76,8 +76,8 @@ pub use federation_announcement::{
 pub use media_sharing::{
     extract_key_grant_payload, extract_takedown_notice_payload, require_key_grant_envelope,
     KeyGrantPayload, KeyGrantScope, KeyValidityWindow, LegalBasis, MultimediaConfig,
-    MultimediaConfigWire, TakedownNoticePayload, WrapAlgorithm, KEY_GRANT_SUBJECT_KIND,
-    TAKEDOWN_NOTICE_SUBJECT_KIND,
+    MultimediaConfigWire, TakedownNoticePayload, WrapAlgorithm, IFAC_SIZE_MAX_BITS,
+    IFAC_SIZE_MIN_BITS, KEY_GRANT_SUBJECT_KIND, TAKEDOWN_NOTICE_SUBJECT_KIND,
 };
 pub use service::{NodeCoreService, RetireKeyGrantsReport};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]

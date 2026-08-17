@@ -427,7 +427,19 @@ jobs:
           # wheel, and this crate's sqlite backend is already compiled by the
           # nextest step above on the same runner, so the marginal cost is the
           # `--release` codegen for it rather than a cold build.
-          maturin develop --features test-panic,pyo3,sqlite --release
+          #
+          # v34.0.0 (CIRISPersist#704) — `cirisnode` added, for the same reason
+          # and with the same evidence. `--features` on the maturin CLI
+          # REPLACES `[tool.maturin] features` in pyproject.toml, it does not
+          # union with it (verified by building this exact line and probing the
+          # module: `cirisnode_put_key_grant_json` was absent). So the released
+          # wheel ships `cirisnode` and the wheel CI runs pytest against never
+          # has — the entire cirisnode Python surface, key grants included, has
+          # been outside pytest since it landed. `tests/python/
+          # test_transit_key_grant_surface.py` is the reachability witness for
+          # this cut's headline feature; without this feature it would skip,
+          # which is the failure it exists to catch.
+          maturin develop --features test-panic,pyo3,sqlite,cirisnode --release
       - name: pytest tests/python/
         if: matrix.substrate.name == 'core-1'
         run: |
