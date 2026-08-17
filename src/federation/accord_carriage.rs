@@ -2603,17 +2603,35 @@ pub(crate) mod carriage_tests {
         });
     }
 
-    /// Postgres runs the CARRIER-BOUND leg only. The overlap leg is withheld
-    /// deliberately: the pg `put_accord_participation` M6 dedup is a
-    /// SELECT-then-INSERT on pooled connections with no transaction, so two
-    /// carriers admitting the same vote concurrently can both pass the
-    /// check and the loser surfaces the `(proposal_digest, pinned_pubkey)`
-    /// PK violation as `Error::Backend` — a spurious failure where the
-    /// contract says idempotent no-op. Integrity holds (the PK keeps the row
-    /// set exact); the error path does not. That is a store-backend defect
-    /// (CIRISPersist#645's surface, reported with this cut), not a carriage
-    /// one — wiring the overlap leg here would be a flaky witness measuring
-    /// a neighbouring gate.
+    /// Postgres runs BOTH legs — carrier-bound and overlap.
+    ///
+    /// v36.0.0 (CIRISPersist#719): the overlap leg was withheld here because
+    /// pg's `put_accord_participation` M6 dedup was a SELECT-then-INSERT on
+    /// pooled connections with no transaction, so two carriers admitting the
+    /// same vote concurrently both passed the check and the loser surfaced the
+    /// `(proposal_digest, pinned_pubkey)` PK violation as `Error::Backend` —
+    /// a spurious failure where the contract says idempotent no-op. Integrity
+    /// always held (the PK is the backstop); the error path did not. Wiring
+    /// the leg then would have been a flaky witness measuring a neighbouring
+    /// gate, so the defect was reported instead and the leg deferred.
+    ///
+    /// That insert now absorbs the race (`ON CONFLICT … DO NOTHING`, with a
+    /// zero-row re-read deciding no-op vs the M6 conflict — `DO NOTHING`
+    /// alone would silently accept a DIFFERING concurrent vote, which is what
+    /// M6 exists to refuse), so the leg is live.
+    ///
+    /// **It is NOT a witness for that fix, and the distinction is recorded
+    /// because it was measured.** Reverting the `ON CONFLICT` clause and
+    /// re-running this leg leaves it GREEN: the matrix drives the overlap
+    /// through the carriage door, whose own admission work widens the window
+    /// between pg's dedup SELECT and its INSERT far too little to lose the
+    /// race reliably in a 3-second run. What this leg pins is that concurrent
+    /// overlapping admissions CONVERGE on pg — real coverage the plane did not
+    /// have. The race itself is argued from the code (check-then-act on a
+    /// pooled connection outside a transaction) and closed by construction;
+    /// a deterministic witness for it needs a fault point between the SELECT
+    /// and the INSERT, which this backend has no seam for. Do not read this
+    /// leg's green as evidence the race is fixed — read the SQL.
     #[cfg(feature = "postgres")]
     #[test]
     #[serial_test::serial(postgres)]
@@ -2627,6 +2645,10 @@ pub(crate) mod carriage_tests {
         concurrent_runtime().block_on(async {
             crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
                 run_concurrent_carrier_bound_matrix(std::sync::Arc::new(a), "cbp").await;
+            })
+            .await;
+            crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
+                run_concurrent_overlap_matrix(std::sync::Arc::new(a), "ccp").await;
             })
             .await;
         });

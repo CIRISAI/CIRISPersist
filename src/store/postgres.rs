@@ -7226,12 +7226,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 participation.proposal_digest
             )));
         }
-        client
+        // v36.0.0 (CIRISPersist#719) — the dedup SELECT above runs on a POOLED
+        // connection with NO transaction, so it is a check-then-act window:
+        // two carriers offering overlapping bundles both saw no row, and the
+        // loser hit the (proposal_digest, pinned_pubkey) PK and surfaced
+        // `Error::Backend("duplicate key ...")` where this contract says
+        // idempotent no-op. Integrity always held — the PK is the backstop —
+        // but the ERROR PATH lied, and it is reachable today by two peers
+        // relaying the same accord evidence to one node.
+        //
+        // `ON CONFLICT DO NOTHING` alone would be WRONG: it silently accepts a
+        // DIFFERING concurrent vote, which is exactly what M6 exists to refuse.
+        // So the insert absorbs the race and a zero-row result re-reads to
+        // decide — identical ⇒ the no-op this contract promises, different ⇒
+        // the same Conflict the pre-check would have raised.
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.accord_participation (\
                     proposal_digest, member_id, pinned_pubkey, vote, window_until, \
                     signed_at, server_arrival_at, participation_json, persist_row_hash\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+                 ON CONFLICT (proposal_digest, pinned_pubkey) DO NOTHING",
                 &[
                     &prep.proposal_digest,
                     &prep.member_id,
@@ -7246,6 +7261,36 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
+        if inserted == 0 {
+            let raced: Option<String> = client
+                .query_opt(
+                    "SELECT persist_row_hash FROM cirislens.accord_participation \
+                     WHERE proposal_digest = $1 AND pinned_pubkey = $2",
+                    &[&prep.proposal_digest, &prep.pinned_pubkey],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("accord_participation race re-read: {e}")))?
+                .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+                .transpose()?;
+            match raced {
+                Some(h) if h == prep.persist_row_hash => return Ok(()),
+                Some(_) => {
+                    return Err(Error::Conflict(format!(
+                        "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder, decided on the concurrent-insert path)",
+                        participation.proposal_digest
+                    )))
+                }
+                // DO NOTHING fired but the row is gone: only a concurrent
+                // delete explains it, and this plane is append-only.
+                None => {
+                    return Err(Error::Backend(
+                        "accord_participation: insert conflicted but no row is present — the \
+                         append-only invariant does not hold on this table"
+                            .to_owned(),
+                    ))
+                }
+            }
+        }
         Ok(())
     }
 
