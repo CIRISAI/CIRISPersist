@@ -9524,6 +9524,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
         use crate::federation::Error;
         use crate::read::LifecycleView;
+        // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
+        // door, ahead of every refusal, so a read rejected for a bad limit or
+        // cursor is logged exactly like one that is served.
+        crate::federation::scores_read_audit::log_scores_read(
+            crate::federation::scores_read_audit::ScoresReadSite::ListScores,
+            caller_occurrence_key_id,
+            &filter,
+        );
         if !(1..=10_000).contains(&limit) {
             return Err(Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -9864,6 +9872,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         trace: bool,
     ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
         use crate::federation::Error;
+        // #552 (CC 3.4.5) — the scores-plane read log; see `list_scores`.
+        crate::federation::scores_read_audit::log_scores_read(
+            crate::federation::scores_read_audit::ScoresReadSite::ResolveScores,
+            caller_occurrence_key_id,
+            &filter,
+        );
         let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
             .await
             .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
@@ -42322,6 +42336,18 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_consent_tie_restriction_wins(
             &backend, "sq598c"
+        )
+        .await;
+    }
+
+    /// #642 B12 — a revocation that NAMES the grant it supersedes wins over a
+    /// grant minted ahead of it, on sqlite.
+    #[tokio::test]
+    async fn consent_causal_supersedes_sqlite_642() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_consent_causal_supersedes(
+            &backend, "sq642",
         )
         .await;
     }

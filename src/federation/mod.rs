@@ -202,6 +202,7 @@ pub mod mesh_config;
 pub mod reverse_quorum;
 pub mod schema_resolver;
 pub mod scores;
+pub mod scores_read_audit;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
@@ -4876,6 +4877,16 @@ pub trait FederationDirectory: Send + Sync {
     /// its own signed envelope instant), with a deterministic
     /// RESTRICTION-WINS tie-break. Read that function's doc for why re-keying
     /// this fold to the envelope instant is the wrong fix.
+    ///
+    /// v36.0.0 (CIRISPersist#642) — the clock is now the FALLBACK, not the key.
+    /// The body is [`consent::fold_stance`], shared with
+    /// [`Self::resolve_scoped_consent`]: a `consent:state:*` row that NAMES the
+    /// statement it supersedes (the signed
+    /// [`consent_supersedes`](envelope::paths::CONSENT_SUPERSEDES) key) is
+    /// ordered causally, and `asserted_at` decides only what causality leaves
+    /// incomparable. Read [`consent::ConsentCausalEdge`] for
+    /// why a 300s skew window is the wrong axis, and [`consent::fold_stance`]
+    /// for the ratchet that keeps the new plane unable to loosen an answer.
     async fn resolve_consent_state(
         &self,
         target_key_id: &str,
@@ -4883,18 +4894,7 @@ pub trait FederationDirectory: Send + Sync {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<hard_case::ConsentState, Error> {
         let rows = self.list_attestations_for(target_key_id).await?;
-        let latest = rows
-            .into_iter()
-            .filter(|a| a.attesting_key_id == subject_key_id)
-            .filter(|a| {
-                consent::envelope_dimension(a)
-                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
-            })
-            .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
-            .max_by_key(consent::fold_ordering_key);
-        Ok(consent::consent_state_of(
-            latest.as_ref().and_then(consent::envelope_dimension),
-        ))
+        Ok(consent::fold_stance(&rows, subject_key_id, now, None))
     }
 
     /// v16.1.0 (CIRISPersist#389, CC 4.5.13) — the **scope/class-scoped**
@@ -4922,6 +4922,14 @@ pub trait FederationDirectory: Send + Sync {
     /// revocation naming a *different* scope stays unrelated. Latest-wins
     /// composes naturally: a scoped re-grant NEWER than a blanket revoke
     /// re-opens that scope.
+    ///
+    /// v36.0.0 (CIRISPersist#642) — same body as
+    /// [`Self::resolve_consent_state`] ([`consent::fold_stance`]), with the
+    /// scope filter switched on: ONE fold, so the causal plane cannot reach one
+    /// entry point and not the other. Note the universe an edge resolves
+    /// against is the subject's WHOLE consent history for this target, not the
+    /// scoped slice — a revocation naming a grant that answers a different
+    /// scope is resolved, not read as a partial view.
     async fn resolve_scoped_consent(
         &self,
         target_key_id: &str,
@@ -4931,18 +4939,11 @@ pub trait FederationDirectory: Send + Sync {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<hard_case::ConsentState, Error> {
         let rows = self.list_attestations_for(target_key_id).await?;
-        let latest = rows
-            .into_iter()
-            .filter(|a| a.attesting_key_id == subject_key_id)
-            .filter(|a| {
-                consent::envelope_dimension(a)
-                    .is_some_and(|d| d.starts_with(consent::consent_dimension::STATE_PREFIX))
-            })
-            .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
-            .filter(|a| consent::matches_scoped_query(a, scope, qualifier))
-            .max_by_key(consent::fold_ordering_key);
-        Ok(consent::consent_state_of(
-            latest.as_ref().and_then(consent::envelope_dimension),
+        Ok(consent::fold_stance(
+            &rows,
+            subject_key_id,
+            now,
+            Some((scope, qualifier)),
         ))
     }
 
