@@ -280,6 +280,14 @@ jobs:
           run_bench secrets_crypto
           run_bench occurrence_registry
           run_bench storage_floor
+          # v35.0.0 (#713) — the per-plane projection acceptance criterion is a
+          # MEASURED delta on projection_for; a bench that is compiled by
+          # --no-run but never invoked reports nothing (the same shape as a
+          # check whose exit code nobody reads, #694). encrypted_kv and
+          # calibration are also absent from this list — that gap predates
+          # this line and is deliberate-or-oversight unknown; flagged in
+          # #713's thread rather than silently changing CI cost here.
+          run_bench projection
           if [ -n "${failed_benches}" ]; then
             echo "::error title=bench job failed::broken benches:${failed_benches}"
             exit 1
