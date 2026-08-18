@@ -1628,6 +1628,55 @@ pub enum AccordRootSource {
 /// The `accord:*` family prefix, on BOTH namespaces a row can carry it.
 const ACCORD_FAMILY_PREFIX: &str = "accord:";
 
+/// v37.1.0 (CIRISPersist#743) — **is this row on the `accord:*` family?**, over
+/// the two strings a consumer already holds, with no `Attestation` deserialize.
+///
+/// # Why this exists as its own verb
+///
+/// The family rides **both namespaces** — `accord:invoke:*` as an
+/// `attestation_type`, `accord:human_dignity:v1` as a `scores` **dimension** —
+/// and a consumer pre-filtering on the dimension alone concludes that
+/// `accord:invoke:*` rows are not accord rows. CIRISEdge shipped exactly that
+/// (CIRISEdge#505): those rows were advertised, fetched and subject-pulled
+/// **without ever reaching the CC 4.2.1 relay gate**, because the pre-filter
+/// decided they were none of its business.
+///
+/// It is a false NEGATIVE, which is the dangerous polarity here: the gate is
+/// not overruled, it is *never consulted*. Nothing was live — edge's
+/// `accord_relay_enforced` derives `false` — but **this must land before any
+/// operator flips enforcement**, or they arm a gate that silently skips one
+/// namespace of the family it exists to gate, and the arming itself reads as
+/// the safe action.
+///
+/// # Why persist owns it rather than edge widening its own pre-filter
+///
+/// Because then two repos would hold a reading of *"is this the accord
+/// family"*, which is the drift #731 and #733 spent two releases removing, and
+/// it re-breaks the moment a third namespace arm appears.
+///
+/// The correct-but-costly expression is
+/// `accord_root_claim(&row) != AccordRootClaim::NotAccord`, which pays a full
+/// deserialize on **every** row — and a pre-filter exists precisely so the gate
+/// is reached rarely. This is that predicate's family test, extracted, taking
+/// the two strings instead of the row.
+///
+/// # It cannot drift from the claim resolver
+///
+/// [`accord_root_claim`] **calls this function** for its own family test rather
+/// than re-spelling the prefix check. Extracting a predicate and leaving the
+/// original copy in place would create the second reading this verb exists to
+/// prevent — inside the one function that most needs to agree with it.
+/// `the_family_test_agrees_with_the_claim_resolver_on_both_namespaces` pins the
+/// agreement over both arms.
+///
+/// `dimension` is `Option` because a row may carry none; `None` is simply not a
+/// dimension-arm match, never an error.
+#[must_use]
+pub fn is_accord_family(attestation_type: &str, dimension: Option<&str>) -> bool {
+    attestation_type.starts_with(ACCORD_FAMILY_PREFIX)
+        || dimension.is_some_and(|d| d.starts_with(ACCORD_FAMILY_PREFIX))
+}
+
 /// v37.0.0 (CIRISPersist#733) — read the claim off a row. Pure: no directory
 /// read, no crypto, no clock, so AV-76 tier 1 at every door.
 ///
@@ -1662,15 +1711,17 @@ pub fn accord_root_claim(row: &Attestation) -> AccordRootClaim {
     use super::envelope::paths;
 
     let dimension = super::admission::envelope_dimension(&row.attestation_envelope);
+    // The family test is `is_accord_family`'s, called rather than restated —
+    // see its doc: a second copy here is the exact drift the verb prevents.
+    if !is_accord_family(&row.attestation_type, dimension) {
+        return AccordRootClaim::NotAccord;
+    }
     let namespace = if row.attestation_type.starts_with(ACCORD_FAMILY_PREFIX) {
-        Some(row.attestation_type.clone())
+        row.attestation_type.clone()
     } else {
         dimension
-            .filter(|d| d.starts_with(ACCORD_FAMILY_PREFIX))
-            .map(ToOwned::to_owned)
-    };
-    let Some(namespace) = namespace else {
-        return AccordRootClaim::NotAccord;
+            .expect("is_accord_family matched, so one arm holds")
+            .to_owned()
     };
 
     // The signed key. A present-but-non-string (or blank) value is NOT a root:
@@ -1869,6 +1920,30 @@ pub struct RelayVerdict {
     pub edge_exists: bool,
 }
 
+/// v37.1.0 (CIRISPersist#743) — **why a [`RelayVerdict`] refused**, in the one
+/// order the conjuncts may be read.
+///
+/// Variants are declared in precedence order and
+/// [`RelayVerdict::refusal_reason`] returns the first that applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RelayRefusal {
+    /// **"I cannot judge."** This node holds no family under the object's root,
+    /// so the roster question was never answerable. It is NOT a statement about
+    /// the signer, and reporting it as one is a confidently wrong attribution:
+    /// the signer may well be seated on a roster this node simply does not
+    /// hold.
+    RosterUnresolvable,
+    /// The roster resolved and the signer holds no live seat on it
+    /// (revocation-folded). A genuine verdict about the signer.
+    SignerNotSeated,
+    /// The signer is seated on a resolvable roster, but this node holds no live
+    /// `delegates_to(self → root)` — it never granted the root. A statement
+    /// about THIS node's own trust, not about the object or its signer.
+    NoEdgeToRoot,
+}
+
 impl RelayVerdict {
     /// Relay iff the signer is seated on a roster this node can resolve AND
     /// this node holds a live edge to that root. Fail-closed in every other
@@ -1876,6 +1951,47 @@ impl RelayVerdict {
     #[must_use]
     pub fn may_relay(self) -> bool {
         self.roster_resolvable && self.signer_seated && self.edge_exists
+    }
+
+    /// v37.1.0 (CIRISPersist#743) — `None` when the object may relay, else the
+    /// FIRST applicable [`RelayRefusal`] in precedence order.
+    ///
+    /// # Why this lives on the type
+    ///
+    /// The struct is three bools and **the order they are read in is
+    /// load-bearing**: `roster_resolvable` must be consulted before
+    /// `signer_seated`, or *"I cannot judge"* silently collapses into *"the
+    /// signer is not seated"* — a distinction v36.2.0 wrote a dedicated
+    /// mutation to protect, because the second is an accusation and the first
+    /// is an admission of ignorance.
+    ///
+    /// CIRISEdge was doing that ordering itself, correctly. That works and it
+    /// means **the invariant lived with each consumer rather than with the
+    /// value**: a second consumer reading the bools in the obvious
+    /// declaration order gets a confidently wrong attribution, and nothing
+    /// catches it — the code is not wrong in any way a reviewer can point at,
+    /// it just answers a different question than it appears to.
+    ///
+    /// So the ordering travels with the verdict now. The bools remain public:
+    /// they are the evidence, this is the reading of it, and a consumer that
+    /// wants to say something else about the same three facts still can.
+    ///
+    /// `edge_exists` is deliberately reported LAST and separately, because it
+    /// is the only conjunct that is about **this node** rather than about the
+    /// object — an operator debugging `NoEdgeToRoot` should be looking at
+    /// their own grants, not at the sender.
+    #[must_use]
+    pub fn refusal_reason(self) -> Option<RelayRefusal> {
+        if !self.roster_resolvable {
+            return Some(RelayRefusal::RosterUnresolvable);
+        }
+        if !self.signer_seated {
+            return Some(RelayRefusal::SignerNotSeated);
+        }
+        if !self.edge_exists {
+            return Some(RelayRefusal::NoEdgeToRoot);
+        }
+        None
     }
 }
 
@@ -2520,6 +2636,139 @@ mod accord_root_tests {
             check_accord_root_binding(&r).unwrap_err().kind(),
             "federation_accord_root_unnamed"
         );
+    }
+
+    /// v37.1.0 (CIRISPersist#743) — the cheap family test sees BOTH namespaces.
+    ///
+    /// CIRISEdge's pre-filter read the dimension only, so `accord:invoke:*`
+    /// rows carried in the `attestation_type` namespace never reached the
+    /// CC 4.2.1 relay gate at all (CIRISEdge#505). LITERALS on both arms.
+    #[test]
+    fn the_cheap_family_test_sees_both_namespaces() {
+        // TYPE arm — the one edge's dimension-only pre-filter missed.
+        assert!(is_accord_family("accord:invoke:notify:v1", None));
+        assert!(is_accord_family(
+            "accord:invoke:notify:v1",
+            Some("scores:medical")
+        ));
+        // DIMENSION arm.
+        assert!(is_accord_family("scores", Some("accord:human_dignity:v1")));
+        assert!(is_accord_family("scores", Some("accord:lifecycle:v1")));
+        // Neither arm.
+        assert!(!is_accord_family("scores", Some("scores:medical")));
+        assert!(!is_accord_family("scores", None));
+        assert!(!is_accord_family(
+            "withdraws",
+            Some("consent:replication:v1")
+        ));
+        // Not a prefix match on a lookalike that merely CONTAINS the token.
+        assert!(!is_accord_family(
+            "scores",
+            Some("x:accord:human_dignity:v1")
+        ));
+        assert!(!is_accord_family("objection:accord", None));
+    }
+
+    /// v37.1.0 (CIRISPersist#743) — the cheap test and the full resolver agree.
+    ///
+    /// This is the whole reason `is_accord_family` is a persist verb rather
+    /// than a widened pre-filter in edge: two readings of *"is this the accord
+    /// family"* in two repos is the drift #731 and #733 spent two releases
+    /// removing. [`accord_root_claim`] CALLS the verb, and this pins that a
+    /// future edit cannot reintroduce a second copy that agrees today and
+    /// diverges later.
+    #[test]
+    fn the_family_test_agrees_with_the_claim_resolver_on_both_namespaces() {
+        for (ty, env, expect_family) in [
+            // TYPE arm, no dimension at all.
+            ("accord:invoke:notify:v1", serde_json::json!({}), true),
+            // DIMENSION arm.
+            (
+                "scores",
+                serde_json::json!({"dimension": "accord:human_dignity:v1"}),
+                true,
+            ),
+            // Neither.
+            (
+                "scores",
+                serde_json::json!({"dimension": "scores:medical"}),
+                false,
+            ),
+            ("withdraws", serde_json::json!({}), false),
+        ] {
+            let r = row(ty, "subject-key", env);
+            let dim = crate::federation::admission::envelope_dimension(&r.attestation_envelope);
+            let cheap = is_accord_family(&r.attestation_type, dim);
+            let full = accord_root_claim(&r) != AccordRootClaim::NotAccord;
+            assert_eq!(
+                cheap, expect_family,
+                "cheap test disagreed with the hand-written expectation for {ty:?}"
+            );
+            assert_eq!(
+                cheap, full,
+                "the cheap family test and accord_root_claim disagree for {ty:?} — a \
+                 consumer pre-filtering with the cheap verb would skip rows the gate \
+                 would have judged (CIRISPersist#743)"
+            );
+        }
+    }
+
+    /// v37.1.0 (CIRISPersist#743) — the refusal ordering lives on the type.
+    ///
+    /// `roster_resolvable` MUST be read before `signer_seated`, or *"I cannot
+    /// judge"* collapses into *"the signer is not seated"* — an admission of
+    /// ignorance reported as an accusation. The `false, false, false` case is
+    /// the one that catches a naive implementation reading the bools in
+    /// declaration order.
+    #[test]
+    fn refusal_reason_reports_cannot_judge_before_not_seated() {
+        let v = |r, s, e| RelayVerdict {
+            roster_resolvable: r,
+            signer_seated: s,
+            edge_exists: e,
+        };
+
+        // All three false: the FIRST answer is "I cannot judge", never
+        // "not seated". This is the whole point of the ordering.
+        assert_eq!(
+            v(false, false, false).refusal_reason(),
+            Some(RelayRefusal::RosterUnresolvable)
+        );
+        // Unresolvable roster is unresolvable even if the other bools are set.
+        assert_eq!(
+            v(false, true, true).refusal_reason(),
+            Some(RelayRefusal::RosterUnresolvable)
+        );
+        // Resolvable and genuinely not seated — the real accusation.
+        assert_eq!(
+            v(true, false, true).refusal_reason(),
+            Some(RelayRefusal::SignerNotSeated)
+        );
+        // Seated on a resolvable roster, but THIS node never granted the root.
+        assert_eq!(
+            v(true, true, false).refusal_reason(),
+            Some(RelayRefusal::NoEdgeToRoot)
+        );
+        // Relayable.
+        assert_eq!(v(true, true, true).refusal_reason(), None);
+    }
+
+    /// `refusal_reason()` and `may_relay()` are the same predicate, read two
+    /// ways — exhaustively over all eight combinations, so they cannot drift.
+    #[test]
+    fn refusal_reason_is_none_exactly_when_may_relay_is_true() {
+        for bits in 0u8..8 {
+            let v = RelayVerdict {
+                roster_resolvable: bits & 1 != 0,
+                signer_seated: bits & 2 != 0,
+                edge_exists: bits & 4 != 0,
+            };
+            assert_eq!(
+                v.refusal_reason().is_none(),
+                v.may_relay(),
+                "{v:?}: refusal_reason() and may_relay() disagree"
+            );
+        }
     }
 
     /// THE DUAL-SIGNAL RULE — both signals present and DISAGREEING is refused,
