@@ -14141,6 +14141,19 @@ mod tests {
     /// or buy a quorum), the family halt latch gating the family root, and the
     /// threshold re-derived from THIS node's roster rather than the carried
     /// policy string.
+    /// v36.2.0 (CIRISPersist#713) — relay eligibility for an `accord:*` object:
+    /// a seated signer AND a live edge from THIS node. Four legs, including the
+    /// one a Global projection would have run over (no edge => no relay).
+    #[tokio::test]
+    async fn accord_relay_eligibility_memory_713() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_accord_relay_eligibility(
+            &backend, "mem713",
+        )
+        .await
+        .expect("713 relay eligibility exercise");
+    }
+
     #[tokio::test]
     async fn family_trust_root_works_on_memory_557() {
         let backend = MemoryBackend::new();

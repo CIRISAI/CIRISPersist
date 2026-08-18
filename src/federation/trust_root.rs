@@ -1426,6 +1426,128 @@ pub(crate) fn transit_candidate_roots(
         })
         .collect()
 }
+/// v36.2.0 (CIRISPersist#713) — **the active roster of an arbitrary trust
+/// root**, revocation-folded.
+///
+/// Every roster-parameterized resolver in this module
+/// ([`capability_roots_to_trusted_root_over_roster`],
+/// [`resolve_transit_eligibility_over_roster`],
+/// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster))
+/// takes `accord_roster_key_ids` as a CALLER-SUPPLIED parameter, and the
+/// production convenience wrappers fill it from
+/// [`accord_holder_roster_key_ids`](super::admission::accord_holder_roster_key_ids)
+/// — the node's OWN genesis-baked holders. That is correct for this node's own
+/// accord and answers nothing about anyone else's.
+///
+/// CC 4.2.3 is explicit that the accord roster is an INSTANCE PARAMETER:
+/// *"another instantiation of this form names its own three"*, and CC 4.2.6
+/// makes it a growable M-of-N family whose seats change through the same
+/// membership-change `supersedes` machinery as any other family. So "the
+/// roster" is not one baked list — it is a question asked OF A ROOT.
+///
+/// A root's roster is the family it charters: a `trust_charter` names its
+/// family in `attested_key_id`, so the roster is exactly
+/// [`active_family_members`](FederationDirectory::active_family_members) of
+/// that id — already revocation-folded, so a removed seat is gone here without
+/// this function re-deriving the fold (one implementation of "who is seated",
+/// per #686's lesson).
+///
+/// `Ok(None)` when this node holds no family under `root_ref` — the honest
+/// answer for a root whose roster this node cannot see, and distinct from
+/// `Ok(Some(vec![]))`, which would mean *"the roster is empty"*. A caller must
+/// not collapse those: the first is "I cannot judge", the second is "there is
+/// nobody to judge".
+pub async fn active_roster_of<F>(
+    directory: &F,
+    root_ref: &str,
+) -> Result<Option<Vec<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if directory.lookup_family(root_ref).await?.is_none() {
+        return Ok(None);
+    }
+    let members = directory.active_family_members(root_ref).await?;
+    Ok(Some(members.into_iter().map(|m| m.key_id).collect()))
+}
+
+/// v36.2.0 (CIRISPersist#713) — **may THIS node relay an `accord:*` object
+/// signed by `signer_key_id` under `root_ref`?**
+///
+/// Both legs, decided together and fail-closed:
+///
+/// 1. **The signer is seated.** `signer_key_id` is in
+///    [`active_roster_of`]`(root_ref)` — a live seat, revocation-folded.
+/// 2. **This node granted the root.** A live `delegates_to(self → root)`
+///    exists ([`trust_root_valid`]'s `edge_exists`).
+///
+/// Leg 2 is the substrate half of CC 4.2.1's *"Reach is consent-scoped
+/// (normative)"*: the accord's reach is *"exactly those holding a live
+/// `delegates_to(user → accord)`"*, and *"a node that never trusted the
+/// accord, or has already cut the edge, is simply not reached."* The
+/// Constitution's own framing is that the accord is **a** trust root, not
+/// **the** trust root — *"an emergency brake they granted, not a power imposed
+/// on everyone"* — so a node with no edge has no business carrying its
+/// traffic, and one that cut the edge has un-granted it.
+///
+/// # What this deliberately does NOT answer
+///
+/// **Whether this node is BOUND by a halt.** That is a different question with
+/// a different clock: CC 4.2.1 requires binding to resolve against the edge
+/// set pinned at the invocation's `asserted_at`, because *"exit is
+/// prospective, never retroactive"* — severing after the brake is pulled must
+/// not release you. This predicate is about CARRIAGE and reads LIVE state, so
+/// a node that cuts its edge stops relaying immediately while remaining bound
+/// by any halt already invoked. Fusing the two would be an axis fusion: one
+/// name, two clocks.
+pub async fn may_relay_accord_object<F>(
+    directory: &F,
+    self_key_id: &str,
+    signer_key_id: &str,
+    root_ref: &str,
+) -> Result<RelayVerdict, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let roster = active_roster_of(directory, root_ref).await?;
+    let signer_seated = roster
+        .as_ref()
+        .is_some_and(|r| r.iter().any(|k| k == signer_key_id));
+    let edge_exists = trust_root_valid(directory, self_key_id, root_ref)
+        .await?
+        .edge_exists;
+    Ok(RelayVerdict {
+        roster_resolvable: roster.is_some(),
+        signer_seated,
+        edge_exists,
+    })
+}
+
+/// v36.2.0 (CIRISPersist#713) — the typed verdict of
+/// [`may_relay_accord_object`]. A bool would collapse three distinct
+/// operator-facing situations into one word; each field below is a different
+/// thing to go fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayVerdict {
+    /// This node holds a family under `root_ref`, so the roster question was
+    /// answerable at all. `false` means *"I cannot judge"* — NOT *"the signer
+    /// is not seated"*.
+    pub roster_resolvable: bool,
+    /// The signer holds a live seat on that roster (revocation-folded).
+    pub signer_seated: bool,
+    /// A live `delegates_to(self → root)` — this node granted the root.
+    pub edge_exists: bool,
+}
+
+impl RelayVerdict {
+    /// Relay iff the signer is seated on a roster this node can resolve AND
+    /// this node holds a live edge to that root. Fail-closed in every other
+    /// combination, including the unresolvable-roster case.
+    #[must_use]
+    pub fn may_relay(self) -> bool {
+        self.roster_resolvable && self.signer_seated && self.edge_exists
+    }
+}
 
 /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our relay traffic?**
 ///
