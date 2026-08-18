@@ -5,6 +5,193 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [37.1.0] - 2026-08-19
+
+**MINOR: adds public API.** Two consumer-surface verbs CIRISEdge asked for while
+adopting v37.0.1 (#743), plus the CIRISVerify v13.6.0 re-pin.
+
+### Added — `is_accord_family(attestation_type, dimension)` (#743)
+
+**A false NEGATIVE, and the dangerous polarity: the gate was not overruled, it
+was never consulted.**
+
+The `accord:*` family rides **both namespaces** — `accord:invoke:*` as an
+`attestation_type`, `accord:human_dignity:v1` as a `scores` **dimension**.
+CIRISEdge's relay pre-filter read the dimension alone, so `accord:invoke:*` rows
+in the type namespace were advertised, fetched and subject-pulled **without ever
+reaching the CC 4.2.1 relay gate**, because the pre-filter concluded they were
+not accord rows (CIRISEdge#505).
+
+Nothing was live — edge's `accord_relay_enforced` derives `false` — but this
+**had to land before any operator flips enforcement**, or they arm a gate that
+silently skips one namespace of the family it exists to gate. The arming reads
+as the safe action, which is what makes the ordering matter.
+
+The correct-but-costly expression is
+`accord_root_claim(&row) != AccordRootClaim::NotAccord`, paying a full
+`Attestation` deserialize on **every** row — and a pre-filter exists precisely so
+the gate is reached rarely. `is_accord_family` is that predicate's family test,
+taking the two strings a consumer already holds.
+
+**Persist owns it rather than edge widening its own pre-filter**, because
+otherwise two repos hold a reading of *"is this the accord family"* — the drift
+#731 and #733 spent two releases removing — and it re-breaks the moment a third
+namespace arm appears. `accord_root_claim` now **calls** the verb rather than
+keeping its own copy: extracting a predicate and leaving the original in place
+would create the second reading the verb exists to prevent, inside the one
+function that most needs to agree with it.
+`the_family_test_agrees_with_the_claim_resolver_on_both_namespaces` pins the
+agreement, and mutating the resolver back to a private copy reds it.
+
+### Added — `RelayVerdict::refusal_reason() -> Option<RelayRefusal>` (#743)
+
+`RelayVerdict` is three bools and **the order they are read in is
+load-bearing**: `roster_resolvable` must be consulted before `signer_seated`, or
+*"I cannot judge"* collapses into *"the signer is not seated"* — an admission of
+ignorance reported as an accusation. v36.2.0 wrote a dedicated mutation to
+protect that distinction.
+
+Edge was doing the ordering itself, correctly. That works, and it means **the
+invariant lived with each consumer rather than with the value**: a second
+consumer reading the bools in declaration order gets a confidently wrong
+attribution, and nothing catches it — the code is not wrong in any way a
+reviewer can point at, it just answers a different question than it appears to.
+
+The new `RelayRefusal` enum declares its variants in precedence order and
+`refusal_reason()` returns the first that applies. `edge_exists` is reported
+last and separately because it is the only conjunct about **this node** rather
+than the object — an operator debugging `NoEdgeToRoot` should be looking at
+their own grants, not at the sender.
+
+The bools stay public: they are the evidence, this is the reading of it.
+
+**Both directions are witnessed.** Reversing the two checks reds
+`refusal_reason_reports_cannot_judge_before_not_seated` while
+`refusal_reason_is_none_exactly_when_may_relay_is_true` stays **green** — the
+reordering changes *why* it refuses, not *whether*, so the equivalence test
+alone would have missed it entirely. That is why both exist.
+
+### Added — `resolve_projection_recipients` + `holdings_authority` (#744)
+
+CIRISEdge closed a real leak: its swarm publisher was broadcasting every held
+`content_id` **and its `symbol_ids`** on a timer to every peer with no
+entitlement filter, so family- and community-scoped holdings were announced to
+peers with no business knowing they existed. Routing the fix through
+`projection_for` surfaced two gaps, one of which edge had shipped an inference
+for and disclosed rather than buried.
+
+**`Projection::SelfOwn` is roster-bounded on every plane — it is not the
+producer predicate wearing a projection's name.** On the attestation plane
+"advertise iff this node produced it" is exactly right; on the holdings plane it
+is **vacuous**, because the swarm publisher is always the producer of its own
+holdings, so the gate admits a family-scoped holding to every peer and closes
+nothing. A projection value that means one thing on one plane and nothing on
+another is not a projection value; it is a coincidence.
+
+The rule is persist's. CIRISServer drew the line that settles it: **projection
+decides who may HOLD the bytes; whether a node may CARRY a given object is the
+per-node relational question.** Advertising a holding *discloses that you hold
+it*, so it is a projection question. Left to consumers, every consumer derives
+its own recipient set from the same cell — the two-owners-for-one-wire-fact
+shape #731 and #733 spent two releases removing.
+
+**Two deliberate deviations from the shape edge proposed.** It takes `authority`
+and `is_tombstone` rather than a caller-supplied `Projection`, so it resolves
+the cell itself — a caller nominating the wrong cell would get a confidently
+wrong answer in the permissive direction, which is precisely the
+`may_relay_accord_object(root_ref)` defect #731 removed one plane over. And it
+returns `RecipientVerdict { set_resolvable, peer_in_set, basis }`, not `bool`,
+so *"cannot judge"* cannot collapse into *"not a member"* — the same distinction
+`RelayVerdict` carries and `refusal_reason()` now owns above.
+
+**With no scope-address table it is already useful.** Persist holds roster
+tables for `self` / `family` / `community` / `affiliations`, which is where the
+leak actually lived. `Cohort` at `species` / `biosphere` / `federation` resolves
+`NoRosterForScope` and **withholds** — not "every peer" — until CIRISVerify#259
+lands.
+
+**Authority is declared at the seam, NOT carried on the row.** Two doors were
+refused, and the second is the interesting one:
+
+- `FountainManifestV1::canonical_value()` is the producer's hybrid-signature
+  preimage in a locked field order, frozen since the V084 migration shipped.
+  Adding a field there invalidates every stored manifest signature mesh-wide —
+  the class this release's five-plane field-set gate exists to prevent.
+- Authority could ride the **existing signed envelope blob**, exactly as
+  `cohort_scope_from_envelope` does, which is mechanically preimage-safe. It is
+  substantively wrong: `AccordCoScrub` is precisely the class a producer must
+  never self-declare. A corpus whose envelope said so would confer trust-root
+  reach on itself — #659's gates-ask-the-signer shape.
+
+So `holdings_authority` re-derives it from persist's own verified state per
+call, composing the existing `is_trust_root` rather than minting a second
+definition. Note the signature takes no `corpus_kind`: the inference edge was
+told not to make is **not expressible**.
+
+#### ADOPTION — the verb and the seam must be adopted TOGETHER
+
+This is the one thing that will bite. The seam is **looser** than edge's
+hard-coded `ProducerSteward`: a trust-root publisher now resolves
+`AccordCoScrub`, so `projection_for(FountainContent, "federation", …)` is
+**`Global`** where it was `Cohort`, and the tombstone ceiling widens with it.
+
+That is free today, because edge's advertise gate maps `Global | Cohort => true`.
+**It stops being free the moment the recipient verb is adopted**: `Global`
+resolves `Unbounded` (every peer), while `Cohort` at `federation` withholds
+entirely. The seam is the difference between *nobody* and *everybody* on that
+one cell. Adopt the verb alone and canonical corpora dark-fail at `federation`;
+adopt the seam alone and they widen with no recipient bound.
+
+Also changing for adopters, and in the stricter direction: `Cohort` at
+`species` / `biosphere` / `federation` is now **withheld** rather than admitted,
+and `Cohort` at `community` / `affiliations` is bounded to the roster.
+
+**Do not fold `peer_has_serve_capability` onto this verb.** `Capability` and
+`Subject` audiences resolve `NotRosterKeyed` and refuse. This is the v36.0.0
+adopt-map hazard restated: a capability gate is a FAMILY question, a projection
+is a FAMILY-AND-SCOPE answer, and folding one onto the other disables gating
+below the commons tiers.
+
+#### A finding worth carrying: `is_trust_root` is a DISJUNCTION
+
+The baked genesis canonical `ciris-canonical-1-d7bdeu223k` satisfies **both**
+halves — `identity_type: "canonical,node"` *and* an `infra:attest` role. So a
+canonical withdrawal **alone does not demote its corpus**; the role tombstone is
+also required. A consumer-side gate consulting only the canonical tombstone
+would be #441's one-surface shape a plane over. Pinned by
+`a_withdrawn_canonical_publisher_stops_being_a_trust_root_corpus`.
+
+### CIRISVerify v13.5.0 → v13.6.1
+
+All seven pins together to `281f4860`. This closes the #262/#259 arc, which is
+worth recording as a sequence because each step corrected the one before:
+
+| release | what |
+|---|---|
+| 13.4.0 | `k_destination` / `derive_destination` — the derivation |
+| 13.5.0 | exporter label pinned (13.4.0's spec was unimplementable) |
+| 13.6.0 | CC 5.4.6's announce prohibition encoded as a checkable rule |
+| **13.6.1** | **the epoch-binding recorded as CONTINGENT** |
+
+13.6.1 is the one that matters for anyone reading the code later. The rotation
+rule is now recorded at `derive_destination` **and** in `announce_policy`, so an
+implementer of a future multi-hop amendment cannot read *"epoch-bound is a
+feature"* without also reading that it is contingent on there being no emission.
+
+That is the same shape as the pins this release keeps adding — a property that
+holds today for a reason the code does not state is a property that will be
+optimized away by someone acting reasonably. It is directly relevant to the
+holdings-plane work in flight (#744), where CIRISEdge found its swarm publisher
+broadcasting every held `content_id` and its `symbol_ids` to every peer with no
+entitlement filter.
+
+The arc is also a case study in escalating rather than settling locally: the
+first reading foreclosed per-group identities on a flat MUST NOT, a targeted
+announce correction broke that reading, and CC then ruled the other way on
+reasoning neither issue contained — the epoch-wave dilemma surfaced only under
+that scrutiny. Settled locally to unblock a downstream, the answer would have
+been right by accident and unreviewable.
+
 ## [37.0.1] - 2026-08-18
 
 **PATCH: behaviour-preserving.** No projection cell changes value. What changes

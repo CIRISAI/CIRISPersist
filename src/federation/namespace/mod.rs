@@ -1154,6 +1154,343 @@ pub async fn is_trust_root(
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// v37.1.0 (CIRISPersist#744) — THE RECIPIENT-SET AXIS
+//
+// CIRISEdge closed a real leak: its swarm publisher broadcast every held
+// `content_id` AND its `symbol_ids`, on a timer, to every peer, with no
+// entitlement filter — so a `family`- or `community`-scoped holding was
+// announced to peers with no business knowing it existed. The fix routes
+// through `projection_for(Plane::FountainContent, …)`, and that surfaced the
+// gap this section closes.
+//
+// **THE RULE IS PERSIST'S, AND IT IS A PROJECTION QUESTION.** CIRISServer drew
+// the line that settles it (the `accord:*` row above states it): *projection
+// decides who may HOLD the bytes; whether a given node may CARRY a particular
+// object is the per-node relational question.* Advertising a holding
+// DISCLOSES THAT YOU HOLD IT. That disclosure is itself a fact about who may
+// hold what, so it is projection's to answer, not a relay overlay's. Were it
+// the consumer's business, every consumer would derive its own recipient set
+// from the same projection cell — the two-owners-for-one-wire-fact shape #731
+// and #733 spent two releases removing.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v37.1.0 (CIRISPersist#744) — **how the recipient set was arrived at, or why
+/// it could not be.** Reported alongside the two booleans of
+/// [`RecipientVerdict`] because *"I cannot judge"* has more than one cause and
+/// each is a different thing for an operator to go fix — the same reason
+/// [`RelayVerdict`](crate::federation::trust_root::RelayVerdict) is three
+/// fields rather than a bool.
+///
+/// `#[non_exhaustive]`: a future audience axis (a scope-address table, an
+/// infra-role set) adds a basis without breaking a consumer's build. Consumers
+/// match what they report on and let the rest fall through — the refusal is
+/// carried by [`RecipientVerdict::may_advertise`], never by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecipientBasis {
+    /// [`Projection::SelfOwn`] — **the record's OWN roster bounds the set.**
+    /// This is the reading CIRISEdge shipped as an inference and #744 asked
+    /// persist to own: `SelfOwn` is not only *"advertise iff this node
+    /// produced it"*, it also bounds WHO the advertisement may reach.
+    OwnRoster,
+    /// [`Projection::Cohort`] — the active roster of the named group bounds
+    /// the set (`community` / `affiliations` / `family`, revocation-folded).
+    CohortRoster,
+    /// [`Projection::Global`] — the record reaches the whole federation, so no
+    /// roster bounds it and every peer is in the set. The ONE resolvable
+    /// audience with no roster read behind it.
+    Unbounded,
+    /// **Cannot judge** — the record's `cohort_scope` names no rostered tier
+    /// (`species` / `biosphere` / `federation`, or a scope this build has
+    /// never heard of). Persist holds roster tables for `self` / `family` /
+    /// `community` / `affiliations` and NOTHING ELSE; the commons tiers are
+    /// audience scopes whose address table does not exist yet (gated on
+    /// CIRISVerify#259). With no table, the honest answer is that the set is
+    /// unresolved — and the fail-closed answer is to advertise to nobody.
+    NoRosterForScope,
+    /// **Cannot judge** — the scope names a rostered tier, but this node
+    /// cannot see that group's roster: the group is unknown here, or the read
+    /// failed. Distinct from [`NoRosterForScope`](Self::NoRosterForScope)
+    /// (the scope has no roster AT ALL) and, critically, distinct from a
+    /// RESOLVED roster the peer is simply not on.
+    GroupUnresolvable,
+    /// **Cannot judge, by construction** — the projection's audience is keyed
+    /// on an axis that is not a roster: [`Projection::Capability`] selects by
+    /// ROLE and [`Projection::Subject`] by the data subject's grant. Neither
+    /// is a question a `(scope, group)` pair can answer, and answering it with
+    /// a roster would be the axis fusion this repo removes elsewhere. NOT a
+    /// licence to advertise: [`RecipientVerdict::may_advertise`] is `false`
+    /// here, and a consumer serving those planes gates them on their own axis
+    /// ([`attestation_family`] → `Trace` / `Scores`, per the v36.1.0 note on
+    /// [`AttestationFamily`]).
+    NotRosterKeyed,
+}
+
+/// v37.1.0 (CIRISPersist#744) — the typed verdict of
+/// [`resolve_projection_recipients`]. Deliberately the shape of
+/// [`RelayVerdict`](crate::federation::trust_root::RelayVerdict) — edge named
+/// [`resolve_transit_eligibility`](crate::federation::trust_root::resolve_transit_eligibility)
+/// as the model and the two verbs answer sibling questions, so a reader
+/// comparing them should not have to learn a second idiom.
+///
+/// **The distinction that must never collapse.** `set_resolvable: false` means
+/// *"I cannot judge"*; `set_resolvable: true, peer_in_set: false` means
+/// *"I judged, and this peer is not seated"*. Both refuse — but an operator
+/// debugging a withheld advertisement needs to know which, and a substrate
+/// that reports the second when it means the first is claiming knowledge it
+/// does not have. [`RelayVerdict`](crate::federation::trust_root::RelayVerdict)
+/// carries the same distinction for the same reason (`roster_resolvable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecipientVerdict {
+    /// The recipient set for this `(plane, scope, group)` was resolvable at
+    /// all. `false` means *"I cannot judge"* — NOT *"the peer is not in the
+    /// set"*. See [`RecipientBasis`] for which cause fired.
+    pub set_resolvable: bool,
+    /// The peer is in the resolved recipient set. Meaningless unless
+    /// `set_resolvable`; a caller must go through
+    /// [`may_advertise`](Self::may_advertise) rather than read this alone.
+    pub peer_in_set: bool,
+    /// How the set was arrived at, or why it could not be.
+    pub basis: RecipientBasis,
+}
+
+impl RecipientVerdict {
+    /// **May this record's holding be advertised to this peer?** Only when the
+    /// set resolved AND the peer is in it. Fail-closed in every other
+    /// combination, including both *"cannot judge"* cases — a directory read
+    /// that failed tells us nothing about the peer, and nothing is not a
+    /// reason to disclose what we hold.
+    #[must_use]
+    pub fn may_advertise(self) -> bool {
+        self.set_resolvable && self.peer_in_set
+    }
+}
+
+/// v37.1.0 (CIRISPersist#744) — **may `peer_key_id` be told that we hold this
+/// record?** The recipient-set verb CIRISEdge asked for, shaped after
+/// [`resolve_transit_eligibility`](crate::federation::trust_root::resolve_transit_eligibility)
+/// as edge proposed.
+///
+/// # Why `SelfOwn` needed this, and why the edge-local reading was vacuous
+///
+/// [`Projection::SelfOwn`] is documented as structural invisibility — no
+/// directory advertisement — and edge's replication bridge implements that as
+/// **"advertise iff this node produced it"**, which is exactly right on the
+/// attestation plane.
+///
+/// It is **VACUOUS on the holdings plane**: the swarm publisher is *always*
+/// the producer of its own holdings, so that predicate admits a family-scoped
+/// holding to every peer and closes nothing — the leak survives the gate. A
+/// projection value that means one thing on one plane and nothing on another
+/// is not a projection value; it is a coincidence. So `SelfOwn` also **bounds
+/// the recipient set to the record's own roster**, which is the reading edge
+/// shipped as an inference and #744 asked persist to own.
+///
+/// The producer predicate is NOT subsumed here and must not be dropped: the
+/// two are conjunctive. *Who may advertise* stays edge's relay question; *who
+/// may be advertised to* is this. Fusing them would put one name on two axes.
+///
+/// # The parameters, and why they are not edge's four
+///
+/// Edge proposed `(plane, scope, group, peer) -> bool`. Two deviations, both
+/// load-bearing:
+///
+/// - `authority` and `is_tombstone` are taken so this verb resolves the
+///   projection ITSELF through [`projection_for`], rather than accepting a
+///   caller-nominated [`Projection`]. A caller that nominates the wrong cell
+///   gets a confidently wrong answer in the permissive direction — the exact
+///   shape #731 removed one plane over
+///   ([`may_relay_accord_object`](crate::federation::trust_root::may_relay_accord_object)
+///   taking a caller-supplied `root_ref`). The caller already holds both
+///   values, because it already had to call [`projection_for`].
+/// - the verdict is [`RecipientVerdict`], not `bool`, so *"I cannot judge"*
+///   stays distinguishable from *"resolved, not a member"*.
+///
+/// # What it does with no scope-address table — the fail-closed answer
+///
+/// Persist holds roster tables for exactly four tiers (`self` / `family` /
+/// `community` / `affiliations`, via
+/// [`active_members`](crate::federation::FederationDirectory::active_members),
+/// revocation-folded). The commons tiers — `species` / `biosphere` /
+/// `federation` — are audience scopes with no roster table, and the
+/// scope-address table that would give them one does not exist yet (gated on
+/// CIRISVerify#259). So a [`Cohort`](Projection::Cohort) projection at a
+/// commons tier resolves [`RecipientBasis::NoRosterForScope`],
+/// `set_resolvable: false`, `may_advertise() == false`. **Not "every peer".**
+/// The verb is answerable TODAY at the four rostered tiers, which is where the
+/// leak #744 reports actually lived; it becomes answerable at the commons
+/// tiers when the table lands, and until then it withholds.
+///
+/// # Fail-closed, always
+///
+/// Any directory error, an unknown group, an unresolvable read — every one
+/// returns a `set_resolvable: false` verdict rather than an `Err`, exactly as
+/// [`resolve_transit_eligibility`](crate::federation::trust_root::resolve_transit_eligibility)
+/// does. The `Result` is retained for API stability and because a future leg
+/// may need to distinguish an infrastructure fault from a refusal; today every
+/// resolution path returns `Ok`.
+pub async fn resolve_projection_recipients(
+    directory: &dyn crate::federation::FederationDirectory,
+    plane: Plane<'_>,
+    cohort_scope: &str,
+    authority: AuthorityClass,
+    is_tombstone: bool,
+    group_key_id: &str,
+    peer_key_id: &str,
+) -> Result<RecipientVerdict, crate::federation::Error> {
+    const fn cannot_judge(basis: RecipientBasis) -> RecipientVerdict {
+        RecipientVerdict {
+            set_resolvable: false,
+            peer_in_set: false,
+            basis,
+        }
+    }
+
+    // The projection is resolved HERE, from the record's own axes — never
+    // nominated by the caller (#731's lesson, one plane over).
+    let basis = match projection_for(plane, cohort_scope, authority, is_tombstone) {
+        // The one audience with no roster behind it: the record reaches the
+        // whole federation, so the set resolved and every peer is in it.
+        Projection::Global => {
+            return Ok(RecipientVerdict {
+                set_resolvable: true,
+                peer_in_set: true,
+                basis: RecipientBasis::Unbounded,
+            })
+        }
+        // Role-keyed / subject-keyed audiences are not this verb's question.
+        // Fail closed and SAY SO, so a consumer cannot read the refusal as
+        // "not seated" and go looking for a roster that was never the answer.
+        Projection::Capability(_) | Projection::Subject => {
+            return Ok(cannot_judge(RecipientBasis::NotRosterKeyed))
+        }
+        // THE #744 CELL. `SelfOwn` is roster-bounded on every plane — it is
+        // not the producer predicate wearing a projection's name.
+        Projection::SelfOwn => RecipientBasis::OwnRoster,
+        Projection::Cohort => RecipientBasis::CohortRoster,
+    };
+
+    // Roster-keyed from here. The scope must name a tier persist holds a
+    // roster table for; the commons tiers do not, and no scope-address table
+    // exists to give them one (CIRISVerify#259).
+    let Ok(cohort) = crate::federation::cohort::Cohort::from_token(cohort_scope) else {
+        return Ok(cannot_judge(RecipientBasis::NoRosterForScope));
+    };
+
+    // The `self` tier's roster is the subject's identity OCCURRENCES, and an
+    // unknown identity resolves `Ok(vec![])` there rather than an error — the
+    // one place "cannot judge" would silently become "resolved, empty" if this
+    // existence check were dropped.
+    // [`active_roster_of`](crate::federation::trust_root::active_roster_of)
+    // draws the same line (`Ok(None)` vs `Ok(Some(vec![]))`) for the same
+    // reason.
+    if matches!(cohort, crate::federation::cohort::Cohort::SelfId)
+        && !matches!(directory.lookup_public_key(group_key_id).await, Ok(Some(_)))
+    {
+        return Ok(cannot_judge(RecipientBasis::GroupUnresolvable));
+    }
+
+    match directory.active_members(cohort, group_key_id).await {
+        Ok(members) => Ok(RecipientVerdict {
+            set_resolvable: true,
+            peer_in_set: members.iter().any(|m| m.key_id == peer_key_id),
+            basis,
+        }),
+        Err(e) => {
+            // The fail-closed clause, and the only place it fires. A read that
+            // failed tells us nothing about the group, and "nothing" is not a
+            // reason to disclose what this node holds.
+            tracing::warn!(
+                cohort_scope,
+                group_key_id,
+                peer_key_id,
+                error = %e,
+                "resolve_projection_recipients: roster read failed — WITHHOLDING \
+                 (an advertisement gate never fails open)"
+            );
+            Ok(cannot_judge(RecipientBasis::GroupUnresolvable))
+        }
+    }
+}
+
+/// v37.1.0 (CIRISPersist#744 item 2) — **the declared authority of a held
+/// fountain corpus**, resolved from its PUBLISHER.
+///
+/// # The gap this closes
+///
+/// [`Plane::FountainContent`] resolves [`Projection::Global`] at `federation`
+/// scope only when the authority
+/// [`is_trust_root`](AuthorityClass::is_trust_root). But a held corpus carries
+/// `content_id`, `corpus_kind` and `symbol_ids` — nothing that says whether it
+/// is accord-co-scrubbed — so CIRISEdge passed
+/// [`AuthorityClass::ProducerSteward`], the negative default, and **a genuine
+/// trust-root canonical corpus was under-advertised.** It cost nothing at the
+/// tiers in play (`Global` and `Cohort` both admit the broadcast there), but
+/// it was a wrong answer to a right question.
+///
+/// # Why this is a SEAM and not a column
+///
+/// Edge's constraint is correct and load-bearing: **a consumer must not infer
+/// an authority class from a corpus kind.** That leaves two shapes, and only
+/// one of them is available:
+///
+/// - **Carrying authority on the fountain row is refused.** The producer's
+///   hybrid signature covers
+///   [`FountainManifestV1::canonical_value`](crate::fountain::FountainManifestV1::canonical_value)
+///   in a LOCKED field order, and `V1` is frozen the moment the V084 migration
+///   shipped (shipped migrations are immutable). A field added to those signed
+///   bytes invalidates every stored manifest signature mesh-wide — the failure
+///   `types::signing_preimage_pin_tests` exists to make impossible by accident
+///   on the planes it covers.
+/// - **A producer-declared authority key in the signed `envelope` is refused
+///   too, and this is the subtler one.** The envelope is opaque JSON, so a new
+///   key inside it moves no preimage for already-stored rows — it is
+///   *mechanically* safe and *substantively* wrong.
+///   [`AuthorityClass::AccordCoScrub`] is precisely the class a producer must
+///   never self-declare: a corpus whose envelope said
+///   `"authority": "accord_co_scrub"` would confer trust-root reach on itself.
+///   That is the shape #543 enumerated (privilege a peer writes into its own
+///   registration) and the shape #659 hit (a gate reading the subject rather
+///   than the signer).
+///
+/// So the authority is DECLARED AT THE SEAM and re-derived from persist's own
+/// verified state on every call — never stored, never signed by the party it
+/// benefits, never inferred from `corpus_kind`. Note the signature: the only
+/// input is the publisher key. `corpus_kind` is not a parameter, so the
+/// inference edge was told not to make is not expressible here.
+///
+/// # What it resolves
+///
+/// [`is_trust_root`] — *is the publisher an accord-blessed canonical server or
+/// an accord-blessed build-signing pipeline, with neither role withdrawn* —
+/// which is already the exact predicate [`projection_for`]'s ✱ cells consult,
+/// so this seam introduces no second definition of "trust root". Withdrawal
+/// therefore wins here for free (v31.5.0 / #685): a quorum-withdrawn canonical
+/// publisher demotes to [`ProducerSteward`](AuthorityClass::ProducerSteward)
+/// and its corpus stops gossiping globally on the very next resolution.
+///
+/// Anything else — an unregistered publisher, a plain producer, a read that
+/// came back empty — is [`ProducerSteward`](AuthorityClass::ProducerSteward),
+/// the negative default. That IS the fail-closed answer on this plane:
+/// `ProducerSteward` never widens a cell in [`projection_for`], on any plane,
+/// so an unknown publisher can only ever narrow the audience.
+///
+/// [`SubstrateSelf`](AuthorityClass::SubstrateSelf) is deliberately
+/// unreachable: it is the substrate-self-report class (`transport:*`,
+/// `system:*`), and a fountain corpus is content — a claim about bytes, not a
+/// substrate reporting on itself.
+pub async fn holdings_authority(
+    directory: &dyn crate::federation::FederationDirectory,
+    publisher_key_id: &str,
+) -> Result<AuthorityClass, crate::federation::Error> {
+    if is_trust_root(directory, publisher_key_id).await? {
+        Ok(AuthorityClass::AccordCoScrub)
+    } else {
+        Ok(AuthorityClass::ProducerSteward)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2779,5 +3116,531 @@ mod subject_retainability_tests {
                  declare — a typo here withholds rows silently, because unknown is refused"
             );
         }
+    }
+}
+
+/// v37.1.0 (CIRISPersist#744) — **the recipient-set axis**, both directions
+/// and both ways of failing to know.
+///
+/// Every expectation below is a HAND-WRITTEN LITERAL. Nothing here derives an
+/// expected verdict from [`resolve_projection_recipients`],
+/// [`projection_for`] or [`holdings_authority`]; a list computed from the code
+/// it checks asserts nothing about that code.
+#[cfg(test)]
+mod recipient_set_tests {
+    use super::*;
+    use crate::federation::FederationDirectory;
+    use crate::store::memory::MemoryBackend;
+
+    /// Register `key_id` as a plain `node` with its deterministic hybrid
+    /// pubkeys — the ordinary, unprivileged publisher/peer of these witnesses.
+    /// Nothing here confers a role: a `node` is descriptive and unlocks
+    /// nothing (`AUTHORITY_CONFERRING_IDENTITY_TYPES` deliberately omits it).
+    async fn register_node(dir: &dyn FederationDirectory, key_id: &str) {
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
+        let now = chrono::Utc::now();
+        let rec = crate::federation::types::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        dir.put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+            .expect("a plain node registration is admissible");
+    }
+
+    /// The #744 fixture: a family whose roster seats exactly `PUBLISHER` and
+    /// `SEATED`, plus a registered `STRANGER` who is on no roster. Returns the
+    /// backend.
+    async fn holdings_fixture() -> MemoryBackend {
+        let backend = MemoryBackend::new();
+        for who in [PUBLISHER, SEATED, STRANGER] {
+            register_node(&backend, who).await;
+        }
+        crate::federation::operational::test_support::seed_test_family(
+            &backend,
+            FAMILY,
+            &[PUBLISHER.to_owned(), SEATED.to_owned()],
+            "quorum:2/3",
+        )
+        .await
+        .expect("seed the holding's own family");
+        backend
+    }
+
+    const FAMILY: &str = "recipients-744-family";
+    const PUBLISHER: &str = "recipients-744-publisher";
+    const SEATED: &str = "recipients-744-seated";
+    const STRANGER: &str = "recipients-744-stranger";
+
+    /// **Direction 1** — a peer IN the resolved set is eligible.
+    ///
+    /// `family` scope on the holdings plane resolves [`Projection::SelfOwn`],
+    /// and `SelfOwn`'s recipient set is the record's own roster. A seated
+    /// member is on it.
+    #[tokio::test]
+    async fn a_roster_peer_is_an_eligible_recipient_of_a_family_scoped_holding() {
+        let backend = holdings_fixture().await;
+        let v = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "family",
+            AuthorityClass::ProducerSteward,
+            false,
+            FAMILY,
+            SEATED,
+        )
+        .await
+        .expect("the verb never returns Err today");
+        assert_eq!(
+            v.basis,
+            RecipientBasis::OwnRoster,
+            "SelfOwn is roster-bounded"
+        );
+        assert!(
+            v.set_resolvable,
+            "this node holds the family, so it can judge"
+        );
+        assert!(
+            v.peer_in_set,
+            "a seated member is in the record's own roster"
+        );
+        assert!(v.may_advertise(), "a roster peer may be told we hold it");
+    }
+
+    /// **Direction 2, AND THE PLANE-SPECIFIC POINT.** A `SelfOwn` holdings
+    /// record must NOT be advertisable to a non-roster peer **even though this
+    /// node produced it**.
+    ///
+    /// This is the exact vacuity CIRISEdge hit: the swarm publisher is always
+    /// the producer of its own holdings, so *"advertise iff this node produced
+    /// it"* — the correct reading of `SelfOwn` on the ATTESTATION plane —
+    /// admits a family-scoped holding to every peer and closes nothing. A
+    /// witness that only tested the attestation-plane reading would PASS
+    /// against the broken behaviour, so this one deliberately makes the
+    /// publisher the record's own producer and still requires a refusal.
+    #[tokio::test]
+    async fn a_self_own_holding_is_withheld_from_a_non_roster_peer_even_though_this_node_produced_it(
+    ) {
+        let backend = holdings_fixture().await;
+        // PUBLISHER is on the roster: it is unambiguously the producer of its
+        // own holdings, which is what makes the producer predicate vacuous.
+        let producer_is_seated = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "family",
+            AuthorityClass::ProducerSteward,
+            false,
+            FAMILY,
+            PUBLISHER,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            producer_is_seated.may_advertise(),
+            "the trap must be reachable — if nothing were advertisable here, the \
+             refusal below would prove nothing"
+        );
+
+        let v = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "family",
+            AuthorityClass::ProducerSteward,
+            false,
+            FAMILY,
+            STRANGER,
+        )
+        .await
+        .expect("no Err");
+        assert_eq!(v.basis, RecipientBasis::OwnRoster);
+        assert!(
+            v.set_resolvable,
+            "the roster resolved — this is a JUDGED refusal, not an unknown"
+        );
+        assert!(
+            !v.peer_in_set,
+            "a stranger is not on the record's own roster"
+        );
+        assert!(
+            !v.may_advertise(),
+            "SelfOwn bounds the RECIPIENT SET, not only the advertiser — a \
+             family-scoped holding must not be announced to a peer with no \
+             business knowing it exists, however produced it"
+        );
+    }
+
+    /// **The third answer.** An unresolvable group fails closed AND stays
+    /// distinguishable from *"resolved, and this peer is not a member"*.
+    ///
+    /// Both refuse. An operator debugging a withheld advertisement needs to
+    /// know which, and a substrate reporting the second when it means the
+    /// first is claiming knowledge it does not have.
+    #[tokio::test]
+    async fn an_unresolvable_group_fails_closed_and_is_distinguishable_from_not_a_member() {
+        let backend = holdings_fixture().await;
+
+        let unknown_group = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "family",
+            AuthorityClass::ProducerSteward,
+            false,
+            "recipients-744-family-this-node-never-heard-of",
+            SEATED,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            !unknown_group.set_resolvable,
+            "a family this node holds no roster for is I-CANNOT-JUDGE"
+        );
+        assert_eq!(unknown_group.basis, RecipientBasis::GroupUnresolvable);
+        assert!(!unknown_group.may_advertise(), "fail closed");
+
+        let not_a_member = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "family",
+            AuthorityClass::ProducerSteward,
+            false,
+            FAMILY,
+            STRANGER,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            not_a_member.set_resolvable,
+            "the roster resolved — this refusal is JUDGED"
+        );
+        assert_eq!(not_a_member.basis, RecipientBasis::OwnRoster);
+        assert!(!not_a_member.may_advertise(), "fail closed");
+
+        assert_ne!(
+            unknown_group, not_a_member,
+            "COLLAPSING these two is the defect this test exists for: \
+             `cannot judge` and `judged, not seated` are different facts and \
+             must not be reported with the same verdict"
+        );
+    }
+
+    /// The `self` tier's roster is the subject's identity OCCURRENCES, and an
+    /// unregistered identity has none — `Ok(vec![])`, not an error. Without
+    /// the existence pre-check that reads as *"resolved, and the roster is
+    /// empty"*, which is the same collapse one tier down.
+    #[tokio::test]
+    async fn a_self_scoped_holding_for_an_unregistered_subject_cannot_be_judged() {
+        let backend = holdings_fixture().await;
+        let v = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "self",
+            AuthorityClass::ProducerSteward,
+            false,
+            "recipients-744-never-registered",
+            SEATED,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            !v.set_resolvable,
+            "an unregistered subject is I-CANNOT-JUDGE, never an empty roster"
+        );
+        assert_eq!(v.basis, RecipientBasis::GroupUnresolvable);
+        assert!(!v.may_advertise(), "fail closed");
+    }
+
+    /// **No scope-address table ⇒ withhold.** `species` / `biosphere` /
+    /// `federation` (and any scope this build has never heard of) project
+    /// `Cohort` for a plain producer, but persist holds no roster table for
+    /// them and the scope-address table is gated on CIRISVerify#259. The
+    /// answer with no table is *"I cannot judge"*, and the fail-closed
+    /// consequence is that nobody is told.
+    #[tokio::test]
+    async fn a_commons_scope_has_no_roster_table_and_withholds() {
+        let backend = holdings_fixture().await;
+        for scope in ["species", "biosphere", "federation", "some-future-scope"] {
+            let v = resolve_projection_recipients(
+                &backend,
+                Plane::FountainContent,
+                scope,
+                AuthorityClass::ProducerSteward,
+                false,
+                FAMILY,
+                SEATED,
+            )
+            .await
+            .expect("no Err");
+            assert_eq!(
+                v.basis,
+                RecipientBasis::NoRosterForScope,
+                "{scope}: persist holds roster tables for self/family/community/\
+                 affiliations and nothing else"
+            );
+            assert!(
+                !v.set_resolvable,
+                "{scope}: unresolved is unresolved — NOT 'every peer'"
+            );
+            assert!(!v.may_advertise(), "{scope}: fail closed");
+        }
+    }
+
+    /// A [`Projection::Global`] record reaches the whole federation, so the
+    /// set IS resolved and every peer is in it — including one on no roster.
+    /// If this cell withheld, a trust root's canonical corpus would stop
+    /// advertising, which is the opposite failure.
+    #[tokio::test]
+    async fn a_global_projection_admits_every_peer_unbounded() {
+        let backend = holdings_fixture().await;
+        let v = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "federation",
+            AuthorityClass::AccordCoScrub,
+            false,
+            FAMILY,
+            STRANGER,
+        )
+        .await
+        .expect("no Err");
+        assert_eq!(v.basis, RecipientBasis::Unbounded);
+        assert!(v.set_resolvable && v.peer_in_set);
+        assert!(v.may_advertise(), "Global bounds nobody out");
+    }
+
+    /// Role-keyed and subject-keyed audiences are NOT roster questions. The
+    /// verb says so explicitly rather than answering with a roster — and it
+    /// still refuses, so a consumer that ignores the basis cannot over-share.
+    #[tokio::test]
+    async fn capability_and_subject_audiences_are_not_roster_keyed() {
+        let backend = holdings_fixture().await;
+        for (dimension, scope) in [
+            ("trace:complete:v1", "species"),
+            ("scores:medical", "community"),
+        ] {
+            let v = resolve_projection_recipients(
+                &backend,
+                Plane::Attestation { dimension },
+                scope,
+                AuthorityClass::ProducerSteward,
+                false,
+                FAMILY,
+                SEATED,
+            )
+            .await
+            .expect("no Err");
+            assert_eq!(
+                v.basis,
+                RecipientBasis::NotRosterKeyed,
+                "{dimension} @ {scope}: the audience is a role / a subject grant"
+            );
+            assert!(
+                !v.may_advertise(),
+                "{dimension} @ {scope}: not-this-verb's-question still refuses"
+            );
+        }
+    }
+}
+
+/// v37.1.0 (CIRISPersist#744 item 2) — **the holdings seam's declared
+/// authority.** A trust-root corpus and a producer corpus must reach
+/// DIFFERENT projections, or the input is decorative.
+#[cfg(test)]
+mod holdings_authority_tests {
+    use super::*;
+    use crate::federation::FederationDirectory;
+    use crate::store::memory::MemoryBackend;
+
+    /// The baked genesis canonical — an accord-co-scrubbed trust root that
+    /// admits through the ordinary `check_canonical_role_admission` gate, so
+    /// nothing here fabricates conferral.
+    async fn seeded_canonical() -> (MemoryBackend, String) {
+        let backend = MemoryBackend::new();
+        backend
+            .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
+            .await
+            .expect("holders seed");
+        crate::federation::genesis::seed_family_and_canonical(&backend)
+            .await
+            .expect("a fresh node seeds the baked plane");
+        let canonical = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
+            .record
+            .key_id
+            .clone();
+        (backend, canonical)
+    }
+
+    /// THE ITEM-2 WITNESS. Same plane, same scope, same corpus — two
+    /// publishers, two projections. If these matched, the authority input
+    /// would be decorative and edge's `ProducerSteward` default would cost
+    /// nothing to keep.
+    #[tokio::test]
+    async fn a_trust_root_corpus_and_a_producer_corpus_reach_different_projections() {
+        let (backend, canonical) = seeded_canonical().await;
+
+        let root = holdings_authority(&backend, &canonical)
+            .await
+            .expect("resolve the seam");
+        assert_eq!(
+            root,
+            AuthorityClass::AccordCoScrub,
+            "the baked canonical publisher IS accord-co-scrubbed"
+        );
+
+        let plain = holdings_authority(&backend, "holdings-744-plain-producer")
+            .await
+            .expect("resolve the seam");
+        assert_eq!(
+            plain,
+            AuthorityClass::ProducerSteward,
+            "an unregistered publisher takes the negative default — which never \
+             widens a cell, so it is the fail-closed answer"
+        );
+
+        // The point of the seam: the two reach different projections.
+        assert_eq!(
+            projection_for(Plane::FountainContent, "federation", root, false),
+            Projection::Global,
+            "a trust root's federation-scoped corpus gossips to the commons"
+        );
+        assert_eq!(
+            projection_for(Plane::FountainContent, "federation", plain, false),
+            Projection::Cohort,
+            "a plain producer's does not"
+        );
+    }
+
+    /// Withdrawal wins, inherited from `is_trust_root`'s `_effective` reads
+    /// (#685). A quorum-withdrawn canonical publisher demotes on the very next
+    /// resolution — its corpus stops gossiping globally with no cache to
+    /// invalidate.
+    #[tokio::test]
+    async fn a_withdrawn_canonical_publisher_stops_being_a_trust_root_corpus() {
+        let (backend, canonical) = seeded_canonical().await;
+        assert_eq!(
+            holdings_authority(&backend, &canonical)
+                .await
+                .expect("seam"),
+            AuthorityClass::AccordCoScrub,
+            "the trap must be reachable — if it were already ProducerSteward, the \
+             demotion below would prove nothing"
+        );
+
+        backend
+            .record_canonical_withdrawal(&canonical, None, &"11".repeat(32))
+            .await
+            .expect("record the quorum withdrawal");
+
+        // THE DISJUNCTION IS REAL, and this leg records it rather than
+        // discovering it later. `is_trust_root` is `canonical OR infra:attest`,
+        // and the baked canonical carries BOTH (`roles` includes `infra:attest`
+        // — it is a build-signing pipeline as well as a bootstrap server). So a
+        // canonical withdrawal alone does NOT demote the corpus, and a
+        // consumer-side gate that consulted only the canonical tombstone would
+        // be the #441 one-surface shape a plane over.
+        assert_eq!(
+            holdings_authority(&backend, &canonical)
+                .await
+                .expect("seam"),
+            AuthorityClass::AccordCoScrub,
+            "the canonical role is withdrawn, but this publisher is ALSO an \
+             accord-blessed `infra:attest` pipeline — one tombstone does not \
+             retire a two-role trust root"
+        );
+
+        backend
+            .record_role_withdrawal(
+                crate::federation::types::roles::INFRA_ATTEST,
+                &canonical,
+                None,
+                &"22".repeat(32),
+            )
+            .await
+            .expect("record the infra:attest withdrawal");
+
+        assert_eq!(
+            holdings_authority(&backend, &canonical)
+                .await
+                .expect("seam"),
+            AuthorityClass::ProducerSteward,
+            "a withdrawn trust root does not keep gossiping its corpus globally"
+        );
+        assert_eq!(
+            projection_for(
+                Plane::FountainContent,
+                "federation",
+                holdings_authority(&backend, &canonical)
+                    .await
+                    .expect("seam"),
+                false
+            ),
+            Projection::Cohort,
+            "and the projection narrows with it"
+        );
+    }
+
+    /// End-to-end through the recipient verb: the authority the seam declares
+    /// is the difference between "every peer" and "withhold" on the same
+    /// record. This is the composition edge will actually run.
+    #[tokio::test]
+    async fn the_seam_decides_whether_a_federation_scoped_corpus_reaches_a_stranger() {
+        let (backend, canonical) = seeded_canonical().await;
+        let stranger = "holdings-744-stranger";
+
+        let as_root = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "federation",
+            holdings_authority(&backend, &canonical)
+                .await
+                .expect("seam"),
+            false,
+            "holdings-744-no-such-group",
+            stranger,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            as_root.may_advertise(),
+            "a trust root's federation corpus is Global — unbounded, no roster read"
+        );
+
+        let as_producer = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "federation",
+            holdings_authority(&backend, "holdings-744-plain-producer")
+                .await
+                .expect("seam"),
+            false,
+            "holdings-744-no-such-group",
+            stranger,
+        )
+        .await
+        .expect("no Err");
+        assert!(
+            !as_producer.may_advertise(),
+            "a plain producer's federation corpus is Cohort, and no scope-address \
+             table exists for that tier — so it withholds"
+        );
+        assert_eq!(as_producer.basis, RecipientBasis::NoRosterForScope);
     }
 }
