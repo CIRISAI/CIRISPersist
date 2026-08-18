@@ -568,8 +568,33 @@ pub fn projection_for(
             // decided by server). The HardCaseEvent shape EXACTLY: no live
             // cell widens past Cohort, because Global gossip of allegations is
             // a reputation directory.
+            //
+            // v37.0.1 (CIRISPersist#741) — THE COMMONS TIERS ARE ENUMERATED
+            // EXPLICITLY, and the enumeration is the point.
+            //
+            // Until this cut the ceiling was correct but INHERITED FROM THE
+            // WILDCARD: `SELF | FAMILY => SelfOwn`, everything else to `_`.
+            // That made this the ONLY family in the registry whose commons
+            // tiers are not spelled out — `Accord`, `ProvenanceBuildManifest`
+            // and `SubstrateHealth` each enumerate
+            // `SPECIES | BIOSPHERE | FEDERATION`. A consistency sweep (this
+            // repo ran four during v37) that "finished" Moderation to match
+            // its three neighbours would have written `=> Global` and lifted
+            // the allegation ceiling SILENTLY, because no test looked at that
+            // cell.
+            //
+            // Enumerated, the arms now say Cohort in the same breath as the
+            // families that say Global, so symmetry is no longer a reason to
+            // edit this. `moderation_holds_its_cohort_ceiling_at_every_commons_tier`
+            // and its tombstone twin red if anyone does anyway — the mechanism,
+            // where the comment above is only the reason.
             AttestationFamily::Moderation => match cohort_scope {
                 cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS
+                | cohort_scope::SPECIES
+                | cohort_scope::BIOSPHERE
+                | cohort_scope::FEDERATION => Projection::Cohort,
                 _ => Projection::Cohort,
             },
             // provenance:build_manifest:* — the binary-verification surface
@@ -1157,7 +1182,7 @@ mod tests {
     /// One representative dimension per decided Attestation family, plus one
     /// resolving the conservative default — LITERALS, never derived from the
     /// classifier under test.
-    const FAMILY_DIMS: [&str; 8] = [
+    const FAMILY_DIMS: [&str; 11] = [
         "consent:replication:v1",
         "trace:complete:v1",
         "scores:medical",
@@ -1165,6 +1190,29 @@ mod tests {
         "content_class:violence",
         "transport:reticulum",
         "system:audit_chain:hash_continuity",
+        // v37.0.1 (CIRISPersist#741) — THE THREE FAMILIES #713 DECIDED, ADDED
+        // THREE CUTS LATE.
+        //
+        // This list's doc says "one representative dimension per decided
+        // Attestation family", and for three releases it was not: `accord:*`
+        // (v36.2.0), `moderation:*` (v36.2.0) and `provenance:build_manifest:*`
+        // (v36.1.0) each got an explicit arm in `projection_for` and none was
+        // added here. So every property sweep built on `all_planes()` — the
+        // anti-rollback dominance invariant among them — silently never looked
+        // at the newest and least settled families in the registry.
+        //
+        // That is worse than a thin corpus: the doc CLAIMS one per decided
+        // family, so the sweep reads as total. Verified by mutation — lifting
+        // moderation's live commons cells to Global left
+        // `tombstone_ceiling_dominates_every_live_cell` GREEN, because the
+        // family it had just broken was not in its corpus.
+        //
+        // Adding a family's arm to `projection_for` and forgetting this list is
+        // the easy mistake, and nothing catches it. `every_decided_family_has_a_
+        // representative_dimension` below now does.
+        "accord:lifecycle:v1",
+        "moderation:rogue_action:v1",
+        "provenance:build_manifest:v1",
         "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
     ];
 
@@ -1189,6 +1237,79 @@ mod tests {
         v
     }
 
+    /// v37.0.1 (CIRISPersist#741) — **THE MECHANISM THAT KEEPS
+    /// [`FAMILY_DIMS`] HONEST.**
+    ///
+    /// `FAMILY_DIMS` is the corpus for every property sweep built on
+    /// [`all_planes`], including the anti-rollback dominance invariant. Its doc
+    /// claims one representative per decided family. For three releases that
+    /// was false — `accord:*`, `moderation:*` and `provenance:build_manifest:*`
+    /// each had an explicit arm in [`projection_for`] and no representative
+    /// here, so the sweeps never looked at them while reading as total.
+    ///
+    /// A doc claim is not a mechanism. This is the mechanism, and it works in
+    /// two directions at once:
+    ///
+    /// - The match below is **EXHAUSTIVE with no wildcard**. `AttestationFamily`
+    ///   is `#[non_exhaustive]`, which constrains downstream crates but not this
+    ///   one — so adding a variant **fails this build** until someone names its
+    ///   representative. That is a compile error, not a test failure: it cannot
+    ///   be skipped, filtered out, or lost in a feature set that does not run.
+    /// - Each named representative is then checked to be present in
+    ///   `FAMILY_DIMS` **and** to actually resolve to that family via
+    ///   [`attestation_family`] — so a typo'd or re-prefixed dimension cannot
+    ///   satisfy the gate while classifying as `Unknown`.
+    #[test]
+    fn every_decided_family_has_a_representative_dimension() {
+        // No wildcard arm. This is load-bearing — see the doc above.
+        fn representative(f: AttestationFamily) -> Option<&'static str> {
+            match f {
+                AttestationFamily::Consent => Some("consent:replication:v1"),
+                AttestationFamily::Trace => Some("trace:complete:v1"),
+                AttestationFamily::Scores => Some("scores:medical"),
+                AttestationFamily::Capacity => Some("capacity:integrity"),
+                AttestationFamily::ContentClass => Some("content_class:violence"),
+                AttestationFamily::SubstrateHealth => Some("transport:reticulum"),
+                AttestationFamily::Accord => Some("accord:lifecycle:v1"),
+                AttestationFamily::Moderation => Some("moderation:rogue_action:v1"),
+                AttestationFamily::ProvenanceBuildManifest => Some("provenance:build_manifest:v1"),
+                // The conservative default is not a decided family; its
+                // representative rides FAMILY_DIMS separately so the sweeps
+                // still exercise the fall-through.
+                AttestationFamily::Unknown => None,
+            }
+        }
+
+        for family in [
+            AttestationFamily::Consent,
+            AttestationFamily::Trace,
+            AttestationFamily::Scores,
+            AttestationFamily::Capacity,
+            AttestationFamily::ContentClass,
+            AttestationFamily::SubstrateHealth,
+            AttestationFamily::Accord,
+            AttestationFamily::Moderation,
+            AttestationFamily::ProvenanceBuildManifest,
+        ] {
+            let dim = representative(family).unwrap_or_else(|| {
+                panic!("{family:?} is a decided family and needs a representative dimension")
+            });
+            assert!(
+                FAMILY_DIMS.contains(&dim),
+                "{family:?}'s representative {dim:?} is not in FAMILY_DIMS, so every \
+                 property sweep over all_planes() is blind to that family while its \
+                 doc claims otherwise (CIRISPersist#741)"
+            );
+            assert_eq!(
+                attestation_family(dim),
+                family,
+                "{dim:?} is listed as {family:?}'s representative but classifies \
+                 differently — a representative that does not resolve to its own \
+                 family exercises the wrong arm"
+            );
+        }
+    }
+
     #[test]
     fn projection_self_and_family_are_publish_own() {
         // Every plane's self/family cells are SelfOwn — the structurally-
@@ -1202,6 +1323,122 @@ mod tests {
                     "{plane:?}/{s}"
                 );
             }
+        }
+    }
+
+    /// The five commons tiers, spelled out rather than derived from any list
+    /// the code under test also reads.
+    const COMMONS_TIERS: [&str; 5] = [
+        "community",
+        "affiliations",
+        "species",
+        "biosphere",
+        "federation",
+    ];
+
+    /// Every live `moderation:*` dimension. Hand-written: deriving this from
+    /// the registry would make the witness agree with whatever the registry
+    /// happens to say.
+    const MODERATION_DIMS: [&str; 5] = [
+        "moderation:rogue_action:v1",
+        "moderation:harassment:v1",
+        "moderation:conduct:v1",
+        "moderation:tone:v1",
+        "moderation:report:v1",
+    ];
+
+    const ALL_AUTHORITIES: [AuthorityClass; 4] = [
+        AuthorityClass::SelfIdentity,
+        AuthorityClass::AccordCoScrub,
+        AuthorityClass::SubstrateSelf,
+        AuthorityClass::ProducerSteward,
+    ];
+
+    /// v37.0.1 (CIRISPersist#741) — THE ALLEGATION CEILING, asserted rather
+    /// than inherited.
+    ///
+    /// Every live `moderation:*` dimension is an **adverse allegation about a
+    /// party** (`rogue_action`, `harassment`, `conduct`, `tone`, `report`), so
+    /// Global gossip of them is a reputation directory. The ceiling held
+    /// before this test, but only because the match arm fell through to `_` —
+    /// making Moderation the one family in the registry whose commons tiers
+    /// were not enumerated, while `Accord`, `ProvenanceBuildManifest` and
+    /// `SubstrateHealth` each spell out `SPECIES | BIOSPHERE | FEDERATION`.
+    ///
+    /// A consistency sweep that "finished" Moderation to match its neighbours
+    /// would have written `=> Global` and lifted the ceiling with every test
+    /// still green, because none looked at this cell.
+    ///
+    /// **No authority widens it**, which is the second half: a trust root can
+    /// carry a key record or a build manifest to the whole federation, and it
+    /// still may not carry an allegation past the cohort.
+    #[test]
+    fn moderation_holds_its_cohort_ceiling_at_every_commons_tier() {
+        for dim in MODERATION_DIMS {
+            let plane = Plane::Attestation { dimension: dim };
+            for tier in COMMONS_TIERS {
+                for authority in ALL_AUTHORITIES {
+                    assert_eq!(
+                        projection_for(plane, tier, authority, false),
+                        Projection::Cohort,
+                        "LIVE allegation ceiling breached: {dim} at {tier} under \
+                         {authority:?} projected past Cohort. Every moderation:* \
+                         dimension is an adverse allegation about a party; Global \
+                         gossip of allegations is a reputation directory \
+                         (CIRISPersist#741, decided v36.2.0 by CIRISServer)."
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tombstone half, and the sharper one: **a withdrawal must not
+    /// republish the allegation to parties who never held it.**
+    ///
+    /// Note the deliberate asymmetry with `Accord` directly above it in
+    /// [`projection_for`], whose row-max IS unconditionally Global precisely
+    /// because its live commons cells are Global — a tombstone retracting a
+    /// partial must reach everywhere the partial could have assembled. Two
+    /// families, opposite tombstone rules, one principle: the retraction
+    /// travels exactly as far as the thing it retracts, never further.
+    #[test]
+    fn moderation_tombstone_never_travels_further_than_the_allegation() {
+        for dim in MODERATION_DIMS {
+            let plane = Plane::Attestation { dimension: dim };
+            for tier in COMMONS_TIERS {
+                for authority in ALL_AUTHORITIES {
+                    assert_eq!(
+                        projection_for(plane, tier, authority, true),
+                        Projection::Cohort,
+                        "TOMBSTONE ceiling breached: a withdrawal of {dim} at {tier} \
+                         under {authority:?} projected past Cohort, republishing the \
+                         allegation to parties who never held it (CIRISPersist#741)."
+                    );
+                }
+            }
+        }
+    }
+
+    /// ANTI-VACUITY. The two ceiling witnesses above assert `== Cohort`
+    /// everywhere they look, so a `projection_for` that had rotted into
+    /// returning `Cohort` unconditionally would satisfy both and prove
+    /// nothing.
+    ///
+    /// This pins that the same harness — same tiers, same call shape — does
+    /// observe `Global` on a family that is supposed to reach it. If this
+    /// fails, the ceiling tests above are no longer evidence of anything.
+    #[test]
+    fn the_ceiling_harness_can_actually_observe_global() {
+        let accord = Plane::Attestation {
+            dimension: "accord:lifecycle:v1",
+        };
+        for tier in ["species", "biosphere", "federation"] {
+            assert_eq!(
+                projection_for(accord, tier, AuthorityClass::ProducerSteward, false),
+                Projection::Global,
+                "anti-vacuity: accord:* must project Global at {tier}; if it does \
+                 not, the moderation ceiling assertions are vacuous"
+            );
         }
     }
 
