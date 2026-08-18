@@ -3315,6 +3315,94 @@ pub mod test_support {
         directory.put_family_local(family).await
     }
 
+    /// v36.2.0 (CIRISPersist#713) — **relay eligibility for an `accord:*`
+    /// object: seated signer AND a live edge from THIS node.**
+    ///
+    /// Four legs, because each is a different way to be wrong:
+    ///
+    /// - **A** seated signer + live edge → relay.
+    /// - **B** seated signer, NO edge → refuse. CC 4.2.1: *"a node that never
+    ///   trusted the accord … is simply not reached."* A node that never
+    ///   granted the root has no business carrying its traffic — this is the
+    ///   leg a `Global` projection would have run over.
+    /// - **C** live edge, signer NOT seated → refuse. Trusting a root does not
+    ///   make every key that names it authoritative.
+    /// - **D** a root this node holds no family for → `roster_resolvable:
+    ///   false`, refuse. *"I cannot judge"* is distinct from *"not seated"*,
+    ///   and both refuse — but an operator must be able to tell them apart.
+    pub async fn exercise_accord_relay_eligibility(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{active_roster_of, may_relay_accord_object};
+        use crate::federation::types::identity_type;
+
+        let accord = format!("{tag}-relay-accord");
+        let relayer = format!("{tag}-relay-node");
+        let stranger = format!("{tag}-relay-stranger");
+        let outsider = format!("{tag}-relay-outsider");
+        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-relay-h{i}")).collect();
+
+        for who in holders.iter().chain([&relayer, &stranger, &outsider]) {
+            register_typed_key(directory, who, identity_type::NODE).await?;
+        }
+        seed_test_family(directory, &accord, &holders, "quorum:2/3").await?;
+
+        // The roster resolves, revocation-folded, WITHOUT a caller supplying it.
+        let roster = active_roster_of(directory, &accord)
+            .await?
+            .expect("a seeded family must resolve its own roster");
+        assert_eq!(roster.len(), holders.len(), "({tag}) roster size");
+        for h in &holders {
+            assert!(roster.contains(h), "({tag}) {h} must be seated");
+        }
+
+        // (B) seated signer, but this node has NOT granted the root.
+        let before = may_relay_accord_object(directory, &relayer, &holders[0], &accord).await?;
+        assert!(before.signer_seated, "({tag}) B: signer is seated");
+        assert!(!before.edge_exists, "({tag}) B: no edge yet");
+        assert!(
+            !before.may_relay(),
+            "({tag}) B: a node that never granted the root must NOT relay its traffic \
+             (CC 4.2.1 — simply not reached)"
+        );
+
+        emit_trust_edge(directory, &relayer, &accord, None).await?;
+
+        // (A) seated signer + live edge.
+        let ok = may_relay_accord_object(directory, &relayer, &holders[0], &accord).await?;
+        assert!(
+            ok.may_relay(),
+            "({tag}) A: seated signer + live edge relays"
+        );
+
+        // (C) live edge, unseated signer.
+        let unseated = may_relay_accord_object(directory, &relayer, &stranger, &accord).await?;
+        assert!(unseated.edge_exists, "({tag}) C: edge still live");
+        assert!(!unseated.signer_seated, "({tag}) C: stranger is not seated");
+        assert!(
+            !unseated.may_relay(),
+            "({tag}) C: trusting a root does not make every key naming it authoritative"
+        );
+
+        // (D) a root this node holds no family for — unjudgeable, and DISTINCT
+        // from an empty roster.
+        let unknown = format!("{tag}-relay-unknown-root");
+        assert!(
+            active_roster_of(directory, &unknown).await?.is_none(),
+            "({tag}) D: an unheld root resolves None, never Some(vec![])"
+        );
+        let cannot_judge =
+            may_relay_accord_object(directory, &relayer, &outsider, &unknown).await?;
+        assert!(
+            !cannot_judge.roster_resolvable,
+            "({tag}) D: roster_resolvable must say I-cannot-judge"
+        );
+        assert!(!cannot_judge.may_relay(), "({tag}) D: fail closed");
+
+        Ok(())
+    }
+
     /// v24.0.0 (CIRISPersist#557) — **the family trust root, end to end, on any
     /// backend.** The mesh's root authority is a THRESHOLD, and this body is the
     /// proof.

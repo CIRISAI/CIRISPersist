@@ -538,6 +538,40 @@ pub fn projection_for(
                 cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
                 _ => Projection::Subject,
             },
+            // accord:* — co-scrub ASSEMBLY (v36.2.0, decided by server).
+            // Global UNCONDITIONALLY at the commons tiers, not ✱: a partial
+            // quorum object is emitted pre-authority and becomes the root's
+            // act only by aggregating, so ✱ would be a bootstrap paradox.
+            //
+            // GLOBAL HERE IS CARRIAGE, NOT REACH, and that distinction is what
+            // reconciles this row with CC 4.2.1's "reach is consent-scoped":
+            // *"a node that never trusted the accord, or has already cut the
+            // edge, is simply not reached."* Projection answers who may HOLD
+            // the bytes so the quorum can assemble across an unknown cohort
+            // span; whether a given node may CARRY a particular object is a
+            // per-node relational question no cohort value can express, and it
+            // is answered by `trust_root::may_relay_accord_object` — seated
+            // signer AND a live `delegates_to(self -> root)`. Without that
+            // predicate this row WOULD over-deliver and the clause would be
+            // violated; with it, Global is the widest the substrate offers and
+            // the relay gate is what narrows it to those who granted the root.
+            // Sub-commons keeps the standard shape.
+            AttestationFamily::Accord => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
+                cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
+                    Projection::Global
+                }
+                _ => Projection::Cohort,
+            },
+            // moderation:* — adverse allegations about a party (v36.2.0,
+            // decided by server). The HardCaseEvent shape EXACTLY: no live
+            // cell widens past Cohort, because Global gossip of allegations is
+            // a reputation directory.
+            AttestationFamily::Moderation => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                _ => Projection::Cohort,
+            },
             // provenance:build_manifest:* — the binary-verification surface
             // (v36.1.0, #713, decided by edge). The KeyRecord shape, ✱ at
             // EVERY commons tier: a trust-root-blessed manifest must be
@@ -651,6 +685,67 @@ pub enum AttestationFamily {
     /// [`SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY`] — substrate self-reports whose
     /// SubstrateSelf commons cells are Global.
     SubstrateHealth,
+    /// v36.2.0 (CIRISPersist#713) — `accord:*`, decided by CIRISServer.
+    /// **`Global` UNCONDITIONALLY at every commons tier — not ✱.**
+    ///
+    /// The operative reason is co-scrub ASSEMBLY, not artifact-vs-subject. An
+    /// accord act is not a single emission: it is m-of-n over the live active
+    /// roster, and it comes into being by **partial quorum objects replicating
+    /// until they assemble**. The co-scrubbers are independent holders by
+    /// construction — that independence IS the security property of an m-of-n
+    /// kill switch — so they are deliberately not co-located in one cohort,
+    /// and the roster is dynamic: which cohorts it spans is **not knowable at
+    /// emit time** by the node emitting a partial. Cap this family at `Cohort`
+    /// and partials from different cohorts never meet: the quorum cannot
+    /// assemble and the kill switch is inoperable BY CONSTRUCTION, silently.
+    ///
+    /// **Why ✱ is the wrong shape, and this is the subtle part.** ✱ suits a
+    /// family whose rows are ALREADY the trust root's act when emitted
+    /// (`KeyRecord`, `provenance:build_manifest:*`). A partial quorum object
+    /// is emitted PRE-AUTHORITY and becomes authoritative by aggregation, so
+    /// ✱ is a bootstrap paradox — the object would need quorum to project
+    /// widely, and need to project widely to reach quorum. As far as anyone
+    /// has found, this is the only decided family of that second kind.
+    ///
+    /// Forgery is closed at the correct layer and does not need projection's
+    /// help: admission requires `identity_type = accord_holder`, which is
+    /// `HardwareAttested` — established by registration-time ceremony. A
+    /// narrower projection would be a weaker second forgery gate that breaks
+    /// assembly.
+    ///
+    /// **Confidentiality is answered elsewhere, deliberately.** An in-flight
+    /// partial does disclose that an accord act is being considered, possibly
+    /// against a named node, before any quorum exists. Projection is the wrong
+    /// lever: it decides who may HOLD the bytes, never who may READ them. The
+    /// partial must reach a roster whose cohort span is unknowable, so its
+    /// projection must be Global; legibility is limited by keeping a partial
+    /// ENCRYPTED UNTIL QUORUM. Narrowing here would buy weaker confidentiality
+    /// AND break assembly.
+    ///
+    /// Stem is `accord:` — the whole reserved prefix the co-scrub argument
+    /// covers. It does NOT extend to its `RESERVED_CLASS_DIMENSION_PREFIXES`
+    /// sibling `objection:`, which stays conservative until argued (the
+    /// `provenance:build_manifest:` / `provenance:` precedent).
+    Accord,
+    /// v36.2.0 (CIRISPersist#713) — `moderation:*`, decided by CIRISServer.
+    /// **`Cohort` — the same value the conservative default gave, but now
+    /// ARGUED rather than inherited**, so the row stops reading as "nobody has
+    /// looked."
+    ///
+    /// Every live dimension (`moderation:rogue_action:v1`, `:harassment:v1`,
+    /// `:conduct:v1`, `:tone:v1`, `:report`) is an **adverse allegation about
+    /// a party** — precisely the [`Plane::HardCaseEvent`] shape, which v35
+    /// already decided: Global gossip of adverse statements is a REPUTATION
+    /// DIRECTORY, so no live cell widens past `Cohort`. The Attestation-plane
+    /// family carrying allegations must not project wider than the
+    /// object-plane row carrying them.
+    ///
+    /// Contextual integrity gives the same answer directly: the information
+    /// type is an allegation about a person, and what makes its transmission
+    /// appropriate is the community adjudicating conduct that occurred within
+    /// it. Global gossip re-purposes it into a portable reputation record —
+    /// the surveillance surface #713 exists to close.
+    Moderation,
     /// v36.1.0 (CIRISPersist#713) — `provenance:build_manifest:*`, the
     /// BINARY-VERIFICATION surface, decided by edge after v36.0.0 shipped it
     /// under the conservative default.
@@ -730,6 +825,16 @@ pub fn attestation_family(dimension: &str) -> AttestationFamily {
     // namespace with one that was.
     if under(dimension, "provenance:build_manifest:") {
         return AttestationFamily::ProvenanceBuildManifest;
+    }
+    // v36.2.0 (#713, decided by CIRISServer). `accord:` is the WHOLE reserved
+    // prefix the co-scrub-assembly argument covers; its
+    // RESERVED_CLASS_DIMENSION_PREFIXES sibling `objection:` is deliberately
+    // NOT matched here and stays conservative until argued.
+    if under(dimension, "accord:") {
+        return AttestationFamily::Accord;
+    }
+    if under(dimension, "moderation:") {
+        return AttestationFamily::Moderation;
     }
     AttestationFamily::Unknown
 }
@@ -860,6 +965,16 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
                     Projection::Cohort
                 }
             }
+            // Row-max, and UNCONDITIONAL for accord: its live commons cells
+            // are Global for every authority, so a tombstone that retracts a
+            // partial must reach everywhere the partial could have assembled.
+            AttestationFamily::Accord => Projection::Global,
+            // Row-max: moderation never widens past Cohort live, so its
+            // retraction does not either. A withdrawal of an allegation must
+            // not travel further than the allegation did — widening it would
+            // republish the allegation to parties who never held it, which is
+            // the tombstone principle this cut already recorded.
+            AttestationFamily::Moderation => Projection::Cohort,
             AttestationFamily::Unknown => Projection::Cohort,
         },
     }
@@ -1455,6 +1570,113 @@ mod tests {
         );
     }
 
+    /// v36.2.0 (#713) — `accord:*` is `Global` UNCONDITIONALLY at the commons
+    /// tiers, and specifically **not ✱**. LITERALS.
+    ///
+    /// The ✱ distinction is the whole point and the easy thing to get wrong
+    /// by analogy with `KeyRecord` / `provenance:build_manifest:*`. A partial
+    /// quorum object is emitted PRE-AUTHORITY and becomes the trust root's act
+    /// only by aggregating, so ✱ would be a bootstrap paradox: it would need
+    /// quorum to project widely and need to project widely to reach quorum.
+    /// The non-trust-root assertions below are therefore the load-bearing
+    /// ones — under ✱ they would read `Cohort` and the kill switch would be
+    /// inoperable by construction, silently.
+    #[test]
+    fn accord_is_global_unconditionally_not_star_713() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
+        use Projection::{Cohort, Global, SelfOwn};
+        let plane = Plane::Attestation {
+            dimension: "accord:halt:v1",
+        };
+        assert_eq!(
+            projection_for(plane, "self", ProducerSteward, false),
+            SelfOwn
+        );
+        assert_eq!(
+            projection_for(plane, "community", ProducerSteward, false),
+            Cohort
+        );
+        for scope in ["species", "biosphere", "federation"] {
+            for authority in [AccordCoScrub, ProducerSteward] {
+                assert_eq!(
+                    projection_for(plane, scope, authority, false),
+                    Global,
+                    "a partial from {authority:?} at {scope} must reach a roster whose cohort \
+                     span is unknowable at emit time — under ✱ this reads Cohort for a \
+                     non-root emitter and the quorum never assembles"
+                );
+            }
+        }
+        // The ceiling is unconditional too: a tombstone retracting a partial
+        // must reach everywhere the partial could have assembled.
+        assert_eq!(tombstone_ceiling(plane, ProducerSteward), Global);
+
+        // The stem is `accord:` ONLY. Its reserved-prefix sibling stays
+        // conservative until argued.
+        let sibling = Plane::Attestation {
+            dimension: "objection:tier5:v1",
+        };
+        assert_eq!(
+            projection_for(sibling, "federation", ProducerSteward, false),
+            Cohort,
+            "objection:* is the undecided half of RESERVED_CLASS_DIMENSION_PREFIXES"
+        );
+    }
+
+    /// v36.2.0 (#713) — `moderation:*` never widens past `Cohort`: the
+    /// `HardCaseEvent` shape, because every live dimension is an adverse
+    /// allegation about a party and Global gossip of those is a reputation
+    /// directory. LITERALS.
+    ///
+    /// Same VALUE the conservative default gave, different STATUS — this row
+    /// is argued. The assertions are identical either way, which is exactly
+    /// why the distinction has to live in the doc and the CHANGELOG rather
+    /// than in a test: no witness can tell "decided Cohort" from "defaulted
+    /// Cohort".
+    #[test]
+    fn moderation_never_widens_past_cohort_713() {
+        use AuthorityClass::{AccordCoScrub, ProducerSteward};
+        use Projection::{Cohort, SelfOwn};
+        for dim in [
+            "moderation:rogue_action:v1",
+            "moderation:harassment:v1",
+            "moderation:conduct:v1",
+            "moderation:tone:v1",
+        ] {
+            let plane = Plane::Attestation { dimension: dim };
+            assert_eq!(
+                projection_for(plane, "self", ProducerSteward, false),
+                SelfOwn,
+                "{dim}"
+            );
+            assert_eq!(
+                projection_for(plane, "family", ProducerSteward, false),
+                SelfOwn,
+                "{dim}"
+            );
+            for scope in [
+                "community",
+                "affiliations",
+                "species",
+                "biosphere",
+                "federation",
+            ] {
+                for authority in [AccordCoScrub, ProducerSteward] {
+                    assert_eq!(
+                        projection_for(plane, scope, authority, false),
+                        Cohort,
+                        "{dim} at {scope}/{authority:?}: an allegation about a party must not \
+                         become a portable reputation record"
+                    );
+                }
+            }
+            // And the retraction does not travel further than the allegation
+            // did — widening it would republish the allegation to parties who
+            // never held it.
+            assert_eq!(tombstone_ceiling(plane, AccordCoScrub), Cohort, "{dim}");
+        }
+    }
+
     /// v36.1.0 (#713) — `provenance:build_manifest:*` is ✱ at EVERY commons
     /// tier, not just federation. LITERALS.
     ///
@@ -1662,7 +1884,12 @@ mod tests {
             // anyway: it pins that the DEEPER stem earned the row and the
             // namespace did not inherit it.
             "provenance:signature_chain:v1",
-            "moderation:harassment",
+            // v36.2.0 (#713) — `moderation:harassment` was HERE until server
+            // decided it: Cohort, ARGUED (same value, different status). Its
+            // replacement is `objection:*`, the genuinely-undecided member of
+            // the reserved-prefix pair — the co-scrub argument covers
+            // `accord:` only.
+            "objection:tier5:v1",
             "trace_manifest:v1", // trace-ADJACENT but not trace:* — undecided
             "capacity_assurance:rung_3", // capacity-ADJACENT but not capacity:*
             "brand_new_scoring_family:leaf",

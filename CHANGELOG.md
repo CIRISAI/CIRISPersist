@@ -5,6 +5,104 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [36.2.0] - 2026-08-17
+
+**The relay unlock.** A node can now determine, for itself, whether it may relay
+an `accord:*` object — and that predicate is what makes the `accord:*`
+projection row constitutionally sound rather than over-broad.
+
+### Added — `active_roster_of` and `may_relay_accord_object` (#713)
+
+Every roster-parameterized resolver in `trust_root` took
+`accord_roster_key_ids` as a **caller-supplied parameter**, and the production
+wrappers filled it from `accord_holder_roster_key_ids()` — the node's own
+genesis-baked holders. Correct for this node's own accord; it answers nothing
+about anyone else's. But CC 4.2.3 is explicit that the roster is an **instance
+parameter** (*"another instantiation of this form names its own three"*), and
+CC 4.2.6 makes it a growable M-of-N family whose seats move through the same
+membership-change `supersedes` machinery as any other family. "The roster" is
+not one baked list; it is a question asked **of a root**.
+
+- **`active_roster_of(dir, root_ref) -> Option<Vec<String>>`** — the active,
+  revocation-folded roster of an **arbitrary** trust root, resolved from the
+  family that root charters (a `trust_charter` names its family in
+  `attested_key_id`). It delegates the fold to `active_family_members` rather
+  than re-deriving it — one implementation of "who is seated", per #686.
+  **`None` (cannot judge) is deliberately distinct from `Some(vec![])`
+  (nobody seated)**, and a caller must not collapse them.
+- **`may_relay_accord_object(dir, self_key, signer_key, root_ref) ->
+  RelayVerdict`** — both legs, fail-closed: the signer holds a live seat, AND
+  this node holds a live `delegates_to(self → root)`. The verdict is typed
+  rather than a bool because `roster_resolvable` / `signer_seated` /
+  `edge_exists` are three different things to go fix.
+
+Leg two is the substrate half of CC 4.2.1's *"Reach is consent-scoped
+(normative)"*: the accord's reach is *"exactly those holding a live
+`delegates_to(user → accord)`"*, and *"a node that never trusted the accord, or
+has already cut the edge, is simply not reached."* The Constitution's framing is
+that the accord is **a** trust root, not **the** trust root — *"an emergency
+brake they granted, not a power imposed on everyone."*
+
+**What it deliberately does NOT answer: whether this node is BOUND by a halt.**
+That question has a different clock — CC 4.2.1 binds against the edge set pinned
+at the invocation's `asserted_at`, because *"exit is prospective, never
+retroactive"* — while relay reads live state, so cutting an edge stops relaying
+immediately while leaving you bound by a halt already invoked. One name, two
+clocks; fusing them would be an axis fusion.
+
+Four legs on **memory, sqlite and postgres**: seated+edge relays; **seated but
+no edge refuses** (the leg a bare `Global` projection runs straight over); edge
+but unseated refuses; an unheld root is unjudgeable and refuses. Three
+mutations, three kills — dropping the consent leg, dropping the seat check, and
+collapsing cannot-judge into empty-roster each red their own leg, and the first
+one's failure message names the clause it violates.
+
+### The `accord:*` and `moderation:*` rows, decided (#713)
+
+Both were on the conservative row awaiting CIRISServer.
+
+**`accord:*` → `Global` unconditionally at the commons tiers — and NOT ✱.** The
+operative reason is co-scrub **assembly**: an accord act is m-of-n over the live
+roster and comes into being by partial quorum objects replicating until they
+assemble. ✱ suits a family whose rows are *already* the root's act when emitted
+(`KeyRecord`, `provenance:build_manifest:*`); a partial is emitted
+**pre-authority** and becomes authoritative by aggregation, so ✱ is a bootstrap
+paradox — it would need quorum to project widely and need to project widely to
+reach quorum. As far as anyone has found, this is the only decided family of
+that second kind.
+
+**Global here is CARRIAGE, not REACH**, and that is what reconciles the row with
+CC 4.2.1. Projection decides who may **hold** the bytes so a quorum can assemble
+across a cohort span unknowable at emit time; whether a given node may **carry** a
+particular object is the per-node relational question above. Without
+`may_relay_accord_object` this row would over-deliver and the clause would be
+violated — the row and the predicate ship together for that reason.
+
+Stem is `accord:` — not its `RESERVED_CLASS_DIMENSION_PREFIXES` sibling
+`objection:`, which stays conservative until argued.
+
+**`moderation:*` → `Cohort`. Decided, not inherited.** Same value the default
+gave, different status. Every live dimension (`rogue_action`, `harassment`,
+`conduct`, `tone`, `report`) is an **adverse allegation about a party** —
+precisely the `HardCaseEvent` shape v35 already decided: Global gossip of those
+is a **reputation directory**. The Attestation-plane family carrying allegations
+must not project wider than the object-plane row carrying them, and the tombstone
+ceiling stays `Cohort` too: a withdrawal must not republish the allegation to
+parties who never held it.
+
+No witness can distinguish "decided Cohort" from "defaulted Cohort", which is
+exactly why that distinction lives in the doc and here rather than in a test.
+
+### Also
+
+An argument CIRISServer drafted and **withdrew** is recorded because it is
+plausible and someone will re-derive it: that capping `accord:*` would strand the
+un-halt and make a tier-5 halt permanently irreversible. Their own source refuses
+it — replication is pull-based and a halted node pulls nothing; the release path
+is offline by design (file drop, USB, QR, operator paste) and the halt latch
+records its own release binding on disk. **Projection has no bearing on halt
+recovery in either direction.**
+
 ## [36.1.0] - 2026-08-17
 
 **MINOR, not a patch: this adds public API.** `attestation_family()` and

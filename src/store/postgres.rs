@@ -22020,6 +22020,26 @@ mod tests {
     /// or buy a quorum), the family halt latch gating the family root, and the
     /// threshold re-derived from THIS node's roster rather than the carried
     /// policy string.
+    /// v36.2.0 (CIRISPersist#713) — relay eligibility for an `accord:*` object
+    /// on POSTGRES, the backend consumers deploy on: a seated signer AND a live
+    /// edge from THIS node, four legs including no-edge-no-relay.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn accord_relay_eligibility_postgres_713() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_accord_relay_eligibility(
+            &backend,
+            &format!("pg713-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("713 relay eligibility exercise");
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn family_trust_root_works_on_postgres_557() {
