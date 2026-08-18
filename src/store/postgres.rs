@@ -30889,11 +30889,22 @@ mod tests {
             weight: Some(1.0),
             asserted_at: chrono::Utc::now(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "dimension": dimension,
-                "score": 1.0,
-                "confidence": 0.9,
-            }),
+            attestation_envelope: {
+                let mut env = serde_json::json!({
+                    "dimension": dimension,
+                    "score": 1.0,
+                    "confidence": 0.9,
+                });
+                // v37.0.0 (CIRISPersist#733) — an `accord:*` DIMENSION row names
+                // its own accord or `check_accord_root_binding` refuses it. The
+                // accord legs assert the CC 3.4.1 emitter-class rule, so their
+                // rows must be otherwise well-formed or those assertions would
+                // be measuring a neighbouring gate.
+                if dimension.starts_with("accord:") {
+                    env["accord_root"] = serde_json::json!("fixture-accord-root");
+                }
+                env
+            },
             original_content_hash: "abc123".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,
@@ -33414,9 +33425,19 @@ mod tests {
             .unwrap();
     }
 
+    /// v37.0.0 — the CEG 0.1 ladder shape `attestation:l{N}:{mechanism}` is
+    /// REMOVED, and the postgres write door refuses it **by its own name**.
+    ///
+    /// This test was the inverse until this cut
+    /// (`..._admits_deprecated_attestation_ladder_in_transition`). Asserting
+    /// merely that the write failed would pass for the wrong reason — deleting
+    /// the admit-branch alone refuses the row as `missing_version_segment`, an
+    /// instruction that would not make it admissible. So the assertion is on
+    /// the specific error, its `kind()` token, and the absence of a stored row;
+    /// and the canonical form is still asserted to admit, on the same backend.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn pg_put_attestation_admits_deprecated_attestation_ladder_in_transition() {
+    async fn pg_put_attestation_refuses_removed_attestation_ladder_shape() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -33446,19 +33467,71 @@ mod tests {
             })
             .await
             .unwrap();
-        // Deprecated 0.1 shape — admitted during transition without
-        // `:v[0-9]+` segment.
-        let att = pg_scores_attestation(&steward, &agent_k, &steward, "attestation:l1:self_verify");
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att })
-            .await
-            .unwrap();
-        // Canonical 0.2 shape.
+        // The REMOVED CEG 0.1 shape — refused by name, on two rungs so the
+        // witness is not pinned to `l1`, and nothing is stored.
+        for dim in [
+            "attestation:l1:self_verify",
+            "attestation:l5:agent_integrity",
+        ] {
+            let att = pg_scores_attestation(&steward, &agent_k, &steward, dim);
+            let id = att.attestation_id.clone();
+            let err = backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: att })
+                .await
+                .expect_err("the removed CEG 0.1 ladder shape must not be admitted");
+            assert!(
+                matches!(
+                    err,
+                    crate::federation::Error::DeprecatedAttestationLadderForm { .. }
+                ),
+                "expected DeprecatedAttestationLadderForm for {dim}, got {err:?}"
+            );
+            assert_eq!(
+                err.kind(),
+                "federation_deprecated_attestation_ladder_form",
+                "the telemetry token for {dim}"
+            );
+            assert!(
+                backend.get_attestation(&id).await.unwrap().is_none(),
+                "a refused row must not be stored ({dim})"
+            );
+        }
+
+        // Canonical 0.2 shape — still admitted. Without this leg a refuse-branch
+        // that matched `attestation:` broadly would look correct.
         let att = pg_scores_attestation(&steward, &agent_k, &steward, "attestation:self_verify");
+        let canonical_id = att.attestation_id.clone();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
-            .unwrap();
+            .expect("the canonical mechanism form must still be admitted");
+        assert!(
+            backend
+                .get_attestation(&canonical_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the canonical row must be stored"
+        );
+
+        // The neighbouring gate keeps its own population: a genuinely
+        // versionless dimension is still `missing_version_segment`.
+        let att = pg_scores_attestation(
+            &steward,
+            &agent_k,
+            &steward,
+            "attestation:some_other_mechanism",
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .expect_err("a versionless dimension is still refused");
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "missing_version_segment");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
     }
 
     // ─── v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2) — holds_bytes ──
@@ -40546,6 +40619,33 @@ mod tests {
             serde_json::to_vec(&mine[0].community).unwrap(),
             "returned SignedCommunity must be byte-identical to what was put"
         );
+    }
+
+    /// **CIRISPersist#734 — whose key may assert a location.** Subject and
+    /// live delegate admit; a REGISTERED third party with a VALID signature is
+    /// refused; retracted / expired delegations are refused as verdicts; and
+    /// the out-of-order case is refused as retryable and then admits. On
+    /// postgres — the backend this repo's seven-instance history says a
+    /// memory-only witness would have missed.
+    ///
+    /// The tag carries a uuid so repeated runs against a live database do not
+    /// collide, and it is placed AFTER the distinguishing prefix inside the
+    /// exercise because `seed_for` truncates key ids at 32 bytes.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn location_proof_authority_is_subject_or_delegate_pg_734() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tag = format!("pg734{}", &uuid_like()[..8]);
+        crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
+            &backend, &tag,
+        )
+        .await
+        .expect("734 location-proof authority exercise");
     }
 
     /// `list_signed_location_proofs_since` on postgres: signed-only,

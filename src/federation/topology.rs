@@ -484,6 +484,184 @@ pub async fn build_delegation_graph(
     })
 }
 
+// ─── 2b. Outbound delegate standing ───────────────────────────────
+
+/// Why [`live_delegate_standing`] refused — or that it did not.
+///
+/// The three refusing variants are NOT interchangeable, and the distinction is
+/// the operationally load-bearing part of this type. [`Self::NoEdge`] means
+/// *this node has not seen a `delegates_to` at all*, which under out-of-order
+/// federation delivery is indistinguishable from *it has not arrived yet*; the
+/// other two mean *the edge is here and it is dead*, which is a verdict no
+/// retry changes. A caller that collapses them re-creates the deferred-window
+/// class this repo keeps re-finding: a legitimate row permanently dropped
+/// because the write door was asked in the window where its authorizer was
+/// absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateStanding {
+    /// A live `delegates_to(subject → candidate)` exists.
+    Live,
+    /// `subject` has issued no `delegates_to` naming `candidate` that this
+    /// node can see. **Possibly a delivery-order artifact — retryable.**
+    NoEdge,
+    /// An edge exists but is retracted — by an admitted `withdraws`/`recants`
+    /// naming it (§6.1 precedence, the CIRISPersist#686 entitlement gate), or
+    /// by the granter's own outgoing retraction against `candidate` (the
+    /// §11.10 edge-retraction model, which carries no
+    /// `references_attestation_id`). A verdict.
+    Retracted,
+    /// An edge exists but has lapsed — `expires_at` passed (SecReview F3), or
+    /// the CC 3.4.12 adult-incapacity `valid_until` lapsed. A verdict.
+    Expired,
+}
+
+impl DelegateStanding {
+    /// True iff the standing confers authority.
+    pub fn is_live(self) -> bool {
+        matches!(self, DelegateStanding::Live)
+    }
+}
+
+/// **Is `candidate` a LIVE delegate of `subject`?** — the outbound twin of
+/// [`crate::federation::admission`]'s inbound `live_delegation_granters` walk
+/// (v37.0.0, CIRISPersist#734).
+///
+/// # Why this is not [`build_delegation_graph`]
+///
+/// The graph builder is a UI aggregate: an unbounded BFS that issues one
+/// [`FederationDirectory::list_attestations_by`] per visited key and returns
+/// every edge it finds so a consumer can render them. Used as an authority
+/// predicate it is wrong twice over. It costs a whole traversal per admitted
+/// row to answer a one-hop question, and — decisively — its
+/// [`DelegationEdge::withdrawn_by`] field is an *annotation*, not a filter: a
+/// retracted edge is still returned, with a marker beside it, so every caller
+/// would have to re-derive liveness and they would drift. This walk answers
+/// the predicate and nothing else, and it returns the CLASSIFIED refusal
+/// because the caller needs to tell an absent authorizer from a dead one.
+///
+/// # One hop, deliberately
+///
+/// A sub-delegate is not the subject's delegate; it is someone else's. The
+/// transitive form already exists as
+/// [`crate::federation::admission::reachable_under_scope`], and it requires a
+/// scope token on every edge to attenuate — there is no location scope token
+/// in the vocabulary, so composing it here would either refuse every real
+/// delegate or run unattenuated. One hop is the tight reading of *"its
+/// delegates"* and the only one this substrate can currently police.
+///
+/// # Liveness — four clauses, one read
+///
+/// Everything is decided from `list_attestations_by(subject)`, the slice that
+/// holds both the edges and the granter's own retractions:
+///
+///   1. shape — a `delegates_to` whose `attested_key_id` is `candidate`;
+///   2. not retracted by an admitted `withdraws`/`recants` naming the edge —
+///      via [`crate::federation::precedence::retired_ids`], THE consolidated
+///      CIRISPersist#686 fold (entitlement + §6.1 precedence), not a second
+///      spelling of it;
+///   3. not retracted by the granter itself — a `withdraws`/`recants` among
+///      `subject`'s outgoing rows against `candidate`, the §11.10
+///      edge-retraction model, which carries no `references_attestation_id`
+///      and is therefore invisible to clause (2);
+///   4. `expires_at` has not passed, and the CC 3.4.12 adult-incapacity
+///      `valid_until` has not lapsed.
+///
+/// # Reach — the honest bound
+///
+/// Clause (2) sees only retractions the substrate indexes among `subject`'s
+/// OUTGOING rows. A third party's retraction filed against `candidate` is
+/// invisible here — the same reach limit `live_delegation_granters` documents
+/// for the inbound direction, and for the same reason: widening it costs a
+/// second fan-out read on every admitted row. Not a hole this walk opened.
+///
+/// `now` is threaded explicitly so callers and tests are deterministic.
+pub async fn live_delegate_standing<F>(
+    directory: &F,
+    subject: &str,
+    candidate: &str,
+    now: DateTime<Utc>,
+) -> Result<DelegateStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if subject.is_empty() || candidate.is_empty() {
+        return Err(Error::InvalidArgument(
+            "live_delegate_standing: subject and candidate must be non-empty".into(),
+        ));
+    }
+    let rows = directory.list_attestations_by(subject).await?;
+
+    // Clause (2) — the ONE consolidated retraction fold. Every row here is
+    // authored by `subject`, so a retraction among them is entitled under the
+    // fold's self-retraction arm; precedence still decides which composer wins.
+    let refs: Vec<&Attestation> = rows.iter().collect();
+    let retired = crate::federation::precedence::retired_ids(&refs);
+
+    // Clause (3) — the granter's own §11.10 edge retraction against
+    // `candidate`. Granter-scoped, so it kills every edge to `candidate` at
+    // once and is computed from the same slice.
+    let granter_retracted = rows.iter().any(|r| {
+        (r.attestation_type == attestation_type::WITHDRAWS
+            || r.attestation_type == attestation_type::RECANTS)
+            && r.attested_key_id == candidate
+    });
+
+    let mut seen_retracted = false;
+    let mut seen_expired = false;
+    for r in &rows {
+        // (1) shape.
+        if r.attestation_type != attestation_type::DELEGATES_TO || r.attested_key_id != candidate {
+            continue;
+        }
+        if granter_retracted || retired.contains(r.attestation_id.as_str()) {
+            seen_retracted = true;
+            continue;
+        }
+        // (4) expiry.
+        if r.expires_at.is_some_and(|exp| exp <= now)
+            || delegation_valid_until_lapsed(&r.attestation_envelope, now)
+        {
+            seen_expired = true;
+            continue;
+        }
+        return Ok(DelegateStanding::Live);
+    }
+    // A dead edge is reported as dead — never as absent. `Retracted` outranks
+    // `Expired` only so the report is stable when both are present; both are
+    // verdicts and neither is retryable.
+    Ok(if seen_retracted {
+        DelegateStanding::Retracted
+    } else if seen_expired {
+        DelegateStanding::Expired
+    } else {
+        DelegateStanding::NoEdge
+    })
+}
+
+/// Has a `delegates_to` envelope's CC 3.4.12 adult-incapacity `valid_until`
+/// lapsed as of `now`?
+///
+/// An adult-incapacity binding carries a mandatory `valid_until`; on lapse the
+/// edge goes non-live and the adult auto-re-sovereigns with no steward assent.
+/// A row of any other shape carries no such field, and this returns `false`
+/// for it. An unparseable value is treated as NOT lapsed — a malformed binding
+/// is rejected at admission, so that branch is unreachable for admitted rows
+/// and we do not un-live a row on a parse quirk.
+///
+/// The FIELD NAME has one spelling
+/// ([`crate::federation::capacity::binding_field::VALID_UNTIL`]) — the part
+/// that could drift. The predicate itself duplicates
+/// `admission::delegation_valid_until_lapsed`, which is private to that
+/// module; hoisting the two into one shared spelling is filed as follow-up
+/// work and is deliberately not smuggled into this cut.
+fn delegation_valid_until_lapsed(envelope: &serde_json::Value, now: DateTime<Utc>) -> bool {
+    envelope
+        .get(crate::federation::capacity::binding_field::VALID_UNTIL)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .is_some_and(|vu| vu <= now)
+}
+
 fn envelope_field_str(envelope: &serde_json::Value, field: &str) -> Option<String> {
     envelope
         .get(field)

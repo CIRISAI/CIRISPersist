@@ -143,14 +143,26 @@ impl FederatedSecretsClient {
     /// Sign a request body with the configured local signer and
     /// emit the signature headers.
     ///
-    /// When the signer has PQC configured, returns the hybrid
-    /// signature (Ed25519 + ML-DSA-65). When PQC isn't configured,
-    /// falls back to Ed25519-only (the server's
-    /// [`crate::verify::HybridPolicy::Ed25519Fallback`] accepts
-    /// either shape during the hybrid-pending rollout window).
+    /// Returns the hybrid signature (Ed25519 + ML-DSA-65). **PQC is
+    /// REQUIRED as of v37.0.0.**
+    ///
+    /// Through v36.x this fell back to an Ed25519-only signature when the
+    /// signer had no PQC configured, because the server verified under
+    /// `HybridPolicy::Ed25519Fallback`. That server-side policy flipped to
+    /// [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict) in the
+    /// v37.0.0 break, so the fallback could now only ever build a request
+    /// the server is guaranteed to refuse with
+    /// `verify_hybrid_pending_rejected`.
+    ///
+    /// Rather than ship a doomed request and surface the cause as a remote
+    /// 401 — which reads as a credential problem — this fails HERE, where
+    /// the actual cause (this signer has no PQC key) is known and can be
+    /// named. Configure the local signer's ML-DSA-65 half; see
+    /// [`crate::signing`].
     async fn sign_body(&self, body: &[u8]) -> Result<Vec<(&'static str, String)>, SecretsError> {
-        // Try hybrid first. The signer returns PqcNotConfigured if
-        // PQC isn't wired; in that case we fall back to Ed25519-only.
+        // Hybrid is the only acceptable shape as of v37.0.0. The signer
+        // returns PqcNotConfigured if PQC isn't wired; that is now a
+        // hard, locally-diagnosed failure rather than a silent downgrade.
         match self.signer.sign_hybrid(body).await {
             Ok(hybrid) => {
                 let ed25519_b64 = BASE64.encode(&hybrid.classical.signature);
@@ -162,14 +174,16 @@ impl FederatedSecretsClient {
                 ])
             }
             Err(crate::signing::LocalSignerError::PqcNotConfigured) => {
-                let sig = self
-                    .signer
-                    .sign_ed25519(body)
-                    .map_err(|e| SecretsError::Internal(format!("local sign: {e}")))?;
-                Ok(vec![
-                    (HEADER_KEY_ID, self.signer.key_id().to_owned()),
-                    (HEADER_ED25519, BASE64.encode(sig)),
-                ])
+                Err(SecretsError::Internal(format!(
+                    "local sign: signer {:?} has no ML-DSA-65 key configured, \
+                     and v37.0.0 secrets routes verify under \
+                     HybridPolicy::Strict — an Ed25519-only signature is \
+                     refused server-side (verify_hybrid_pending_rejected). \
+                     Through v36.x this downgraded silently; it now fails \
+                     here instead of arriving as a remote 401. Configure the \
+                     signer's PQC half.",
+                    self.signer.key_id()
+                )))
             }
             Err(e) => Err(SecretsError::Internal(format!("local sign: {e}"))),
         }

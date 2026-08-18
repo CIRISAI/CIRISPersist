@@ -52,6 +52,64 @@
 //! today is wasted work but not incorrect: the sidecar's stages are
 //! deterministic, and re-running them yields the same outputs.
 //!
+//! # Deploy ordering (v37.0.0) — READ BEFORE ROLLING THIS OUT
+//!
+//! v37.0.0 changes what invariant 2 accepts, in two independent ways.
+//! Both are flag days shared with CIRISEdge; neither is negotiable at
+//! runtime (no env var, no per-peer epoch — the operator declared a hard
+//! break).
+//!
+//! 1. **Canonicalization re-pin (CIRISPersist#716).**
+//!    [`canonicalize_for_edge_signing`] now rebuilds the edge-signed
+//!    bytes through
+//!    [`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize)
+//!    (V2Jcs) instead of hand-building the V1Python canonicalizer. An
+//!    edge still signing V1Python bytes is refused.
+//! 2. **PQC posture (`HybridPolicy::Strict`).** The edge signature must
+//!    now carry BOTH halves. An Ed25519-only `edge_signature` — accepted
+//!    through v36.x — is refused, and the edge's ML-DSA-65 pubkey must be
+//!    registered in `federation_keys`.
+//!
+//! **The two breaks have DIFFERENT shapes. Do not plan for one shape.**
+//!
+//! * **(2) PQC/Strict is immediate and total.** Any edge whose
+//!   `federation_keys` row lacks `pubkey_ml_dsa_65`, or that sends no
+//!   `ml_dsa_65` half, is refused on EVERY request from the instant v37
+//!   serves traffic. Payload-independent. This is the break that decides
+//!   the deploy window.
+//! * **(1) The canonicalizer re-pin is PAYLOAD-DEPENDENT.** V1Python and
+//!   RFC 8785 JCS produce byte-IDENTICAL output for payloads with no
+//!   non-ASCII characters and no divergent float tokens (`1e-05` vs
+//!   `1e-5`). An un-re-pinned edge sending all-ASCII envelopes therefore
+//!   KEEPS VERIFYING against v37, and fails only when a payload first
+//!   contains non-ASCII. Both halves of this are pinned as witnesses
+//!   (`v1_canonicalized_edge_signature_is_rejected` and
+//!   `v1_canonicalized_ascii_envelope_still_verifies`) because the
+//!   asymmetry is easy to get wrong in exactly the expensive direction.
+//!
+//! **The trap:** "we deployed v37 and edge ingest kept working" is NOT
+//! evidence that the edge re-pinned its canonicalizer. It is evidence
+//! that recent traffic happened to be ASCII. The latent failure then
+//! arrives later, detached from the deploy, looking like data corruption
+//! or a key problem. Verify the edge's canonicalizer by BUILD, not by
+//! observed success.
+//!
+//! **Ordering: cut both in the same window; if you must sequence, roll
+//! PERSIST FIRST.** Persist-first is strictly better for diagnosis: a v37
+//! persist refusing an un-re-pinned edge answers with
+//! [`edge_signature_rejection_detail`]'s message — which names the
+//! canonicalizer re-pin and the Strict flip explicitly, and rules out the
+//! key — in the 422 body the edge itself receives. A v36 persist refusing
+//! a re-pinned edge answers with a bare "ed25519 signature mismatch",
+//! indistinguishable from a credential problem. Both orderings drop the
+//! same traffic; only one of them explains itself.
+//!
+//! Nothing re-verifies from storage on this plane — `edge_signature` is
+//! checked once at admission — so the outage is bounded to in-flight
+//! requests and ends the moment both sides are on v37. No stored corpus
+//! goes dark (contrast the audit plane, PINNED by #714 for exactly that
+//! reason).
+//!
 //! [`PipelineEnvelope`]: crate::pipeline::types::PipelineEnvelope
 //! [`BatchEnvelope`]: crate::schema::BatchEnvelope
 //! [`CompleteTrace`]: crate::schema::CompleteTrace
@@ -71,9 +129,10 @@ use crate::queue::QueueError;
 use crate::schema::BatchEvent;
 use crate::server::AppState;
 use crate::store::Backend;
+use crate::verify::hybrid::VerifyError;
 use crate::verify::{
-    canonical::PythonJsonDumpsCanonicalizer, ed25519::verify_trace, verify_hybrid_via_directory,
-    Canonicalizer, HybridPolicy,
+    canonical::ceg_produce_canonicalize, ed25519::verify_trace, verify_hybrid_via_directory,
+    HybridPolicy,
 };
 
 // ── Stable error kind tokens (THREAT_MODEL.md AV-15) ─────────────────
@@ -134,14 +193,18 @@ where
         Ok(b) => b,
         Err(detail) => return invariant_response(KIND_EDGE_SIGNATURE, detail),
     };
-    // Policy: Ed25519Fallback for now — the federation rolls out
-    // hybrid-pending edge keys per the writer contract (Ed25519 first,
-    // ML-DSA-65 cold-path attach). Production posture flips to Strict
-    // once edge keys are PQC-complete across the fleet; until then
-    // Fallback accepts Ed25519-only verification. row_age is not
-    // applicable for write-path verifies (the edge_signature is
-    // computed fresh per request).
-    let policy = HybridPolicy::Ed25519Fallback;
+    // v37.0.0 — Strict. This was Ed25519Fallback from v1.1.0, waiting on
+    // "once edge keys are PQC-complete across the fleet". That wait is
+    // over: `HybridPolicy`'s own doc says Ed25519Fallback is a
+    // development / sovereign-mode posture and NOT for federation
+    // production, and this is the edge ingest WRITE path — the most
+    // production plane persist serves. An Ed25519-only edge_signature is
+    // now refused (`VerifyError::HybridPendingRejected`), matching the
+    // #465 tightening `root_binding` already took on the provenance
+    // plane. row_age is still not applicable for write-path verifies (the
+    // edge_signature is computed fresh per request), and it is inert
+    // under Strict regardless.
+    let policy = HybridPolicy::Strict;
     let edge_sig_outcome = verify_hybrid_via_directory(
         &*state.directory,
         &canonical_bytes,
@@ -153,13 +216,21 @@ where
     )
     .await;
     if let Err(e) = edge_sig_outcome {
+        // v37.0.0 — the detail names the flag-day cause. Both v37 breaks
+        // (the #716 canonicalizer re-pin and the Strict flip above) land
+        // here looking like a bad key; `edge_signature_rejection_detail`
+        // is what stops an operator from re-issuing keys to fix a
+        // canonicalization change. It goes to BOTH the log and the 422
+        // body, so the un-re-pinned peer reads its own cause on the wire.
+        let detail = edge_signature_rejection_detail(&e);
         tracing::warn!(
             error = %e,
             kind = e.kind(),
             edge_key_id = %envelope.edge_key_id,
+            detail = %detail,
             "pipeline ingest rejected: edge signature failed verify"
         );
-        return invariant_response(KIND_EDGE_SIGNATURE, format!("{e}"));
+        return invariant_response(KIND_EDGE_SIGNATURE, detail);
     }
 
     // 2b. Role-tag enforcement (v1.3.0, CIRISPersist#46). After the
@@ -419,15 +490,108 @@ fn invariant_response(kind: &'static str, detail: String) -> Response {
 /// [`crate::verify::canonicalize_envelope_for_signing`]'s strip rule
 /// adapted for the pipeline-envelope wire shape (the federation-
 /// internal wrapper carries `edge_signature`, not `signature`).
+///
+/// # v37.0.0 (CIRISPersist#716) — routed through the produce gate
+///
+/// From the v4.15.0 JCS produce flip to v36.x this function hand-built
+/// `PythonJsonDumpsCanonicalizer` (V1Python) while every other persist
+/// signing/admission surface re-canonicalized through
+/// [`ceg_produce_canonicalize`] (V2Jcs). It was the second instance of
+/// the [#714] class and was left standing there **deliberately**: unlike
+/// #714's subject, the signer here is another repo's deployed fleet
+/// (CIRISEdge), so persist could not flip it alone.
+///
+/// v37.0.0 is the operator-declared flag day, so it flips. Same strip
+/// rule (`edge_signature` only — the federation-internal wrapper's
+/// analogue of the `signature`/`signature_pqc` strip), now over the gate.
+///
+/// **This changes the verified bytes** — but only for payloads on which
+/// the two rules actually diverge (non-ASCII, or non-ES float tokens).
+/// The two canonicalizations are byte-identical for plain-ASCII payloads,
+/// so an un-re-pinned edge fails at invariant 2 on its first DIVERGENT
+/// envelope, not necessarily on its first envelope. See
+/// [`edge_signature_rejection_detail`] for the operator-facing message
+/// that names the cause, and the module `# Deploy ordering (v37.0.0)`
+/// note for why that asymmetry is a trap. Unlike the audit plane — which #714
+/// PINNED to V1 because it re-verifies STORED rows — nothing here
+/// re-verifies from storage: `edge_signature` is checked once, at
+/// admission, against bytes rebuilt from the request. So the blast radius
+/// is bounded to in-flight requests from un-re-pinned peers, and it ends
+/// when the peer rolls forward. No stored corpus goes dark.
+///
+/// [#714]: https://github.com/CIRISAI/CIRISPersist/issues/714
 fn canonicalize_for_edge_signing(envelope: &PipelineEnvelope) -> Result<Vec<u8>, String> {
     let mut value = serde_json::to_value(envelope)
         .map_err(|e| format!("serialize envelope for canonicalize: {e}"))?;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("edge_signature");
     }
-    PythonJsonDumpsCanonicalizer
-        .canonicalize_value(&value)
-        .map_err(|e| format!("canonicalize: {e}"))
+    ceg_produce_canonicalize(&value).map_err(|e| format!("canonicalize: {e}"))
+}
+
+/// v37.0.0 (CIRISPersist#716 + the #465-class PQC tightening) — render an
+/// edge-signature [`VerifyError`] into a detail string that names the
+/// **flag-day cause**, not just the symptom.
+///
+/// Both v37.0.0 breaks surface here as a signature that "just doesn't
+/// verify", and both look exactly like a key/registration problem to an
+/// operator reading a log line. That misdiagnosis is the expensive
+/// outcome — it sends someone to re-register keys for a canonicalizer
+/// re-pin. So each one states its own cause and its own remedy:
+///
+/// * `Crypto` (Ed25519 mismatch) — most likely the #716 canonicalizer
+///   re-pin: this build rebuilds the signed bytes under CEG-produce/JCS,
+///   so a V1Python-signed envelope will not verify no matter how correct
+///   the key is. The message also states that the two rules AGREE on
+///   plain ASCII, because that is what makes an un-re-pinned edge look
+///   healthy right up until the payload that breaks it.
+/// * `HybridPendingRejected` — the [`HybridPolicy::Strict`] flip: the
+///   signer's `federation_keys` row is classical-only and it sent no
+///   `ml_dsa_65` half, which v36 and earlier accepted.
+/// * `PqcFieldsMustBeBoth` — the sig/pubkey pairing: exactly one of the
+///   envelope's `ml_dsa_65` half and the row's `pubkey_ml_dsa_65` is
+///   present. Distinct from the above so an operator can tell "this edge
+///   never registered PQC" from "the PQC half went missing in flight".
+///
+/// The detail reaches the peer: [`invariant_response`] serializes it into
+/// the 422 body's `detail` field, so the signer sees the cause on the
+/// wire and not only in persist's logs.
+fn edge_signature_rejection_detail(e: &VerifyError) -> String {
+    match e {
+        VerifyError::Crypto(msg) if msg.contains("verify_unknown_key") => {
+            format!("{e} — edge_key_id is not registered in federation_keys")
+        }
+        VerifyError::Crypto(_) => format!(
+            "{e} — NOTE (v37.0.0 flag day, CIRISPersist#716): this build \
+             canonicalizes the edge-signed bytes under CEG-produce/JCS \
+             (V2Jcs). An envelope signed over the previous V1Python \
+             canonicalization WILL NOT VERIFY here even with a correct, \
+             correctly-registered key. The two rules diverge on non-ASCII \
+             text (JCS emits raw UTF-8; V1Python escaped it as \\uXXXX) and \
+             on float tokens — they agree on plain ASCII, so an \
+             un-re-pinned signer can appear healthy until its first \
+             non-ASCII payload, which is likely what just happened. \
+             Re-pin the signer to CEG-produce/JCS and re-sign; this is not \
+             a key problem."
+        ),
+        VerifyError::HybridPendingRejected => format!(
+            "{e} — NOTE (v37.0.0 flag day): the edge signature policy is \
+             now HybridPolicy::Strict. An Ed25519-only edge_signature was \
+             accepted through v36.x and is REFUSED here: send the ml_dsa_65 \
+             half and register the edge's ML-DSA-65 pubkey in \
+             federation_keys. This is not a key-validity problem."
+        ),
+        VerifyError::PqcFieldsMustBeBoth => format!(
+            "{e} — the envelope's ml_dsa_65 signature half and this \
+             edge_key_id's federation_keys.pubkey_ml_dsa_65 must BOTH be \
+             present or BOTH absent, and exactly one of them is. Either the \
+             envelope omitted the half for a PQC-registered edge (v37.0.0: \
+             send it — HybridPolicy::Strict requires it), or it sent the \
+             half for an edge with no registered PQC pubkey (register the \
+             edge's ML-DSA-65 pubkey). Not a key-validity problem."
+        ),
+        _ => format!("{e}"),
+    }
 }
 
 // ── Wire shapes ──────────────────────────────────────────────────────
@@ -481,7 +645,7 @@ mod tests {
     use crate::scrub::NullScrubber;
     use crate::store::MemoryBackend;
     use crate::verify::ed25519::canonical_payload_value;
-    use crate::verify::PythonJsonDumpsCanonicalizer;
+    use crate::verify::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
@@ -500,6 +664,39 @@ mod tests {
     const EDGE_KEY_ID: &str = "cirislens-edge-test-1";
     /// `signature_key_id` on the inner agent trace.
     const AGENT_KEY_ID: &str = "ciris-agent-key:pipeline-test";
+    /// v37.0.0 — fixed seed for the edge's ML-DSA-65 half. The edge
+    /// signature policy is now `HybridPolicy::Strict`, so a fixture edge
+    /// key without a PQC half can no longer sign an acceptable envelope.
+    const EDGE_PQC_SEED: [u8; 32] = [0xE9; 32];
+    /// `pqc_key_id` the edge stamps on the envelope.
+    const EDGE_PQC_KEY_ID: &str = "cirislens-edge-test-1-pqc";
+
+    fn edge_mldsa() -> ciris_keyring::MlDsa65SoftwareSigner {
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&EDGE_PQC_SEED, EDGE_PQC_KEY_ID)
+            .expect("deterministic ML-DSA-65 keypair from seed")
+    }
+
+    /// v37.0.0 — sign `envelope` the way a re-pinned CIRISEdge does:
+    /// canonicalize through the produce gate, Ed25519-sign those bytes,
+    /// then ML-DSA-65-sign `(canonical || ed25519_sig)` — the bound form
+    /// `verify_hybrid` reconstructs. Sets BOTH halves.
+    ///
+    /// Every fixture goes through here so there is exactly one place that
+    /// knows the edge signing shape; the witnesses that must deviate from
+    /// it (V1 bytes, PQC omitted) do so explicitly and say why.
+    async fn sign_edge(envelope: &mut PipelineEnvelope) {
+        use ciris_keyring::PqcSigner as _;
+        let canonical = canonicalize_for_edge_signing(envelope).expect("canonicalize");
+        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
+            .sign(&canonical)
+            .to_bytes();
+        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+        bound.extend_from_slice(&canonical);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = edge_mldsa().sign(&bound).await.expect("ml-dsa sign");
+        envelope.edge_signature.ed25519 = BASE64.encode(ed_sig);
+        envelope.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+    }
 
     fn temp_journal() -> (tempfile::TempDir, Arc<Journal>) {
         let dir = tempfile::tempdir().unwrap();
@@ -508,8 +705,8 @@ mod tests {
         (dir, Arc::new(j))
     }
 
-    fn build_app(queue_depth: usize) -> (Router, Arc<MemoryBackend>) {
-        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
+    async fn build_app(queue_depth: usize) -> (Router, Arc<MemoryBackend>) {
+        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, PqcSigner as _};
         let backend = Arc::new(MemoryBackend::new());
         // Register the edge fixture key + agent fixture key in the
         // directory so verify can resolve them.
@@ -520,6 +717,12 @@ mod tests {
         // `cirislens_pipeline_writer`; the alternate
         // `cirislens_secrets_writer` would also pass.
         backend.set_roles(EDGE_KEY_ID, vec!["cirislens_pipeline_writer".to_owned()]);
+        // v37.0.0 — the edge key must be hybrid-COMPLETE now that the
+        // route verifies under `HybridPolicy::Strict`. `add_public_key`
+        // alone writes a hybrid-pending row (pubkey_ml_dsa_65 = None),
+        // which Strict refuses.
+        let edge_pqc_pk = edge_mldsa().public_key().await.expect("ml-dsa pk");
+        backend.set_pqc_pubkey(EDGE_KEY_ID, &BASE64.encode(&edge_pqc_pk));
         let agent_sk = SigningKey::from_bytes(&AGENT_SEED);
         backend.add_public_key(AGENT_KEY_ID, agent_sk.verifying_key());
 
@@ -614,7 +817,7 @@ mod tests {
     /// Build a PipelineEnvelope around the given BatchEnvelope, with
     /// classification-count matching components, no encrypted secrets,
     /// and a valid edge signature.
-    fn make_signed_pipeline_envelope(batch: BatchEnvelope) -> PipelineEnvelope {
+    async fn make_signed_pipeline_envelope(batch: BatchEnvelope) -> PipelineEnvelope {
         #[cfg(feature = "classify")]
         let component_count: usize = batch
             .events
@@ -651,13 +854,9 @@ mod tests {
                 signed_at,
             },
             edge_key_id: EDGE_KEY_ID.into(),
-            edge_pqc_key_id: None,
+            edge_pqc_key_id: Some(EDGE_PQC_KEY_ID.into()),
         };
-        // Compute canonical bytes (envelope minus edge_signature).
-        let canonical = canonicalize_for_edge_signing(&envelope).expect("canonicalize");
-        let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
-        let sig = edge_sk.sign(&canonical);
-        envelope.edge_signature.ed25519 = BASE64.encode(sig.to_bytes());
+        sign_edge(&mut envelope).await;
         envelope
     }
 
@@ -717,9 +916,9 @@ mod tests {
     /// Happy path: well-formed envelope flows through every gate.
     #[tokio::test]
     async fn pipeline_ingest_accepts_well_formed_envelope() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(2);
-        let env = make_signed_pipeline_envelope(batch);
+        let env = make_signed_pipeline_envelope(batch).await;
         let (status, _) = post_envelope(&app, &env).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -727,9 +926,9 @@ mod tests {
     /// FSD §4.3 invariant 1: unknown schema version rejected.
     #[tokio::test]
     async fn pipeline_ingest_rejects_unknown_schema_version() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch);
+        let mut env = make_signed_pipeline_envelope(batch).await;
         env.pipeline_schema_version = "99.0".into();
         let (status, body) = post_envelope(&app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -741,14 +940,12 @@ mod tests {
     /// invariant gate, not the edge-signature gate.
     #[tokio::test]
     async fn pipeline_ingest_rejects_pii_scrubbed_inconsistency() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch);
+        let mut env = make_signed_pipeline_envelope(batch).await;
         env.sidecar.pipeline_metadata.pii_scrubbed = false;
         // Re-sign — the metadata change invalidates the edge sig.
-        let canonical = canonicalize_for_edge_signing(&env).unwrap();
-        let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
-        env.edge_signature.ed25519 = BASE64.encode(edge_sk.sign(&canonical).to_bytes());
+        sign_edge(&mut env).await;
         let (status, body) = post_envelope(&app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_PII_SCRUBBED);
@@ -760,15 +957,13 @@ mod tests {
     #[cfg(feature = "classify")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_classifications_count_mismatch() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(2);
-        let mut env = make_signed_pipeline_envelope(batch);
+        let mut env = make_signed_pipeline_envelope(batch).await;
         // 2 components but 3 classifications.
         env.sidecar.classifications.push(Vec::new());
         // Re-sign.
-        let canonical = canonicalize_for_edge_signing(&env).unwrap();
-        let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
-        env.edge_signature.ed25519 = BASE64.encode(edge_sk.sign(&canonical).to_bytes());
+        sign_edge(&mut env).await;
         let (status, body) = post_envelope(&app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_CLASSIFICATIONS_COUNT);
@@ -782,9 +977,9 @@ mod tests {
     async fn pipeline_ingest_rejects_orphan_secret() {
         use crate::pipeline::classify::Sensitivity;
         use crate::secrets::types::{EncryptedSecretRecord, SecretRecord};
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch);
+        let mut env = make_signed_pipeline_envelope(batch).await;
         // Inject an "encrypted secret" whose UUID DOESN'T appear in
         // the scrubbed envelope. The scrubbed envelope has no
         // {SECRET:...} markers, so any UUID is orphan.
@@ -812,9 +1007,7 @@ mod tests {
         env.sidecar.encrypted_secrets.push(orphan);
         env.sidecar.pipeline_metadata.secrets_encrypted = 1;
         // Re-sign.
-        let canonical = canonicalize_for_edge_signing(&env).unwrap();
-        let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
-        env.edge_signature.ed25519 = BASE64.encode(edge_sk.sign(&canonical).to_bytes());
+        sign_edge(&mut env).await;
         let (status, body) = post_envelope(&app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_ORPHAN_SECRET);
@@ -824,9 +1017,9 @@ mod tests {
     /// in `edge_signature.ed25519` and assert the route rejects.
     #[tokio::test]
     async fn pipeline_ingest_rejects_bad_edge_signature() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch);
+        let mut env = make_signed_pipeline_envelope(batch).await;
         // Decode, flip byte 0, re-encode — base64-clean and produces
         // a still-64-byte signature that won't verify.
         let mut sig_bytes = BASE64.decode(&env.edge_signature.ed25519).unwrap();
@@ -837,18 +1030,321 @@ mod tests {
         assert_eq!(body.expect_error().kind, KIND_EDGE_SIGNATURE);
     }
 
+    // ── v37.0.0 flag-day witnesses ───────────────────────────────────
+    //
+    // Two independent breaks land on invariant 2 in this cut:
+    //   * CIRISPersist#716 — `canonicalize_for_edge_signing` re-pinned
+    //     from V1Python to CEG-produce/JCS.
+    //   * The `HybridPolicy::Ed25519Fallback` -> `Strict` flip.
+    //
+    // Each gets a witness that asserts the NEW behaviour against a
+    // HAND-WRITTEN expectation. None of them derive the expected value by
+    // calling the code under test — a test that recomputes its
+    // expectation through `canonicalize_for_edge_signing` would stay
+    // green under either canonicalizer and prove only determinism.
+
+    /// v37.0.0 (CIRISPersist#716) — the edge-signing canonicalizer emits
+    /// CEG-produce/JCS bytes, NOT V1Python bytes.
+    ///
+    /// The two rules differ on non-ASCII: `PythonJsonDumpsCanonicalizer`
+    /// is `ensure_ascii=True` and escapes every code point >= 0x80 as
+    /// `\uXXXX` (non-BMP as an escaped UTF-16 surrogate pair), while RFC
+    /// 8785 JCS emits raw UTF-8. That is the axis this flip moves, so the
+    /// expectations below are written as literal bytes on that axis and
+    /// are mutually exclusive: no single canonicalizer can satisfy both
+    /// the "present" and the "absent" assertion.
+    #[tokio::test]
+    async fn edge_signing_canonicalizes_under_ceg_produce_jcs() {
+        let batch = make_signed_batch(1);
+        let mut env = make_signed_pipeline_envelope(batch).await;
+        // A build id carrying BMP non-ASCII (é) and non-BMP (🔑).
+        env.sidecar.pipeline_metadata.edge_build_id = "caf\u{e9}-\u{1f511}-build".into();
+        let bytes = canonicalize_for_edge_signing(&env).expect("canonicalize");
+        let text = String::from_utf8(bytes).expect("JCS output is UTF-8");
+
+        // HAND-WRITTEN: what RFC 8785 JCS produces — raw UTF-8, verbatim.
+        assert!(
+            text.contains("\"edge_build_id\":\"caf\u{e9}-\u{1f511}-build\""),
+            "expected raw-UTF-8 JCS rendering of edge_build_id; got: {text}"
+        );
+        // HAND-WRITTEN: what V1Python would have produced instead. é is
+        // U+00E9 -> \u00e9; 🔑 is U+1F511 -> surrogate pair \ud83d\udd11.
+        // Its ABSENCE is what pins the flip.
+        assert!(
+            !text.contains("caf\\u00e9"),
+            "V1Python \\u00e9 escape present — canonicalizer did NOT flip to JCS"
+        );
+        assert!(
+            !text.contains("\\ud83d\\udd11"),
+            "V1Python surrogate-pair escape present — canonicalizer did NOT flip to JCS"
+        );
+        // HAND-WRITTEN: the strip rule survives the re-pin — the
+        // signature block never appears in the bytes it signs.
+        assert!(
+            !text.contains("\"edge_signature\""),
+            "edge_signature must be stripped from its own signed bytes"
+        );
+    }
+
+    /// v37.0.0 (CIRISPersist#716) — THE FLAG DAY, asserted.
+    ///
+    /// An envelope signed over V1Python bytes — exactly what a CIRISEdge
+    /// that has not re-pinned still produces — is REJECTED. The key is
+    /// valid, registered, hybrid-complete and role-tagged; only the
+    /// canonicalization is stale.
+    ///
+    /// **The payload here carries non-ASCII deliberately.** The two rules
+    /// agree byte-for-byte on plain-ASCII, ES-float-clean payloads, so a
+    /// V1-signed all-ASCII envelope still verifies after the flip (pinned
+    /// by [`v1_canonicalized_ascii_envelope_still_verifies`]). The break
+    /// is payload-DEPENDENT, which is the operationally dangerous part —
+    /// an un-re-pinned edge appears healthy until the first divergent
+    /// payload. This witness pins the divergent half.
+    #[tokio::test]
+    async fn v1_canonicalized_edge_signature_is_rejected() {
+        use ciris_keyring::PqcSigner as _;
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let batch = make_signed_batch(1);
+        let mut env = make_signed_pipeline_envelope(batch).await;
+        // Non-ASCII — the axis on which V1Python (\uXXXX escapes) and
+        // JCS (raw UTF-8) actually differ.
+        env.sidecar.pipeline_metadata.edge_build_id = "edge-caf\u{e9}-build".into();
+
+        // Re-sign over V1Python bytes: the pre-v37 rule, hand-built here
+        // precisely because the production path no longer offers it.
+        let mut value = serde_json::to_value(&env).unwrap();
+        value.as_object_mut().unwrap().remove("edge_signature");
+        let v1_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&value)
+            .unwrap();
+        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
+            .sign(&v1_bytes)
+            .to_bytes();
+        let mut bound = Vec::with_capacity(v1_bytes.len() + ed_sig.len());
+        bound.extend_from_slice(&v1_bytes);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = edge_mldsa().sign(&bound).await.unwrap();
+        env.edge_signature.ed25519 = BASE64.encode(ed_sig);
+        env.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+
+        let (status, body) = post_envelope(&app, &env).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let err = body.expect_error();
+        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
+        // LOUD + SELF-EXPLAINING: the detail must send the operator to
+        // the canonicalizer, not to the key. A bare "signature failed
+        // verify" here is the outcome this witness exists to prevent.
+        assert!(
+            err.detail.contains("CEG-produce/JCS") && err.detail.contains("V1Python"),
+            "rejection detail must name the canonicalization re-pin; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("CIRISPersist#716"),
+            "rejection detail must cite the issue; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("not a key problem"),
+            "rejection detail must rule OUT the key, the likeliest misdiagnosis; got: {}",
+            err.detail
+        );
+    }
+
+    /// v37.0.0 — `HybridPolicy::Strict` on the edge ingest write path.
+    ///
+    /// A classical-only edge — one whose `federation_keys` row has no
+    /// `pubkey_ml_dsa_65`, sending no `ml_dsa_65` signature half — was
+    /// ACCEPTED through v36.x under `Ed25519Fallback`. It is refused now.
+    /// The canonicalization is current and the Ed25519 signature is valid
+    /// over the right bytes; PQC absence is the only defect.
+    ///
+    /// Note the shape: `HybridPendingRejected` is reachable only when the
+    /// KEY ROW is hybrid-pending. If the row HAS a PQC pubkey and the
+    /// envelope omits the signature, `verify_hybrid`'s both-or-neither
+    /// pairing fires first and yields `PqcFieldsMustBeBoth` instead —
+    /// pinned separately by
+    /// [`pqc_sig_omitted_against_hybrid_complete_key_is_rejected`].
+    #[tokio::test]
+    async fn ed25519_only_edge_signature_is_rejected_under_strict() {
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        // A v36-era edge: registered, role-tagged, but classical-only —
+        // `add_public_key` writes `pubkey_ml_dsa_65 = None` and we
+        // deliberately do NOT call `set_pqc_pubkey`.
+        const LEGACY_EDGE_KEY_ID: &str = "cirislens-edge-test-legacy";
+        backend.add_public_key(
+            LEGACY_EDGE_KEY_ID,
+            SigningKey::from_bytes(&EDGE_SEED).verifying_key(),
+        );
+        backend.set_roles(
+            LEGACY_EDGE_KEY_ID,
+            vec!["cirislens_pipeline_writer".to_owned()],
+        );
+
+        let batch = make_signed_batch(1);
+        let mut env = make_signed_pipeline_envelope(batch).await;
+        env.edge_key_id = LEGACY_EDGE_KEY_ID.into();
+        env.edge_pqc_key_id = None;
+        // Re-sign classical-only over the CURRENT (JCS) bytes.
+        let canonical = canonicalize_for_edge_signing(&env).expect("canonicalize");
+        env.edge_signature.ed25519 = BASE64.encode(
+            SigningKey::from_bytes(&EDGE_SEED)
+                .sign(&canonical)
+                .to_bytes(),
+        );
+        env.edge_signature.ml_dsa_65 = None;
+
+        let (status, body) = post_envelope(&app, &env).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let err = body.expect_error();
+        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
+        // HAND-WRITTEN: the exact upstream refusal, so this reds if the
+        // policy silently drifts back to a soft posture.
+        assert!(
+            err.detail
+                .contains("hybrid-pending row rejected by Strict policy"),
+            "expected the Strict refusal; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("HybridPolicy::Strict") && err.detail.contains("ml_dsa_65"),
+            "rejection detail must name the policy flip and the missing half; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("not a key-validity problem"),
+            "rejection detail must rule OUT the key; got: {}",
+            err.detail
+        );
+    }
+
+    /// v37.0.0 (CIRISPersist#716) — the OTHER half of the flag day's real
+    /// semantics: a V1-signed **all-ASCII** envelope STILL VERIFIES.
+    ///
+    /// `PythonJsonDumpsCanonicalizer` and RFC 8785 JCS agree byte-for-byte
+    /// on payloads with no non-ASCII and no divergent float tokens, so the
+    /// re-pin is NOT a clean break — an un-re-pinned edge keeps working
+    /// for ASCII traffic and fails only on the first divergent payload.
+    ///
+    /// This is asserted, not assumed, because it is the single most
+    /// important fact for scheduling the cutover: "we deployed and
+    /// nothing broke" is NOT evidence that the edge re-pinned. Anyone
+    /// planning the window on the belief that the break is immediate and
+    /// total is planning against behaviour this test contradicts.
+    #[tokio::test]
+    async fn v1_canonicalized_ascii_envelope_still_verifies() {
+        use ciris_keyring::PqcSigner as _;
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let batch = make_signed_batch(1);
+        let mut env = make_signed_pipeline_envelope(batch).await;
+        // Pure ASCII — the fixture's default shape.
+        env.sidecar.pipeline_metadata.edge_build_id = "edge-ascii-build".into();
+
+        let mut value = serde_json::to_value(&env).unwrap();
+        value.as_object_mut().unwrap().remove("edge_signature");
+        let v1_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&value)
+            .unwrap();
+        // HAND-WRITTEN: on an ASCII payload the two rules coincide, so
+        // the V1 bytes ARE the bytes this build rebuilds.
+        assert_eq!(
+            v1_bytes,
+            canonicalize_for_edge_signing(&env).unwrap(),
+            "V1Python and JCS must coincide on an all-ASCII payload"
+        );
+        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
+            .sign(&v1_bytes)
+            .to_bytes();
+        let mut bound = Vec::with_capacity(v1_bytes.len() + ed_sig.len());
+        bound.extend_from_slice(&v1_bytes);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = edge_mldsa().sign(&bound).await.unwrap();
+        env.edge_signature.ed25519 = BASE64.encode(ed_sig);
+        env.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+
+        let (status, _) = post_envelope(&app, &env).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an ASCII payload signed under V1 still verifies — the re-pin \
+             is payload-dependent, not a clean break"
+        );
+    }
+
+    /// v37.0.0 — a hybrid-COMPLETE key that omits the PQC signature half
+    /// is refused as `PqcFieldsMustBeBoth`, not `HybridPendingRejected`.
+    ///
+    /// Distinct from [`ed25519_only_edge_signature_is_rejected_under_strict`]:
+    /// there the KEY ROW is classical-only. Here the row carries a PQC
+    /// pubkey and the SENDER dropped the half — a downgrade attempt
+    /// against a hybrid-capable identity. Both must refuse, and the
+    /// details must differ, or an operator cannot tell "this edge never
+    /// registered PQC" from "something stripped the PQC half in flight".
+    #[tokio::test]
+    async fn pqc_sig_omitted_against_hybrid_complete_key_is_rejected() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let batch = make_signed_batch(1);
+        let mut env = make_signed_pipeline_envelope(batch).await;
+        env.edge_signature.ml_dsa_65 = None;
+
+        let (status, body) = post_envelope(&app, &env).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let err = body.expect_error();
+        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
+        assert!(
+            err.detail
+                .contains("PQC signature without pubkey (or vice versa)"),
+            "expected the both-or-neither refusal; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("HybridPolicy::Strict requires it"),
+            "detail must state the remedy for the omitted-half direction; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("Not a key-validity problem"),
+            "detail must rule OUT the key; got: {}",
+            err.detail
+        );
+    }
+
+    /// v37.0.0 — the two flag-day failures must NOT read alike. An
+    /// operator triaging one must not be handed the other's remedy.
+    #[tokio::test]
+    async fn flag_day_rejection_details_are_distinguishable() {
+        use crate::verify::hybrid::VerifyError;
+        let canon = edge_signature_rejection_detail(&VerifyError::Crypto(
+            "ed25519 signature mismatch".to_string(),
+        ));
+        let strict = edge_signature_rejection_detail(&VerifyError::HybridPendingRejected);
+        let unknown =
+            edge_signature_rejection_detail(&VerifyError::Crypto("verify_unknown_key".to_string()));
+
+        assert!(canon.contains("CIRISPersist#716") && canon.contains("Re-pin the signer"));
+        assert!(!canon.contains("HybridPolicy::Strict"));
+
+        assert!(strict.contains("HybridPolicy::Strict"));
+        assert!(!strict.contains("CIRISPersist#716"));
+
+        // The genuine key problem still reads as one — the loud
+        // canonicalizer note must not swallow it.
+        assert!(unknown.contains("not registered in federation_keys"));
+        assert!(!unknown.contains("CIRISPersist#716"));
+    }
+
     /// Mission constraint (MISSION.md §3 anti-pattern #7) — full
     /// queue surfaces 429 + Retry-After on the new route too.
     #[tokio::test]
     async fn pipeline_ingest_429_on_full_queue() {
-        let (app, _backend) = build_app(1);
+        let (app, _backend) = build_app(1).await;
         // Saturate the queue with rapid valid-envelope submissions.
         // The persister drains one at a time; with queue_depth=1 the
         // second-in-flight submission lands 429.
         let mut got_429 = false;
         for _ in 0..200 {
             let batch = make_signed_batch(1);
-            let env = make_signed_pipeline_envelope(batch);
+            let env = make_signed_pipeline_envelope(batch).await;
             let body = serde_json::to_vec(&env).unwrap();
             let resp = app
                 .clone()

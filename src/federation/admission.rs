@@ -1,6 +1,9 @@
 //! Wire-enforced admission gate on `scores`-attestation dimensions
-//! (CIRISPersist#102 Ask 3, v2.4.0; extended for CEG 0.2 §7.0 +
-//! transition-window dual-acceptance at v3.0.0, CIRISPersist#116).
+//! (CIRISPersist#102 Ask 3, v2.4.0; extended for CEG 0.2 §7.0 at
+//! v3.0.0, CIRISPersist#116). The CEG 0.1 → 0.2 attestation-ladder
+//! dual-accept transition window was REMOVED at v37.0.0 — the
+//! deprecated `attestation:l{N}:*` wire shape is now refused with a
+//! reason of its own (see [`super::Error::DeprecatedAttestationLadderForm`]).
 //!
 //! # Fractal-self framing (CEG §0.5)
 //!
@@ -118,45 +121,6 @@ pub const ATTESTATION_LADDER_MECHANISMS: &[&str] = &[
     "attestation:license_validity",
     "attestation:agent_integrity",
 ];
-
-/// v3.0.0 (CEG 0.1 → 0.2 transition window) — policy for the L1-L5
-/// attestation-ladder rename. CEG 0.2 renamed `attestation:l{N}:*` →
-/// `attestation:{mechanism}`; the deprecated form is admitted during
-/// the transition window so producers still emitting the 0.1 wire
-/// shape don't have their rows rejected.
-///
-/// The `dimension` field on `federation_attestations` is TEXT — no
-/// schema migration is required by the rename. The transition policy
-/// here is purely string-level admission behavior.
-///
-/// # Flip target
-///
-/// Post-CEG 0.3 (separate future PR; tracked at CIRISPersist#117
-/// when CEG 0.3 lands), persist's policy flips to
-/// [`AttestationLadderTransitionPolicy::RejectDeprecated`] — the
-/// deprecated `attestation:l{N}:*` form is rejected at admission per
-/// CEG §13.1 deprecation table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttestationLadderTransitionPolicy {
-    /// CEG 0.1 → 0.2 transition (v3.0.0 default). Both
-    /// `attestation:l{N}:*` and `attestation:{mechanism}` are admitted
-    /// on write. Producers SHOULD migrate to the mechanism form;
-    /// consumers SHOULD treat both as equivalent during the window.
-    DualAccept,
-    /// Post-CEG 0.3 target (NOT the default at v3.0.0). The
-    /// deprecated `attestation:l{N}:*` form is rejected at admission;
-    /// only the mechanism-only form is admitted.
-    RejectDeprecated,
-}
-
-impl AttestationLadderTransitionPolicy {
-    /// True iff the policy admits the deprecated `attestation:l{N}:*`
-    /// wire shape. The current v3.0.0 default returns true.
-    pub fn admits_deprecated_form(self) -> bool {
-        matches!(self, Self::DualAccept)
-    }
-}
 
 /// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — a reserved-prefix
 /// admission rule. The substrate rejects a `scores` attestation whose
@@ -289,11 +253,13 @@ impl DimensionRejectionReason {
 ///   v3.0.0 ships a minimal allowlist; sovereign deployments extend
 ///   per CEG §7.6 (e.g., adding the `witness` identity type once
 ///   their federation directory has registered witnesses).
-/// - `attestation_ladder_transition`: CEG 0.1 → 0.2 transition window
-///   policy. Default is [`AttestationLadderTransitionPolicy::DualAccept`]
-///   — both `attestation:l{N}:*` (deprecated) and
-///   `attestation:{mechanism}` (canonical) admit. Flips to
-///   `RejectDeprecated` post-CEG 0.3.
+///
+/// The CEG 0.1 → 0.2 attestation-ladder transition knob that used to
+/// sit on this struct (`attestation_ladder_transition`) is GONE as of
+/// v37.0.0. There is no per-deployment setting that re-admits the
+/// deprecated `attestation:l{N}:*` wire shape; it is refused
+/// unconditionally with
+/// [`super::Error::DeprecatedAttestationLadderForm`].
 ///
 /// Customize via the explicit constructor for tests / sovereign
 /// deployments that need a different stem list. The default is
@@ -323,11 +289,6 @@ pub struct DimensionAdmissionPolicy {
     /// expected; an overlapping rule shadow is a configuration bug
     /// the operator owns (the policy struct doesn't normalize).
     pub reserved_prefix_rules: Vec<ReservedPrefixRule>,
-    /// v3.0.0 (CEG 0.1 → 0.2 transition). Default
-    /// [`AttestationLadderTransitionPolicy::DualAccept`] — both
-    /// `attestation:l{N}:*` and `attestation:{mechanism}` admit.
-    /// See the policy enum docs for the post-CEG-0.3 flip target.
-    pub attestation_ladder_transition: AttestationLadderTransitionPolicy,
 }
 
 impl Default for DimensionAdmissionPolicy {
@@ -344,7 +305,6 @@ impl Default for DimensionAdmissionPolicy {
             ],
             require_version_segment: true,
             reserved_prefix_rules: default_reserved_prefix_rules(),
-            attestation_ladder_transition: AttestationLadderTransitionPolicy::DualAccept,
         }
     }
 }
@@ -1088,6 +1048,33 @@ impl DimensionAdmissionPolicy {
             });
         }
 
+        // Layer 1d — v37.0.0. The CEG 0.1 attestation-ladder wire shape
+        // `attestation:l{N}:{mechanism}` is REMOVED. CEG 0.2 §13.1 deprecated
+        // it in favour of the mechanism-only form; persist carried a
+        // dual-accept transition window from v3.0.0 until this cut, and the
+        // window is now closed.
+        //
+        // # Why this is a branch and not a deletion
+        //
+        // Deleting the admit-branch alone would let the deprecated shape fall
+        // through to the Layer 2b version-segment gate and refuse as
+        // `missing_version_segment` — which tells an emitter their dimension
+        // needs a `:v[0-9]+`, an instruction that is WRONG here (the canonical
+        // ladder form carries no version segment either). The producer's real
+        // defect is the wire shape, so the refusal names the wire shape, the
+        // spec section that deprecated it, the release that removed it, and the
+        // form to emit instead. A dead path that refuses for a neighbouring
+        // gate's reason is a dead path nobody downstream can fix.
+        //
+        // Ordered BEFORE the stem deny-list and the version gate so the
+        // specific reason wins over both generic ones.
+        if is_deprecated_attestation_ladder_prefix(dim) {
+            return Err(Error::DeprecatedAttestationLadderForm {
+                dimension: dim.to_string(),
+                canonical: ATTESTATION_LADDER_MECHANISMS,
+            });
+        }
+
         // Layer 2a — the morally-charged-stem deny-list.
         // T1 (rules/verdicts) + T2 (mechanism-vs-judgment) + T4
         // (adjudication separation) are all caught by the same
@@ -1134,7 +1121,7 @@ impl DimensionAdmissionPolicy {
         // T3 version-pinning.
         if self.require_version_segment
             && !contains_version_segment(dim)
-            && !self.is_attestation_ladder_dimension(dim)
+            && !Self::is_attestation_ladder_dimension(dim)
             && parse_canonical_binding_hash(dim).is_none()
         {
             return Err(Error::DimensionRejected {
@@ -1227,60 +1214,47 @@ impl DimensionAdmissionPolicy {
     }
 
     /// True iff `dim` is one of the CEG 0.2 §5.2 attestation-ladder
-    /// dimensions — either the canonical mechanism form
-    /// ([`ATTESTATION_LADDER_MECHANISMS`]) or the deprecated
-    /// `attestation:l{N}:*` form when
-    /// [`AttestationLadderTransitionPolicy::DualAccept`] is in effect.
+    /// dimensions — the canonical mechanism form
+    /// ([`ATTESTATION_LADDER_MECHANISMS`]), and ONLY that form as of
+    /// v37.0.0.
     ///
-    /// # Transition window
+    /// The carve-out this answers is the Layer 2b version-segment
+    /// exemption: a ladder dimension names the verification MECHANISM
+    /// the producer ran, so it carries no `:v[0-9]+`.
     ///
-    /// During the 0.1 → 0.2 transition window (default policy
-    /// [`AttestationLadderTransitionPolicy::DualAccept`]):
-    ///
-    /// - Both `attestation:l1:self_verify` (deprecated 0.1 wire shape)
-    ///   AND `attestation:self_verify` (canonical 0.2 mechanism form)
-    ///   return `true`.
-    /// - The `dimension` field on `federation_attestations` is TEXT
-    ///   so no schema migration is required; the transition is purely
-    ///   admission-layer behavior.
-    ///
-    /// Post-CEG-0.3 (policy flipped to
-    /// [`AttestationLadderTransitionPolicy::RejectDeprecated`]), only
-    /// the canonical mechanism form returns `true`; the deprecated
-    /// form falls through to the version-segment check and is
-    /// rejected with `missing_version_segment`. The CEG §13.1
-    /// deprecation table records the timing.
-    fn is_attestation_ladder_dimension(&self, dim: &str) -> bool {
-        // Canonical mechanism form is always admitted.
-        if ATTESTATION_LADDER_MECHANISMS.contains(&dim) {
-            return true;
-        }
-        // Deprecated `attestation:l{N}:*` form — only during the
-        // transition window.
-        if self.attestation_ladder_transition.admits_deprecated_form()
-            && is_deprecated_attestation_ladder_prefix(dim)
-        {
-            return true;
-        }
-        false
+    /// The deprecated CEG 0.1 shape `attestation:l{N}:*` used to
+    /// return `true` here under the dual-accept transition policy.
+    /// It no longer reaches this function at all — Layer 1d refuses it
+    /// with [`super::Error::DeprecatedAttestationLadderForm`] before
+    /// the version gate runs, so the exemption question never arises
+    /// for it. CEG §13.1 records the deprecation.
+    fn is_attestation_ladder_dimension(dim: &str) -> bool {
+        ATTESTATION_LADDER_MECHANISMS.contains(&dim)
     }
 }
 
-/// The DEPRECATED CEG 0.1 attestation-ladder prefix (`attestation:l<N>:…`).
+/// The REMOVED CEG 0.1 attestation-ladder prefix (`attestation:l<N>:…`).
 ///
 /// Hoisted to a const in v26 (#519): this is a shape rule persist applies to
 /// the whole `attestation:` family, and CC's five catalogued rows state no rule
 /// at all — so [`crate::federation::family_rules`] has to be able to read the
 /// prefix at the site that branches on it rather than re-spelling the literal.
 /// The source scan found this one; nobody remembered it.
+///
+/// v37.0.0 flipped the branch this const feeds from an ADMIT to a REFUSE. The
+/// const stays because the substrate still has to RECOGNISE the shape in order
+/// to refuse it by name — a removed wire shape that is merely unmatched refuses
+/// for whatever neighbouring gate catches it next, which is the failure mode
+/// the named refusal exists to prevent.
 pub const ATTESTATION_LADDER_DEPRECATED_PREFIX: &str = "attestation:l";
 
-/// True iff `dim` matches the deprecated CEG 0.1 attestation-ladder
+/// True iff `dim` matches the removed CEG 0.1 attestation-ladder
 /// shape `attestation:l<N>:<mechanism>`, where `<N>` is one or more
 /// ASCII digits and `<mechanism>` is any non-empty suffix. CEG 0.2
-/// §13.1 records this as a deprecated wire shape; persist admits it
-/// during the 0.1 → 0.2 transition window (see
-/// [`AttestationLadderTransitionPolicy`]).
+/// §13.1 records the deprecation; v37.0.0 removed the shape, and this
+/// predicate is what Layer 1d of [`DimensionAdmissionPolicy::check`]
+/// branches on to refuse it with
+/// [`super::Error::DeprecatedAttestationLadderForm`].
 fn is_deprecated_attestation_ladder_prefix(dim: &str) -> bool {
     let Some(rest) = dim.strip_prefix(ATTESTATION_LADDER_DEPRECATED_PREFIX) else {
         return false;
@@ -11343,6 +11317,49 @@ pub async fn check_reserved_prefix_admission(
         check_private_use_not_federatable(dim, &row.tier)?;
     }
 
+    // v37.0.0 (CIRISPersist#733) — **AN `accord:*` ROW NAMES ITS OWN ACCORD.**
+    //
+    // Nothing on the row used to say which accord it belonged to, and
+    // `attested_key_id` cannot be made to: across this one family it holds the
+    // agent being SCORED (`accord:human_dignity:v1`), the SELF-ATTESTING HOLDER
+    // (`accord:invoke:notify:*`) or THE ACCORD (`accord:lifecycle:v1`). One
+    // column, three meanings — so a relaying node could not resolve the roster
+    // it would have to judge the signer against, and CIRISEdge's gate refused
+    // every non-drill `accord:*` row outright. The remedy is a signed envelope
+    // key; see `trust_root::check_accord_root_binding` for the rule, the one
+    // documented fallback, and the dual-signal refusal.
+    //
+    // # Placed HERE, and in the pure tier, on purpose
+    //
+    // - This function is the chokepoint EVERY federation-tier row passes:
+    //   `put_attestation` on memory / sqlite / postgres calls it, and so does
+    //   `check_promotion_admission`, so a row that enters at the local tier
+    //   still meets the rule on its way out (the same B8 argument
+    //   `check_instant_binding` makes above).
+    // - It must sit AHEAD of the fast-exit below, which returns for any
+    //   non-reserved `attestation_type`. The `accord:*` family rides BOTH
+    //   namespaces — `accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as
+    //   a `scores` DIMENSION — and the fast-exit is keyed on the type alone, so
+    //   a check placed after it would silently miss the dimension shape, which
+    //   is the majority of the family. Asking both namespaces is the same thing
+    //   `check_namespace_family_registered` and `check_private_use_not_federatable`
+    //   do a few lines up, for the same reason.
+    // - Pure (no directory read, no crypto) and a REFUSAL, so an early position
+    //   is safe under AV-76.
+    //
+    // # What this changes about refusal precedence
+    //
+    // For the TYPE shape, a row that is BOTH malformed (no `accord_root`) AND
+    // signed by a non-`accord_holder` now reports the malformation first.
+    // Deliberate: a row that names no accord is malformed whoever signed it,
+    // and the emitter-class question cannot even be posed for the relay case
+    // this exists to serve. A well-formed row from the wrong emitter class
+    // still reports `AccordDimensionRequiresAccordHolder`, unchanged — and on
+    // the put door the DIMENSION shape reaches `DimensionAdmissionPolicy::check`
+    // before this function on all three backends, so its constitutional
+    // asymmetry keeps its precedence there too.
+    super::trust_root::check_accord_root_binding(row)?;
+
     // Which (if any) identity-gated reserved prefix does the TYPE carry?
     let is_accord = at.starts_with("accord:");
     let is_hard_case = at.starts_with("hard_case:");
@@ -13158,43 +13175,52 @@ mod tests {
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
     }
 
-    // ── CEG 0.1 → 0.2 attestation-ladder transition window ──
+    // ── CEG 0.1 attestation-ladder wire shape: REMOVED at v37.0.0 ──
 
+    /// The removed CEG 0.1 shape is refused, and refused **by its own name**.
+    ///
+    /// The failure this pins is not "the row is rejected" — deleting the
+    /// admit-branch alone already rejects it, as `missing_version_segment`.
+    /// That refusal tells the producer to add a `:v[0-9]+` segment, which
+    /// would NOT make the row admissible (the canonical ladder form carries
+    /// no version segment either). So the assertion is on the specific
+    /// refusal and on the whole message, spelled as a literal.
     #[test]
-    fn admission_accepts_deprecated_attestation_ladder_in_dual_accept() {
-        // CEG 0.2 transition: persist admits BOTH
-        // `attestation:l1:self_verify` (deprecated 0.1 shape) AND
-        // `attestation:self_verify` (canonical 0.2 shape) on write.
-        // The dimension lacks a `:v[0-9]+` segment but is exempt via
-        // the attestation-ladder carve-out.
+    fn admission_refuses_removed_attestation_ladder_shape_by_name() {
         let p = default_policy();
         for dim in [
             "attestation:l1:self_verify",
             "attestation:l2:hardware",
             "attestation:l5:agent_integrity",
+            "attestation:l42:agent_integrity",
         ] {
-            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
-                .unwrap_or_else(|e| panic!("transition admit failed for {dim}: {e:?}"));
+            let err = p
+                .check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_err();
+            match &err {
+                Error::DeprecatedAttestationLadderForm { dimension, .. } => {
+                    assert_eq!(dimension, dim, "the refusal must echo the shape received");
+                }
+                other => {
+                    panic!("expected DeprecatedAttestationLadderForm for {dim}, got {other:?}")
+                }
+            }
+            assert_eq!(
+                err.kind(),
+                "federation_deprecated_attestation_ladder_form",
+                "the telemetry token for {dim}"
+            );
         }
     }
 
+    /// The message is the whole point of the variant — it has to name the
+    /// shape received, the spec section that deprecated it, the release that
+    /// removed it, and the form to emit instead. Spelled as a hand-written
+    /// literal so a reword of the message reds this test rather than
+    /// silently re-deriving itself from the code under test.
     #[test]
-    fn admission_accepts_canonical_attestation_mechanism_form() {
+    fn removed_attestation_ladder_refusal_message_is_self_explaining() {
         let p = default_policy();
-        for dim in ATTESTATION_LADDER_MECHANISMS {
-            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
-                .unwrap_or_else(|e| panic!("canonical admit failed for {dim}: {e:?}"));
-        }
-    }
-
-    #[test]
-    fn admission_rejects_deprecated_form_post_ceg_0_3_flip() {
-        // Post-CEG-0.3 flip target — operator sets the policy to
-        // RejectDeprecated. The deprecated wire shape no longer
-        // benefits from the version-segment carve-out and falls
-        // through to the standard missing_version_segment check.
-        let mut p = default_policy();
-        p.attestation_ladder_transition = AttestationLadderTransitionPolicy::RejectDeprecated;
         let err = p
             .check(
                 attestation_type::SCORES,
@@ -13202,11 +13228,187 @@ mod tests {
                 identity_type::AGENT,
             )
             .unwrap_err();
-        match err {
-            Error::DimensionRejected { reason, .. } => {
-                assert_eq!(reason, "missing_version_segment");
+        assert_eq!(
+            err.to_string(),
+            "removed attestation-ladder wire shape \"attestation:l1:self_verify\": the CEG 0.1 \
+             form `attestation:l<N>:<mechanism>` was deprecated by CEG 0.2 §13.1 and REMOVED at \
+             persist v37.0.0 — the dual-accept transition window is closed. Emit the canonical \
+             mechanism form `attestation:<mechanism>` instead; admissible set: \
+             [\"attestation:self_verify\", \"attestation:hardware_rooted\", \
+             \"attestation:registry_consensus\", \"attestation:license_validity\", \
+             \"attestation:agent_integrity\"]"
+        );
+    }
+
+    /// The other half of the cut: removing the deprecated shape must not have
+    /// removed the canonical one. Without this leg, a refuse-branch that
+    /// matched `attestation:` broadly would look correct.
+    #[test]
+    fn admission_accepts_canonical_attestation_mechanism_form() {
+        let p = default_policy();
+        for dim in ATTESTATION_LADDER_MECHANISMS {
+            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_or_else(|e| panic!("canonical admit failed for {dim}: {e:?}"));
+        }
+        // Hand-written, not read off the const: the five mechanisms the
+        // canonical vocabulary is supposed to contain.
+        for dim in [
+            "attestation:self_verify",
+            "attestation:hardware_rooted",
+            "attestation:registry_consensus",
+            "attestation:license_validity",
+            "attestation:agent_integrity",
+        ] {
+            p.check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_or_else(|e| panic!("canonical admit failed for {dim}: {e:?}"));
+        }
+    }
+
+    /// End-to-end on the **memory** backend: the gate is not merely a pure
+    /// function that agrees with itself — `put_attestation` refuses the removed
+    /// shape with the named token and stores nothing, and still admits the
+    /// canonical form. The sqlite and postgres halves of this witness live
+    /// beside their own fixtures in `store::sqlite` / `store::postgres`.
+    #[tokio::test]
+    async fn memory_put_attestation_refuses_removed_attestation_ladder_shape() {
+        use crate::federation::tier_ingest::test_support::{
+            hybrid_pubkeys, seal_row, sign_envelope,
+        };
+        use crate::federation::{
+            Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord,
+        };
+        let backend = crate::store::memory::MemoryBackend::new();
+        let author = "mem-ladder-author";
+        let now = chrono::Utc::now();
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(author);
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: crate::federation::KeyRecord {
+                    key_id: author.to_owned(),
+                    pubkey_ed25519_base64: ed_pk,
+                    pubkey_ml_dsa_65_base64: mldsa_pk,
+                    algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                    identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+                    identity_ref: author.to_owned(),
+                    valid_from: now,
+                    valid_until: None,
+                    registration_envelope: serde_json::json!({ "id": author }),
+                    original_content_hash: "deadbeef".to_owned(),
+                    scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: author.to_owned(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    capability_roles: Vec::new(),
+                    attestation_evidence: None,
+                    consent_role: None,
+                    additional_scrubs: Vec::new(),
+                },
+            })
+            .await
+            .expect("register author key");
+
+        let row = |id: &str, dimension: &str| {
+            let envelope = serde_json::json!({ "dimension": dimension, "score": 0.5 });
+            let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
+            SignedAttestation {
+                attestation: seal_row(
+                    author,
+                    Attestation {
+                        attestation_id: id.to_owned(),
+                        attesting_key_id: author.to_owned(),
+                        attested_key_id: author.to_owned(),
+                        attestation_type: attestation_type::SCORES.to_owned(),
+                        weight: None,
+                        asserted_at: now,
+                        expires_at: None,
+                        attestation_envelope: envelope,
+                        original_content_hash: och,
+                        scrub_signature_classical: ed_sig,
+                        scrub_signature_pqc: pqc_sig,
+                        scrub_key_id: author.to_owned(),
+                        scrub_timestamp: now,
+                        pqc_completed_at: None,
+                        persist_row_hash: String::new(),
+                        subject_key_ids: Vec::new(),
+                        withdraws_admission_rule: None,
+                        cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                        tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                        promoted_at: None,
+                        additional_scrubs: Vec::new(),
+                    },
+                ),
             }
-            other => panic!("expected DimensionRejected, got {other:?}"),
+        };
+
+        // The removed CEG 0.1 shape — refused BY NAME, and not stored.
+        let err = backend
+            .put_attestation(row("mem-ladder-removed", "attestation:l1:self_verify"))
+            .await
+            .expect_err("the removed CEG 0.1 ladder shape must not be admitted");
+        assert!(
+            matches!(err, Error::DeprecatedAttestationLadderForm { .. }),
+            "expected DeprecatedAttestationLadderForm, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_deprecated_attestation_ladder_form");
+        assert!(
+            backend
+                .get_attestation("mem-ladder-removed")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused row must not be stored"
+        );
+
+        // A second l{N} rung, so the witness is not pinned to `l1`.
+        let err = backend
+            .put_attestation(row(
+                "mem-ladder-removed-5",
+                "attestation:l5:agent_integrity",
+            ))
+            .await
+            .expect_err("every l{N} rung is removed, not just l1");
+        assert_eq!(err.kind(), "federation_deprecated_attestation_ladder_form");
+
+        // …and the canonical mechanism form still admits, end-to-end.
+        backend
+            .put_attestation(row("mem-ladder-canonical", "attestation:self_verify"))
+            .await
+            .expect("the canonical mechanism form must still be admitted");
+        assert!(
+            backend
+                .get_attestation("mem-ladder-canonical")
+                .await
+                .unwrap()
+                .is_some(),
+            "the canonical row must be stored"
+        );
+    }
+
+    /// The leg that proves Layer 1d refuses for its OWN reason rather than
+    /// swallowing a neighbouring gate's cases: a dimension that genuinely
+    /// lacks a version segment still refuses as `missing_version_segment`,
+    /// NOT as the ladder token.
+    #[test]
+    fn versionless_dimension_still_refuses_as_missing_version_segment() {
+        let p = default_policy();
+        for dim in [
+            "latency:p95_ms",
+            "attestation_scope:coverage",
+            // `attestation:` family, versionless, but NOT the `l{N}:` shape —
+            // this one belongs to the version gate, not to Layer 1d.
+            "attestation:some_other_mechanism",
+        ] {
+            let err = p
+                .check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_err();
+            match err {
+                Error::DimensionRejected { reason, .. } => {
+                    assert_eq!(reason, "missing_version_segment", "for {dim}");
+                }
+                other => panic!("expected DimensionRejected for {dim}, got {other:?}"),
+            }
         }
     }
 

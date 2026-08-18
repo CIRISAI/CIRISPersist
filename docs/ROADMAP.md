@@ -44,14 +44,33 @@ Carry-forward CEG closures from earlier 2.x cuts: typed Goal with
 M-1 alignment (#114, 2.10.0), `occurrence_id` envelope fields
 (#110, 2.9.0), `attestation_type` clean-break rename (#102, 2.4.0).
 
-## 3.1 — CEG 0.3 retirement flip (planned)
+## 3.1 — CEG 0.3 retirement flip — SHIPPED in v37.0.0, as a REMOVAL
 
-Once CIRISRegistry retires the deprecated
-`attestation:l{N}:*` form via the CEG §11.2 amendment process,
-persist flips its admission policy from
-`AttestationLadderTransitionPolicy::DualAccept` (3.0 default) to
-`RejectDeprecated`. Small follow-up; the policy enum + flip target
-are already documented + regression-tested.
+The deprecated `attestation:l{N}:*` form is **refused at admission**.
+`AttestationLadderTransitionPolicy`, the `attestation_ladder_transition`
+field on `DimensionAdmissionPolicy`, and `admits_deprecated_form()` were
+all **removed** — not flipped to `RejectDeprecated`. A single-variant
+enum is the wrong end state: leaving a selectable *"admit the dead 0.1
+wire shape"* option is how a transition posture becomes permanent.
+
+**Why this sat open for five CEG versions**, recorded because the
+mechanism matters more than the fix:
+
+1. Its own doc named the flip condition — *"post-CEG 0.3"*. The tree
+   reached **CEG 0.8**. The condition passed and nothing noticed.
+2. Its tracking pointer read *"tracked at CIRISPersist#117"*. **#117 is
+   an unrelated, closed issue** about the VerifyDirectory mutation
+   surface. The pointer that should have surfaced this pointed elsewhere,
+   and closed for reasons of its own.
+3. Nothing failed. **A permissive default produces no signal** — the one
+   property that makes this class survive.
+
+Refusal is deliberately loud rather than incidental: the removed shape
+reports `federation_deprecated_attestation_ladder_form` naming the
+canonical form to emit, instead of falling through to
+`missing_version_segment`, which would have told a producer their
+dimension lacked `:v[0-9]+` when the real problem was a wire shape that
+no longer exists.
 
 ## 3.x — Subscription v0.2 (CIRISPersist#84 substrate-wide)
 

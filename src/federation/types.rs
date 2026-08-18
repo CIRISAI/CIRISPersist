@@ -3226,15 +3226,31 @@ impl LocationProof {
 /// against `authority_key_id`'s REGISTERED pubkeys
 /// (`verify_location_proof_admission`) before any write. Additive
 /// (`#[serde(default)]`).
+///
+/// # v37.0.0 (CIRISPersist#734) — BREAKING: whose signature, not just whether
+///
+/// This type's own documentation used to record, as deliberate scope, that
+/// `authority_key_id` was *"typically the subject itself … but not enforced to
+/// be"*. It is enforced now. `verify_location_proof_admission` refuses any
+/// authority outside `{subject} ∪ {live delegates of subject}` with
+/// [`crate::federation::Error::LocationAuthorityUnauthorized`] — see that gate
+/// for the epistemic justification and for why the four sibling
+/// `authority_key_id` fields on this page deliberately do NOT change.
+///
+/// A producer that was signing a third party's location proof with its own key
+/// — valid signature, admitted row before this cut — is now refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedLocationProof {
     /// The location proof being submitted.
     pub location_proof: LocationProof,
     /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
-    /// pubkeys the scrub signature below must verify against. Typically the
-    /// subject itself (`location_proof.subject_key_id`), but not enforced to
-    /// be — E4 closes "no signature at all", not "which identity may assert
-    /// a location for this subject" (a broader policy layer, out of scope).
+    /// pubkeys the scrub signature below must verify against.
+    ///
+    /// v37.0.0 (CIRISPersist#734) — MUST be `location_proof.subject_key_id`
+    /// itself, or a key holding a LIVE `delegates_to` from it. Location is
+    /// self-knowledge: no one else has a source for where the subject is, so a
+    /// third party's signature here proves only that they signed it. Enforced
+    /// at admission on every backend; the row is not stored otherwise.
     #[serde(default)]
     pub authority_key_id: String,
     /// Ed25519 signature (base64) over `JCS(LocationProof::signing_envelope())`.
@@ -4301,6 +4317,44 @@ fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
 ///
 /// v31.0.0 (CIRISPersist#646) — every instant in the hashed value is first
 /// truncated to MICROSECONDS. See [`truncate_instants_to_microseconds`].
+///
+/// # The V1Python canonicalizer here is PINNED — do not "clean this up"
+///
+/// v37.0.0 (CIRISPersist#734). This function MUST keep using
+/// [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)
+/// and MUST NOT be routed through
+/// [`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize),
+/// for the same reason
+/// [`canonicalize_envelope_for_signing_v1_pinned`](crate::verify::canonical::canonicalize_envelope_for_signing_v1_pinned)
+/// is pinned: **`persist_row_hash` is a stored at-rest hash over rows that
+/// already exist**, and the write paths compare a freshly computed hash against
+/// the stored column to decide "same row or different row", refusing on a
+/// mismatch (`put_public_key` → `Error::Conflict`, `adopt_scrub_upgrade` →
+/// downgrade/replace refused, `plan_replicated_key_apply` → falls through to a
+/// supersede that refuses a same-version re-apply).
+///
+/// Flip the rule and every stored row whose content contains a non-ASCII
+/// character or a non-ES float token recomputes to a DIFFERENT hash than the one
+/// in its column — so it reads as a different row, and those write paths start
+/// refusing rows that were fine yesterday. Non-ASCII genuinely reaches this hash
+/// through `family_name`, `reason` and `policy_blob`, and nothing on any write
+/// path enforces ASCII, so this is reachable rather than theoretical.
+///
+/// **What makes this SAFE to change later, and why the pin is still needed.**
+/// Unlike the audit chain, `persist_row_hash` sits in **no signature preimage**:
+/// it is stripped by all six `signing_envelope()` methods (pinned by
+/// [`signing_preimage_pin_tests`]), dropped from the genesis authorization
+/// digest, and genesis recomputes both sides rather than trusting the stored
+/// column. So a deliberate flip is an in-place column rewrite, not a
+/// re-genesis. The danger is not that it can never move — it is that it would
+/// move by ACCIDENT, in a consistency sweep that folds it onto the produce gate
+/// for tidiness, with nothing to red. That is the same shape as
+/// CIRISPersist#716's original state: correct, deliberate, and indistinguishable
+/// at the code level from the bug next to it.
+///
+/// The pin has its own witness, `persist_row_hash_v1_pin_tests` — including an
+/// anti-vacuity test, because on an all-ASCII corpus the parity assertion passes
+/// against the flipped code and proves nothing.
 pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::Error> {
     use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use sha2::{Digest, Sha256};
@@ -4444,6 +4498,1013 @@ mod monotonic_admission_tests {
             v["a"], v["b"],
             "the allocated step must survive the microsecond floor, or two rows share a position"
         );
+    }
+}
+
+/// v37.0.0 (CIRISPersist#734) — **the `persist_row_hash` canonicalizer is
+/// pinned to V1Python, and the pin has a witness that can actually fail.**
+///
+/// [`compute_persist_row_hash`] uses
+/// [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)
+/// over a stored-row corpus. Routing it through
+/// [`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize)
+/// — the obvious tidy-up, and exactly the kind of consistency sweep this cut has
+/// been running — recomputes a different hash for every stored row carrying
+/// non-ASCII text or a non-ES float token, which makes the write paths that
+/// compare stored-vs-recomputed start refusing rows that were fine yesterday.
+///
+/// Mirrors `verify::canonical::v1_pinned_preserves_the_stored_audit_corpus_rule`
+/// and `ffi::pyo3::canonicalizer_parity_735`, including their anti-vacuity
+/// discipline: on an all-ASCII corpus the parity assertion below passes against
+/// the FLIPPED code, so the corpus is itself pinned as divergent.
+#[cfg(test)]
+mod persist_row_hash_v1_pin_tests {
+    use super::*;
+    use crate::verify::canonical::{ceg_produce_canonicalize, Canonicalizer};
+    use crate::verify::PythonJsonDumpsCanonicalizer;
+    use sha2::{Digest, Sha256};
+
+    /// Rows on which the two canonicalization rules DISAGREE, in the two ways
+    /// they can: raw UTF-8 vs `\uXXXX` escapes, and wire float tokens vs
+    /// ECMAScript number serialization.
+    ///
+    /// These are not synthetic. `family_name`, `reason` and `policy_blob` all
+    /// reach `persist_row_hash` and nothing on any write path enforces ASCII,
+    /// so a multilingual mesh stores these rows as a matter of course.
+    fn divergent_corpus() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "family_key_id": "fam-1",
+                "family_name": "家族",
+                "consensus_protocol": "quorum:2/3",
+            }),
+            serde_json::json!({
+                "community_key_id": "comm-1",
+                "policy_blob": {"note": "h\u{00e9}llo ⚠️", "tier": "commons"},
+            }),
+            serde_json::json!({
+                "family_key_id": "fam-2",
+                "reason": "révocation — clé compromise",
+            }),
+            // Non-ES float tokens: `1e-05` and the long decimal are preserved
+            // verbatim by serde_json's arbitrary_precision parse and
+            // re-serialized per ECMAScript rules by JCS. Unicode is not the
+            // only axis on which the two rules diverge.
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"cost_usd":0.0031992000000000006,"score":1e-05,"key_id":"k1"}"#,
+            )
+            .expect("wire float fixture parses"),
+        ]
+    }
+
+    /// **The anti-vacuity pin.** The parity test below asserts that
+    /// [`compute_persist_row_hash`] equals the V1 rule; on an all-ASCII corpus
+    /// that holds under the FLIPPED code too, and the witness proves nothing —
+    /// *a check that cannot fail is a report*. This test asserts the corpus
+    /// really does exercise the divergence, so a later "simplification" of these
+    /// fixtures to ASCII reds HERE rather than silently disarming the pin.
+    #[test]
+    fn the_row_hash_corpus_actually_diverges() {
+        for row in divergent_corpus() {
+            let v1 = PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&row)
+                .expect("v1 canonicalize");
+            let jcs = ceg_produce_canonicalize(&row).expect("jcs canonicalize");
+            assert_ne!(
+                v1, jcs,
+                "fixture must exercise the V1/JCS divergence — an all-agreeing \
+                 corpus makes the pin below vacuous: {row}"
+            );
+        }
+    }
+
+    /// **The pin.** `compute_persist_row_hash` IS the V1Python rule byte-for-
+    /// byte, and is NOT the produce-gate rule. Routing it through
+    /// `ceg_produce_canonicalize` reds this test — by design.
+    ///
+    /// The expected value is built by spelling the rule out literally rather
+    /// than by calling the function under test. In a witness that is correct:
+    /// re-deriving the bound from the code it checks is how a witness ends up
+    /// asserting only that a function equals itself.
+    #[test]
+    fn persist_row_hash_is_pinned_to_the_v1_canonicalizer() {
+        for row in divergent_corpus() {
+            let got = compute_persist_row_hash(&row).expect("hash");
+
+            // The projection, spelled out: drop the two excluded columns, then
+            // truncate instants. These fixtures carry neither excluded column
+            // nor any instant, so the projected value IS the row — asserted,
+            // not assumed, so a fixture that grew one does not slip past.
+            assert!(
+                row.get("persist_row_hash").is_none() && row.get("consent_role").is_none(),
+                "fixture must carry neither excluded column, or the literal \
+                 expectation below stops matching the rule: {row}"
+            );
+
+            let v1_bytes = PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&row)
+                .expect("v1 canonicalize");
+            assert_eq!(
+                got,
+                hex::encode(Sha256::digest(&v1_bytes)),
+                "compute_persist_row_hash MUST be SHA-256 over V1Python bytes. \
+                 Every stored `persist_row_hash` column was computed with this \
+                 rule; changing it makes those rows recompute to a different \
+                 hash, so the write paths that compare stored-vs-recomputed \
+                 start refusing rows that were fine yesterday. Row: {row}"
+            );
+
+            let jcs_bytes = ceg_produce_canonicalize(&row).expect("jcs canonicalize");
+            assert_ne!(
+                got,
+                hex::encode(Sha256::digest(&jcs_bytes)),
+                "routing compute_persist_row_hash through the produce gate would \
+                 take every stored persist_row_hash dark on this row: {row}"
+            );
+        }
+    }
+
+    /// The pin is about the RULE, not about one corpus: a real typed row with
+    /// non-ASCII in a field that genuinely reaches this hash must land on the
+    /// V1 value too.
+    ///
+    /// `Family::family_name` is the field — free text, non-unique, and nothing
+    /// on the write path constrains its character set.
+    #[test]
+    fn a_real_typed_row_with_non_ascii_hashes_under_v1() {
+        let fam = Family {
+            family_key_id: "fam-nonascii".to_owned(),
+            family_name: "家族 ⚠️ Ünïcode".to_owned(),
+            members: Vec::new(),
+            founded_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
+            consensus_protocol: "quorum:2/3".to_owned(),
+            consensus_protocol_entrenched: false,
+            // Deliberately non-empty: the projection must DROP it, so a rule
+            // that started hashing it would change the answer.
+            persist_row_hash: "ff".repeat(32),
+        };
+        let got = compute_persist_row_hash(&fam).expect("hash");
+
+        let mut projected = serde_json::to_value(&fam).expect("serializes");
+        projected
+            .as_object_mut()
+            .expect("object")
+            .remove("persist_row_hash");
+        let v1_bytes = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&projected)
+            .expect("v1 canonicalize");
+        assert_eq!(
+            got,
+            hex::encode(Sha256::digest(&v1_bytes)),
+            "a real Family row with non-ASCII `family_name` must hash under V1"
+        );
+        assert_ne!(
+            got,
+            hex::encode(Sha256::digest(
+                ceg_produce_canonicalize(&projected).expect("jcs canonicalize")
+            )),
+            "and must NOT match the produce-gate rule — if these two agree the \
+             fixture has lost its non-ASCII content and the pin is vacuous"
+        );
+    }
+}
+
+/// v37.0.0 (CIRISPersist#734) — **the five synthesized signing preimages are
+/// PINNED, so widening one is a reviewed act rather than a silent mesh-wide
+/// signature invalidation.**
+///
+/// # The gap this closes
+///
+/// [`Family`], [`Community`], [`FamilyMembershipRevocation`],
+/// [`CommunityMembershipRevocation`] and [`LocationProof`] each expose a
+/// `signing_envelope()` that is *the whole struct, serialized, minus
+/// `persist_row_hash`*. Those bytes are JCS-canonicalized, hybrid-Strict
+/// signed, STORED, and **re-verified by a peer on replication** — see
+/// `store::sqlite::tests::superseded_family_crosses_to_a_peer_sqlite_651`.
+///
+/// None of the five carries `deny_unknown_fields` or any other shape gate, and
+/// the projection is subtractive: a field added to one of these structs enters
+/// the signing preimage AUTOMATICALLY. So a single future cut adding one
+/// serializing field silently invalidates every stored signature on that plane,
+/// mesh-wide, with no test failing anywhere. That is a forced re-genesis
+/// arriving as a surprise after real agents depend on the mesh — the operator's
+/// constraint on this genesis is *"just make sure this is the last time."*
+///
+/// The class has already fired once: `genesis/mod.rs` records a seed signed
+/// before CIRISPersist#643's `RowMirror` change being refused at every
+/// `put_attestation` afterwards.
+///
+/// # What is pinned, and how
+///
+/// For each type a FULLY-POPULATED instance is built — every `Option` is
+/// `Some`, every `Vec` non-empty, every `bool` flipped off its default — and
+/// its key set is asserted equal to a hand-written literal list, **in both
+/// directions**. Full population is load-bearing: these types use `Option` +
+/// `skip_serializing_if`, so a field left `None` VANISHES from the JSON and a
+/// gate built on a sparse instance would pass while blind to it. That is
+/// exactly how CIRISPersist#683 escaped the `KeyRecord` guard in
+/// `genesis::bundle` — `additional_scrubs` was absent from the sampled record.
+///
+/// Both directions matters, and is where this improves on the gate it mirrors
+/// (`genesis::bundle::authorization_digest_tests`, which tests `difference`
+/// only): an ADDED field and a REMOVED field each move the preimage, and only
+/// set-equality catches both.
+///
+/// The nested roster element types [`FamilyMember`] / [`CommunityMember`] are
+/// pinned too. They serialize INSIDE the parent's `members` array, so widening
+/// one moves the parent's bytes without touching the parent's own field list —
+/// a hole a parent-only gate would not see.
+///
+/// # Two shapes, because one is blind to CIRISPersist#727
+///
+/// #727 asks for a gate because `skip_serializing_if` collapses
+/// absent-from-the-wire and present-but-default. The obvious remedy — REMOVING
+/// `skip_serializing_if` so defaults serialize explicitly — moves the JCS bytes
+/// on all five of these planes and invalidates every stored signature.
+///
+/// **A fully-populated fixture cannot see that change at all.** Every field is
+/// `Some`, so it serializes either way and the key set is identical before and
+/// after. So each type is pinned in BOTH shapes: fully-populated (which catches
+/// a field being added, renamed or dropped) and MINIMAL — every `Option` `None`,
+/// every `Vec` empty — which is the only shape where a `skip_serializing_if`
+/// change is observable. The minimal shape is also what most real rows look
+/// like on the wire, so it is the one most stored signatures were computed over.
+///
+/// Note what the two shapes say together: [`Family`] carries no
+/// `skip_serializing_if` field at all, so its two pinned lists are identical and
+/// that identity is itself the claim. The other four differ, and the difference
+/// IS the set of fields whose presence is optional on the wire.
+///
+/// # What this gate does NOT literally exercise, and why that is still covered
+///
+/// v37.0.0. **No mutation here is literally "add a struct field and watch it
+/// red."** A pure field addition is not expressible as a zero-churn mutation:
+/// Rust requires every struct literal to name the new field, and [`Family`]
+/// alone has ~25 construction sites spread across modules. So the mutation
+/// suite reaches the ADD direction three other ways — renaming a field on the
+/// struct (a key appears AND one disappears), renaming a field on a nested
+/// type, and making `signing_envelope` invent a key at the projection.
+///
+/// That is sufficient **by construction**, not by hope: the assertion is
+/// set-equality over the SERIALIZED KEY SET, which cannot see where a novel key
+/// came from. A struct field, a nested type's field, and a projection-level
+/// insertion all arrive as one extra entry in the same set. Any of the three
+/// redding proves the fourth would.
+///
+/// This limit is written down because the alternative is how the defects this
+/// release exists to close were born. `ifac_size` was documented as required
+/// and enforced nowhere. CIRISPersist#727 was a serde default meeting an
+/// `unwrap_or("")` reader. The CEG 0.1 ladder flag named its own flip condition
+/// only in prose, and sat open five CEG versions past it. **And the first draft
+/// of THIS gate carried a doc claim that it would catch #727's remedy — which
+/// it would not have, caught only because someone tried to write the mutation
+/// for it.** A gate whose limits are recorded is worth more than one that reads
+/// as total; the next person to touch these five planes needs to know which
+/// shapes are pinned and which are inferred.
+#[cfg(test)]
+mod signing_preimage_pin_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Set-equality against a hand-written literal, with a message that names
+    /// the REMEDY rather than only the diff.
+    ///
+    /// `expected` is never derived from the type under test — not from
+    /// `to_value`, not from another list here. A list computed from the code it
+    /// checks asserts nothing about that code.
+    fn assert_preimage_fields(what: &str, value: &serde_json::Value, expected: &[&str]) {
+        let got: BTreeSet<&str> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{what}: the signing preimage must be a JSON object"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let want: BTreeSet<&str> = expected.iter().copied().collect();
+        assert_eq!(
+            want.len(),
+            expected.len(),
+            "{what}: the pinned list has a duplicate entry"
+        );
+        let added: Vec<&&str> = got.difference(&want).collect();
+        let removed: Vec<&&str> = want.difference(&got).collect();
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "{what}: the SIGNING PREIMAGE changed shape — added {added:?}, removed \
+             {removed:?}.\n\
+             \n\
+             These bytes are JCS-canonicalized, hybrid-Strict signed, stored, and \
+             re-verified by peers on replication. Changing this set invalidates EVERY \
+             stored signature on this plane, mesh-wide, and forces a re-genesis.\n\
+             \n\
+             THE SAFE WAY to add a field here is `Option<T>` + \
+             `#[serde(default, skip_serializing_if = \"Option::is_none\")]` (or \
+             `Vec` + `skip_serializing_if = \"Vec::is_empty\"`). An absent field \
+             serializes to nothing, so bytes signed before the change still verify \
+             byte-for-byte after it.\n\
+             \n\
+             Anything else — a bare field, a `#[serde(default)]` without \
+             `skip_serializing_if`, a rename, a REMOVAL, or dropping an existing \
+             `skip_serializing_if` (see CIRISPersist#727) — moves the preimage and \
+             requires re-signing every stored row on this plane before it can \
+             federate again. If that is genuinely intended, update this pinned list \
+             in the same commit and say why in the CHANGELOG."
+        );
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().expect("rfc3339 literal")
+    }
+
+    /// A fully-populated [`FamilyMember`]: `role` is `Some`, not `None`.
+    fn full_family_member() -> FamilyMember {
+        FamilyMember {
+            key_id: "member-key".to_owned(),
+            joined_at: t("2026-01-02T03:04:05Z"),
+            role: Some("founder".to_owned()),
+        }
+    }
+
+    fn full_community_member() -> CommunityMember {
+        CommunityMember {
+            key_id: "member-key".to_owned(),
+            joined_at: t("2026-01-02T03:04:05Z"),
+            role: Some("founder".to_owned()),
+        }
+    }
+
+    /// Every field of [`Family`] set to a non-default, non-empty value —
+    /// including `consensus_protocol_entrenched`, which carries
+    /// `#[serde(default)]` with NO `skip_serializing_if` and therefore always
+    /// serializes (it is flipped to `true` anyway so a future
+    /// `skip_serializing_if` on it would red this gate).
+    fn full_family() -> Family {
+        Family {
+            family_key_id: "fam-key".to_owned(),
+            family_name: "Acme Household".to_owned(),
+            members: vec![full_family_member()],
+            founded_at: t("2026-01-01T00:00:00Z"),
+            consensus_protocol: "quorum:2/3".to_owned(),
+            consensus_protocol_entrenched: true,
+            persist_row_hash: "aa".repeat(32),
+        }
+    }
+
+    fn full_community() -> Community {
+        Community {
+            community_key_id: "comm-key".to_owned(),
+            community_name: "Acme Co-op".to_owned(),
+            members: vec![full_community_member()],
+            founded_at: t("2026-01-01T00:00:00Z"),
+            consensus_protocol: "majority".to_owned(),
+            policy_blob: Some(serde_json::json!({ "cohort_scope": "community" })),
+            persist_row_hash: "bb".repeat(32),
+        }
+    }
+
+    fn full_family_membership_revocation() -> FamilyMembershipRevocation {
+        FamilyMembershipRevocation {
+            family_key_id: "fam-key".to_owned(),
+            removed_identity_key_id: "removed-key".to_owned(),
+            removed_at: t("2026-02-01T00:00:00Z"),
+            effective_at: t("2026-02-02T00:00:00Z"),
+            reason: Some("ceremony annotation".to_owned()),
+            witness_set: vec!["witness-a".to_owned(), "witness-b".to_owned()],
+            persist_row_hash: "cc".repeat(32),
+        }
+    }
+
+    fn full_community_membership_revocation() -> CommunityMembershipRevocation {
+        CommunityMembershipRevocation {
+            community_key_id: "comm-key".to_owned(),
+            removed_identity_key_id: "removed-key".to_owned(),
+            removed_at: t("2026-02-01T00:00:00Z"),
+            effective_at: t("2026-02-02T00:00:00Z"),
+            reason: Some("ceremony annotation".to_owned()),
+            witness_set: vec!["witness-a".to_owned(), "witness-b".to_owned()],
+            persist_row_hash: "dd".repeat(32),
+        }
+    }
+
+    fn full_location_proof() -> LocationProof {
+        LocationProof {
+            subject_key_id: "subject-key".to_owned(),
+            // A real canonical res-7 cell; the shape gate is elsewhere, but a
+            // plausible value keeps this fixture usable as documentation.
+            cell_id: "872830828ffffff".to_owned(),
+            cell_resolution: 7,
+            asserted_at: t("2026-03-01T00:00:00Z"),
+            valid_until: Some(t("2026-04-01T00:00:00Z")),
+            attestation_evidence: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            withdrawn_at: Some(t("2026-03-15T00:00:00Z")),
+            persist_row_hash: "ee".repeat(32),
+        }
+    }
+
+    // ── The pinned lists. HAND-WRITTEN. Never derived. ──────────────────
+    //
+    // Each is the field set of a FULLY-POPULATED instance as of v37.0.0,
+    // transcribed from the struct definition by hand. `signing_envelope()`
+    // subtracts exactly `persist_row_hash` from these and nothing else, which
+    // the tests below assert separately — so a projection that started
+    // stripping a second field reds here too, not only a struct that grew.
+
+    const FAMILY_FIELDS: &[&str] = &[
+        "family_key_id",
+        "family_name",
+        "members",
+        "founded_at",
+        "consensus_protocol",
+        "consensus_protocol_entrenched",
+        "persist_row_hash",
+    ];
+    const FAMILY_MEMBER_FIELDS: &[&str] = &["key_id", "joined_at", "role"];
+    const COMMUNITY_FIELDS: &[&str] = &[
+        "community_key_id",
+        "community_name",
+        "members",
+        "founded_at",
+        "consensus_protocol",
+        "policy_blob",
+        "persist_row_hash",
+    ];
+    const COMMUNITY_MEMBER_FIELDS: &[&str] = &["key_id", "joined_at", "role"];
+    const FAMILY_MEMBERSHIP_REVOCATION_FIELDS: &[&str] = &[
+        "family_key_id",
+        "removed_identity_key_id",
+        "removed_at",
+        "effective_at",
+        "reason",
+        "witness_set",
+        "persist_row_hash",
+    ];
+    const COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS: &[&str] = &[
+        "community_key_id",
+        "removed_identity_key_id",
+        "removed_at",
+        "effective_at",
+        "reason",
+        "witness_set",
+        "persist_row_hash",
+    ];
+    const LOCATION_PROOF_FIELDS: &[&str] = &[
+        "subject_key_id",
+        "cell_id",
+        "cell_resolution",
+        "asserted_at",
+        "valid_until",
+        "attestation_evidence",
+        "withdrawn_at",
+        "persist_row_hash",
+    ];
+
+    // ── MINIMAL fixtures + their pinned lists ───────────────────────────
+    //
+    // Every `Option` `None`, every `Vec` empty. This is the shape a
+    // `skip_serializing_if` change is visible in, and the shape most stored
+    // rows actually take on the wire. A gate built only on the full shape is
+    // blind to CIRISPersist#727's remedy — see the module doc.
+
+    fn minimal_family() -> Family {
+        Family {
+            family_key_id: "fam-key".to_owned(),
+            family_name: "Acme Household".to_owned(),
+            members: Vec::new(),
+            founded_at: t("2026-01-01T00:00:00Z"),
+            consensus_protocol: "quorum:2/3".to_owned(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: "aa".repeat(32),
+        }
+    }
+
+    fn minimal_community() -> Community {
+        Community {
+            community_key_id: "comm-key".to_owned(),
+            community_name: "Acme Co-op".to_owned(),
+            members: Vec::new(),
+            founded_at: t("2026-01-01T00:00:00Z"),
+            consensus_protocol: "majority".to_owned(),
+            policy_blob: None,
+            persist_row_hash: "bb".repeat(32),
+        }
+    }
+
+    fn minimal_family_membership_revocation() -> FamilyMembershipRevocation {
+        FamilyMembershipRevocation {
+            family_key_id: "fam-key".to_owned(),
+            removed_identity_key_id: "removed-key".to_owned(),
+            removed_at: t("2026-02-01T00:00:00Z"),
+            effective_at: t("2026-02-02T00:00:00Z"),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: "cc".repeat(32),
+        }
+    }
+
+    fn minimal_community_membership_revocation() -> CommunityMembershipRevocation {
+        CommunityMembershipRevocation {
+            community_key_id: "comm-key".to_owned(),
+            removed_identity_key_id: "removed-key".to_owned(),
+            removed_at: t("2026-02-01T00:00:00Z"),
+            effective_at: t("2026-02-02T00:00:00Z"),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: "dd".repeat(32),
+        }
+    }
+
+    fn minimal_location_proof() -> LocationProof {
+        LocationProof {
+            subject_key_id: "subject-key".to_owned(),
+            cell_id: "872830828ffffff".to_owned(),
+            cell_resolution: 7,
+            asserted_at: t("2026-03-01T00:00:00Z"),
+            valid_until: None,
+            attestation_evidence: None,
+            withdrawn_at: None,
+            persist_row_hash: "ee".repeat(32),
+        }
+    }
+
+    fn minimal_family_member() -> FamilyMember {
+        FamilyMember {
+            key_id: "member-key".to_owned(),
+            joined_at: t("2026-01-02T03:04:05Z"),
+            role: None,
+        }
+    }
+
+    fn minimal_community_member() -> CommunityMember {
+        CommunityMember {
+            key_id: "member-key".to_owned(),
+            joined_at: t("2026-01-02T03:04:05Z"),
+            role: None,
+        }
+    }
+
+    /// `Family` carries NO `skip_serializing_if` field, so its minimal shape is
+    /// its full shape. Spelled out rather than aliased to [`FAMILY_FIELDS`]:
+    /// the identity is the claim, and deriving one list from the other would
+    /// make it unfalsifiable.
+    const FAMILY_FIELDS_MINIMAL: &[&str] = &[
+        "family_key_id",
+        "family_name",
+        "members",
+        "founded_at",
+        "consensus_protocol",
+        "consensus_protocol_entrenched",
+        "persist_row_hash",
+    ];
+    /// `role` is absent — `skip_serializing_if = "Option::is_none"`.
+    const FAMILY_MEMBER_FIELDS_MINIMAL: &[&str] = &["key_id", "joined_at"];
+    /// `policy_blob` is absent.
+    const COMMUNITY_FIELDS_MINIMAL: &[&str] = &[
+        "community_key_id",
+        "community_name",
+        "members",
+        "founded_at",
+        "consensus_protocol",
+        "persist_row_hash",
+    ];
+    const COMMUNITY_MEMBER_FIELDS_MINIMAL: &[&str] = &["key_id", "joined_at"];
+    /// `reason` and `witness_set` are absent.
+    const FAMILY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL: &[&str] = &[
+        "family_key_id",
+        "removed_identity_key_id",
+        "removed_at",
+        "effective_at",
+        "persist_row_hash",
+    ];
+    const COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL: &[&str] = &[
+        "community_key_id",
+        "removed_identity_key_id",
+        "removed_at",
+        "effective_at",
+        "persist_row_hash",
+    ];
+    /// `valid_until`, `attestation_evidence` and `withdrawn_at` are absent.
+    const LOCATION_PROOF_FIELDS_MINIMAL: &[&str] = &[
+        "subject_key_id",
+        "cell_id",
+        "cell_resolution",
+        "asserted_at",
+        "persist_row_hash",
+    ];
+
+    /// **The MINIMAL wire shape is pinned on all five planes plus both nested
+    /// member types** — the shape a `skip_serializing_if` change is visible in.
+    ///
+    /// Dropping `skip_serializing_if` from any optional field here (the obvious
+    /// CIRISPersist#727 remedy) makes that field serialize as `null` on rows
+    /// that do not carry it, which moves the JCS bytes for every such stored
+    /// row. The fully-populated pins cannot see it — every field is `Some`
+    /// there, so the key set does not move. This test is the only thing in the
+    /// module that can.
+    #[test]
+    fn minimal_wire_shape_is_pinned() {
+        let cases: Vec<(&str, serde_json::Value, &[&str])> = vec![
+            (
+                "Family (minimal)",
+                minimal_family().signing_envelope(),
+                FAMILY_FIELDS_MINIMAL,
+            ),
+            (
+                "Community (minimal)",
+                minimal_community().signing_envelope(),
+                COMMUNITY_FIELDS_MINIMAL,
+            ),
+            (
+                "FamilyMembershipRevocation (minimal)",
+                minimal_family_membership_revocation().signing_envelope(),
+                FAMILY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL,
+            ),
+            (
+                "CommunityMembershipRevocation (minimal)",
+                minimal_community_membership_revocation().signing_envelope(),
+                COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL,
+            ),
+            (
+                "LocationProof (minimal)",
+                minimal_location_proof().signing_envelope(),
+                LOCATION_PROOF_FIELDS_MINIMAL,
+            ),
+            (
+                "FamilyMember (minimal)",
+                serde_json::to_value(minimal_family_member()).expect("serializes"),
+                FAMILY_MEMBER_FIELDS_MINIMAL,
+            ),
+            (
+                "CommunityMember (minimal)",
+                serde_json::to_value(minimal_community_member()).expect("serializes"),
+                COMMUNITY_MEMBER_FIELDS_MINIMAL,
+            ),
+        ];
+        for (what, value, fields) in cases {
+            // The five parent planes are checked through `signing_envelope`, so
+            // `persist_row_hash` is already gone; the nested members have no
+            // envelope of their own and are serialized directly.
+            let expected: Vec<&str> = if fields.contains(&STRIPPED) {
+                without_row_hash(fields)
+            } else {
+                fields.to_vec()
+            };
+            assert_preimage_fields(what, &value, &expected);
+        }
+    }
+
+    /// The minimal shape must be a STRICT SUBSET of the full shape, and the
+    /// difference must be exactly the optional fields.
+    ///
+    /// Without this, the two pinned lists could drift into describing two
+    /// unrelated types and both tests would still pass. It also names, in one
+    /// place, every field whose presence on the wire is optional — the set
+    /// CIRISPersist#727 is about.
+    #[test]
+    fn the_optional_wire_fields_are_exactly_these() {
+        /// One plane's two pinned lists plus the optional-field set that must
+        /// be exactly their difference. A named struct rather than a 4-tuple:
+        /// three of the four members are `&[&str]` and positional confusion
+        /// between them would silently weaken the assertion.
+        struct Plane {
+            what: &'static str,
+            full: &'static [&'static str],
+            minimal: &'static [&'static str],
+            optional: &'static [&'static str],
+        }
+        let plane = |what, full, minimal, optional| Plane {
+            what,
+            full,
+            minimal,
+            optional,
+        };
+        let cases: Vec<Plane> = vec![
+            plane("Family", FAMILY_FIELDS, FAMILY_FIELDS_MINIMAL, &[]),
+            plane(
+                "Community",
+                COMMUNITY_FIELDS,
+                COMMUNITY_FIELDS_MINIMAL,
+                &["policy_blob"],
+            ),
+            plane(
+                "FamilyMembershipRevocation",
+                FAMILY_MEMBERSHIP_REVOCATION_FIELDS,
+                FAMILY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL,
+                &["reason", "witness_set"],
+            ),
+            plane(
+                "CommunityMembershipRevocation",
+                COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS,
+                COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS_MINIMAL,
+                &["reason", "witness_set"],
+            ),
+            plane(
+                "LocationProof",
+                LOCATION_PROOF_FIELDS,
+                LOCATION_PROOF_FIELDS_MINIMAL,
+                &["valid_until", "attestation_evidence", "withdrawn_at"],
+            ),
+            plane(
+                "FamilyMember",
+                FAMILY_MEMBER_FIELDS,
+                FAMILY_MEMBER_FIELDS_MINIMAL,
+                &["role"],
+            ),
+            plane(
+                "CommunityMember",
+                COMMUNITY_MEMBER_FIELDS,
+                COMMUNITY_MEMBER_FIELDS_MINIMAL,
+                &["role"],
+            ),
+        ];
+        for c in cases {
+            let f: BTreeSet<&str> = c.full.iter().copied().collect();
+            let m: BTreeSet<&str> = c.minimal.iter().copied().collect();
+            let what = c.what;
+            assert!(
+                m.is_subset(&f),
+                "{what}: the minimal pin is not a subset of the full pin — the two \
+                 lists have drifted apart and are describing different types"
+            );
+            let diff: BTreeSet<&str> = f.difference(&m).copied().collect();
+            let want: BTreeSet<&str> = c.optional.iter().copied().collect();
+            assert_eq!(
+                diff, want,
+                "{what}: the OPTIONAL wire fields changed. A field becoming optional \
+                 (or stopping being optional) moves the JCS bytes for every stored \
+                 row that does not carry it — see CIRISPersist#727."
+            );
+        }
+    }
+
+    /// The stripped field, spelled once. Every `signing_envelope()` removes
+    /// exactly this and nothing else.
+    const STRIPPED: &str = "persist_row_hash";
+
+    /// `expected` minus [`STRIPPED`] — what `signing_envelope()` must yield.
+    /// This is a projection of the PINNED list, never of the type, so it stays
+    /// a hand-written claim.
+    fn without_row_hash<'a>(expected: &[&'a str]) -> Vec<&'a str> {
+        let out: Vec<&str> = expected
+            .iter()
+            .copied()
+            .filter(|f| *f != STRIPPED)
+            .collect();
+        assert_eq!(
+            out.len() + 1,
+            expected.len(),
+            "the pinned list must contain {STRIPPED} exactly once"
+        );
+        out
+    }
+
+    /// Assert both halves for one type: the struct's own serialized shape, and
+    /// the signing preimage the peers actually verify.
+    fn pin(what: &str, full: serde_json::Value, envelope: serde_json::Value, fields: &[&str]) {
+        assert_preimage_fields(&format!("{what} (serialized record)"), &full, fields);
+        assert_preimage_fields(
+            &format!("{what} (signing_envelope — THE bytes peers verify)"),
+            &envelope,
+            &without_row_hash(fields),
+        );
+    }
+
+    #[test]
+    fn family_signing_preimage_is_pinned() {
+        let f = full_family();
+        pin(
+            "Family",
+            serde_json::to_value(&f).expect("serializes"),
+            f.signing_envelope(),
+            FAMILY_FIELDS,
+        );
+    }
+
+    /// [`FamilyMember`] serializes INSIDE `Family::members`, so widening it
+    /// moves `Family`'s signed bytes while leaving `Family`'s own field list
+    /// untouched. Pinned separately, and read out of the parent's array rather
+    /// than serialized standalone — so this measures what actually lands in the
+    /// preimage.
+    #[test]
+    fn family_member_signing_preimage_is_pinned() {
+        let f = full_family();
+        let members = f.signing_envelope()["members"].clone();
+        let first = members
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .expect("the fixture family carries a member");
+        assert_preimage_fields(
+            "FamilyMember (inside Family::members)",
+            &first,
+            FAMILY_MEMBER_FIELDS,
+        );
+    }
+
+    #[test]
+    fn community_signing_preimage_is_pinned() {
+        let c = full_community();
+        pin(
+            "Community",
+            serde_json::to_value(&c).expect("serializes"),
+            c.signing_envelope(),
+            COMMUNITY_FIELDS,
+        );
+    }
+
+    #[test]
+    fn community_member_signing_preimage_is_pinned() {
+        let c = full_community();
+        let members = c.signing_envelope()["members"].clone();
+        let first = members
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .expect("the fixture community carries a member");
+        assert_preimage_fields(
+            "CommunityMember (inside Community::members)",
+            &first,
+            COMMUNITY_MEMBER_FIELDS,
+        );
+    }
+
+    #[test]
+    fn family_membership_revocation_signing_preimage_is_pinned() {
+        let r = full_family_membership_revocation();
+        pin(
+            "FamilyMembershipRevocation",
+            serde_json::to_value(&r).expect("serializes"),
+            r.signing_envelope(),
+            FAMILY_MEMBERSHIP_REVOCATION_FIELDS,
+        );
+    }
+
+    #[test]
+    fn community_membership_revocation_signing_preimage_is_pinned() {
+        let r = full_community_membership_revocation();
+        pin(
+            "CommunityMembershipRevocation",
+            serde_json::to_value(&r).expect("serializes"),
+            r.signing_envelope(),
+            COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS,
+        );
+    }
+
+    #[test]
+    fn location_proof_signing_preimage_is_pinned() {
+        let p = full_location_proof();
+        pin(
+            "LocationProof",
+            serde_json::to_value(&p).expect("serializes"),
+            p.signing_envelope(),
+            LOCATION_PROOF_FIELDS,
+        );
+    }
+
+    /// **The fixtures are genuinely FULLY POPULATED** — the property every pin
+    /// above depends on, asserted rather than assumed.
+    ///
+    /// Each of these types has `Option` / `Vec` fields carrying
+    /// `skip_serializing_if`. A fixture that left one empty would drop that key
+    /// from the JSON, the pinned list would be written WITHOUT it, and the gate
+    /// would then be blind to exactly the field it was built to watch — the
+    /// CIRISPersist#683 failure, verbatim.
+    ///
+    /// The check is structural: for each type, the serialized key COUNT must
+    /// equal the pinned list length, and no value may be JSON `null` (serde
+    /// emits `null` for a `Some`-less `Option` that lacks
+    /// `skip_serializing_if`, which is the other way a field can be present but
+    /// vacuous).
+    #[test]
+    fn every_pin_fixture_is_fully_populated() {
+        let cases: Vec<(&str, serde_json::Value, usize)> = vec![
+            (
+                "Family",
+                serde_json::to_value(full_family()).expect("serializes"),
+                FAMILY_FIELDS.len(),
+            ),
+            (
+                "Community",
+                serde_json::to_value(full_community()).expect("serializes"),
+                COMMUNITY_FIELDS.len(),
+            ),
+            (
+                "FamilyMembershipRevocation",
+                serde_json::to_value(full_family_membership_revocation()).expect("serializes"),
+                FAMILY_MEMBERSHIP_REVOCATION_FIELDS.len(),
+            ),
+            (
+                "CommunityMembershipRevocation",
+                serde_json::to_value(full_community_membership_revocation()).expect("serializes"),
+                COMMUNITY_MEMBERSHIP_REVOCATION_FIELDS.len(),
+            ),
+            (
+                "LocationProof",
+                serde_json::to_value(full_location_proof()).expect("serializes"),
+                LOCATION_PROOF_FIELDS.len(),
+            ),
+            (
+                "FamilyMember",
+                serde_json::to_value(full_family_member()).expect("serializes"),
+                FAMILY_MEMBER_FIELDS.len(),
+            ),
+            (
+                "CommunityMember",
+                serde_json::to_value(full_community_member()).expect("serializes"),
+                COMMUNITY_MEMBER_FIELDS.len(),
+            ),
+        ];
+        for (what, value, want) in cases {
+            let obj = value.as_object().expect("object");
+            assert_eq!(
+                obj.len(),
+                want,
+                "{what}: the pin fixture is not fully populated — it serialized \
+                 {} keys against a pinned list of {want}. A `skip_serializing_if` \
+                 field left empty is INVISIBLE to this gate.",
+                obj.len()
+            );
+            for (k, v) in obj {
+                assert!(
+                    !v.is_null(),
+                    "{what}.{k} serialized as null — populate it with a real value, \
+                     or the gate watches a field it cannot see change"
+                );
+                if let Some(s) = v.as_str() {
+                    assert!(!s.is_empty(), "{what}.{k} is an empty string");
+                }
+                if let Some(a) = v.as_array() {
+                    assert!(!a.is_empty(), "{what}.{k} is an empty array");
+                }
+            }
+        }
+    }
+
+    /// The subtraction is exactly one field, on all five planes.
+    ///
+    /// `signing_envelope()` is `to_value(self)` minus `persist_row_hash`. If a
+    /// future edit made one of them strip a SECOND field, every peer would keep
+    /// verifying happily against its own matching implementation while the
+    /// stored `persist_row_hash`-bearing row and the signed bytes diverged —
+    /// the "verified once, then never" shape.
+    #[test]
+    fn signing_envelope_strips_exactly_the_row_hash() {
+        let cases: Vec<(&str, serde_json::Value, serde_json::Value)> = vec![
+            (
+                "Family",
+                serde_json::to_value(full_family()).expect("serializes"),
+                full_family().signing_envelope(),
+            ),
+            (
+                "Community",
+                serde_json::to_value(full_community()).expect("serializes"),
+                full_community().signing_envelope(),
+            ),
+            (
+                "FamilyMembershipRevocation",
+                serde_json::to_value(full_family_membership_revocation()).expect("serializes"),
+                full_family_membership_revocation().signing_envelope(),
+            ),
+            (
+                "CommunityMembershipRevocation",
+                serde_json::to_value(full_community_membership_revocation()).expect("serializes"),
+                full_community_membership_revocation().signing_envelope(),
+            ),
+            (
+                "LocationProof",
+                serde_json::to_value(full_location_proof()).expect("serializes"),
+                full_location_proof().signing_envelope(),
+            ),
+        ];
+        for (what, full, envelope) in cases {
+            let full_keys: BTreeSet<&str> = full
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let env_keys: BTreeSet<&str> = envelope
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let dropped: Vec<&&str> = full_keys.difference(&env_keys).collect();
+            assert_eq!(
+                dropped,
+                vec![&STRIPPED],
+                "{what}::signing_envelope must drop exactly [{STRIPPED}], dropped \
+                 {dropped:?}"
+            );
+            assert!(
+                env_keys.difference(&full_keys).next().is_none(),
+                "{what}::signing_envelope INVENTED a field the record does not carry"
+            );
+            // The surviving values must be untouched, not merely present.
+            for k in &env_keys {
+                assert_eq!(
+                    envelope.get(*k),
+                    full.get(*k),
+                    "{what}::signing_envelope altered the value of {k}"
+                );
+            }
+        }
     }
 }
 

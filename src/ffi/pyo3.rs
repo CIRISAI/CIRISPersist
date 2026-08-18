@@ -6433,16 +6433,22 @@ impl PyEngine {
     /// 1. Builds a `KeyRecord` with this engine's local Ed25519 pubkey
     ///    + `key_id`, the supplied `identity_type` / `identity_ref` /
     ///    `valid_until`, and `algorithm = "hybrid"`.
-    /// 2. Canonicalizes the supplied `registration_envelope` JSON via
-    ///    `PythonJsonDumpsCanonicalizer` (same rule the existing
-    ///    `canonicalize_envelope` PyO3 method uses).
+    /// 2. Canonicalizes the supplied `registration_envelope` JSON
+    ///    through the CEG produce gate (`ceg_produce_canonicalize` —
+    ///    RFC 8785 JCS at the current produce epoch), the same rule the
+    ///    `canonicalize_envelope` PyO3 method uses and the same rule
+    ///    `register::verify_key_registration` rebuilds with. (This doc
+    ///    said `PythonJsonDumpsCanonicalizer` until v37.0.0, and so did
+    ///    the code — see `Engine::register_self_federation_key` for the
+    ///    defect that made a non-ASCII bootstrap row permanently
+    ///    unverifiable.)
     /// 3. Signs those canonical bytes with the local Ed25519 key →
     ///    `scrub_signature_classical`.
     /// 4. `original_content_hash = hex(SHA-256(canonical_bytes))`.
     /// 5. `scrub_key_id = key_id` (self-signed bootstrap row).
-    /// 6. ML-DSA-65 half left as `None` — the existing cold-path PQC
-    ///    fill in `put_public_key` will attach the PQC signature
-    ///    asynchronously if the engine was constructed with PQC keys.
+    /// 6. ML-DSA-65 half signed in the same call when the engine carries
+    ///    a PQC identity (v10.1.0/#275), leaving `pqc_completed_at` set;
+    ///    an Ed25519-only engine stores the classical half alone.
     /// 7. Calls `put_public_key` with the assembled `SignedKeyRecord`.
     ///
     /// Returns the registered `key_id` — the **derived** federation
@@ -14057,10 +14063,19 @@ impl PyEngine {
     /// v0.4.0 — Verify a CompleteTrace envelope end-to-end.
     /// Looks up `signature_key_id` via the federation directory,
     /// reconstructs canonical bytes per `trace_schema_version`
-    /// (deterministic dispatch — 2.7.0 / 2.7.9), verifies the
-    /// Ed25519 signature.
+    /// (deterministic field-layout dispatch — 2.7.0 / 2.7.9 / 3.0.0),
+    /// verifies the Ed25519 signature.
     ///
-    /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"}`
+    /// **v37.0.0 — the CANONICALIZER is resolved from the trace's own
+    /// signed schema epoch too**, via
+    /// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
+    /// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) — the identical
+    /// expression `src/ingest.rs` uses on the production
+    /// `receive_and_persist` path. Until v36.x this method hard-coded
+    /// the Python-compat rule, so a `3.0.0` trace carrying non-ASCII
+    /// was stored by `receive_and_persist` and rejected here.
+    ///
+    /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"|"3.0.0"}`
     /// on success. Raises `ValueError` with a stable verify
     /// error-token (`verify_signature_mismatch`,
     /// `verify_unknown_key`, `verify_invalid_signature`,
@@ -14071,7 +14086,7 @@ impl PyEngine {
     /// storing it (dry-run validation, pre-storage check, audit
     /// replay). Persistence still goes through
     /// `receive_and_persist` (which verifies internally before
-    /// storing).
+    /// storing) — and the two now agree by construction.
     fn verify_trace<'py>(
         &self,
         py: Python<'py>,
@@ -14080,13 +14095,21 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::CompleteTrace;
-            use crate::verify::{verify_trace_via_directory, PythonJsonDumpsCanonicalizer};
+            use crate::verify::verify_trace_via_directory;
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
             let runtime = self.runtime.clone();
             // Read off the one field the response needs BEFORE the trace moves
             // into the detached closure.
             let schema_version = trace.trace_schema_version.as_str().to_owned();
+            // v37.0.0 — SIGNED-BYTES-BOUND, NOT HARD-CODED. Until v36.x this
+            // surface handed `verify_trace_via_directory` a hard-coded
+            // `PythonJsonDumpsCanonicalizer` and never consulted the signed
+            // schema epoch, while `receive_and_persist` resolved it from the
+            // trace's own `trace_schema_version`. See [`trace_canonicalizer`]
+            // for the defect, the #176 downgrade guard, and why the GIL note
+            // below still covers both arms of the gate.
+            let canon = trace_canonicalizer(&schema_version);
             // v25.x (CIRISPersist#580) — the whole verify runs with the GIL
             // RELEASED. `TraceKeyDirectory::lookup` bridges the sync
             // `PublicKeyDirectory` trait to the async backend with
@@ -14114,7 +14137,7 @@ impl PyEngine {
                         backend: pg.clone(),
                         runtime,
                     };
-                    verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir)
+                    verify_trace_via_directory(&trace, canon, &key_dir)
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
@@ -14122,7 +14145,7 @@ impl PyEngine {
                         backend: sq.clone(),
                         runtime,
                     };
-                    verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir)
+                    verify_trace_via_directory(&trace, canon, &key_dir)
                 }
             });
             // Error mapping stays OUTSIDE the detach: building a `PyErr` is
@@ -28925,15 +28948,73 @@ where
 }
 
 /// v0.4.0 — Canonicalize a federation envelope value (registration_
-/// envelope / attestation_envelope / revocation_envelope) via
-/// PythonJsonDumpsCanonicalizer. Used by the verify_signed_*
-/// methods to produce the bytes the scrub signature was computed
-/// over.
+/// envelope / attestation_envelope / revocation_envelope) **through the
+/// produce gate** ([`crate::verify::canonical::ceg_produce_canonicalize`]).
+/// Used by the `verify_signed_*` methods to produce the bytes the scrub
+/// signature was computed over.
+///
+/// # v37.0.0 (CIRISPersist#735) — routed through the gate
+///
+/// From v4.15.0 (the JCS produce flip) to v36.x this hand-built
+/// [`crate::verify::PythonJsonDumpsCanonicalizer`], while every Rust twin
+/// of these three verifies rebuilds the same preimage with
+/// `ceg_produce_canonicalize` — `register::verify_key_registration`
+/// (`src/federation/register.rs`), the accord-family quorum in
+/// `src/federation/admission.rs`, and `operational.rs`'s scrub verifies.
+/// On ASCII-only input the two rules agree byte-for-byte, which is why it
+/// survived; on any envelope carrying a non-ASCII character (`family_name`,
+/// `reason` and `policy_blob` all reach these bytes) or a non-ES float token
+/// the FFI verify said VERIFIED about bytes no admission gate would ever
+/// rebuild — a false green in front of a door that refuses.
+///
+/// Note the deliberate ABSENCE of a signature strip: these three envelopes
+/// carry their signature in ROW COLUMNS (`scrub_signature_classical` /
+/// `scrub_signature_pqc`), not inside the envelope, so the Rust twins
+/// canonicalize the envelope whole. This is
+/// [`crate::verify::canonicalize_envelope_for_signing`] WITHOUT the strip,
+/// not a different rule.
 fn canonicalize_envelope_value(envelope: &serde_json::Value) -> PyResult<Vec<u8>> {
-    use crate::verify::canonical::Canonicalizer;
-    crate::verify::PythonJsonDumpsCanonicalizer
-        .canonicalize_value(envelope)
+    crate::verify::canonical::ceg_produce_canonicalize(envelope)
         .map_err(|e| PyRuntimeError::new_err(format!("canonicalize_envelope_value: {e}")))
+}
+
+/// v37.0.0 — **the trace canonicalizer is resolved from the trace's own
+/// SIGNED schema epoch**, exactly as the production ingest path resolves it.
+///
+/// One expression, delegating to
+/// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
+/// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) through
+/// [`canonicalizer_for`](crate::verify::canonical::canonicalizer_for) — the
+/// IDENTICAL expression `IngestPipeline::verify_complete_trace` uses in
+/// `src/ingest.rs`, where it is documented as *"signed-bytes-bound, not
+/// caller-selectable"*. This is a seam for the witness, not a second rule: if
+/// the two ever disagree, `verify_trace_and_ingest_agree_on_the_canon_gate`
+/// reds.
+///
+/// # The FIFTH instance of the #714 / #716 / #735 class
+///
+/// [`PyEngine::verify_trace`] hard-coded
+/// [`PythonJsonDumpsCanonicalizer`](crate::verify::PythonJsonDumpsCanonicalizer)
+/// and never consulted the epoch. `"3.0.0"` is a SUPPORTED schema
+/// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
+/// epoch, so a 3.0.0 trace carrying one non-ASCII character was ADMITTED by
+/// `receive_and_persist` and REJECTED by `Engine.verify_trace` — the same
+/// trace, two answers, from one library, with the dry-run primitive (the one a
+/// peer consults BEFORE storing) giving the wrong one.
+///
+/// # GIL
+///
+/// Returns a `&'static dyn Canonicalizer`; [`Canonicalizer`](crate::verify::canonical::Canonicalizer)
+/// is `Send + Sync`, so the handle crosses `py.detach` exactly as the unit
+/// struct did. Neither arm touches CPython — `PythonJsonDumpsCanonicalizer`
+/// names the OUTPUT FORMAT it emulates and `JcsCanonicalizer` delegates to
+/// `ciris_verify_core::jcs` — so the #580 no-hoisting argument covers both.
+fn trace_canonicalizer(
+    schema_version: &str,
+) -> &'static dyn crate::verify::canonical::Canonicalizer {
+    crate::verify::canonical::canonicalizer_for(
+        crate::verify::ed25519::canon_version_for_trace_schema(schema_version),
+    )
 }
 
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
@@ -29183,6 +29264,18 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections
         // are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
+        // v37.0.0 (#733, CC 4.2) — an `accord:*` row that names no accord, or
+        // names two, is the same shape: caller-fault malformed content the
+        // PRODUCER must fix by re-minting. Only the producer can act on it, so
+        // it surfaces as a 4xx alongside the other admission-gate rejections.
+        | crate::federation::Error::AccordRootUnnamed { .. }
+        | crate::federation::Error::AccordRootDisagrees { .. }
+        // v37.0.0 — the REMOVED CEG 0.1 attestation-ladder wire shape
+        // `attestation:l{N}:{mechanism}`. Caller-fault malformed content: the
+        // producer's remedy is to re-emit in the canonical
+        // `attestation:{mechanism}` form, so it is a 4xx alongside the other
+        // admission-gate rejections.
+        | crate::federation::Error::DeprecatedAttestationLadderForm { .. }
         | crate::federation::Error::DimensionRejected { .. } => PyValueError::new_err(kind),
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix
         // emitter mismatch is caller-fault malformed-content; same
@@ -29303,6 +29396,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // as-self nor a live scoped delegation) is caller-side
         // authorization failure; ValueError (4xx).
         crate::federation::Error::DelegatedScopeUnauthorized { .. } => PyValueError::new_err(kind),
+        // v37.0.0 (CIRISPersist#734) — a location proof whose `authority_key_id`
+        // is neither the subject nor a LIVE delegate of it is caller-side
+        // authorization failure; ValueError (4xx). Location is self-knowledge:
+        // a third party has no source for where a subject is. The `rule` field
+        // separates the RETRYABLE out-of-order case (the `delegates_to` has not
+        // replicated yet) from a substantive verdict, but only `kind()` crosses
+        // the FFI — so a caller that must distinguish them reads the message.
+        crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-only key is caller-side authorization failure; ValueError
@@ -29885,12 +29986,20 @@ async fn cold_path_pqc_sign(
     envelope: &serde_json::Value,
     classical_sig_b64: &str,
 ) -> Result<(String, String), String> {
-    use crate::verify::canonical::Canonicalizer;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
 
-    let canonical = PythonJsonDumpsCanonicalizer
-        .canonicalize_value(envelope)
+    // v37.0.0 (CIRISPersist#735) — THE PRODUCE GATE, not a hand-built
+    // canonicalizer. The stored PQC half is rebuilt by every Rust verifier
+    // with `ceg_produce_canonicalize` (the accord quorum in
+    // `src/federation/admission.rs`, the holder cross-check in
+    // `src/federation/blobs.rs`, `register::verify_key_registration`).
+    // Minting it over `PythonJsonDumpsCanonicalizer` agreed byte-for-byte on
+    // ASCII-only input and diverged permanently on everything else — a PQC
+    // half no gate could ever rebuild, on a row nothing re-mints (the sweep
+    // only sees `pqc_completed_at IS NULL`, and `attach_*_pqc_signature`
+    // refuses an already-complete row).
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
         .map_err(|e| format!("canonicalize: {e}"))?;
     let classical_sig = B64
         .decode(classical_sig_b64)
@@ -33761,4 +33870,564 @@ fn panic_count() -> u64 {
 #[pyfunction]
 fn install_panic_logger() -> bool {
     crate::debug::install_panic_logger()
+}
+
+// ─── CIRISPersist#735 — the FFI canonicalization parity witness ─────────
+
+/// v37.0.0 (CIRISPersist#735) — **the FFI signing/verifying surface must mint
+/// and rebuild the bytes the Rust gates rebuild.**
+///
+/// This is the THIRD instance of the #714 / #716 class (`#714` →
+/// `canonicalize_envelope_for_signing`, fixed v35.0.0 `060b8e9`; `#716` →
+/// `canonicalize_for_edge_signing`, flipping in v37.0.0; this → the PyO3
+/// cold-path PQC signer and the PyO3 `verify_signed_*` rebuild). Every
+/// instance was found while fixing the previous one, so the witness is
+/// written to fail for the whole class, not for one address.
+///
+/// # Why an ASCII test proves nothing here
+///
+/// `PythonJsonDumpsCanonicalizer` and `ceg_produce_canonicalize` (RFC 8785
+/// JCS at the current produce epoch) agree **byte-for-byte** on the
+/// structured-ASCII shapes persist's own envelopes usually carry — key_ids,
+/// SHA-256 hex, ISO stamps, base64. That agreement is exactly why this defect
+/// survived from the v4.15.0 produce flip to v37.0.0 with a green suite. So
+/// every assertion below runs on a corpus that is pinned to DIVERGE
+/// (`the_divergent_corpus_actually_diverges`), and the parity assertions are
+/// paired with that pin so a future reader can tell the witness is
+/// load-bearing rather than vacuous.
+///
+/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holds_bytes_envelope`
+/// and `pipeline.rs`'s edge-signing pins record the ASCII-AGREEMENT property;
+/// this module is deliberately their mirror image.
+#[cfg(test)]
+mod canonicalizer_parity_735 {
+    // Deliberately NO `use super::*`: every reference to the two functions
+    // under test is spelled `super::` at the call site, so a reader can see
+    // which module's rule is being pinned without resolving a glob.
+    use crate::verify::canonical::{ceg_produce_canonicalize, Canonicalizer};
+    use crate::verify::PythonJsonDumpsCanonicalizer;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    /// Envelopes on which the two canonicalization rules DISAGREE, in the two
+    /// ways they can: raw UTF-8 vs `\uXXXX` escapes, and wire float tokens
+    /// vs ECMAScript number serialization.
+    ///
+    /// These are not synthetic. `family_name`, `reason` and `policy_blob` all
+    /// reach federation signed bytes and nothing on any write path enforces
+    /// ASCII, so a multilingual mesh mints these envelopes as a matter of
+    /// course.
+    fn divergent_corpus() -> Vec<serde_json::Value> {
+        vec![
+            // Non-ASCII on the fields that genuinely reach a signed envelope.
+            serde_json::json!({
+                "family_name": "家族",
+                "reason": "révocation — clé compromise",
+                "purpose": "⚠️ federation registration",
+            }),
+            // A policy_blob carrying non-ASCII nested below the top level:
+            // the divergence is not a top-level-only property.
+            serde_json::json!({
+                "policy_blob": {"note": "h\u{00e9}llo", "tier": "commons"},
+                "kind": "registration",
+            }),
+            // Non-ES float tokens. `1e-05` and the long decimal are preserved
+            // verbatim by serde_json's arbitrary_precision parse and
+            // re-serialized per ECMAScript rules by JCS — unicode is not the
+            // only axis (this is the shape #714's commit message calls out).
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"cost_usd":0.0031992000000000006,"score":1e-05,"kind":"attestation"}"#,
+            )
+            .expect("wire float fixture parses"),
+        ]
+    }
+
+    /// The one envelope the round-trip witnesses mint and verify over.
+    fn divergent_envelope() -> serde_json::Value {
+        divergent_corpus()
+            .into_iter()
+            .next()
+            .expect("corpus is non-empty")
+    }
+
+    /// **The anti-vacuity pin.** Every other test in this module asserts
+    /// PARITY between two rules; on an all-ASCII corpus those assertions pass
+    /// against the *unfixed* code and prove nothing (feedback: a check that
+    /// cannot fail is a report). This test asserts the corpus actually
+    /// exercises the V1/V2 divergence, so a later "simplification" of the
+    /// fixtures to ASCII reds HERE rather than silently disarming the module.
+    #[test]
+    fn the_divergent_corpus_actually_diverges() {
+        for env in divergent_corpus() {
+            let v1 = PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&env)
+                .expect("v1 canonicalize");
+            let jcs = ceg_produce_canonicalize(&env).expect("jcs canonicalize");
+            assert_ne!(
+                v1, jcs,
+                "fixture must exercise the V1/V2 divergence — an all-agreeing \
+                 corpus makes every parity assertion in this module vacuous: {env}"
+            );
+        }
+    }
+
+    /// **CIRISPersist#735 — `cold_path_pqc_sign` mints a PQC half the gates
+    /// can rebuild.**
+    ///
+    /// Mint through the FFI cold path exactly as `put_public_key` /
+    /// `put_attestation` / `put_revocation` auto-fire do (six call sites) and
+    /// as the backfill sweep does (three more), then verify with
+    /// [`crate::verify::hybrid::verify_hybrid`] over
+    /// `ceg_produce_canonicalize(envelope)` — the bytes
+    /// `register::verify_key_registration`, the accord-family quorum in
+    /// `admission.rs` and `blobs.rs`'s holder cross-check all reconstruct.
+    ///
+    /// `verify_hybrid` binds the PQC leg over `(canonical || classical_sig)`
+    /// internally, which is the same bound-signature shape `cold_path_pqc_sign`
+    /// assembles — so this test compares the two constructions end to end and
+    /// not merely two calls to one helper.
+    ///
+    /// Against the unfixed code (`PythonJsonDumpsCanonicalizer` inside
+    /// `cold_path_pqc_sign`) this FAILS on the non-ASCII envelope: the stored
+    /// PQC half is over bytes no verifier will ever rebuild, and because
+    /// nothing re-mints an already-attached half, that row is permanently
+    /// PQC-dark.
+    #[tokio::test]
+    async fn cold_path_pqc_sign_mints_the_bytes_the_gates_rebuild() {
+        use ciris_keyring::PqcSigner as _;
+        let envelope = divergent_envelope();
+
+        // The gate's reconstruction — the ONLY bytes any Rust verifier builds.
+        let gate_bytes = ceg_produce_canonicalize(&envelope).expect("gate canonicalize");
+
+        // Classical half, signed over the gate bytes (what a correct producer
+        // does; `register::verify_key_registration` re-checks exactly this).
+        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
+        let ed_sig = {
+            use ed25519_dalek::Signer as _;
+            ed_sk.sign(&gate_bytes).to_bytes()
+        };
+        let classical_sig_b64 = B64.encode(ed_sig);
+
+        // Mint the PQC half through the FFI cold path under test.
+        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+            &[0x35; 32],
+            "cold-path-735-mldsa",
+        )
+        .expect("deterministic ml-dsa seed");
+        let (pqc_pubkey_b64, pqc_sig_b64) =
+            super::cold_path_pqc_sign(&signer, &envelope, &classical_sig_b64)
+                .await
+                .expect("cold path pqc sign");
+
+        // The pubkey the helper returns is the signer's own — a sanity leg so
+        // a helper that returned some OTHER key's bytes cannot pass.
+        let expected_pk = signer.public_key().await.expect("ml-dsa pubkey");
+        assert_eq!(
+            pqc_pubkey_b64,
+            B64.encode(&expected_pk),
+            "the cold path must publish the key it signed with"
+        );
+
+        let outcome = crate::verify::hybrid::verify_hybrid(
+            &gate_bytes,
+            &classical_sig_b64,
+            Some(&pqc_sig_b64),
+            &B64.encode(ed_sk.verifying_key().to_bytes()),
+            Some(&pqc_pubkey_b64),
+            crate::verify::hybrid::HybridPolicy::Strict,
+            None,
+        )
+        .expect(
+            "a PQC half minted by the FFI cold path MUST verify against the bytes \
+             every Rust gate rebuilds — CIRISPersist#735",
+        );
+        assert_eq!(
+            outcome,
+            crate::verify::hybrid::VerifyOutcome::HybridVerified,
+            "Strict policy must reach a full hybrid verify, not a fallback"
+        );
+    }
+
+    /// **CIRISPersist#735 — the mint side really is the gate, byte-for-byte.**
+    ///
+    /// The round-trip above proves the signature verifies; this proves WHY,
+    /// which is the property that survives a future refactor: the preimage
+    /// `cold_path_pqc_sign` signs is `ceg_produce_canonicalize(envelope) ||
+    /// classical_sig`, not `PythonJsonDumpsCanonicalizer(envelope) ||
+    /// classical_sig`. Verified by signing both candidate preimages with the
+    /// same deterministic signer and asserting which one the cold path
+    /// reproduces — a right-outcome-through-the-wrong-mechanism pass is
+    /// therefore not available to it.
+    #[tokio::test]
+    async fn cold_path_pqc_sign_preimage_is_the_produce_gate_not_v1() {
+        use ciris_keyring::PqcSigner as _;
+        let envelope = divergent_envelope();
+        let classical_sig_b64 = B64.encode([0x11u8; 64]);
+        let classical_sig = B64.decode(&classical_sig_b64).expect("fixture decodes");
+
+        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+            &[0x36; 32],
+            "cold-path-735-preimage",
+        )
+        .expect("deterministic ml-dsa seed");
+
+        let (_pk, actual_sig_b64) =
+            super::cold_path_pqc_sign(&signer, &envelope, &classical_sig_b64)
+                .await
+                .expect("cold path pqc sign");
+
+        let mut jcs_preimage = ceg_produce_canonicalize(&envelope).expect("jcs");
+        jcs_preimage.extend_from_slice(&classical_sig);
+        let mut v1_preimage = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&envelope)
+            .expect("v1");
+        v1_preimage.extend_from_slice(&classical_sig);
+        assert_ne!(
+            jcs_preimage, v1_preimage,
+            "the fixture must diverge or this test cannot fail"
+        );
+
+        let jcs_sig = signer.sign(&jcs_preimage).await.expect("sign jcs preimage");
+        let v1_sig = signer.sign(&v1_preimage).await.expect("sign v1 preimage");
+        assert_eq!(
+            actual_sig_b64,
+            B64.encode(&jcs_sig),
+            "cold_path_pqc_sign must sign ceg_produce_canonicalize(envelope) || \
+             classical_sig — CIRISPersist#735"
+        );
+        assert_ne!(
+            actual_sig_b64,
+            B64.encode(&v1_sig),
+            "cold_path_pqc_sign must NOT sign PythonJsonDumpsCanonicalizer(envelope) \
+             || classical_sig — that is the #735 defect"
+        );
+    }
+
+    /// **CIRISPersist#735 — the FFI verify side rebuilds the gate's bytes.**
+    ///
+    /// `canonicalize_envelope_value` feeds `verify_signed_key_record`,
+    /// `verify_signed_attestation` and `verify_signed_revocation` — the
+    /// verify-without-storing primitive a peer uses for dry-runs and
+    /// trust-graph audits. Its Rust twins (`register::verify_key_registration`,
+    /// `admission.rs`'s accord quorum, `operational.rs`'s scrub verifies) all
+    /// rebuild with `ceg_produce_canonicalize`.
+    ///
+    /// While it hand-built the V1 rule, a peer's dry-run said VERIFIED about a
+    /// non-ASCII envelope that every write door refuses — a false green in
+    /// front of a closed door, which is worse than a red.
+    ///
+    /// Note the ABSENCE of a signature strip on both sides: these envelopes
+    /// carry their signature in row columns, so the twins canonicalize whole.
+    #[test]
+    fn canonicalize_envelope_value_is_the_produce_gate() {
+        for env in divergent_corpus() {
+            let ffi = super::canonicalize_envelope_value(&env).expect("ffi canonicalize");
+            let gate = ceg_produce_canonicalize(&env).expect("gate canonicalize");
+            assert_eq!(
+                String::from_utf8_lossy(&ffi),
+                String::from_utf8_lossy(&gate),
+                "the FFI verify side must rebuild the bytes the Rust twins rebuild \
+                 — CIRISPersist#735: {env}"
+            );
+            let v1 = PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&env)
+                .expect("v1 canonicalize");
+            assert_ne!(
+                ffi, v1,
+                "and must NOT be the V1 rule on a divergent envelope — otherwise \
+                 this assertion is vacuous: {env}"
+            );
+        }
+    }
+
+    /// **CIRISPersist#735 — mint and verify agree ACROSS the two FFI
+    /// functions.**
+    ///
+    /// The two halves of this fix are separately correct only if they are the
+    /// same rule: a signature minted by `cold_path_pqc_sign` must verify
+    /// against bytes rebuilt by `canonicalize_envelope_value`. Fixing one site
+    /// and not the other leaves the FFI surface internally inconsistent on
+    /// exactly the inputs that matter, so this pins the pair.
+    #[tokio::test]
+    async fn ffi_mint_and_ffi_verify_agree_on_a_non_ascii_envelope() {
+        let envelope = divergent_envelope();
+        let verify_bytes =
+            super::canonicalize_envelope_value(&envelope).expect("ffi verify-side canonicalize");
+
+        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[0x74; 32]);
+        let ed_sig = {
+            use ed25519_dalek::Signer as _;
+            ed_sk.sign(&verify_bytes).to_bytes()
+        };
+        let classical_sig_b64 = B64.encode(ed_sig);
+
+        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+            &[0x37; 32],
+            "cold-path-735-crossfoot",
+        )
+        .expect("deterministic ml-dsa seed");
+        let (pqc_pubkey_b64, pqc_sig_b64) =
+            super::cold_path_pqc_sign(&signer, &envelope, &classical_sig_b64)
+                .await
+                .expect("cold path pqc sign");
+
+        let outcome = crate::verify::hybrid::verify_hybrid(
+            &verify_bytes,
+            &classical_sig_b64,
+            Some(&pqc_sig_b64),
+            &B64.encode(ed_sk.verifying_key().to_bytes()),
+            Some(&pqc_pubkey_b64),
+            crate::verify::hybrid::HybridPolicy::Strict,
+            None,
+        )
+        .expect(
+            "the FFI mint side and the FFI verify side must be the SAME rule — \
+             CIRISPersist#735",
+        );
+        assert_eq!(
+            outcome,
+            crate::verify::hybrid::VerifyOutcome::HybridVerified
+        );
+    }
+}
+
+// ─── the #714 / #716 / #735 class, instance FIVE — the verify_trace gate ────
+
+/// v37.0.0 — **`Engine.verify_trace` and `receive_and_persist` must return the
+/// SAME answer about the same trace.**
+///
+/// The FIFTH instance of the class documented on [`canonicalizer_parity_735`]
+/// (#714 → #716 → #735 → `Engine::register_self_federation_key` →
+/// here). Instances 1–4 were *produce*-side: bytes minted under one rule and
+/// rebuilt under another. This one is *verify*-side and worse in a specific
+/// way — it does not corrupt a row, it makes **one library give two answers**.
+/// [`super::PyEngine::verify_trace`] hard-coded
+/// [`PythonJsonDumpsCanonicalizer`] while `IngestPipeline::verify_complete_trace`
+/// resolves the canonicalizer from the trace's own signed
+/// `trace_schema_version` (`src/ingest.rs`, *"signed-bytes-bound, not
+/// caller-selectable"*). `"3.0.0"` is a supported schema
+/// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
+/// epoch, so a 3.0.0 trace with a non-ASCII payload was **stored by
+/// `receive_and_persist` and rejected by `Engine.verify_trace`** — and
+/// `verify_trace` is precisely the primitive a peer runs BEFORE storing.
+///
+/// # Why the corpus must be non-ASCII, and why both epochs are exercised
+///
+/// The two rules agree byte-for-byte on ASCII, so an ASCII trace verifies
+/// under either and proves nothing (feedback: a check that cannot fail is a
+/// report). [`the_trace_corpus_actually_diverges`] pins the divergence.
+///
+/// And the fix is a GATE, not a flip: the 2.7.0 leg below asserts a pre-cutover
+/// Python-signed trace still verifies. A "fix" that hard-coded JCS instead
+/// would pass every 3.0.0 assertion here and red that one.
+#[cfg(test)]
+mod verify_trace_canon_parity_class {
+    use crate::schema::{
+        CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent, TraceLevel,
+    };
+    use crate::verify::canonical::{canonicalizer_for, Canonicalizer, JcsCanonicalizer};
+    use crate::verify::ed25519::{
+        canon_version_for_trace_schema, canonical_payload_value_v279, verify_trace_via_directory,
+        PublicKeyDirectory,
+    };
+    use crate::verify::PythonJsonDumpsCanonicalizer;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+    use std::collections::HashMap;
+
+    /// In-memory [`PublicKeyDirectory`], the shape
+    /// [`super::super::TraceKeyDirectory`] wraps around a backend.
+    struct MemKeys(HashMap<String, VerifyingKey>);
+    impl PublicKeyDirectory for MemKeys {
+        fn lookup(
+            &self,
+            key_id: &str,
+        ) -> Result<Option<VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.get(key_id).copied())
+        }
+    }
+
+    const KEY_ID: &str = "ciris-agent-key:verify-trace-parity";
+
+    /// A trace whose component payload carries the two divergence axes: raw
+    /// UTF-8 vs `\uXXXX` escapes, and a wire float token vs ECMAScript number
+    /// serialization. `rationale` / `thought_content` are exactly the fields
+    /// CIRISAgent#174 measured as the multilingual breaking set.
+    fn unsigned_trace(schema: &str) -> CompleteTrace {
+        let data: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{
+                "rationale": "用户推理 — conscience passed",
+                "note": "⚠️ héllo",
+                "latency_seconds": 1e-05,
+                "cost_usd": 0.0031992000000000006
+            }"#,
+        )
+        .expect("component data fixture parses");
+        CompleteTrace {
+            trace_id: "trace-verify-parity-1".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "7c3f8e2b1d9a4f60".into(),
+            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
+            trace_level: TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse(schema).expect("supported schema"),
+            components: vec![TraceComponent {
+                component_type: ComponentType::Conscience,
+                event_type: ReasoningEventType::ConscienceResult,
+                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
+                data,
+                agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
+            }],
+            deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: String::new(),
+            signature_key_id: KEY_ID.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
+        }
+    }
+
+    /// Sign a trace the way a producer at that epoch signs it: Python-compat
+    /// below 3.x, JCS at 3.x — i.e. under `canonicalizer_for(canon_version_
+    /// for_trace_schema(schema))`, the producer side of the same gate.
+    fn signed_trace(schema: &str, sk: &SigningKey) -> (CompleteTrace, MemKeys) {
+        let unsigned = unsigned_trace(schema);
+        let payload = canonical_payload_value_v279(&unsigned);
+        let bytes = canonicalizer_for(canon_version_for_trace_schema(schema))
+            .canonicalize_value(&payload)
+            .expect("producer canonicalize");
+        let trace = CompleteTrace {
+            signature: B64.encode(sk.sign(&bytes).to_bytes()),
+            ..unsigned
+        };
+        let mut keys = HashMap::new();
+        keys.insert(KEY_ID.to_owned(), sk.verifying_key());
+        (trace, MemKeys(keys))
+    }
+
+    fn fixed_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x51; 32])
+    }
+
+    /// **The anti-vacuity pin.** On an ASCII, ES-float-clean payload the two
+    /// rules emit identical bytes, every assertion in this module passes
+    /// against the UNFIXED code, and the module becomes a report. This asserts
+    /// the fixture genuinely exercises the divergence, so trimming it to ASCII
+    /// reds HERE.
+    #[test]
+    fn the_trace_corpus_actually_diverges() {
+        let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
+        let v1 = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&payload)
+            .expect("v1");
+        let jcs = JcsCanonicalizer.canonicalize_value(&payload).expect("jcs");
+        assert_ne!(
+            v1, jcs,
+            "the trace fixture must exercise the V1/V2 divergence — an all-ASCII \
+             payload makes every assertion in this module vacuous"
+        );
+    }
+
+    /// **The FFI's rule IS ingest's rule, spelled from the same expression.**
+    ///
+    /// `src/ingest.rs` resolves the canonicalizer as
+    /// `canonicalizer_for(canon_version_for_trace_schema(trace.trace_schema_version))`.
+    /// Asserted over EVERY supported schema version — including the ones where
+    /// the two rules agree — because the defect is a missing gate, not a wrong
+    /// branch: pinning only 3.0.0 would let a future "optimization" that
+    /// short-circuits 2.7.x back onto a hard-coded rule survive.
+    #[test]
+    fn verify_trace_and_ingest_agree_on_the_canon_gate() {
+        let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
+        for schema in crate::schema::version::SUPPORTED_VERSIONS {
+            let ffi = super::trace_canonicalizer(schema)
+                .canonicalize_value(&payload)
+                .expect("ffi canonicalize");
+            let ingest = canonicalizer_for(canon_version_for_trace_schema(schema))
+                .canonicalize_value(&payload)
+                .expect("ingest canonicalize");
+            assert_eq!(
+                String::from_utf8_lossy(&ffi),
+                String::from_utf8_lossy(&ingest),
+                "the FFI verify surface must resolve the canonicalizer exactly as \
+                 src/ingest.rs does, at schema {schema}"
+            );
+        }
+    }
+
+    /// **The bug, tested directly: one trace, two answers.**
+    ///
+    /// A 3.0.0 JCS-signed non-ASCII trace — the shape `receive_and_persist`
+    /// ADMITS — must verify through the canonicalizer
+    /// [`super::PyEngine::verify_trace`] now selects, and must NOT verify under
+    /// the hard-coded V1 rule it used until v36.x. The second assertion is the
+    /// defect stated as a fact: it is what the shipped FFI did.
+    #[test]
+    fn a_3_0_0_non_ascii_trace_verifies_through_the_ffi_gate_and_not_under_v1() {
+        let sk = fixed_key();
+        let (trace, keys) = signed_trace("3.0.0", &sk);
+
+        assert_eq!(
+            canon_version_for_trace_schema("3.0.0"),
+            crate::verify::canonical::CanonVersion::V2Jcs,
+            "3.0.0 is the JCS cutover epoch"
+        );
+
+        // The ingest path's verdict — what `receive_and_persist` decides.
+        let ingest_canon = canonicalizer_for(canon_version_for_trace_schema(
+            trace.trace_schema_version.as_str(),
+        ));
+        verify_trace_via_directory(&trace, ingest_canon, &keys)
+            .expect("the ingest path ADMITS this trace");
+
+        // The FFI's verdict — what `Engine.verify_trace` reports. Same answer.
+        verify_trace_via_directory(
+            &trace,
+            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            &keys,
+        )
+        .expect(
+            "Engine.verify_trace must return the SAME answer as receive_and_persist \
+             for the same trace — the #714/#716/#735 class, instance 5",
+        );
+
+        // And the rule that WAS hard-coded here refuses it — so the assertion
+        // above is discriminating, not a tautology over two agreeing rules.
+        assert!(
+            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).is_err(),
+            "the hard-coded V1 rule REJECTS a trace the ingest path stores — that \
+             disagreement is the defect"
+        );
+    }
+
+    /// **The fix is a GATE, not a flip to JCS.**
+    ///
+    /// Pre-cutover 2.7.x traces are signed under Python-compat and must keep
+    /// verifying — the whole reason `canon_version_for_trace_schema` reads a
+    /// per-row signed epoch instead of a global constant. A "fix" that replaced
+    /// the hard-coded V1 rule with a hard-coded JCS rule passes every 3.0.0
+    /// assertion above and reds here.
+    #[test]
+    fn a_2_7_9_non_ascii_trace_still_verifies_under_the_pre_cutover_rule() {
+        let sk = fixed_key();
+        let (trace, keys) = signed_trace("2.7.9", &sk);
+
+        verify_trace_via_directory(
+            &trace,
+            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            &keys,
+        )
+        .expect("a pre-cutover 2.7.9 trace MUST keep verifying under Python-compat");
+
+        assert!(
+            verify_trace_via_directory(&trace, &JcsCanonicalizer, &keys).is_err(),
+            "and JCS must REFUSE it — otherwise this leg cannot detect a blanket \
+             flip and the epoch gate is not being exercised"
+        );
+    }
 }

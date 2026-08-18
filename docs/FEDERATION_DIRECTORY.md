@@ -252,12 +252,15 @@ The `DimensionAdmissionPolicy` (2.4.0 baseline) now carries a
 `reserved_prefix_rules` allowlist that gates `SCORES` attestations
 on `(prefix → required identity_types)`. The defaults ship the
 CEG §5.3 + §7.x base set documented above; operators extend via
-the policy's `pub` fields. The dual-acceptance for the CEG
-0.1→0.2 `attestation:l{N}:*` → `attestation:{mechanism}` rename
-is a separate
-`AttestationLadderTransitionPolicy::DualAccept` knob — see
-[`docs/THREAT_MODEL.md` AV-45](THREAT_MODEL.md) for the
-transition-window analysis.
+the policy's `pub` fields. The CEG 0.1→0.2
+`attestation:l{N}:*` → `attestation:{mechanism}` rename is **no longer
+a knob**: as of v37.0.0 the deprecated form is refused at admission with
+`federation_deprecated_attestation_ladder_form`, and the
+`AttestationLadderTransitionPolicy` enum, the
+`attestation_ladder_transition` field and `admits_deprecated_form()`
+were removed rather than defaulted the other way — so there is no
+configuration under which the dead form is admitted. See
+[`docs/THREAT_MODEL.md` AV-45](THREAT_MODEL.md).
 
 **Why every row signs itself:** the registry's DB compromise
 problem disappears if every row carries cryptographic provenance.

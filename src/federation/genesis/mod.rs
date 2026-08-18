@@ -132,7 +132,10 @@ pub fn test_anchor_registration_envelope(
 ///   hybrid form (`SelfSigner::sign_bound` over the same canonical bytes). When present
 ///   the seeded terminus is a fully scrub-VERIFYING rooting root — persist's
 ///   own `root_binding` Confirms a chain terminating here (its
-///   `Ed25519Fallback` link policy verifies classical-only or full-hybrid).
+///   `RequireHybrid` link policy needs the FULL hybrid form — v37.0.0 doc
+///   correction: this said `Ed25519Fallback` / "classical-only or
+///   full-hybrid", stale since CIRISPersist#465 tightened the walk. A
+///   classical-only terminus does NOT root).
 ///   When absent: a non-verifying placeholder — the seed + presence checks +
 ///   verify-side anchor-membership rooting still work, but persist-side
 ///   `root_binding` will NOT confirm through this terminus (the pinned
