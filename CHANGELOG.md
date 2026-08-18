@@ -5,6 +5,82 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [36.3.0] - 2026-08-18
+
+**MINOR: adds public API.** `may_relay_accord_participation`, plus the
+CIRISVerify v13.5.0 re-pin.
+
+### Fixed — `root_ref` was the caller's to nominate, and it failed permissive (#731)
+
+v36.2.0 shipped `may_relay_accord_object(dir, self_key, signer_key, root_ref)`
+and closed the roster half of this: persist can now answer *"what is root R's
+roster"* instead of taking it as a parameter. **It did not answer "which R?"**
+
+That is the same shape one level up, and it fails in the direction that
+matters. A caller nominating the wrong root gets a **confidently wrong answer
+in the permissive direction** — pass a root this node happens to trust, whose
+roster happens to seat the signer, and `may_relay()` returns `true` for an
+object belonging to a *different* accord. The predicate cannot detect it,
+because it was never given the object.
+
+`AccordParticipation` carries **both** `family_key_id` (*"the accord family
+this decision is for"*) and `member_id`, inside the bytes the threshold
+signature covers. So the object names its own root and its own signer, and
+neither is a caller's to supply:
+
+```rust
+may_relay_accord_participation(&dir, self_key_id, &participation)
+```
+
+`may_relay_accord_object` remains as the lower-level form, now documented as
+one whose `root_ref` MUST be the object's own.
+
+**The witness builds the trap before disproving it.** Leg E seeds a *second*
+accord that this node also trusts and whose roster also seats the signer, then
+asserts the caller-supplied form returns `may_relay() == true` when that second
+root is nominated — because if nominating the wrong root already refused, the
+leg would prove nothing. Only then does it show the object-taking form reaching
+its verdict from the object. Mutating the verb to ignore
+`participation.family_key_id` reds it on both backends.
+
+Fail-closed carries over: an object naming a root this node holds no family for
+yields `roster_resolvable: false` — *"I cannot judge"*, still distinct from
+*"not seated"* — even when the caller could have nominated a root that would
+have passed.
+
+### CIRISVerify v13.4.0 → v13.5.0
+
+All seven pins together to `b677417c`. **Not a routine re-pin:** v13.4.0's
+scope-privacy API — pinned by v36.2.0 one day earlier — was *unimplementable*,
+demanding a raw secret openmls does not expose, caught by CIRISEdge on
+adoption. Persist does not call it (`scope_privacy` sits behind a `ciris-crypto`
+feature persist does not enable), so nothing here was broken — but **persist
+pins this crate for the whole stack**, so v36.2.0 handed every consumer a pin to
+an API that cannot be used. That is why this moves promptly rather than
+bundling. The v13.4.0 golden vectors are unchanged by the fix.
+
+Also in v13.5.0: the DoH hostname defect persist reported, confirmed and
+**widened** — `android_sync.rs:39` carried the identical bug feeding a live DoH
+lookup, not just iOS. Verified in the pinned source rather than taken on
+report: both mobile FFI files and `config.rs` now carry
+`eu.registry.ciris-services-1.ai`, with a source-level guard. The one remaining
+`registry.ciris.ai` hit in the pinned tree is a JWT **test fixture**
+(`jti: lic-12345`, org "Test Hospital"), not production.
+
+Upstream's lesson is worth carrying here verbatim, because it is this repo's
+own recurring shape: **a dead consensus source degrades rather than errors**, so
+from inside the process it is indistinguishable from a healthy source that did
+not answer. That is why it survived releases. The new guard catches the string;
+nothing yet asserts a configured source is *reachable*.
+
+### Backlog
+
+**#624** and **#552** closed — both had SHIPPED in v36.0.0 and stayed open,
+#624 because the PR body listed it as additive rather than in the `Closes`
+keywords. Closed with evidence rather than silently, which is the #708 rule
+applied in the other direction: a closing keyword is an unverified scope claim,
+and so is an open issue whose work already landed.
+
 ## [36.2.0] - 2026-08-17
 
 **The relay unlock.** A node can now determine, for itself, whether it may relay

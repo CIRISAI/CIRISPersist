@@ -3334,7 +3334,9 @@ pub mod test_support {
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::trust_root::{active_roster_of, may_relay_accord_object};
+        use crate::federation::trust_root::{
+            active_roster_of, may_relay_accord_object, may_relay_accord_participation,
+        };
         use crate::federation::types::identity_type;
 
         let accord = format!("{tag}-relay-accord");
@@ -3399,6 +3401,59 @@ pub mod test_support {
             "({tag}) D: roster_resolvable must say I-cannot-judge"
         );
         assert!(!cannot_judge.may_relay(), "({tag}) D: fail closed");
+
+        // (E) v36.3.0 (#731) — THE OBJECT'S ROOT WINS, not a caller's.
+        //
+        // Build the permissive trap deliberately: a SECOND accord this node
+        // also trusts, whose roster ALSO seats the signer. Under the
+        // caller-supplied form, nominating that second root returns
+        // may_relay() == true for a participation that belongs to the first —
+        // a confidently wrong answer in the permissive direction, which the
+        // predicate cannot detect because it never sees the object.
+        let other_accord = format!("{tag}-relay-accord-b");
+        seed_test_family(directory, &other_accord, &holders, "quorum:2/3").await?;
+        emit_trust_edge(directory, &relayer, &other_accord, None).await?;
+        let nominated =
+            may_relay_accord_object(directory, &relayer, &holders[0], &other_accord).await?;
+        assert!(
+            nominated.may_relay(),
+            "({tag}) E: the trap must actually be reachable — if nominating the \
+             wrong root already refused, this leg would prove nothing"
+        );
+
+        // The object names accord A and a signer seated on it: relayable, and
+        // the verdict is reached WITHOUT the caller naming any root.
+        let part = ciris_verify_core::accord_live_quorum::AccordParticipation {
+            family_key_id: accord.clone(),
+            proposal_digest: "0".repeat(64),
+            member_id: holders[0].clone(),
+            vote: ciris_verify_core::accord_live_quorum::Vote::Yes,
+            window_until: "2030-01-01T00:00:00Z".to_owned(),
+            signed_at: "2026-01-01T00:00:00Z".to_owned(),
+            signature: ciris_verify_core::threshold::ThresholdSignature {
+                member_id: holders[0].clone(),
+                ed25519_signature_base64: String::new(),
+                mldsa65_signature_base64: None,
+            },
+        };
+        let from_object = may_relay_accord_participation(directory, &relayer, &part).await?;
+        assert!(
+            from_object.may_relay(),
+            "({tag}) E: an object naming a root this node granted, signed by a \
+             seated member, relays"
+        );
+
+        // And an object naming a root this node holds NO family for is
+        // unjudgeable — even though the caller could have nominated one of the
+        // two roots that would have passed.
+        let mut foreign = part.clone();
+        foreign.family_key_id = format!("{tag}-relay-unknown-root");
+        let unjudgeable = may_relay_accord_participation(directory, &relayer, &foreign).await?;
+        assert!(
+            !unjudgeable.roster_resolvable,
+            "({tag}) E: the OBJECT's root decides judgeability, not the caller's"
+        );
+        assert!(!unjudgeable.may_relay(), "({tag}) E: fail closed");
 
         Ok(())
     }
