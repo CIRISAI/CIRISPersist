@@ -5,6 +5,87 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [37.0.1] - 2026-08-18
+
+**PATCH: behaviour-preserving.** No projection cell changes value. What changes
+is that three of them are now *observed* by the sweeps that claimed to observe
+them.
+
+Raised by CIRISServer during v37.0.0 adoption (CIRISServer#444), which asked
+whether a federation-tier `moderation:*` row could project past the Cohort
+ceiling — and marked its own belief as unverified rather than assuming.
+
+### Fixed — `FAMILY_DIMS` was missing three of the families it claims to cover
+
+`FAMILY_DIMS` is the corpus behind `all_planes()`, which every property sweep in
+the projection registry iterates — including
+`tombstone_ceiling_dominates_every_live_cell`, the anti-rollback invariant. Its
+doc says *"one representative dimension per decided Attestation family."*
+
+For three releases that was false. `accord:*` and `moderation:*` (v36.2.0) and
+`provenance:build_manifest:*` (v36.1.0) each got an explicit arm in
+`projection_for` and none was added to the list. **The sweeps never looked at the
+three newest and least settled families in the registry, while reading as
+total.**
+
+Measured, not argued: mutating `moderation:*`'s live commons cells to `Global`
+left `tombstone_ceiling_dominates_every_live_cell` **green** — the invariant was
+broken and its own dedicated test could not see it, because the family it had
+just broken was not in its corpus. With the three representatives added, the same
+mutation reds it.
+
+Adding a family's arm to `projection_for` and forgetting this list is the easy
+mistake and nothing caught it. Now `every_decided_family_has_a_representative_dimension`
+does, and it is a **compile-time** gate rather than a runtime one: the match over
+`AttestationFamily` is exhaustive with no wildcard, so adding a variant fails the
+build until someone names its representative. A compile error cannot be filtered
+out by a test selector or missed by a feature set that does not run — which
+matters here, because three separate feature-set blind spots surfaced during
+v37.0.0.
+
+### Added — the `moderation:*` allegation ceiling, asserted more completely
+
+The ceiling itself was already correct and already witnessed by
+`moderation_never_widens_past_cohort_713` (v36.2.0), which covers all five
+commons tiers. Four gaps in that witness are closed:
+
+- `moderation:report:v1`, the 5th live dimension, was absent
+- `SelfIdentity` and `SubstrateSelf` — it covered 2 of 4 authorities, so *"no
+  authority widens it"* was half-asserted. A trust root may carry a key record
+  to the whole federation and still may not carry an allegation past the cohort.
+- the tombstone path across all tiers and authorities, previously a single
+  `AccordCoScrub` call
+- **an anti-vacuity leg.** Both ceiling tests assert `== Cohort` everywhere they
+  look, so a `projection_for` that rotted into returning `Cohort` unconditionally
+  would satisfy both and prove nothing. `the_ceiling_harness_can_actually_observe_global`
+  pins that the same harness still observes `Global` on `accord:*`.
+
+### Changed — `moderation:*`'s commons tiers are enumerated explicitly
+
+Behaviour-identical. The ceiling previously fell through to `_`, making Moderation
+the only family whose commons tiers were not spelled out while `Accord`,
+`ProvenanceBuildManifest` and `SubstrateHealth` each enumerate
+`SPECIES | BIOSPHERE | FEDERATION`. A consistency sweep that "finished" Moderation
+to match its neighbours would have written `=> Global`. Enumerated, the arms say
+Cohort in the same breath as the families that say Global, so symmetry is no
+longer a reason to edit it.
+
+### A correction on the record
+
+The issue that opened this work (CIRISPersist#741) claimed *"there is no test
+anywhere pinning moderation × FEDERATION — I grepped: zero witnesses."* **That
+was false.** The grep searched for the enum variant `Moderation`; the existing
+test asserts over dimension string literals and contains no occurrence of that
+token. Listing the test binary would have found it immediately; reading source
+text could not.
+
+A search that cannot observe the thing it rules out is not evidence of absence —
+the same shape as `cargo check --lib` reporting green on a test-only compile
+error, and as `--features sqlite` passing while 18 `test-anchor` tests could not
+run. It is recorded here because it was produced *in the issue describing that
+very class*, and because the corrected finding — a blind property-sweep corpus —
+was strictly more serious than the one claimed.
+
 ## [37.0.0] - 2026-08-18
 
 **MAJOR: every deferred permissive posture flips in this cut.**
