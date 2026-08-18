@@ -289,10 +289,10 @@ pub use admission::{
     verify_signed_identity_occurrence_revocation, verify_signed_touch_claim,
     verify_signed_transport_destination, verify_touch_claim_admission, withdraw_accord_role,
     withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,
-    AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
-    DimensionRejectionReason, NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule,
-    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
-    MINTED_NAMESPACE_FAMILIES, UNREGISTERED_GATED_FAMILIES,
+    CanonicalWithdrawal, DimensionAdmissionPolicy, DimensionRejectionReason,
+    NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
+    ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW, MINTED_NAMESPACE_FAMILIES,
+    UNREGISTERED_GATED_FAMILIES,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -5712,6 +5712,107 @@ pub enum Error {
         identity_type: String,
     },
 
+    /// v37.0.0 (CIRISPersist#733). The row is on the `accord:*` family but its
+    /// SIGNED envelope carries no
+    /// [`accord_root`](envelope::paths::ACCORD_ROOT), so nothing on it says
+    /// WHICH accord it belongs to and a relaying node cannot resolve the
+    /// roster it would have to judge the signer against. Stable `kind()` token
+    /// `federation_accord_root_unnamed`.
+    ///
+    /// Raised by [`trust_root::check_accord_root_binding`] at the
+    /// [`admission::check_reserved_prefix_admission`] chokepoint. The one
+    /// exemption is the drill dimension
+    /// [`trust_root::ACCORD_HEARTBEAT_DIMENSION`] — see that gate.
+    #[error(
+        "attestation {attestation_id:?} is on the accord:* family ({namespace:?}) but its \
+         signed envelope carries no `{key}`: nothing on the row says WHICH accord it belongs \
+         to, so a node relaying it cannot resolve the roster that would authorize the signer, \
+         and refuses. `attested_key_id` is not a substitute — it names the scored agent, the \
+         self-attesting holder or the accord depending on dimension. Stamp `{key}` (the \
+         accord's root ref) into the envelope BEFORE signing (CIRISPersist#733)"
+    )]
+    AccordRootUnnamed {
+        /// The row that named no accord.
+        attestation_id: String,
+        /// Which namespace put it on the family — the `attestation_type` or
+        /// the envelope `dimension`, whichever began with `accord:`.
+        namespace: String,
+        /// The envelope key that was missing, spelled once
+        /// ([`envelope::paths::ACCORD_ROOT`]).
+        key: &'static str,
+    },
+
+    /// v37.0.0 (CIRISPersist#733). An
+    /// [`ACCORD_HEARTBEAT_DIMENSION`](trust_root::ACCORD_HEARTBEAT_DIMENSION)
+    /// row carries BOTH root signals — the explicit
+    /// [`accord_root`](envelope::paths::ACCORD_ROOT) key AND the standing rule
+    /// that `attested_key_id` is the accord on that dimension — and they name
+    /// DIFFERENT accords. Stable `kind()` token
+    /// `federation_accord_root_disagrees`.
+    ///
+    /// Refused rather than resolved either way. Preferring the key lets an
+    /// emitter relabel a heartbeat's accord; preferring the column makes the
+    /// key decorative on the one dimension where a rule already exists. One
+    /// artifact asserting two roots is malformed whichever a reader would have
+    /// picked — the same ruling
+    /// [`namespace::supersets`]'s `every_pointer_read_is_discriminator_guarded`
+    /// applies to the composer pointer.
+    #[error(
+        "attestation {attestation_id:?} names TWO accords: its signed envelope `{key}` says \
+         {envelope_root:?}, while the {dimension} rule reads the accord from `attested_key_id` \
+         = {attested_key_id:?}. A row asserting two roots is malformed whichever one a reader \
+         would have preferred, so it is REFUSED rather than resolved silently — re-mint with \
+         the two agreeing (CIRISPersist#733)"
+    )]
+    AccordRootDisagrees {
+        /// The row that named two accords.
+        attestation_id: String,
+        /// The root the signed envelope key named.
+        envelope_root: String,
+        /// The root the drill-dimension rule reads off the row.
+        attested_key_id: String,
+        /// The drill dimension whose rule supplied the second signal.
+        dimension: &'static str,
+        /// The envelope key that supplied the first, spelled once.
+        key: &'static str,
+    },
+
+    /// v37.0.0 (CIRISPersist#734). A [`SignedLocationProof`] was REFUSED
+    /// because its `authority_key_id` is neither the subject itself nor a
+    /// LIVE delegate of the subject. Location is self-knowledge: a third
+    /// party has no source for where a subject is, so their valid signature
+    /// proves only that they signed it. E4 closed "no signature at all";
+    /// this closes "which identity may assert a location for this subject".
+    /// The admissible set is exactly `{subject} ∪ {live delegates of subject}`.
+    /// The row is not stored (verify-before-mutation, AV-9). Stable `kind()`
+    /// token `federation_location_authority_unauthorized`.
+    ///
+    /// `rule` names WHICH clause refused, and the distinction is
+    /// operationally load-bearing: `location_authority_no_delegation_edge`
+    /// may be an out-of-order replication artifact (the `delegates_to` has
+    /// not arrived yet) and is safe to RETRY; the retracted/expired tokens
+    /// are substantive verdicts that retrying will not change. See
+    /// [`tier_ingest::LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE`].
+    #[error(
+        "location proof for subject {subject_key_id:?} offers authority \
+         {offered_authority_key_id:?}, which is neither the subject itself nor a live \
+         delegates_to delegate of it ({rule}): location is SELF-KNOWLEDGE, so a third \
+         party's valid signature proves only that they signed it, never where the \
+         subject is. Admissible authority is exactly the subject plus its live \
+         delegates (CIRISPersist#734)"
+    )]
+    LocationAuthorityUnauthorized {
+        /// `location_proof.subject_key_id` — whose location was asserted.
+        subject_key_id: String,
+        /// The `authority_key_id` offered on the wrapper, whose signature
+        /// DID verify against its registered pubkeys. The refusal is about
+        /// standing, never about the signature.
+        offered_authority_key_id: String,
+        /// Which clause refused; one of the `tier_ingest::LOCATION_AUTHORITY_RULE_*`
+        /// tokens. `..._no_delegation_edge` is the retryable one.
+        rule: &'static str,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3b). The submitted `scores`
     /// attestation's `dimension` failed one of the four
     /// operational-language tests (FSD-002 §1.10.1): rules/verdicts
@@ -5726,6 +5827,40 @@ pub enum Error {
         /// Stable machine-readable reason token (matches one of
         /// [`admission::DimensionRejectionReason`]'s `as_str()`).
         reason: &'static str,
+    },
+
+    /// v37.0.0. The submitted `scores` attestation's `dimension` is spelled in
+    /// the **removed** CEG 0.1 attestation-ladder wire shape
+    /// `attestation:l{N}:{mechanism}`.
+    ///
+    /// CEG 0.2 §13.1 deprecated that shape in favour of the mechanism-only
+    /// form `attestation:{mechanism}`. Persist admitted both from v3.0.0
+    /// under an `AttestationLadderTransitionPolicy::DualAccept` default whose
+    /// documented flip condition ("post-CEG 0.3") passed five CEG versions
+    /// ago; v37.0.0 removed the policy, the knob and the deprecated shape
+    /// together.
+    ///
+    /// # Why its own variant rather than a `DimensionRejected` reason
+    ///
+    /// Without this arm the removed shape falls through to the
+    /// version-segment gate and refuses as `missing_version_segment` — an
+    /// instruction to add a `:v[0-9]+` that would NOT make the row
+    /// admissible, because the canonical ladder form carries no version
+    /// segment either. The producer's defect is the wire shape, so the
+    /// refusal carries the shape it received AND the admissible set, which a
+    /// bare reason token has no room for.
+    #[error(
+        "removed attestation-ladder wire shape {dimension:?}: the CEG 0.1 form \
+         `attestation:l<N>:<mechanism>` was deprecated by CEG 0.2 §13.1 and REMOVED at \
+         persist v37.0.0 — the dual-accept transition window is closed. Emit the canonical \
+         mechanism form `attestation:<mechanism>` instead; admissible set: {canonical:?}"
+    )]
+    DeprecatedAttestationLadderForm {
+        /// The `dimension` value from the attestation envelope, as received.
+        dimension: String,
+        /// The canonical mechanism-only vocabulary the producer must emit
+        /// instead — [`admission::ATTESTATION_LADDER_MECHANISMS`].
+        canonical: &'static [&'static str],
     },
 
     /// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0). The submitted
@@ -6984,10 +7119,18 @@ impl Error {
                 "federation_constitutional_family_reserved"
             }
             Error::GenesisAttestationReserved { .. } => "federation_genesis_attestation_reserved",
+            Error::AccordRootUnnamed { .. } => "federation_accord_root_unnamed",
+            Error::AccordRootDisagrees { .. } => "federation_accord_root_disagrees",
+            Error::LocationAuthorityUnauthorized { .. } => {
+                "federation_location_authority_unauthorized"
+            }
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
             Error::DimensionRejected { .. } => "federation_dimension_rejected",
+            Error::DeprecatedAttestationLadderForm { .. } => {
+                "federation_deprecated_attestation_ladder_form"
+            }
             Error::CapacitySelfEmissionRejected { .. } => {
                 "federation_capacity_self_emission_rejected"
             }

@@ -1623,28 +1623,60 @@ applying CEG §8.1.9 Policy I composition on the canonical-only
 mechanism strings silently drop the malicious data, masking the
 intrusion.
 
-**Mitigation v3.0.0**:
+**Mitigation v37.0.0 — CLOSED BY REMOVAL** (was: dual-acceptance,
+v3.0.0–v36.3.0):
 
-1. **`AttestationLadderTransitionPolicy` enum on
-   `DimensionAdmissionPolicy`** (`src/federation/admission.rs`).
-   3.0.0 defaults to `DualAccept` per CEG 0.1→0.2 transition; the
-   `RejectDeprecated` variant exists and is regression-tested at the
-   admission gate (so the flip is a one-line change, not a refactor).
-2. **The `is_deprecated_attestation_ladder_prefix` parser** is a
-   runtime-checked match against `attestation:l<digits>:<mechanism>`,
-   so a future canonical mechanism named with a leading `l<N>` doesn't
-   accidentally match. Tight regex; no semantic confusion.
-3. **CEG §11.2 amendment process** is the human-loop gate on the
-   flip: persist tracks Registry's CEG release; the 3.1 flip ships
-   when Registry retires the deprecated form, not before.
+1. **The deprecated form is REFUSED at admission.**
+   `AttestationLadderTransitionPolicy`, the
+   `attestation_ladder_transition` field on `DimensionAdmissionPolicy`,
+   and `admits_deprecated_form()` are **removed** — not set to
+   `RejectDeprecated`. There is no longer a policy value that admits
+   `attestation:l{N}:*`, so the residual below is not merely closed but
+   **unreachable by configuration**.
+2. **The `is_deprecated_attestation_ladder_prefix` parser survives, with
+   its role inverted** — it was an ADMIT branch, it is now a REFUSE
+   branch. It remains a runtime-checked match against
+   `attestation:l<digits>:<mechanism>`, so a future canonical mechanism
+   named with a leading `l<N>` is not caught by it.
+3. **The refusal is specific, not incidental.** Deleting the branch
+   outright would have let the removed shape fall through to
+   `missing_version_segment` — a refusal that tells a producer their
+   dimension lacks `:v[0-9]+` when the real problem is a wire shape that
+   no longer exists. It reports
+   `federation_deprecated_attestation_ladder_form` and names the
+   canonical form to emit instead. A dead path that fails loudly is what
+   lets a downstream fix itself; one that fails obscurely costs an
+   afternoon of the wrong investigation.
+4. **CEG §11.2 was the human-loop gate and it had already opened.** The
+   flip condition was *"post-CEG 0.3"*; the tree reached CEG 0.8 with the
+   window still open, because a permissive default emits no signal when
+   its own condition passes. The tracking pointer compounded it — it
+   named CIRISPersist#117, an unrelated issue that closed on its own
+   business. **A flag whose flip condition lives only in prose is not
+   tracked, and a wrong issue number is worse than none.**
 
-**Residual**: during the 3.0 dual-acceptance window, a producer
-emitting only deprecated-form `attestation:l{N}:*` looks valid at
-admission but is invisible to a CEG 0.2-strict consumer that only
-parses mechanism strings. Documented: producers MUST emit canonical
-form going forward (per CEG §13.1); deprecated-form emissions are a
-producer-conformance bug, surfaced by CIRISConformance suite, not
-substrate enforcement.
+**Residual — NONE as of v37.0.0.** The residual that stood from v3.0.0
+to v36.3.0 was: during the dual-acceptance window a producer emitting
+only deprecated-form `attestation:l{N}:*` looked valid at admission but
+was invisible to a CEG 0.2-strict consumer parsing mechanism strings —
+a producer-conformance bug surfaced by the CIRISConformance suite rather
+than by substrate enforcement.
+
+**That gap is now closed at the substrate**, which is the correct place
+for it: a rule enforced only by a downstream conformance suite is a rule
+the substrate cannot promise. A producer still emitting the deprecated
+form is refused at admission and told what to emit instead, so the
+failure lands on the party that can fix it, at the moment they can fix
+it, rather than as silent invisibility to a third party later.
+
+**Note the STORED corpus is a separate question.** This gate protects
+NEW rows only; rows admitted during the 13-version dual-acceptance
+window are still present and still carry the deprecated form. Consumers
+reading history must continue to tolerate it. That is not a defect of
+the gate, but it MUST NOT be forgotten on the grounds that admission is
+now strict — the same complementarity that applies to `accord_root`
+(v37.0.0, #733), where the write door covers new rows and the consumer's
+enforcement flag covers the corpus.
 
 #### AV-46: §10.1.2 ContentMiss flood DoS against `list_holders`
 

@@ -80,8 +80,14 @@ pub const HEADER_KEY_ID: &str = "x-ciris-signing-key-id";
 /// Header carrying the Ed25519 signature (base64) over the request
 /// body bytes.
 pub const HEADER_ED25519: &str = "x-ciris-signature-ed25519";
-/// Header carrying the ML-DSA-65 signature (base64). Optional
-/// during the hybrid-pending rollout window (HybridPolicy::Ed25519Fallback).
+/// Header carrying the ML-DSA-65 signature (base64).
+///
+/// **REQUIRED as of v37.0.0.** It was optional during the hybrid-pending
+/// rollout window, when [`verify_request`] ran under
+/// `HybridPolicy::Ed25519Fallback`; that window closed in the v37.0.0
+/// break. A request omitting this header is refused with
+/// `verify_hybrid_pending_rejected`, and the signing key must have a
+/// `pubkey_ml_dsa_65` registered in `federation_keys`.
 pub const HEADER_ML_DSA_65: &str = "x-ciris-signature-ml-dsa-65";
 
 // ── v1.3.0 (CIRISPersist#46) — Role-tag tiers ──────────────────────
@@ -335,17 +341,22 @@ where
     F: FederationDirectory,
 {
     let sig = extract_signatures(headers)?;
-    // HybridPolicy::Ed25519Fallback matches the pipeline ingest
-    // route — the federation rolls out hybrid-pending steward keys
-    // (Ed25519 first, ML-DSA-65 cold-path attach). Production posture
-    // flips to Strict once steward keys are PQC-complete fleet-wide.
+    // v37.0.0 — Strict, still matching the pipeline ingest route (which
+    // flipped in the same cut). The "once steward keys are PQC-complete
+    // fleet-wide" wait ends here by operator declaration. This route
+    // authenticates SECRETS traffic — store / retrieve / decrypt /
+    // reencrypt_all — so it is the last plane that should have been
+    // accepting a classical-only signature: an Ed25519-only credential is
+    // exactly what a store-now-decrypt-later adversary needs. A steward
+    // sending no `x-ciris-signature-ml-dsa-65` header is now refused with
+    // `verify_hybrid_pending_rejected`.
     let outcome = verify_hybrid_via_directory(
         directory,
         body,
         &sig.key_id,
         &sig.ed25519,
         sig.ml_dsa_65.as_deref(),
-        HybridPolicy::Ed25519Fallback,
+        HybridPolicy::Strict,
         None,
     )
     .await;
@@ -358,16 +369,37 @@ where
                 }
                 _ => "secrets_signature_invalid",
             };
+            // v37.0.0 — name the flag-day cause. A steward that simply
+            // stopped being accepted overnight will otherwise read this
+            // 401 as a revoked/rotated credential and go re-register a
+            // key that was never the problem.
+            let detail = match &e {
+                VerifyError::HybridPendingRejected => format!(
+                    "{e} — NOTE (v37.0.0 flag day): secrets routes now verify under \
+                     HybridPolicy::Strict. An Ed25519-only request signature was \
+                     accepted through v36.x and is REFUSED here: send the \
+                     {HEADER_ML_DSA_65} header and register the signing key's \
+                     ML-DSA-65 pubkey in federation_keys. This is not a \
+                     key-validity or revocation problem."
+                ),
+                VerifyError::PqcFieldsMustBeBoth => format!(
+                    "{e} — the {HEADER_ML_DSA_65} header and this key_id's \
+                     federation_keys.pubkey_ml_dsa_65 must BOTH be present or \
+                     BOTH absent, and exactly one of them is. Either the \
+                     request omitted the header for a PQC-registered key \
+                     (v37.0.0: send it — HybridPolicy::Strict requires it), or \
+                     it sent the header for a key with no registered PQC \
+                     pubkey (register it). Not a key-validity problem."
+                ),
+                _ => format!("{e}"),
+            };
             tracing::warn!(
                 error = %e,
                 key_id = %sig.key_id,
+                detail = %detail,
                 "secrets route rejected: signature verification failed"
             );
-            Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                kind,
-                format!("{e}"),
-            ))
+            Err(error_response(StatusCode::UNAUTHORIZED, kind, detail))
         }
     }
 }
@@ -939,6 +971,18 @@ mod tests {
     const STEWARD_SEED: [u8; 32] = [0x5Au8; 32];
     /// `key_id` the steward identifies itself by in `federation_keys`.
     const STEWARD_KEY_ID: &str = "secrets-steward-test-1";
+    /// v37.0.0 — the steward's ML-DSA-65 half. Secrets routes verify
+    /// under `HybridPolicy::Strict` now, so a classical-only steward
+    /// cannot authenticate any route.
+    const STEWARD_PQC_SEED: [u8; 32] = [0xA7u8; 32];
+
+    fn steward_mldsa() -> ciris_keyring::MlDsa65SoftwareSigner {
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+            &STEWARD_PQC_SEED,
+            "secrets-steward-test-1-pqc",
+        )
+        .expect("deterministic ML-DSA-65 keypair from seed")
+    }
 
     async fn build_app() -> (Router, Arc<SqliteSecretsBackend>, Arc<SqliteBackend>) {
         let backend = Arc::new(SqliteBackend::open_in_memory().await.unwrap());
@@ -947,10 +991,16 @@ mod tests {
         let sk = SigningKey::from_bytes(&STEWARD_SEED);
         let vk: VerifyingKey = sk.verifying_key();
         let pubkey_b64 = BASE64.encode(vk.to_bytes());
+        let steward_pqc_pk = {
+            use ciris_keyring::PqcSigner as _;
+            steward_mldsa().public_key().await.expect("ml-dsa pk")
+        };
         let key = KeyRecord {
             key_id: STEWARD_KEY_ID.into(),
             pubkey_ed25519_base64: pubkey_b64,
-            pubkey_ml_dsa_65_base64: None,
+            // v37.0.0 — hybrid-COMPLETE. Under `HybridPolicy::Strict` a
+            // row with no PQC pubkey cannot authenticate anything.
+            pubkey_ml_dsa_65_base64: Some(BASE64.encode(&steward_pqc_pk)),
             algorithm: algorithm::HYBRID.into(),
             identity_type: identity_type::PRIMITIVE.into(),
             identity_ref: "steward".into(),
@@ -993,36 +1043,52 @@ mod tests {
         (router(state), secrets, backend)
     }
 
-    /// Sign a request body with the steward fixture key.
-    fn sign(body: &[u8]) -> String {
+    /// Sign a request body with the steward fixture key, HYBRID.
+    ///
+    /// v37.0.0 — returns both halves. The PQC half signs
+    /// `(body || ed25519_sig)`, the bound form `verify_hybrid`
+    /// reconstructs. Under `HybridPolicy::Strict` the classical half
+    /// alone authenticates nothing, so there is no Ed25519-only variant
+    /// of this helper — the witness that needs that shape builds it
+    /// inline and says why.
+    async fn sign(body: &[u8]) -> (String, String) {
+        use ciris_keyring::PqcSigner as _;
         let sk = SigningKey::from_bytes(&STEWARD_SEED);
-        BASE64.encode(sk.sign(body).to_bytes())
+        let ed_sig = sk.sign(body).to_bytes();
+        let mut bound = Vec::with_capacity(body.len() + ed_sig.len());
+        bound.extend_from_slice(body);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = steward_mldsa().sign(&bound).await.expect("ml-dsa sign");
+        (BASE64.encode(ed_sig), BASE64.encode(&pqc_sig))
     }
 
-    fn signed_post(uri: &str, body: Vec<u8>) -> Request<Body> {
-        let sig = sign(&body);
+    async fn signed_post(uri: &str, body: Vec<u8>) -> Request<Body> {
+        let (sig, pqc) = sign(&body).await;
         Request::post(uri)
             .header("content-type", "application/json")
             .header(HEADER_KEY_ID, STEWARD_KEY_ID)
             .header(HEADER_ED25519, &sig)
+            .header(HEADER_ML_DSA_65, &pqc)
             .body(Body::from(body))
             .unwrap()
     }
 
-    fn signed_get(uri: &str) -> Request<Body> {
-        let sig = sign(&[]);
+    async fn signed_get(uri: &str) -> Request<Body> {
+        let (sig, pqc) = sign(&[]).await;
         Request::get(uri)
             .header(HEADER_KEY_ID, STEWARD_KEY_ID)
             .header(HEADER_ED25519, &sig)
+            .header(HEADER_ML_DSA_65, &pqc)
             .body(Body::empty())
             .unwrap()
     }
 
-    fn signed_delete(uri: &str) -> Request<Body> {
-        let sig = sign(&[]);
+    async fn signed_delete(uri: &str) -> Request<Body> {
+        let (sig, pqc) = sign(&[]).await;
         Request::delete(uri)
             .header(HEADER_KEY_ID, STEWARD_KEY_ID)
             .header(HEADER_ED25519, &sig)
+            .header(HEADER_ML_DSA_65, &pqc)
             .body(Body::empty())
             .unwrap()
     }
@@ -1045,7 +1111,7 @@ mod tests {
         .unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/store", body))
+            .oneshot(signed_post("/api/v1/secrets/store", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1074,7 +1140,7 @@ mod tests {
         .unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/try_claim", body.clone()))
+            .oneshot(signed_post("/api/v1/secrets/try_claim", body.clone()).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1084,7 +1150,7 @@ mod tests {
         // Second call should AlreadyClaimed with the same UUID.
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/try_claim", body))
+            .oneshot(signed_post("/api/v1/secrets/try_claim", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1128,7 +1194,8 @@ mod tests {
             "accessor": "z",
         }))
         .unwrap();
-        let mut sig_bytes = BASE64.decode(sign(&body)).unwrap();
+        let (good_sig, pqc) = sign(&body).await;
+        let mut sig_bytes = BASE64.decode(good_sig).unwrap();
         sig_bytes[0] ^= 0xFF;
         let bad_sig = BASE64.encode(&sig_bytes);
         let resp = app
@@ -1138,6 +1205,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header(HEADER_KEY_ID, STEWARD_KEY_ID)
                     .header(HEADER_ED25519, &bad_sig)
+                    .header(HEADER_ML_DSA_65, &pqc)
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1148,12 +1216,109 @@ mod tests {
         assert_eq!(err.kind, "secrets_signature_invalid");
     }
 
+    /// v37.0.0 — `HybridPolicy::Strict` on the secrets routes.
+    ///
+    /// A CLASSICAL-ONLY steward — `federation_keys` row with no
+    /// `pubkey_ml_dsa_65`, sending no `x-ciris-signature-ml-dsa-65`
+    /// header, valid Ed25519 signature over the exact body, fully
+    /// role-tagged — was ACCEPTED through v36.x under `Ed25519Fallback`.
+    /// It is refused now. PQC absence is the only defect.
+    ///
+    /// The row must be hybrid-PENDING for `HybridPendingRejected` to be
+    /// the refusal: if the row HAS a PQC pubkey and only the header is
+    /// missing, `verify_hybrid`'s both-or-neither pairing fires first and
+    /// yields `PqcFieldsMustBeBoth` instead. Both refuse; the details
+    /// differ so an operator can tell "never registered PQC" from
+    /// "header stripped in flight".
+    #[tokio::test]
+    async fn ed25519_only_secrets_signature_is_rejected_under_strict() {
+        let (app, _secrets, backend) = build_app().await;
+        // A v36-era steward: registered + role-tagged, but classical-only.
+        const LEGACY_STEWARD_KEY_ID: &str = "secrets-steward-test-legacy";
+        let sk = SigningKey::from_bytes(&STEWARD_SEED);
+        let legacy = KeyRecord {
+            key_id: LEGACY_STEWARD_KEY_ID.into(),
+            pubkey_ed25519_base64: BASE64.encode(sk.verifying_key().to_bytes()),
+            // Deliberately hybrid-PENDING.
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: identity_type::PRIMITIVE.into(),
+            identity_ref: "steward-legacy".into(),
+            valid_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": LEGACY_STEWARD_KEY_ID}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: LEGACY_STEWARD_KEY_ID.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: vec![
+                ROLE_SECRETS_READER.to_owned(),
+                ROLE_SECRETS_WRITER.to_owned(),
+                ROLE_SECRETS_ADMIN.to_owned(),
+            ],
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: legacy })
+            .await
+            .unwrap();
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "plaintext": "x",
+            "description": "y",
+            "accessor": "z",
+        }))
+        .unwrap();
+        let ed_sig = BASE64.encode(sk.sign(&body).to_bytes());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/secrets/store")
+                    .header("content-type", "application/json")
+                    .header(HEADER_KEY_ID, LEGACY_STEWARD_KEY_ID)
+                    .header(HEADER_ED25519, &ed_sig)
+                    // HEADER_ML_DSA_65 deliberately omitted.
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let err: SecretsErrorResponse = body_json(resp).await;
+        assert_eq!(err.kind, "secrets_signature_invalid");
+        // HAND-WRITTEN: the exact upstream refusal — reds if the policy
+        // drifts back to a soft posture.
+        assert!(
+            err.detail
+                .contains("hybrid-pending row rejected by Strict policy"),
+            "expected the Strict refusal; got: {}",
+            err.detail
+        );
+        // LOUD: name the flag day and rule out the credential.
+        assert!(
+            err.detail.contains("HybridPolicy::Strict")
+                && err.detail.contains("x-ciris-signature-ml-dsa-65"),
+            "detail must name the policy flip and the missing header; got: {}",
+            err.detail
+        );
+        assert!(
+            err.detail
+                .contains("not a key-validity or revocation problem"),
+            "detail must rule OUT the credential, the likeliest misdiagnosis; got: {}",
+            err.detail
+        );
+    }
+
     /// Unknown UUID → 404 + secrets_not_found token.
     #[tokio::test]
     async fn unknown_uuid_returns_404() {
         let (app, _secrets, _backend) = build_app().await;
         let uri = "/api/v1/secrets/00000000-0000-0000-0000-000000000000?accessor=test";
-        let resp = app.clone().oneshot(signed_get(uri)).await.unwrap();
+        let resp = app.clone().oneshot(signed_get(uri).await).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let err: SecretsErrorResponse = body_json(resp).await;
         assert_eq!(err.kind, "secrets_not_found");
@@ -1184,7 +1349,7 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({"plaintext": "secret"})).unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/encrypt", body))
+            .oneshot(signed_post("/api/v1/secrets/encrypt", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1193,7 +1358,7 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({"ciphertext": enc.ciphertext})).unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/decrypt", body))
+            .oneshot(signed_post("/api/v1/secrets/decrypt", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1211,7 +1376,7 @@ mod tests {
             "new_config": {"patterns": ["api_key"]},
         }))
         .unwrap();
-        let sig = sign(&body);
+        let (sig, pqc) = sign(&body).await;
         let resp = app
             .clone()
             .oneshot(
@@ -1219,6 +1384,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header(HEADER_KEY_ID, STEWARD_KEY_ID)
                     .header(HEADER_ED25519, &sig)
+                    .header(HEADER_ML_DSA_65, &pqc)
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1230,7 +1396,7 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(signed_get("/api/v1/secrets/filter_config"))
+            .oneshot(signed_get("/api/v1/secrets/filter_config").await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1251,14 +1417,14 @@ mod tests {
         .unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/store", body))
+            .oneshot(signed_post("/api/v1/secrets/store", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // List.
         let resp = app
             .clone()
-            .oneshot(signed_get("/api/v1/secrets?limit=100"))
+            .oneshot(signed_get("/api/v1/secrets?limit=100").await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1279,13 +1445,13 @@ mod tests {
         .unwrap();
         let resp = app
             .clone()
-            .oneshot(signed_post("/api/v1/secrets/store", body))
+            .oneshot(signed_post("/api/v1/secrets/store", body).await)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = app
             .clone()
-            .oneshot(signed_get("/api/v1/secrets?limit=100"))
+            .oneshot(signed_get("/api/v1/secrets?limit=100").await)
             .await
             .unwrap();
         let list: ListSecretsResponse = body_json(resp).await;
@@ -1296,7 +1462,11 @@ mod tests {
             .map(|r| r.uuid.clone())
             .expect("our secret in listing");
         let uri = format!("/api/v1/secrets/{uuid}?accessor=u");
-        let resp = app.clone().oneshot(signed_delete(&uri)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(signed_delete(&uri).await)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body: ForgetSecretResponse = body_json(resp).await;
         assert!(body.deleted);

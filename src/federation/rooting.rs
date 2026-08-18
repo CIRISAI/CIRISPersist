@@ -581,16 +581,22 @@ where
 ///
 /// # Crypto path
 ///
-/// Each link's signature is verified through
-/// [`crate::verify::hybrid::verify_hybrid`] (`ciris_crypto` under the
-/// hood) — never persist-local crypto. The verify policy is
-/// [`HybridPolicy::Ed25519Fallback`]: a hybrid-pending link (cold-path
-/// ML-DSA-65 sign not yet complete) is verified on its Ed25519
-/// signature alone. Provenance rooting authenticates *origin*; the PQC
-/// posture of a link is a separate, freshness-policy concern the
-/// caller layers on via [`provenance_chain`] + its own
-/// [`HybridPolicy`]. A link that DOES carry a PQC signature is
-/// verified hybrid (both signatures must pass).
+/// Each link's signature is verified by DELEGATING to CIRISVerify's
+/// provenance walk (CIRISPersist#465) — never persist-local crypto. The
+/// verify policy is
+/// [`ciris_verify_core::threshold::HybridPolicy::RequireHybrid`]: EVERY
+/// link must carry a valid bound ML-DSA-65 scrub-signature, and a
+/// classical-only link is REJECTED as
+/// [`RootingRejection::UnsignedProvenanceLink`].
+///
+/// **Doc correction (v37.0.0):** this paragraph claimed
+/// `HybridPolicy::Ed25519Fallback` — "a hybrid-pending link is verified
+/// on its Ed25519 signature alone" — which has been false since #465
+/// tightened the walk to `RequireHybrid` (see the inline comment at the
+/// delegation site). The stale text described a classical-only link as
+/// rootable when the gate refuses it, which is precisely backwards for a
+/// federation binding gate (F-AV-14 / AV-8). Corrected during the v37.0.0
+/// policy sweep; the code was already correct and did not change.
 ///
 /// # Not a trust statement
 ///

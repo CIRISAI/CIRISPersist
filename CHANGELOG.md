@@ -5,6 +5,309 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [37.0.0] - 2026-08-18
+
+**MAJOR: every deferred permissive posture flips in this cut.**
+
+The operator's directive was that every break happens NOW, ahead of the first
+mesh-based agent release and a fresh mesh genesis — *"just make sure this is the
+last time."* Each of these gets harder the moment agents depend on the current
+shape, so they land together and consumers adopt one breaking version instead of
+eight.
+
+A sweep for *"permissive posture, deferred to a later flag day"* found **seven
+flags across three classes**. None was an open decision. Each was waiting on a
+condition that had already passed, or on a flag day nobody had scheduled.
+
+### The shape shared by almost everything in this release
+
+Nearly every defect fixed here is **one signal covering two worlds** — an
+instrument that reports identically whether or not the defect is present:
+
+- `attested_key_id` meant the agent SCORED, the SELF-ATTESTING HOLDER, or THE
+  ACCORD depending on dimension. One column, three meanings, so no verb could
+  disambiguate it (#733).
+- V1Python and JCS canonicalization emit **byte-identical bytes for
+  plain-ASCII** input. Three separate sites minted signatures under the wrong
+  rule for versions, invisible until the first non-ASCII payload (#716, #735,
+  and a fourth found while fixing the third).
+- A permissive default emits no signal when its own flip condition passes — the
+  CEG 0.1 ladder window stayed open five CEG versions past its stated target.
+- `authority_key_id` was documented as *"typically the subject, but not enforced
+  to be"*: a valid signature from any registered key proved only that they
+  signed it, never where the subject was (#734).
+
+The tooling turned out to have the same disease, and it is recorded here because
+it changed how this release was verified: `--features sqlite` reported 2105
+passed / 0 failed while `sqlite,test-anchor` had 18 failures on the same tree; a
+hard `E0004` was invisible to every feature set without `pyo3`; and
+`cargo check --lib` went green while `--all-targets` was red, because `--lib`
+does not compile test bodies. **A check that cannot fail is a report.** Verify
+per feature SET, never a union and never a subset, and always `--all-targets`.
+
+### Added — `accord_root`, a signed envelope key naming which accord a row belongs to (#733)
+
+`accord:*` rows did not say which accord they belonged to, and `attested_key_id`
+could not be made to: it is an axis fusion across that one family. Worse, it is
+**unsigned** — the scrub signature covers `attestation_envelope` alone — so a
+root named in a top-level column buys nothing on the RELAY path, which is
+exactly where a node handles a row it never admitted.
+
+The remedy follows the `consent_supersedes` precedent (#642): a new **signed
+envelope key**, plane-scoped, with an `ENVELOPE_VOCABULARY_SHA256` re-pin. New
+pin: `e019ecb873f662399c13515414849a8d055d5ec2f0893e21f74cdccf6f60a111`.
+
+**Required at the write door**, with `accord:lifecycle:v1` keeping its existing
+rule (`attested_key_id` names the accord) as the documented fallback — both
+conjuncts, `scores` AND the drill dimension, because a rule looser than the fold
+it mirrors would exempt rows the fold never counts as drills.
+
+**Disagreement is a REFUSAL.** Once the key exists, an `accord:lifecycle:v1` row
+carries two signals. Silently preferring either is wrong in a different
+direction: prefer the key and an emitter can relabel a heartbeat's accord; prefer
+the column and the new field is decorative on the one dimension where a rule
+exists. The problem is not which meaning to pick — it is that **one artifact
+asserts two**. This also keeps the heartbeat rule a live CHECK rather than
+something the new field quietly obsoletes.
+
+New verb: `may_relay_accord_attestation(&dir, self_key_id, &attestation)`. It
+reads root AND signer from signature-covered bytes, running
+`check_row_column_binding` first and treating its refusal as
+`roster_resolvable: false`.
+
+**The write door protects NEW rows only.** The stored corpus is covered by the
+consumer's enforcement flag, not by this check. They are COMPLEMENTARY — stated
+here because otherwise someone later removes one on the grounds the other
+exists. That is not hypothetical: v34's `ifac_size` was documented as required
+and enforced nowhere for weeks, and #727 was a serde default meeting an
+`unwrap_or("")` reader.
+
+**Consumer-visible precedence change:** for the `attestation_type` shape only, a
+row that is BOTH unnamed AND signed by a non-`accord_holder` now reports
+`federation_accord_root_unnamed` first. The dimension shape is unchanged.
+
+**The genesis corpus was never at risk, and this was established before any
+fixture was touched.** Both baked `accord:*` rows are `scores` +
+`accord:lifecycle:v1` + `attested_key_id = humanity-accord`, satisfying the
+fallback exactly. Zero genesis fixtures edited. Had the fallback required only
+the dimension, a fresh mesh genesis would have needed a re-mint.
+
+### Changed — `HybridPolicy::Ed25519Fallback` to `Strict` at four production paths
+
+The enum's own doc already said this posture is *"Development / sovereign-mode;
+**not for federation production**."* Four production paths used it anyway:
+`server/pipeline.rs` (edge ingest), `server/secrets.rs`, and **both** cirisnode
+backends.
+
+`cirisnode/postgres.rs` was not in the original sweep — found by re-deriving the
+list rather than trusting it. Leaving it would have made the accepted signature
+set depend on which backend a node compiled with.
+
+**Two sites were deliberately NOT flipped, and the measurement is why.**
+`audit/verify.rs` and `cirisnode/verify.rs` both pass `ml_dsa_65_pubkey_b64` as
+a hardcoded `None`, so `Strict` there refuses EVERY input rather than tightening
+anything. Flipping `audit/verify.rs` reds 19 tests and takes the stored audit
+chain and its RFC 6962 Merkle corpus dark; `AuditEntry` has no PQC field at all.
+Both are now documented pins with witnesses, not silent omissions.
+
+Also fixed: `federation/rooting.rs` and `genesis/mod.rs` documented
+`Ed25519Fallback` for a walk that has used `RequireHybrid` since #465 — they
+described a classical-only link as rootable when the gate refuses it.
+`secrets/client.rs` silently downgraded to Ed25519-only on `PqcNotConfigured`,
+which after this flip could only build a doomed request; it now fails locally
+with the actual cause.
+
+### Changed — the edge-signing canonicalizer is CEG-produce, not V1 (#716)
+
+`canonicalize_for_edge_signing` moves from `PythonJsonDumpsCanonicalizer` to
+`ceg_produce_canonicalize`. This is the second instance of the #714 class, held
+back in v35.0.0 because it is the edge inbound wire pin.
+
+**The break is PAYLOAD-DEPENDENT, and that is the dangerous part.** The two
+rules emit identical bytes for plain-ASCII, ES-float-clean payloads — the first
+V1-rejection witness written for this returned **200 OK**. They diverge on
+non-ASCII (JCS emits raw UTF-8, V1 escapes it) and on float tokens (`1e-05` vs
+`1e-5`). An un-re-pinned edge appears completely healthy and fails on its first
+accented name.
+
+> **"We deployed and ingest kept working" is NOT evidence the peer re-pinned.**
+> It is evidence recent traffic was ASCII. Verify the canonicalizer by BUILD.
+
+Both halves are pinned as witnesses so this cannot regress into an assumption.
+
+**Deploy ordering:** cut both sides in the same window. If you must sequence,
+roll **persist first** — a v37 persist refusing an old edge returns a 422 whose
+detail names both flips and rules out the key, while a v36 persist refusing a
+new edge returns a bare signature mismatch indistinguishable from a credential
+problem. Both drop the same traffic; only one explains itself. Nothing
+re-verifies from storage on this plane, so the outage is bounded to in-flight
+requests.
+
+### Fixed — the PyO3 cold-path PQC signer minted over V1 (#735)
+
+`cold_path_pqc_sign` built the bound PQC preimage with
+`PythonJsonDumpsCanonicalizer` at nine production call sites while every Rust
+verifier rebuilds it with `ceg_produce_canonicalize`.
+`canonicalize_envelope_value` had the same defect on the FFI verify side. Third
+instance of the class.
+
+The sharpest statement of it: the documented Lens workflow is *step 2:
+canonicalize_envelope* (on the gate since #176) then *step 5: cold path ML-DSA
+over (canonical_bytes || classical_sig)*. **Step 2 produced JCS and step 5
+produced V1 — the two halves of one row used different rules.**
+
+The fix only ever turns a permanent failure into a pass: on ASCII the rules
+agree, and on divergent input the stored half already failed every Rust gate.
+
+**Reported, not fixed:** `attach_attestation_pqc_signature` and
+`attach_revocation_pqc_signature` have no verify-before-mutation on any backend
+— only the key plane got the #657 door. And a bad half is unreachable by the
+backfill sweep (which filters `pqc_completed_at IS NULL`) and by attach (which
+refuses complete rows), so there is no re-mint path and no detection path.
+
+### Fixed — a location proof's authority is the subject or its live delegates (#734)
+
+`SignedLocationProof.authority_key_id` was documented as *"typically the subject
+itself, but not enforced to be"*, so **any registered key could assert a
+location for any subject** — valid signature, admitted row, wrong claim. E4
+closed *"no signature at all"*; nothing closed *"whose signature."*
+
+The authority set is now exactly `{subject} ∪ {live delegates of subject}`. The
+justification is epistemic and it is what makes the rule tight rather than
+arbitrary: **location is self-knowledge.** A third party has no source for where
+a subject is, so their signature proves only that they signed it.
+
+Delegation liveness is load-bearing — a withdrawn or recanted `delegates_to`
+confers nothing. The new `topology::live_delegate_standing` composes
+`precedence::retired_ids`, the consolidated #686 fold, so *"retracted"* has one
+spelling.
+
+**Refusals are typed by WHY, because persist has no deferral queue for these.**
+A refused proof is gone unless re-submitted, so the caller must be able to tell
+a timing artifact from a verdict: `..._no_delegation_edge` is RETRYABLE (the
+`delegates_to` may not have replicated yet), while `..._retracted` and
+`..._expired` are substantive. A witness drives it end to end — proof before its
+edge yields the retryable token; land the edge; the byte-identical proof is
+admitted.
+
+The four sibling `authority_key_id` types are deliberately unchanged: on family
+and community planes an authority legitimately speaks about parties other than
+itself, so the epistemic argument does not transfer.
+
+### Added — a field-set gate on five signed planes, in BOTH wire shapes
+
+`Family`, `Community`, both membership revocations, and `LocationProof` sign the
+whole record minus `persist_row_hash` — JCS-canonicalized, hybrid-Strict signed,
+**stored**, and **re-verified cross-peer**. Unlike `EnvelopeCore` and
+`KeyRecord`, none had a field-set gate. **One future cut adding one serializing
+field would silently invalidate every stored signature on that plane,
+mesh-wide** — a forced re-genesis arriving as a surprise. That class already
+fired once: `genesis/mod.rs:1174` records a seed signed before #643's
+`RowMirror` change being refused at every `put_attestation`.
+
+Each type is now pinned against a hand-written literal key list in **both** the
+fully-populated and the MINIMAL shape (every `Option` `None`, every `Vec`
+empty), plus a test asserting the minimal list is a strict subset differing
+exactly by the optional fields.
+
+**Why both shapes, and this is the honest part:** the gate's first version
+claimed in its own doc that it would catch #727's remedy — someone dropping
+`skip_serializing_if`. **That claim was false, and it was caught only because
+someone tried to write the mutation for it.** A fully-populated fixture has
+every `Option` as `Some`, so removing `skip_serializing_if` moves no key set the
+gate can observe. The minimal shape is the only one where that change is visible
+— and it is also what most stored rows actually look like on the wire.
+
+The module doc records what the gate does NOT literally exercise and why that is
+still covered by construction, because a gate whose limits are written down is
+worth more than one that reads as total.
+
+### Added — `compute_persist_row_hash` is PINNED to V1, with a divergence witness
+
+The row hash is V1 and stored, but sits in **no** signature preimage. So
+flipping it is an in-place column rewrite, not a re-genesis — **as long as
+nobody does it by accident.** It carried no pin and no witness, so a future
+consistency sweep (exactly the kind this cut ran, four instances deep) would
+have routed it through the produce gate for tidiness and taken every stored row
+hash dark with nothing to red. It is now pinned like
+`canonicalize_envelope_for_signing_v1_pinned`, with a corpus that actually
+diverges — non-ASCII AND non-ES-float — and anti-vacuity legs that red if the
+corpus rots to ASCII.
+
+### Removed — the CEG 0.1 attestation-ladder transition (BREAKING)
+
+`AttestationLadderTransitionPolicy`, the `attestation_ladder_transition` field
+on `DimensionAdmissionPolicy`, and `admits_deprecated_form()` are **removed** —
+not defaulted to `RejectDeprecated`. A single-variant enum is the wrong end
+state: leaving a selectable *"admit the dead 0.1 wire shape"* option is how a
+transition posture becomes permanent, which is the pattern this whole cut exists
+to end.
+
+**Three independent reasons this sat open**, recorded because the mechanism
+generalizes:
+
+1. Its own doc named the flip condition — *"post-CEG 0.3."* The tree reached
+   **CEG 0.8**.
+2. Its tracking pointer read *"tracked at CIRISPersist#117"* — an **unrelated,
+   closed** issue about the VerifyDirectory mutation surface.
+3. Nothing failed. **A permissive default produces no signal.**
+
+The refusal is deliberately loud: `is_deprecated_attestation_ladder_prefix`
+survives with its role inverted from an ADMIT branch to a REFUSE branch, so the
+removed shape reports `federation_deprecated_attestation_ladder_form` and names
+the canonical form to emit, instead of falling through to
+`missing_version_segment` — which would have told a producer their dimension
+lacked a version segment when the real problem was a wire shape that no longer
+exists.
+
+**The stored corpus still carries the deprecated form** from the 13-version
+dual-acceptance window. Consumers reading history must continue to tolerate it;
+this gate protects new rows only.
+
+### BREAKING — removed public API
+
+| Removed | Path |
+|---|---|
+| `enum AttestationLadderTransitionPolicy` (`DualAccept`, `RejectDeprecated`) | `federation::admission::` — also dropped from the `federation::` re-export |
+| `fn AttestationLadderTransitionPolicy::admits_deprecated_form(self) -> bool` | `federation::admission::` |
+| field `DimensionAdmissionPolicy::attestation_ladder_transition` | `federation::admission::` |
+
+Added: `federation::Error::DeprecatedAttestationLadderForm { dimension, canonical }`,
+`kind()` token `federation_deprecated_attestation_ladder_form`, surfacing across
+the FFI as `PyValueError` (4xx — caller-fault content the producer re-emits).
+
+The break is **Rust-API-only**: there is no `.pyi` surface for the removed items
+and no struct-literal construction of `DimensionAdmissionPolicy` anywhere in the
+repo. Out-of-repo Rust consumers that build that struct by literal will need the
+field dropped — that is BELIEVED to be nobody, not verified, because it cannot be
+checked from here.
+
+Full refusal text, so a producer can match on it without deploying first:
+
+```
+removed attestation-ladder wire shape "attestation:l1:self_verify": the CEG 0.1
+form `attestation:l<N>:<mechanism>` was deprecated by CEG 0.2 §13.1 and REMOVED
+at persist v37.0.0 — the dual-accept transition window is closed. Emit the
+canonical mechanism form `attestation:<mechanism>` instead; admissible set:
+["attestation:self_verify", "attestation:hardware_rooted",
+ "attestation:registry_consensus", "attestation:license_validity",
+ "attestation:agent_integrity"]
+```
+
+### Test-infrastructure findings — filed, not fixed
+
+Three axes make this suite's greens unreliable, none visible in its output:
+**#736** (per-PROCESS fixture accumulation makes results selection-dependent —
+`founder_n` is read from a shared DB while fixtures pin a literal threshold),
+**#738** (21 tests fail in parallel and pass serially), and the feature-set
+blindness above. A red on those planes must be attributed by re-running in
+isolation before being read as a regression — and a green full suite is likewise
+not evidence a change is safe there.
+
+**#737** records a flip that was proposed and correctly dropped: cirisnode's
+`admission_gate: None` is a trust-score default, not an authentication bypass —
+`verify_envelope_signed` runs regardless.
+
 ## [36.3.0] - 2026-08-18
 
 **MINOR: adds public API.** `may_relay_accord_participation`, plus the

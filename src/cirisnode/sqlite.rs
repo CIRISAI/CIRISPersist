@@ -1385,7 +1385,16 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             &attestation.peer_key_id,
             &attestation.signature_classical_base64,
             attestation.signature_pqc_base64.as_deref(),
-            crate::verify::hybrid::HybridPolicy::Ed25519Fallback,
+            // v37.0.0 — Strict, in lockstep with the postgres twin
+            // (`super::postgres`'s `put_delivery_attestation`). A
+            // delivery attestation is a federation peer's signed claim
+            // that it received an announcement; accepting a
+            // classical-only one let a peer's PQC-absent signature into
+            // a federation-visible record. Backend parity is the point:
+            // a policy that differs between sqlite and postgres would
+            // make the accepted set depend on which backend the node was
+            // compiled with.
+            crate::verify::hybrid::HybridPolicy::Strict,
             None,
         )
         .await
@@ -2734,7 +2743,21 @@ mod tests {
 
     // ─── Federation Delivery Attestations (FSD §3.2.1) ──────────────
 
-    async fn put_peer_federation_key_sqlite(
+    /// v37.0.0 — the peer's ML-DSA-65 half, deterministic from the same
+    /// seed. `put_delivery_attestation` verifies under
+    /// `HybridPolicy::Strict` now, so a peer with no PQC key cannot
+    /// produce an acceptable attestation.
+    fn peer_mldsa_sqlite(seed: u8) -> ciris_keyring::MlDsa65SoftwareSigner {
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], "test-peer-pqc")
+            .expect("deterministic ML-DSA-65 keypair from seed")
+    }
+
+    /// v37.0.0 — register a peer whose row is hybrid-PENDING (no
+    /// `pubkey_ml_dsa_65`): a v36-era classical-only peer. Needed to
+    /// reach `HybridPendingRejected`; a row that HAS a PQC pubkey but
+    /// receives no PQC signature refuses earlier, as
+    /// `PqcFieldsMustBeBoth`.
+    async fn put_classical_only_peer_key_sqlite(
         backend: &SqliteBackend,
         seed: u8,
     ) -> (String, ed25519_dalek::SigningKey, String) {
@@ -2743,11 +2766,53 @@ mod tests {
         use base64::Engine as _;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
         let pubkey_b64 = B64.encode(signing_key.verifying_key().to_bytes());
-        let key_id = format!("test-peer-{seed:02x}-{}", Uuid::new_v4());
+        let key_id = format!("test-peer-legacy-{seed:02x}-{}", Uuid::new_v4());
         let record = crate::federation::KeyRecord {
             key_id: key_id.clone(),
             pubkey_ed25519_base64: pubkey_b64.clone(),
             pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::AGENT.into(),
+            identity_ref: format!("agent-legacy-{seed:02x}"),
+            valid_from: Utc::now() - chrono::Duration::hours(1),
+            valid_until: None,
+            registration_envelope: serde_json::json!({"id": key_id}),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.clone(),
+            scrub_timestamp: Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+        (key_id, signing_key, pubkey_b64)
+    }
+
+    async fn put_peer_federation_key_sqlite(
+        backend: &SqliteBackend,
+        seed: u8,
+    ) -> (String, ed25519_dalek::SigningKey, String) {
+        use crate::federation::FederationDirectory;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_keyring::PqcSigner as _;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey_b64 = B64.encode(signing_key.verifying_key().to_bytes());
+        let key_id = format!("test-peer-{seed:02x}-{}", Uuid::new_v4());
+        let pqc_pk = peer_mldsa_sqlite(seed).public_key().await.expect("pqc pk");
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: pubkey_b64.clone(),
+            // v37.0.0 — hybrid-COMPLETE; Strict refuses a pending row.
+            pubkey_ml_dsa_65_base64: Some(B64.encode(&pqc_pk)),
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::AGENT.into(),
             identity_ref: format!("agent-{seed:02x}"),
@@ -2773,13 +2838,21 @@ mod tests {
         (key_id, signing_key, pubkey_b64)
     }
 
-    fn build_signed_attestation_sqlite(
+    /// v37.0.0 — build a HYBRID-signed delivery attestation.
+    ///
+    /// `pqc_seed` selects the ML-DSA-65 half; pass the same seed used to
+    /// register the peer for a legitimate attestation. The PQC signature
+    /// covers `(canonical || ed25519_sig)`, the bound form
+    /// `verify_hybrid` reconstructs.
+    async fn build_signed_attestation_sqlite(
         announcement_id: &str,
         canonical_hash: &[u8; 32],
         peer_key_id: &str,
         peer_pubkey_b64: &str,
         peer_signing_key: &ed25519_dalek::SigningKey,
+        pqc_seed: u8,
     ) -> crate::cirisnode::DeliveryAttestation {
+        use ciris_keyring::PqcSigner as _;
         use ed25519_dalek::Signer as _;
         let mut att = crate::cirisnode::DeliveryAttestation {
             announcement_id: announcement_id.to_owned(),
@@ -2795,7 +2868,20 @@ mod tests {
         };
         let canonical = att.canonical_bytes().unwrap();
         let sig = peer_signing_key.sign(&canonical);
-        att.signature_classical_base64 = crate::cirisnode::encode_signature_base64(&sig.to_bytes());
+        let ed_sig = sig.to_bytes();
+        att.signature_classical_base64 = crate::cirisnode::encode_signature_base64(&ed_sig);
+        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+        bound.extend_from_slice(&canonical);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = peer_mldsa_sqlite(pqc_seed)
+            .sign(&bound)
+            .await
+            .expect("ml-dsa sign");
+        att.signature_pqc_base64 = Some({
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            B64.encode(&pqc_sig)
+        });
         att
     }
 
@@ -2822,14 +2908,17 @@ mod tests {
             peers.push(put_peer_federation_key_sqlite(&b, seed).await);
         }
 
-        for (key_id, signing_key, pubkey_b64) in &peers {
+        for ((key_id, signing_key, pubkey_b64), seed) in peers.iter().zip([0xD1u8, 0xD2u8, 0xD3u8])
+        {
             let att = build_signed_attestation_sqlite(
                 &announcement_id,
                 &canonical_hash,
                 key_id,
                 pubkey_b64,
                 signing_key,
-            );
+                seed,
+            )
+            .await;
             backend.put_delivery_attestation(att.clone()).await.unwrap();
             // Idempotent replay.
             backend.put_delivery_attestation(att).await.unwrap();
@@ -2887,9 +2976,65 @@ mod tests {
             &legit_key_id,
             &legit_pubkey_b64,
             &attacker_signer,
-        );
+            0xE1,
+        )
+        .await;
         let err = backend.put_delivery_attestation(att).await.unwrap_err();
         assert!(matches!(err, Error::Signature(_)), "got: {err:?}");
+    }
+
+    /// v37.0.0 — `HybridPolicy::Strict` on `put_delivery_attestation`.
+    ///
+    /// A classical-only delivery attestation — valid Ed25519 signature,
+    /// registered peer, correct canonical bytes — was ACCEPTED through
+    /// v36.x under `Ed25519Fallback`. It is refused now. PQC absence is
+    /// the only defect.
+    ///
+    /// The postgres twin of this witness is
+    /// `postgres::tests::pg_delivery_attestation_rejects_ed25519_only_under_strict`;
+    /// the two backends MUST agree, or the accepted set depends on which
+    /// backend the node was compiled with.
+    #[tokio::test]
+    async fn sqlite_delivery_attestation_rejects_ed25519_only_under_strict() {
+        let (b, backend) = fresh_backend().await;
+
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC7; 32]);
+        let env = build_announcement_sqlite(
+            &author_key,
+            crate::cirisnode::AnnouncementPriority::Informational,
+            crate::cirisnode::AuthorityClass::BootstrapSeed,
+            crate::cirisnode::AnnouncementKind::PolicyUpdate,
+            None,
+            None,
+        );
+        let announcement_id = env.contribution_id.clone();
+        backend.put_contribution(env).await.unwrap();
+
+        let (key_id, signing_key, pubkey_b64) = put_classical_only_peer_key_sqlite(&b, 0xE2).await;
+        let mut att = build_signed_attestation_sqlite(
+            &announcement_id,
+            &[0x42; 32],
+            &key_id,
+            &pubkey_b64,
+            &signing_key,
+            0xE2,
+        )
+        .await;
+        // Strip the PQC half only — the Ed25519 signature over the
+        // canonical bytes stays valid, and the peer row is classical-only,
+        // so the refusal is the POLICY, not a field-pairing error.
+        att.signature_pqc_base64 = None;
+
+        let err = backend.put_delivery_attestation(att).await.unwrap_err();
+        // HAND-WRITTEN: the exact upstream refusal, spelled as a literal
+        // so it reds if the policy drifts back to a soft posture.
+        match &err {
+            Error::Signature(msg) => assert!(
+                msg.contains("hybrid-pending row rejected by Strict policy"),
+                "expected the Strict refusal; got: {msg}"
+            ),
+            other => panic!("expected Error::Signature, got: {other:?}"),
+        }
     }
 
     /// v3.4.0 (CIRISPersist#123) — admission gate gates

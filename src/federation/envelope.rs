@@ -133,6 +133,52 @@ pub mod paths {
     /// the bytes are signed; enforced at every `put_attestation` by
     /// [`crate::federation::admission::check_row_column_binding`].
     pub const ROW: &str = "row";
+    /// v37.0.0 (CIRISPersist#733) — **WHICH ACCORD THIS ROW BELONGS TO.** The
+    /// root ref (`root_ref` in [`crate::federation::trust_root`]'s vocabulary
+    /// — a constitutional family id, or a key id on the key arm) of the accord
+    /// an `accord:*` row is about. Read by
+    /// [`crate::federation::trust_root::accord_root_claim`] and by nothing
+    /// else.
+    ///
+    /// # Why a new key and not `attested_key_id`
+    ///
+    /// Because that column is an AXIS FUSION on this very family, verified
+    /// against CIRISEdge's own fixtures on #733:
+    ///
+    /// | dimension | what `attested_key_id` holds |
+    /// |---|---|
+    /// | `accord:human_dignity:v1` | the **agent being scored** |
+    /// | `accord:invoke:notify:*` | the **self-attesting holder** |
+    /// | `accord:lifecycle:v1` | the **accord** |
+    ///
+    /// One column, three meanings — so no verb can disambiguate it, in either
+    /// repo, and naming the root there would have added a FOURTH. This is the
+    /// same ruling [`CONSENT_SUPERSEDES`] was minted under one plane over (CC
+    /// 4.5.1.1's *"the remedy is the field split, envelope cost accepted"*),
+    /// and the name is PLANE-SCOPED (`accord_`) for the same reason: a generic
+    /// `root` would invite the next plane to reuse it, which is how the fused
+    /// column got fused.
+    ///
+    /// # Why it must live INSIDE the envelope
+    ///
+    /// [`crate::federation::attestation_emit`] canonicalizes
+    /// `attestation_envelope` and **nothing else**, so the top-level
+    /// `attesting_key_id` / `attested_key_id` columns carry no signature. They
+    /// are bound on the RECEIVE path by
+    /// [`crate::federation::admission::check_row_column_binding`] — and
+    /// relaying is precisely the moment a node handles a row it never admitted
+    /// and therefore never ran that gate over. A root named in an unsigned
+    /// column buys nothing where it is needed.
+    ///
+    /// # REQUIRED, with one documented fallback
+    ///
+    /// [`crate::federation::trust_root::check_accord_root_binding`] refuses an
+    /// `accord:*` row that omits it. The single exception is the drill
+    /// dimension [`crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION`],
+    /// where persist's OWN fold already defines a row about X as a drill about
+    /// accord X — and where, if BOTH signals are present and DISAGREE, the row
+    /// is refused rather than one signal silently preferred.
+    pub const ACCORD_ROOT: &str = "accord_root";
 }
 
 /// v31.0.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
@@ -381,6 +427,15 @@ pub struct EnvelopeCore {
     /// `put_attestation` REFUSES such a row on every backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<RowMirror>,
+    /// [`paths::ACCORD_ROOT`] — v37.0.0 (#733). WHICH accord an `accord:*` row
+    /// belongs to. Typed here so a local producer that stamps a non-string is
+    /// refused at the emit door; a FOREIGN row carrying junk is stored verbatim
+    /// and fails CLOSED at
+    /// [`crate::federation::trust_root::accord_root_claim`] instead, exactly as
+    /// [`Self::consent_supersedes`] does at its fold. Byte-invariant: `None` ⇒
+    /// no key ⇒ identical JCS bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accord_root: Option<String>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
@@ -805,6 +860,7 @@ fn fully_populated_core() -> EnvelopeCore {
             cohort_scope: "federation".into(),
             weight: serde_json::Number::from_f64(1.0),
         }),
+        accord_root: Some("humanity-accord".into()),
         // Deliberately EMPTY: `extra` is the open half, and the typed
         // key set is exactly what this value serializes to only while
         // nothing untyped rides along.
@@ -838,6 +894,7 @@ mod tests {
             (paths::ASSERTED_AT, true),
             (paths::EXPIRES_AT, true),
             (paths::ROW, true),
+            (paths::ACCORD_ROOT, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -992,6 +1049,16 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // vocabulary both sides agree on rather than unsigned columns a
             // relay can rewrite.
             paths::ROW,
+            // v37.0.0 (CIRISPersist#733) — WHICH ACCORD a row belongs to.
+            // Added DELIBERATELY, re-pinning `ENVELOPE_VOCABULARY_SHA256` on
+            // #642's precedent, which is #598's: a key that decides WHICH
+            // TRUST ROOT governs a row must be part of the vocabulary both
+            // sides agree on, not a field one side invented. Consumers
+            // asserting the old hash break loudly, which is the point — a
+            // producer that has not adopted is minting `accord:*` rows that
+            // name no accord, and every relaying node will refuse to carry
+            // them once enforcement is on.
+            paths::ACCORD_ROOT,
         ],
         // v31.0.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
         // alongside the universal paths so a consumer can validate the mirror
@@ -1055,8 +1122,16 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// `references_attestation_id` because CC 4.5.1.1's revision condition says so
 /// — see [`paths::CONSENT_SUPERSEDES`] for the ruling and the gate that
 /// enforced it.
+/// v37.0.0 (CIRISPersist#733) — **RE-PINNED**, and #642's reasoning transposed
+/// one plane over. [`paths::ACCORD_ROOT`] joined `universal_paths`: an
+/// `accord:*` row did not name the accord it belongs to, `attested_key_id`
+/// means three different things across the family and so cannot be made to,
+/// and the field a relaying node resolves a TRUST ROOT from must be part of
+/// the agreed vocabulary rather than a column no signature covers. Consumers
+/// asserting the old hash BREAK, deliberately: an unadopted producer is
+/// minting rows that no enforcing relay will carry.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "c159bc2ec76176c8573b24b4052c5f0b93e3dae75d615f2d221c1f460a2d7cac";
+    "e019ecb873f662399c13515414849a8d055d5ec2f0893e21f74cdccf6f60a111";
 
 #[cfg(test)]
 mod vocab_tests {

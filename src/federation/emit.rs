@@ -129,10 +129,14 @@ impl From<crate::signing::LocalSignerError> for EmitError {
 /// 4. Compute `entry_hash` from canonical bytes (entry_hash +
 ///    signature zeroed during hash; the hash IS part of the signed
 ///    bytes — see `audit::verify` rustdoc for the binding rationale).
-/// 5. Sign the canonical bytes with `signer.sign_ed25519` —
-///    audit entries are Ed25519-only per the
-///    [`crate::verify::hybrid::HybridPolicy::Ed25519Fallback`] used by
-///    [`crate::audit::verify::verify_entry_signature`].
+/// 5. Sign the canonical bytes with `signer.sign_ed25519` — audit
+///    entries are Ed25519-only, matching the PINNED
+///    [`crate::verify::hybrid::HybridPolicy::Ed25519Fallback`] in
+///    [`crate::audit::verify::verify_entry_signature`]. That pin is
+///    structural, not a pending rollout: `AuditEntry` has no PQC field
+///    and no per-actor ML-DSA-65 pubkey exists, so the v37.0.0 Strict
+///    sweep deliberately skipped the audit plane (see that function's
+///    doc). This step stays Ed25519-only.
 /// 6. Call `audit_service.record_entry(entry)` — this triggers the
 ///    Phase C Merkle hook (which signs + stores the STH) and the
 ///    Phase D projection (which UPSERTs `federation_trust_grants`).

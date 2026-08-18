@@ -1411,6 +1411,29 @@ impl MemoryBackend {
         state.keys.insert(key_id.to_owned(), key);
     }
 
+    /// v37.0.0 — test helper to attach an ML-DSA-65 public key to an
+    /// existing `federation_keys` row, making that key hybrid-complete.
+    ///
+    /// [`add_public_key`](Self::add_public_key) writes
+    /// `pubkey_ml_dsa_65_base64: None` — a hybrid-PENDING row. That was
+    /// sufficient while the production write paths verified under
+    /// `HybridPolicy::Ed25519Fallback`; the v37.0.0 flip to
+    /// `HybridPolicy::Strict` means a fixture key with no PQC half can no
+    /// longer sign anything those paths will accept. Tests that need an
+    /// ACCEPTED write call this after `add_public_key`; tests that need
+    /// the refusal simply don't.
+    ///
+    /// Panics if the key isn't already present, matching
+    /// [`set_roles`](Self::set_roles)'s contract.
+    pub fn set_pqc_pubkey(&self, key_id: &str, pubkey_ml_dsa_65_base64: &str) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let rec = state
+            .federation_keys
+            .get_mut(key_id)
+            .expect("set_pqc_pubkey: key_id must exist via add_public_key first");
+        rec.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+    }
+
     /// v1.3.0 (CIRISPersist#46) — test helper to grant a key the
     /// supplied role tags. Mutates the existing `federation_keys`
     /// row's `roles` column; called after [`add_public_key`] by tests
@@ -18778,6 +18801,14 @@ mod tests {
         let row = |attn: &str, attesting: &str, attested: &str| {
             let mut a = fix_attestation("rp-att", attesting, attested, attesting);
             a.attestation_type = attn.to_owned();
+            // v37.0.0 (CIRISPersist#733) — the accord legs assert the
+            // EMITTER-CLASS rule, so their rows must be otherwise well-formed:
+            // an `accord:*` row that names no accord is refused by
+            // `check_accord_root_binding` first, and this witness would then be
+            // measuring a neighbouring gate rather than CC 3.4.1.
+            if attn.starts_with("accord:") {
+                a.attestation_envelope["accord_root"] = serde_json::json!("rp-accord-root");
+            }
             crate::federation::tier_ingest::test_support::reseal(&mut a);
             a
         };
@@ -21069,6 +21100,21 @@ mod tests {
         assert_eq!(backend.community_dek_epoch("e4-cmr-comm"), 1);
     }
 
+    /// **CIRISPersist#734 — whose key may assert a location.** Subject and
+    /// live delegate admit; a REGISTERED third party with a VALID signature is
+    /// refused; retracted / expired delegations are refused as verdicts; and
+    /// the out-of-order case is refused as retryable and then admits. On
+    /// memory.
+    #[tokio::test]
+    async fn location_proof_authority_is_subject_or_delegate_memory_734() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
+            &backend, "mem734",
+        )
+        .await
+        .expect("734 location-proof authority exercise");
+    }
+
     /// A forged `LocationProof`.
     #[tokio::test]
     async fn forged_location_proof_wrong_signer_rejected_502e4() {
@@ -21095,11 +21141,20 @@ mod tests {
             withdrawn_at: None,
             persist_row_hash: String::new(),
         };
-        // Honest: signed by e4-loc-authority — admits.
+        // Honest: signed by the SUBJECT itself — admits.
+        //
+        // v37.0.0 (CIRISPersist#734) — this used to be signed by
+        // `e4-loc-authority`, an unrelated registered third party, and it
+        // admitted. That WAS the #734 hole, asserted as correct behaviour by
+        // this very test: E4 only ever checked that the signature matched the
+        // offered authority's registered pubkeys, never that the authority had
+        // standing over the subject. The honest signer is the subject now.
+        // `e4-loc-authority` stays registered because the forgery below claims
+        // to be it, and the leg is only meaningful against a key that resolves.
         backend
             .put_location_proof(
                 crate::federation::tier_ingest::test_support::sign_location_proof(
-                    "e4-loc-authority",
+                    "e4-loc-subject",
                     proof("2026-06-01T00:00:00Z"),
                 ),
             )
@@ -21107,13 +21162,15 @@ mod tests {
             .expect("(E4) honestly-signed location proof admits");
 
         // Forged: a DIFFERENT proof (distinct asserted_at, so it isn't a
-        // no-op re-submit), signed by the attacker, claiming the honest
-        // authority.
+        // no-op re-submit), signed by the attacker, claiming the subject's
+        // own key as authority. The SIGNATURE leg must catch this — which is
+        // what keeps it distinct from the #734 authority leg, and why the
+        // claimed authority is the one that WOULD have had standing.
         let mut forged = crate::federation::tier_ingest::test_support::sign_location_proof(
             "e4-loc-attacker",
             proof("2026-06-02T00:00:00Z"),
         );
-        forged.authority_key_id = "e4-loc-authority".to_owned();
+        forged.authority_key_id = "e4-loc-subject".to_owned();
         let err = backend
             .put_location_proof(forged)
             .await

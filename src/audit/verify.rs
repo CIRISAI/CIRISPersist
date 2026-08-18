@@ -105,9 +105,37 @@ pub fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime
 /// `actor_id` (which IS the pubkey, per the v0.7.1 self-signed
 /// identity model).
 ///
-/// Uses [`HybridPolicy::Ed25519Fallback`] — audit entries are
-/// classical-only in v0.8.1 (no per-actor ML-DSA-65 key yet). The
-/// hybrid path lands alongside the federation-wide PQC rollout.
+/// # Policy: `Ed25519Fallback`, PINNED — do NOT "tighten" this to `Strict`
+///
+/// Audit entries are classical-only: [`AuditEntry`] has exactly one
+/// `signature` field and NO PQC half, and `actor_id` IS the Ed25519
+/// pubkey (the v0.7.1 self-signed identity model) — there is no
+/// per-actor ML-DSA-65 pubkey anywhere to verify against. Both PQC
+/// arguments below are therefore passed as a hardcoded `None`.
+///
+/// That makes `Strict` **unconditionally unsatisfiable here**, not
+/// merely stricter: with `ml_dsa_65_sig_b64 = None`, `verify_hybrid`
+/// reaches [`verify_ed25519_only_with_policy`] and `Strict` returns
+/// `HybridPendingRejected` for EVERY input. No audit entry — past,
+/// present, or future — could verify. `verify_chain` re-derives and
+/// re-checks signatures from STORED rows and the RFC 6962 Merkle leaves
+/// hash the same bytes, so the entire stored audit corpus would go dark
+/// on the first read.
+///
+/// **This was measured, not assumed** (v37.0.0): flipping this single
+/// argument to `Strict` reds 19 tests across `audit::sqlite` and
+/// `audit::verify` — every test that asserts a successful verify —
+/// with `hybrid-pending row rejected by Strict policy`.
+///
+/// The v37.0.0 flag day therefore deliberately SKIPPED this site while
+/// flipping the four sites where a hybrid verify is actually reachable
+/// (pipeline ingest, secrets routes, and both `put_delivery_attestation`
+/// backends). Tightening this plane is not a policy edit at all: it
+/// requires giving audit actors PQC keys and a per-row version gate, the
+/// same shape as the V1-canonicalization pin in the module doc above.
+///
+/// [`AuditEntry`]: crate::audit::types::AuditEntry
+/// [`verify_ed25519_only_with_policy`]: crate::verify::hybrid
 pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
     if entry.signature.is_empty() {
         return Err(Error::Signature("signature missing".into()));
@@ -119,9 +147,12 @@ pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
     verify_hybrid(
         &canonical,
         &entry.signature,
-        None, // no PQC half yet
+        None, // AuditEntry has no PQC half — see the PINNED policy note
         &entry.actor_id,
-        None,
+        None, // no per-actor ML-DSA-65 pubkey exists to verify against
+        // PINNED. `Strict` here rejects EVERY audit entry (both PQC args
+        // are None), taking the stored chain + Merkle corpus dark. See
+        // the doc comment above; measured at 19 reds in v37.0.0.
         HybridPolicy::Ed25519Fallback,
         None,
     )

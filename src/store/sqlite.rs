@@ -29156,6 +29156,22 @@ mod tests {
         );
     }
 
+    /// **CIRISPersist#734 — whose key may assert a location.** Subject and
+    /// live delegate admit; a REGISTERED third party with a VALID signature is
+    /// refused; retracted / expired delegations are refused as verdicts; and
+    /// the out-of-order case is refused as retryable and then admits. On
+    /// sqlite.
+    #[tokio::test]
+    async fn location_proof_authority_is_subject_or_delegate_sqlite_734() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_location_proof_authority(
+            &backend, "sq734",
+        )
+        .await
+        .expect("734 location-proof authority exercise");
+    }
+
     /// `list_signed_location_proofs_since` returns exactly the one
     /// signed-put proof, byte-identical (including the 3 V110 signature
     /// fields), and excludes an unsigned legacy row (direct INSERT — no
@@ -30402,6 +30418,14 @@ mod tests {
             "score": 1.0,
             "confidence": 0.9,
         });
+        // v37.0.0 (CIRISPersist#733) — an `accord:*` DIMENSION row names its own
+        // accord or `check_accord_root_binding` refuses it at the write door.
+        // The accord legs below assert the CC 3.4.1 emitter-class rule, so their
+        // rows must be otherwise well-formed — a row refused for the missing key
+        // would make those assertions measure a neighbouring gate.
+        if dimension.starts_with("accord:") {
+            a.attestation_envelope["accord_root"] = serde_json::json!("fixture-accord-root");
+        }
         resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a
     }
@@ -32463,11 +32487,18 @@ mod tests {
             .unwrap();
     }
 
+    /// v37.0.0 — the CEG 0.1 ladder shape `attestation:l{N}:{mechanism}` is
+    /// REMOVED, and the sqlite write door refuses it **by its own name**.
+    ///
+    /// This test was the inverse until this cut
+    /// (`..._admits_deprecated_attestation_ladder_in_transition`). Inverting it
+    /// to "something failed" would pass for the wrong reason: deleting the
+    /// admit-branch alone makes the row fall through to the version-segment
+    /// gate and refuse as `missing_version_segment`, an instruction that would
+    /// not make the row admissible. So the assertion is on the specific error
+    /// and its `kind()` token, plus the absence of a stored row.
     #[tokio::test]
-    async fn sqlite_put_attestation_admits_deprecated_attestation_ladder_in_transition() {
-        // CEG 0.1 → 0.2 transition: `attestation:l1:self_verify` is
-        // the deprecated 0.1 wire shape; persist admits it during the
-        // transition window WITHOUT requiring `:v[0-9]+`.
+    async fn sqlite_put_attestation_refuses_removed_attestation_ladder_shape() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         backend
@@ -32482,17 +32513,61 @@ mod tests {
             })
             .await
             .unwrap();
+        // Two rungs, so the witness is not pinned to `l1`.
+        for (id, dim) in [
+            ("att-removed-l1", "attestation:l1:self_verify"),
+            ("att-removed-l5", "attestation:l5:agent_integrity"),
+        ] {
+            let att = scores_attestation_with_dimension(
+                id,
+                "registry-steward",
+                "k-a",
+                "registry-steward",
+                dim,
+            );
+            let err = backend
+                .put_attestation(SignedAttestation { attestation: att })
+                .await
+                .expect_err("the removed CEG 0.1 ladder shape must not be admitted");
+            assert!(
+                matches!(
+                    err,
+                    crate::federation::Error::DeprecatedAttestationLadderForm { .. }
+                ),
+                "expected DeprecatedAttestationLadderForm for {dim}, got {err:?}"
+            );
+            assert_eq!(
+                err.kind(),
+                "federation_deprecated_attestation_ladder_form",
+                "the telemetry token for {dim}"
+            );
+            assert!(
+                backend.get_attestation(id).await.unwrap().is_none(),
+                "a refused row must not be stored ({dim})"
+            );
+        }
+
+        // The neighbouring gate still owns its own cases: a genuinely
+        // versionless dimension reports `missing_version_segment`, NOT the
+        // ladder token. Without this leg the refusal above could be swallowing
+        // the version gate's population.
         let att = scores_attestation_with_dimension(
-            "att-deprecated",
+            "att-versionless",
             "registry-steward",
             "k-a",
             "registry-steward",
-            "attestation:l1:self_verify",
+            "attestation:some_other_mechanism",
         );
-        backend
+        let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
-            .unwrap();
+            .expect_err("a versionless dimension is still refused");
+        match err {
+            crate::federation::Error::DimensionRejected { reason, .. } => {
+                assert_eq!(reason, "missing_version_segment");
+            }
+            other => panic!("expected DimensionRejected, got {other:?}"),
+        }
     }
 
     #[tokio::test]

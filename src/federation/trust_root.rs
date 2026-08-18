@@ -1565,6 +1565,294 @@ where
     .await
 }
 
+/// v37.0.0 (CIRISPersist#733) — **which accord does this row claim to belong
+/// to?** The ONE reading of that question, shared by the write door
+/// ([`check_accord_root_binding`]) and the relay verb
+/// ([`may_relay_accord_attestation`]).
+///
+/// Two definitions of "the root this row names" would be two definitions of
+/// the rule, and this substrate has a recorded defect class for exactly that
+/// (#541 preserve-set not equal to verified-set; #663, two copies of a filter
+/// chain). So the door and the verb do not merely agree — they call the same
+/// body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccordRootClaim {
+    /// The row is not on the `accord:*` family, by either namespace. The rule
+    /// does not apply and the row is none of this predicate's business.
+    NotAccord,
+    /// Exactly one root is named, and [`AccordRootSource`] says by what.
+    Named {
+        /// The accord's root ref — a constitutional family id, or a key id on
+        /// the key arm. The argument [`may_relay_accord_object`] takes.
+        root_ref: String,
+        /// Which signal supplied it.
+        source: AccordRootSource,
+    },
+    /// The row is on the `accord:*` family and names NO root: no
+    /// [`accord_root`](super::envelope::paths::ACCORD_ROOT), and not the one
+    /// dimension whose fallback rule persist itself defines.
+    Unnamed {
+        /// The namespace that put it on the family — the `attestation_type` or
+        /// the envelope `dimension`, whichever began with `accord:`.
+        namespace: String,
+    },
+    /// **THE DUAL-SIGNAL DISAGREEMENT.** A drill row carries both signals and
+    /// they name different accords. Neither is preferred; see
+    /// [`check_accord_root_binding`].
+    Disagrees {
+        /// What the signed envelope key said.
+        envelope_root: String,
+        /// What the drill-dimension rule reads off the row.
+        attested_key_id: String,
+    },
+}
+
+/// v37.0.0 (CIRISPersist#733) — which signal named the root in
+/// [`AccordRootClaim::Named`]. Reported rather than collapsed into the string
+/// because the two have different strengths, and an operator debugging a
+/// refused relay needs to know which one answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccordRootSource {
+    /// The signed [`accord_root`](super::envelope::paths::ACCORD_ROOT)
+    /// envelope key — the general answer, available on every dimension.
+    SignedEnvelopeKey,
+    /// The [`ACCORD_HEARTBEAT_DIMENSION`] fallback: persist's own fold in
+    /// [`trust_root_valid`] resolves drills as `list_attestations_for(root)`
+    /// filtered to that dimension, which makes a drill row ABOUT X a drill
+    /// about accord X *by this repo's own definition*. The fallback exists so
+    /// the one dimension that already had an answer keeps it; it is not a
+    /// general escape.
+    HeartbeatDimensionRule,
+}
+
+/// The `accord:*` family prefix, on BOTH namespaces a row can carry it.
+const ACCORD_FAMILY_PREFIX: &str = "accord:";
+
+/// v37.0.0 (CIRISPersist#733) — read the claim off a row. Pure: no directory
+/// read, no crypto, no clock, so AV-76 tier 1 at every door.
+///
+/// # What it reads, and why the columns are safe to read HERE
+///
+/// `dimension` and [`accord_root`](super::envelope::paths::ACCORD_ROOT) come
+/// out of the signed envelope. `attestation_type` and `attested_key_id` are
+/// unsigned COLUMNS — which would be worthless on the relay path, since
+/// relaying is exactly when a node handles a row it never admitted. Both
+/// callers close that hole before calling, and differently:
+///
+/// - the write door runs behind
+///   [`check_row_column_binding`](super::admission::check_row_column_binding),
+///   which every backend's `put_attestation` and the promote door call BEFORE
+///   [`check_reserved_prefix_admission`](super::admission::check_reserved_prefix_admission);
+/// - [`may_relay_accord_attestation`] calls that same gate itself, and treats
+///   its refusal as *"I cannot judge"*.
+///
+/// So in both cases the columns have been proven equal to the signed
+/// [`RowMirror`](super::envelope::RowMirror) before they are read. One gate,
+/// two callers, no second definition of "the columns are the signed ones".
+///
+/// # The heartbeat fallback is the FOLD's rule, spelled once
+///
+/// It requires `attestation_type == scores` AND
+/// `dimension == ACCORD_HEARTBEAT_DIMENSION` — both conjuncts, because that is
+/// exactly what [`trust_root_valid`]'s drill fold filters on. A rule looser
+/// here than the fold it mirrors would exempt rows the fold would never count
+/// as drills, which is a hole shaped like a courtesy.
+#[must_use]
+pub fn accord_root_claim(row: &Attestation) -> AccordRootClaim {
+    use super::envelope::paths;
+
+    let dimension = super::admission::envelope_dimension(&row.attestation_envelope);
+    let namespace = if row.attestation_type.starts_with(ACCORD_FAMILY_PREFIX) {
+        Some(row.attestation_type.clone())
+    } else {
+        dimension
+            .filter(|d| d.starts_with(ACCORD_FAMILY_PREFIX))
+            .map(ToOwned::to_owned)
+    };
+    let Some(namespace) = namespace else {
+        return AccordRootClaim::NotAccord;
+    };
+
+    // The signed key. A present-but-non-string (or blank) value is NOT a root:
+    // a foreign row is stored verbatim, so junk arrives here rather than being
+    // refused by serde, and it must fail CLOSED exactly as a missing key does.
+    let envelope_root = row
+        .attestation_envelope
+        .get(paths::ACCORD_ROOT)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    // The drill-dimension fallback — the fold's own conjunction, see above.
+    let heartbeat_root = (row.attestation_type == attestation_type::SCORES
+        && dimension == Some(ACCORD_HEARTBEAT_DIMENSION))
+    .then_some(row.attested_key_id.as_str())
+    .filter(|s| !s.trim().is_empty());
+
+    match (envelope_root, heartbeat_root) {
+        // THE DUAL-SIGNAL RULE. Both present and disagreeing is malformed; see
+        // `check_accord_root_binding` for why neither signal is preferred.
+        (Some(env), Some(row_root)) if env != row_root => AccordRootClaim::Disagrees {
+            envelope_root: env.to_owned(),
+            attested_key_id: row_root.to_owned(),
+        },
+        // Both present and AGREEING: the key answers, and the dimension rule
+        // has just been used as a CHECK rather than obsoleted by the new field.
+        (Some(env), _) => AccordRootClaim::Named {
+            root_ref: env.to_owned(),
+            source: AccordRootSource::SignedEnvelopeKey,
+        },
+        (None, Some(row_root)) => AccordRootClaim::Named {
+            root_ref: row_root.to_owned(),
+            source: AccordRootSource::HeartbeatDimensionRule,
+        },
+        (None, None) => AccordRootClaim::Unnamed { namespace },
+    }
+}
+
+/// v37.0.0 (CIRISPersist#733) — **THE WRITE DOOR: an `accord:*` row names its
+/// own accord, or it does not enter.**
+///
+/// Called from
+/// [`check_reserved_prefix_admission`](super::admission::check_reserved_prefix_admission),
+/// which every backend's `put_attestation` and
+/// [`check_promotion_admission`](super::admission::check_promotion_admission)
+/// run — so a row cannot reach federation tier, by direct write or by
+/// promotion from local, without passing here.
+///
+/// # Required, because documentation is not enforcement
+///
+/// v34's `ifac_size` was documented as required and enforced nowhere, and was
+/// admitted for weeks; CIRISEdge#727 is the same lesson from the reader's side,
+/// where a serde default met an `unwrap_or("")` and turned a documented-required
+/// field silently optional. **A field is required only if something refuses
+/// without it**, so this refuses.
+///
+/// # THE STRUCTURAL CAVEAT — this door and the consumer's flag are
+/// COMPLEMENTARY, never redundant
+///
+/// A write door protects **new** rows only. Rows already stored were minted
+/// before the key existed and cannot be retroactively required; the stored
+/// corpus is covered by the CONSUMER's enforcement flag instead (CIRISEdge's
+/// `ReplicationRuntimeConfig::accord_relay_enforced`, which derives `false`, so
+/// the transition is per-operator, reversible, and correctly ordered —
+/// enforcement goes on AFTER that operator's producers re-mint). Neither
+/// mechanism covers the other's rows.
+///
+/// **Do not "simplify" either one away on the grounds that the other exists.**
+/// Deleting this door would let a producer keep minting unjudgeable rows
+/// forever; deleting the flag would darken carriage of the existing corpus on a
+/// flag day. #733 settled that there is no widened or time-boxed fallback for
+/// pre-existing rows, because a time-boxed fallback is not a transition — it is
+/// a scheduled reopening of the permissive failure #731 closed, expiring on the
+/// calendar's schedule rather than on the operator's.
+///
+/// # The one exemption, and the CHECK it turns into
+///
+/// [`ACCORD_HEARTBEAT_DIMENSION`] keeps its standing rule as the documented
+/// fallback (see [`AccordRootSource::HeartbeatDimensionRule`]). But a drill row
+/// that carries BOTH signals and disagrees is **refused**, not resolved:
+///
+/// - preferring the key would let an emitter relabel a heartbeat's accord, and
+///   the dimension rule that used to pin it would no longer pin anything;
+/// - preferring the column would make the new field decorative on the one
+///   dimension where a rule already exists — inviting exactly the drift the
+///   field was added to remove.
+///
+/// The problem is not which meaning to pick; it is that ONE ARTIFACT ASSERTS
+/// TWO, which is the same shape as the pointer-polysemy ruling that minted
+/// [`CONSENT_SUPERSEDES`](super::envelope::paths::CONSENT_SUPERSEDES). It costs
+/// one comparison, and it turns the heartbeat rule into a CHECK rather than
+/// something the new field quietly obsoletes.
+pub fn check_accord_root_binding(row: &Attestation) -> Result<(), Error> {
+    match accord_root_claim(row) {
+        AccordRootClaim::NotAccord | AccordRootClaim::Named { .. } => Ok(()),
+        AccordRootClaim::Unnamed { namespace } => Err(Error::AccordRootUnnamed {
+            attestation_id: row.attestation_id.clone(),
+            namespace,
+            key: super::envelope::paths::ACCORD_ROOT,
+        }),
+        AccordRootClaim::Disagrees {
+            envelope_root,
+            attested_key_id,
+        } => Err(Error::AccordRootDisagrees {
+            attestation_id: row.attestation_id.clone(),
+            envelope_root,
+            attested_key_id,
+            dimension: ACCORD_HEARTBEAT_DIMENSION,
+            key: super::envelope::paths::ACCORD_ROOT,
+        }),
+    }
+}
+
+/// v37.0.0 (CIRISPersist#733) — **may this node relay THIS `accord:*`
+/// attestation?** The row names its own root and its own signer, so neither is
+/// a caller's to nominate.
+///
+/// The attestation analogue of [`may_relay_accord_participation`], and the
+/// plane CIRISEdge's relay gate actually serves: participations travel the
+/// `AccordQuorumEvidence` cursor, while `accord:*` ATTESTATIONS travel the
+/// Summary/Diff/Fetch flow the gate sits on.
+///
+/// # Both operands come from signature-covered bytes
+///
+/// [`check_row_column_binding`](super::admission::check_row_column_binding) is
+/// the FIRST thing this does, and its refusal is *"I cannot judge"*. That is
+/// not belt-and-braces: `attesting_key_id` and `attested_key_id` are unsigned
+/// columns, and fixing #731 in CIRISEdge uncovered a second defect of exactly
+/// this class from reading the unsigned `attesting_key_id` as the signer —
+/// #731 was *"an attacker picks the root"*, that one was *"an attacker picks
+/// the signer"*. Running the binding gate first proves the columns equal the
+/// signed [`RowMirror`](super::envelope::RowMirror) for this row, after which
+/// reading them is reading signed bytes.
+///
+/// # The verdict
+///
+/// The root comes from [`accord_root_claim`] — the signed
+/// [`accord_root`](super::envelope::paths::ACCORD_ROOT) key, falling back to
+/// the drill-dimension rule — and the two legs are then
+/// [`may_relay_accord_object`]'s, reused rather than re-derived here.
+///
+/// Everything else yields `roster_resolvable: false` and refuses:
+///
+/// | case | why it is *"I cannot judge"* and not *"not seated"* |
+/// |---|---|
+/// | the mirror is absent or diverges | the row never passed a persist door, so its columns assert nothing |
+/// | not on the `accord:*` family | it names no accord and is not this predicate's to judge |
+/// | [`AccordRootClaim::Unnamed`] | a pre-#733 row, or an unadopted producer's — the durable narrowing #733 accepted |
+/// | [`AccordRootClaim::Disagrees`] | one artifact asserting two roots, refused for the reason the write door refuses it |
+///
+/// The `Disagrees` arm is reachable HERE and is not dead code behind the write
+/// door: a relaying node handles rows it never admitted, which is the entire
+/// premise of the plane.
+pub async fn may_relay_accord_attestation<F>(
+    directory: &F,
+    self_key_id: &str,
+    attestation: &Attestation,
+) -> Result<RelayVerdict, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    const UNJUDGEABLE: RelayVerdict = RelayVerdict {
+        roster_resolvable: false,
+        signer_seated: false,
+        edge_exists: false,
+    };
+
+    if super::admission::check_row_column_binding(attestation).is_err() {
+        return Ok(UNJUDGEABLE);
+    }
+    let AccordRootClaim::Named { root_ref, .. } = accord_root_claim(attestation) else {
+        return Ok(UNJUDGEABLE);
+    };
+    may_relay_accord_object(
+        directory,
+        self_key_id,
+        &attestation.attesting_key_id,
+        &root_ref,
+    )
+    .await
+}
+
 /// v36.2.0 (CIRISPersist#713) — the typed verdict of
 /// [`may_relay_accord_object`]. A bool would collapse three distinct
 /// operator-facing situations into one word; each field below is a different
@@ -2073,5 +2361,246 @@ where
             "recovery declaration must carry BOTH \"{CHARTER_RECOVERS_FIELD}\" and \
              \"{CHARTER_SUCCESSOR_KEYS_FIELD}\", or neither"
         )),
+    }
+}
+
+#[cfg(test)]
+mod accord_root_tests {
+    use super::*;
+
+    /// A minimal row. Every field is a hand-written literal — nothing here is
+    /// derived from the code under test.
+    fn row(
+        attestation_type: &str,
+        attested_key_id: &str,
+        envelope: serde_json::Value,
+    ) -> Attestation {
+        Attestation {
+            attestation_id: "art-1".into(),
+            attesting_key_id: "signer-1".into(),
+            attested_key_id: attested_key_id.into(),
+            attestation_type: attestation_type.into(),
+            weight: Some(1.0),
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "signer-1".into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// A row off the `accord:*` family is none of this rule's business, on
+    /// EITHER namespace. Without this the door would refuse the whole corpus.
+    #[test]
+    fn a_non_accord_row_is_not_this_rules_business() {
+        let r = row(
+            "scores",
+            "subject-1",
+            serde_json::json!({"dimension": "trace:complete:v1", "score": 0.9}),
+        );
+        assert_eq!(accord_root_claim(&r), AccordRootClaim::NotAccord);
+        assert!(check_accord_root_binding(&r).is_ok());
+    }
+
+    /// REQUIRED. A non-drill `accord:*` DIMENSION row that names no accord is
+    /// refused, and the refusal names the namespace that put it on the family.
+    #[test]
+    fn a_non_drill_accord_row_without_the_key_is_refused() {
+        let r = row(
+            "scores",
+            "scored-agent-1",
+            serde_json::json!({"dimension": "accord:human_dignity:v1", "score": 1.0}),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Unnamed {
+                namespace: "accord:human_dignity:v1".to_owned()
+            }
+        );
+        let err = check_accord_root_binding(&r).unwrap_err();
+        assert_eq!(err.kind(), "federation_accord_root_unnamed");
+        assert!(
+            err.to_string().contains("accord_root"),
+            "the refusal must name the key to stamp: {err}"
+        );
+    }
+
+    /// The same rule on the OTHER namespace: `accord:*` as an
+    /// `attestation_type`. `accord:invoke:notify:*` puts the SELF-ATTESTING
+    /// HOLDER in `attested_key_id`, which is exactly why the column cannot
+    /// answer and the key is required here too.
+    #[test]
+    fn a_type_namespace_accord_row_without_the_key_is_refused() {
+        let r = row(
+            "accord:invoke:notify:halt",
+            "holder-1",
+            serde_json::json!({"dimension": "identity_binding:v1"}),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Unnamed {
+                namespace: "accord:invoke:notify:halt".to_owned()
+            }
+        );
+        assert_eq!(
+            check_accord_root_binding(&r).unwrap_err().kind(),
+            "federation_accord_root_unnamed"
+        );
+    }
+
+    /// …and it admits once the key is there, resolving to what the key says.
+    #[test]
+    fn the_signed_key_names_the_root_on_any_dimension() {
+        let r = row(
+            "scores",
+            "scored-agent-1",
+            serde_json::json!({
+                "dimension": "accord:human_dignity:v1",
+                "accord_root": "humanity-accord",
+            }),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Named {
+                root_ref: "humanity-accord".to_owned(),
+                source: AccordRootSource::SignedEnvelopeKey,
+            }
+        );
+        assert!(check_accord_root_binding(&r).is_ok());
+    }
+
+    /// THE FALLBACK. A drill row about X is a drill about accord X by persist's
+    /// own fold, so it admits with no key and resolves to `attested_key_id`.
+    #[test]
+    fn a_drill_row_without_the_key_admits_via_the_heartbeat_rule() {
+        let r = row(
+            "scores",
+            "humanity-accord",
+            serde_json::json!({"dimension": "accord:lifecycle:v1", "score": 1.0}),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Named {
+                root_ref: "humanity-accord".to_owned(),
+                source: AccordRootSource::HeartbeatDimensionRule,
+            }
+        );
+        assert!(check_accord_root_binding(&r).is_ok());
+    }
+
+    /// The fallback is the FOLD's rule, both conjuncts. A non-`scores` row on
+    /// the drill dimension is not a drill by `trust_root_valid`'s filter, so it
+    /// gets no exemption — a looser door here would be a hole shaped like a
+    /// courtesy.
+    #[test]
+    fn the_fallback_does_not_reach_a_non_scores_row_on_the_drill_dimension() {
+        let r = row(
+            "withdraws",
+            "humanity-accord",
+            serde_json::json!({"dimension": "accord:lifecycle:v1"}),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Unnamed {
+                namespace: "accord:lifecycle:v1".to_owned()
+            }
+        );
+        assert_eq!(
+            check_accord_root_binding(&r).unwrap_err().kind(),
+            "federation_accord_root_unnamed"
+        );
+    }
+
+    /// THE DUAL-SIGNAL RULE — both signals present and DISAGREEING is refused,
+    /// and the refusal reports BOTH roots so an operator can see which producer
+    /// to fix.
+    #[test]
+    fn a_drill_naming_two_accords_is_refused() {
+        let r = row(
+            "scores",
+            "humanity-accord",
+            serde_json::json!({
+                "dimension": "accord:lifecycle:v1",
+                "accord_root": "other-accord",
+            }),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Disagrees {
+                envelope_root: "other-accord".to_owned(),
+                attested_key_id: "humanity-accord".to_owned(),
+            }
+        );
+        let err = check_accord_root_binding(&r).unwrap_err();
+        assert_eq!(err.kind(), "federation_accord_root_disagrees");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("other-accord") && msg.contains("humanity-accord"),
+            "the refusal must name BOTH roots it refuses to choose between: {msg}"
+        );
+    }
+
+    /// …and both signals present and AGREEING admits. Without this leg the
+    /// refusal above could be firing merely on the key's PRESENCE on a drill
+    /// row, which would make the new field unusable on the one dimension that
+    /// already had an answer.
+    #[test]
+    fn a_drill_whose_two_signals_agree_admits() {
+        let r = row(
+            "scores",
+            "humanity-accord",
+            serde_json::json!({
+                "dimension": "accord:lifecycle:v1",
+                "accord_root": "humanity-accord",
+            }),
+        );
+        assert_eq!(
+            accord_root_claim(&r),
+            AccordRootClaim::Named {
+                root_ref: "humanity-accord".to_owned(),
+                source: AccordRootSource::SignedEnvelopeKey,
+            }
+        );
+        assert!(check_accord_root_binding(&r).is_ok());
+    }
+
+    /// A FOREIGN row is stored verbatim, so junk reaches the resolver rather
+    /// than being refused by serde. Every non-string and blank shape must fail
+    /// CLOSED, exactly as a missing key does — an `accord_root` of `42` or `""`
+    /// is not a root.
+    #[test]
+    fn a_malformed_key_fails_closed_like_a_missing_one() {
+        for junk in [
+            serde_json::json!(42),
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(serde_json::Value::Null),
+            serde_json::json!(["humanity-accord"]),
+        ] {
+            let r = row(
+                "scores",
+                "scored-agent-1",
+                serde_json::json!({
+                    "dimension": "accord:human_dignity:v1",
+                    "accord_root": junk,
+                }),
+            );
+            assert_eq!(
+                check_accord_root_binding(&r).unwrap_err().kind(),
+                "federation_accord_root_unnamed",
+                "a malformed accord_root ({junk}) must fail CLOSED"
+            );
+        }
     }
 }

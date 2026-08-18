@@ -241,8 +241,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     PersistFamilyRule {
         prefix: "attestation:",
         rule: "the canonical wire shape is `attestation:{mechanism}`; the CEG 0.1 ladder form \
-               `attestation:l{N}:{mechanism}` is DEPRECATED and admits only while the transition \
-               policy says DualAccept",
+               `attestation:l{N}:{mechanism}` was deprecated by CEG 0.2 §13.1 and REMOVED at \
+               v37.0.0 — it is recognised only in order to be refused BY NAME \
+               (`federation_deprecated_attestation_ladder_form`), never admitted, and no \
+               per-deployment policy re-admits it",
         enforced_at: &[
             "federation::admission::is_deprecated_attestation_ladder_prefix",
             "federation::admission::DimensionAdmissionPolicy::check",
@@ -664,8 +666,9 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
             .into_iter()
             .map(str::to_owned),
         )
-        // `attestation:l{N}:` is a SHAPE rule over the `attestation:` family;
-        // record it at family granularity, which is the granularity the
+        // `attestation:l{N}:` is a SHAPE rule over the `attestation:` family —
+        // as of v37.0.0 a REFUSE rule rather than the admit-window it was.
+        // Record it at family granularity, which is the granularity the
         // registry and the classifier both speak.
         .chain(std::iter::once(
             registry::family_stem(admission::ATTESTATION_LADDER_DEPRECATED_PREFIX).to_owned(),

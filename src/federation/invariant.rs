@@ -294,6 +294,20 @@ mod tests {
     }
 
     fn fix_attestation(id: &str, attn_type: &str, attesting: &str, attested: &str) -> Attestation {
+        // v37.0.0 (CIRISPersist#733) — an `accord:*` row names its own accord or
+        // the write door refuses it. This fixture exists to test the EMITTER-CLASS
+        // rule, so the row must be otherwise well-formed: without the key, every
+        // accord leg here would refuse for the wrong reason and the emitter-class
+        // assertion would be measuring a neighbouring gate.
+        let mut envelope = serde_json::json!({
+            "id": id,
+            "dimension": "identity_binding:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        if attn_type.starts_with("accord:") {
+            envelope["accord_root"] = serde_json::json!("wia-accord-root");
+        }
         Attestation {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
@@ -302,12 +316,7 @@ mod tests {
             weight: Some(1.0),
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": id,
-                "dimension": "identity_binding:v1",
-                "score": 1.0,
-                "confidence": 0.9,
-            }),
+            attestation_envelope: envelope,
             original_content_hash: "abc123".into(),
             scrub_signature_classical: "c2ln".into(),
             scrub_signature_pqc: None,

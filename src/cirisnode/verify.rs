@@ -39,13 +39,39 @@
 //!
 //! # Policy
 //!
-//! [`HybridPolicy::Ed25519Fallback`] for v0.7.1: classical-only
-//! envelopes verify against Ed25519. Hybrid envelopes (Ed25519 +
-//! ML-DSA-65) also accepted via the upstream
-//! [`verify_hybrid`](crate::verify::hybrid::verify_hybrid) impl.
-//! Tightening to [`HybridPolicy::Strict`] is a CIRISNodeCore-track
-//! decision deferred to a later release once the contributor-key
-//! ML-DSA-65 rollout completes federation-side.
+//! [`HybridPolicy::Ed25519Fallback`], **PINNED** — classical-only
+//! envelopes verify against Ed25519.
+//!
+//! ## Correction (v37.0.0): hybrid envelopes are NOT accepted here
+//!
+//! This doc previously claimed "Hybrid envelopes (Ed25519 + ML-DSA-65)
+//! also accepted via the upstream `verify_hybrid` impl". That has been
+//! false since it was written. [`verify_envelope_signed`] passes
+//! `ml_dsa_65_pubkey_b64` as an unconditional `None`, and `verify_hybrid`
+//! pairs sig+pubkey both-or-neither: an envelope carrying
+//! `signature.ml_dsa_65 = Some(..)` hits `PqcFieldsMustBeBoth` and is
+//! REFUSED. Only the classical-only shape verifies. There is no
+//! per-contributor ML-DSA-65 pubkey directory on the cirisnode track for
+//! it to check against.
+//!
+//! ## Why v37.0.0's flag day skipped this site
+//!
+//! Because `ml_dsa_65_pubkey_b64` is always `None`, `Strict` is
+//! **unconditionally unsatisfiable** here rather than merely stricter:
+//! PQC-present → `PqcFieldsMustBeBoth`, PQC-absent → `Strict` →
+//! `HybridPendingRejected`. Every envelope refused, both branches. This
+//! was measured, not assumed — flipping it reds
+//! `verify_round_trip_accepts_legitimate_sig` (the module's only
+//! accepts-a-good-signature witness) with `hybrid-pending row rejected by
+//! Strict policy`.
+//!
+//! So tightening this plane is not a policy edit. It needs a
+//! per-contributor PQC pubkey source plumbed into
+//! [`verify_envelope_signed`] FIRST; only then does `Strict` become a
+//! gate rather than an outage. Contrast the delivery-attestation path in
+//! `super::sqlite` / `super::postgres`, which resolves BOTH pubkeys from
+//! `federation_keys` via `verify_hybrid_via_directory` and therefore DID
+//! flip to `Strict` in v37.0.0.
 
 use serde::Serialize;
 
@@ -95,13 +121,18 @@ pub fn verify_envelope_signed<T: Serialize>(
         &sig.ed25519,
         sig.ml_dsa_65.as_deref(),
         contributor_pubkey_b64,
-        // v0.7.1: no per-contributor ML-DSA-65 pubkey directory yet.
-        // Hybrid envelopes are accepted only when the caller passes
-        // BOTH signature AND pubkey — i.e., self-contained hybrid
-        // verification. For the cirisnode track, contributor identity
-        // is single-key (Ed25519); hybrid lands in a later release
-        // alongside per-contributor PQC key registration.
+        // No per-contributor ML-DSA-65 pubkey directory on the cirisnode
+        // track — contributor identity is single-key (Ed25519). Passing
+        // `None` unconditionally means an envelope that DOES carry
+        // `signature.ml_dsa_65` is refused as `PqcFieldsMustBeBoth`,
+        // NOT hybrid-verified (the module doc used to claim otherwise;
+        // corrected in v37.0.0).
         None,
+        // PINNED. With the pubkey above always `None`, `Strict` refuses
+        // EVERY envelope on both branches — it is an outage, not a
+        // tightening. v37.0.0's flag day skipped this site for that
+        // reason; see the module doc. A real tightening needs a
+        // per-contributor PQC pubkey source plumbed in first.
         HybridPolicy::Ed25519Fallback,
         None,
     )

@@ -3330,14 +3330,22 @@ pub mod test_support {
     /// - **D** a root this node holds no family for → `roster_resolvable:
     ///   false`, refuse. *"I cannot judge"* is distinct from *"not seated"*,
     ///   and both refuse — but an operator must be able to tell them apart.
+    ///
+    /// v36.3.0 (CIRISPersist#731) adds **E**, the object's root beating a
+    /// caller's nomination; v37.0.0 (CIRISPersist#733) adds **F** (the
+    /// ATTESTATION plane — the row names its own accord) and **G** (the write
+    /// door that makes it required). Each F/G leg builds its trap and asserts
+    /// the trap is REACHABLE before disproving it, because a leg whose
+    /// permissive alternative already refused proves nothing.
     pub async fn exercise_accord_relay_eligibility(
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::trust_root::{
-            active_roster_of, may_relay_accord_object, may_relay_accord_participation,
+            active_roster_of, may_relay_accord_attestation, may_relay_accord_object,
+            may_relay_accord_participation, ACCORD_HEARTBEAT_DIMENSION,
         };
-        use crate::federation::types::identity_type;
+        use crate::federation::types::{attestation_type, identity_type};
 
         let accord = format!("{tag}-relay-accord");
         let relayer = format!("{tag}-relay-node");
@@ -3454,6 +3462,303 @@ pub mod test_support {
             "({tag}) E: the OBJECT's root decides judgeability, not the caller's"
         );
         assert!(!unjudgeable.may_relay(), "({tag}) E: fail closed");
+
+        // ── (F) v37.0.0 (#733) — THE ATTESTATION PLANE ──────────────────
+        //
+        // The plane edge's relay gate actually serves. An `accord:*` row did
+        // not name its own accord and `attested_key_id` cannot be made to (it
+        // holds the scored agent, the self-attesting holder, or the accord,
+        // depending on dimension), so the root now rides the SIGNED envelope
+        // under `accord_root`, with the drill dimension's standing rule as the
+        // one documented fallback.
+        let accord_scores_dimension = "accord:human_dignity:v1";
+        let drill_envelope = |id: &str, root: Option<&str>| {
+            let mut env = json!({
+                "id": id,
+                "dimension": ACCORD_HEARTBEAT_DIMENSION,
+                "score": 1.0,
+                "confidence": 0.9,
+            });
+            if let Some(r) = root {
+                env["accord_root"] = json!(r);
+            }
+            env
+        };
+
+        // (F1) THE SIGNED KEY DECIDES, not `attested_key_id`.
+        //
+        // The trap: a NON-drill row whose `attested_key_id` names the second
+        // accord — which this node trusts and whose roster seats the signer —
+        // while its signed envelope names a root this node holds no family for.
+        // A resolver that reached for the column on a non-drill dimension would
+        // answer `may_relay() == true`, which is #731's confidently-wrong
+        // permissive answer wearing the attestation plane's clothes.
+        assert!(
+            may_relay_accord_object(directory, &relayer, &holders[0], &other_accord)
+                .await?
+                .may_relay(),
+            "({tag}) F1: the trap must be reachable — if the column's root already \
+             refused, this leg would prove nothing"
+        );
+        let f1_id = uuid::Uuid::new_v4().to_string();
+        let mislabelled = signed_trust_attestation(
+            &f1_id,
+            &holders[0],
+            &other_accord,
+            attestation_type::SCORES,
+            json!({
+                "id": f1_id,
+                "dimension": accord_scores_dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+                "accord_root": unknown,
+            }),
+        );
+        let f1 = may_relay_accord_attestation(directory, &relayer, &mislabelled).await?;
+        assert!(
+            !f1.roster_resolvable && !f1.may_relay(),
+            "({tag}) F1: the SIGNED `accord_root` decides, never `attested_key_id` \
+             (got {f1:?})"
+        );
+
+        // (F2) THE CARRIAGE #733 BUYS: a non-drill `accord:*` row that names
+        // its accord relays. Before this cut the resolver had no answer for any
+        // dimension but the drill, so an enforcing node carried none of these.
+        let f2_id = uuid::Uuid::new_v4().to_string();
+        let scored = signed_trust_attestation(
+            &f2_id,
+            &holders[0],
+            &stranger,
+            attestation_type::SCORES,
+            json!({
+                "id": f2_id,
+                "dimension": accord_scores_dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+                "accord_root": accord,
+            }),
+        );
+        assert!(
+            may_relay_accord_attestation(directory, &relayer, &scored)
+                .await?
+                .may_relay(),
+            "({tag}) F2: a non-drill accord row naming its own accord, signed by a \
+             seated holder, RELAYS"
+        );
+
+        // (F3) The drill rule remains the documented fallback: no key, and the
+        // row still carries.
+        let f3_id = uuid::Uuid::new_v4().to_string();
+        let drill = signed_trust_attestation(
+            &f3_id,
+            &holders[0],
+            &accord,
+            attestation_type::SCORES,
+            drill_envelope(&f3_id, None),
+        );
+        assert!(
+            may_relay_accord_attestation(directory, &relayer, &drill)
+                .await?
+                .may_relay(),
+            "({tag}) F3: an `accord:lifecycle:v1` row about X is a drill about accord \
+             X by persist's OWN fold — the fallback still carries it"
+        );
+
+        // (F4) THE DUAL-SIGNAL RULE. A drill carrying BOTH signals, disagreeing.
+        //
+        // Both named roots are trusted here and both rosters seat the signer,
+        // so preferring EITHER signal silently would answer `may_relay() ==
+        // true`. Both preferences are asserted reachable, so the refusal below
+        // can only come from the disagreement itself.
+        assert!(
+            may_relay_accord_object(directory, &relayer, &holders[0], &accord)
+                .await?
+                .may_relay(),
+            "({tag}) F4: preferring the COLUMN's root would have admitted"
+        );
+        assert!(
+            may_relay_accord_object(directory, &relayer, &holders[0], &other_accord)
+                .await?
+                .may_relay(),
+            "({tag}) F4: preferring the KEY's root would have admitted"
+        );
+        let f4_id = uuid::Uuid::new_v4().to_string();
+        let two_roots = signed_trust_attestation(
+            &f4_id,
+            &holders[0],
+            &accord,
+            attestation_type::SCORES,
+            drill_envelope(&f4_id, Some(&other_accord)),
+        );
+        let f4 = may_relay_accord_attestation(directory, &relayer, &two_roots).await?;
+        assert!(
+            !f4.roster_resolvable && !f4.may_relay(),
+            "({tag}) F4: ONE ARTIFACT ASSERTING TWO roots is refused, not resolved \
+             toward whichever signal a reader prefers (got {f4:?})"
+        );
+
+        // (F5) …and AGREEMENT admits, or F4's refusal could be firing for any
+        // other reason the fixture happens to carry.
+        let f5_id = uuid::Uuid::new_v4().to_string();
+        let agreeing = signed_trust_attestation(
+            &f5_id,
+            &holders[0],
+            &accord,
+            attestation_type::SCORES,
+            drill_envelope(&f5_id, Some(&accord)),
+        );
+        assert!(
+            may_relay_accord_attestation(directory, &relayer, &agreeing)
+                .await?
+                .may_relay(),
+            "({tag}) F5: the two signals AGREEING admits — the drill rule became a \
+             CHECK, not something the new field obsoletes"
+        );
+
+        // (F6) AN ATTACKER DOES NOT PICK THE SIGNER either. `attesting_key_id`
+        // is an unsigned column; relaying is exactly when a node handles a row
+        // it never admitted, so the verb runs `check_row_column_binding` first
+        // and reads the signer only once it is proven equal to the signed
+        // mirror. #731 was "an attacker picks the root"; this is its sibling.
+        let f6_id = uuid::Uuid::new_v4().to_string();
+        let unseated_signer = signed_trust_attestation(
+            &f6_id,
+            &stranger,
+            &accord,
+            attestation_type::SCORES,
+            drill_envelope(&f6_id, Some(&accord)),
+        );
+        let f6_base = may_relay_accord_attestation(directory, &relayer, &unseated_signer).await?;
+        assert!(
+            f6_base.roster_resolvable && !f6_base.signer_seated && !f6_base.may_relay(),
+            "({tag}) F6: baseline — the stranger's own row is JUDGEABLE and refused \
+             for the right reason (got {f6_base:?})"
+        );
+        let mut relabelled = unseated_signer.clone();
+        relabelled.attesting_key_id = holders[0].clone();
+        let f6 = may_relay_accord_attestation(directory, &relayer, &relabelled).await?;
+        assert!(
+            !f6.roster_resolvable && !f6.may_relay(),
+            "({tag}) F6: relabelling the UNSIGNED `attesting_key_id` to a seated \
+             holder must not buy carriage — the mirror binds the signer (got {f6:?})"
+        );
+
+        // ── (G) v37.0.0 (#733) — THE WRITE DOOR ─────────────────────────
+        //
+        // `check_accord_root_binding` runs inside
+        // `check_reserved_prefix_admission`, which every backend's
+        // `put_attestation` and the promote door call — so these legs exercise
+        // the real door on memory, sqlite AND postgres, not the pure function.
+        //
+        // The door protects NEW rows only; the stored corpus is covered by the
+        // CONSUMER's enforcement flag. Complementary, never redundant.
+        let la = format!("{tag}-relay-la");
+        register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
+        let subject = format!("{tag}-relay-subject");
+        register_typed_key(directory, &subject, identity_type::NODE).await?;
+
+        // (G1) REQUIRED: a non-drill `accord:*` row that names no accord is
+        // refused, and no row leaks through.
+        let g1_id = uuid::Uuid::new_v4().to_string();
+        let g1 = signed_trust_attestation(
+            &g1_id,
+            &la,
+            &subject,
+            attestation_type::SCORES,
+            json!({
+                "id": g1_id,
+                "dimension": accord_scores_dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+        );
+        let err = directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: g1 })
+            .await
+            .expect_err("({tag}) G1: an accord:* row naming no accord must be REFUSED");
+        assert_eq!(
+            err.kind(),
+            "federation_accord_root_unnamed",
+            "({tag}) G1: {err}"
+        );
+        assert!(
+            directory.list_attestations_for(&subject).await?.is_empty(),
+            "({tag}) G1: the refused row must not have landed"
+        );
+
+        // (G2) …and the SAME row carrying the key admits, so G1's refusal is
+        // about the key and about nothing else in the fixture.
+        let g2_id = uuid::Uuid::new_v4().to_string();
+        let g2 = signed_trust_attestation(
+            &g2_id,
+            &la,
+            &subject,
+            attestation_type::SCORES,
+            json!({
+                "id": g2_id,
+                "dimension": accord_scores_dimension,
+                "score": 1.0,
+                "confidence": 0.9,
+                "accord_root": accord,
+            }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: g2 })
+            .await?;
+        assert_eq!(
+            directory.list_attestations_for(&subject).await?.len(),
+            1,
+            "({tag}) G2: the same row NAMING its accord admits"
+        );
+
+        // (G3) The drill fallback admits with no key at all.
+        let g3_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &g3_id,
+                    &la,
+                    &accord,
+                    attestation_type::SCORES,
+                    drill_envelope(&g3_id, None),
+                ),
+            })
+            .await?;
+
+        // (G4) THE DUAL-SIGNAL REFUSAL at the door: a drill naming two accords.
+        let g4_id = uuid::Uuid::new_v4().to_string();
+        let err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &g4_id,
+                    &la,
+                    &accord,
+                    attestation_type::SCORES,
+                    drill_envelope(&g4_id, Some(&other_accord)),
+                ),
+            })
+            .await
+            .expect_err("({tag}) G4: a drill naming TWO accords must be REFUSED");
+        assert_eq!(
+            err.kind(),
+            "federation_accord_root_disagrees",
+            "({tag}) G4: {err}"
+        );
+
+        // (G5) …and an AGREEING drill admits, so G4 is not firing for some
+        // other property of the fixture.
+        let g5_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &g5_id,
+                    &la,
+                    &accord,
+                    attestation_type::SCORES,
+                    drill_envelope(&g5_id, Some(&accord)),
+                ),
+            })
+            .await?;
 
         Ok(())
     }

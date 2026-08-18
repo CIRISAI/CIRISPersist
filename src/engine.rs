@@ -2884,7 +2884,7 @@ impl Engine {
         roles: Vec<String>,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::FederationDirectory;
-        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use crate::verify::canonical::ceg_produce_canonicalize;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -2962,15 +2962,40 @@ impl Engine {
         )
         .map_err(crate::federation::Error::InvalidArgument)?;
 
-        // Canonicalize the registration envelope with the production
-        // Python-dumps canonicalizer (the rule the manual/FFI workflow
-        // signs over), SHA-256 it, and classically self-sign with the
-        // composed signer.
-        let canonical = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&registration_envelope)
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("register_self canonicalize: {e}"))
-            })?;
+        // Canonicalize the registration envelope **through the CEG produce
+        // gate**, SHA-256 it, and self-sign with the composed signer.
+        //
+        // v37.0.0 — THE FOURTH INSTANCE of the #714 / #716 / #735
+        // canonicalization-parity class, and the one that mints a node's own
+        // bootstrap identity. From the v4.15.0 JCS produce flip to v36.x this
+        // hand-built `PythonJsonDumpsCanonicalizer` for BOTH halves of the row
+        // — the signing preimage and `original_content_hash` — while
+        // `register::verify_key_registration` (the gate every PEER runs on the
+        // `Insert` branch of `apply_replicated_key_record`) rebuilds both with
+        // `ceg_produce_canonicalize`, and `put_public_key` stores the envelope
+        // in its `canonical_at_rest` (JCS) form. The two rules agree
+        // byte-for-byte on the structured-ASCII shape
+        // `bind_subject_into_envelope` stamps, which is why it survived; a
+        // caller-supplied envelope carrying one non-ASCII character or one
+        // non-ES float token (`1e-05`) diverges, and then:
+        //
+        //   * the STORED envelope is JCS while both signatures and the
+        //     content hash are over V1 — the row is self-inconsistent at rest,
+        //     `sha256sum(registration_envelope) != original_content_hash`;
+        //   * every peer refuses it (`registration original_content_hash
+        //     mismatch`), so the node's own bootstrap row is unreplicatable;
+        //   * and it is UNREPAIRABLE. This path writes `pqc_completed_at =
+        //     Some(now)` whenever the engine has a PQC identity, so the row is
+        //     invisible to `list_hybrid_pending_keys` (`WHERE pqc_completed_at
+        //     IS NULL`) and `attach_key_pqc_signature` refuses it as "already
+        //     PQC-complete". There is no re-mint path and no detection path.
+        //
+        // Routed through the gate, the row `put_public_key` stores and the
+        // bytes it was signed over are the same byte sequence by construction.
+        // Witnessed by `register_self_canonicalizer_parity`.
+        let canonical = ceg_produce_canonicalize(&registration_envelope).map_err(|e| {
+            crate::federation::Error::Backend(format!("register_self canonicalize: {e}"))
+        })?;
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
 
         // Microsecond truncation (Postgres TIMESTAMPTZ precision) — inlined
@@ -18399,6 +18424,270 @@ mod tests {
         assert_eq!(
             identity_type::parse_set("user,wise_authority"),
             vec!["user", "wise_authority"]
+        );
+    }
+}
+
+// ─── the #714 / #716 / #735 canonicalization-parity class, instance FOUR ────
+
+/// v37.0.0 — **the node's own bootstrap identity must be signed over the
+/// bytes the mesh rebuilds, and stored as the bytes it was signed over.**
+///
+/// This is the FOURTH instance of the class whose first three were
+/// CIRISPersist#714 (`canonicalize_envelope_for_signing`, fixed v35.0.0 in
+/// `060b8e9`), #716 (`canonicalize_for_edge_signing`, flipping in v37.0.0)
+/// and #735 (the PyO3 cold-path PQC signer + `canonicalize_envelope_value`).
+/// Every instance was found while fixing the previous one, so this witness is
+/// written to fail for the whole class rather than for one address.
+///
+/// # Why an ASCII test proves nothing here
+///
+/// `PythonJsonDumpsCanonicalizer` and `ceg_produce_canonicalize` (RFC 8785
+/// JCS at the current produce epoch) agree **byte-for-byte** on the
+/// structured-ASCII shape
+/// [`bind_subject_into_envelope`](crate::federation::admission::bind_subject_into_envelope)
+/// stamps — a `key_id`, an `identity_type`, two base64 pubkeys. That is
+/// exactly why the defect survived the v4.15.0 produce flip with a green
+/// suite. The `registration_envelope` is **caller-supplied**
+/// ([`Engine::register_self_federation_key`]'s parameter, reachable from
+/// Python as `registration_envelope_json`), so the divergent half is whatever
+/// the host puts in it. Every assertion below therefore runs on a fixture
+/// pinned to DIVERGE by [`the_bootstrap_envelope_actually_diverges`], and that
+/// pin is what keeps the rest of this module from rotting into a report.
+///
+/// # Why the defect was unrepairable rather than merely wrong
+///
+/// [`Engine::register_self_federation_key`] sets `pqc_completed_at =
+/// Some(now)` on any PQC-carrying engine, so a bad row is invisible to the
+/// backfill sweep (`list_hybrid_pending_keys`, `WHERE pqc_completed_at IS
+/// NULL`) and refused by `attach_key_pqc_signature` as already PQC-complete.
+/// No re-mint path, no detection path — which is why this is witnessed at the
+/// ROW level (register, read back, run the peer's gate), not only at the byte
+/// level.
+#[cfg(all(test, feature = "sqlite"))]
+mod register_self_canonicalizer_parity {
+    use crate::verify::canonical::{ceg_produce_canonicalize, Canonicalizer};
+    use crate::verify::PythonJsonDumpsCanonicalizer;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    /// The caller-supplied half of a bootstrap `registration_envelope`, in the
+    /// two shapes the two rules disagree on: raw UTF-8 vs `\uXXXX` escapes,
+    /// and wire float tokens vs ECMAScript number serialization.
+    ///
+    /// Not synthetic. A genesis ceremony stamps operator-facing metadata into
+    /// this envelope — a node label, an operator name, a locale — and nothing
+    /// on any write path enforces ASCII.
+    fn caller_envelope() -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(
+            r#"{
+                "node_label": "北京 節點",
+                "operator": "Renée Dupré",
+                "purpose": "⚠️ mesh genesis — bootstrap identity",
+                "ceremony_drift_seconds": 1e-05,
+                "ceremony_cost_usd": 0.0031992000000000006
+            }"#,
+        )
+        .expect("bootstrap envelope fixture parses")
+    }
+
+    /// Reproduce the envelope the production path canonicalizes: the caller's
+    /// object with the #659 subject binding stamped in, through THE SAME
+    /// shared projection [`Engine::register_self_federation_key`] calls.
+    /// Spelled out rather than read back from the row, because the stored row
+    /// is in canonical-at-rest form and the point of
+    /// [`register_self_preimage_is_the_produce_gate_not_v1`] is to compare the
+    /// two PRE-canonicalization candidates.
+    fn bound_envelope(row: &crate::federation::KeyRecord) -> serde_json::Value {
+        let mut env = caller_envelope();
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut env,
+            &row.key_id,
+            &row.identity_type,
+            &row.pubkey_ed25519_base64,
+            row.pubkey_ml_dsa_65_base64.as_deref(),
+        )
+        .expect("subject binding");
+        env
+    }
+
+    /// Register the node's own bootstrap identity over the divergent envelope
+    /// and hand back the engine plus the row AS STORED.
+    async fn register_and_read_back() -> (crate::Engine, crate::federation::KeyRecord) {
+        let signer =
+            crate::federation::tier_ingest::test_support::local_signer("register-self-parity");
+        let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let key_id = engine
+            .register_self_federation_key("primitive", "ref", None, caller_envelope(), Vec::new())
+            .await
+            .expect("register self over a non-ASCII bootstrap envelope");
+        let dir = engine.federation_directory();
+        let row = crate::federation::FederationDirectory::lookup_public_key(&*dir, &key_id)
+            .await
+            .expect("lookup")
+            .expect("the bootstrap row is present");
+        (engine, row)
+    }
+
+    /// **The anti-vacuity pin.** Every other test here asserts PARITY between
+    /// two rules; on an all-ASCII envelope those assertions pass against the
+    /// *unfixed* code and prove nothing (feedback: a check that cannot fail is
+    /// a report). This asserts the fixture actually exercises the V1/V2
+    /// divergence — on the caller's half AND on the fully bound envelope the
+    /// production path signs — so trimming the fixture to ASCII reds HERE
+    /// instead of silently disarming the module.
+    #[tokio::test]
+    async fn the_bootstrap_envelope_actually_diverges() {
+        let caller = caller_envelope();
+        assert_ne!(
+            PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&caller)
+                .expect("v1"),
+            ceg_produce_canonicalize(&caller).expect("jcs"),
+            "the caller-supplied fixture must exercise the V1/V2 divergence"
+        );
+        let (_engine, row) = register_and_read_back().await;
+        let bound = bound_envelope(&row);
+        assert_ne!(
+            PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&bound)
+                .expect("v1"),
+            ceg_produce_canonicalize(&bound).expect("jcs"),
+            "and must still diverge AFTER the subject binding is stamped in — the \
+             binding is pure ASCII, so it cannot be what carries the divergence"
+        );
+    }
+
+    /// **The row a node mints for itself must pass the gate every PEER runs on
+    /// it.**
+    ///
+    /// A fresh `key_id` arriving at a peer through
+    /// `apply_replicated_key_record` takes the `Insert` branch and meets
+    /// [`verify_key_registration`](crate::federation::register::verify_key_registration),
+    /// which rebuilds BOTH the `original_content_hash` cross-check and the
+    /// hybrid-Strict preimage with `ceg_produce_canonicalize`. This path runs
+    /// no such gate locally (deliberately — that gate is for PEER
+    /// registration), so nothing between the mint and the wire could have
+    /// caught a divergence.
+    ///
+    /// Against the unfixed code this FAILS with `registration
+    /// original_content_hash mismatch`: the node registers fine locally and is
+    /// refused by the entire mesh — fail-closed, but on the wrong side of the
+    /// wire and invisible until peering.
+    #[tokio::test]
+    async fn register_self_row_verifies_through_the_peer_gate() {
+        let (engine, row) = register_and_read_back().await;
+        let dir = engine.federation_directory();
+        let outcome = crate::federation::register::verify_key_registration(&*dir, &row)
+            .await
+            .expect(
+                "a node's own bootstrap row MUST verify through the gate every peer runs \
+                 on it — the #714/#716/#735 class, instance 4",
+            );
+        assert_eq!(
+            outcome,
+            crate::verify::hybrid::VerifyOutcome::HybridVerified,
+            "hybrid-Strict must reach a full hybrid verify, not a fallback"
+        );
+    }
+
+    /// **The mint side really is the gate, byte-for-byte.**
+    ///
+    /// The gate round-trip above proves the row verifies; this proves WHY,
+    /// which is the property that survives a refactor. The preimage
+    /// [`Engine::register_self_federation_key`] signs is
+    /// `ceg_produce_canonicalize(bound_envelope)`, not
+    /// `PythonJsonDumpsCanonicalizer(bound_envelope)` — asserted by signing
+    /// both candidates with the engine's own signer and checking WHICH ONE the
+    /// stored `scrub_signature_classical` reproduces (Ed25519 is
+    /// deterministic). A right-outcome-through-the-wrong-mechanism pass is
+    /// therefore not available to it.
+    ///
+    /// The same discrimination is applied to `original_content_hash`, because
+    /// this path committed BOTH halves over the hand-built rule and a fix that
+    /// moved only the signature would leave the row refused at the cross-check.
+    #[tokio::test]
+    async fn register_self_preimage_is_the_produce_gate_not_v1() {
+        let (engine, row) = register_and_read_back().await;
+        let bound = bound_envelope(&row);
+
+        let jcs = ceg_produce_canonicalize(&bound).expect("jcs");
+        let v1 = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&bound)
+            .expect("v1");
+        assert_ne!(jcs, v1, "the fixture must diverge or this test cannot fail");
+
+        let jcs_sig = B64.encode(
+            engine
+                .sign_hybrid(&jcs)
+                .await
+                .expect("sign the jcs candidate")
+                .classical
+                .signature,
+        );
+        let v1_sig = B64.encode(
+            engine
+                .sign_hybrid(&v1)
+                .await
+                .expect("sign the v1 candidate")
+                .classical
+                .signature,
+        );
+        assert_eq!(
+            row.scrub_signature_classical, jcs_sig,
+            "register_self_federation_key must self-sign ceg_produce_canonicalize(envelope)"
+        );
+        assert_ne!(
+            row.scrub_signature_classical, v1_sig,
+            "and must NOT self-sign PythonJsonDumpsCanonicalizer(envelope) — the defect"
+        );
+
+        assert_eq!(
+            row.original_content_hash,
+            hex::encode(Sha256::digest(&jcs)),
+            "original_content_hash must digest the produce gate's bytes"
+        );
+        assert_ne!(
+            row.original_content_hash,
+            hex::encode(Sha256::digest(&v1)),
+            "and must NOT digest the V1 bytes — a fix that moved only the signature \
+             would still leave the row refused at the cross-check"
+        );
+    }
+
+    /// **The stored envelope and the bytes it was signed over must be the same
+    /// byte sequence.**
+    ///
+    /// `put_public_key` runs
+    /// [`canonicalize_in_place`](crate::federation::canonical_at_rest::canonicalize_in_place)
+    /// first, so the column holds the JCS form. While the signature and the
+    /// hash were minted over V1, the row was **self-inconsistent at rest**:
+    /// `sha256sum(registration_envelope) != original_content_hash` — precisely
+    /// the hand-verifiability property `canonical_at_rest` exists to provide,
+    /// and precisely what an auditor of a genesis ceremony checks first.
+    #[tokio::test]
+    async fn stored_bootstrap_envelope_agrees_with_the_bytes_it_was_signed_over() {
+        let (_engine, row) = register_and_read_back().await;
+        let stored = serde_json::to_vec(&row.registration_envelope).expect("stored serialize");
+        assert_eq!(
+            hex::encode(Sha256::digest(&stored)),
+            row.original_content_hash,
+            "the stored registration_envelope column must sha256sum to \
+             original_content_hash — a bootstrap row that fails this is unverifiable by \
+             hand and refused by every peer"
+        );
+        crate::federation::canonical_at_rest::check_canonical_at_rest(&row.registration_envelope)
+            .expect("the stored envelope is canonical at rest");
+        assert_ne!(
+            stored,
+            PythonJsonDumpsCanonicalizer
+                .canonicalize_value(&row.registration_envelope)
+                .expect("v1"),
+            "and the stored form must be distinguishable from the V1 rule on this \
+             fixture, or the assertion above is vacuous"
         );
     }
 }

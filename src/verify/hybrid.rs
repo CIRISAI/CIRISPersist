@@ -68,6 +68,30 @@ pub enum HybridPolicy {
     },
     /// Always accept Ed25519-only verification. Development /
     /// sovereign-mode posture; not for federation production.
+    ///
+    /// # v37.0.0 — the production callers are gone, with two exceptions
+    ///
+    /// The v37.0.0 break flipped every production path that could
+    /// meaningfully verify hybrid to [`Strict`](Self::Strict): the edge
+    /// pipeline ingest route, the secrets routes, and
+    /// `put_delivery_attestation` on BOTH the sqlite and postgres
+    /// cirisnode backends.
+    ///
+    /// Two callers deliberately remain, and they are PINS rather than
+    /// leftovers — in both, the PQC **pubkey** argument is a hardcoded
+    /// `None`, so `Strict` would refuse every input rather than tighten
+    /// anything:
+    ///
+    /// * [`crate::audit::verify::verify_entry_signature`] — `AuditEntry`
+    ///   has no PQC field and `actor_id` IS the Ed25519 pubkey. Measured:
+    ///   flipping it reds 19 tests and takes the stored audit chain +
+    ///   Merkle corpus dark.
+    /// * `crate::cirisnode::verify::verify_envelope_signed` — no
+    ///   per-contributor ML-DSA-65 pubkey directory exists on that track.
+    ///
+    /// Both carry the reasoning at their definition. Tightening either is
+    /// a plumbing change (give the plane a PQC pubkey source) first and a
+    /// policy change second — never a one-line edit here.
     Ed25519Fallback,
 }
 
