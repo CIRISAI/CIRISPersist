@@ -1523,6 +1523,48 @@ where
     })
 }
 
+/// v36.3.0 (CIRISPersist#731) — **may this node relay THIS accord
+/// participation?** The object names its own root and its own signer, so
+/// neither is a caller's to nominate.
+///
+/// [`may_relay_accord_object`] takes `root_ref` as a parameter, which is the
+/// same shape v36.2.0 removed one level down: before that release the roster
+/// was caller-supplied, and the fix was to let persist answer *"what is root
+/// R's roster"*. It did not answer **"which R?"**
+///
+/// It has to, because a caller that nominates the wrong root gets a
+/// **confidently wrong answer in the permissive direction**: pass a root this
+/// node happens to trust, whose roster happens to seat the signer, and the
+/// verdict is `may_relay() == true` for an object belonging to a DIFFERENT
+/// accord. The predicate cannot detect that, because it was never given the
+/// object.
+///
+/// [`AccordParticipation`] carries `family_key_id` (*"the accord family this
+/// decision is for"*) and `member_id` — both inside the signed bytes the
+/// threshold signature covers. So this reads the root and the signer from the
+/// object and ignores anything the caller might have preferred.
+///
+/// Fail-closed exactly as [`may_relay_accord_object`]: an object naming a root
+/// this node holds no family for yields `roster_resolvable: false` — *"I
+/// cannot judge"*, which is distinct from *"the signer is not seated"* and
+/// refuses either way.
+pub async fn may_relay_accord_participation<F>(
+    directory: &F,
+    self_key_id: &str,
+    participation: &ciris_verify_core::accord_live_quorum::AccordParticipation,
+) -> Result<RelayVerdict, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    may_relay_accord_object(
+        directory,
+        self_key_id,
+        &participation.member_id,
+        &participation.family_key_id,
+    )
+    .await
+}
+
 /// v36.2.0 (CIRISPersist#713) — the typed verdict of
 /// [`may_relay_accord_object`]. A bool would collapse three distinct
 /// operator-facing situations into one word; each field below is a different
