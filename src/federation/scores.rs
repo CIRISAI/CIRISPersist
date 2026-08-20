@@ -352,7 +352,15 @@ pub fn compose_verdict(
     ComposedVerdict {
         band,
         contributor_count,
-        witness_diversity,
+        // #723 — the float is folded and classified above; only the BAND
+        // crosses the wire (scores.rs's own line-4 contract).
+        witness_diversity: witness_diversity.map(|min| {
+            if min > 0.0 {
+                crate::read::DiversityStanding::Established
+            } else {
+                crate::read::DiversityStanding::NotEstablished
+            }
+        }),
         open_contradictions,
         age_of_head,
         policy_applied: policy_id.to_string(),
@@ -578,6 +586,41 @@ mod tests {
     /// ATTESTED diversity certificate unlocks it; and a NEGATIVE certificate
     /// (bars examined and NOT met) sinks it again via the boolean-via-score Min
     /// fold — so the gate cannot be opened by simply adding more rows.
+    /// v38.0.0 (CIRISPersist#723) — **the default verdict projection
+    /// carries no float.** scores.rs's own contract (line 4 of the module
+    /// doc): "the float never crosses the wire". `witness_diversity` was the
+    /// one default-on field breaking it — a raw attested magnitude nobody
+    /// downstream reads (the classifier consumes only its sign). Scoped to
+    /// `trace: false` deliberately: the trace is the DECLARED open-trace leg
+    /// (opt-in, floats legitimate) and asserting over it would be red for
+    /// the wrong reason.
+    #[test]
+    fn the_default_verdict_projection_carries_no_float_723() {
+        fn any_float(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Number(n) => n.as_f64().is_some() && !n.is_i64() && !n.is_u64(),
+                serde_json::Value::Array(a) => a.iter().any(any_float),
+                serde_json::Value::Object(o) => o.values().any(any_float),
+                _ => false,
+            }
+        }
+        let rows = vec![
+            scores_row("s0", "a0", 1.0, 1.0, 10),
+            // A magnitude nobody needs: 0.734 must NOT survive to the wire.
+            diversity_row("d1", "auditor", 0.734, 20),
+        ];
+        let v = compose_verdict(rows, vec![], "cc-4.4.2-signed-mean", false, t(100));
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(
+            !any_float(&j),
+            "scores.rs states the float never crosses the wire; got {j}"
+        );
+        // Anti-vacuity: the diversity row actually reached the fold and the
+        // band crossed as a STRING — deleting the row would pass the float
+        // scan trivially, so the presence is pinned too.
+        assert_eq!(j["witness_diversity"], "established");
+    }
+
     #[test]
     fn sybil_brigade_cannot_reach_well_established_without_attested_diversity_543() {
         // Five sock keys, unanimous and emphatic — the brigade.
@@ -614,7 +657,10 @@ mod tests {
             false,
             t(100),
         );
-        assert_eq!(v.witness_diversity, Some(1.0));
+        assert_eq!(
+            v.witness_diversity,
+            Some(crate::read::DiversityStanding::Established)
+        );
         assert_eq!(
             v.band,
             ConfidenceBand::WellEstablished,
@@ -629,7 +675,7 @@ mod tests {
         let v = compose_verdict(contested, vec![], "cc-4.4.2-signed-mean", false, t(100));
         assert_eq!(
             v.witness_diversity,
-            Some(-1.0),
+            Some(crate::read::DiversityStanding::NotEstablished),
             "Min fold — any negative trumps positive, fail-secure"
         );
         assert_ne!(
