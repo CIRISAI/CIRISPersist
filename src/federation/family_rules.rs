@@ -476,6 +476,17 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "cohort:",
+        "a SCOPE-ADDRESS-TABLE id prefix, not a dimension family — a different \
+         namespace entirely. v38.0.0 (CIRISPersist#746): edge's ContentScope::Group \
+         mints `cohort:{community_id}` / `av-stream:{hex}` table ids, and \
+         `resolve_projection_recipients` REFUSES them by name \
+         (RecipientBasis::GroupIdNotFederationKeyed) when one is handed to its \
+         federation-key parameter. The literal exists to refuse the wrong id space, \
+         never to route on it — routing on a sniffed prefix would be the axis \
+         fusion the parameter removes. No dimension ever carries this stem.",
+    ),
+    (
         "slashing:",
         "a RETENTION rule, not an admission rule — and the distinction is the whole \
          entry. v31.0.0 (CIRISPersist#650) names this stem in \

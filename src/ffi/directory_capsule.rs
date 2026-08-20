@@ -243,7 +243,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 3;
+pub const DIRECTORY_ABI_VERSION: u32 = 4;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -4132,22 +4132,29 @@ mod tests {
     /// `participations_admitted` (which an older consumer deserializes as a
     /// required field) with the `effect` enum; see the
     /// [`DIRECTORY_ABI_VERSION`] doc.
+    /// v38.0.0 (CIRISPersist#721) — bumped 3 → 4: `RemovePeerRecord` gained
+    /// `reason` + `acting_under_delegation_id` (serde-default, so an old
+    /// consumer's payload still DECODES and then refuses with the typed
+    /// reason-required error — but the contract the consumer was built
+    /// against changed, and the load-time gate must say so).
     ///
     /// The pin is deliberately two assertions on two different things: the
     /// constant consumers compile against, and the value this build actually
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_3() {
+    fn abi_version_pinned_at_4() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 3,
-            "an existing DirectoryOp variant's shape changed in v36.0.0; the \
-             load-time gate is the only signal a consumer gets BEFORE it \
-             dispatches an op, so a shape break must move this or the gate \
-             certifies a contract the consumer was not built for"
+            DIRECTORY_ABI_VERSION, 4,
+            "an existing DirectoryOp variant's shape changed in v38.0.0 \
+             (RemovePeerRecord gained reason + acting_under_delegation_id, \
+             CIRISPersist#721); the load-time gate is the only signal a \
+             consumer gets BEFORE it dispatches an op, so a shape break must \
+             move this or the gate certifies a contract the consumer was not \
+             built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 3,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 4,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -4216,7 +4223,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "147a19b5650ce9f3ed45ec0c8f729f62b60b9af8302d5ed931c2fd99acd1cbdb",
+            "8298961b160172d8a865a1bd2a836a08869c5ddf3f86e800f4bdc773795dcefe",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
