@@ -35867,7 +35867,6 @@ mod tests {
         async fn trust_score(
             &self,
             key_id: &str,
-            _recursion_depth: u8,
         ) -> Result<f64, crate::federation::TrustScoringError> {
             match self.0.get(key_id) {
                 Some(s) => Ok(*s),
@@ -35886,7 +35885,6 @@ mod tests {
         crate::federation::AdmissionGate::new(
             std::sync::Arc::new(PgFixedTrustScoring(map)),
             threshold,
-            0,
         )
     }
 

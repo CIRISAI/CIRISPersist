@@ -8052,7 +8052,6 @@ mod tests {
         let gate = crate::federation::AdmissionGate::new(
             std::sync::Arc::new(crate::federation::MemoryTrustScoring::new()),
             0.5,
-            0,
         );
         engine.set_admission_gate(Some(gate));
         let sq = engine.sqlite_backend().expect("sqlite");

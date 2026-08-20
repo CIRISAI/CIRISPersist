@@ -34,7 +34,6 @@
 //! single-source-of-truth about who holds what — eviction is
 //! announced, not silent.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 pub mod admission;
@@ -86,19 +85,6 @@ pub struct ReplicationConfig {
     /// passes).
     pub trust_threshold: f64,
 
-    /// Default BFS depth for trust-score resolution through
-    /// `delegates_to` edges. `0` is strict (only the key's own
-    /// attestations count). Per-tier overrides in
-    /// [`Self::tier_recursion_depths`] fall back to this value. Default
-    /// `0`.
-    pub trust_recursion_depth: u8,
-
-    /// Per-`identity_type` recursion-depth overrides. A key whose
-    /// `identity_type` matches a key in this map gets its trust score
-    /// resolved to the override depth instead of
-    /// [`Self::trust_recursion_depth`]. Default empty.
-    pub tier_recursion_depths: HashMap<String, u8>,
-
     /// Hard upper bound on local `federation_blobs` storage in bytes.
     /// Above `budget × steady_state_utilization` the sweeper evicts.
     /// Default `u64::MAX` (sweeper inactive).
@@ -125,8 +111,6 @@ impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
             trust_threshold: 0.0,
-            trust_recursion_depth: 0,
-            tier_recursion_depths: HashMap::new(),
             storage_budget_bytes: u64::MAX,
             steady_state_utilization: 0.92,
             eviction_decay_half_life_days: 30.0,
@@ -136,16 +120,6 @@ impl Default for ReplicationConfig {
 }
 
 impl ReplicationConfig {
-    /// Resolve the recursion depth for a key with `identity_type`.
-    /// Returns the per-tier override when present, otherwise
-    /// [`Self::trust_recursion_depth`].
-    pub fn recursion_depth_for(&self, identity_type: &str) -> u8 {
-        self.tier_recursion_depths
-            .get(identity_type)
-            .copied()
-            .unwrap_or(self.trust_recursion_depth)
-    }
-
     /// True iff the sweeper has a finite budget. `u64::MAX` (the
     /// default) is the "sweeper inactive" sentinel.
     pub fn sweeper_active(&self) -> bool {
@@ -207,8 +181,6 @@ mod tests {
     fn default_config_defaults_match_plan() {
         let c = ReplicationConfig::default();
         assert_eq!(c.trust_threshold, 0.0);
-        assert_eq!(c.trust_recursion_depth, 0);
-        assert!(c.tier_recursion_depths.is_empty());
         assert_eq!(c.storage_budget_bytes, u64::MAX);
         assert_eq!(c.steady_state_utilization, 0.92);
         assert_eq!(c.eviction_decay_half_life_days, 30.0);
@@ -217,16 +189,46 @@ mod tests {
         assert_eq!(c.watermark_bytes(), u64::MAX);
     }
 
+    /// v38.0.0 (CIRISPersist#748) — the decorative depth knob is RETIRED,
+    /// and this keeps it retired: no production source under src/ may
+    /// mention it again without stating a pinned attenuation rule first.
+    /// (Needle split so this witness cannot match itself.)
     #[test]
-    fn tier_override_resolves() {
-        let mut c = ReplicationConfig {
-            trust_recursion_depth: 1,
-            ..Default::default()
-        };
-        c.tier_recursion_depths.insert("accord_holder".into(), 3);
-        assert_eq!(c.recursion_depth_for("accord_holder"), 3);
-        // Falls back to default for unknown tier.
-        assert_eq!(c.recursion_depth_for("agent"), 1);
+    fn the_retired_depth_knob_stays_retired() {
+        let needle = format!("recursion{}", "_depth");
+        let mut offenders = Vec::new();
+        for entry in walkdir_src() {
+            let text = std::fs::read_to_string(&entry).unwrap_or_default();
+            for (i, line) in text.lines().enumerate() {
+                let l = line.trim_start();
+                if l.starts_with("//") || l.starts_with("///") || l.starts_with("//!") {
+                    continue;
+                }
+                if line.contains(&needle) && !entry.ends_with("replication/mod.rs") {
+                    offenders.push(format!("{entry}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "recursion depth reappeared without a pinned attenuation rule (#748): {offenders:?}"
+        );
+    }
+
+    fn walkdir_src() -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+        out
     }
 
     #[test]

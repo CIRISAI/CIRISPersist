@@ -420,7 +420,6 @@ mod tests {
     fn apply_to_preserves_trust_knobs() {
         let base = ReplicationConfig {
             trust_threshold: 0.7,
-            trust_recursion_depth: 2,
             ..Default::default()
         };
         let cfg = CacheMode::Cache {
@@ -428,7 +427,6 @@ mod tests {
         }
         .apply_to(base);
         assert_eq!(cfg.trust_threshold, 0.7);
-        assert_eq!(cfg.trust_recursion_depth, 2);
     }
 
     #[test]
