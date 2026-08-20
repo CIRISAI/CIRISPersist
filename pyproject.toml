@@ -164,6 +164,7 @@ features = [
     "cirislens_sequence",
     "cirislens_occurrence",
     "cirislens_legacy_migration",
+    "ledgers",
     "secrets",
     "cirisnode",
     "extract",

@@ -322,6 +322,20 @@ Engine	keyring_path	ontological
 Engine	keyring_signer_capsule	structural	
 Engine	keyring_storage_kind	ontological	
 Engine	latest_stream_sth	testimonial	log_commitment
+Engine	ledger_advance_head	deontic	
+Engine	ledger_conservation_fold	nomological	
+Engine	ledger_derive_id	nomological	
+Engine	ledger_detect_double_head	nomological	
+Engine	ledger_get	empirical	
+Engine	ledger_latest_checkpoint	empirical	
+Engine	ledger_list_entry_ranges	empirical	
+Engine	ledger_list_fork_evidence	testimonial	equivocation_evidence
+Engine	ledger_list_for_owner	empirical	
+Engine	ledger_put_checkpoint	testimonial	log_commitment
+Engine	ledger_put_entry_range	empirical	
+Engine	ledger_record_fork_evidence	testimonial	equivocation_evidence
+Engine	ledger_register	deontic	
+Engine	ledger_verify_chain	nomological	
 Engine	list_accord_participations_json	empirical	
 Engine	list_accord_proposals_by_anchor_json	empirical	
 Engine	list_aggregations_at_level	axiotic	

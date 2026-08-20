@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=180 deontic=125 structural=40 testimonial=37 procedural=36 ontological=34 epistemic=29 axiotic=19 nomological=12 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=185 deontic=127 structural=40 testimonial=40 procedural=36 ontological=34 epistemic=29 axiotic=19 nomological=16 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -47,311 +47,318 @@ axiotic	descriptive	19	Engine	list_scores
 axiotic	descriptive	19	Engine	put_aggregated_tier	
 axiotic	descriptive	19	Engine	resolve_scores	
 axiotic	descriptive	19	Engine	verify_coord_compare_for_merge	
-deontic	binding	125	Engine	accord_nonce_issued	
-deontic	binding	125	Engine	add_community_member	
-deontic	binding	125	Engine	add_moderator	
-deontic	binding	125	Engine	add_peer_record_json	
-deontic	binding	125	Engine	adopt_scrub_upgrade	
-deontic	binding	125	Engine	apply_replicated_accord_evidence	
-deontic	binding	125	Engine	apply_replicated_attestation	
-deontic	binding	125	Engine	apply_replicated_key_record	
-deontic	binding	125	Engine	attestation_promote	
-deontic	binding	125	Engine	bake_assembled_genesis	
-deontic	binding	125	Engine	blackhole_prune_expired_iso	
-deontic	binding	125	Engine	blackhole_record_hit	
-deontic	binding	125	Engine	blackhole_remove	
-deontic	binding	125	Engine	blackhole_upsert	
-deontic	binding	125	Engine	build_corpus_want_v1	
-deontic	binding	125	Engine	build_storage_budget_v1	
-deontic	binding	125	Engine	check_no_moderator_federate_json	
-deontic	binding	125	Engine	cirisnode_cast_vote	
-deontic	binding	125	Engine	cirisnode_process_takedown_admission_json	
-deontic	binding	125	Engine	cirisnode_put_key_grant_json	
-deontic	binding	125	Engine	cirisnode_put_moderation_event	
-deontic	binding	125	Engine	cirisnode_put_promotion_attestation	
-deontic	binding	125	Engine	cirisnode_put_reconsideration_attestation	
-deontic	binding	125	Engine	cirisnode_put_reconsideration_request	
-deontic	binding	125	Engine	cirisnode_put_slashing_attestation	
-deontic	binding	125	Engine	cirisnode_retire_key_grants_json	
-deontic	binding	125	Engine	clear_active_halt	
-deontic	binding	125	Engine	cohort_add_member	
-deontic	binding	125	Engine	cohort_build_membership_change_envelope	
-deontic	binding	125	Engine	cohort_revoke_member	
-deontic	binding	125	Engine	cohort_supersede_group	
-deontic	binding	125	Engine	cohort_supersede_group_with_quorum	
-deontic	binding	125	Engine	cohort_swap_member	
-deontic	binding	125	Engine	cohort_verify_membership_quorum	
-deontic	binding	125	Engine	corpus_want_admits	
-deontic	binding	125	Engine	deregister_federation_key	
-deontic	binding	125	Engine	emit_attestation	
-deontic	binding	125	Engine	emit_attestation_self	
-deontic	binding	125	Engine	evict_actor_json	
-deontic	binding	125	Engine	federation_grant_trust	
-deontic	binding	125	Engine	federation_revoke_trust	
-deontic	binding	125	Engine	file_moderation	
-deontic	binding	125	Engine	grant_delegation	
-deontic	binding	125	Engine	grant_trust	
-deontic	binding	125	Engine	has_accord_conferred_role	
-deontic	binding	125	Engine	install_storage_budget_v1	
-deontic	binding	125	Engine	is_load_bearing_json	
-deontic	binding	125	Engine	is_named_moderator_json	
-deontic	binding	125	Engine	is_steward_bound_json	
-deontic	binding	125	Engine	issue_accord_nonce	
-deontic	binding	125	Engine	may_release_copy_json	
-deontic	binding	125	Engine	put_accord_decision_json	
-deontic	binding	125	Engine	put_accord_participation_json	
-deontic	binding	125	Engine	put_accord_proposal_json	
-deontic	binding	125	Engine	put_attestation	
-deontic	binding	125	Engine	put_blob_signing	
-deontic	binding	125	Engine	put_community_json	
-deontic	binding	125	Engine	put_edge_detection_event	
-deontic	binding	125	Engine	put_family_json	
-deontic	binding	125	Engine	put_fountain_content	
-deontic	binding	125	Engine	put_identity_occurrence_json	
-deontic	binding	125	Engine	put_org_membership	
-deontic	binding	125	Engine	put_organization	
-deontic	binding	125	Engine	put_partner_record	
-deontic	binding	125	Engine	put_public_key	
-deontic	binding	125	Engine	put_revocation	
-deontic	binding	125	Engine	put_scope_blob	
-deontic	binding	125	Engine	reachable_under_scope	
-deontic	binding	125	Engine	reachable_under_scope_with_reasons	
-deontic	binding	125	Engine	register_federation_key	
-deontic	binding	125	Engine	register_public_key	
-deontic	binding	125	Engine	rematerialize_role_withdrawals	
-deontic	binding	125	Engine	remove_moderator	
-deontic	binding	125	Engine	remove_peer_record	
-deontic	binding	125	Engine	resolve_key_statement_standing_json	
-deontic	binding	125	Engine	resolve_mesh_config_json	
-deontic	binding	125	Engine	resolve_quarantine_json	
-deontic	binding	125	Engine	resolve_reverse_quorum_json	
-deontic	binding	125	Engine	resolve_transit_eligibility_json	
-deontic	binding	125	Engine	revoke_delegation	
-deontic	binding	125	Engine	revoke_trust_grant	
-deontic	binding	125	Engine	secrets_decapsulate	
-deontic	binding	125	Engine	secrets_decrypt	
-deontic	binding	125	Engine	secrets_forget_secret	
-deontic	binding	125	Engine	secrets_migrate_to_hardware_key	
-deontic	binding	125	Engine	secrets_process_incoming_text	
-deontic	binding	125	Engine	secrets_recall_secret	
-deontic	binding	125	Engine	secrets_reencrypt_all	
-deontic	binding	125	Engine	secrets_retrieve_secret	
-deontic	binding	125	Engine	secrets_rotate_master_key	
-deontic	binding	125	Engine	secrets_store_detected_secret	
-deontic	binding	125	Engine	secrets_store_secret	
-deontic	binding	125	Engine	secrets_update_filter_config	
-deontic	binding	125	Engine	serve_blob_to_peer_json	
-deontic	binding	125	Engine	service_token_revocation_check	
-deontic	binding	125	Engine	service_token_revocation_record	
-deontic	binding	125	Engine	set_active_halt	
-deontic	binding	125	Engine	set_consent_role	
-deontic	binding	125	Engine	set_multimedia_config_json	
-deontic	binding	125	Engine	set_retention	
-deontic	binding	125	Engine	set_storage_budget_bytes	
-deontic	binding	125	Engine	set_trust_threshold	
-deontic	binding	125	Engine	steward_bind	
-deontic	binding	125	Engine	steward_bind_incapacity	
-deontic	binding	125	Engine	storage_budget_supersedes	
-deontic	binding	125	Engine	supersede_canonical	
-deontic	binding	125	Engine	trust_root_verdict_json	
-deontic	binding	125	Engine	unwrap_dek_v2_b64	
-deontic	binding	125	Engine	update_peer_policy	
-deontic	binding	125	Engine	update_peer_trust	
-deontic	binding	125	Engine	verify_coord_check_observed_region	
-deontic	binding	125	Engine	verify_corpus_want_v1	
-deontic	binding	125	Engine	verify_hybrid	
-deontic	binding	125	Engine	verify_hybrid_via_directory	
-deontic	binding	125	Engine	verify_signed_attestation	
-deontic	binding	125	Engine	verify_signed_key_record	
-deontic	binding	125	Engine	verify_signed_revocation	
-deontic	binding	125	Engine	verify_skill_import_manifest_b64	
-deontic	binding	125	Engine	verify_storage_budget_v1	
-deontic	binding	125	Engine	wa_cert_set_active	
-deontic	binding	125	Engine	wa_cert_upsert	
-deontic	binding	125	Engine	withdraw_canonical_role	
-deontic	binding	125	Engine	wrap_dek_for_recipient_v2_b64	
-deontic	binding	125	ReconsiderDosGuard	admit_filing	
-deontic	binding	125	ReconsiderDosGuard	record_outcome	
-empirical	descriptive	180	Engine	active_community_members_json	
-empirical	descriptive	180	Engine	active_family_members_json	
-empirical	descriptive	180	Engine	attestation_insert_local	
-empirical	descriptive	180	Engine	attestation_insert_local_many	
-empirical	descriptive	180	Engine	attestation_upsert_local	
-empirical	descriptive	180	Engine	attestation_upsert_local_many	
-empirical	descriptive	180	Engine	blackhole_list_json	
-empirical	descriptive	180	Engine	ceremony_get	
-empirical	descriptive	180	Engine	ceremony_list	
-empirical	descriptive	180	Engine	ceremony_record	
-empirical	descriptive	180	Engine	ceremony_update_status	
-empirical	descriptive	180	Engine	cirisgraph_count_edges	
-empirical	descriptive	180	Engine	cirisgraph_count_nodes	
-empirical	descriptive	180	Engine	cirisgraph_count_nodes_by_type	
-empirical	descriptive	180	Engine	cirisgraph_delete_node	
-empirical	descriptive	180	Engine	cirisgraph_get_edges_for_node	
-empirical	descriptive	180	Engine	cirisgraph_get_node	
-empirical	descriptive	180	Engine	cirisgraph_query_nodes	
-empirical	descriptive	180	Engine	cirisgraph_traverse_k_hop	
-empirical	descriptive	180	Engine	cirisgraph_upsert_edge	
-empirical	descriptive	180	Engine	cirisgraph_upsert_node	
-empirical	descriptive	180	Engine	cirisnode_count_delivery_attestations	
-empirical	descriptive	180	Engine	cirisnode_get_goal_json	
-empirical	descriptive	180	Engine	cirisnode_list_contributions	
-empirical	descriptive	180	Engine	cirisnode_list_delivery_attestations	
-empirical	descriptive	180	Engine	cirisnode_list_goals_json	
-empirical	descriptive	180	Engine	cirisnode_list_key_grants_for_content_json	
-empirical	descriptive	180	Engine	cirisnode_list_key_grants_for_filtered_json	
-empirical	descriptive	180	Engine	cirisnode_list_key_grants_for_json	
-empirical	descriptive	180	Engine	cirisnode_list_key_grants_for_scope_epoch_json	
-empirical	descriptive	180	Engine	cirisnode_list_takedowns_for_filtered_json	
-empirical	descriptive	180	Engine	cirisnode_list_takedowns_for_json	
-empirical	descriptive	180	Engine	cirisnode_list_votes	
-empirical	descriptive	180	Engine	cirisnode_put_contribution	
-empirical	descriptive	180	Engine	cirisnode_put_goal_json	
-empirical	descriptive	180	Engine	cirisnode_retire_goal_json	
-empirical	descriptive	180	Engine	cohort_active_member_keys_json	
-empirical	descriptive	180	Engine	cohort_active_members_json	
-empirical	descriptive	180	Engine	cohort_group_at	
-empirical	descriptive	180	Engine	cohort_group_history	
-empirical	descriptive	180	Engine	cohort_groups_of_json	
-empirical	descriptive	180	Engine	cohort_lookup_group_json	
-empirical	descriptive	180	Engine	consent_role_json	
-empirical	descriptive	180	Engine	continuity_get_latest	
-empirical	descriptive	180	Engine	continuity_record	
-empirical	descriptive	180	Engine	continuity_record_reactivation	
-empirical	descriptive	180	Engine	correlation_get	
-empirical	descriptive	180	Engine	correlation_query	
-empirical	descriptive	180	Engine	correlation_record	
-empirical	descriptive	180	Engine	correlation_update_status	
-empirical	descriptive	180	Engine	count_identity_changes	
-empirical	descriptive	180	Engine	count_overrides	
-empirical	descriptive	180	Engine	count_traces	
-empirical	descriptive	180	Engine	deferral_get	
-empirical	descriptive	180	Engine	deferral_list_active	
-empirical	descriptive	180	Engine	deferral_record	
-empirical	descriptive	180	Engine	deferral_resolve	
-empirical	descriptive	180	Engine	delegates_to_graph	
-empirical	descriptive	180	Engine	delegations_to_json	
-empirical	descriptive	180	Engine	duty_holders_for_community_json	
-empirical	descriptive	180	Engine	duty_holders_for_content_json	
-empirical	descriptive	180	Engine	federation_directory_query	
-empirical	descriptive	180	Engine	federation_list_trusted_keys	
-empirical	descriptive	180	Engine	federation_lookup_trust	
-empirical	descriptive	180	Engine	feedback_list	
-empirical	descriptive	180	Engine	feedback_list_for_thought	
-empirical	descriptive	180	Engine	feedback_record	
-empirical	descriptive	180	Engine	fetch_trace_events_page	
-empirical	descriptive	180	Engine	get_accord_decision_json	
-empirical	descriptive	180	Engine	get_accord_proposal_json	
-empirical	descriptive	180	Engine	get_active_halt_json	
-empirical	descriptive	180	Engine	get_blob_json	
-empirical	descriptive	180	Engine	get_calibration_bundle_by_version	
-empirical	descriptive	180	Engine	get_classifications	
-empirical	descriptive	180	Engine	get_current_calibration_bundle	
-empirical	descriptive	180	Engine	get_detection_events	
-empirical	descriptive	180	Engine	get_edge_detection_events	
-empirical	descriptive	180	Engine	get_features	
-empirical	descriptive	180	Engine	get_fountain_content	
-empirical	descriptive	180	Engine	get_installed_storage_budget_json	
-empirical	descriptive	180	Engine	get_multimedia_config_json	
-empirical	descriptive	180	Engine	get_retention	
-empirical	descriptive	180	Engine	get_scope_blob	
-empirical	descriptive	180	Engine	get_trace_detail	
-empirical	descriptive	180	Engine	get_trace_summary	
-empirical	descriptive	180	Engine	get_trust_grant	
-empirical	descriptive	180	Engine	has_blob_json	
-empirical	descriptive	180	Engine	incident_correlate	
-empirical	descriptive	180	Engine	incident_list	
-empirical	descriptive	180	Engine	incident_record	
-empirical	descriptive	180	Engine	incident_transition	
-empirical	descriptive	180	Engine	list_accord_participations_json	
-empirical	descriptive	180	Engine	list_accord_proposals_by_anchor_json	
-empirical	descriptive	180	Engine	list_attestations	
-empirical	descriptive	180	Engine	list_attestations_by	
-empirical	descriptive	180	Engine	list_attestations_for	
-empirical	descriptive	180	Engine	list_attestations_since	
-empirical	descriptive	180	Engine	list_canonical_servers	
-empirical	descriptive	180	Engine	list_canonical_withdrawals	
-empirical	descriptive	180	Engine	list_communities_for_member_active_json	
-empirical	descriptive	180	Engine	list_communities_for_member_json	
-empirical	descriptive	180	Engine	list_community_membership_revocations_for_json	
-empirical	descriptive	180	Engine	list_consent_peers	
-empirical	descriptive	180	Engine	list_consent_revocation_promotion_overdue_json	
-empirical	descriptive	180	Engine	list_consent_revocation_promotion_overdue_readonly_json	
-empirical	descriptive	180	Engine	list_families_for_member_active_json	
-empirical	descriptive	180	Engine	list_families_for_member_json	
-empirical	descriptive	180	Engine	list_family_membership_revocations_for_json	
-empirical	descriptive	180	Engine	list_federation_keys	
-empirical	descriptive	180	Engine	list_held_by_json	
-empirical	descriptive	180	Engine	list_held_fountain_content	
-empirical	descriptive	180	Engine	list_holders_json	
-empirical	descriptive	180	Engine	list_llm_calls	
-empirical	descriptive	180	Engine	list_local_holders_json	
-empirical	descriptive	180	Engine	list_org_memberships_for	
-empirical	descriptive	180	Engine	list_org_memberships_since	
-empirical	descriptive	180	Engine	list_organizations_for	
-empirical	descriptive	180	Engine	list_organizations_since	
-empirical	descriptive	180	Engine	list_outbound	
-empirical	descriptive	180	Engine	list_partner_records_for	
-empirical	descriptive	180	Engine	list_partner_records_since	
-empirical	descriptive	180	Engine	list_retention	
-empirical	descriptive	180	Engine	list_revocations	
-empirical	descriptive	180	Engine	list_tasks	
-empirical	descriptive	180	Engine	list_trace_summaries	
-empirical	descriptive	180	Engine	list_trust_grants	
-empirical	descriptive	180	Engine	lookup_community_json	
-empirical	descriptive	180	Engine	lookup_family_json	
-empirical	descriptive	180	Engine	lookup_trust_grant	
-empirical	descriptive	180	Engine	moderators_of_json	
-empirical	descriptive	180	Engine	nodes_stewarded_by_json	
-empirical	descriptive	180	Engine	outbound_status	
-empirical	descriptive	180	Engine	owner_of_json	
-empirical	descriptive	180	Engine	peer_metadata_for_json	
-empirical	descriptive	180	Engine	put_blob_chunk	
-empirical	descriptive	180	Engine	put_blob_chunks_json	
-empirical	descriptive	180	Engine	put_blob_json	
-empirical	descriptive	180	Engine	put_calibration_bundle	
-empirical	descriptive	180	Engine	put_detection_event	
-empirical	descriptive	180	Engine	revocations_for	
-empirical	descriptive	180	Engine	secrets_get_access_logs	
-empirical	descriptive	180	Engine	secrets_get_filter_config	
-empirical	descriptive	180	Engine	secrets_get_service_stats	
-empirical	descriptive	180	Engine	secrets_list_stored	
-empirical	descriptive	180	Engine	service_token_revocation_list	
-empirical	descriptive	180	Engine	set_classifications	
-empirical	descriptive	180	Engine	set_features	
-empirical	descriptive	180	Engine	steward_binding_chain_json	
-empirical	descriptive	180	Engine	steward_bindings_of_json	
-empirical	descriptive	180	Engine	store_blob_local_json	
-empirical	descriptive	180	Engine	task_delete	
-empirical	descriptive	180	Engine	task_get	
-empirical	descriptive	180	Engine	task_list	
-empirical	descriptive	180	Engine	task_update_status	
-empirical	descriptive	180	Engine	task_upsert	
-empirical	descriptive	180	Engine	telemetry_list_metrics	
-empirical	descriptive	180	Engine	telemetry_record_metric	
-empirical	descriptive	180	Engine	telemetry_record_metrics_batch	
-empirical	descriptive	180	Engine	thought_delete	
-empirical	descriptive	180	Engine	thought_get	
-empirical	descriptive	180	Engine	thought_get_descendants	
-empirical	descriptive	180	Engine	thought_list	
-empirical	descriptive	180	Engine	thought_update_status	
-empirical	descriptive	180	Engine	thought_upsert	
-empirical	descriptive	180	Engine	ticket_assign	
-empirical	descriptive	180	Engine	ticket_get	
-empirical	descriptive	180	Engine	ticket_list	
-empirical	descriptive	180	Engine	ticket_update_status	
-empirical	descriptive	180	Engine	ticket_upsert	
-empirical	descriptive	180	Engine	tsdb_count_edges_by_relationship_in_window	
-empirical	descriptive	180	Engine	tsdb_get_summary	
-empirical	descriptive	180	Engine	tsdb_query_summaries	
-empirical	descriptive	180	Engine	tsdb_query_summary_nodes	
-empirical	descriptive	180	Engine	update_peer_alias	
-empirical	descriptive	180	Engine	update_peer_notes	
-empirical	descriptive	180	Engine	wa_cert_get	
-empirical	descriptive	180	Engine	wa_cert_get_by_kid	
-empirical	descriptive	180	Engine	wa_cert_get_by_oauth	
-empirical	descriptive	180	Engine	wa_cert_list_by_role	
-empirical	descriptive	180	Engine	wa_cert_update_last_login	
+deontic	binding	127	Engine	accord_nonce_issued	
+deontic	binding	127	Engine	add_community_member	
+deontic	binding	127	Engine	add_moderator	
+deontic	binding	127	Engine	add_peer_record_json	
+deontic	binding	127	Engine	adopt_scrub_upgrade	
+deontic	binding	127	Engine	apply_replicated_accord_evidence	
+deontic	binding	127	Engine	apply_replicated_attestation	
+deontic	binding	127	Engine	apply_replicated_key_record	
+deontic	binding	127	Engine	attestation_promote	
+deontic	binding	127	Engine	bake_assembled_genesis	
+deontic	binding	127	Engine	blackhole_prune_expired_iso	
+deontic	binding	127	Engine	blackhole_record_hit	
+deontic	binding	127	Engine	blackhole_remove	
+deontic	binding	127	Engine	blackhole_upsert	
+deontic	binding	127	Engine	build_corpus_want_v1	
+deontic	binding	127	Engine	build_storage_budget_v1	
+deontic	binding	127	Engine	check_no_moderator_federate_json	
+deontic	binding	127	Engine	cirisnode_cast_vote	
+deontic	binding	127	Engine	cirisnode_process_takedown_admission_json	
+deontic	binding	127	Engine	cirisnode_put_key_grant_json	
+deontic	binding	127	Engine	cirisnode_put_moderation_event	
+deontic	binding	127	Engine	cirisnode_put_promotion_attestation	
+deontic	binding	127	Engine	cirisnode_put_reconsideration_attestation	
+deontic	binding	127	Engine	cirisnode_put_reconsideration_request	
+deontic	binding	127	Engine	cirisnode_put_slashing_attestation	
+deontic	binding	127	Engine	cirisnode_retire_key_grants_json	
+deontic	binding	127	Engine	clear_active_halt	
+deontic	binding	127	Engine	cohort_add_member	
+deontic	binding	127	Engine	cohort_build_membership_change_envelope	
+deontic	binding	127	Engine	cohort_revoke_member	
+deontic	binding	127	Engine	cohort_supersede_group	
+deontic	binding	127	Engine	cohort_supersede_group_with_quorum	
+deontic	binding	127	Engine	cohort_swap_member	
+deontic	binding	127	Engine	cohort_verify_membership_quorum	
+deontic	binding	127	Engine	corpus_want_admits	
+deontic	binding	127	Engine	deregister_federation_key	
+deontic	binding	127	Engine	emit_attestation	
+deontic	binding	127	Engine	emit_attestation_self	
+deontic	binding	127	Engine	evict_actor_json	
+deontic	binding	127	Engine	federation_grant_trust	
+deontic	binding	127	Engine	federation_revoke_trust	
+deontic	binding	127	Engine	file_moderation	
+deontic	binding	127	Engine	grant_delegation	
+deontic	binding	127	Engine	grant_trust	
+deontic	binding	127	Engine	has_accord_conferred_role	
+deontic	binding	127	Engine	install_storage_budget_v1	
+deontic	binding	127	Engine	is_load_bearing_json	
+deontic	binding	127	Engine	is_named_moderator_json	
+deontic	binding	127	Engine	is_steward_bound_json	
+deontic	binding	127	Engine	issue_accord_nonce	
+deontic	binding	127	Engine	ledger_advance_head	
+deontic	binding	127	Engine	ledger_register	
+deontic	binding	127	Engine	may_release_copy_json	
+deontic	binding	127	Engine	put_accord_decision_json	
+deontic	binding	127	Engine	put_accord_participation_json	
+deontic	binding	127	Engine	put_accord_proposal_json	
+deontic	binding	127	Engine	put_attestation	
+deontic	binding	127	Engine	put_blob_signing	
+deontic	binding	127	Engine	put_community_json	
+deontic	binding	127	Engine	put_edge_detection_event	
+deontic	binding	127	Engine	put_family_json	
+deontic	binding	127	Engine	put_fountain_content	
+deontic	binding	127	Engine	put_identity_occurrence_json	
+deontic	binding	127	Engine	put_org_membership	
+deontic	binding	127	Engine	put_organization	
+deontic	binding	127	Engine	put_partner_record	
+deontic	binding	127	Engine	put_public_key	
+deontic	binding	127	Engine	put_revocation	
+deontic	binding	127	Engine	put_scope_blob	
+deontic	binding	127	Engine	reachable_under_scope	
+deontic	binding	127	Engine	reachable_under_scope_with_reasons	
+deontic	binding	127	Engine	register_federation_key	
+deontic	binding	127	Engine	register_public_key	
+deontic	binding	127	Engine	rematerialize_role_withdrawals	
+deontic	binding	127	Engine	remove_moderator	
+deontic	binding	127	Engine	remove_peer_record	
+deontic	binding	127	Engine	resolve_key_statement_standing_json	
+deontic	binding	127	Engine	resolve_mesh_config_json	
+deontic	binding	127	Engine	resolve_quarantine_json	
+deontic	binding	127	Engine	resolve_reverse_quorum_json	
+deontic	binding	127	Engine	resolve_transit_eligibility_json	
+deontic	binding	127	Engine	revoke_delegation	
+deontic	binding	127	Engine	revoke_trust_grant	
+deontic	binding	127	Engine	secrets_decapsulate	
+deontic	binding	127	Engine	secrets_decrypt	
+deontic	binding	127	Engine	secrets_forget_secret	
+deontic	binding	127	Engine	secrets_migrate_to_hardware_key	
+deontic	binding	127	Engine	secrets_process_incoming_text	
+deontic	binding	127	Engine	secrets_recall_secret	
+deontic	binding	127	Engine	secrets_reencrypt_all	
+deontic	binding	127	Engine	secrets_retrieve_secret	
+deontic	binding	127	Engine	secrets_rotate_master_key	
+deontic	binding	127	Engine	secrets_store_detected_secret	
+deontic	binding	127	Engine	secrets_store_secret	
+deontic	binding	127	Engine	secrets_update_filter_config	
+deontic	binding	127	Engine	serve_blob_to_peer_json	
+deontic	binding	127	Engine	service_token_revocation_check	
+deontic	binding	127	Engine	service_token_revocation_record	
+deontic	binding	127	Engine	set_active_halt	
+deontic	binding	127	Engine	set_consent_role	
+deontic	binding	127	Engine	set_multimedia_config_json	
+deontic	binding	127	Engine	set_retention	
+deontic	binding	127	Engine	set_storage_budget_bytes	
+deontic	binding	127	Engine	set_trust_threshold	
+deontic	binding	127	Engine	steward_bind	
+deontic	binding	127	Engine	steward_bind_incapacity	
+deontic	binding	127	Engine	storage_budget_supersedes	
+deontic	binding	127	Engine	supersede_canonical	
+deontic	binding	127	Engine	trust_root_verdict_json	
+deontic	binding	127	Engine	unwrap_dek_v2_b64	
+deontic	binding	127	Engine	update_peer_policy	
+deontic	binding	127	Engine	update_peer_trust	
+deontic	binding	127	Engine	verify_coord_check_observed_region	
+deontic	binding	127	Engine	verify_corpus_want_v1	
+deontic	binding	127	Engine	verify_hybrid	
+deontic	binding	127	Engine	verify_hybrid_via_directory	
+deontic	binding	127	Engine	verify_signed_attestation	
+deontic	binding	127	Engine	verify_signed_key_record	
+deontic	binding	127	Engine	verify_signed_revocation	
+deontic	binding	127	Engine	verify_skill_import_manifest_b64	
+deontic	binding	127	Engine	verify_storage_budget_v1	
+deontic	binding	127	Engine	wa_cert_set_active	
+deontic	binding	127	Engine	wa_cert_upsert	
+deontic	binding	127	Engine	withdraw_canonical_role	
+deontic	binding	127	Engine	wrap_dek_for_recipient_v2_b64	
+deontic	binding	127	ReconsiderDosGuard	admit_filing	
+deontic	binding	127	ReconsiderDosGuard	record_outcome	
+empirical	descriptive	185	Engine	active_community_members_json	
+empirical	descriptive	185	Engine	active_family_members_json	
+empirical	descriptive	185	Engine	attestation_insert_local	
+empirical	descriptive	185	Engine	attestation_insert_local_many	
+empirical	descriptive	185	Engine	attestation_upsert_local	
+empirical	descriptive	185	Engine	attestation_upsert_local_many	
+empirical	descriptive	185	Engine	blackhole_list_json	
+empirical	descriptive	185	Engine	ceremony_get	
+empirical	descriptive	185	Engine	ceremony_list	
+empirical	descriptive	185	Engine	ceremony_record	
+empirical	descriptive	185	Engine	ceremony_update_status	
+empirical	descriptive	185	Engine	cirisgraph_count_edges	
+empirical	descriptive	185	Engine	cirisgraph_count_nodes	
+empirical	descriptive	185	Engine	cirisgraph_count_nodes_by_type	
+empirical	descriptive	185	Engine	cirisgraph_delete_node	
+empirical	descriptive	185	Engine	cirisgraph_get_edges_for_node	
+empirical	descriptive	185	Engine	cirisgraph_get_node	
+empirical	descriptive	185	Engine	cirisgraph_query_nodes	
+empirical	descriptive	185	Engine	cirisgraph_traverse_k_hop	
+empirical	descriptive	185	Engine	cirisgraph_upsert_edge	
+empirical	descriptive	185	Engine	cirisgraph_upsert_node	
+empirical	descriptive	185	Engine	cirisnode_count_delivery_attestations	
+empirical	descriptive	185	Engine	cirisnode_get_goal_json	
+empirical	descriptive	185	Engine	cirisnode_list_contributions	
+empirical	descriptive	185	Engine	cirisnode_list_delivery_attestations	
+empirical	descriptive	185	Engine	cirisnode_list_goals_json	
+empirical	descriptive	185	Engine	cirisnode_list_key_grants_for_content_json	
+empirical	descriptive	185	Engine	cirisnode_list_key_grants_for_filtered_json	
+empirical	descriptive	185	Engine	cirisnode_list_key_grants_for_json	
+empirical	descriptive	185	Engine	cirisnode_list_key_grants_for_scope_epoch_json	
+empirical	descriptive	185	Engine	cirisnode_list_takedowns_for_filtered_json	
+empirical	descriptive	185	Engine	cirisnode_list_takedowns_for_json	
+empirical	descriptive	185	Engine	cirisnode_list_votes	
+empirical	descriptive	185	Engine	cirisnode_put_contribution	
+empirical	descriptive	185	Engine	cirisnode_put_goal_json	
+empirical	descriptive	185	Engine	cirisnode_retire_goal_json	
+empirical	descriptive	185	Engine	cohort_active_member_keys_json	
+empirical	descriptive	185	Engine	cohort_active_members_json	
+empirical	descriptive	185	Engine	cohort_group_at	
+empirical	descriptive	185	Engine	cohort_group_history	
+empirical	descriptive	185	Engine	cohort_groups_of_json	
+empirical	descriptive	185	Engine	cohort_lookup_group_json	
+empirical	descriptive	185	Engine	consent_role_json	
+empirical	descriptive	185	Engine	continuity_get_latest	
+empirical	descriptive	185	Engine	continuity_record	
+empirical	descriptive	185	Engine	continuity_record_reactivation	
+empirical	descriptive	185	Engine	correlation_get	
+empirical	descriptive	185	Engine	correlation_query	
+empirical	descriptive	185	Engine	correlation_record	
+empirical	descriptive	185	Engine	correlation_update_status	
+empirical	descriptive	185	Engine	count_identity_changes	
+empirical	descriptive	185	Engine	count_overrides	
+empirical	descriptive	185	Engine	count_traces	
+empirical	descriptive	185	Engine	deferral_get	
+empirical	descriptive	185	Engine	deferral_list_active	
+empirical	descriptive	185	Engine	deferral_record	
+empirical	descriptive	185	Engine	deferral_resolve	
+empirical	descriptive	185	Engine	delegates_to_graph	
+empirical	descriptive	185	Engine	delegations_to_json	
+empirical	descriptive	185	Engine	duty_holders_for_community_json	
+empirical	descriptive	185	Engine	duty_holders_for_content_json	
+empirical	descriptive	185	Engine	federation_directory_query	
+empirical	descriptive	185	Engine	federation_list_trusted_keys	
+empirical	descriptive	185	Engine	federation_lookup_trust	
+empirical	descriptive	185	Engine	feedback_list	
+empirical	descriptive	185	Engine	feedback_list_for_thought	
+empirical	descriptive	185	Engine	feedback_record	
+empirical	descriptive	185	Engine	fetch_trace_events_page	
+empirical	descriptive	185	Engine	get_accord_decision_json	
+empirical	descriptive	185	Engine	get_accord_proposal_json	
+empirical	descriptive	185	Engine	get_active_halt_json	
+empirical	descriptive	185	Engine	get_blob_json	
+empirical	descriptive	185	Engine	get_calibration_bundle_by_version	
+empirical	descriptive	185	Engine	get_classifications	
+empirical	descriptive	185	Engine	get_current_calibration_bundle	
+empirical	descriptive	185	Engine	get_detection_events	
+empirical	descriptive	185	Engine	get_edge_detection_events	
+empirical	descriptive	185	Engine	get_features	
+empirical	descriptive	185	Engine	get_fountain_content	
+empirical	descriptive	185	Engine	get_installed_storage_budget_json	
+empirical	descriptive	185	Engine	get_multimedia_config_json	
+empirical	descriptive	185	Engine	get_retention	
+empirical	descriptive	185	Engine	get_scope_blob	
+empirical	descriptive	185	Engine	get_trace_detail	
+empirical	descriptive	185	Engine	get_trace_summary	
+empirical	descriptive	185	Engine	get_trust_grant	
+empirical	descriptive	185	Engine	has_blob_json	
+empirical	descriptive	185	Engine	incident_correlate	
+empirical	descriptive	185	Engine	incident_list	
+empirical	descriptive	185	Engine	incident_record	
+empirical	descriptive	185	Engine	incident_transition	
+empirical	descriptive	185	Engine	ledger_get	
+empirical	descriptive	185	Engine	ledger_latest_checkpoint	
+empirical	descriptive	185	Engine	ledger_list_entry_ranges	
+empirical	descriptive	185	Engine	ledger_list_for_owner	
+empirical	descriptive	185	Engine	ledger_put_entry_range	
+empirical	descriptive	185	Engine	list_accord_participations_json	
+empirical	descriptive	185	Engine	list_accord_proposals_by_anchor_json	
+empirical	descriptive	185	Engine	list_attestations	
+empirical	descriptive	185	Engine	list_attestations_by	
+empirical	descriptive	185	Engine	list_attestations_for	
+empirical	descriptive	185	Engine	list_attestations_since	
+empirical	descriptive	185	Engine	list_canonical_servers	
+empirical	descriptive	185	Engine	list_canonical_withdrawals	
+empirical	descriptive	185	Engine	list_communities_for_member_active_json	
+empirical	descriptive	185	Engine	list_communities_for_member_json	
+empirical	descriptive	185	Engine	list_community_membership_revocations_for_json	
+empirical	descriptive	185	Engine	list_consent_peers	
+empirical	descriptive	185	Engine	list_consent_revocation_promotion_overdue_json	
+empirical	descriptive	185	Engine	list_consent_revocation_promotion_overdue_readonly_json	
+empirical	descriptive	185	Engine	list_families_for_member_active_json	
+empirical	descriptive	185	Engine	list_families_for_member_json	
+empirical	descriptive	185	Engine	list_family_membership_revocations_for_json	
+empirical	descriptive	185	Engine	list_federation_keys	
+empirical	descriptive	185	Engine	list_held_by_json	
+empirical	descriptive	185	Engine	list_held_fountain_content	
+empirical	descriptive	185	Engine	list_holders_json	
+empirical	descriptive	185	Engine	list_llm_calls	
+empirical	descriptive	185	Engine	list_local_holders_json	
+empirical	descriptive	185	Engine	list_org_memberships_for	
+empirical	descriptive	185	Engine	list_org_memberships_since	
+empirical	descriptive	185	Engine	list_organizations_for	
+empirical	descriptive	185	Engine	list_organizations_since	
+empirical	descriptive	185	Engine	list_outbound	
+empirical	descriptive	185	Engine	list_partner_records_for	
+empirical	descriptive	185	Engine	list_partner_records_since	
+empirical	descriptive	185	Engine	list_retention	
+empirical	descriptive	185	Engine	list_revocations	
+empirical	descriptive	185	Engine	list_tasks	
+empirical	descriptive	185	Engine	list_trace_summaries	
+empirical	descriptive	185	Engine	list_trust_grants	
+empirical	descriptive	185	Engine	lookup_community_json	
+empirical	descriptive	185	Engine	lookup_family_json	
+empirical	descriptive	185	Engine	lookup_trust_grant	
+empirical	descriptive	185	Engine	moderators_of_json	
+empirical	descriptive	185	Engine	nodes_stewarded_by_json	
+empirical	descriptive	185	Engine	outbound_status	
+empirical	descriptive	185	Engine	owner_of_json	
+empirical	descriptive	185	Engine	peer_metadata_for_json	
+empirical	descriptive	185	Engine	put_blob_chunk	
+empirical	descriptive	185	Engine	put_blob_chunks_json	
+empirical	descriptive	185	Engine	put_blob_json	
+empirical	descriptive	185	Engine	put_calibration_bundle	
+empirical	descriptive	185	Engine	put_detection_event	
+empirical	descriptive	185	Engine	revocations_for	
+empirical	descriptive	185	Engine	secrets_get_access_logs	
+empirical	descriptive	185	Engine	secrets_get_filter_config	
+empirical	descriptive	185	Engine	secrets_get_service_stats	
+empirical	descriptive	185	Engine	secrets_list_stored	
+empirical	descriptive	185	Engine	service_token_revocation_list	
+empirical	descriptive	185	Engine	set_classifications	
+empirical	descriptive	185	Engine	set_features	
+empirical	descriptive	185	Engine	steward_binding_chain_json	
+empirical	descriptive	185	Engine	steward_bindings_of_json	
+empirical	descriptive	185	Engine	store_blob_local_json	
+empirical	descriptive	185	Engine	task_delete	
+empirical	descriptive	185	Engine	task_get	
+empirical	descriptive	185	Engine	task_list	
+empirical	descriptive	185	Engine	task_update_status	
+empirical	descriptive	185	Engine	task_upsert	
+empirical	descriptive	185	Engine	telemetry_list_metrics	
+empirical	descriptive	185	Engine	telemetry_record_metric	
+empirical	descriptive	185	Engine	telemetry_record_metrics_batch	
+empirical	descriptive	185	Engine	thought_delete	
+empirical	descriptive	185	Engine	thought_get	
+empirical	descriptive	185	Engine	thought_get_descendants	
+empirical	descriptive	185	Engine	thought_list	
+empirical	descriptive	185	Engine	thought_update_status	
+empirical	descriptive	185	Engine	thought_upsert	
+empirical	descriptive	185	Engine	ticket_assign	
+empirical	descriptive	185	Engine	ticket_get	
+empirical	descriptive	185	Engine	ticket_list	
+empirical	descriptive	185	Engine	ticket_update_status	
+empirical	descriptive	185	Engine	ticket_upsert	
+empirical	descriptive	185	Engine	tsdb_count_edges_by_relationship_in_window	
+empirical	descriptive	185	Engine	tsdb_get_summary	
+empirical	descriptive	185	Engine	tsdb_query_summaries	
+empirical	descriptive	185	Engine	tsdb_query_summary_nodes	
+empirical	descriptive	185	Engine	update_peer_alias	
+empirical	descriptive	185	Engine	update_peer_notes	
+empirical	descriptive	185	Engine	wa_cert_get	
+empirical	descriptive	185	Engine	wa_cert_get_by_kid	
+empirical	descriptive	185	Engine	wa_cert_get_by_oauth	
+empirical	descriptive	185	Engine	wa_cert_list_by_role	
+empirical	descriptive	185	Engine	wa_cert_update_last_login	
 epistemic	descriptive	29	Engine	age_band_fine_json	
 epistemic	descriptive	29	Engine	age_band_json	
 epistemic	descriptive	29	Engine	cache_budget_bytes	
@@ -381,18 +388,22 @@ epistemic	descriptive	29	Engine	secrets_test_encryption
 epistemic	descriptive	29	Engine	temporal_drift	
 epistemic	descriptive	29	Engine	verify_trace	
 epistemic	descriptive	29	ScoringFactorStream	summary	
-nomological	descriptive	12	Engine	audit_canonicalize_for_hash	
-nomological	descriptive	12	Engine	audit_canonicalize_for_signing	
-nomological	descriptive	12	Engine	canonicalize_envelope	
-nomological	descriptive	12	Engine	canonicalize_envelope_for_signing	
-nomological	descriptive	12	Engine	cohort_scope_crypto_tier	
-nomological	descriptive	12	Engine	debug_canonicalize	
-nomological	descriptive	12	Engine	envelope_vocabulary	
-nomological	descriptive	12	Engine	is_canonical	
-nomological	descriptive	12	Engine	maintenance_tighten_vocabulary	
-nomological	descriptive	12	Engine	trace_summary_extraction	
-nomological	descriptive	12	Engine	validate_envelope_canonical_form	
-nomological	descriptive	12	Engine	verify_coord_constants_json	
+nomological	descriptive	16	Engine	audit_canonicalize_for_hash	
+nomological	descriptive	16	Engine	audit_canonicalize_for_signing	
+nomological	descriptive	16	Engine	canonicalize_envelope	
+nomological	descriptive	16	Engine	canonicalize_envelope_for_signing	
+nomological	descriptive	16	Engine	cohort_scope_crypto_tier	
+nomological	descriptive	16	Engine	debug_canonicalize	
+nomological	descriptive	16	Engine	envelope_vocabulary	
+nomological	descriptive	16	Engine	is_canonical	
+nomological	descriptive	16	Engine	ledger_conservation_fold	
+nomological	descriptive	16	Engine	ledger_derive_id	
+nomological	descriptive	16	Engine	ledger_detect_double_head	
+nomological	descriptive	16	Engine	ledger_verify_chain	
+nomological	descriptive	16	Engine	maintenance_tighten_vocabulary	
+nomological	descriptive	16	Engine	trace_summary_extraction	
+nomological	descriptive	16	Engine	validate_envelope_canonical_form	
+nomological	descriptive	16	Engine	verify_coord_constants_json	
 ontological	descriptive	34	Engine	attach_attestation_pqc_signature	
 ontological	descriptive	34	Engine	attach_key_pqc_signature	
 ontological	descriptive	34	Engine	attach_revocation_pqc_signature	
@@ -509,40 +520,43 @@ structural	binding	40	ScoringFactorStream	__anext__
 structural	binding	40	ScoringFactorStream	__iter__	
 structural	binding	40	ScoringFactorStream	__len__	
 structural	binding	40	ScoringFactorStream	__next__	
-testimonial	binding	37	Engine	audit_chain_proof	self_audit
-testimonial	binding	37	Engine	audit_list_entries	self_audit
-testimonial	binding	37	Engine	audit_next_chain_position	self_audit
-testimonial	binding	37	Engine	audit_record_entry	self_audit
-testimonial	binding	37	Engine	audit_verify_all_chains	self_audit
-testimonial	binding	37	Engine	audit_verify_chain	self_audit
-testimonial	binding	37	Engine	cirisnode_put_delivery_attestation	delivery_event
-testimonial	binding	37	Engine	compare_wholeness_witnesses_json	equivocation_evidence
-testimonial	binding	37	Engine	current_sth	log_commitment
-testimonial	binding	37	Engine	delete_traces_for_agent	erasure_effect
-testimonial	binding	37	Engine	delete_traces_for_agent_id_hash	erasure_effect
-testimonial	binding	37	Engine	descend_aggregated_sources	erasure_effect
-testimonial	binding	37	Engine	evict_fountain_content_hard_delete	erasure_effect
-testimonial	binding	37	Engine	hash_chain_gaps	self_audit
-testimonial	binding	37	Engine	latest_stream_sth	log_commitment
-testimonial	binding	37	Engine	list_delivery_receipts_for	delivery_event
-testimonial	binding	37	Engine	list_witness_equivocations_json	equivocation_evidence
-testimonial	binding	37	Engine	lookup_signed_record_by_content_hash	upstream_attestation
-testimonial	binding	37	Engine	maintenance_archive_expired	erasure_effect
-testimonial	binding	37	Engine	maintenance_prune_audit_chain	self_audit
-testimonial	binding	37	Engine	next_sequence	self_audit
-testimonial	binding	37	Engine	peek_sequence	self_audit
-testimonial	binding	37	Engine	provenance_chain	self_audit
-testimonial	binding	37	Engine	put_delivery_receipt	delivery_event
-testimonial	binding	37	Engine	put_stream_sth	log_commitment
-testimonial	binding	37	Engine	put_wholeness_witness_json	equivocation_evidence
-testimonial	binding	37	Engine	rebuild_signed_wire_index	upstream_attestation
-testimonial	binding	37	Engine	receive_and_persist	upstream_attestation
-testimonial	binding	37	Engine	run_retention	erasure_effect
-testimonial	binding	37	Engine	seal_stream	log_commitment
-testimonial	binding	37	Engine	stream_consistency_proof	log_commitment
-testimonial	binding	37	Engine	stream_inclusion_proof	log_commitment
-testimonial	binding	37	Engine	sweep_ttl_expired	erasure_effect
-testimonial	binding	37	Engine	trust_grant_consistency_proof	log_commitment
-testimonial	binding	37	Engine	trust_grant_inclusion_proof	log_commitment
-testimonial	binding	37	Engine	tsdb_prune_summaries	erasure_effect
-testimonial	binding	37	Engine	verify_locale_inclusion_json	log_commitment
+testimonial	binding	40	Engine	audit_chain_proof	self_audit
+testimonial	binding	40	Engine	audit_list_entries	self_audit
+testimonial	binding	40	Engine	audit_next_chain_position	self_audit
+testimonial	binding	40	Engine	audit_record_entry	self_audit
+testimonial	binding	40	Engine	audit_verify_all_chains	self_audit
+testimonial	binding	40	Engine	audit_verify_chain	self_audit
+testimonial	binding	40	Engine	cirisnode_put_delivery_attestation	delivery_event
+testimonial	binding	40	Engine	compare_wholeness_witnesses_json	equivocation_evidence
+testimonial	binding	40	Engine	current_sth	log_commitment
+testimonial	binding	40	Engine	delete_traces_for_agent	erasure_effect
+testimonial	binding	40	Engine	delete_traces_for_agent_id_hash	erasure_effect
+testimonial	binding	40	Engine	descend_aggregated_sources	erasure_effect
+testimonial	binding	40	Engine	evict_fountain_content_hard_delete	erasure_effect
+testimonial	binding	40	Engine	hash_chain_gaps	self_audit
+testimonial	binding	40	Engine	latest_stream_sth	log_commitment
+testimonial	binding	40	Engine	ledger_list_fork_evidence	equivocation_evidence
+testimonial	binding	40	Engine	ledger_put_checkpoint	log_commitment
+testimonial	binding	40	Engine	ledger_record_fork_evidence	equivocation_evidence
+testimonial	binding	40	Engine	list_delivery_receipts_for	delivery_event
+testimonial	binding	40	Engine	list_witness_equivocations_json	equivocation_evidence
+testimonial	binding	40	Engine	lookup_signed_record_by_content_hash	upstream_attestation
+testimonial	binding	40	Engine	maintenance_archive_expired	erasure_effect
+testimonial	binding	40	Engine	maintenance_prune_audit_chain	self_audit
+testimonial	binding	40	Engine	next_sequence	self_audit
+testimonial	binding	40	Engine	peek_sequence	self_audit
+testimonial	binding	40	Engine	provenance_chain	self_audit
+testimonial	binding	40	Engine	put_delivery_receipt	delivery_event
+testimonial	binding	40	Engine	put_stream_sth	log_commitment
+testimonial	binding	40	Engine	put_wholeness_witness_json	equivocation_evidence
+testimonial	binding	40	Engine	rebuild_signed_wire_index	upstream_attestation
+testimonial	binding	40	Engine	receive_and_persist	upstream_attestation
+testimonial	binding	40	Engine	run_retention	erasure_effect
+testimonial	binding	40	Engine	seal_stream	log_commitment
+testimonial	binding	40	Engine	stream_consistency_proof	log_commitment
+testimonial	binding	40	Engine	stream_inclusion_proof	log_commitment
+testimonial	binding	40	Engine	sweep_ttl_expired	erasure_effect
+testimonial	binding	40	Engine	trust_grant_consistency_proof	log_commitment
+testimonial	binding	40	Engine	trust_grant_inclusion_proof	log_commitment
+testimonial	binding	40	Engine	tsdb_prune_summaries	erasure_effect
+testimonial	binding	40	Engine	verify_locale_inclusion_json	log_commitment

@@ -231,7 +231,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "service_token_revocation_not_found"
         | "legacy_migration_not_found"
         | "sequence_not_found"
-        | "occurrence_not_found" => NotFound::new_err(msg),
+        | "occurrence_not_found"
+        | "ledgers_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -254,7 +255,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "service_token_revocation_conflict"
         | "legacy_migration_conflict"
         | "sequence_conflict"
-        | "occurrence_conflict" => Conflict::new_err(msg),
+        | "occurrence_conflict"
+        | "ledgers_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -279,7 +281,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "service_token_revocation_backend"
         | "legacy_migration_backend"
         | "sequence_backend"
-        | "occurrence_backend" => Transient::new_err(msg),
+        | "occurrence_backend"
+        | "ledgers_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -26055,6 +26058,586 @@ impl PyEngine {
     // decoded/encoded via serde at the FFI boundary; lists encoded as
     // JSON arrays; set_active / update_last_login return Python
     // `bool` (true=row updated, false=missing wa_id).
+
+    // ── the `ledgers` family (CIRISPersist#754, CC 3.3.10.1 rc4.3) ─────
+    //
+    // The working index over owner-serialized ledgers: L1 registration
+    // (one ledger per (identity, unit, standard_version) triple — the id
+    // is DERIVED, never caller-chosen), L4 head bookkeeping (forward-only;
+    // a differing hash at the stored seq refuses as fork-shaped), L5
+    // checkpoints (immutable — a witnessed fact pins, never flips), L2/L6
+    // entry-range pointers, L8 fork-evidence records (detection records,
+    // adjudication punishes — a fork NEVER fires slashing from here).
+    // Rows on the ledger:* dimension family stay REFUSED at federation
+    // tier until CIRISConstitution#92 graduates the family; these local
+    // verbs are live for consumers that enable the feature.
+
+    /// CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger
+    /// for `(owner_key_id, unit, standard_version)`. Returns JSON
+    /// `{"ledger_id": .., "outcome": "registered"|"already_registered"}`.
+    /// A differing claim on an occupied triple raises `Conflict` — no
+    /// parallel books within the claim's scope (fail-secure per rc4.3).
+    #[cfg(feature = "ledgers")]
+    fn ledger_register(
+        &self,
+        py: Python<'_>,
+        owner_key_id: &str,
+        unit: &str,
+        standard_version: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (owner, unit, sv) = (
+                owner_key_id.to_owned(),
+                unit.to_owned(),
+                standard_version.to_owned(),
+            );
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let (ledger_id, outcome) = backend
+                            .register_ledger(&owner, &unit, &sv)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        let r = serde_json::json!({
+                            "ledger_id": ledger_id,
+                            "outcome": outcome,
+                        });
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("register outcome encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let (ledger_id, outcome) = backend
+                            .register_ledger(&owner, &unit, &sv)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        let r = serde_json::json!({
+                            "ledger_id": ledger_id,
+                            "outcome": outcome,
+                        });
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("register outcome encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome
+    /// (`"advanced"` / `"unchanged"` / `"stale"`); a DIFFERENT hash at the
+    /// stored seq raises `Conflict` (the fork shape — assemble evidence
+    /// with `ledger_detect_double_head` and record it, per L8).
+    #[cfg(feature = "ledgers")]
+    #[pyo3(signature = (ledger_id, seq, head_hash, witness_anchor_ref=None, source_envelope_ref=None))]
+    fn ledger_advance_head(
+        &self,
+        py: Python<'_>,
+        ledger_id: &str,
+        seq: u64,
+        head_hash: &str,
+        witness_anchor_ref: Option<String>,
+        source_envelope_ref: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (lid, hash) = (ledger_id.to_owned(), head_hash.to_owned());
+            let (anchor, envref) = (witness_anchor_ref, source_envelope_ref);
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .advance_head(&lid, seq, &hash, anchor.as_deref(), envref.as_deref())
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("advance outcome encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .advance_head(&lid, seq, &hash, anchor.as_deref(), envref.as_deref())
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("advance outcome encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// Point lookup by `ledger_id`. JSON `LedgerHeadRow` or `None`.
+    #[cfg(feature = "ledgers")]
+    fn ledger_get(&self, py: Python<'_>, ledger_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lid = ledger_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let row = backend
+                            .get_ledger(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r)
+                                .map_err(|e| {
+                                    PyRuntimeError::new_err(format!("LedgerHeadRow encode: {e}"))
+                                })
+                                .map(Some),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let row = backend
+                            .get_ledger(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r)
+                                .map_err(|e| {
+                                    PyRuntimeError::new_err(format!("LedgerHeadRow encode: {e}"))
+                                })
+                                .map(Some),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// Every ledger bound to one steward-bound identity, as a JSON array
+    /// of `LedgerHeadRow`, ordered by `ledger_id`.
+    #[cfg(feature = "ledgers")]
+    fn ledger_list_for_owner(&self, py: Python<'_>, owner_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let owner = owner_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_ledgers_for_owner(&owner)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LedgerHeadRow list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_ledgers_for_owner(&owner)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LedgerHeadRow list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// CC 3.3.10.1 L5 — store a co-witnessed checkpoint (JSON
+    /// `LedgerCheckpointRow`). `True` on first write, `False` on an
+    /// identical re-put; a DIFFERING row at an occupied `(ledger_id, seq)`
+    /// raises `Conflict` — checkpoints are immutable, a witnessed fact
+    /// pins and never flips. `balance_minor` must be a canonical i128
+    /// decimal string (integer-only per L7).
+    #[cfg(feature = "ledgers")]
+    fn ledger_put_checkpoint(&self, py: Python<'_>, checkpoint_json: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let cp: crate::ledgers::LedgerCheckpointRow = serde_json::from_str(checkpoint_json)
+                .map_err(|e| PyValueError::new_err(format!("LedgerCheckpointRow decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .put_checkpoint(&cp)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .put_checkpoint(&cp)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// The highest-seq checkpoint for a ledger — JSON or `None`.
+    #[cfg(feature = "ledgers")]
+    fn ledger_latest_checkpoint(
+        &self,
+        py: Python<'_>,
+        ledger_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lid = ledger_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let row = backend
+                            .latest_checkpoint(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r)
+                                .map_err(|e| {
+                                    PyRuntimeError::new_err(format!(
+                                        "LedgerCheckpointRow encode: {e}"
+                                    ))
+                                })
+                                .map(Some),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let row = backend
+                            .latest_checkpoint(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r)
+                                .map_err(|e| {
+                                    PyRuntimeError::new_err(format!(
+                                        "LedgerCheckpointRow encode: {e}"
+                                    ))
+                                })
+                                .map(Some),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// CC 3.3.10.1 L2/L6 — index which `evidence_refs` blob holds entries
+    /// `[from_seq, to_seq]` (JSON `LedgerEntryRangeRow`). Same
+    /// immutable/idempotent contract as checkpoints.
+    #[cfg(feature = "ledgers")]
+    fn ledger_put_entry_range(&self, py: Python<'_>, range_json: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let rg: crate::ledgers::LedgerEntryRangeRow = serde_json::from_str(range_json)
+                .map_err(|e| PyValueError::new_err(format!("LedgerEntryRangeRow decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .put_entry_range(&rg)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .put_entry_range(&rg)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// All entry ranges for a ledger, ordered by `from_seq` — JSON array.
+    #[cfg(feature = "ledgers")]
+    fn ledger_list_entry_ranges(&self, py: Python<'_>, ledger_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lid = ledger_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_entry_ranges(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LedgerEntryRangeRow list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_entry_ranges(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("LedgerEntryRangeRow list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// CC 3.3.10.1 L8 — record a proven fork (JSON `ForkEvidence`) for the
+    /// adjudication plane. Returns the content-derived `evidence_id`
+    /// (idempotent: one fork, one row). Deliberately NO
+    /// registered-ledger precondition — evidence about a ledger this node
+    /// never registered must not be droppable. Recording NEVER fires
+    /// `slashing:*`: adjudication distinguishes equivocation from honest
+    /// stale-state recovery (the eltoo critique, answered by the
+    /// cooperative witness set).
+    #[cfg(feature = "ledgers")]
+    fn ledger_record_fork_evidence(&self, py: Python<'_>, evidence_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let ev: crate::ledgers::ForkEvidence = serde_json::from_str(evidence_json)
+                .map_err(|e| PyValueError::new_err(format!("ForkEvidence decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .record_fork_evidence(&ev)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        backend
+                            .record_fork_evidence(&ev)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// All recorded fork evidence for a ledger — JSON array of rows.
+    #[cfg(feature = "ledgers")]
+    fn ledger_list_fork_evidence(&self, py: Python<'_>, ledger_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let lid = ledger_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_fork_evidence(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ForkEvidenceRow list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::ledgers::sqlite::SqliteLedgerBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::ledgers::LedgerService;
+                        let r = backend
+                            .list_fork_evidence(&lid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ForkEvidenceRow list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// CC 3.3.10.1 L1 — the deterministic `(steward-bound identity, unit,
+    /// standard_version)` → `ledger_id` derivation. Pure; THE one spelling
+    /// every door recomputes (a second spelling is how two locally-correct
+    /// implementations drift — the #663 class).
+    #[cfg(feature = "ledgers")]
+    #[staticmethod]
+    fn ledger_derive_id(
+        owner_key_id: &str,
+        unit: &str,
+        standard_version: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            crate::ledgers::standard::derive_ledger_id(owner_key_id, unit, standard_version)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// CC 3.3.10.1 L7 — the conservation fold: pure, deterministic,
+    /// integer-only, and BYTE-EQUAL across members (the CC 6.1.6 contract
+    /// discipline — determinism is what makes a violation transferable
+    /// evidence any member checks without trusting the accuser, the
+    /// PeerReview role of reference replay). Input: JSON array of
+    /// `LedgerEntry`. Output: the fold's canonical bytes as a UTF-8
+    /// string — compare THESE across members. Matched transfer pairs sum
+    /// to zero; every violation is a typed flag, never merged away.
+    #[cfg(feature = "ledgers")]
+    #[staticmethod]
+    fn ledger_conservation_fold(entries_json: &str) -> PyResult<String> {
+        catch_panic(|| {
+            let entries: Vec<crate::ledgers::LedgerEntry> = serde_json::from_str(entries_json)
+                .map_err(|e| PyValueError::new_err(format!("LedgerEntry list decode: {e}")))?;
+            let fold = crate::ledgers::conservation_fold(&entries)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let bytes = crate::ledgers::fold_canonical_bytes(&fold)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            String::from_utf8(bytes).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// CC 3.3.10.1 L2/L6 — validate a chain span (JSON array of
+    /// `LedgerEntry`) from stated expectations: dense sequence, prev-hash
+    /// links, one ledger, one unit. Returns the JSON `ChainHead`; raises
+    /// `ValueError` naming the violation. This IS the substance of L6's
+    /// promotion compliance proof (chain validity from the latest
+    /// witnessed checkpoint to the promoted head).
+    #[cfg(feature = "ledgers")]
+    #[staticmethod]
+    fn ledger_verify_chain(
+        entries_json: &str,
+        expected_first_seq: u64,
+        expected_first_prev: &str,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let entries: Vec<crate::ledgers::LedgerEntry> = serde_json::from_str(entries_json)
+                .map_err(|e| PyValueError::new_err(format!("LedgerEntry list decode: {e}")))?;
+            let head = if expected_first_seq == 0
+                && !entries.is_empty()
+                && expected_first_prev == entries[0].ledger_id
+            {
+                crate::ledgers::verify_chain_from_genesis(&entries)
+            } else {
+                crate::ledgers::verify_chain_from_checkpoint(
+                    expected_first_seq.saturating_sub(1),
+                    expected_first_prev,
+                    &entries,
+                )
+            }
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            serde_json::to_string(&head).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON
+    /// `SignedHead` each) at one sequence number with different hashes.
+    /// Returns the JSON `ForkEvidence` in canonical order (transferable
+    /// evidence must not depend on arrival order), or `None` when the
+    /// heads do not constitute a fork.
+    #[cfg(feature = "ledgers")]
+    #[staticmethod]
+    fn ledger_detect_double_head(head_a_json: &str, head_b_json: &str) -> PyResult<Option<String>> {
+        catch_panic(|| {
+            let a: crate::ledgers::standard::SignedHead = serde_json::from_str(head_a_json)
+                .map_err(|e| PyValueError::new_err(format!("SignedHead decode: {e}")))?;
+            let b: crate::ledgers::standard::SignedHead = serde_json::from_str(head_b_json)
+                .map_err(|e| PyValueError::new_err(format!("SignedHead decode: {e}")))?;
+            match crate::ledgers::detect_double_head(&a, &b) {
+                None => Ok(None),
+                Some(ev) => serde_json::to_string(&ev)
+                    .map(Some)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+            }
+        })
+    }
 
     /// v1.5.19 — Idempotent upsert of a WA cert. `cert_json` is a
     /// JSON-encoded `WaCert` (24 columns). UPSERT on `wa_id` —

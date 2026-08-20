@@ -844,6 +844,12 @@ class Engine:
     def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
         """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
 
+    def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
+        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale"); a DIFFERENT hash at the stored seq raises... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_register(self, owner_key_id: str, unit: str, standard_version: str) -> str:
+        """(derived) deontic — CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger for (owner_key_id, unit, standard_version). Returns JSON {"ledger_id": .., "outc... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
     def may_release_copy_json(
         self, object_kind: str, object_id: str, object_id2: str | None = None
     ) -> str:
@@ -1628,6 +1634,15 @@ class Engine:
     def latest_stream_sth(self, stream_id: str) -> str | None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — the latest STH (highest tree_size) stored for stream_id, as a serialized SignedTreeHead JSON string, or None if..."""
 
+    def ledger_list_fork_evidence(self, ledger_id: str) -> str:
+        """(derived) testimonial — All recorded fork evidence for a ledger — JSON array of rows. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_put_checkpoint(self, checkpoint_json: str) -> bool:
+        """(derived) testimonial — CC 3.3.10.1 L5 — store a co-witnessed checkpoint (JSON LedgerCheckpointRow). True on first write, False on an identical re-put; a DIFFERING row at... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_record_fork_evidence(self, evidence_json: str) -> str:
+        """(derived) testimonial — CC 3.3.10.1 L8 — record a proven fork (JSON ForkEvidence) for the adjudication plane. Returns the content-derived evidence_id (idempotent: one fork... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
     def list_delivery_receipts_for(self, stream_id: str, limit: int) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts for stream_id, ascending (k, subscriber_key_id), bounded by limit. Returns a JSON a..."""
 
@@ -1986,6 +2001,22 @@ class Engine:
 
     def is_canonical(self, key_id: str) -> bool:
         """(derived) nomological — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is key_id a canonical / founding bootstrap server? Returns True iff its federation_keys row's identity_typ..."""
+
+    @staticmethod
+    def ledger_conservation_fold(entries_json: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L7 — the conservation fold: pure, deterministic, integer-only, and BYTE-EQUAL across members (the CC 6.1.6 contract discipline — determ... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_derive_id(owner_key_id: str, unit: str, standard_version: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L1 — the deterministic (steward-bound identity, unit, standard_version) → ledger_id derivation. Pure; THE one spelling every door recom... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_detect_double_head(head_a_json: str, head_b_json: str) -> str | None:
+        """(derived) nomological — CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON SignedHead each) at one sequence number with different hashes. Returns the JSON ForkEvid... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_verify_chain(entries_json: str, expected_first_seq: int, expected_first_prev: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L2/L6 — validate a chain span (JSON array of LedgerEntry) from stated expectations: dense sequence, prev-hash links, one ledger, one un... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def maintenance_tighten_vocabulary(self, target_json: str, dry_run: bool = False) -> str:
         """(derived) nomological — v25.1.0 (CIRISPersist#582) — Run one vocabulary tightening: retire every federation-tier attestation carrying a non-conformant wire value at a name..."""
@@ -2730,6 +2761,21 @@ class Engine:
 
     def incident_transition(self, transition_json: str) -> None:
         """(derived) empirical — v0.8.3 — AV-55 state-machine transition. Notes required for Resolved/Closed targets. [build-conditional: #[cfg(feature = "cirisincident")]]"""
+
+    def ledger_get(self, ledger_id: str) -> str | None:
+        """(derived) empirical — Point lookup by ledger_id. JSON LedgerHeadRow or None. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_latest_checkpoint(self, ledger_id: str) -> str | None:
+        """(derived) empirical — The highest-seq checkpoint for a ledger — JSON or None. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_list_entry_ranges(self, ledger_id: str) -> str:
+        """(derived) empirical — All entry ranges for a ledger, ordered by from_seq — JSON array. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_list_for_owner(self, owner_key_id: str) -> str:
+        """(derived) empirical — Every ledger bound to one steward-bound identity, as a JSON array of LedgerHeadRow, ordered by ledger_id. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_put_entry_range(self, range_json: str) -> bool:
+        """(derived) empirical — CC 3.3.10.1 L2/L6 — index which evidence_refs blob holds entries [from_seq, to_seq] (JSON LedgerEntryRangeRow). Same immutable/idempotent contract... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def list_accord_participations_json(self, proposal_digest: str) -> str:
         """(derived) empirical — #302 — all participations for a proposal as a JSON array."""
