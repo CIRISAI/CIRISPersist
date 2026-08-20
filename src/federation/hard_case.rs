@@ -120,6 +120,13 @@ pub mod admin_op {
     /// ([`Revocation::revoked_after`](crate::federation::Revocation::revoked_after),
     /// #570 ask 4).
     pub const DE_ADMISSION: &str = "de_admission";
+    /// v38.0.0 (CIRISPersist#721) — an authority REMOVED a peer record
+    /// (hard: the `federation_keys` row cascades away; soft: `removed_at`
+    /// hides it from cohort-scoped reads). Both faces used to happen
+    /// UNANNOUNCED — the only table verbs that removed served rows with no
+    /// record anywhere, while their own DSAR sibling tombstoned AND emitted
+    /// in the same transaction.
+    pub const PEER_REMOVAL: &str = "peer_removal";
 }
 
 /// The `detail` keys an [`kind::ADMIN_ACTION`] row MUST carry. Named here so

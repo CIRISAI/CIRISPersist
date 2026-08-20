@@ -8879,19 +8879,38 @@ impl PyEngine {
     /// delete the federation_keys row (rejected with
     /// `federation_hard_remove_with_active_attestations` if there are
     /// outstanding attestations).
-    fn remove_peer_record(&self, py: Python<'_>, key_id: &str, hard: bool) -> PyResult<()> {
+    ///
+    /// v38.0.0 (CIRISPersist#721) — a removal is an ATTRIBUTED, ANNOUNCED
+    /// act: `reason` is required (a removal nobody recorded is the defect),
+    /// `acting_under_delegation_id` is recorded when the actor acts under a
+    /// conferral, and both faces emit an `admin_action:peer_removal`
+    /// hard_case row inside the same transaction. The soft face also stamps
+    /// the sibling key row's `mutated_at` so cursor planes re-serve it (the
+    /// #707 class: a served set that changes silently).
+    #[pyo3(signature = (key_id, hard, reason, acting_under_delegation_id=None))]
+    fn remove_peer_record(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        hard: bool,
+        reason: &str,
+        acting_under_delegation_id: Option<String>,
+    ) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
+            let reason = reason.to_owned();
+            let delegation = acting_under_delegation_id;
             py.detach(|| match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
+                    let (reason, delegation) = (reason.clone(), delegation.clone());
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .remove_peer_record(&key_id, hard)
+                            .remove_peer_record(&key_id, hard, &reason, delegation.as_deref())
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -8902,7 +8921,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .remove_peer_record(&key_id, hard)
+                            .remove_peer_record(&key_id, hard, &reason, delegation.as_deref())
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -12623,19 +12642,29 @@ impl PyEngine {
 
     /// Federation directory: grant trust to a key.
     ///
-    /// `trust_grant_json` is a JSON string of `TrustGrant`:
-    /// `{"key": ..., "trust_type": "temporary"|"partnered"|"anonymous",
-    ///   "trust_relationship": "direct"|"registry",
-    ///   "trust_domains": [...]|null,
-    ///   "trusted_by": ..., "expires_at": "...."|null}`.
-    /// Raises `ValueError` on self-trust (trusted_by == key),
-    /// missing-domains-on-Registry, or unknown key_id.
-    fn federation_grant_trust(&self, py: Python<'_>, trust_grant_json: &str) -> PyResult<()> {
+    /// v38.0.0 (CIRISPersist#721) — takes a **SignedTrustGrant**: the bare
+    /// `TrustGrant` wire shape carried a `trusted_by` the caller merely
+    /// typed, verified against nothing, on this published surface — a trust
+    /// edge whose granter is unproven is a rumor with a column. The JSON is
+    /// `{"grant": {"key": ..., "trust_type": "temporary"|"partnered"|
+    /// "anonymous", "trust_relationship": "direct"|"registry",
+    /// "trust_domains": [...]|null, "trusted_by": ...,
+    /// "expires_at": "..."|null},
+    /// "signature_classical_base64": ...,
+    /// "signature_pqc_base64": ...|null}` — the granter's Strict hybrid
+    /// signature over the pinned signing bytes
+    /// (`admission::trust_grant_signing_bytes`), verified against the
+    /// DIRECTORY-pinned keys of `trusted_by` inside every backend. Raises
+    /// `ValueError` on a failed proof, self-trust, missing-domains-on-
+    /// Registry, or unknown key_id.
+    fn federation_grant_trust(&self, py: Python<'_>, signed_grant_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let grant: crate::federation::TrustGrant = serde_json::from_str(trust_grant_json)
-                .map_err(|e| PyValueError::new_err(format!("TrustGrant JSON decode: {e}")))?;
+            let grant: crate::federation::SignedTrustGrant =
+                serde_json::from_str(signed_grant_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedTrustGrant JSON decode: {e}"))
+                })?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -12664,13 +12693,22 @@ impl PyEngine {
     }
 
     /// Federation directory: revoke trust for a key. Idempotent —
-    /// revoking an already-expired key is a no-op.
-    fn federation_revoke_trust(&self, py: Python<'_>, key: &str, revoked_by: &str) -> PyResult<()> {
+    /// revoking an already-expired or absent grant is a no-op.
+    ///
+    /// v38.0.0 (CIRISPersist#721) — takes a **SignedTrustRevocation**
+    /// (`{"key": ..., "revoked_by": ..., "revoked_at": "...",
+    /// "signature_classical_base64": ..., "signature_pqc_base64": ...}`).
+    /// The old form validated `revoked_by` non-empty and then DISCARDED it;
+    /// the revoker is now PROVEN by signature and must BE the stored
+    /// granter — only the granter withdraws its own grant.
+    fn federation_revoke_trust(&self, py: Python<'_>, revocation_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let key = key.to_owned();
-            let revoked_by = revoked_by.to_owned();
+            let revocation: crate::federation::SignedTrustRevocation =
+                serde_json::from_str(revocation_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedTrustRevocation JSON decode: {e}"))
+                })?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -12678,7 +12716,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .revoke_trust(&key, &revoked_by)
+                            .revoke_trust(revocation)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -12689,7 +12727,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .revoke_trust(&key, &revoked_by)
+                            .revoke_trust(revocation.clone())
                             .await
                             .map_err(federation_err_to_py)
                     })

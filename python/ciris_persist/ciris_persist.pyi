@@ -758,11 +758,11 @@ class Engine:
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
         """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds for attesting_key_id,..."""
 
-    def federation_grant_trust(self, trust_grant_json: str) -> None:
+    def federation_grant_trust(self, signed_grant_json: str) -> None:
         """(derived) deontic — Federation directory: grant trust to a key."""
 
-    def federation_revoke_trust(self, key: str, revoked_by: str) -> None:
-        """(derived) deontic — Federation directory: revoke trust for a key. Idempotent — revoking an already-expired key is a no-op."""
+    def federation_revoke_trust(self, revocation_json: str) -> None:
+        """(derived) deontic — Federation directory: revoke trust for a key. Idempotent — revoking an already-expired or absent grant is a no-op."""
 
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
@@ -1078,7 +1078,7 @@ class Engine:
     def remove_moderator(self, community_id: str, target_attestation_id: str, moderator_key_id: str, duty: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10) — remove a named moderator: withdraws against the appointment edge target_attestation_id. moderator_key_id keys the retractio..."""
 
-    def remove_peer_record(self, key_id: str, hard: bool) -> None:
+    def remove_peer_record(self, key_id: str, hard: bool, reason: str, acting_under_delegation_id: str | None = None) -> None:
         """(derived) deontic — Federation directory: remove a peer record. hard=false soft-marks removed_at; hard=true cascades through the FK to delete the federation_keys row (..."""
 
     def resolve_key_statement_standing_json(self, key_id: str, statement_at: str | None = None, now: str | None = None) -> str:

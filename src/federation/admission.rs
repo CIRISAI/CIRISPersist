@@ -775,6 +775,138 @@ pub const STAGED_GOVERNED_FAMILIES: &[(&str, &str)] = &[
 /// already-gated door, never an open one.
 pub const LEDGER_DIMENSION_PREFIX: &str = "ledger:";
 
+/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a
+/// [`TrustGrant`](super::TrustGrant): pinned-JCS over a domain-tagged
+/// projection of the grant. Pinned canonicalizer, never
+/// `produce_canon_version()` — a stored signature is a contract (the
+/// `compute_persist_row_hash` reasoning).
+pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": "ciris.trust.grant.v1",
+        "grant": grant,
+    });
+    crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
+        .canonicalize_value(&value)
+        .map_err(|e| Error::InvalidArgument(format!("trust grant canonicalize: {e}")))
+}
+
+/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a trust
+/// revocation. Same discipline as [`trust_grant_signing_bytes`].
+pub fn trust_revocation_signing_bytes(
+    key: &str,
+    revoked_by: &str,
+    revoked_at: &chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": "ciris.trust.revocation.v1",
+        "key": key,
+        "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "revoked_by": revoked_by,
+    });
+    crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
+        .canonicalize_value(&value)
+        .map_err(|e| Error::InvalidArgument(format!("trust revocation canonicalize: {e}")))
+}
+
+/// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
+/// granter must PROVE it is `trusted_by`: a Strict hybrid verification of
+/// the signature over [`trust_grant_signing_bytes`] against `trusted_by`'s
+/// DIRECTORY-PINNED pubkeys (never keys the caller carries — the #377
+/// rule: authority re-derives from this node's own verified state). Asked
+/// INSIDE every backend's `grant_trust`, in the same position, ahead of the
+/// shape validation — a door whose safety lives in its caller is the #652
+/// shape.
+pub async fn check_trust_grant_authority(
+    directory: &dyn super::FederationDirectory,
+    signed: &super::SignedTrustGrant,
+) -> Result<(), Error> {
+    let bytes = trust_grant_signing_bytes(&signed.grant)?;
+    crate::verify::hybrid::verify_hybrid_via_directory(
+        directory,
+        &bytes,
+        &signed.grant.trusted_by,
+        &signed.signature_classical_base64,
+        signed.signature_pqc_base64.as_deref(),
+        crate::verify::hybrid::HybridPolicy::Strict,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        Error::InvalidArgument(format!(
+            "trust grant authority: granter {:?} did not prove the grant (hybrid verify \
+             against the directory-pinned keys failed: {e}). A trust edge whose granter is \
+             unproven is a rumor with a column (CIRISPersist#721)",
+            signed.grant.trusted_by
+        ))
+    })?;
+    Ok(())
+}
+
+/// v38.0.0 (CIRISPersist#721) — **the trust-revocation authority gate.**
+/// Signature proof that the caller IS `revoked_by`, plus the ownership
+/// rule enforced by the backends against the STORED row: only the granter
+/// withdraws its own grant (the protective-1 side of the reverse-quorum
+/// classification — see [`TRUST_PLANE_OPS`]).
+pub async fn check_trust_revocation_authority(
+    directory: &dyn super::FederationDirectory,
+    signed: &super::SignedTrustRevocation,
+) -> Result<(), Error> {
+    let bytes =
+        trust_revocation_signing_bytes(&signed.key, &signed.revoked_by, &signed.revoked_at)?;
+    crate::verify::hybrid::verify_hybrid_via_directory(
+        directory,
+        &bytes,
+        &signed.revoked_by,
+        &signed.signature_classical_base64,
+        signed.signature_pqc_base64.as_deref(),
+        crate::verify::hybrid::HybridPolicy::Strict,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        Error::InvalidArgument(format!(
+            "trust revocation authority: revoker {:?} did not prove the revocation (hybrid \
+             verify against the directory-pinned keys failed: {e})",
+            signed.revoked_by
+        ))
+    })?;
+    Ok(())
+}
+
+/// v38.0.0 (CIRISPersist#721) — **every op that writes the trust plane,
+/// classified.** The accord-ops invariant: every governance-shaped op sits
+/// in a named row — m-of-n, reverse-quorum-protective, or unilateral-signed
+/// WITH the reason recorded — and an unclassified door is the finding.
+/// `(op, classification, gate — resolved as a definition by the test)`.
+pub const TRUST_PLANE_OPS: &[(&str, &str, &str)] = &[
+    (
+        "grant_trust (Direct)",
+        "unilateral-signed: the granter's OWN subjective edge about its own trust; consumers \
+         weigh it via resolve_trust policy, so no third party is bound by it",
+        "check_trust_grant_authority",
+    ),
+    (
+        "grant_trust (Registry)",
+        "signed conferral: trust_domains make it capability-shaped. RECORDED as the open \
+         question rather than silently unilateral — a consumer that treats registry domains \
+         as authority should require quorum treatment on this row (the #543 third-party \
+         rule); until one does, the signature gate bounds it to a provable granter",
+        "check_trust_grant_authority",
+    ),
+    (
+        "revoke_trust",
+        "protective-1 (reverse-quorum side 1): the granter withdrawing its OWN grant; \
+         ownership enforced against the STORED trusted_by inside every backend",
+        "check_trust_revocation_authority",
+    ),
+    (
+        "emit::grant_trust (V021 audit-chained twin)",
+        "unilateral-signed by construction: the granter IS the LocalSigner, self-grant \
+         structurally refused, landed via the audit chain",
+        "grant_trust",
+    ),
+];
+
 /// Reason token for [`check_ledger_binding_admission`] refusals. A token on
 /// the existing [`Error::DimensionRejected`] shape rather than a new variant,
 /// for the reason `invariant.rs` records: the pyo3 FFI matches
@@ -13786,6 +13918,27 @@ mod tests {
                 governed_family_stems().iter().any(|g| g == stem),
                 "{stem:?} is declared an exception to a gate it is not subject to — persist does \
                  not govern that family, so the line excuses nothing"
+            );
+        }
+    }
+
+    /// v38.0.0 (CIRISPersist#721) — every trust-plane op is CLASSIFIED, and
+    /// every named gate resolves as a real definition. An unclassified door
+    /// on the trust plane is the finding this table exists to prevent; a
+    /// row naming a gate that does not exist is #590's free-text pin.
+    #[test]
+    fn trust_plane_ops_are_classified_and_their_gates_resolve_721() {
+        assert!(TRUST_PLANE_OPS.len() >= 4, "vacuous table");
+        let sources = [include_str!("admission.rs"), include_str!("emit.rs")];
+        for (op, classification, gate) in TRUST_PLANE_OPS {
+            assert!(
+                classification.len() > 40,
+                "{op}: a classification under 40 chars is a shrug"
+            );
+            let needle_fn = format!("fn {gate}");
+            assert!(
+                sources.iter().any(|s| s.contains(&needle_fn)),
+                "{op}: named gate {gate:?} does not resolve to a definition"
             );
         }
     }

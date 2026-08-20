@@ -4020,6 +4020,55 @@ pub struct TrustGrant {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// v38.0.0 (CIRISPersist#721) — a [`TrustGrant`] carrying its granter's
+/// hybrid signature over [`trust_grant_signing_bytes`]. The V020 trust
+/// doors accepted a bare `TrustGrant` — `trusted_by` was a string the
+/// caller typed, verified against NOTHING, on the published FFI surface —
+/// while their V021 twin (`emit::grant_trust`) had always derived the
+/// granter from a signer. A trust edge whose granter is unproven is not a
+/// trust edge; it is a rumor with a column. The signer IS `trusted_by`
+/// (the gate asks about the signer, never the subject — the #543 rule).
+///
+/// [`trust_grant_signing_bytes`]: crate::federation::admission::trust_grant_signing_bytes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedTrustGrant {
+    /// The grant — the signed content.
+    pub grant: TrustGrant,
+    /// `trusted_by`'s Ed25519 signature over the pinned signing bytes.
+    pub signature_classical_base64: String,
+    /// `trusted_by`'s ML-DSA-65 signature (bound, per the hybrid rule).
+    /// Required by the Strict policy the gate applies — a capability-
+    /// shaped edge does not ride a classical-only signature (CC
+    /// 5.3.2.4.3.1 posture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_pqc_base64: Option<String>,
+}
+
+/// v38.0.0 (CIRISPersist#721) — an attributed, signed trust revocation.
+/// The old door validated `revoked_by` as non-empty and then DISCARDED it
+/// (`let _ = revoked_by`) — persist stored an unattributed revocation and
+/// trusted an unidentified caller to log who did it. The revoker must BE
+/// the stored granter (withdrawing one's OWN grant is the protective-1
+/// side of the reverse-quorum table), proven by signature over
+/// [`trust_revocation_signing_bytes`].
+///
+/// [`trust_revocation_signing_bytes`]: crate::federation::admission::trust_revocation_signing_bytes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedTrustRevocation {
+    /// The trusted key whose grant is being revoked.
+    pub key: String,
+    /// The revoker — must equal the stored row's `trusted_by`.
+    pub revoked_by: String,
+    /// When the revoker asserts the revocation. Signed content, so a
+    /// replayed revocation is at least an HONEST replay of a real act.
+    pub revoked_at: DateTime<Utc>,
+    /// `revoked_by`'s Ed25519 signature over the pinned signing bytes.
+    pub signature_classical_base64: String,
+    /// `revoked_by`'s ML-DSA-65 signature (bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_pqc_base64: Option<String>,
+}
+
 /// A row from the directory — the grant + its `trusted_at`
 /// timestamp. Returned by
 /// [`super::FederationDirectory::lookup_trust`] and

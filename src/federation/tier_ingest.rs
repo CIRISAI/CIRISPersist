@@ -682,6 +682,47 @@ pub mod test_support {
         (ed_pk, Some(mldsa_pk))
     }
 
+    /// v38.0.0 (CIRISPersist#721) — wrap a [`TrustGrant`] with its
+    /// granter's REAL deterministic hybrid signature over the pinned
+    /// signing bytes, so the door's authority gate verifies against the
+    /// pubkeys [`register_hybrid_key`] registered for `trusted_by`.
+    pub fn signed_trust_grant(
+        grant: crate::federation::TrustGrant,
+    ) -> crate::federation::SignedTrustGrant {
+        let bytes = crate::federation::admission::trust_grant_signing_bytes(&grant)
+            .expect("trust grant canonicalizes");
+        let sig = threshold_sign(&grant.trusted_by, &bytes);
+        crate::federation::SignedTrustGrant {
+            grant,
+            signature_classical_base64: sig.ed25519_signature_base64,
+            signature_pqc_base64: sig.mldsa65_signature_base64,
+        }
+    }
+
+    /// v38.0.0 (CIRISPersist#721) — a signed trust revocation from
+    /// `revoked_by`'s deterministic hybrid keys.
+    pub fn signed_trust_revocation(
+        key: &str,
+        revoked_by: &str,
+    ) -> crate::federation::SignedTrustRevocation {
+        let revoked_at =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let bytes = crate::federation::admission::trust_revocation_signing_bytes(
+            key,
+            revoked_by,
+            &revoked_at,
+        )
+        .expect("trust revocation canonicalizes");
+        let sig = threshold_sign(revoked_by, &bytes);
+        crate::federation::SignedTrustRevocation {
+            key: key.to_owned(),
+            revoked_by: revoked_by.to_owned(),
+            revoked_at,
+            signature_classical_base64: sig.ed25519_signature_base64,
+            signature_pqc_base64: sig.mldsa65_signature_base64,
+        }
+    }
+
     /// #249 Cut G3 — produce a [`ThresholdSignature`](ciris_verify_core::threshold::ThresholdSignature)
     /// for `key_id` over `bytes` using `key_id`'s deterministic hybrid keypair
     /// (the same pair [`hybrid_pubkeys`] registers). The ML-DSA-65 half signs

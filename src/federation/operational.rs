@@ -5291,17 +5291,33 @@ pub mod test_support {
         );
 
         // ── NEGATIVE leg: grant_trust / revoke_trust must NOT move it ──────
+        // v38.0.0 (#721): the doors take PROVEN grants now — register a
+        // hybrid granter and sign through the test-support twin of the
+        // production signing shape.
+        let granter = format!("trust-granter-707-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(directory, &granter)
+            .await;
         directory
-            .grant_trust(crate::federation::TrustGrant {
-                key: node.clone(),
-                trust_type: crate::federation::TrustType::Temporary,
-                trust_relationship: crate::federation::TrustRelationship::Direct,
-                trust_domains: None,
-                trusted_by: anchor.clone(),
-                expires_at: None,
-            })
+            .grant_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_grant(
+                    crate::federation::TrustGrant {
+                        key: node.clone(),
+                        trust_type: crate::federation::TrustType::Temporary,
+                        trust_relationship: crate::federation::TrustRelationship::Direct,
+                        trust_domains: None,
+                        trusted_by: granter.clone(),
+                        expires_at: None,
+                    },
+                ),
+            )
             .await?;
-        directory.revoke_trust(&node, &anchor).await?;
+        directory
+            .revoke_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_revocation(
+                    &node, &granter,
+                ),
+            )
+            .await?;
         let after_trust = directory
             .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
             .await?;
