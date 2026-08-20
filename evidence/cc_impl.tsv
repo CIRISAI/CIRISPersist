@@ -103,4 +103,11 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.7	CLM-persist-ruled-family-inventory	CIRISPersist	src/federation/family_rules.rs#persist_ruled_prefixes	ciris-persist@37.1.0
 3.1.7	CLM-rule-not-on-the-row	CIRISPersist	src/federation/family_rules.rs#rule_not_on_the_row_for	ciris-persist@37.1.0
 3.1.7	CLM-absence-claims-still-hold	CIRISPersist	src/federation/namespace/supersets.rs#manifest_absence_claims	ciris-persist@37.1.0
+3.3.10.1	CLM-ledger-standard	CIRISPersist	src/ledgers/standard.rs#derive_ledger_id	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-standard	CIRISPersist	src/federation/admission.rs#check_ledger_binding_admission	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-standard	CIRISPersist	src/ledgers/standard.rs#verify_chain_from_checkpoint	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-standard	CIRISPersist	src/ledgers/standard.rs#detect_double_head	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-standard	CIRISPersist	src/federation/admission.rs#STAGED_GOVERNED_FAMILIES	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#conservation_fold	ciris-persist@38.0.0
+3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#fold_canonical_bytes	ciris-persist@38.0.0
 4.5.1.1	CLM-ci-axis	CIRISPersist	src/federation/namespace/supersets.rs#fusion_classification	ciris-persist@37.1.0
