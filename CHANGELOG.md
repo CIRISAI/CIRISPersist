@@ -5,6 +5,148 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.0.0] - 2026-08-20
+
+The constitutional-ledger cut, the registry fold's storage, and nine bugs
+paid down in one break window. Everything breaking in this majors together;
+CIRISServer / CIRISEdge / CIRISRegistry re-pin once.
+
+### Added — the `ledgers` consumer-table family (CC 3.3.10.1 rc4.3, CIRISConstitution#92, CIRISPersist#754)
+
+In-grammar ledgers land as **owner-serialized content, staged on
+ratification**. The prohibition stands untouched — CEG carries no conserved
+balance as substrate state; value rides external rails (CC 3.3.10) — and
+what ships is the working INDEX plus the pure standard:
+
+- **Four tables** (V132, both dialects): `ledger_heads` (the L1 triple
+  binding + current head + witness anchor), `ledger_checkpoints` (L5
+  co-witnessed snapshots — immutable, a witnessed fact pins),
+  `ledger_entry_ranges` (which `evidence_refs` blob holds `[from, to]`),
+  `ledger_fork_evidence` (L8 records; deliberately NO FK — evidence about a
+  ledger this node never registered must not be droppable). Balance columns
+  are TEXT decimal (the fold is i128; a 64-bit column would cap its own
+  arithmetic).
+- **The pure standard** (`ledgers::standard`, compiled UNCONDITIONALLY so
+  the admission gate cannot vary by feature set): `derive_ledger_id` (L1,
+  pinned-JCS domain-tagged preimage — pinned canonicalizer, never
+  `produce_canon_version()`), entry hashing + chain validity (L2/L6 — the
+  promotion proof's substance), the **conservation fold** (L7: pure,
+  integer-only, byte-equal; matched transfer pairs sum to zero; every
+  violation a typed flag, never merged away — PeerReview's transferable-
+  evidence role), fork detection (L8: records, NEVER fires `slashing:*` —
+  adjudication distinguishes equivocation from honest stale-state recovery,
+  the eltoo critique answered by the cooperative witness set).
+- **The staging latch** (`STAGED_GOVERNED_FAMILIES`): `ledger:*` is
+  governed NOW and refused at federation tier by R2(b) until CC#92's
+  graduation lands the registry row — the re-vendor itself opens the door,
+  and the latch line then self-deletes by test. The L1 binding arm
+  (`check_ledger_binding_admission`) is live from day one: a `ledger:*`
+  row's declared `ledger_id` must BE the derivation of its
+  `(attested identity, unit-segment, version-segment)` triple, so a second
+  book cannot pass under any id. Dimensions carry the `:v1` segment — the
+  wire version IS the standard_version binding.
+- **The ACID witnesses**, through the exposed surface only: sixteen true
+  concurrent claims on one triple yield exactly one registration; the fork
+  race at one seq stores exactly one offered hash, never a blend; eight
+  differing checkpoints — one lands; rows survive a reopen from disk and a
+  second pool. 11 `LedgerService` verbs + 14 FFI methods (fold bytes are
+  compared ACROSS members — that is the point of byte-equal).
+- Evidence: `CLM-ledger-standard` / `CLM-ledger-fold` rows point at the
+  implementing symbols.
+
+### Added — the `registry_key_escrows` family (CIRISPersist#752, decided on #751)
+
+The CIRISRegistry → CIRISServer fold's one storage ask: registry's
+`key_escrows` working index (V133), five `KeyEscrowService` verbs folding
+the three PortalService escrow RPCs, five FFI verbs. Constitutionally the
+CC 4.4.3.2.8 `archive_custody` shape — custody METADATA, never key
+material, never a claims plane (CC 1.7's lockdown closes the envelope-kind
+branch; authorization rides `delegates_to`, recovery rides `key_grant`).
+Lifecycle: born active, ONE door, terminal states pin — and a re-offered
+create cannot resurrect a terminal escrow.
+
+### BREAKING
+
+- **#723** — `ComposedVerdict.witness_diversity` is a BAND
+  (`"established"` / `"not_established"`), no longer a raw float: scores.rs's
+  own contract ("the float never crosses the wire") had one default-on
+  exception, and the classifier only ever read its sign. Tri-state kept:
+  `None` (nothing attested) ≠ `NotEstablished` (an attested negative sank
+  the set — the fail-secure min-fold arm, now pinned through the enum).
+  Wire change on the directory-capsule op + `resolve_scores` JSON.
+- **#721** — `grant_trust` takes `SignedTrustGrant`, `revoke_trust` takes
+  `SignedTrustRevocation`: the granter/revoker PROVES itself (Strict hybrid
+  over pinned signing bytes against directory-pinned keys, verified inside
+  every backend), and only the granter withdraws its own grant. The V020
+  doors accepted a `trusted_by` the caller merely typed, and revoke
+  literally discarded `revoked_by`. `remove_peer_record` gains
+  `reason` (required) + `acting_under_delegation_id` (recorded): both
+  removal faces now emit `admin_action:peer_removal` in-transaction, the
+  DSAR-scoped `delete_traces_for_agent` announces like its Art.-17 sibling,
+  and the soft face stamps the sibling key row's `mutated_at` (the #707
+  class's third face). `TRUST_PLANE_OPS` classifies every trust-plane op;
+  parity reclassifies `validate_trust_grant` Gate → Plumbing (it was shape
+  validation being reported as a gate).
+- **#671** — `purge_genesis_delegation_row_v31` takes a
+  `GenesisPurgeAuthority` (`CompiledIn` | `QuorumVerified`), re-asked inside
+  all three backends; `verify_bundle_quorum` returns the unforgeable
+  `QuorumVerifiedBundle` proof. Candidate ceremony ids become re-cuttable —
+  and ONLY under a quorum proof carrying them (four-arm witness, negative
+  pin included). Sub-defects 1+2 of the issue had already landed in v36
+  (verified, not re-fixed).
+- **#748** — `TrustScoring::trust_score` drops `recursion_depth`;
+  `AdmissionGate` and `ReplicationConfig` drop the depth knobs. Every impl
+  bound `_recursion_depth`, every ctor passed 0, and no attenuation rule was
+  ever specified: a knob that does nothing is a lie. Transitive propagation
+  stays the consumer's (AV-29 records the non-goal as the mitigation); a
+  source-scan tripwire keeps the knob retired until someone pins the rule.
+
+### Fixed
+
+- **#609** — a node refusing 100% of a peer's writes no longer serializes
+  as clean: refusals are counted at the ONE chokepoint (inside `charge`'s
+  single lock acquisition), exposed as `refusals_by_budget` +
+  `refused_keys_in_window` (hard-bounded — the key is attacker-chosen and
+  unauthenticated, so an unbounded map would be a memory amplifier). The
+  BAND deliberately does not read them: a correct refusal is a fault report
+  about someone else; the tripwire's Red stays "this build's arithmetic
+  broke".
+- **#709** — the partner-licence quorum denominator folds expiry and
+  revocation: `resolve_steward_roster` counted every steward-shaped row
+  ever replicated in, so the same signed bytes admitted on a fresh node and
+  refused on a synced one ("2/33"). Witness: thirty expired rows and a
+  revoked steward land, the same two signers still admit. RECORDED, not
+  hidden: "steward" is two axes under one word (custody binding vs org
+  authority); the seating-ceremony designation stays open on #709.
+- **#724** — the two vendored manifests' `polarity` split-truth is a
+  checked fact: the cross-manifest agreement gate (subtractive, both
+  directions) ships seeded with the seven measured divergences, and every
+  registry family column must be deserialized, read-elsewhere (named
+  reader), or declared inert (named reason) — a new CC column reds until a
+  human decides which, without `deny_unknown_fields` breaking CC additions.
+- **#738** — the env-mutating test-anchor suite moved to its own PROCESS
+  (`tests/test_anchor_env.rs`) with an RAII arm guard; a source-scan
+  tripwire keeps env mutation out of src/. Proof at the class level:
+  genesis + trust_root + register + accord_carriage run 59/59 in PARALLEL
+  under plain `cargo test` with `test-anchor` on.
+- **#746** — a scope-address-table id (`cohort:*` / `av-stream:*`) handed
+  to `resolve_projection_recipients` refuses BY NAME
+  (`GroupIdNotFederationKeyed`, non-breaking variant) before any roster
+  read, never as a confident `GroupUnresolvable` about a group that was
+  never asked about. The handover is edge's; both refusal enums now carry
+  forced-wildcard-arm guidance (map it to cannot-judge, never a verdict).
+
+### Consumer notes
+
+Server/Edge re-pin: `witness_diversity` JSON shape; `SignedTrustGrant` /
+`SignedTrustRevocation` wire shapes; `remove_peer_record` attribution
+params (capsule op fields are serde-default, so old payloads decode and
+refuse with the TYPED reason-required error); `TrustScoring` impls drop the
+depth param; the genesis validator's `remove_peer_record` calls gain
+attribution. The `ledger:*` plane stays refused at federation tier until
+CIRISConstitution#92 graduates — build against the tables and the pure
+standard now; the wire opens by re-vendor.
+
 ## [37.1.0] - 2026-08-19
 
 **MINOR: adds public API.** Two consumer-surface verbs CIRISEdge asked for while
