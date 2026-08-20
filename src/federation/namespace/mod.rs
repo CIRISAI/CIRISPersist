@@ -1187,6 +1187,14 @@ pub async fn is_trust_root(
 /// match what they report on and let the rest fall through — the refusal is
 /// carried by [`RecipientVerdict::may_advertise`], never by this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # The forced wildcard arm (downstream guidance, v38.0.0 / #746)
+///
+/// `#[non_exhaustive]` forces external matches to carry a wildcard arm.
+/// Map that arm to **"I cannot judge"** — withhold, never a seated/
+/// not-seated answer. A wildcard that defaults to "not in the set" turns
+/// every future variant into a silent refusal of legitimate peers, and one
+/// that defaults to "in the set" turns it into an open door; only
+/// cannot-judge fails closed without lying about why.
 #[non_exhaustive]
 pub enum RecipientBasis {
     /// [`Projection::SelfOwn`] — **the record's OWN roster bounds the set.**
@@ -1215,6 +1223,21 @@ pub enum RecipientBasis {
     /// (the scope has no roster AT ALL) and, critically, distinct from a
     /// RESOLVED roster the peer is simply not on.
     GroupUnresolvable,
+    /// **Wrong id space** (v38.0.0, CIRISPersist#746) — the caller handed a
+    /// SCOPE-ADDRESS-TABLE id (edge's `ContentScope::Group` mints
+    /// `cohort:{community_id}` / `av-stream:{hex}`) where this verb's
+    /// contract is a FEDERATION DIRECTORY key id (`family_key_id` /
+    /// `community_key_id` / `key_id`). Persist holds no mapping between the
+    /// two spaces, and answering through the roster read would have reported
+    /// a confident [`GroupUnresolvable`](Self::GroupUnresolvable) about a
+    /// group that was never asked about — the false-authoritative "I cannot
+    /// judge" this verb's signature exists to prevent (#731). The prefix
+    /// check is a TYPED REFUSAL ONLY, never a resolution path — sniffing a
+    /// prefix to pick a table would be one parameter meaning two things,
+    /// the axis fusion this repo removes elsewhere. The handover itself is
+    /// edge's: `ContentScope` must carry (or translate to) the federation
+    /// group key id it already knows at scope-address mint time.
+    GroupIdNotFederationKeyed,
     /// **Cannot judge, by construction** — the projection's audience is keyed
     /// on an axis that is not a roster: [`Projection::Capability`] selects by
     /// ROLE and [`Projection::Subject`] by the data subject's grant. Neither
@@ -1385,6 +1408,25 @@ pub async fn resolve_projection_recipients(
     // [`active_roster_of`](crate::federation::trust_root::active_roster_of)
     // draws the same line (`Ok(None)` vs `Ok(Some(vec![]))`) for the same
     // reason.
+    // v38.0.0 (CIRISPersist#746) — a scope-address-table id is the WRONG ID
+    // SPACE for this verb, and it is refused BY NAME before any roster read:
+    // feeding it through active_members would yield a confident
+    // GroupUnresolvable about a group that was never asked about. The two
+    // prefixes are the ones edge's scope-address table mints; the check
+    // refuses, it never routes — routing on a sniffed prefix would be the
+    // axis fusion this parameter exists to remove.
+    if group_key_id.starts_with("cohort:") || group_key_id.starts_with("av-stream:") {
+        tracing::warn!(
+            cohort_scope,
+            group_key_id,
+            peer_key_id,
+            "resolve_projection_recipients: scope-address-table id in the \
+             federation-key parameter (#746) — WITHHOLDING with the typed \
+             refusal; the caller must hand over the federation group key id"
+        );
+        return Ok(cannot_judge(RecipientBasis::GroupIdNotFederationKeyed));
+    }
+
     if matches!(cohort, crate::federation::cohort::Cohort::SelfId)
         && !matches!(directory.lookup_public_key(group_key_id).await, Ok(Some(_)))
     {
@@ -3424,6 +3466,59 @@ mod recipient_set_tests {
         assert_eq!(v.basis, RecipientBasis::Unbounded);
         assert!(v.set_resolvable && v.peer_in_set);
         assert!(v.may_advertise(), "Global bounds nobody out");
+    }
+
+    /// v38.0.0 (CIRISPersist#746) — **a scope-address-table id is refused BY
+    /// NAME, never answered as an unknown group.** Edge's
+    /// `ContentScope::Group` carries `cohort:{community_id}` /
+    /// `av-stream:{hex}` — a different id space than the federation
+    /// directory key this verb's contract names. Before this cut, feeding
+    /// one through yielded a confident `GroupUnresolvable` for a peer that
+    /// may well be SEATED on the real roster — the false-authoritative
+    /// wildcard the verb's signature exists to prevent. Now the refusal
+    /// names the actual problem, and the roster is never consulted (a
+    /// prefix that ROUTED to a table would be axis fusion; a prefix that
+    /// refuses is a typed error).
+    #[tokio::test]
+    async fn a_table_id_is_refused_by_name_not_answered_as_unknown_746() {
+        let backend = holdings_fixture().await;
+        for table_id in [format!("cohort:{FAMILY}"), "av-stream:deadbeef".to_owned()] {
+            let v = resolve_projection_recipients(
+                &backend,
+                Plane::FountainContent,
+                "community",
+                AuthorityClass::ProducerSteward,
+                false,
+                &table_id,
+                SEATED,
+            )
+            .await
+            .expect("no Err");
+            assert_eq!(
+                v.basis,
+                RecipientBasis::GroupIdNotFederationKeyed,
+                "{table_id}: the wrong id space must be named, not shrugged at"
+            );
+            assert!(
+                !v.set_resolvable,
+                "{table_id}: cannot judge is not resolved"
+            );
+            assert!(!v.may_advertise(), "{table_id}: and it still fails closed");
+        }
+        // The control: the REAL federation key resolves exactly as before —
+        // the refusal is about the id space, not about the group.
+        let v = resolve_projection_recipients(
+            &backend,
+            Plane::FountainContent,
+            "federation",
+            AuthorityClass::AccordCoScrub,
+            false,
+            FAMILY,
+            STRANGER,
+        )
+        .await
+        .expect("no Err");
+        assert_ne!(v.basis, RecipientBasis::GroupIdNotFederationKeyed);
     }
 
     /// Role-keyed and subject-keyed audiences are NOT roster questions. The

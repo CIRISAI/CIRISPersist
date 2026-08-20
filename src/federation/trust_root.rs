@@ -1927,6 +1927,13 @@ pub struct RelayVerdict {
 /// [`RelayVerdict::refusal_reason`] returns the first that applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// # The forced wildcard arm (downstream guidance, v38.0.0 / #746)
+///
+/// `#[non_exhaustive]` forces external matches to carry a wildcard arm.
+/// Map it to **"I cannot judge"** — refuse-and-withhold, never a
+/// seated/not-seated verdict: a future refusal variant your build has not
+/// heard of is still a refusal, and inventing a verdict for it is how a
+/// relay gate answers a question it was never asked.
 #[non_exhaustive]
 pub enum RelayRefusal {
     /// **"I cannot judge."** This node holds no family under the object's root,
