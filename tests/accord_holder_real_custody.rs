@@ -219,7 +219,11 @@ async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
     let verified = verify_bundle_quorum(&backend, bundle)
         .await
         .expect("#554: the production bundle must verify");
-    assert_eq!(verified, 2, "A1 + B1 hybrid authorizations — 2-of-3");
+    assert_eq!(
+        verified.distinct_holders(),
+        2,
+        "A1 + B1 hybrid authorizations — 2-of-3"
+    );
 
     // The SAME artifact's holders must pass the SAME gate the put path runs.
     // Pre-#554 this half refused every holder the verifier had just blessed.

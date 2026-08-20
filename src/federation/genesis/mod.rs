@@ -614,15 +614,38 @@ fn baked_delegation_row(id: &str) -> Option<&'static super::Attestation> {
 /// [`Error::InvalidArgument`](super::Error::InvalidArgument) if `attestation_id`
 /// is not a baked genesis delegation id.
 pub fn check_genesis_rebake_purge_admission(attestation_id: &str) -> Result<(), super::Error> {
+    check_genesis_rebake_purge_admission_under(
+        attestation_id,
+        &bundle::GenesisPurgeAuthority::CompiledIn,
+    )
+}
+
+/// v38.0.0 (CIRISPersist#671) — the purge door's predicate, under a NAMED
+/// authority. `CompiledIn` keeps the exact #665 bound; `QuorumVerified`
+/// widens it to ids a bundle carries whose holder quorum THIS NODE verified
+/// ([`bundle::QuorumVerifiedBundle`] is constructible only by
+/// [`bundle::verify_bundle_quorum`], so the widening is a proof, never a
+/// caller-supplied string list). An id under NEITHER bound refuses — a
+/// caller with no verified bundle cannot purge a candidate id, on any
+/// backend, which is the negative half the witness pins.
+pub fn check_genesis_rebake_purge_admission_under(
+    attestation_id: &str,
+    authority: &bundle::GenesisPurgeAuthority<'_>,
+) -> Result<(), super::Error> {
     if baked_delegation_row(attestation_id).is_some() {
         return Ok(());
     }
+    if let bundle::GenesisPurgeAuthority::QuorumVerified(verified) = authority {
+        if verified.carries_attestation_id(attestation_id) {
+            return Ok(());
+        }
+    }
     Err(super::Error::InvalidArgument(format!(
         "refusing to purge attestation {attestation_id} through the genesis re-bake door \
-         (CIRISPersist#665): it is not one of the baked genesis delegation ids {:?}. This door \
-         exists only to let the compiled-in bundle replace its OWN previous ceremony's rows — \
-         the general purge path is `purge_attestation_v31`, and it refuses exclusion-bearing \
-         rows on purpose",
+         (CIRISPersist#665/#671): it is not one of the baked genesis delegation ids {:?}, and \
+         the presented authority carries no quorum-verified bundle naming it. This door exists \
+         only to let a ceremony replace rows it is HOLDING replacements for — the general purge \
+         path is `purge_attestation_v31`, and it refuses exclusion-bearing rows on purpose",
         genesis_delegation_ids(),
     )))
 }
@@ -3454,7 +3477,11 @@ where
     }
 
     match dir
-        .purge_genesis_delegation_row_v31(id, expected_persist_row_hash)
+        .purge_genesis_delegation_row_v31(
+            id,
+            expected_persist_row_hash,
+            &bundle::GenesisPurgeAuthority::CompiledIn,
+        )
         .await
     {
         // v31.1.0 (CIRISPersist#665 review) — the compare-and-delete found a
@@ -3986,9 +4013,10 @@ mod tests {
         sq.seed_genesis_accord_holders(&b.holders)
             .await
             .expect("holders seed");
-        let n = verify_bundle_quorum(&sq, &b)
+        let quorum_proof = verify_bundle_quorum(&sq, &b)
             .await
             .expect("bundle quorum verifies");
+        let n = quorum_proof.distinct_holders();
         eprintln!("DRYRUN quorum: {n} authorizations verified");
         seed_accord_family(&sq).await.expect("family row");
         for rec in &b.serve_nodes {

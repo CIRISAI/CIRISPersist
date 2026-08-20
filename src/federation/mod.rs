@@ -1314,8 +1314,9 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
+        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, Error> {
-        let _ = (attestation_id, expected_persist_row_hash);
+        let _ = (attestation_id, expected_persist_row_hash, authority);
         Err(Error::Unsupported {
             method: "purge_genesis_delegation_row_v31",
         })

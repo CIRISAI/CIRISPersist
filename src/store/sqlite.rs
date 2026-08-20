@@ -4643,9 +4643,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
+        authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate, before any statement runs (AV-9).
-        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+            attestation_id,
+            authority,
+        )?;
         let conn = self.conn.clone();
         let id = attestation_id.to_owned();
         let expected = expected_persist_row_hash.to_owned();

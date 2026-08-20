@@ -3945,10 +3945,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
+        authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate (AV-9), before the lock, so a refusal cannot
         // interleave with a mutation.
-        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+            attestation_id,
+            authority,
+        )?;
         let mut state = self.state.lock().expect("memory backend lock");
         // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE, under the same
         // lock as the removal so the compare cannot be overtaken between the two

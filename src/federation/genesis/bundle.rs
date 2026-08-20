@@ -377,6 +377,62 @@ pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
     Some((m.parse().ok()?, n.parse().ok()?))
 }
 
+/// v38.0.0 (CIRISPersist#671) — **proof that a bundle's holder quorum
+/// verified on THIS node.** The only constructor is
+/// [`verify_bundle_quorum`], which makes the value an unforgeable token:
+/// holding one means an m-of-n strict-majority of the node's OWN roster
+/// signed the bundle's `authorization_digest` — a digest over the WHOLE
+/// bundle, its attestation ids included. That is what lets the genesis
+/// purge door widen from "ids the compiled-in artifact carries" to "ids a
+/// verified ceremony carries" without degenerating into "ids the caller
+/// names": the authority is a proof of quorum, never a string list.
+#[derive(Debug)]
+pub struct QuorumVerifiedBundle<'a> {
+    bundle: &'a GenesisBundle,
+    distinct_holders: usize,
+}
+
+impl<'a> QuorumVerifiedBundle<'a> {
+    /// How many distinct holders verified — the bake report's number.
+    #[must_use]
+    pub fn distinct_holders(&self) -> usize {
+        self.distinct_holders
+    }
+
+    /// Whether the verified bundle carries `attestation_id` — the purge
+    /// door's widened predicate. Covered by the quorum signatures: the ids
+    /// are inside the authorization digest.
+    #[must_use]
+    pub fn carries_attestation_id(&self, attestation_id: &str) -> bool {
+        self.bundle
+            .attestations
+            .iter()
+            .any(|sa| sa.attestation.attestation_id == attestation_id)
+    }
+}
+
+/// v38.0.0 (CIRISPersist#671) — **who authorizes a genesis delegation-row
+/// purge.** The #665 door's bound was "the id must be one the COMPILED-IN
+/// bundle carries" — drawn when the compiled artifact was the only source
+/// of genesis ids. `bake_assembled_genesis` broke that premise: a verified
+/// candidate bundle may carry a NOVEL id (`genesis-grant:<new-serve-node>`),
+/// which installed fine and then could never be re-cut — every later
+/// ceremony reissuing that stable id hit the purge refusal, and the `?`
+/// aborted the whole bake. The authority names which regime the caller is
+/// in; the door re-asks it INTERNALLY on every backend (the AV-9
+/// discipline — a delete door whose safety lives in its caller is the #652
+/// shape).
+pub enum GenesisPurgeAuthority<'a> {
+    /// The boot path re-baking the compiled-in artifact — the original
+    /// #665 bound, unchanged.
+    CompiledIn,
+    /// A candidate bundle whose holder quorum THIS NODE verified. The
+    /// blast-radius argument survives intact: for a quorum-verified id the
+    /// bundle authorizing the purge is BY CONSTRUCTION holding the
+    /// replacement.
+    QuorumVerified(&'a QuorumVerifiedBundle<'a>),
+}
+
 /// v19.1.0 (#490) — verify a bundle's holder quorum **against persist's own
 /// verified state**: each authorization's holder must resolve in THIS
 /// node's directory as a seated accord holder (the baked/effective roster),
@@ -384,8 +440,13 @@ pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
 /// over [`authorization_digest`] with the DIRECTORY-pinned pubkeys, and the
 /// distinct count must reach `max(carried M, strict_majority(own roster))`
 /// — the floor means a tampered `consensus_protocol` cannot talk the
-/// threshold down. Returns the distinct verified-holder count.
-pub async fn verify_bundle_quorum<D>(directory: &D, bundle: &GenesisBundle) -> Result<usize, Error>
+/// threshold down. Returns the quorum PROOF (v38.0.0/#671): a
+/// [`QuorumVerifiedBundle`] carrying the distinct verified-holder count and
+/// authorizing the genesis purge door for the ids this bundle carries.
+pub async fn verify_bundle_quorum<'a, D>(
+    directory: &D,
+    bundle: &'a GenesisBundle,
+) -> Result<QuorumVerifiedBundle<'a>, Error>
 where
     D: FederationDirectory + ?Sized,
 {
@@ -503,7 +564,10 @@ where
             })?;
     }
 
-    Ok(distinct.len())
+    Ok(QuorumVerifiedBundle {
+        bundle,
+        distinct_holders: distinct.len(),
+    })
 }
 
 /// Per-item outcome inside a [`GenesisBakeReport`].
@@ -617,7 +681,8 @@ where
 
     // Fail-closed FIRST: no write before the quorum verifies against our
     // own roster + pinned keys.
-    let quorum_verified = verify_bundle_quorum(directory, &bundle).await?;
+    let quorum = verify_bundle_quorum(directory, &bundle).await?;
+    let purge_authority = GenesisPurgeAuthority::QuorumVerified(&quorum);
 
     // Serve nodes: insert / idempotent / authenticated re-anchor.
     let mut serve_outcomes = Vec::with_capacity(bundle.serve_nodes.len());
@@ -748,7 +813,11 @@ where
                     // so there is no evidence to preserve.
                     super::preflight_replacement_admission(&sa.attestation)?;
                     if directory
-                        .purge_genesis_delegation_row_v31(&id, &existing.persist_row_hash)
+                        .purge_genesis_delegation_row_v31(
+                            &id,
+                            &existing.persist_row_hash,
+                            &purge_authority,
+                        )
                         .await?
                     {
                         match directory.put_attestation(sa.clone()).await {
@@ -832,7 +901,11 @@ where
                         continue;
                     }
                     if directory
-                        .purge_genesis_delegation_row_v31(&id, &existing.persist_row_hash)
+                        .purge_genesis_delegation_row_v31(
+                            &id,
+                            &existing.persist_row_hash,
+                            &purge_authority,
+                        )
                         .await?
                     {
                         // A duplicate here is NOT a false success — the `?`
@@ -862,7 +935,7 @@ where
     }
 
     Ok(GenesisBakeReport {
-        quorum_verified,
+        quorum_verified: quorum.distinct_holders(),
         serve_nodes: serve_outcomes,
         attestations: att_outcomes,
     })
@@ -871,6 +944,59 @@ where
 #[cfg(test)]
 mod authorization_digest_tests {
     use super::*;
+
+    /// v38.0.0 (CIRISPersist#671) — **the purge door widens under quorum,
+    /// and ONLY under quorum.** The un-recuttable-candidate-id defect: a
+    /// verified ceremony could install `genesis-grant:<new-serve-node>`
+    /// (a novel id), and every later ceremony reissuing that stable id hit
+    /// the compiled-in-only purge refusal — with the `?` aborting the whole
+    /// bake. Four arms, each a distinct fact: baked id under CompiledIn
+    /// (the #665 bound, unchanged); novel id under CompiledIn (the negative
+    /// pin — no verified bundle, no purge); novel id under a quorum proof
+    /// CARRYING it (the re-cut, now open); novel id under a quorum proof
+    /// NOT carrying it (a proof is not a skeleton key).
+    #[test]
+    fn the_purge_door_widens_under_quorum_and_only_under_quorum_671() {
+        use crate::federation::genesis::check_genesis_rebake_purge_admission_under as door;
+
+        let artifact = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/genesis_v2.json"
+        ));
+        let mut bundle = parse_genesis_bundle(artifact).expect("fixture parses");
+        // The real re-cut shape: a ceremony carrying a grant for a NEW
+        // serve node — an id the compiled-in artifact has never heard of.
+        let novel = "genesis-grant:new-serve-node-671";
+        bundle.attestations[1].attestation.attestation_id = novel.to_owned();
+        // Same-module construction: the predicate under test is the DOOR's,
+        // not the verifier's (verify_bundle_quorum's own witnesses live in
+        // tests/accord_holder_real_custody.rs against real signatures).
+        let proof = QuorumVerifiedBundle {
+            bundle: &bundle,
+            distinct_holders: 2,
+        };
+
+        let baked = "genesis-charter";
+        assert!(door(baked, &GenesisPurgeAuthority::CompiledIn).is_ok());
+        assert!(door(baked, &GenesisPurgeAuthority::QuorumVerified(&proof)).is_ok());
+
+        // The negative pin: an id named by a caller with NO verified bundle
+        // is still refused — on every backend, since each re-asks this
+        // predicate internally.
+        let err = door(novel, &GenesisPurgeAuthority::CompiledIn).unwrap_err();
+        assert!(err.to_string().contains("#665/#671"), "{err}");
+
+        // The re-cut: the proof carries the id, the door opens.
+        assert!(door(novel, &GenesisPurgeAuthority::QuorumVerified(&proof)).is_ok());
+
+        // A proof is not a skeleton key: an id the bundle does NOT carry
+        // stays refused under it.
+        assert!(door(
+            "genesis-grant:some-other-node",
+            &GenesisPurgeAuthority::QuorumVerified(&proof)
+        )
+        .is_err());
+    }
 
     /// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — **the field set of
     /// `KeyRecord` is pinned, so widening the record widens the digest as a
