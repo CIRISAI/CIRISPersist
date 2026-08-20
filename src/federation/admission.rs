@@ -8783,13 +8783,16 @@ pub async fn check_privileged_identity_type_admission_over_roster(
         //
         // - HardwareAttested (`accord_holder`) → hardware_attestation_policy
         // - AnchorScrubbed  (`canonical`)      → check_canonical_role_admission
-        // - DerivedFromVerifiedState (`witness`/`steward`/`partner`/
-        //   `wise_authority`) → the claim is DESCRIPTIVE; every use site
-        //   re-derives the authority from persist's own verified state (the
-        //   steward-binding walk, licensure quorum, WA adjudication edge), so a
-        //   self-asserted claim buys nothing. Demanding a co-scrub for these
-        //   would fail CLOSED on legitimate operators — a witness has no accord
-        //   family to co-scrub it, and at bootstrap there is no roster at all.
+        // - DerivedFromVerifiedState (`steward`/`partner`/`wise_authority`)
+        //   → the claim is DESCRIPTIVE; use sites re-derive the authority
+        //   from persist's own verified state (the steward-binding walk,
+        //   licensure quorum, WA adjudication edge), so a self-asserted
+        //   claim buys nothing. Demanding a co-scrub for these would fail
+        //   CLOSED on legitimate operators, and at bootstrap there is no
+        //   roster at all. CAVEAT (v38.0.0, #709): for STEWARD that claim
+        //   holds on the custody-binding axis; the ORG-AUTHORITY roster was
+        //   a bare string test until v38 folded expiry + revocation, and its
+        //   seating ceremony is #709's open decision — see the mode table.
         //
         // Getting this distinction wrong in either direction is a real bug:
         // too loose and a Sybil self-asserts authority; too strict and honest

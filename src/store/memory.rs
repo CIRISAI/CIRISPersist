@@ -10611,6 +10611,104 @@ mod tests {
         ts::assert_quorum_bundle_survives_backward_clock(&backend, &node, "mem", future).await;
     }
 
+    /// v38.0.0 (CIRISPersist#709) — **a bystander's registration is not a
+    /// vote.** The partner-licence quorum denominator was `count(identity_type
+    /// = steward)` over the whole directory — no validity window, no
+    /// revocation fold — while M is signed and frozen at mint. So the SAME
+    /// signed bytes admitted on a fresh node and refused on a synced one
+    /// ("quorum policy 2/33 refused"), non-convergent and remotely inflatable
+    /// (steward-shaped rows arrive over replication and never leave). The
+    /// denominator now folds the two liveness facts persist itself holds:
+    /// expiry and revocation.
+    #[tokio::test]
+    async fn partner_quorum_denominator_folds_liveness_709() {
+        use crate::federation::operational::test_support as op;
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+
+        let stewards: Vec<op::Identity> = (0..3)
+            .map(|i| op::Identity::new(&format!("s709-{i}")))
+            .collect();
+        for s in &stewards {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: s.steward_key_record(),
+                })
+                .await
+                .unwrap();
+        }
+        let refs: Vec<&op::Identity> = stewards.iter().collect();
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+
+        // THE CONTROL — 2 of 3 seated stewards is a strict majority.
+        backend
+            .put_partner_record(op::signed_partner_record(
+                &uuid::Uuid::new_v4().to_string(),
+                "lic-709-control",
+                1,
+                "active",
+                now,
+                &refs[..2],
+                2,
+                false,
+            ))
+            .await
+            .expect("2-of-3 must admit before the accumulation");
+
+        // THE ACCUMULATION — thirty EXPIRED steward-shaped rows, planted as
+        // state (what a directory looks like after months of replication;
+        // the door's own gates are not the subject here, the DENOMINATOR is).
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for i in 0..30 {
+                let mut rec = op::Identity::new(&format!("expired709-{i}")).steward_key_record();
+                rec.valid_until = Some("2021-01-01T00:00:00Z".parse().unwrap());
+                st.federation_keys.insert(rec.key_id.clone(), rec);
+            }
+        }
+        // …and one REVOKED live steward, through the real doors.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("revoked709", "revoked709", "revoked709"),
+            })
+            .await
+            .ok();
+        {
+            // identity_type must be steward for the row to enter the scan.
+            let mut st = backend.state.lock().expect("memory backend lock");
+            if let Some(rec) = st.federation_keys.get_mut("revoked709") {
+                rec.identity_type = crate::federation::types::identity_type::STEWARD.to_owned();
+            }
+        }
+        backend
+            .put_revocation(SignedRevocation {
+                revocation: fix_revocation("rev709", "revoked709", "revoked709", "revoked709"),
+            })
+            .await
+            .expect("revocation admits");
+
+        // THE SAME two signers, a NEW licence: the denominator must still be
+        // the 3 seated stewards — an expired row is not seated, a revoked row
+        // is not seated, and a bystander's registration is not a vote.
+        backend
+            .put_partner_record(op::signed_partner_record(
+                &uuid::Uuid::new_v4().to_string(),
+                "lic-709-after",
+                1,
+                "active",
+                now,
+                &refs[..2],
+                2,
+                false,
+            ))
+            .await
+            .expect(
+                "2-of-3 SEATED must still admit — 30 expired rows and a revoked one \
+                 inflated the denominator (#709)",
+            );
+    }
+
     /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
     /// survives a backward clock step, on this backend's real write path.**
     ///

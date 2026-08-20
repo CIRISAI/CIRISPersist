@@ -420,6 +420,20 @@ pub mod identity_type {
             // plane is where conferral lives. The mode was mis-declared, not
             // merely unenforced.
             WITNESS => ConferralMode::DelegatedFromTrustRoot,
+            // v38.0.0 (CIRISPersist#709) — STEWARD's row here is HALF TRUE,
+            // and the half matters: "steward" is two axes under one word.
+            // The custody steward-BINDING (which human anchors a key) is
+            // genuinely re-derived at every use site — `steward_bindings_of`
+            // walks live `delegates_to` edges. The ORG-AUTHORITY roster
+            // (`resolve_steward_roster` / `check_role_authority`'s bootstrap
+            // anchor) was a bare membership test against this self-asserted
+            // string — the exact shape #607 ruled a MIS-DECLARATION for
+            // WITNESS. v38 folds expiry + revocation into that roster; the
+            // remaining step — designating the seating ceremony (registration
+            // co-scrub à la #607, or a steward-body family per
+            // `ownership_reclaim::wa_quorum_over_body`) — is #709's open
+            // decision, and until it lands this mode row is a claim about
+            // the BINDING axis only.
             STEWARD | PARTNER | WISE_AUTHORITY => ConferralMode::DerivedFromVerifiedState,
             _ => return None,
         })
