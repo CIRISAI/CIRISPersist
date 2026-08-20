@@ -887,4 +887,84 @@ mod tests {
         assert!(a.reserved.is_none());
         assert!(lookup("totally:made:up:dimension").is_none());
     }
+
+    /// v38.0.0 (CIRISPersist#724) — **nothing could notice an unread
+    /// manifest column.** The `polarity` column shipped in the vendored
+    /// registry and sat unread for five weeks across three vendorings,
+    /// because `RawFamily` deserializes a SUBSET of the row and serde
+    /// silently drops the rest (deliberately — `deny_unknown_fields` would
+    /// make every future CC column addition a hard break, and the
+    /// optional-column-over-panic rationale above stands). This closes the
+    /// noticing gap without closing the compatibility door: every column
+    /// the artifact actually carries must be deserialized by [`RawFamily`],
+    /// read elsewhere (named below with its reader), or deliberately inert
+    /// (named below with WHY). A new CC column reds this test until a human
+    /// decides which it is — which is the entire ask of #724.
+    #[test]
+    fn every_manifest_family_column_has_a_reader_724() {
+        // Columns RawFamily deserializes — a hand pin; if RawFamily gains a
+        // field this list is one line away and the test names the file.
+        const DESERIALIZED: &[&str] = &[
+            "prefix",
+            "owning_component",
+            "owning_repo",
+            "cc_section",
+            "description",
+            "reserved_rule",
+        ];
+        // Columns read OUTSIDE the shared type, each naming its reader.
+        const READ_ELSEWHERE: &[(&str, &str)] = &[(
+            "polarity",
+            "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
+             at that site) + the #724 cross-manifest agreement gate",
+        )];
+        // Columns deliberately inert, each naming WHY — the subtractive
+        // manifest: a rationale under 40 chars is a shrug, not a reason.
+        const DELIBERATELY_UNREAD: &[(&str, &str)] = &[(
+            "reserved",
+            "redundant with reserved_rule presence by construction; the redundancy itself \
+             is what RawFamily's field comment pins, and reading both would mint a second \
+             spelling of one fact",
+        )];
+
+        for (_, why) in DELIBERATELY_UNREAD {
+            assert!(
+                why.len() > 40,
+                "a rationale under 40 chars is a shrug: {why:?}"
+            );
+        }
+
+        let manifest: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let mut carried: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for fam in manifest["families"].as_array().unwrap() {
+            for k in fam.as_object().unwrap().keys() {
+                carried.insert(k.as_str());
+            }
+        }
+        assert!(carried.len() >= 6, "vacuous gate: {carried:?}");
+
+        let accounted: std::collections::BTreeSet<&str> = DESERIALIZED
+            .iter()
+            .copied()
+            .chain(READ_ELSEWHERE.iter().map(|(c, _)| *c))
+            .chain(DELIBERATELY_UNREAD.iter().map(|(c, _)| *c))
+            .collect();
+        let unaccounted: Vec<&&str> = carried
+            .iter()
+            .filter(|c| !accounted.contains(**c))
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "the vendored registry carries column(s) nothing reads and nobody has declared \
+             inert: {unaccounted:?}. Read it, name its reader, or record why it is inert — \
+             an unread manifest column is a claim the substrate silently ignores (#724)."
+        );
+        // Both directions: an accounted column the artifact no longer
+        // carries is a stale pin.
+        let stale: Vec<&&str> = accounted
+            .iter()
+            .filter(|c| !carried.contains(**c))
+            .collect();
+        assert!(stale.is_empty(), "stale column pin(s): {stale:?}");
+    }
 }
