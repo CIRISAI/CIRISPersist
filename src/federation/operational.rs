@@ -443,10 +443,47 @@ pub async fn resolve_steward_roster<F>(
 where
     F: crate::federation::FederationDirectory + ?Sized,
 {
-    let stewards = directory
+    let all = directory
         .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
         .await
         .map_err(|e| Error::OperationalAuthority(format!("steward roster resolve: {e}")))?;
+    // v38.0.0 (CIRISPersist#709) — **the roster is the SEATED stewards, not
+    // every steward-shaped row ever accumulated.** The quorum denominator
+    // (`founder_n` in `check_partner_set_and_quorum`) is computed over this
+    // list while M is signed into the envelope and frozen at mint — so a
+    // roster that only ever grows makes the same signed bytes admit on a
+    // fresh node and refuse on a synced one, with no repair short of a new
+    // ceremony. Two liveness facts fold here, both from persist's own
+    // verified state: the validity window on the registered row, and the
+    // revocation plane (a revoked steward is not seated; revocations are
+    // admitted through their own anti-rollback door and never leave).
+    //
+    // NOT folded here — recorded, not hidden: `identity_type = "steward"` is
+    // itself a self-asserted string (its ConferralMode row's "every use site
+    // re-derives from verified state" is TRUE of the custody steward-BINDING
+    // walk and FALSE of this org-authority roster — two axes under one word).
+    // Bounding the roster to conferral-seated stewards needs the seating
+    // ceremony DESIGNATED (registration co-scrub à la #607's WITNESS move,
+    // or a steward-body family per `ownership_reclaim::wa_quorum_over_body`)
+    // — tracked on #709, which stays open for exactly that decision.
+    let now = chrono::Utc::now();
+    let mut stewards = Vec::with_capacity(all.len());
+    for k in all {
+        if k.valid_from > now {
+            continue;
+        }
+        if k.valid_until.is_some_and(|u| u <= now) {
+            continue;
+        }
+        let revocations = directory
+            .revocations_for(&k.key_id)
+            .await
+            .map_err(|e| Error::OperationalAuthority(format!("steward revocation fold: {e}")))?;
+        if !revocations.is_empty() {
+            continue;
+        }
+        stewards.push(k);
+    }
     let members: Vec<ciris_verify_core::threshold::ThresholdMember> = stewards
         .iter()
         .map(|k| ciris_verify_core::threshold::ThresholdMember {
@@ -5254,17 +5291,33 @@ pub mod test_support {
         );
 
         // ── NEGATIVE leg: grant_trust / revoke_trust must NOT move it ──────
+        // v38.0.0 (#721): the doors take PROVEN grants now — register a
+        // hybrid granter and sign through the test-support twin of the
+        // production signing shape.
+        let granter = format!("trust-granter-707-{tag}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(directory, &granter)
+            .await;
         directory
-            .grant_trust(crate::federation::TrustGrant {
-                key: node.clone(),
-                trust_type: crate::federation::TrustType::Temporary,
-                trust_relationship: crate::federation::TrustRelationship::Direct,
-                trust_domains: None,
-                trusted_by: anchor.clone(),
-                expires_at: None,
-            })
+            .grant_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_grant(
+                    crate::federation::TrustGrant {
+                        key: node.clone(),
+                        trust_type: crate::federation::TrustType::Temporary,
+                        trust_relationship: crate::federation::TrustRelationship::Direct,
+                        trust_domains: None,
+                        trusted_by: granter.clone(),
+                        expires_at: None,
+                    },
+                ),
+            )
             .await?;
-        directory.revoke_trust(&node, &anchor).await?;
+        directory
+            .revoke_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_revocation(
+                    &node, &granter,
+                ),
+            )
+            .await?;
         let after_trust = directory
             .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
             .await?;

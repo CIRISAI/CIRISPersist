@@ -3048,7 +3048,7 @@ mod tests {
         // Install a gate that rates the author at 0.1, threshold 0.5.
         let mut scoring = crate::federation::MemoryTrustScoring::new();
         scoring.set_score(author.clone(), 0.1);
-        let gate = crate::federation::AdmissionGate::new(std::sync::Arc::new(scoring), 0.5, 0);
+        let gate = crate::federation::AdmissionGate::new(std::sync::Arc::new(scoring), 0.5);
         backend.set_admission_gate(Some(gate));
 
         let env = ContributionEnvelope {

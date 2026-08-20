@@ -749,6 +749,243 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
 ///   its reason. It has now done that once, for real.
 pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[];
 
+/// **Staged families** `(stem, tracking ref)` — governed NOW, registered NOT
+/// YET, and the R2(b) refusal is the staging latch (CIRISPersist#754).
+///
+/// The opposite posture from [`UNREGISTERED_GATED_FAMILIES`]: a declared
+/// exception ADMITS a governed-but-uncatalogued family; a staged family is
+/// deliberately REFUSED at every federation-tier door until the Constitution
+/// registers it. Nothing here needs flipping on graduation — the moment the
+/// CC row lands and the vendored `namespace_registry.json` is re-vendored,
+/// `is_family_registered` answers true and R2(b) stands aside. The staged
+/// line is then a stale latch, and
+/// [`tests::staged_families_are_still_unregistered_and_tracked`] fails until
+/// it is deleted — the same self-deleting discipline as the exceptions list.
+pub const STAGED_GOVERNED_FAMILIES: &[(&str, &str)] = &[
+    // CC 3.3.10.1 (1.0-rc4.3) — in-grammar ledgers. Persist's working index
+    // and the pure standard shipped ahead of ratification; `ledger:*` rows
+    // refuse at federation tier until CIRISConstitution#92 graduates the
+    // family. Local-tier rows are the node's own business, as everywhere.
+    ("ledger:", "CIRISConstitution#92"),
+];
+
+/// v38.0.0 (CIRISPersist#754) — the CC 3.3.10.1 `ledger:*` dimension family
+/// stem. Staged on CIRISConstitution#92 (see [`STAGED_GOVERNED_FAMILIES`]);
+/// the L1 binding arm below is live from day one so graduation opens an
+/// already-gated door, never an open one.
+pub const LEDGER_DIMENSION_PREFIX: &str = "ledger:";
+
+/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a
+/// [`TrustGrant`](super::TrustGrant): pinned-JCS over a domain-tagged
+/// projection of the grant. Pinned canonicalizer, never
+/// `produce_canon_version()` — a stored signature is a contract (the
+/// `compute_persist_row_hash` reasoning).
+pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": "ciris.trust.grant.v1",
+        "grant": grant,
+    });
+    crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
+        .canonicalize_value(&value)
+        .map_err(|e| Error::InvalidArgument(format!("trust grant canonicalize: {e}")))
+}
+
+/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a trust
+/// revocation. Same discipline as [`trust_grant_signing_bytes`].
+pub fn trust_revocation_signing_bytes(
+    key: &str,
+    revoked_by: &str,
+    revoked_at: &chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": "ciris.trust.revocation.v1",
+        "key": key,
+        "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "revoked_by": revoked_by,
+    });
+    crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
+        .canonicalize_value(&value)
+        .map_err(|e| Error::InvalidArgument(format!("trust revocation canonicalize: {e}")))
+}
+
+/// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
+/// granter must PROVE it is `trusted_by`: a Strict hybrid verification of
+/// the signature over [`trust_grant_signing_bytes`] against `trusted_by`'s
+/// DIRECTORY-PINNED pubkeys (never keys the caller carries — the #377
+/// rule: authority re-derives from this node's own verified state). Asked
+/// INSIDE every backend's `grant_trust`, in the same position, ahead of the
+/// shape validation — a door whose safety lives in its caller is the #652
+/// shape.
+pub async fn check_trust_grant_authority(
+    directory: &dyn super::FederationDirectory,
+    signed: &super::SignedTrustGrant,
+) -> Result<(), Error> {
+    let bytes = trust_grant_signing_bytes(&signed.grant)?;
+    crate::verify::hybrid::verify_hybrid_via_directory(
+        directory,
+        &bytes,
+        &signed.grant.trusted_by,
+        &signed.signature_classical_base64,
+        signed.signature_pqc_base64.as_deref(),
+        crate::verify::hybrid::HybridPolicy::Strict,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        Error::InvalidArgument(format!(
+            "trust grant authority: granter {:?} did not prove the grant (hybrid verify \
+             against the directory-pinned keys failed: {e}). A trust edge whose granter is \
+             unproven is a rumor with a column (CIRISPersist#721)",
+            signed.grant.trusted_by
+        ))
+    })?;
+    Ok(())
+}
+
+/// v38.0.0 (CIRISPersist#721) — **the trust-revocation authority gate.**
+/// Signature proof that the caller IS `revoked_by`, plus the ownership
+/// rule enforced by the backends against the STORED row: only the granter
+/// withdraws its own grant (the protective-1 side of the reverse-quorum
+/// classification — see [`TRUST_PLANE_OPS`]).
+pub async fn check_trust_revocation_authority(
+    directory: &dyn super::FederationDirectory,
+    signed: &super::SignedTrustRevocation,
+) -> Result<(), Error> {
+    let bytes =
+        trust_revocation_signing_bytes(&signed.key, &signed.revoked_by, &signed.revoked_at)?;
+    crate::verify::hybrid::verify_hybrid_via_directory(
+        directory,
+        &bytes,
+        &signed.revoked_by,
+        &signed.signature_classical_base64,
+        signed.signature_pqc_base64.as_deref(),
+        crate::verify::hybrid::HybridPolicy::Strict,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        Error::InvalidArgument(format!(
+            "trust revocation authority: revoker {:?} did not prove the revocation (hybrid \
+             verify against the directory-pinned keys failed: {e})",
+            signed.revoked_by
+        ))
+    })?;
+    Ok(())
+}
+
+/// v38.0.0 (CIRISPersist#721) — **every op that writes the trust plane,
+/// classified.** The accord-ops invariant: every governance-shaped op sits
+/// in a named row — m-of-n, reverse-quorum-protective, or unilateral-signed
+/// WITH the reason recorded — and an unclassified door is the finding.
+/// `(op, classification, gate — resolved as a definition by the test)`.
+pub const TRUST_PLANE_OPS: &[(&str, &str, &str)] = &[
+    (
+        "grant_trust (Direct)",
+        "unilateral-signed: the granter's OWN subjective edge about its own trust; consumers \
+         weigh it via resolve_trust policy, so no third party is bound by it",
+        "check_trust_grant_authority",
+    ),
+    (
+        "grant_trust (Registry)",
+        "signed conferral: trust_domains make it capability-shaped. RECORDED as the open \
+         question rather than silently unilateral — a consumer that treats registry domains \
+         as authority should require quorum treatment on this row (the #543 third-party \
+         rule); until one does, the signature gate bounds it to a provable granter",
+        "check_trust_grant_authority",
+    ),
+    (
+        "revoke_trust",
+        "protective-1 (reverse-quorum side 1): the granter withdrawing its OWN grant; \
+         ownership enforced against the STORED trusted_by inside every backend",
+        "check_trust_revocation_authority",
+    ),
+    (
+        "emit::grant_trust (V021 audit-chained twin)",
+        "unilateral-signed by construction: the granter IS the LocalSigner, self-grant \
+         structurally refused, landed via the audit chain",
+        "grant_trust",
+    ),
+];
+
+/// Reason token for [`check_ledger_binding_admission`] refusals. A token on
+/// the existing [`Error::DimensionRejected`] shape rather than a new variant,
+/// for the reason `invariant.rs` records: the pyo3 FFI matches
+/// `DimensionRejected {..}` by shape, so a token needs no FFI change.
+pub const LEDGER_BINDING_REASON: &str = "ledger_l1_binding_violation";
+
+/// CC 3.3.10.1 **L1** — a `ledger:*` row's declared `ledger_id` must BE the
+/// derivation of its triple, and the triple is read off signature-covered
+/// material: the owner is `attested_key_id` (the row is ABOUT the ledger's
+/// steward-bound identity), the unit and standard version are dimension
+/// segments (`ledger:head:{unit}:v{N}` / `ledger:checkpoint:{unit}:v{N}`).
+///
+/// Because `ledger_id` is a pure function of the triple
+/// ([`crate::ledgers::standard::derive_ledger_id`] — the ONE spelling, which
+/// is why `ledgers::standard` is compiled unconditionally), "a second ledger
+/// claiming an occupied triple" cannot pass this gate under a different id:
+/// same triple ⇒ same derivation, and a foreign id fails the recompute. The
+/// remaining fork — two chains under one correctly-derived id — is L8's
+/// problem, not L1's.
+///
+/// `ledger:promotion:v{N}` rows carry no unit segment, so the recompute does
+/// not apply; the gate still requires the envelope to NAME its `ledger_id`
+/// (a promotion about no ledger is undecidable, and fail-secure beats
+/// admit-and-wait on a governed family). A malformed `ledger:*` dimension is
+/// refused outright for the same reason.
+///
+/// Pure — no directory lookup — so it sits in the cheap tier of
+/// [`check_reserved_prefix_admission`] beside the R2 arms.
+pub fn check_ledger_binding_admission(
+    attestation_type: &str,
+    envelope: &serde_json::Value,
+    attested_key_id: &str,
+) -> Result<(), Error> {
+    if attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(LEDGER_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    let reject = || {
+        Err(Error::DimensionRejected {
+            dimension: dimension.to_string(),
+            reason: LEDGER_BINDING_REASON,
+        })
+    };
+    let segments: Vec<&str> = dimension.split(':').collect();
+    let (unit, version) = match segments.as_slice() {
+        ["ledger", "head", unit, v] | ["ledger", "checkpoint", unit, v] => (Some(*unit), *v),
+        ["ledger", "promotion", v] => (None, *v),
+        _ => return reject(),
+    };
+    let Some(digits) = version.strip_prefix('v') else {
+        return reject();
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return reject();
+    }
+    let Some(declared) = envelope.get("ledger_id").and_then(|v| v.as_str()) else {
+        return reject();
+    };
+    if let Some(unit) = unit {
+        if unit.is_empty() {
+            return reject();
+        }
+        let expected = crate::ledgers::standard::derive_ledger_id(attested_key_id, unit, digits)
+            .map_err(|_| Error::DimensionRejected {
+                dimension: dimension.to_string(),
+                reason: LEDGER_BINDING_REASON,
+            })?;
+        if declared != expected {
+            return reject();
+        }
+    }
+    Ok(())
+}
+
 /// **CIRISPersist#571 — the three media-plane families persist STOPPED gating,
 /// and why that is a fix rather than a relaxation.**
 ///
@@ -835,6 +1072,11 @@ pub fn governed_family_stems() -> Vec<String> {
         .map(|r| family_stem(&r.pattern_prefix).to_owned())
         .chain(HARD_CODED_RESERVED_STEMS.iter().map(|s| (*s).to_owned()))
         .chain(
+            STAGED_GOVERNED_FAMILIES
+                .iter()
+                .map(|(s, _)| (*s).to_owned()),
+        )
+        .chain(
             crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
                 .iter()
                 .map(|s| family_stem(s).to_owned()),
@@ -889,6 +1131,7 @@ fn is_governed_family(namespace: &str) -> bool {
         .iter()
         .any(|r| family_stem(&r.pattern_prefix) == stem)
         || HARD_CODED_RESERVED_STEMS.contains(&stem)
+        || STAGED_GOVERNED_FAMILIES.iter().any(|(s, _)| *s == stem)
         || crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
             .iter()
             .any(|s| family_stem(s) == stem)
@@ -8672,13 +8915,16 @@ pub async fn check_privileged_identity_type_admission_over_roster(
         //
         // - HardwareAttested (`accord_holder`) → hardware_attestation_policy
         // - AnchorScrubbed  (`canonical`)      → check_canonical_role_admission
-        // - DerivedFromVerifiedState (`witness`/`steward`/`partner`/
-        //   `wise_authority`) → the claim is DESCRIPTIVE; every use site
-        //   re-derives the authority from persist's own verified state (the
-        //   steward-binding walk, licensure quorum, WA adjudication edge), so a
-        //   self-asserted claim buys nothing. Demanding a co-scrub for these
-        //   would fail CLOSED on legitimate operators — a witness has no accord
-        //   family to co-scrub it, and at bootstrap there is no roster at all.
+        // - DerivedFromVerifiedState (`steward`/`partner`/`wise_authority`)
+        //   → the claim is DESCRIPTIVE; use sites re-derive the authority
+        //   from persist's own verified state (the steward-binding walk,
+        //   licensure quorum, WA adjudication edge), so a self-asserted
+        //   claim buys nothing. Demanding a co-scrub for these would fail
+        //   CLOSED on legitimate operators, and at bootstrap there is no
+        //   roster at all. CAVEAT (v38.0.0, #709): for STEWARD that claim
+        //   holds on the custody-binding axis; the ORG-AUTHORITY roster was
+        //   a bare string test until v38 folded expiry + revocation, and its
+        //   seating ceremony is #709's open decision — see the mode table.
         //
         // Getting this distinction wrong in either direction is a real bug:
         // too loose and a Sybil self-asserts authority; too strict and honest
@@ -11317,6 +11563,13 @@ pub async fn check_reserved_prefix_admission(
         check_private_use_not_federatable(dim, &row.tier)?;
     }
 
+    // CC 3.3.10.1 L1 (CIRISPersist#754) — a `ledger:*` row's declared
+    // ledger_id must BE the derivation of its (attested identity, unit,
+    // standard_version) triple. Dormant pre-graduation (R2(b) above refuses
+    // the staged family first) and live the moment CIRISConstitution#92
+    // lands the registry row — the door graduation opens is already gated.
+    check_ledger_binding_admission(at, &row.attestation_envelope, &row.attested_key_id)?;
+
     // v37.0.0 (CIRISPersist#733) — **AN `accord:*` ROW NAMES ITS OWN ACCORD.**
     //
     // Nothing on the row used to say which accord it belonged to, and
@@ -13629,7 +13882,11 @@ mod tests {
         let undeclared: Vec<&String> = stems
             .iter()
             .filter(|s| {
-                !registry::is_family_registered(s) && !UNREGISTERED_GATED_FAMILIES.contains(&&***s)
+                !registry::is_family_registered(s)
+                    && !UNREGISTERED_GATED_FAMILIES.contains(&&***s)
+                    && !STAGED_GOVERNED_FAMILIES
+                        .iter()
+                        .any(|(staged, _)| *staged == s.as_str())
             })
             .collect();
         assert!(
@@ -13663,6 +13920,138 @@ mod tests {
                  not govern that family, so the line excuses nothing"
             );
         }
+    }
+
+    /// v38.0.0 (CIRISPersist#721) — every trust-plane op is CLASSIFIED, and
+    /// every named gate resolves as a real definition. An unclassified door
+    /// on the trust plane is the finding this table exists to prevent; a
+    /// row naming a gate that does not exist is #590's free-text pin.
+    #[test]
+    fn trust_plane_ops_are_classified_and_their_gates_resolve_721() {
+        assert!(TRUST_PLANE_OPS.len() >= 4, "vacuous table");
+        let sources = [include_str!("admission.rs"), include_str!("emit.rs")];
+        for (op, classification, gate) in TRUST_PLANE_OPS {
+            assert!(
+                classification.len() > 40,
+                "{op}: a classification under 40 chars is a shrug"
+            );
+            let needle_fn = format!("fn {gate}");
+            assert!(
+                sources.iter().any(|s| s.contains(&needle_fn)),
+                "{op}: named gate {gate:?} does not resolve to a definition"
+            );
+        }
+    }
+
+    /// The staged latch must stay TRUE (CIRISPersist#754). Once CC registers
+    /// a staged stem, R2(b) stands aside by itself and the line here is a
+    /// stale latch — this fails until it is deleted, exactly like the
+    /// declared-exceptions twin.
+    #[test]
+    fn staged_families_are_still_unregistered_and_tracked() {
+        use crate::federation::namespace::registry;
+        for (stem, tracked) in STAGED_GOVERNED_FAMILIES {
+            assert!(
+                stem.ends_with(':'),
+                "{stem:?} must be a family stem (ending in ':'), not a leaf prefix"
+            );
+            assert!(
+                tracked.contains('#'),
+                "{stem:?} must name the tracking issue that graduates it"
+            );
+            assert!(
+                !registry::is_family_registered(stem),
+                "{stem:?} GRADUATED — the vendored registry now carries its row, so admission \
+                 is open and this staged line is a stale latch. Delete it."
+            );
+            assert!(
+                governed_family_stems().iter().any(|g| g == stem),
+                "{stem:?} is staged but not governed — the latch latches nothing"
+            );
+            // And the latch actually refuses: a leaf under the staged stem
+            // fails R2(b) at federation admission today.
+            let leaf = format!("{stem}leaf:v1");
+            assert!(
+                matches!(
+                    check_namespace_family_registered(&leaf),
+                    Err(Error::NamespaceFamilyUnregistered { .. })
+                ),
+                "staged family {stem:?} did not refuse at R2(b)"
+            );
+        }
+    }
+
+    /// CC 3.3.10.1 L1 (CIRISPersist#754) — the binding arm recomputes the
+    /// derivation; a foreign id, a foreign owner, and a malformed dimension
+    /// all refuse; unrelated rows pass untouched.
+    #[test]
+    fn ledger_l1_binding_recomputes_the_triple() {
+        let owner = "owner-1";
+        let lid = crate::ledgers::standard::derive_ledger_id(owner, "usd", "1").unwrap();
+        let env = |dim: &str, id: &str| serde_json::json!({ "dimension": dim, "ledger_id": id });
+        let scores = attestation_type::SCORES;
+
+        // The honest row passes, on both unit-carrying shapes.
+        check_ledger_binding_admission(scores, &env("ledger:head:usd:v1", &lid), owner).unwrap();
+        check_ledger_binding_admission(scores, &env("ledger:checkpoint:usd:v1", &lid), owner)
+            .unwrap();
+
+        let rejected = |e: Result<(), Error>| {
+            matches!(
+                e,
+                Err(Error::DimensionRejected { reason, .. }) if reason == LEDGER_BINDING_REASON
+            )
+        };
+        // A foreign id cannot claim the triple.
+        assert!(rejected(check_ledger_binding_admission(
+            scores,
+            &env("ledger:head:usd:v1", "ledger-bogus"),
+            owner
+        )));
+        // The right id under the WRONG owner is a second book.
+        assert!(rejected(check_ledger_binding_admission(
+            scores,
+            &env("ledger:head:usd:v1", &lid),
+            "owner-2"
+        )));
+        // A different unit or version derives a different id.
+        assert!(rejected(check_ledger_binding_admission(
+            scores,
+            &env("ledger:head:eur:v1", &lid),
+            owner
+        )));
+        assert!(rejected(check_ledger_binding_admission(
+            scores,
+            &env("ledger:head:usd:v2", &lid),
+            owner
+        )));
+        // Malformed shapes under the governed family refuse outright.
+        for bad in [
+            "ledger:head:usd",     // no version segment
+            "ledger:head::v1",     // empty unit
+            "ledger:head:usd:vx",  // non-numeric version
+            "ledger:weird:usd:v1", // unknown leaf
+            "ledger:promotion:v1:extra",
+        ] {
+            assert!(
+                rejected(check_ledger_binding_admission(
+                    scores,
+                    &env(bad, &lid),
+                    owner
+                )),
+                "{bad} must refuse"
+            );
+        }
+        // A promotion needs no recompute but MUST name its ledger.
+        check_ledger_binding_admission(scores, &env("ledger:promotion:v1", &lid), owner).unwrap();
+        let no_id = serde_json::json!({ "dimension": "ledger:promotion:v1" });
+        assert!(rejected(check_ledger_binding_admission(
+            scores, &no_id, owner
+        )));
+        // Non-scores rows and non-ledger dimensions pass untouched.
+        check_ledger_binding_admission("delegates_to", &env("ledger:head:usd:v1", "x"), owner)
+            .unwrap();
+        check_ledger_binding_admission(scores, &env("health:liveness:v1", "x"), owner).unwrap();
     }
 
     /// **THE DIFFERENTIAL WITNESS** (CIRISPersist#590, the #541/#532/#588

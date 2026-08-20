@@ -796,6 +796,102 @@ pub const fn band_token(band: ConfidenceBand) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// v38.0.0 (CIRISPersist#724) — **the two vendored manifests must agree
+    /// on polarity where both declare a family**, modulo a written
+    /// divergence row. The registry (CC-generated at the pinned cut) and the
+    /// supersets walk (a frozen hand-driven research artifact with no
+    /// generator) each carry a per-family `polarity`; nothing ever
+    /// cross-checked them, and `POLARITY_RANGES` reads only the registry's
+    /// answer — so a family the other manifest ranges NARROWER could make
+    /// the marginal-pinning census under-report with no test able to see it.
+    ///
+    /// Subtractive-manifest discipline (the `KNOWN_AXIS_FUSIONS` shape, both
+    /// directions): a NEW divergence reds until a human writes the row; a
+    /// RESOLVED divergence reds until its row is deleted. Stems where either
+    /// side declares multiple distinct leaf polarities are per-leaf by
+    /// design and outside this gate's single-value comparison.
+    ///
+    /// Registry is the authority in every seeded row: it is the
+    /// CC-generated artifact at the pinned cut, while the supersets walk
+    /// predates the rc3 polarity column and recorded the CEG-0.3 reading —
+    /// and its file may not be hand-edited (editing a generatorless walk
+    /// forges a research artifact), so these rows resolve only via a new
+    /// sanctioned walk.
+    const KNOWN_POLARITY_DIVERGENCES: &[(&str, &str, &str)] = &[
+        // (family stem, registry says, supersets walk says). Two hard value
+        // conflicts with DIFFERENT numeric ranges under POLARITY_RANGES —
+        // the census reads the registry's answer, and these rows are why
+        // that choice is now a checked fact instead of an accident:
+        ("capacity_assurance:", "signed", "enumerated"),
+        ("config:", "signed", "boolean-via-score"),
+        // Same per-leaf intent, two spellings:
+        (
+            "consent:",
+            "per-leaf (CC 3.3.1)",
+            "per-leaf (enumerated | signed | positive-only)",
+        ),
+        // The walk marked these n/a before the rc3 registry landed real
+        // labels — the CEG-0.3 vintage showing through:
+        ("ownership:", "boolean-via-score", "n/a"),
+        ("trace:", "signed", "n/a"),
+        ("trace_summary:", "signed", "n/a"),
+        ("trust:", "positive-only", "n/a"),
+    ];
+
+    #[test]
+    fn the_two_vendored_manifests_agree_on_polarity_where_both_declare_724() {
+        use crate::federation::namespace::registry::family_stem;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut registry: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (prefix, polarity) in super::vendored_family_polarities() {
+            registry
+                .entry(family_stem(&prefix).to_owned())
+                .or_default()
+                .insert(polarity);
+        }
+        let mut walk: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (prefix, polarity) in crate::federation::namespace::supersets::family_polarities() {
+            walk.entry(family_stem(prefix).to_owned())
+                .or_default()
+                .insert(polarity);
+        }
+
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for (stem, reg_vals) in &registry {
+            let Some(walk_vals) = walk.get(stem) else {
+                continue; // declared by one manifest only — not a divergence
+            };
+            if reg_vals.len() != 1 || walk_vals.len() != 1 {
+                continue; // per-leaf polarity — outside the single-value gate
+            }
+            let (r, w) = (reg_vals.first().unwrap(), walk_vals.first().unwrap());
+            if r != w {
+                found.push((stem.clone(), r.clone(), w.clone()));
+            }
+        }
+
+        let known: BTreeSet<(String, String, String)> = KNOWN_POLARITY_DIVERGENCES
+            .iter()
+            .map(|(s, r, w)| ((*s).to_owned(), (*r).to_owned(), (*w).to_owned()))
+            .collect();
+        let found: BTreeSet<_> = found.into_iter().collect();
+        let new: Vec<_> = found.difference(&known).collect();
+        let stale: Vec<_> = known.difference(&found).collect();
+        assert!(
+            new.is_empty(),
+            "NEW cross-manifest polarity divergence(s) — write the row or fix the source:\n{new:#?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "RESOLVED divergence(s) still pinned — delete the row(s):\n{stale:#?}"
+        );
+        assert!(
+            !registry.is_empty() && !walk.is_empty(),
+            "vacuous gate — one side read nothing"
+        );
+    }
+
     use super::*;
     use crate::federation::FederationDirectory;
     use std::collections::{BTreeMap, BTreeSet};

@@ -482,6 +482,25 @@ pub enum ConfidenceBand {
     InsufficientWitnesses,
 }
 
+/// v38.0.0 (CIRISPersist#723) — the witness-diversity BAND.
+///
+/// The magnitude of the CC 3.1 boolean-via-score min fold is consumed only
+/// as a sign inside `classify` (`> 0.0` gates `WellEstablished`, AV-73), so
+/// carrying the raw float onto the wire disclosed a number nobody reads and
+/// broke the band-not-float discipline every other value on this surface
+/// follows (`ConfidenceBand`, `DrillFreshness`, mesh-config centi-units).
+/// The min fold's polarity survives banding: ANY negative certificate sinks
+/// the whole set to `NotEstablished` — fail-secure, exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiversityStanding {
+    /// The attested min fold is positive — the diversity gate is satisfied.
+    Established,
+    /// An attested row refuted diversity (min ≤ 0) — a negative certificate
+    /// trumps any number of positives.
+    NotEstablished,
+}
+
 /// v17.4.0 (FSD-005 Appendix C.3) — the `resolve_scores` fold result.
 /// `#[non_exhaustive]`; the `trace` is the OPEN extensibility escape hatch
 /// (`serde_json::Value` at the FFI seam) — any future fold input (a
@@ -494,10 +513,17 @@ pub struct ComposedVerdict {
     pub band: ConfidenceBand,
     /// Distinct attesting keys among the live (post-precedence) rows.
     pub contributor_count: u32,
-    /// The anti-collusion witness-diversity n (NOT n_eff). `None` until the
-    /// server-tier diversity policy lands (Appendix C.5 out-of-scope).
+    /// The anti-collusion witness-diversity signal, as a BAND (v38.0.0,
+    /// CIRISPersist#723 — `scores.rs`'s stated contract is "the float never
+    /// crosses the wire", and this was the one default-on field breaking
+    /// it). Tri-state on purpose: `None` means no attested
+    /// `witness_diversity:*` row reached the fold — absence is not
+    /// permission — which is materially different from an attested row that
+    /// REFUTED diversity (`NotEstablished`, the fail-secure min-fold arm).
+    /// Collapsing to a bool would merge "not attested" with "attested and
+    /// refuted" — the a-band-never-collapses-two-facts rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub witness_diversity: Option<f64>,
+    pub witness_diversity: Option<DiversityStanding>,
     /// Count of live rows whose sign opposes the head (open contradictions).
     pub open_contradictions: u32,
     /// Age of the precedence head (`now − head.asserted_at`). `None` when

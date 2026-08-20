@@ -879,6 +879,30 @@ pub fn load_bearing_predicate(family_prefix: &str) -> Option<(&'static str, &'st
         .map(|(_, kind, rationale)| (*kind, *rationale))
 }
 
+/// v38.0.0 (CIRISPersist#724) — every family's `polarity` prose, read by a
+/// TEST only (the cross-manifest agreement gate in
+/// `scores_read_audit::tests`), never by a runtime predicate — the same
+/// read-by-a-test discipline as [`family_emit_authorities`]. This closes
+/// the second address of the #724 class: the supersets walk carries its own
+/// per-family `polarity` with a WIDER vocabulary than the registry's, and
+/// until this accessor nothing could even notice the two manifests
+/// disagreeing. Families with no string-valued `polarity` are omitted.
+#[must_use]
+pub fn family_polarities() -> Vec<(&'static str, String)> {
+    families()
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| {
+                    v.get("polarity")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|p| (k.as_str(), p.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// v30.12.0 (CIRISPersist#635) — the `emit_authority` prose of every family
 /// the manifest declares, for the retainability drift alarm. Prose, so it is
 /// read by a TEST and never by the runtime predicate — see
@@ -1709,7 +1733,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         assert_eq!(
-            checked, 73,
+            checked, 80,
             "checked {checked} version-pinned persist src/ rows, expected 73. \
              If you ADDED evidence rows, update this number in the same commit. \
              If you did not, a parse change just silently emptied this test."

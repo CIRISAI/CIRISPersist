@@ -37,20 +37,28 @@ impl TrustScoringError {
 /// resolver. Backends implement against the federation directory's
 /// attestation graph; the memory shim returns a trivial answer.
 ///
-/// `recursion_depth = 0` means "score only attestations directly
-/// targeting `key_id`". Higher values walk `delegates_to:*` edges per
-/// the BFS `crate::federation::topology::build_delegation_graph`
-/// already implements.
+/// **v38.0.0 (CIRISPersist#748) — `recursion_depth` is RETIRED.** The
+/// parameter promised a `delegates_to` BFS that no implementation ever
+/// performed: every impl in this tree bound `_recursion_depth`, every
+/// construction site passed a literal `0`, and no attenuation rule for a
+/// multi-hop walk was ever specified anywhere — so depth-1 scoring was
+/// decorative end-to-end, a knob wearing a real one's clothes. The
+/// contract is now what the code always did: a per-call AGGREGATE over
+/// `scores` attestations directly targeting `key_id`
+/// ([`aggregate_trust_score`]). Transitive propagation is deliberately
+/// the CONSUMER's: graph walks are an explicit architectural non-goal of
+/// this substrate (THREAT_MODEL.md AV-29 records the non-goal as the
+/// mitigation) — the exposed edges are
+/// [`crate::federation::topology::build_delegation_graph`] and
+/// `FederationDirectory::{list_attestations_for, list_attestations_by}`,
+/// and a consumer that wants friend-of-friends composes them under its
+/// own, stated attenuation rule.
 #[async_trait::async_trait]
 pub trait TrustScoring: Send + Sync {
-    /// Resolve the aggregate trust score for `key_id` walking up to
-    /// `recursion_depth` `delegates_to` hops. Returns a value in
+    /// Resolve the aggregate trust score for `key_id` over the `scores`
+    /// attestations directly targeting it. Returns a value in
     /// `[0.0, 1.0]`.
-    async fn trust_score(
-        &self,
-        key_id: &str,
-        recursion_depth: u8,
-    ) -> Result<f64, TrustScoringError>;
+    async fn trust_score(&self, key_id: &str) -> Result<f64, TrustScoringError>;
 }
 
 /// v3.4.0 (CIRISPersist#123) — pure aggregate helper. Folds a slice of
@@ -111,11 +119,7 @@ impl MemoryTrustScoring {
 
 #[async_trait::async_trait]
 impl TrustScoring for MemoryTrustScoring {
-    async fn trust_score(
-        &self,
-        key_id: &str,
-        _recursion_depth: u8,
-    ) -> Result<f64, TrustScoringError> {
+    async fn trust_score(&self, key_id: &str) -> Result<f64, TrustScoringError> {
         match self.scores.get(key_id) {
             Some(s) => Ok(*s),
             None => Err(TrustScoringError::KeyNotFound(key_id.to_owned())),

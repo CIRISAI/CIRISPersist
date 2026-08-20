@@ -749,14 +749,20 @@ class Engine:
     def emit_attestation_self(self, input_json: str) -> str:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
 
+    def escrow_create(self, row_json: str) -> bool:
+        """(derived) deontic — CC 4.4.3.2.8 — create (or idempotently re-create) an escrow record (JSON KeyEscrowRow, status must be "active" — an escrow is born live and its lif... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_set_status(self, escrow_id: str, status: str) -> bool:
+        """(derived) deontic — The lifecycle door (registry's RequestKeyRecovery outcome path): "active" may move to "recovered" / "revoked" / "expired"; a same-state re-assertio... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
         """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds for attesting_key_id,..."""
 
-    def federation_grant_trust(self, trust_grant_json: str) -> None:
+    def federation_grant_trust(self, signed_grant_json: str) -> None:
         """(derived) deontic — Federation directory: grant trust to a key."""
 
-    def federation_revoke_trust(self, key: str, revoked_by: str) -> None:
-        """(derived) deontic — Federation directory: revoke trust for a key. Idempotent — revoking an already-expired key is a no-op."""
+    def federation_revoke_trust(self, revocation_json: str) -> None:
+        """(derived) deontic — Federation directory: revoke trust for a key. Idempotent — revoking an already-expired or absent grant is a no-op."""
 
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
@@ -843,6 +849,12 @@ class Engine:
 
     def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
         """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
+
+    def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
+        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale"); a DIFFERENT hash at the stored seq raises... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_register(self, owner_key_id: str, unit: str, standard_version: str) -> str:
+        """(derived) deontic — CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger for (owner_key_id, unit, standard_version). Returns JSON {"ledger_id": .., "outc... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def may_release_copy_json(
         self, object_kind: str, object_id: str, object_id2: str | None = None
@@ -1066,7 +1078,7 @@ class Engine:
     def remove_moderator(self, community_id: str, target_attestation_id: str, moderator_key_id: str, duty: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10) — remove a named moderator: withdraws against the appointment edge target_attestation_id. moderator_key_id keys the retractio..."""
 
-    def remove_peer_record(self, key_id: str, hard: bool) -> None:
+    def remove_peer_record(self, key_id: str, hard: bool, reason: str, acting_under_delegation_id: str | None = None) -> None:
         """(derived) deontic — Federation directory: remove a peer record. hard=false soft-marks removed_at; hard=true cascades through the FK to delete the federation_keys row (..."""
 
     def resolve_key_statement_standing_json(self, key_id: str, statement_at: str | None = None, now: str | None = None) -> str:
@@ -1628,6 +1640,15 @@ class Engine:
     def latest_stream_sth(self, stream_id: str) -> str | None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — the latest STH (highest tree_size) stored for stream_id, as a serialized SignedTreeHead JSON string, or None if..."""
 
+    def ledger_list_fork_evidence(self, ledger_id: str) -> str:
+        """(derived) testimonial — All recorded fork evidence for a ledger — JSON array of rows. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_put_checkpoint(self, checkpoint_json: str) -> bool:
+        """(derived) testimonial — CC 3.3.10.1 L5 — store a co-witnessed checkpoint (JSON LedgerCheckpointRow). True on first write, False on an identical re-put; a DIFFERING row at... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_record_fork_evidence(self, evidence_json: str) -> str:
+        """(derived) testimonial — CC 3.3.10.1 L8 — record a proven fork (JSON ForkEvidence) for the adjudication plane. Returns the content-derived evidence_id (idempotent: one fork... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
     def list_delivery_receipts_for(self, stream_id: str, limit: int) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts for stream_id, ascending (k, subscriber_key_id), bounded by limit. Returns a JSON a..."""
 
@@ -1986,6 +2007,22 @@ class Engine:
 
     def is_canonical(self, key_id: str) -> bool:
         """(derived) nomological — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is key_id a canonical / founding bootstrap server? Returns True iff its federation_keys row's identity_typ..."""
+
+    @staticmethod
+    def ledger_conservation_fold(entries_json: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L7 — the conservation fold: pure, deterministic, integer-only, and BYTE-EQUAL across members (the CC 6.1.6 contract discipline — determ... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_derive_id(owner_key_id: str, unit: str, standard_version: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L1 — the deterministic (steward-bound identity, unit, standard_version) → ledger_id derivation. Pure; THE one spelling every door recom... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_detect_double_head(head_a_json: str, head_b_json: str) -> str | None:
+        """(derived) nomological — CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON SignedHead each) at one sequence number with different hashes. Returns the JSON ForkEvid... [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    @staticmethod
+    def ledger_verify_chain(entries_json: str, expected_first_seq: int, expected_first_prev: str) -> str:
+        """(derived) nomological — CC 3.3.10.1 L2/L6 — validate a chain span (JSON array of LedgerEntry) from stated expectations: dense sequence, prev-hash links, one ledger, one un... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def maintenance_tighten_vocabulary(self, target_json: str, dry_run: bool = False) -> str:
         """(derived) nomological — v25.1.0 (CIRISPersist#582) — Run one vocabulary tightening: retire every federation-tier attestation carrying a non-conformant wire value at a name..."""
@@ -2598,6 +2635,15 @@ class Engine:
     def duty_holders_for_content_json(self, content_sha256: str, community_id: str, duty: str) -> str:
         """(derived) empirical — #249 Cut A — the duty-holders of a content target (content_sha256) for duty (moderate / takedown / review): the content's resolved subjects ∪ the n..."""
 
+    def escrow_get(self, escrow_id: str) -> str | None:
+        """(derived) empirical — Point lookup by escrow_id — JSON KeyEscrowRow or None. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_list_for_key(self, key_id: str) -> str:
+        """(derived) empirical — The recovery path's first question — every escrow naming one key, JSON array. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_list_for_org(self, org_id: str) -> str:
+        """(derived) empirical — Registry's ListKeyEscrows — every escrow for one org, JSON array. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
     def federation_directory_query(self, filter_json: str) -> str:
         """(derived) empirical — v2.7.0 (CIRISPersist#104) — Trust-Topology aggregate query. Walks federation_attestations to produce a [TrustTopology] with nodes (resolved through..."""
 
@@ -2730,6 +2776,21 @@ class Engine:
 
     def incident_transition(self, transition_json: str) -> None:
         """(derived) empirical — v0.8.3 — AV-55 state-machine transition. Notes required for Resolved/Closed targets. [build-conditional: #[cfg(feature = "cirisincident")]]"""
+
+    def ledger_get(self, ledger_id: str) -> str | None:
+        """(derived) empirical — Point lookup by ledger_id. JSON LedgerHeadRow or None. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_latest_checkpoint(self, ledger_id: str) -> str | None:
+        """(derived) empirical — The highest-seq checkpoint for a ledger — JSON or None. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_list_entry_ranges(self, ledger_id: str) -> str:
+        """(derived) empirical — All entry ranges for a ledger, ordered by from_seq — JSON array. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_list_for_owner(self, owner_key_id: str) -> str:
+        """(derived) empirical — Every ledger bound to one steward-bound identity, as a JSON array of LedgerHeadRow, ordered by ledger_id. [build-conditional: #[cfg(feature = "ledgers")]]"""
+
+    def ledger_put_entry_range(self, range_json: str) -> bool:
+        """(derived) empirical — CC 3.3.10.1 L2/L6 — index which evidence_refs blob holds entries [from_seq, to_seq] (JSON LedgerEntryRangeRow). Same immutable/idempotent contract... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def list_accord_participations_json(self, proposal_digest: str) -> str:
         """(derived) empirical — #302 — all participations for a proposal as a JSON array."""

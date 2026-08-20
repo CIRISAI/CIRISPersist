@@ -643,6 +643,61 @@ mod tests {
         )
     }
 
+    /// v38.0.0 — the HYBRID fixture the wire tests use. v37.0.0 flipped
+    /// secrets signing to HybridPolicy::Strict, so an Ed25519-only signer
+    /// refuses at `sign_body` — every mock-server test below tests WIRE
+    /// behaviour, not the signer, and rode the ed-only fixture straight
+    /// into that refusal (and from there into the fixture hang, see
+    /// [`accept_with_deadline`]). Caught by the first COMPLETED `rest`-leg
+    /// run since the flip — main's ci.yml runs had been cancelled since,
+    /// so the leg's red was invisible (the #691 shape at CI granularity).
+    fn make_hybrid_signer() -> Arc<LocalSigner> {
+        let f = write_seed(&[0x5Au8; 32]);
+        let pqc = write_seed(&[0x5Bu8; 32]);
+        Arc::new(
+            LocalSigner::from_config(&LocalSignerConfig {
+                key_id: "test-steward".into(),
+                key_path: f.path().to_path_buf(),
+                pqc_key_id: Some("test-steward-pqc".into()),
+                pqc_key_path: Some(pqc.path().to_path_buf()),
+            })
+            .expect("load hybrid signer"),
+        )
+    }
+
+    /// v38.0.0 — a blocking `accept()` in these one-shot mock servers
+    /// converts ANY pre-connect client failure into a six-minute nextest
+    /// timeout: the test panics, the tokio runtime's drop then waits on
+    /// the spawn_blocking thread, and that thread is parked in `accept()`
+    /// forever. Measured, not hypothetical — three tests timed out at
+    /// 360s each on the rest leg. A bounded nonblocking poll makes the
+    /// fixture EXIT on a client that never connects, so the test reports
+    /// its real failure instead of a hang.
+    fn accept_with_deadline(
+        listener: &std::net::TcpListener,
+        secs: u64,
+    ) -> Option<std::net::TcpStream> {
+        listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => {
+                    sock.set_nonblocking(false).ok();
+                    return Some(sock);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     #[test]
     fn client_construct_succeeds_with_default_settings() {
         let signer = make_signer();
@@ -654,21 +709,45 @@ mod tests {
         assert!(dbg.contains("test-steward"));
     }
 
-    /// `sign_body` emits the two signature headers (Ed25519-only
-    /// when PQC isn't configured).
+    /// v38.0.0 — the v37.0.0 contract, finally witnessed on the leg that
+    /// runs it: signing WITHOUT a PQC half REFUSES loudly and locally,
+    /// naming the remedy — never a silent Ed25519-only downgrade that
+    /// arrives as a remote 401. (This test previously asserted the
+    /// pre-v37 downgrade by name; it was red from the flip onward, unseen
+    /// because main's rest-leg runs were cancelled.)
     #[tokio::test]
-    async fn sign_body_ed25519_only_when_no_pqc() {
+    async fn sign_body_refuses_without_pqc_v37() {
         let signer = make_signer();
         let url = Url::parse("https://persist.example.com").unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
-        let headers = client.sign_body(b"hello").await.expect("sign");
-        assert_eq!(headers.len(), 2);
+        let err = client.sign_body(b"hello").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Configure the signer's PQC half"),
+            "the refusal must name the remedy: {msg}"
+        );
+        assert!(
+            msg.contains("HybridPolicy::Strict"),
+            "and the rule it enforces: {msg}"
+        );
+    }
+
+    /// The positive twin: a hybrid signer emits all THREE headers, with a
+    /// 64-byte Ed25519 signature and a non-empty ML-DSA-65 half.
+    #[tokio::test]
+    async fn sign_body_emits_three_hybrid_headers() {
+        let signer = make_hybrid_signer();
+        let url = Url::parse("https://persist.example.com").unwrap();
+        let client = FederatedSecretsClient::new(url, signer).expect("construct");
+        let headers = client.sign_body(b"hello").await.expect("hybrid sign");
+        assert_eq!(headers.len(), 3);
         assert_eq!(headers[0].0, HEADER_KEY_ID);
         assert_eq!(headers[0].1, "test-steward");
         assert_eq!(headers[1].0, HEADER_ED25519);
-        // Decoded sig should be 64 bytes (Ed25519 sig length).
         let sig = BASE64.decode(&headers[1].1).expect("base64 decode");
         assert_eq!(sig.len(), 64);
+        assert_eq!(headers[2].0, HEADER_ML_DSA_65);
+        assert!(!headers[2].1.is_empty());
     }
 
     /// `url(path)` joins paths correctly off the base URL.
@@ -700,7 +779,8 @@ mod tests {
 
         // Server task — responds with 404 + secrets_not_found.
         let server = tokio::task::spawn_blocking(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let mut sock = accept_with_deadline(&listener, 15)
+                .expect("client never connected — its error is the real failure");
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).ok();
             let body = serde_json::to_string(&SecretsErrorResponse {
@@ -720,7 +800,7 @@ mod tests {
             sock.write_all(response.as_bytes()).ok();
         });
 
-        let signer = make_signer();
+        let signer = make_hybrid_signer();
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
         let res = client
@@ -741,7 +821,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let server = tokio::task::spawn_blocking(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let mut sock = accept_with_deadline(&listener, 15)
+                .expect("client never connected — its error is the real failure");
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).ok();
             let body = serde_json::to_string(&SecretsErrorResponse {
@@ -761,7 +842,7 @@ mod tests {
             sock.write_all(response.as_bytes()).ok();
         });
 
-        let signer = make_signer();
+        let signer = make_hybrid_signer();
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
         let res = client.rotate_master_key(None, "test".into()).await;
@@ -787,7 +868,8 @@ mod tests {
         // it.
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let server = tokio::task::spawn_blocking(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let mut sock = accept_with_deadline(&listener, 15)
+                .expect("client never connected — its error is the real failure");
             let mut buf = vec![0u8; 8192];
             let n = sock.read(&mut buf).expect("read");
             buf.truncate(n);
@@ -810,7 +892,7 @@ mod tests {
             sock.write_all(response.as_bytes()).ok();
         });
 
-        let signer = make_signer();
+        let signer = make_hybrid_signer();
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
         client
@@ -855,7 +937,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let server = tokio::task::spawn_blocking(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let mut sock = accept_with_deadline(&listener, 15)
+                .expect("client never connected — its error is the real failure");
             let mut buf = vec![0u8; 8192];
             let _ = sock.read(&mut buf).ok();
             let reference = SecretReference {
@@ -885,7 +968,7 @@ mod tests {
             sock.write_all(response.as_bytes()).ok();
         });
 
-        let signer = make_signer();
+        let signer = make_hybrid_signer();
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let client = FederatedSecretsClient::new(url, signer).expect("construct");
         let res = client

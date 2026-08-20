@@ -160,7 +160,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_family_charter_admission", Class::Gate),
     ("check_federation", Class::Gate),
     ("check_genesis_attestation_reserved", Class::Gate),
-    ("check_genesis_rebake_purge_admission", Class::Gate),
+    ("check_genesis_rebake_purge_admission_under", Class::Gate),
     ("check_geographic_community_admission", Class::Gate),
     ("check_infra_attest_role_admission", Class::Gate),
     ("check_instant_binding", Class::Gate),
@@ -422,7 +422,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("validate_grant_admission", Class::Gate),
     ("validate_location_cell", Class::Gate),
     ("validate_registration_pubkey", Class::Gate),
-    ("validate_trust_grant", Class::Gate),
+    // v38.0.0 (CIRISPersist#721) — validate_trust_grant is SHAPE validation
+    // (malformed input), not authority: classifying it Gate was the parity
+    // table reporting the trust doors as gated while they were open. The
+    // authority gates are the two below.
+    ("validate_trust_grant", Class::Plumbing),
+    ("check_trust_grant_authority", Class::Gate),
+    ("check_trust_revocation_authority", Class::Gate),
     ("verify_and_prepare_participation", Class::Gate),
     ("verify_bundle_quorum", Class::Gate),
     ("verify_community_admission", Class::Gate),

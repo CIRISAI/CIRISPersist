@@ -1948,6 +1948,44 @@ impl Backend for PostgresBackend {
             }
         }
 
+        // v38.0.0 (#721) — ANNOUNCED inside the transaction, exactly like
+        // the Art.-17 sibling: this door deletes strictly MORE (three
+        // federation planes the erasure sibling never touches) and was the
+        // one of the pair that said nothing.
+        if trace_events_deleted > 0
+            || trace_llm_calls_deleted > 0
+            || federation_keys_deleted > 0
+            || federation_attestations_deleted > 0
+            || federation_revocations_deleted > 0
+        {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let detail = serde_json::json!({
+                "op": "delete_traces_for_agent",
+                "agent_id_hash": agent_id_hash,
+                "signing_key_id": signature_key_id,
+                "trace_events": trace_events_deleted,
+                "trace_llm_calls": trace_llm_calls_deleted,
+                "federation_keys": federation_keys_deleted,
+                "federation_attestations": federation_attestations_deleted,
+                "federation_revocations": federation_revocations_deleted,
+            });
+            tx.execute(
+                "INSERT INTO cirislens.hard_case_events \
+                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, NOW()) \
+                 ON CONFLICT (event_id) DO NOTHING",
+                &[
+                    &event_id,
+                    &crate::federation::hard_case::kind::TRACE_ERASURE,
+                    &Some(agent_id_hash),
+                    &None::<String>,
+                    &detail,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("dsar announcement: {e}")))?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("commit dsar tx: {e}")))?;
@@ -5623,9 +5661,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
+        authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
         // The door's own gate, before any statement runs (AV-9).
-        crate::federation::genesis::check_genesis_rebake_purge_admission(attestation_id)?;
+        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+            attestation_id,
+            authority,
+        )?;
         let client = self
             .get_client()
             .await
@@ -11158,8 +11200,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn grant_trust(
         &self,
-        grant: crate::federation::TrustGrant,
+        signed: crate::federation::SignedTrustGrant,
     ) -> Result<(), crate::federation::Error> {
+        // v38.0.0 (#721) — the authority gate FIRST, inside the door (AV-9):
+        // the granter proves it is trusted_by against the directory-pinned
+        // keys, then the shape validation runs.
+        crate::federation::admission::check_trust_grant_authority(self, &signed).await?;
+        let grant = signed.grant;
         crate::store::memory::validate_trust_grant(&grant)?;
         let client = self
             .get_client()
@@ -11227,26 +11274,47 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn revoke_trust(
         &self,
-        key: &str,
-        revoked_by: &str,
+        revocation: crate::federation::SignedTrustRevocation,
     ) -> Result<(), crate::federation::Error> {
-        if key.is_empty() {
+        if revocation.key.is_empty() {
             return Err(crate::federation::Error::InvalidArgument(
                 "key must be non-empty".into(),
             ));
         }
-        if revoked_by.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "revoked_by must be non-empty".into(),
-            ));
-        }
-        // Idempotent: only set expires_at if the row isn't already
-        // expired. UPDATE returning zero rows is fine (idempotent
-        // no-op); only backend errors propagate.
+        // v38.0.0 (#721) — signature proof first; then ownership against the
+        // STORED granter (only the granter withdraws its own grant). The row
+        // keeps the original trusted_by for forensic continuity, and the
+        // revoker is no longer discarded — it is PROVEN.
+        crate::federation::admission::check_trust_revocation_authority(self, &revocation).await?;
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let stored = client
+            .query_opt(
+                "SELECT trusted_by FROM cirislens.federation_keys \
+                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
+                &[&revocation.key],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("revoke_trust granter read: {e}"))
+            })?;
+        if let Some(row) = stored {
+            let granter: String = row
+                .try_get(0)
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            if granter != revocation.revoked_by {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "trust on {} was granted by {granter:?}; {:?} may not revoke it — only \
+                     the granter withdraws its own grant (CIRISPersist#721)",
+                    revocation.key, revocation.revoked_by
+                )));
+            }
+        }
+        // Idempotent: only set expires_at if the row isn't already
+        // expired. UPDATE returning zero rows is fine (idempotent
+        // no-op); only backend errors propagate.
         client
             .execute(
                 "UPDATE cirislens.federation_keys \
@@ -11254,14 +11322,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  WHERE key_id = $1 \
                    AND trusted_by IS NOT NULL \
                    AND (expires_at IS NULL OR expires_at > NOW())",
-                &[&key],
+                &[&revocation.key],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
-        // `revoked_by` is logged in the audit chain by the caller —
-        // not stored on the row directly (the row keeps the original
-        // `trusted_by` for forensic continuity).
-        let _ = revoked_by;
         Ok(())
     }
 
@@ -11797,7 +11861,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         key_id: &str,
         hard: bool,
+        reason: &str,
+        acting_under_delegation_id: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
+        // v38.0.0 (#721) — a removal is an attributed act; an unrecorded one
+        // is the defect (the check_admin_action_attribution discipline).
+        if reason.trim().is_empty() {
+            return Err(crate::federation::Error::InvalidArgument(
+                "remove_peer_record: a removal is an attributed act — `reason` is required \
+                 (CIRISPersist#721)"
+                    .into(),
+            ));
+        }
         let mut client = self
             .get_client()
             .await
@@ -11896,7 +11971,54 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "remove_peer_record peer_metadata update: {e}"
                 ))
             })?;
+            // v38.0.0 (#721, the #707-class third face): the soft removal
+            // changes the SERVED SET (cohort-scoped listing filters on
+            // removed_at) while the sibling key row's serve position stood
+            // still. Stamp mutated_at through the same allocator every
+            // other mutation door uses, so the cursor planes re-serve.
+            let mutated_at = self.next_key_serve_position(&tx).await?;
+            tx.execute(
+                "UPDATE cirislens.federation_keys SET mutated_at = $2 WHERE key_id = $1",
+                &[&key_id, &mutated_at],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "remove_peer_record mutated_at stamp: {e}"
+                ))
+            })?;
         }
+
+        // v38.0.0 (#721) — the removal is ANNOUNCED inside the same
+        // transaction, both faces, exactly like the DSAR sibling: an
+        // admin_action:peer_removal hard_case row carrying the attribution.
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let detail = serde_json::json!({
+            crate::federation::hard_case::admin_field::DELEGATION_ID: acting_under_delegation_id,
+            crate::federation::hard_case::admin_field::REASON: reason,
+            "hard": hard,
+        });
+        tx.execute(
+            "INSERT INTO cirislens.hard_case_events \
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW()) \
+             ON CONFLICT (event_id) DO NOTHING",
+            &[
+                &event_id,
+                &format!(
+                    "{}{}",
+                    crate::federation::hard_case::kind::ADMIN_ACTION_PREFIX,
+                    crate::federation::hard_case::admin_op::PEER_REMOVAL
+                ),
+                &Some(key_id),
+                &None::<String>,
+                &detail,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("remove_peer_record announcement: {e}"))
+        })?;
 
         tx.commit()
             .await
@@ -30215,14 +30337,13 @@ mod tests {
 
     async fn trust_steward(backend: &PostgresBackend) -> String {
         let kid = format!("trust-steward-{}", uuid_like());
-        use crate::federation::FederationDirectory;
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: fix_section_i_key(&kid, "registry", chrono::Utc::now(), false),
-            })
-            .await
-            .unwrap();
+        // v38/#721: real hybrid pubkeys — the door verifies the granter.
+        crate::federation::tier_ingest::test_support::register_hybrid_key(backend, &kid).await;
         kid
+    }
+
+    fn signed_grant(grant: crate::federation::TrustGrant) -> crate::federation::SignedTrustGrant {
+        crate::federation::tier_ingest::test_support::signed_trust_grant(grant)
     }
 
     /// Trust shape 1+2+3: round-trip + self-trust reject + Registry-
@@ -30257,7 +30378,7 @@ mod tests {
             trusted_by: steward.clone(),
             expires_at: None,
         };
-        backend.grant_trust(grant).await.unwrap();
+        backend.grant_trust(signed_grant(grant)).await.unwrap();
         let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
         assert_eq!(row.key, key_id);
         assert_eq!(row.trust_type, crate::federation::TrustType::Partnered);
@@ -30276,7 +30397,10 @@ mod tests {
             trusted_by: key_id.clone(),
             expires_at: None,
         };
-        let err = backend.grant_trust(bad_self).await.unwrap_err();
+        let err = backend
+            .grant_trust(signed_grant(bad_self))
+            .await
+            .unwrap_err();
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
 
         // Shape 3: Registry without domains is rejected at the API
@@ -30289,7 +30413,10 @@ mod tests {
             trusted_by: steward.clone(),
             expires_at: None,
         };
-        let err = backend.grant_trust(bad_registry).await.unwrap_err();
+        let err = backend
+            .grant_trust(signed_grant(bad_registry))
+            .await
+            .unwrap_err();
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
     }
 
@@ -30321,10 +30448,24 @@ mod tests {
             trusted_by: steward.clone(),
             expires_at: None,
         };
-        backend.grant_trust(grant).await.unwrap();
-        backend.revoke_trust(&key_id, &steward).await.unwrap();
+        backend.grant_trust(signed_grant(grant)).await.unwrap();
+        backend
+            .revoke_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_revocation(
+                    &key_id, &steward,
+                ),
+            )
+            .await
+            .unwrap();
         // Second revoke MUST succeed (idempotent).
-        backend.revoke_trust(&key_id, &steward).await.unwrap();
+        backend
+            .revoke_trust(
+                crate::federation::tier_ingest::test_support::signed_trust_revocation(
+                    &key_id, &steward,
+                ),
+            )
+            .await
+            .unwrap();
         let row = backend.lookup_trust(&key_id).await.unwrap().unwrap();
         assert!(row.expires_at.is_some());
 
@@ -30373,25 +30514,25 @@ mod tests {
             .await
             .unwrap();
         backend
-            .grant_trust(crate::federation::TrustGrant {
+            .grant_trust(signed_grant(crate::federation::TrustGrant {
                 key: k_direct.clone(),
                 trust_type: crate::federation::TrustType::Temporary,
                 trust_relationship: crate::federation::TrustRelationship::Direct,
                 trust_domains: None,
                 trusted_by: steward.clone(),
                 expires_at: None,
-            })
+            }))
             .await
             .unwrap();
         backend
-            .grant_trust(crate::federation::TrustGrant {
+            .grant_trust(signed_grant(crate::federation::TrustGrant {
                 key: k_registry.clone(),
                 trust_type: crate::federation::TrustType::Temporary,
                 trust_relationship: crate::federation::TrustRelationship::Registry,
                 trust_domains: Some(vec![domain.clone()]),
                 trusted_by: steward.clone(),
                 expires_at: None,
-            })
+            }))
             .await
             .unwrap();
 
@@ -35124,7 +35265,10 @@ mod tests {
         assert_ne!(p1.items[0].key_id, p2.items[0].key_id);
 
         // Soft-removed peers drop out.
-        backend.remove_peer_record(&fam_b, false).await.unwrap();
+        backend
+            .remove_peer_record(&fam_b, false, "test removal (#721 attributed act)", None)
+            .await
+            .unwrap();
         let fam_live = backend
             .list_federation_keys(
                 mk(&cohort),
@@ -35184,7 +35328,10 @@ mod tests {
             .add_peer_record(&key_id, "AAAA", "agent", None)
             .await
             .unwrap();
-        backend.remove_peer_record(&key_id, false).await.unwrap();
+        backend
+            .remove_peer_record(&key_id, false, "test removal (#721 attributed act)", None)
+            .await
+            .unwrap();
         let meta = pg_peek_peer(&backend, &key_id).await.expect("preserved");
         assert!(meta.5.is_some(), "removed_at set");
         assert!(pg_peek_key_exists(&backend, &key_id).await, "key preserved");
@@ -35242,7 +35389,7 @@ mod tests {
             .unwrap();
 
         let err = backend
-            .remove_peer_record(&a, true)
+            .remove_peer_record(&a, true, "test removal (#721 attributed act)", None)
             .await
             .expect_err("must reject orphaning");
         assert!(matches!(
@@ -35266,7 +35413,10 @@ mod tests {
             .add_peer_record(&key_id, "AAAA", "agent", None)
             .await
             .unwrap();
-        backend.remove_peer_record(&key_id, true).await.unwrap();
+        backend
+            .remove_peer_record(&key_id, true, "test removal (#721 attributed act)", None)
+            .await
+            .unwrap();
         assert!(!pg_peek_key_exists(&backend, &key_id).await);
         assert!(pg_peek_peer(&backend, &key_id).await.is_none());
     }
@@ -35447,7 +35597,10 @@ mod tests {
             .add_peer_record(&key_id, "AAAA", "agent", None)
             .await
             .unwrap();
-        backend.remove_peer_record(&key_id, false).await.unwrap();
+        backend
+            .remove_peer_record(&key_id, false, "test removal (#721 attributed act)", None)
+            .await
+            .unwrap();
         let got = backend.peer_metadata_for(&key_id).await.unwrap();
         assert!(got.is_none(), "soft-removed peer must read as None");
     }
@@ -35867,7 +36020,6 @@ mod tests {
         async fn trust_score(
             &self,
             key_id: &str,
-            _recursion_depth: u8,
         ) -> Result<f64, crate::federation::TrustScoringError> {
             match self.0.get(key_id) {
                 Some(s) => Ok(*s),
@@ -35886,7 +36038,6 @@ mod tests {
         crate::federation::AdmissionGate::new(
             std::sync::Arc::new(PgFixedTrustScoring(map)),
             threshold,
-            0,
         )
     }
 

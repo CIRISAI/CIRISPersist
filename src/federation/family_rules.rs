@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
-//! of 19** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
+//! of 20** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
 //!
 //! # What is derived and what is pinned
 //!
@@ -206,6 +206,29 @@ pub struct PersistFamilyRule {
 /// Ordered by gap kind then prefix, so the three populations read as the three
 /// different asks they are.
 pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+    // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
+    // CIRISConstitution#92. Two rules ride the one prefix: the staging latch
+    // (R2(b) refuses the whole family at federation tier until the CC row
+    // lands and the re-vendor opens the door by itself), and the L1 binding
+    // arm (a `ledger:*` row's declared ledger_id must BE the derivation of
+    // its (attested identity, unit, standard_version) triple — one ledger per
+    // triple, no parallel books, fail-secure per the rc4.3 text). The L1 arm
+    // is live from day one so graduation opens an already-gated door.
+    PersistFamilyRule {
+        prefix: "ledger:",
+        rule: "STAGED (refused at federation tier pending CIRISConstitution#92) + \
+               L1 triple binding: declared ledger_id must equal \
+               derive_ledger_id(attested_key_id, unit, standard_version)",
+        enforced_at: &[
+            "federation::admission::check_ledger_binding_admission",
+            "federation::admission::check_namespace_family_registered",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#92 — graduation lands the registry row (with the CC \
+                 3.3.10.1 reserved_rule) and deletes the staged latch; this entry then \
+                 shrinks to the L1 binding rule alone until the row states it",
+    },
     // ── NoRuleOnTheRow: the row is silent, so the classifier is too. ───────
     PersistFamilyRule {
         prefix: "x_private:",
@@ -453,6 +476,17 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "cohort:",
+        "a SCOPE-ADDRESS-TABLE id prefix, not a dimension family — a different \
+         namespace entirely. v38.0.0 (CIRISPersist#746): edge's ContentScope::Group \
+         mints `cohort:{community_id}` / `av-stream:{hex}` table ids, and \
+         `resolve_projection_recipients` REFUSES them by name \
+         (RecipientBasis::GroupIdNotFederationKeyed) when one is handed to its \
+         federation-key parameter. The literal exists to refuse the wrong id space, \
+         never to route on it — routing on a sniffed prefix would be the axis \
+         fusion the parameter removes. No dimension ever carries this stem.",
+    ),
+    (
         "slashing:",
         "a RETENTION rule, not an admission rule — and the distinction is the whole \
          entry. v31.0.0 (CIRISPersist#650) names this stem in \
@@ -662,6 +696,7 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 admission::RECONSIDERATION_DIMENSION_PREFIX,
                 admission::QUARANTINE_DIMENSION_PREFIX,
                 registry::ACCORD_CO_SCRUB_MATCH_PREFIX,
+                admission::LEDGER_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -953,9 +988,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            19,
+            20,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             19\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             20\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

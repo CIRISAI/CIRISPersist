@@ -410,8 +410,9 @@ pub use types::{
     ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
     SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
-    SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm,
-    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
+    SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
+    TrustRow, TrustType,
 };
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
@@ -1314,8 +1315,9 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
+        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, Error> {
-        let _ = (attestation_id, expected_persist_row_hash);
+        let _ = (attestation_id, expected_persist_row_hash, authority);
         Err(Error::Unsupported {
             method: "purge_genesis_delegation_row_v31",
         })
@@ -4050,7 +4052,12 @@ pub trait FederationDirectory: Send + Sync {
     ///   3. UPSERT on `key_id` — preserves the pubkey + signature
     ///      envelope written by the prior `put_public_key`, overwrites
     ///      the trust columns. `trusted_at` is set to `NOW()`.
-    async fn grant_trust(&self, grant: TrustGrant) -> Result<(), Error> {
+    /// v38.0.0 (CIRISPersist#721) — takes a [`SignedTrustGrant`]: the
+    /// granter PROVES it is `trusted_by` (Strict hybrid over the pinned
+    /// signing bytes, verified against the directory-pinned keys) at
+    /// [`admission::check_trust_grant_authority`], asked INSIDE every
+    /// implementation ahead of the shape validation.
+    async fn grant_trust(&self, grant: SignedTrustGrant) -> Result<(), Error> {
         let _ = grant;
         Err(Error::Backend(
             "grant_trust not implemented for this backend".into(),
@@ -4058,9 +4065,16 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// Soft-delete a trust row by setting `expires_at = NOW()`.
-    /// Idempotent — revoking an already-expired row is a no-op.
-    async fn revoke_trust(&self, key: &str, revoked_by: &str) -> Result<(), Error> {
-        let _ = (key, revoked_by);
+    /// Idempotent — revoking an already-expired or absent row is a no-op.
+    ///
+    /// v38.0.0 (CIRISPersist#721) — takes a [`SignedTrustRevocation`]: the
+    /// revoker proves it is `revoked_by`
+    /// ([`admission::check_trust_revocation_authority`]) and must BE the
+    /// stored row's `trusted_by` — only the granter withdraws its own grant
+    /// (the protective-1 side; see [`admission::TRUST_PLANE_OPS`]). The old
+    /// door validated `revoked_by` non-empty and then DISCARDED it.
+    async fn revoke_trust(&self, revocation: SignedTrustRevocation) -> Result<(), Error> {
+        let _ = revocation;
         Err(Error::Backend(
             "revoke_trust not implemented for this backend".into(),
         ))
@@ -4229,8 +4243,14 @@ pub trait FederationDirectory: Send + Sync {
     ///   `key_id`.
     /// - [`Error::HardRemoveWithActiveAttestations`] when `hard =
     ///   true` and the peer has active attestations.
-    async fn remove_peer_record(&self, key_id: &str, hard: bool) -> Result<(), Error> {
-        let _ = (key_id, hard);
+    async fn remove_peer_record(
+        &self,
+        key_id: &str,
+        hard: bool,
+        reason: &str,
+        acting_under_delegation_id: Option<&str>,
+    ) -> Result<(), Error> {
+        let _ = (key_id, hard, reason, acting_under_delegation_id);
         Err(Error::Backend(
             "remove_peer_record not implemented for this backend".into(),
         ))
