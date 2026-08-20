@@ -1105,11 +1105,18 @@ mod tests {
     /// security half of the #545 fix: making the marker representable must
     /// not make it admissible; a peer presenting it on a real mesh is making
     /// a custody claim this node refuses as a DECISION, not a parse error.
-    #[serial_test::serial(test_anchor_env)]
     #[test]
     fn software_only_test_marker_refused_when_anchor_not_live_545() {
-        // Ensure the anchor is genuinely dark for this process.
-        std::env::remove_var("CIRIS_TEST_TRUST_ROOT");
+        // v38.0.0 (#738): the lib test process never carries a live anchor —
+        // the env-mutating suite lives in tests/test_anchor_env.rs, its own
+        // process. ASSERTED rather than scrubbed: a remove_var here would be
+        // exactly the class the hygiene tripwire exists to keep out, and if
+        // this precondition ever fails, the isolation broke and that is the
+        // finding.
+        assert!(
+            std::env::var("CIRIS_TEST_TRUST_ROOT").is_err(),
+            "a live test anchor leaked into the lib test process (#738 isolation broke)"
+        );
         let p = HardwareAttestationPolicy::default();
         let v = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": true});
         let err = p.check("mesh-peer", Some(&v), Utc::now()).unwrap_err();
