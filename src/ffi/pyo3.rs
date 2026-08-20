@@ -3370,9 +3370,16 @@ impl PyEngine {
     /// `slot_denials` **must be 0**: the tracked-peers cap is derived to make
     /// the branch that increments it unreachable by arithmetic. A non-zero
     /// reading does not mean "traffic is heavy", it means *the inequality the
-    /// derivation gate asserts no longer holds in this build*. It is **not** a
-    /// throttling metric — ordinary per-peer quota refusals are a different,
-    /// far more common thing and are not counted here at all.
+    /// derivation gate asserts no longer holds in this build*.
+    ///
+    /// v38.0.0 (CIRISPersist#609): ordinary quota refusals ARE now counted —
+    /// `refusals_by_budget` (per `peer` / `untracked_tail` / `node` /
+    /// `reserved`) and `refused_keys_in_window` (DISTINCT keys refused in the
+    /// burst window, hard-bounded so a rotating flood reads *at least N*,
+    /// never grows memory). A node refusing 100% of a peer's writes no longer
+    /// serializes as clean. The BAND still does not read them: a correct
+    /// refusal is a fault report about someone else, so banding these axes
+    /// belongs to the consumer's standing fold (e.g. Server IngestStanding).
     ///
     /// Those refusals arrive as a `RuntimeError` on the WRITE path, and as of
     /// v28.3.0 (CIRISPersist#571) they say which one. v24.3.0 (#575) put the

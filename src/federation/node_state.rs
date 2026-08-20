@@ -409,8 +409,11 @@ pub const PEER_QUOTA_NOTE: &str =
                                    between processes serving one node, and is stored nowhere. \
                                    slot_denials must be 0 by the tracked-peers cap derivation; a \
                                    non-zero reading means that arithmetic no longer holds in this \
-                                   build. Not a throttling metric — ordinary quota refusals are \
-                                   not counted here.";
+                                   build. refusals_by_budget / refused_keys_in_window (#609) count \
+                                   ordinary quota refusals per budget and distinct refused keys in \
+                                   the burst window; the BAND does not read them — a correct \
+                                   refusal is a fault report about someone else, so banding \
+                                   belongs to the consumer's standing fold.";
 
 /// CIRISServer#356 — one of the signals that is **not a node fact**, named
 /// together with the target it needs and the binding that answers it.
@@ -896,13 +899,16 @@ async fn resolve_consent_sla_signal(
 /// after the real path changed, which is the shape of a test that proves
 /// nothing.
 #[must_use]
-pub const fn peer_quota_band(observation: Option<PeerQuotaObservation>) -> StateBand {
+pub fn peer_quota_band(observation: Option<&PeerQuotaObservation>) -> StateBand {
     match observation {
         // The derivation no longer holds in this build. See
         // `PER_PEER_QUOTA_TRACKED_PEERS_CAP`.
         Some(o) if o.slot_denials > 0 => StateBand::Red,
         // Clean AND exercised: at least one peer write has been charged
-        // against this quota, so the zero means something.
+        // against this quota, so the zero means something. Deliberately
+        // NOT reading the #609 refusal counters: a correct refusal is a
+        // fault report about someone ELSE, while this band's Red means
+        // THIS build's arithmetic broke — see PEER_QUOTA_NOTE.
         Some(o) if o.tracked_peers > 0 => StateBand::Green,
         // Clean and NOT exercised (a fresh process), or no quota at all.
         // Both are "I have not tested this", which is not "it passed".
@@ -914,7 +920,7 @@ pub const fn peer_quota_band(observation: Option<PeerQuotaObservation>) -> State
 fn resolve_peer_quota_signal(directory: &dyn FederationDirectory) -> PeerQuotaSignal {
     let observation = directory.peer_quota_observation();
     PeerQuotaSignal {
-        band: peer_quota_band(observation),
+        band: peer_quota_band(observation.as_ref()),
         observation,
         note: PEER_QUOTA_NOTE.to_owned(),
     }
@@ -1035,6 +1041,7 @@ pub mod parity_test_support {
         assert!(
             s.peer_quota
                 .observation
+                .as_ref()
                 .is_some_and(|o| o.process_local && o.slot_denials == 0),
             "({tag}) every backend that charges peer writes reports the gauge"
         );
@@ -1338,21 +1345,44 @@ mod tests {
             process_local: true,
             tracked_peers: 0,
             slot_denials: 0,
+            refusals_by_budget: Default::default(),
+            refused_keys_in_window: 0,
         };
         let exercised = PeerQuotaObservation {
             process_local: true,
             tracked_peers: 3,
             slot_denials: 0,
+            refusals_by_budget: Default::default(),
+            refused_keys_in_window: 0,
         };
         let fired = PeerQuotaObservation {
             process_local: true,
             tracked_peers: 3,
             slot_denials: 1,
+            refusals_by_budget: Default::default(),
+            refused_keys_in_window: 0,
         };
         // The REAL predicate the fold runs — not a copy of it.
-        assert_eq!(peer_quota_band(Some(fresh)), StateBand::Unknown);
-        assert_eq!(peer_quota_band(Some(exercised)), StateBand::Green);
-        assert_eq!(peer_quota_band(Some(fired)), StateBand::Red);
+        assert_eq!(peer_quota_band(Some(&fresh)), StateBand::Unknown);
+        assert_eq!(peer_quota_band(Some(&exercised)), StateBand::Green);
+        assert_eq!(peer_quota_band(Some(&fired)), StateBand::Red);
+        // #609: refusals alone do NOT band — the band's Red is the build
+        // tripwire, the refusal axes are the consumer's to fold. But they
+        // MUST serialize, or the whole fix is invisible again.
+        let refusing = PeerQuotaObservation {
+            refusals_by_budget: [(
+                crate::federation::replication::admission::QuotaBudget::Peer,
+                7_u64,
+            )]
+            .into_iter()
+            .collect(),
+            refused_keys_in_window: 1,
+            ..exercised.clone()
+        };
+        assert_eq!(peer_quota_band(Some(&refusing)), StateBand::Green);
+        let j = serde_json::to_value(&refusing).unwrap();
+        assert_eq!(j["refusals_by_budget"]["peer"], 7);
+        assert_eq!(j["refused_keys_in_window"], 1);
         assert_eq!(
             peer_quota_band(None),
             StateBand::Unknown,

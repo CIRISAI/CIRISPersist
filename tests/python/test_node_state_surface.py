@@ -177,6 +177,10 @@ def test_the_zeroes_do_not_share_a_token() -> None:
         assert quota["process_local"] is True
         assert quota["slot_denials"] == 0
         assert quota["tracked_peers"] == 0
+        # 609: the refusal axes ride the same payload — empty on a fresh
+        # engine, but PRESENT, so "no refusals" and "not measured" differ.
+        assert quota["refusals_by_budget"] == {}
+        assert quota["refused_keys_in_window"] == 0
         assert undeclared["peer_quota"]["band"] == "unknown"
         assert undeclared["peer_quota"]["note"], "the volatility rides in the payload"
         assert "process-local" in undeclared["peer_quota"]["note"]

@@ -729,7 +729,14 @@ impl QuotaDimension {
 /// v25.1.0 (CIRISPersist#583) — **which budget** a write is charged against.
 /// Closed; the four #575 shipped, named so the refusal taxonomy can be
 /// generated from `budget × dimension × horizon` instead of hand-listed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// v38.0.0 (CIRISPersist#609): `Ord` + serde so the refusal counters can key
+/// a canonical map on it — the enum serializes as its snake_case token, which
+/// is what makes it a legal JSON map key.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum QuotaBudget {
     /// This author's own bucket. Fairness.
     Peer,
@@ -746,6 +753,27 @@ pub enum QuotaBudget {
 impl QuotaBudget {
     /// Every budget, in declaration order.
     pub const ALL: &'static [Self] = &[Self::Peer, Self::UntrackedTail, Self::Node, Self::Reserved];
+
+    /// The stable token — the same spelling serde emits.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::UntrackedTail => "untracked_tail",
+            Self::Node => "node",
+            Self::Reserved => "reserved",
+        }
+    }
+
+    /// Index into [`Self::ALL`] — the refusal counters' array key.
+    const fn idx(self) -> usize {
+        match self {
+            Self::Peer => 0,
+            Self::UntrackedTail => 1,
+            Self::Node => 2,
+            Self::Reserved => 3,
+        }
+    }
 }
 
 /// v25.1.0 (CIRISPersist#583) — **which horizon** a refusal came from. Every
@@ -1520,10 +1548,16 @@ pub struct PeerWriteQuota {
 /// seeing from outside the crate's own test module — the only place it was
 /// observable before this cut.
 ///
-/// It is emphatically **not** a throttling metric: ordinary quota refusals
-/// (`PeerQuotaRefusal`) are a different, far more common thing and are not
-/// counted here at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// v38.0.0 (CIRISPersist#609) — the refusal counters land. Before this cut
+/// the only exposed number was the tail-squeeze tripwire, which is derived
+/// UNREACHABLE — so a node refusing 100% of a peer's writes read as
+/// `Green`: the control fired perfectly and reported nothing. Refusals are
+/// now counted per budget, plus a bounded distinct-refused-keys window so
+/// one stuck producer is distinguishable from a wave. The BAND still does
+/// not read them (a correct refusal is a fault report about someone ELSE,
+/// while the tripwire's Red means THIS build's arithmetic broke) — the two
+/// axes ship as data for the consumer's standing fold to band.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerQuotaObservation {
     /// Always `true`. See the type doc — this is the field that says the two
     /// numbers below are about a process, not about a node.
@@ -1537,7 +1571,26 @@ pub struct PeerQuotaObservation {
     pub tracked_peers: usize,
     /// The #583 tail-squeeze count. **Must be 0**; see the type doc.
     pub slot_denials: u64,
+    /// v38.0.0 (#609) — refusals since process start, per budget. A key
+    /// serializes as its snake_case token (`peer` / `untracked_tail` /
+    /// `node` / `reserved`), so the JSON is a plain string-keyed object.
+    pub refusals_by_budget: std::collections::BTreeMap<QuotaBudget, u64>,
+    /// v38.0.0 (#609) — DISTINCT keys refused inside the burst window
+    /// ([`PER_PEER_ATTESTATION_WRITE_WINDOW`]), bounded at
+    /// [`REFUSED_KEYS_WINDOW_CAP`]: one stuck producer reads `1`, a rotating
+    /// flood saturates to the cap and reads as *at least this many*.
+    pub refused_keys_in_window: usize,
 }
+
+/// v38.0.0 (CIRISPersist#609) — hard bound on the refused-keys window map.
+///
+/// The key is `attesting_key_id`, which at this point in the chain is
+/// attacker-chosen and UNAUTHENTICATED (the whole reason the untracked tail
+/// exists) — an unbounded set would be a memory amplifier reachable by an
+/// unauthenticated flooder, strictly worse than the blindness being fixed.
+/// Sized as 2× the tracked-peers cap: comfortably above any honest
+/// population, and once saturated the reading means *at least this many*.
+pub const REFUSED_KEYS_WINDOW_CAP: usize = PER_PEER_QUOTA_TRACKED_PEERS_CAP * 2;
 
 /// The four budgets, behind one lock. They move together on every write, so
 /// splitting the lock would only buy a torn decision.
@@ -1563,6 +1616,32 @@ struct QuotaState {
     /// deployment that has drifted should be able to SEE it rather than
     /// silently demote newcomers to a contended commons.
     slot_denials: u64,
+    /// v38.0.0 (#609) — refusals since process start, indexed by
+    /// [`QuotaBudget::idx`]. Counted at the ONE chokepoint (`charge`), so
+    /// the counter and the refusal cannot disagree.
+    refusals_by_budget: [u64; 4],
+    /// v38.0.0 (#609) — last refusal instant per key, pruned to the burst
+    /// window on every write and hard-bounded at
+    /// [`REFUSED_KEYS_WINDOW_CAP`] (see the const for why the bound is the
+    /// security-relevant part).
+    refused_keys: HashMap<String, Instant>,
+}
+
+impl QuotaState {
+    /// The one refusal-accounting site. Prune first so the window reading
+    /// is honest even under a rotating-identity flood, then record —
+    /// skipping the insert (but still counting the budget) once the cap is
+    /// reached, so the map can never exceed its bound.
+    fn record_refusal(&mut self, key_id: &str, budget: QuotaBudget, now: Instant) {
+        self.refusals_by_budget[budget.idx()] += 1;
+        self.refused_keys
+            .retain(|_, at| now.duration_since(*at) <= PER_PEER_ATTESTATION_WRITE_WINDOW);
+        if self.refused_keys.contains_key(key_id)
+            || self.refused_keys.len() < REFUSED_KEYS_WINDOW_CAP
+        {
+            self.refused_keys.insert(key_id.to_owned(), now);
+        }
+    }
 }
 
 impl Default for PeerWriteQuota {
@@ -1628,6 +1707,8 @@ impl PeerWriteQuota {
                     now,
                 ),
                 slot_denials: 0,
+                refusals_by_budget: [0; 4],
+                refused_keys: HashMap::new(),
             }),
         }
     }
@@ -1779,12 +1860,31 @@ impl PeerWriteQuota {
         cost: &WriteCost,
         now: Instant,
     ) -> Result<(), PeerQuotaRefused> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let verdict = Self::charge_locked(&mut st, key_id, class, cost, now);
+        // v38.0.0 (#609) — the refusal is COUNTED where it is decided, inside
+        // the same lock acquisition, so the counter and the verdict cannot
+        // disagree and the hot unauthenticated path takes no second lock.
+        // The no-partial-charge invariant is about token SPEND, not about
+        // accounting — a refusal that mutates only the refusal counters
+        // spends nothing.
+        if let Err(refused) = &verdict {
+            st.record_refusal(key_id, refused.reason.budget(), now);
+        }
+        verdict
+    }
+
+    fn charge_locked(
+        st: &mut QuotaState,
+        key_id: &str,
+        class: WriteAdmissionClass,
+        cost: &WriteCost,
+        now: Instant,
+    ) -> Result<(), PeerQuotaRefused> {
         let peer_spec = Self::peer_spec();
         let node_spec = BudgetSpec::for_multiple(NODE_INGEST_BUDGET_MULTIPLE);
         let tail_spec = BudgetSpec::for_multiple(UNTRACKED_TAIL_BUDGET_MULTIPLE);
         let reserved_spec = BudgetSpec::for_multiple(RESERVED_CLASS_BUDGET_MULTIPLE);
-
-        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
         // The reserved class is charged against its own budget and NOTHING
         // else — not the node's, not the peer's, not the tail's. That is the
@@ -1946,10 +2046,21 @@ impl PeerWriteQuota {
     #[must_use]
     pub fn observe(&self) -> PeerQuotaObservation {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
         PeerQuotaObservation {
             process_local: true,
             tracked_peers: st.buckets.len(),
             slot_denials: st.slot_denials,
+            refusals_by_budget: QuotaBudget::ALL
+                .iter()
+                .filter(|b| st.refusals_by_budget[b.idx()] > 0)
+                .map(|b| (*b, st.refusals_by_budget[b.idx()]))
+                .collect(),
+            refused_keys_in_window: st
+                .refused_keys
+                .values()
+                .filter(|at| now.duration_since(**at) <= PER_PEER_ATTESTATION_WRITE_WINDOW)
+                .count(),
         }
     }
 
@@ -2721,6 +2832,74 @@ mod tests {
     /// `attesting_key_id` was born with a full 600-write allowance and
     /// identity is free at this point in the chain. It is now one node-wide
     /// burst allowance, no matter how many identities ask.
+    /// v38.0.0 (CIRISPersist#609) — **a peer refused on every write is
+    /// visible from outside the crate.** Before this cut the only exposed
+    /// counter was the tail-squeeze tripwire (derived unreachable), so a
+    /// node refusing 100% of one peer's writes serialized as clean. The
+    /// refusal counters land at the ONE chokepoint, and the JSON carries
+    /// them — asserted at the JSON layer because that is the actual
+    /// consumer contract.
+    #[test]
+    fn a_peer_refused_on_every_write_is_visible_from_outside_609() {
+        let quota = PeerWriteQuota::new();
+        let t0 = Instant::now();
+        // Drain until the control fires — the flood.
+        let mut drained = 0_u64;
+        while quota.check_at("flooder", t0).is_ok() {
+            drained += 1;
+            assert!(
+                drained < 10_000_000,
+                "quota never refused — no control at all"
+            );
+        }
+        // The control fires (this passed before the fix too)...
+        assert!(quota.check_at("flooder", t0).is_err());
+        assert!(quota.check_at("flooder", t0).is_err());
+        // ...and NOW it is countable (this is the arm that was missing).
+        let o = quota.observe();
+        let total: u64 = o.refusals_by_budget.values().sum();
+        assert!(total >= 2, "refusals must count: {o:?}");
+        assert_eq!(
+            o.refused_keys_in_window, 1,
+            "one stuck producer, not a wave: {o:?}"
+        );
+        let j = serde_json::to_value(&o).unwrap();
+        assert!(
+            j.get("refusals_by_budget")
+                .is_some_and(|v| v.as_object().is_some_and(|m| !m.is_empty())),
+            "a node refusing 100% of a peer's writes must not serialize as clean: {j}"
+        );
+        // And the band still holds its lane: refusals are the consumer's
+        // axis, the band's Red stays the build tripwire.
+        assert_eq!(o.slot_denials, 0);
+    }
+
+    /// v38.0.0 (#609) — the refused-keys window is HARD-BOUNDED. The key is
+    /// attacker-chosen and unauthenticated, so an unbounded map would be a
+    /// memory amplifier reachable by a rotating-identity flood — strictly
+    /// worse than the blindness being fixed. Saturated reads mean *at least
+    /// this many*.
+    #[test]
+    fn the_refused_keys_window_saturates_at_its_cap_609() {
+        let quota = PeerWriteQuota::new();
+        let t0 = Instant::now();
+        while quota.check_at("seed", t0).is_ok() {}
+        // A rotating-identity flood: every key distinct, every write refused.
+        for i in 0..(REFUSED_KEYS_WINDOW_CAP + 50) {
+            let _ = quota.check_at(&format!("rotator-{i}"), t0);
+        }
+        let o = quota.observe();
+        assert!(
+            o.refused_keys_in_window <= REFUSED_KEYS_WINDOW_CAP,
+            "the window must saturate, never grow: {} > {REFUSED_KEYS_WINDOW_CAP}",
+            o.refused_keys_in_window
+        );
+        assert!(
+            o.refused_keys_in_window >= REFUSED_KEYS_WINDOW_CAP / 2,
+            "the window must actually track distinct keys: {o:?}"
+        );
+    }
+
     #[test]
     fn a_restart_is_worth_one_node_burst_not_a_sybil_multiple() {
         let quota = PeerWriteQuota::new(); // ← the restart
