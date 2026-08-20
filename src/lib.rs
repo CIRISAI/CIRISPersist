@@ -96,6 +96,8 @@ pub mod pipeline;
 pub mod prelude;
 pub mod queue;
 pub mod read;
+#[cfg(feature = "registry_key_escrows")]
+pub mod registry_key_escrows;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod retention;
 #[cfg(feature = "cirislens_scheduled_tasks")]

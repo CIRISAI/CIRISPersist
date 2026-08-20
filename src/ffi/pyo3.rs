@@ -232,7 +232,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "legacy_migration_not_found"
         | "sequence_not_found"
         | "occurrence_not_found"
-        | "ledgers_not_found" => NotFound::new_err(msg),
+        | "ledgers_not_found"
+        | "key_escrows_not_found" => NotFound::new_err(msg),
 
         // Conflict family — uniqueness / version / state-transition
         // conflict; caller MUST NOT retry, MUST re-read.
@@ -256,7 +257,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "legacy_migration_conflict"
         | "sequence_conflict"
         | "occurrence_conflict"
-        | "ledgers_conflict" => Conflict::new_err(msg),
+        | "ledgers_conflict"
+        | "key_escrows_conflict" => Conflict::new_err(msg),
 
         // Transient family — backend connection / timeout / pool
         // exhaustion; caller MAY retry with backoff.
@@ -282,7 +284,8 @@ pub(crate) fn translate_error_kind(kind: &str, msg: String) -> PyErr {
         | "legacy_migration_backend"
         | "sequence_backend"
         | "occurrence_backend"
-        | "ledgers_backend" => Transient::new_err(msg),
+        | "ledgers_backend"
+        | "key_escrows_backend" => Transient::new_err(msg),
 
         // Default — Permanent. Covers invalid arguments, signature
         // failures, crypto errors, rotation conflicts, "not authorized,"
@@ -26636,6 +26639,236 @@ impl PyEngine {
                     .map(Some)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string())),
             }
+        })
+    }
+
+    // ── the `registry_key_escrows` family (CIRISPersist#752, from #751) ─
+    //
+    // The registry→server fold's storage ask: CC 4.4.3.2.8
+    // `archive_custody` working-index verbs — custody METADATA, never key
+    // material. Authorization rides `delegates_to`, recovery rides
+    // `key_grant` (both existing planes; CC 1.7's lockdown forbids a new
+    // envelope kind). Registry's RequestKeyEscrow / RequestKeyRecovery /
+    // ListKeyEscrows map onto create / set_status / list.
+
+    /// CC 4.4.3.2.8 — create (or idempotently re-create) an escrow record
+    /// (JSON `KeyEscrowRow`, status must be `"active"` — an escrow is born
+    /// live and its lifecycle has exactly one door). `True` on first
+    /// write; `False` on an identical re-put — which also cannot resurrect
+    /// a terminal escrow, only the immutable identity columns decide;
+    /// `Conflict` on a differing row at an occupied `escrow_id`.
+    #[cfg(feature = "registry_key_escrows")]
+    fn escrow_create(&self, py: Python<'_>, row_json: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let row: crate::registry_key_escrows::KeyEscrowRow = serde_json::from_str(row_json)
+                .map_err(|e| PyValueError::new_err(format!("KeyEscrowRow decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        backend
+                            .create_escrow(&row)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::registry_key_escrows::sqlite::SqliteKeyEscrowBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        backend
+                            .create_escrow(&row)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// Point lookup by `escrow_id` — JSON `KeyEscrowRow` or `None`.
+    #[cfg(feature = "registry_key_escrows")]
+    fn escrow_get(&self, py: Python<'_>, escrow_id: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let eid = escrow_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let row = backend
+                            .get_escrow(&eid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("KeyEscrowRow encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::registry_key_escrows::sqlite::SqliteKeyEscrowBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let row = backend
+                            .get_escrow(&eid)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        match row {
+                            None => Ok(None),
+                            Some(r) => serde_json::to_string(&r).map(Some).map_err(|e| {
+                                PyRuntimeError::new_err(format!("KeyEscrowRow encode: {e}"))
+                            }),
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    /// Registry's `ListKeyEscrows` — every escrow for one org, JSON array.
+    #[cfg(feature = "registry_key_escrows")]
+    fn escrow_list_for_org(&self, py: Python<'_>, org_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let org = org_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let r = backend
+                            .list_escrows_for_org(&org)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("KeyEscrowRow list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::registry_key_escrows::sqlite::SqliteKeyEscrowBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let r = backend
+                            .list_escrows_for_org(&org)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("KeyEscrowRow list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// The recovery path's first question — every escrow naming one key,
+    /// JSON array.
+    #[cfg(feature = "registry_key_escrows")]
+    fn escrow_list_for_key(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key = key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let r = backend
+                            .list_escrows_for_key(&key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("KeyEscrowRow list encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::registry_key_escrows::sqlite::SqliteKeyEscrowBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        let r = backend
+                            .list_escrows_for_key(&key)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&r).map_err(|e| {
+                            PyRuntimeError::new_err(format!("KeyEscrowRow list encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// The lifecycle door (registry's `RequestKeyRecovery` outcome path):
+    /// `"active"` may move to `"recovered"` / `"revoked"` / `"expired"`;
+    /// a same-state re-assertion is `False` (idempotent); any transition
+    /// out of a terminal state raises `Conflict` — a custody outcome pins,
+    /// it never flips.
+    #[cfg(feature = "registry_key_escrows")]
+    fn escrow_set_status(&self, py: Python<'_>, escrow_id: &str, status: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let eid = escrow_id.to_owned();
+            let status =
+                crate::registry_key_escrows::EscrowStatus::parse_str(status).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown status `{status}` — active|recovered|revoked|expired"
+                    ))
+                })?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        backend
+                            .set_escrow_status(&eid, status)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = crate::registry_key_escrows::sqlite::SqliteKeyEscrowBackend::new(
+                        sq.conn_handle(),
+                    );
+                    runtime.block_on(async move {
+                        use crate::registry_key_escrows::KeyEscrowService;
+                        backend
+                            .set_escrow_status(&eid, status)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
         })
     }
 

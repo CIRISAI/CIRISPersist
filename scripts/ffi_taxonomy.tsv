@@ -262,6 +262,11 @@ Engine	emit_attestation_self	deontic
 Engine	engine_handle	structural	
 Engine	enqueue_outbound	procedural	
 Engine	envelope_vocabulary	nomological	
+Engine	escrow_create	deontic	
+Engine	escrow_get	empirical	
+Engine	escrow_list_for_key	empirical	
+Engine	escrow_list_for_org	empirical	
+Engine	escrow_set_status	deontic	
 Engine	evict_actor_json	deontic	
 Engine	evict_aggregated_tier	procedural	
 Engine	evict_fountain_content_hard_delete	testimonial	erasure_effect

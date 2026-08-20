@@ -749,6 +749,12 @@ class Engine:
     def emit_attestation_self(self, input_json: str) -> str:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
 
+    def escrow_create(self, row_json: str) -> bool:
+        """(derived) deontic — CC 4.4.3.2.8 — create (or idempotently re-create) an escrow record (JSON KeyEscrowRow, status must be "active" — an escrow is born live and its lif... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_set_status(self, escrow_id: str, status: str) -> bool:
+        """(derived) deontic — The lifecycle door (registry's RequestKeyRecovery outcome path): "active" may move to "recovered" / "revoked" / "expired"; a same-state re-assertio... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
         """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds for attesting_key_id,..."""
 
@@ -2628,6 +2634,15 @@ class Engine:
 
     def duty_holders_for_content_json(self, content_sha256: str, community_id: str, duty: str) -> str:
         """(derived) empirical — #249 Cut A — the duty-holders of a content target (content_sha256) for duty (moderate / takedown / review): the content's resolved subjects ∪ the n..."""
+
+    def escrow_get(self, escrow_id: str) -> str | None:
+        """(derived) empirical — Point lookup by escrow_id — JSON KeyEscrowRow or None. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_list_for_key(self, key_id: str) -> str:
+        """(derived) empirical — The recovery path's first question — every escrow naming one key, JSON array. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
+
+    def escrow_list_for_org(self, org_id: str) -> str:
+        """(derived) empirical — Registry's ListKeyEscrows — every escrow for one org, JSON array. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
 
     def federation_directory_query(self, filter_json: str) -> str:
         """(derived) empirical — v2.7.0 (CIRISPersist#104) — Trust-Topology aggregate query. Walks federation_attestations to produce a [TrustTopology] with nodes (resolved through..."""

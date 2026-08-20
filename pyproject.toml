@@ -165,6 +165,7 @@ features = [
     "cirislens_occurrence",
     "cirislens_legacy_migration",
     "ledgers",
+    "registry_key_escrows",
     "secrets",
     "cirisnode",
     "extract",

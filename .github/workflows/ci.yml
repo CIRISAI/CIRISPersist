@@ -684,7 +684,7 @@ jobs:
         cirislens_creation_ceremonies cirislens_continuity_awareness
         cirislens_feedback_mappings cirislens_wa_cert
         cirislens_service_token_revocation cirislens_sequence
-        cirislens_occurrence cirislens_legacy_migration ledgers
+        cirislens_occurrence cirislens_legacy_migration ledgers registry_key_escrows
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -873,7 +873,7 @@ jobs:
         cirislens_creation_ceremonies cirislens_continuity_awareness
         cirislens_feedback_mappings cirislens_wa_cert
         cirislens_service_token_revocation cirislens_sequence
-        cirislens_occurrence cirislens_legacy_migration ledgers
+        cirislens_occurrence cirislens_legacy_migration ledgers registry_key_escrows
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.97.0
