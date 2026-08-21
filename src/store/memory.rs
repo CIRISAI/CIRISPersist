@@ -10873,6 +10873,16 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, memory arm.
+    #[tokio::test]
+    async fn node_speaks_for_owner_memory_765() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_node_speaks_for_owner(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, memory arm.
     #[tokio::test]
     async fn owner_signed_community_row_memory_757() {

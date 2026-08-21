@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.3.0] - 2026-08-21
+
+The chat ladder's last door (measured by CIRISServer against v38.2.0 +
+edge v18.4.0: the message crosses the wire and refuses at persist's
+community door with a "transient" that can never transition).
+
+### Added
+
+- **#765 — the writer-admission PRINCIPAL fold** (`admission_identity_for_writer`,
+  one spelling): occurrence axis first (§4.4 active binding), then the live
+  `delegates_to(owner → node)` OWNER-BINDING axis (CC 1.13.3.3 via `owner_of`
+  — the same liveness fold the single-owner gate polices, #578/#584). A
+  node's occurrence row is self-referential (CIRISServer#454), so v38.2
+  resolved a node to ITSELF and asked the membership question about the
+  instrument instead of the principal — `retry_after_community_roster`
+  forever. Consumed at the community write gate, AV-84 standing (fixing
+  membership alone moves the refusal exactly one gate deeper, onto
+  `AttestedParty` — measured by mutation), and trace-ingest's
+  `writer_admission`. The equivalence widens to the single live owner and
+  NEVER past it: an unbound node inherits nothing, a third party is still a
+  third party, and a withdrawn binding stops lifting the moment it dies.
+- **#764 — `nodes_owned_by`, the reverse owner-binding walk** (for
+  CIRISEdge#524's send-set: a `consent:replication:v1` grant naming a PERSON
+  was silently unroutable). Candidates from the granter-side index; each
+  candidate's VERDICT is `owner_of` itself, so
+  `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction. An
+  `AmbiguousNodeOwner` candidate is skipped (one poisoned node must not
+  unroute its owner's every grant); the forward walk still fails closed.
+
+Witnessed on all three backends (`exercise_node_speaks_for_owner`, five
+arms); three mutations red their arm by name — the membership mutation
+reproduces the ladder's refusal verbatim.
+
 ## [38.2.0] - 2026-08-21
 
 Downstream (CIRISServer) wired 2-member-community chat — messages as

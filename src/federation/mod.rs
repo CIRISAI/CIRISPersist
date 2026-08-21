@@ -3878,13 +3878,21 @@ pub trait FederationDirectory: Send + Sync {
         let admission = if needs_admission {
             // occurrence → identity (singleton fallback: unbound
             // occurrence IS its own identity, FSD §4.4).
-            // ACTIVE binding only (PR #761 review): the historical lookup
-            // treats a revoked device as co-self with its former owner, and
-            // membership inheritance is exactly what revoking a lost device
-            // must sever.
-            let identity = self
-                .active_identity_for_occurrence(writer_occurrence_key_id)
-                .await?;
+            // THE PRINCIPAL FOLD (v38.3.0, #765): occurrence axis first
+            // (ACTIVE binding only — a revoked device must not stay co-self
+            // with its former owner, PR #761), then the live owner-binding
+            // axis — a NODE's occurrence is self-referential (#454), and its
+            // authority to write into its owner's cohorts lives on the
+            // `delegates_to(owner → node)` owner-binding. Without the second
+            // axis, an on-behalf community row refused
+            // `retry_after_community_roster` FOREVER: the roster's members
+            // are persons; the membership question was being asked about the
+            // instrument instead of the principal.
+            let identity = crate::federation::admission::admission_identity_for_writer(
+                self,
+                writer_occurrence_key_id,
+            )
+            .await?;
             // ACTIVE membership, not raw containment — the roster is
             // append-only, so raw `members` counts a revoked member as a
             // member. See `active_community_key_ids_for` for the full
