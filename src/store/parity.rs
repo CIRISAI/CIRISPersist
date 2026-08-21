@@ -174,7 +174,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_peer_record_admission", Class::Gate),
     ("check_privileged_identity_type_admission", Class::Gate),
     ("check_promotion_admission", Class::Gate),
-    ("check_promotion_cohort_standing", Class::Gate),
+    // v38.2.0 PR #759 review — the standing comparison RESOLVES occurrence →
+    // identity at every standing door, so the doors call the resolved form;
+    // the pure `check_promotion_cohort_standing` survives only as the
+    // string-compare delegate inside `cohort_standing_core`'s callers.
+    ("check_cohort_standing_resolved", Class::Gate),
+    // Refuses a split-brain row whose cohort-target aliases disagree; a
+    // refusal, so it contributes to the compared sequence.
+    ("envelope_cohort_target", Class::Gate),
+    // Targeted cohorts are never local-tier (local rows defer signature
+    // verification; a membership claim needs the verified signature).
+    ("check_targeted_cohort_never_local", Class::Gate),
     ("check_purge_admission", Class::Gate),
     ("check_put_blob_admission", Class::Gate),
     ("check_reseal_admission", Class::Gate),

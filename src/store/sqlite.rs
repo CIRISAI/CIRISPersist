@@ -3920,7 +3920,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // family/community placement and left an owner-signed community
             // row inexpressible (promotion, the only other door, re-seals
             // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -3933,8 +3933,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // this line a member could place a row ABOUT A THIRD PARTY into the
         // whole community's plane — the exact claim AV-84 exists to refuse,
         // arriving through the door its own doc said could not be reached.
-        // Pure (no directory read, no clock), so it stays in the cheap tier.
-        crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        // v38.2.0 PR #759 review: the standing comparison RESOLVES
+        // occurrence -> identity (a device signing about its own owning
+        // identity is not a third party), and a targeted placement is never
+        // local-tier (local rows defer signature verification, and an
+        // unverified membership claim is mintable by anyone).
+        crate::federation::admission::check_targeted_cohort_never_local(
+            &row.tier,
+            &row.cohort_scope,
+        )?;
+        crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Same shape as the postgres backend; see
@@ -4765,7 +4773,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // (a rule shipped behind one door while the motion uses another).
         // Verify-before-mutation (AV-9): `row` is a local clone and nothing has
         // been written yet.
-        crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
         // v31.0.0 (CIRISPersist#649) — and the typed-column binding at the same
         // door, for the same "one rule, both doors" reason: a caller that
         // re-scopes without re-stamping is REFUSED rather than minting a row

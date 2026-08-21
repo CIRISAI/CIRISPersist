@@ -3853,8 +3853,50 @@ pub trait FederationDirectory: Send + Sync {
             // member. See `active_community_key_ids_for` for the full
             // argument; measured by the revoked-member arm of
             // `exercise_owner_signed_community_row`.
-            let family_key_ids = self.active_family_key_ids_for(&identity).await?;
-            let community_key_ids = self.active_community_key_ids_for(&identity).await?;
+            //
+            // Resolved for the CLAIMED TARGET ONLY (PR #759 review): the
+            // first shape enumerated every cohort containing the writer and
+            // folded revocations for each — O(N) sequential directory
+            // round-trips on the hot write path for an identity in N groups,
+            // when the predicate only ever asks about the ONE target the row
+            // names. One roster read + one revocation read now. An UNKNOWN
+            // target maps to the empty set — the same membership refusal,
+            // which is also the transient-correct answer for a row arriving
+            // ahead of its roster (CIRISEdge#522: refused rows re-offer);
+            // backend errors still propagate as errors.
+            fn contains_or_absent<M>(
+                members: Result<Vec<M>, Error>,
+                key_of: impl Fn(&M) -> &str,
+                identity: &str,
+            ) -> Result<bool, Error> {
+                match members {
+                    Ok(active) => Ok(active.iter().any(|m| key_of(m) == identity)),
+                    Err(Error::InvalidArgument(_)) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            let mut family_key_ids: Vec<String> = Vec::new();
+            let mut community_key_ids: Vec<String> = Vec::new();
+            if let Some(target) = claimed_target_id {
+                if claimed_cohort_scope == cs::FAMILY
+                    && contains_or_absent(
+                        self.active_family_members(target).await,
+                        |m| m.key_id.as_str(),
+                        &identity,
+                    )?
+                {
+                    family_key_ids.push(target.to_owned());
+                }
+                if claimed_cohort_scope == cs::COMMUNITY
+                    && contains_or_absent(
+                        self.active_community_members(target).await,
+                        |m| m.key_id.as_str(),
+                        &identity,
+                    )?
+                {
+                    community_key_ids.push(target.to_owned());
+                }
+            }
             crate::scope::CallerAdmission::from_resolved(
                 writer_occurrence_key_id.to_owned(),
                 identity,
@@ -7094,12 +7136,13 @@ pub enum Error {
     /// branch on [`admission::CohortStandingRefusal::as_str`], never this text.
     /// See [`admission::check_promotion_cohort_standing`].
     #[error(
-        "targeted-cohort placement refused ({reason}): promoting to cohort_scope \
+        "targeted-cohort placement refused ({reason}): cohort_scope \
          {cohort_scope:?} requires the row to name no party but its own producer \
-         {producer_key_id:?}, but its {} names {foreign_key_id:?}. A promotion into a \
+         {producer_key_id:?}, but its {} names {foreign_key_id:?}. A placement into a \
          family/community plane is a producer self-declaration about its own content's \
-         visibility (CIRISPersist#592 / AV-84); a claim about a third party belongs at a \
-         broad belonging-tier, where any authenticated writer may emit",
+         visibility (CIRISPersist#592 / AV-84, at the put, promote and re-scope doors \
+         since v38.2.0); a claim about a third party belongs at a broad belonging-tier, \
+         where any authenticated writer may emit",
         reason.field()
     )]
     CohortStandingRefused {

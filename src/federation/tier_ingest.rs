@@ -1293,17 +1293,24 @@ pub mod test_support {
                 subject_key_ids: vec![producer.to_owned()],
                 withdraws_admission_rule: None,
                 cohort_scope: cohort_scope::COMMUNITY.to_owned(),
-                tier: attestation_tier::LOCAL.to_owned(),
+                // FEDERATION tier, really signed (PR #759 review): the first
+                // shape of this witness rode tier `local` with placeholder
+                // signatures — and LANDED, because local tier defers
+                // signature verification. That was itself the hole: a
+                // community placement is a membership claim, and an
+                // unverified membership claim is mintable by anyone. The
+                // owner-signed path this witness certifies is the
+                // federation-tier one, under the author's REAL hybrid
+                // signature, verified by `verify_federation_tier_ingest` in
+                // full.
+                tier: attestation_tier::FEDERATION.to_owned(),
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             }
         };
-        // #598 — the signed instants + RowMirror the door requires of any
-        // row. Not part of what this witness is about; without it the row is
-        // refused for an unrelated reason and the wall would look fixed.
         let row = |producer: &str, target: Option<&str>| {
             let mut r = row(producer, target);
-            stamp_mirror(&mut r);
+            seal_row_in_place(producer, &mut r);
             r
         };
 
@@ -1408,6 +1415,95 @@ pub mod test_support {
              gate consulted raw roster containment instead of the active fold \
              (admitted AND NOT revoked)"
         );
+
+        // Arms 5-7 need an ACTIVE member (arm 4 revoked `author` out of
+        // `cid`), so they run against a second community.
+        let bob_observer = format!("observer-757-{suffix}");
+        let cid2 = format!("chat-comm2-757-{suffix}");
+        register_user_role_key(dir, &bob_observer).await;
+        register_hybrid_key(dir, &cid2).await;
+        seed_two_member_community(dir, &cid2, &bob_observer, &bob_observer).await;
+
+        // (5) SPLIT-BRAIN TARGET REFUSES (PR #759 review). Membership was
+        // proven for the FIRST alias only, while consumers that walk every
+        // alias (the moderator gate) key the row on the second — a member of
+        // C1 must not smuggle a row keyed on C2.
+        let mut split = row(&bob_observer, Some(&cid2));
+        split.attestation_envelope["community_key_id"] =
+            serde_json::Value::String(format!("other-comm-757-{suffix}"));
+        seal_row_in_place(&bob_observer, &mut split);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: split })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("({suffix}) PR#759: disagreeing cohort-target aliases must refuse")
+            });
+        assert!(
+            format!("{err}").contains("aliases disagree"),
+            "({suffix}) the refusal names the split-brain: {err}"
+        );
+
+        // (6) LOCAL TIER + TARGETED SCOPE REFUSES (PR #759 review). Local
+        // rows defer signature verification, so a community placement there
+        // is an unverified membership claim — the shape the FIRST version of
+        // this witness accidentally proved mintable (placeholder signatures,
+        // tier local, landed).
+        let mut local = row(&bob_observer, Some(&cid2));
+        local.tier = attestation_tier::LOCAL.to_owned();
+        local.scrub_signature_classical = "c2ln".to_owned();
+        local.scrub_signature_pqc = None;
+        stamp_mirror(&mut local);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: local })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) PR#759: a local-tier community placement carries an \
+                     UNVERIFIED membership claim and must refuse"
+                )
+            });
+        assert!(
+            format!("{err}").contains("never local"),
+            "({suffix}) the refusal names the never-local rule: {err}"
+        );
+
+        // (7) A DEVICE OCCURRENCE WRITES AS ITS OWNING IDENTITY (PR #759
+        // review). `attesting = O`, `attested = I`, `resolve(O) = I`: the
+        // identity an occurrence resolves to is NOT a third party — it IS
+        // the producer (#275 / §4.4). The string-compare form of AV-84
+        // refused this as `AttestedParty`, which would have made
+        // owner-attributed device chat unwriteable.
+        let device = format!("device-757-{suffix}");
+        register_user_role_key(dir, &device).await;
+        dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: bob_observer.clone(),
+            occurrence_key_id: device.clone(),
+            device_class: crate::federation::types::device_class::SERVER.into(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
+        let mut via_device = row(&device, Some(&cid2));
+        via_device.attested_key_id = bob_observer.clone();
+        via_device.subject_key_ids = vec![bob_observer.clone()];
+        seal_row_in_place(&device, &mut via_device);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: via_device,
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({suffix}) PR#759: a device occurrence writing about its OWN owning \
+                 identity is the producer, not a third party — refused with: {e}"
+            )
+        });
     }
 
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role

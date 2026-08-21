@@ -2144,6 +2144,83 @@ impl std::fmt::Display for CohortStandingRefusal {
     }
 }
 
+/// The ONE standing comparison, parameterised over party resolution: refuse
+/// iff any named party RESOLVES differently from the producer. The string
+/// form ([`check_promotion_cohort_standing`], resolution = identity fn) and
+/// the directory form ([`check_cohort_standing_resolved`]) both delegate
+/// here, so the two doors cannot drift to two ideas of "same producer".
+fn cohort_standing_core(
+    row: &super::Attestation,
+    resolve: impl Fn(&str) -> String,
+) -> Result<(), Error> {
+    let producer = row.attesting_key_id.as_str();
+    let producer_identity = resolve(producer);
+    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
+        Err(Error::CohortStandingRefused {
+            cohort_scope: row.cohort_scope.clone(),
+            producer_key_id: producer.to_owned(),
+            foreign_key_id: foreign.to_owned(),
+            reason,
+        })
+    };
+    if row.attested_key_id != producer && resolve(&row.attested_key_id) != producer_identity {
+        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
+    }
+    if let Some(foreign) = row
+        .subject_key_ids
+        .iter()
+        .find(|s| s.as_str() != producer && resolve(s) != producer_identity)
+    {
+        return refuse(CohortStandingRefusal::NamedSubject, foreign);
+    }
+    Ok(())
+}
+
+/// v38.2.0 (PR #759 review) — AV-84 with **occurrence→identity resolution**:
+/// standing compares IDENTITIES, not key strings.
+///
+/// The pure form compares `attested_key_id` / `subject_key_ids` against
+/// `attesting_key_id` byte-for-byte. That refuses a row a DEVICE occurrence
+/// signs about its OWN owning identity (`attesting = O`, `attested = I`,
+/// `resolve(O) = I`) as a "third party" — but the identity an occurrence
+/// resolves to is not a third party, it IS the producer (#275's two-signer
+/// split; the same §4.4 singleton-fallback rule the scope gate applies).
+/// Owner-attributed chat is exactly this shape, so the pure comparison at
+/// the put door would have made device-authored community rows unwriteable.
+///
+/// Resolution is directory-backed and cached per distinct key string within
+/// the row (at most: producer + attested + each subject). Parties that
+/// resolve to DIFFERENT identities still refuse — resolution widens the
+/// producer's equivalence class to its own occurrences, never to anyone
+/// else's.
+pub async fn check_cohort_standing_resolved(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use crate::federation::types::cohort_scope as cs;
+    if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
+        return Ok(());
+    }
+    // Resolve every distinct party once, up front — the core is sync.
+    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for k in std::iter::once(row.attesting_key_id.as_str())
+        .chain(std::iter::once(row.attested_key_id.as_str()))
+        .chain(row.subject_key_ids.iter().map(String::as_str))
+    {
+        if k.is_empty() || resolved.contains_key(k) {
+            continue;
+        }
+        let identity = match directory.lookup_identity_for_occurrence(k).await? {
+            Some(io) => io.identity_key_id,
+            None => k.to_owned(),
+        };
+        resolved.insert(k.to_owned(), identity);
+    }
+    cohort_standing_core(row, |k| {
+        resolved.get(k).cloned().unwrap_or_else(|| k.to_owned())
+    })
+}
+
 /// CIRISPersist#592 (AV-84) — **THE TARGETED-COHORT STANDING GATE**:
 /// a row reaches the `family` / `community` plane only as a self-declaration by
 /// its own producer.
@@ -2239,23 +2316,7 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
         return Ok(());
     }
 
-    let producer = row.attesting_key_id.as_str();
-    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
-        Err(Error::CohortStandingRefused {
-            cohort_scope: row.cohort_scope.clone(),
-            producer_key_id: producer.to_owned(),
-            foreign_key_id: foreign.to_owned(),
-            reason,
-        })
-    };
-
-    if row.attested_key_id != producer {
-        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
-    }
-    if let Some(foreign) = row.subject_key_ids.iter().find(|s| s.as_str() != producer) {
-        return refuse(CohortStandingRefusal::NamedSubject, foreign);
-    }
-    Ok(())
+    cohort_standing_core(row, |k| k.to_owned())
 }
 
 /// v26.0.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
@@ -2467,7 +2528,7 @@ pub async fn check_promotion_admission(
     // producer self-declaration or it is refused. Pure and free, so it leads
     // the walks; and #589's justification for AV-45's absence from this stack
     // is precisely the sentence this arm turns into a check.
-    check_promotion_cohort_standing(row)?;
+    check_cohort_standing_resolved(directory, row).await?;
 
     // v31.0.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
     // promote door for the B8 reason: a row must not escape a put-gate by
@@ -10143,6 +10204,42 @@ pub async fn check_no_moderator_federate_admission_by_id(
     check_no_moderator_federate_admission(directory, &community).await
 }
 
+/// v38.2.0 (PR #759 review) — **a targeted-cohort placement is NEVER
+/// local-tier.** Pure predicate, tier-1: a refusal, never an accept.
+///
+/// Local-tier rows are signature-EXEMPT (`verify_federation_tier_ingest`
+/// returns early below `federation`; CC 5.3.2.2 deferred signature). A
+/// `family`/`community` placement is a MEMBERSHIP CLAIM — the write gate
+/// admits it because the producer proved membership — and a membership
+/// claim carried by a row whose author signature was never verified is a
+/// claim anyone can mint: any caller could stamp any registered member's
+/// `attesting_key_id` with placeholder signatures and land a row scoped to
+/// that member's community. Measured, not theorised: the first #757 witness
+/// did exactly this ("c2ln" placeholder signatures at local tier) and
+/// landed.
+///
+/// Before #757 this was vacuously unreachable — the door refused those
+/// scopes at every tier — which is why nothing asserted it (the third
+/// shut-door premise that cut falsified). The owner-signed path is
+/// unaffected: an author's community row rides FEDERATION tier, where
+/// `verify_row_hybrid_signature` runs in full. Precedent:
+/// [`check_capacity_never_local`] (AV-83), the same never-local shape.
+pub fn check_targeted_cohort_never_local(tier: &str, cohort_scope: &str) -> Result<(), Error> {
+    use crate::federation::types::{attestation_tier, cohort_scope as cs};
+    if tier == attestation_tier::LOCAL
+        && (cohort_scope == cs::FAMILY || cohort_scope == cs::COMMUNITY)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "a {cohort_scope}-scoped placement is a membership claim and local-tier \
+             rows defer signature verification (CC 5.3.2.2) — an unverified \
+             membership claim is mintable by anyone, so targeted cohorts are \
+             never local. Write it at federation tier under the author's \
+             signature (PR #759 review)"
+        )));
+    }
+    Ok(())
+}
+
 /// v38.2.0 (CIRISPersist#757 / CIRISServer chat wiring) — **the envelope keys
 /// a row may name its cohort under**, spelled once.
 ///
@@ -10181,17 +10278,44 @@ pub const COHORT_TARGET_ENVELOPE_FIELDS: &[&str] = &[
 /// question askable at the put door, which is the door that preserves the
 /// author's signature.
 ///
-/// Returns the first non-empty match in [`COHORT_TARGET_ENVELOPE_FIELDS`]
-/// order. The value is inside the signed envelope, so a relay cannot alter it
+/// Returns the target named by the signed envelope, refusing a SPLIT-BRAIN
+/// row: every populated alias in [`COHORT_TARGET_ENVELOPE_FIELDS`] must agree.
+///
+/// First-match-wins (the v38.2.0 initial shape) validated membership only for
+/// the earliest field — a member of C1 could sign `community_id: C1` plus
+/// `community_key_id: C2` and pass the gate on C1 while every consumer that
+/// reads a different alias (the moderator gate walks ALL of them) keys the
+/// row on C2, a community the writer never proved membership in. Found by
+/// review on PR #759; agreement is required rather than per-alias validation
+/// because no legitimate row names two different cohorts today, and a refusal
+/// is reversible where an admitted split-brain row is not.
+///
+/// The value is inside the signed envelope, so a relay cannot alter it
 /// without breaking the signature the tier-ingest gate verifies.
-#[must_use]
-pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Option<&str> {
-    COHORT_TARGET_ENVELOPE_FIELDS.iter().find_map(|field| {
-        envelope
+pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Result<Option<&str>, Error> {
+    let mut found: Option<(&str, &str)> = None;
+    for field in COHORT_TARGET_ENVELOPE_FIELDS {
+        let Some(v) = envelope
             .get(*field)
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
-    })
+        else {
+            continue;
+        };
+        match found {
+            None => found = Some((field, v)),
+            Some((first_field, first)) if first != v => {
+                return Err(Error::InvalidArgument(format!(
+                    "cohort target aliases disagree: {first_field}={first:?} but \
+                     {field}={v:?} — a row names ONE cohort; refusing the \
+                     split-brain (membership would be proven for one id while \
+                     consumers key on the other; PR #759 review)"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(found.map(|(_, v)| v))
 }
 
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry

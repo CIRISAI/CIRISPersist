@@ -3017,7 +3017,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // family/community placement and left an owner-signed community
             // row inexpressible (promotion, the only other door, re-seals
             // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -3030,8 +3030,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // this line a member could place a row ABOUT A THIRD PARTY into the
         // whole community's plane — the exact claim AV-84 exists to refuse,
         // arriving through the door its own doc said could not be reached.
-        // Pure (no directory read, no clock), so it stays in the cheap tier.
-        crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        // v38.2.0 PR #759 review: the standing comparison RESOLVES
+        // occurrence -> identity (a device signing about its own owning
+        // identity is not a third party), and a targeted placement is never
+        // local-tier (local rows defer signature verification, and an
+        // unverified membership claim is mintable by anyone).
+        crate::federation::admission::check_targeted_cohort_never_local(
+            &row.tier,
+            &row.cohort_scope,
+        )?;
+        crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission hook.
         // Same shape and same tier position as the sqlite + postgres backends;
@@ -4035,6 +4043,39 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
             )));
         }
+        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
+        // `repair_stranded_scope_backlog` re-scopes an already-federation row
+        // to a covering grant's audience through here, which can be
+        // `community` — so without this the standing gate on
+        // `promote_attestation` would have a door beside it, this repo's own
+        // recurring class.
+        //
+        // Gated on a CANDIDATE clone, before the stored row is touched. Since
+        // v38.2.0 (PR #759 review) the standing check RESOLVES occurrences
+        // through the directory — i.e. it re-enters `self`, which takes the
+        // state lock — so it cannot run under the guard (self-deadlock). The
+        // candidate is cloned under a short first lock, gated LOCK-FREE, and
+        // the mutating lock below re-verifies the row is byte-identical to
+        // what was gated (the #719 re-read shape); a concurrent mutation is a
+        // typed Conflict, never a gate bypass.
+        let gated = {
+            let state = self.state.lock().expect("memory backend lock");
+            state
+                .federation_attestations
+                .iter()
+                .find(|a| a.attestation_id == attestation_id)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "federation_attestations row {attestation_id} does not exist"
+                    ))
+                })?
+        };
+        let mut candidate = gated.clone();
+        candidate.cohort_scope = cohort_scope.to_owned();
+        candidate.attestation_envelope = reseal.attestation_envelope.clone();
+        crate::federation::admission::check_cohort_standing_resolved(self, &candidate).await?;
+
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v36.0.0 (#668/#707-class) — a re-scope rewrites the served
@@ -4053,23 +4094,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         "federation_attestations row {attestation_id} does not exist"
                     ))
                 })?;
-            // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
-            // `repair_stranded_scope_backlog` re-scopes an already-federation row
-            // to a covering grant's audience through here, which can be
-            // `community` — so without this the standing gate on
-            // `promote_attestation` would have a door beside it, this repo's own
-            // recurring class.
-            //
-            // Gated on a CANDIDATE clone, before `row` is touched: this backend
-            // holds `&mut` into live state, so stamping first and checking second
-            // would leave a REFUSED re-scope having already mutated the row — the
-            // AV-9 violation sqlite/postgres are structurally protected from by
-            // working on a loaded copy. Memory tolerating what the SQL backends
-            // reject is exactly the class this ordering exists to deny.
-            let mut candidate = row.clone();
-            candidate.cohort_scope = cohort_scope.to_owned();
-            candidate.attestation_envelope = reseal.attestation_envelope.clone();
-            crate::federation::admission::check_promotion_cohort_standing(&candidate)?;
+            if row.persist_row_hash != gated.persist_row_hash {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "set_attestation_cohort_scope: row {attestation_id} changed while its \
+                     re-scope was being gated — retry against the current row"
+                )));
+            }
             // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING at the
             // SECOND placement door. `cohort_scope` is one of the seven columns
             // #643 bound into the signed envelope, so re-scoping in place made
