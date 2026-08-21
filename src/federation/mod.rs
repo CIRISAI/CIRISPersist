@@ -2751,6 +2751,43 @@ pub trait FederationDirectory: Send + Sync {
             .collect())
     }
 
+    /// v38.2.0 (PR #761 review) — occurrence → identity through the ACTIVE
+    /// binding only.
+    ///
+    /// [`Self::lookup_identity_for_occurrence`] returns the HISTORICAL row —
+    /// revocation deliberately leaves it intact so folds can cite it. Using
+    /// it as an admission resolver treats a REVOKED (lost, stolen, retired)
+    /// device as co-self with its former owner: the device signs
+    /// `attesting = O, attested = I` and inherits the owner's family and
+    /// community membership. The active fold
+    /// ([`Self::list_identity_occurrences_active`], with the #421 re-assert
+    /// semantics) is the one that already answers KEX and peer-set reads; a
+    /// revoked occurrence falls back to its SINGLETON identity (it is its
+    /// own key and nothing more), which strips the inherited memberships
+    /// without inventing a new refusal class.
+    async fn active_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<String, Error> {
+        let Some(io) = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await?
+        else {
+            return Ok(occurrence_key_id.to_owned());
+        };
+        let active = self
+            .list_identity_occurrences_active(&io.identity_key_id)
+            .await?;
+        if active
+            .iter()
+            .any(|o| o.occurrence_key_id == occurrence_key_id)
+        {
+            Ok(io.identity_key_id)
+        } else {
+            Ok(occurrence_key_id.to_owned())
+        }
+    }
+
     /// v38.2.0 (CIRISPersist#757 follow-on) — the family key_ids `identity`
     /// is an **ACTIVE** member of: raw roster containment minus effective
     /// revocations, projected to ids. See
@@ -3841,20 +3878,62 @@ pub trait FederationDirectory: Send + Sync {
         let admission = if needs_admission {
             // occurrence → identity (singleton fallback: unbound
             // occurrence IS its own identity, FSD §4.4).
-            let identity = match self
-                .lookup_identity_for_occurrence(writer_occurrence_key_id)
-                .await?
-            {
-                Some(io) => io.identity_key_id,
-                None => writer_occurrence_key_id.to_owned(),
-            };
+            // ACTIVE binding only (PR #761 review): the historical lookup
+            // treats a revoked device as co-self with its former owner, and
+            // membership inheritance is exactly what revoking a lost device
+            // must sever.
+            let identity = self
+                .active_identity_for_occurrence(writer_occurrence_key_id)
+                .await?;
             // ACTIVE membership, not raw containment — the roster is
             // append-only, so raw `members` counts a revoked member as a
             // member. See `active_community_key_ids_for` for the full
             // argument; measured by the revoked-member arm of
             // `exercise_owner_signed_community_row`.
-            let family_key_ids = self.active_family_key_ids_for(&identity).await?;
-            let community_key_ids = self.active_community_key_ids_for(&identity).await?;
+            //
+            // Resolved for the CLAIMED TARGET ONLY (PR #759 review): the
+            // first shape enumerated every cohort containing the writer and
+            // folded revocations for each — O(N) sequential directory
+            // round-trips on the hot write path for an identity in N groups,
+            // when the predicate only ever asks about the ONE target the row
+            // names. One roster read + one revocation read now. An UNKNOWN
+            // target maps to the empty set — the same membership refusal,
+            // which is also the transient-correct answer for a row arriving
+            // ahead of its roster (CIRISEdge#522: refused rows re-offer);
+            // backend errors still propagate as errors.
+            fn contains_or_absent<M>(
+                members: Result<Vec<M>, Error>,
+                key_of: impl Fn(&M) -> &str,
+                identity: &str,
+            ) -> Result<bool, Error> {
+                match members {
+                    Ok(active) => Ok(active.iter().any(|m| key_of(m) == identity)),
+                    Err(Error::InvalidArgument(_)) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            let mut family_key_ids: Vec<String> = Vec::new();
+            let mut community_key_ids: Vec<String> = Vec::new();
+            if let Some(target) = claimed_target_id {
+                if claimed_cohort_scope == cs::FAMILY
+                    && contains_or_absent(
+                        self.active_family_members(target).await,
+                        |m| m.key_id.as_str(),
+                        &identity,
+                    )?
+                {
+                    family_key_ids.push(target.to_owned());
+                }
+                if claimed_cohort_scope == cs::COMMUNITY
+                    && contains_or_absent(
+                        self.active_community_members(target).await,
+                        |m| m.key_id.as_str(),
+                        &identity,
+                    )?
+                {
+                    community_key_ids.push(target.to_owned());
+                }
+            }
             crate::scope::CallerAdmission::from_resolved(
                 writer_occurrence_key_id.to_owned(),
                 identity,
@@ -7094,12 +7173,13 @@ pub enum Error {
     /// branch on [`admission::CohortStandingRefusal::as_str`], never this text.
     /// See [`admission::check_promotion_cohort_standing`].
     #[error(
-        "targeted-cohort placement refused ({reason}): promoting to cohort_scope \
+        "targeted-cohort placement refused ({reason}): cohort_scope \
          {cohort_scope:?} requires the row to name no party but its own producer \
-         {producer_key_id:?}, but its {} names {foreign_key_id:?}. A promotion into a \
+         {producer_key_id:?}, but its {} names {foreign_key_id:?}. A placement into a \
          family/community plane is a producer self-declaration about its own content's \
-         visibility (CIRISPersist#592 / AV-84); a claim about a third party belongs at a \
-         broad belonging-tier, where any authenticated writer may emit",
+         visibility (CIRISPersist#592 / AV-84, at the put, promote and re-scope doors \
+         since v38.2.0); a claim about a third party belongs at a broad belonging-tier, \
+         where any authenticated writer may emit",
         reason.field()
     )]
     CohortStandingRefused {

@@ -174,7 +174,25 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_peer_record_admission", Class::Gate),
     ("check_privileged_identity_type_admission", Class::Gate),
     ("check_promotion_admission", Class::Gate),
-    ("check_promotion_cohort_standing", Class::Gate),
+    // v38.2.0 PR #759 review — the standing comparison RESOLVES occurrence →
+    // identity at every standing door, so the doors call the resolved form;
+    // the pure `check_promotion_cohort_standing` survives only as the
+    // string-compare delegate inside `cohort_standing_core`'s callers.
+    ("check_cohort_standing_resolved", Class::Gate),
+    // Refuses a split-brain row whose cohort-target aliases disagree; a
+    // refusal, so it contributes to the compared sequence.
+    ("envelope_cohort_target", Class::Gate),
+    // Targeted cohorts REQUIRE federation tier (every other tier is
+    // signature-exempt; a membership claim needs the verified signature) —
+    // PR #761 strengthened the v38.2.0 never-local form, which an unknown
+    // tier string slipped past.
+    (
+        "check_targeted_cohort_requires_federation_tier",
+        Class::Gate,
+    ),
+    // The tier vocabulary is a closed set; memory had no CHECK constraint,
+    // and an unknown tier is signature-exempt.
+    ("check_attestation_tier_vocabulary", Class::Gate),
     ("check_purge_admission", Class::Gate),
     ("check_put_blob_admission", Class::Gate),
     ("check_reseal_admission", Class::Gate),
@@ -233,7 +251,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("load_or_init_content_master", Class::Delegates),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
-    ("lookup_identity_for_occurrence", Class::Delegates),
+    // PR #761 review — occurrence resolution rides the ACTIVE fold: a
+    // revoked device falls back to its singleton identity instead of
+    // remaining co-self with its former owner.
+    ("active_identity_for_occurrence", Class::Delegates),
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
     ("memory_idempotent_insert", Class::Delegates),

@@ -1184,11 +1184,13 @@ impl Backend for PostgresBackend {
         occurrence_key_id: &str,
     ) -> Result<Option<String>, Error> {
         use crate::federation::FederationDirectory;
-        let io = self
-            .lookup_identity_for_occurrence(occurrence_key_id)
+        // ACTIVE binding only (PR #761 review) — a revoked occurrence falls
+        // back to its singleton identity, severing inherited membership.
+        let identity = self
+            .active_identity_for_occurrence(occurrence_key_id)
             .await
             .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
-        Ok(io.map(|o| o.identity_key_id))
+        Ok((identity != occurrence_key_id).then_some(identity))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
@@ -4834,7 +4836,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // family/community placement and left an owner-signed community
             // row inexpressible (promotion, the only other door, re-seals
             // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -4847,8 +4849,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // this line a member could place a row ABOUT A THIRD PARTY into the
         // whole community's plane — the exact claim AV-84 exists to refuse,
         // arriving through the door its own doc said could not be reached.
-        // Pure (no directory read, no clock), so it stays in the cheap tier.
-        crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        // v38.2.0 PR #759 review: the standing comparison RESOLVES
+        // occurrence -> identity (a device signing about its own owning
+        // identity is not a third party), and a targeted placement is never
+        // local-tier (local rows defer signature verification, and an
+        // unverified membership claim is mintable by anyone).
+        crate::federation::admission::check_attestation_tier_vocabulary(&row.tier)?;
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
+            &row.tier,
+            &row.cohort_scope,
+        )?;
+        crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Runs AFTER the dimension gate; only fires on `scores`
@@ -5744,8 +5755,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `promote_attestation` would have a door beside it, which is this
         // repo's own recurring class (a rule shipped behind one door while the
         // motion uses another). Verify-before-mutation (AV-9): `row` is a
-        // loaded copy and nothing has been written yet.
-        crate::federation::admission::check_promotion_cohort_standing(&row)?;
+        // loaded copy and nothing has been written yet. PR #761 review: the
+        // stored tier must support a targeted placement (non-federation tiers
+        // are signature-exempt), and the caller-supplied reseal envelope must
+        // not smuggle a split-brain cohort target past the put-door alias
+        // gate.
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
+            &row.tier,
+            &row.cohort_scope,
+        )?;
+        crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?;
+        crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
         // v31.0.0 (CIRISPersist#649) — and the typed-column binding at the same
         // door, for the same "one rule, both doors" reason.
         crate::federation::admission::check_row_column_binding(&row)?;

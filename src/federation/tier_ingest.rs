@@ -1293,17 +1293,24 @@ pub mod test_support {
                 subject_key_ids: vec![producer.to_owned()],
                 withdraws_admission_rule: None,
                 cohort_scope: cohort_scope::COMMUNITY.to_owned(),
-                tier: attestation_tier::LOCAL.to_owned(),
+                // FEDERATION tier, really signed (PR #759 review): the first
+                // shape of this witness rode tier `local` with placeholder
+                // signatures — and LANDED, because local tier defers
+                // signature verification. That was itself the hole: a
+                // community placement is a membership claim, and an
+                // unverified membership claim is mintable by anyone. The
+                // owner-signed path this witness certifies is the
+                // federation-tier one, under the author's REAL hybrid
+                // signature, verified by `verify_federation_tier_ingest` in
+                // full.
+                tier: attestation_tier::FEDERATION.to_owned(),
                 promoted_at: None,
                 additional_scrubs: Vec::new(),
             }
         };
-        // #598 — the signed instants + RowMirror the door requires of any
-        // row. Not part of what this witness is about; without it the row is
-        // refused for an unrelated reason and the wall would look fixed.
         let row = |producer: &str, target: Option<&str>| {
             let mut r = row(producer, target);
-            stamp_mirror(&mut r);
+            seal_row_in_place(producer, &mut r);
             r
         };
 
@@ -1407,6 +1414,192 @@ pub mod test_support {
             "({suffix}) #757: a REVOKED member wrote into the community plane — the write \
              gate consulted raw roster containment instead of the active fold \
              (admitted AND NOT revoked)"
+        );
+
+        // Arms 5-7 need an ACTIVE member (arm 4 revoked `author` out of
+        // `cid`), so they run against a second community.
+        let bob_observer = format!("observer-757-{suffix}");
+        let cid2 = format!("chat-comm2-757-{suffix}");
+        register_user_role_key(dir, &bob_observer).await;
+        register_hybrid_key(dir, &cid2).await;
+        seed_two_member_community(dir, &cid2, &bob_observer, &bob_observer).await;
+
+        // (5) SPLIT-BRAIN TARGET REFUSES (PR #759 review). Membership was
+        // proven for the FIRST alias only, while consumers that walk every
+        // alias (the moderator gate) key the row on the second — a member of
+        // C1 must not smuggle a row keyed on C2.
+        let mut split = row(&bob_observer, Some(&cid2));
+        split.attestation_envelope["community_key_id"] =
+            serde_json::Value::String(format!("other-comm-757-{suffix}"));
+        seal_row_in_place(&bob_observer, &mut split);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: split })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("({suffix}) PR#759: disagreeing cohort-target aliases must refuse")
+            });
+        assert!(
+            format!("{err}").contains("aliases disagree"),
+            "({suffix}) the refusal names the split-brain: {err}"
+        );
+
+        // (6) LOCAL TIER + TARGETED SCOPE REFUSES (PR #759 review). Local
+        // rows defer signature verification, so a community placement there
+        // is an unverified membership claim — the shape the FIRST version of
+        // this witness accidentally proved mintable (placeholder signatures,
+        // tier local, landed).
+        let mut local = row(&bob_observer, Some(&cid2));
+        local.tier = attestation_tier::LOCAL.to_owned();
+        local.scrub_signature_classical = "c2ln".to_owned();
+        local.scrub_signature_pqc = None;
+        stamp_mirror(&mut local);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: local })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) PR#759: a local-tier community placement carries an \
+                     UNVERIFIED membership claim and must refuse"
+                )
+            });
+        assert!(
+            format!("{err}").contains("federation tier"),
+            "({suffix}) the refusal names the federation-tier requirement: {err}"
+        );
+
+        // (7) A DEVICE OCCURRENCE WRITES AS ITS OWNING IDENTITY (PR #759
+        // review). `attesting = O`, `attested = I`, `resolve(O) = I`: the
+        // identity an occurrence resolves to is NOT a third party — it IS
+        // the producer (#275 / §4.4). The string-compare form of AV-84
+        // refused this as `AttestedParty`, which would have made
+        // owner-attributed device chat unwriteable.
+        let device = format!("device-757-{suffix}");
+        register_user_role_key(dir, &device).await;
+        dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: bob_observer.clone(),
+            occurrence_key_id: device.clone(),
+            device_class: crate::federation::types::device_class::SERVER.into(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
+        let mut via_device = row(&device, Some(&cid2));
+        via_device.attested_key_id = bob_observer.clone();
+        via_device.subject_key_ids = vec![bob_observer.clone()];
+        seal_row_in_place(&device, &mut via_device);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: via_device,
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({suffix}) PR#759: a device occurrence writing about its OWN owning \
+                 identity is the producer, not a third party — refused with: {e}"
+            )
+        });
+
+        // (8) AN UNKNOWN TIER REFUSES (PR #761 review). The SQL schemas
+        // CHECK the tier vocabulary; memory checked nothing — and an unknown
+        // tier is signature-EXEMPT (`verify_federation_tier_ingest` verifies
+        // only `federation`), so tier "bogus" was a signature bypass on
+        // exactly one backend. The vocabulary gate is tier-1 and
+        // backend-shared, so all three answer alike.
+        let mut bogus = row(&bob_observer, Some(&cid2));
+        bogus.tier = "bogus".to_owned();
+        stamp_mirror(&mut bogus);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: bogus })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("({suffix}) PR#761: an unknown tier is signature-exempt and must refuse")
+            });
+        assert!(
+            format!("{err}").contains("vocabulary is closed"),
+            "({suffix}) the refusal names the closed tier vocabulary: {err}"
+        );
+
+        // (9) A LOCAL ROW CANNOT BE RE-SCOPED INTO A TARGETED COHORT
+        // (PR #761 review). `set_attestation_cohort_scope` preserves the
+        // stored tier, so re-scoping a local (signature-deferred) row to
+        // `community` would mint the same unverified membership claim the
+        // put door now refuses — the recurring "a rule shipped behind one
+        // door while the motion uses another" class, caught at the door
+        // BESIDE the one the last fix gated.
+        let mut local_row = row(&bob_observer, Some(&cid2));
+        local_row.cohort_scope = crate::federation::types::cohort_scope::SELF.to_owned();
+        local_row.tier = attestation_tier::LOCAL.to_owned();
+        seal_row_in_place(&bob_observer, &mut local_row);
+        let local_id = local_row.attestation_id.clone();
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: local_row.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) seed local self row: {e}"));
+        let reseal = reseal_for_scope(
+            &bob_observer,
+            &local_row,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        );
+        let err = dir
+            .set_attestation_cohort_scope(
+                &local_id,
+                crate::federation::types::cohort_scope::COMMUNITY,
+                &reseal,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) PR#761: re-scoping a LOCAL row into a community is an \
+                     unverified membership claim and must refuse"
+                )
+            });
+        assert!(
+            format!("{err}").contains("federation tier"),
+            "({suffix}) the re-scope refusal names the federation-tier requirement: {err}"
+        );
+
+        // (10) A REVOKED DEVICE LOSES ITS OWNER'S MEMBERSHIP (PR #761
+        // review). `lookup_identity_for_occurrence` returns the HISTORICAL
+        // binding — revocation leaves the row intact — so resolving through
+        // it kept a lost/stolen device co-self with its former owner,
+        // regaining exactly the family/community write access the
+        // revocation exists to sever. Resolution now rides the ACTIVE fold;
+        // the revoked device falls back to its singleton identity, which is
+        // not a member.
+        dir.put_identity_occurrence_revocation_local(
+            crate::federation::types::IdentityOccurrenceRevocation {
+                identity_key_id: bob_observer.clone(),
+                occurrence_key_id: device.clone(),
+                revoked_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
+        let mut via_revoked = row(&device, Some(&cid2));
+        via_revoked.attested_key_id = bob_observer.clone();
+        via_revoked.subject_key_ids = vec![bob_observer.clone()];
+        seal_row_in_place(&device, &mut via_revoked);
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: via_revoked,
+            })
+            .await
+            .is_err(),
+            "({suffix}) PR#761: a REVOKED device wrote with its former owner's community \
+             membership — resolution consulted the historical binding, not the active fold"
         );
     }
 

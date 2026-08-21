@@ -1724,6 +1724,18 @@ pub mod attestation_tier {
     pub const LOCAL: &str = "local";
     /// Hybrid-signed, federation-visible (status quo + promotion target).
     pub const FEDERATION: &str = "federation";
+
+    /// v38.2.0 (PR #761 review) — the CLOSED tier vocabulary. The SQL
+    /// backends enforce it with a schema `CHECK`; memory had nothing, so a
+    /// row with tier `"bogus"` landed there and refused on sqlite/postgres —
+    /// and worse, `verify_federation_tier_ingest` exempts every tier that is
+    /// not exactly `federation` from signature verification, so an unknown
+    /// tier was a signature-exempt tier. The doors now refuse unknown tiers
+    /// as a pure tier-1 check on every backend.
+    #[must_use]
+    pub fn is_valid(s: &str) -> bool {
+        s == LOCAL || s == FEDERATION
+    }
 }
 
 /// Default tier for backward compat: pre-v4.4.0 rows are all federation.

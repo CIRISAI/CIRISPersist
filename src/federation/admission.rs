@@ -2144,6 +2144,104 @@ impl std::fmt::Display for CohortStandingRefusal {
     }
 }
 
+/// The ONE standing comparison, parameterised over party resolution: refuse
+/// iff any named party RESOLVES differently from the producer. The string
+/// form ([`check_promotion_cohort_standing`], resolution = identity fn) and
+/// the directory form ([`check_cohort_standing_resolved`]) both delegate
+/// here, so the two doors cannot drift to two ideas of "same producer".
+fn cohort_standing_core(
+    row: &super::Attestation,
+    resolve: impl Fn(&str) -> String,
+) -> Result<(), Error> {
+    let producer = row.attesting_key_id.as_str();
+    let producer_identity = resolve(producer);
+    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
+        Err(Error::CohortStandingRefused {
+            cohort_scope: row.cohort_scope.clone(),
+            producer_key_id: producer.to_owned(),
+            foreign_key_id: foreign.to_owned(),
+            reason,
+        })
+    };
+    if row.attested_key_id != producer && resolve(&row.attested_key_id) != producer_identity {
+        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
+    }
+    if let Some(foreign) = row
+        .subject_key_ids
+        .iter()
+        .find(|s| s.as_str() != producer && resolve(s) != producer_identity)
+    {
+        return refuse(CohortStandingRefusal::NamedSubject, foreign);
+    }
+    Ok(())
+}
+
+/// v38.2.0 (PR #759 review) — AV-84 with **occurrence→identity resolution**:
+/// standing compares IDENTITIES, not key strings.
+///
+/// The pure form compares `attested_key_id` / `subject_key_ids` against
+/// `attesting_key_id` byte-for-byte. That refuses a row a DEVICE occurrence
+/// signs about its OWN owning identity (`attesting = O`, `attested = I`,
+/// `resolve(O) = I`) as a "third party" — but the identity an occurrence
+/// resolves to is not a third party, it IS the producer (#275's two-signer
+/// split; the same §4.4 singleton-fallback rule the scope gate applies).
+/// Owner-attributed chat is exactly this shape, so the pure comparison at
+/// the put door would have made device-authored community rows unwriteable.
+///
+/// Resolution is directory-backed and cached per distinct key string within
+/// the row (at most: producer + attested + each subject). Parties that
+/// resolve to DIFFERENT identities still refuse — resolution widens the
+/// producer's equivalence class to its own occurrences, never to anyone
+/// else's.
+pub async fn check_cohort_standing_resolved(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use crate::federation::types::cohort_scope as cs;
+    if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
+        return Ok(());
+    }
+    // INCREMENTAL, fail-fast (PR #761 review): a row may carry thousands of
+    // `subject_key_ids` under the envelope cap, and each resolution is an
+    // awaited directory read — resolving ALL parties before comparing turned
+    // a row that refuses on its FIRST foreign subject into an O(n)
+    // amplification path. Parties are resolved one at a time, in row order,
+    // and the first foreign identity refuses immediately. Resolution is the
+    // ACTIVE binding (`active_identity_for_occurrence`): the historical
+    // lookup would keep a REVOKED device co-self with its former owner,
+    // regaining exactly the membership the revocation severs.
+    //
+    // Kept in lockstep with [`cohort_standing_core`] (the pure string form):
+    // same comparisons, same refusal variants, in the same order — the
+    // witness arms exercise both.
+    let producer = row.attesting_key_id.as_str();
+    let producer_identity = directory.active_identity_for_occurrence(producer).await?;
+    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
+        Err(Error::CohortStandingRefused {
+            cohort_scope: row.cohort_scope.clone(),
+            producer_key_id: producer.to_owned(),
+            foreign_key_id: foreign.to_owned(),
+            reason,
+        })
+    };
+    if row.attested_key_id != producer
+        && directory
+            .active_identity_for_occurrence(&row.attested_key_id)
+            .await?
+            != producer_identity
+    {
+        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
+    }
+    for subject in &row.subject_key_ids {
+        if subject.as_str() != producer
+            && directory.active_identity_for_occurrence(subject).await? != producer_identity
+        {
+            return refuse(CohortStandingRefusal::NamedSubject, subject);
+        }
+    }
+    Ok(())
+}
+
 /// CIRISPersist#592 (AV-84) — **THE TARGETED-COHORT STANDING GATE**:
 /// a row reaches the `family` / `community` plane only as a self-declaration by
 /// its own producer.
@@ -2239,23 +2337,7 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
         return Ok(());
     }
 
-    let producer = row.attesting_key_id.as_str();
-    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
-        Err(Error::CohortStandingRefused {
-            cohort_scope: row.cohort_scope.clone(),
-            producer_key_id: producer.to_owned(),
-            foreign_key_id: foreign.to_owned(),
-            reason,
-        })
-    };
-
-    if row.attested_key_id != producer {
-        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
-    }
-    if let Some(foreign) = row.subject_key_ids.iter().find(|s| s.as_str() != producer) {
-        return refuse(CohortStandingRefusal::NamedSubject, foreign);
-    }
-    Ok(())
+    cohort_standing_core(row, |k| k.to_owned())
 }
 
 /// v26.0.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
@@ -2467,7 +2549,11 @@ pub async fn check_promotion_admission(
     // producer self-declaration or it is refused. Pure and free, so it leads
     // the walks; and #589's justification for AV-45's absence from this stack
     // is precisely the sentence this arm turns into a check.
-    check_promotion_cohort_standing(row)?;
+    check_cohort_standing_resolved(directory, row).await?;
+    // PR #761 review — the reseal REPLACES the envelope, so alias agreement
+    // must be re-asked on the bytes this row will federate as; the put-door
+    // check saw the pre-promotion envelope, not this one.
+    envelope_cohort_target(&row.attestation_envelope)?;
 
     // v31.0.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
     // promote door for the B8 reason: a row must not escape a put-gate by
@@ -10143,6 +10229,65 @@ pub async fn check_no_moderator_federate_admission_by_id(
     check_no_moderator_federate_admission(directory, &community).await
 }
 
+/// v38.2.0 (PR #759 review) — **a targeted-cohort placement is NEVER
+/// local-tier.** Pure predicate, tier-1: a refusal, never an accept.
+///
+/// Local-tier rows are signature-EXEMPT (`verify_federation_tier_ingest`
+/// returns early below `federation`; CC 5.3.2.2 deferred signature). A
+/// `family`/`community` placement is a MEMBERSHIP CLAIM — the write gate
+/// admits it because the producer proved membership — and a membership
+/// claim carried by a row whose author signature was never verified is a
+/// claim anyone can mint: any caller could stamp any registered member's
+/// `attesting_key_id` with placeholder signatures and land a row scoped to
+/// that member's community. Measured, not theorised: the first #757 witness
+/// did exactly this ("c2ln" placeholder signatures at local tier) and
+/// landed.
+///
+/// Before #757 this was vacuously unreachable — the door refused those
+/// scopes at every tier — which is why nothing asserted it (the third
+/// shut-door premise that cut falsified). The owner-signed path is
+/// unaffected: an author's community row rides FEDERATION tier, where
+/// `verify_row_hybrid_signature` runs in full. Precedent:
+/// [`check_capacity_never_local`] (AV-83), the same never-local shape.
+pub fn check_targeted_cohort_requires_federation_tier(
+    tier: &str,
+    cohort_scope: &str,
+) -> Result<(), Error> {
+    use crate::federation::types::{attestation_tier, cohort_scope as cs};
+    if tier != attestation_tier::FEDERATION
+        && (cohort_scope == cs::FAMILY || cohort_scope == cs::COMMUNITY)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "a {cohort_scope}-scoped placement is a membership claim, and only \
+             federation-tier rows have their author signature verified \
+             (`verify_federation_tier_ingest` exempts every other tier, CC \
+             5.3.2.2) — an unverified membership claim is mintable by anyone, \
+             so a targeted cohort requires federation tier. Stated as a \
+             REQUIREMENT rather than `!= local` so an unknown tier string \
+             cannot slip between the two vocabularies (PR #761 review; the \
+             first form refused only `local`)"
+        )));
+    }
+    Ok(())
+}
+
+/// v38.2.0 (PR #761 review) — the tier value itself is a CLOSED set. Pure
+/// tier-1 refusal. The SQL schemas enforce this with a `CHECK`; memory
+/// enforced nothing, so the backends disagreed about whether a row with an
+/// unknown tier exists at all — and an unknown tier is signature-EXEMPT (see
+/// [`check_targeted_cohort_requires_federation_tier`]), which upgraded the
+/// divergence from cosmetic to a gate bypass.
+pub fn check_attestation_tier_vocabulary(tier: &str) -> Result<(), Error> {
+    if !crate::federation::types::attestation_tier::is_valid(tier) {
+        return Err(Error::InvalidArgument(format!(
+            "unknown attestation tier {tier:?} — the vocabulary is closed \
+             (local | federation); an unrecognised tier would be \
+             signature-exempt (PR #761 review)"
+        )));
+    }
+    Ok(())
+}
+
 /// v38.2.0 (CIRISPersist#757 / CIRISServer chat wiring) — **the envelope keys
 /// a row may name its cohort under**, spelled once.
 ///
@@ -10181,17 +10326,44 @@ pub const COHORT_TARGET_ENVELOPE_FIELDS: &[&str] = &[
 /// question askable at the put door, which is the door that preserves the
 /// author's signature.
 ///
-/// Returns the first non-empty match in [`COHORT_TARGET_ENVELOPE_FIELDS`]
-/// order. The value is inside the signed envelope, so a relay cannot alter it
+/// Returns the target named by the signed envelope, refusing a SPLIT-BRAIN
+/// row: every populated alias in [`COHORT_TARGET_ENVELOPE_FIELDS`] must agree.
+///
+/// First-match-wins (the v38.2.0 initial shape) validated membership only for
+/// the earliest field — a member of C1 could sign `community_id: C1` plus
+/// `community_key_id: C2` and pass the gate on C1 while every consumer that
+/// reads a different alias (the moderator gate walks ALL of them) keys the
+/// row on C2, a community the writer never proved membership in. Found by
+/// review on PR #759; agreement is required rather than per-alias validation
+/// because no legitimate row names two different cohorts today, and a refusal
+/// is reversible where an admitted split-brain row is not.
+///
+/// The value is inside the signed envelope, so a relay cannot alter it
 /// without breaking the signature the tier-ingest gate verifies.
-#[must_use]
-pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Option<&str> {
-    COHORT_TARGET_ENVELOPE_FIELDS.iter().find_map(|field| {
-        envelope
+pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Result<Option<&str>, Error> {
+    let mut found: Option<(&str, &str)> = None;
+    for field in COHORT_TARGET_ENVELOPE_FIELDS {
+        let Some(v) = envelope
             .get(*field)
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
-    })
+        else {
+            continue;
+        };
+        match found {
+            None => found = Some((field, v)),
+            Some((first_field, first)) if first != v => {
+                return Err(Error::InvalidArgument(format!(
+                    "cohort target aliases disagree: {first_field}={first:?} but \
+                     {field}={v:?} — a row names ONE cohort; refusing the \
+                     split-brain (membership would be proven for one id while \
+                     consumers key on the other; PR #759 review)"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(found.map(|(_, v)| v))
 }
 
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
