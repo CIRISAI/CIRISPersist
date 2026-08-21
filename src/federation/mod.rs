@@ -387,6 +387,7 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
+pub(crate) use tier_ingest::community_reput_verdict;
 pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
     verify_envelope_hybrid_signature, verify_family_admission,
@@ -2750,6 +2751,69 @@ pub trait FederationDirectory: Send + Sync {
             .collect())
     }
 
+    /// v38.2.0 (CIRISPersist#757 follow-on) — the family key_ids `identity`
+    /// is an **ACTIVE** member of: raw roster containment minus effective
+    /// revocations, projected to ids. See
+    /// [`Self::active_community_key_ids_for`] for why raw containment is not
+    /// an admission answer; this is the family mirror.
+    async fn active_family_key_ids_for(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        for f in self
+            .list_families_for_member(member_identity_key_id)
+            .await?
+        {
+            let active = self.active_family_members(&f.family_key_id).await?;
+            if active.iter().any(|m| m.key_id == member_identity_key_id) {
+                out.push(f.family_key_id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// v38.2.0 (CIRISPersist#757 follow-on) — the community key_ids
+    /// `identity` is an **ACTIVE** member of.
+    ///
+    /// # Why raw roster containment is not an admission answer
+    ///
+    /// The roster is append-only: membership removal is a
+    /// [`CommunityMembershipRevocation`](types::CommunityMembershipRevocation)
+    /// row, and effective membership is *admitted AND NOT revoked* — the
+    /// fold [`Self::active_community_members`] spells once (#709; the same
+    /// rule the community-DEK cascade's wrap fan-out resolves over, and the
+    /// same rule the consumer's `require_member` applies on replicated
+    /// state). `list_communities_for_member` answers raw containment, which
+    /// counts a REVOKED member as a member.
+    ///
+    /// Through v38.0.0 that mismatch was vacuously unreachable at the write
+    /// gate: `put_attestation` passed a hardcoded `None` target, so the
+    /// family/community arms refused every placement before membership was
+    /// ever consulted. v38.2.0 (#757) opened that door — and the raw fold
+    /// would have let a revoked member keep WRITING into the community's
+    /// plane, which is precisely the failure the removal primitive exists
+    /// to prevent (forward secrecy: a removed member loses the room, not
+    /// just future DEK epochs). Admission therefore filters through the
+    /// active fold, spelled HERE once — a sixth hand-rolled
+    /// membership-minus-revocations spelling is the #686 defect class.
+    async fn active_community_key_ids_for(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        for c in self
+            .list_communities_for_member(member_identity_key_id)
+            .await?
+        {
+            let active = self.active_community_members(&c.community_key_id).await?;
+            if active.iter().any(|m| m.key_id == member_identity_key_id) {
+                out.push(c.community_key_id);
+            }
+        }
+        Ok(out)
+    }
+
     /// #249 Cut B — the **active member roster** of `community_key_id`.
     /// Structural mirror of [`Self::active_family_members`]; the forward
     /// fold the community-DEK cascade's wrap fan-out resolves over (same
@@ -3784,16 +3848,13 @@ pub trait FederationDirectory: Send + Sync {
                 Some(io) => io.identity_key_id,
                 None => writer_occurrence_key_id.to_owned(),
             };
-            let family_key_ids = self
-                .list_families_for_member(&identity)
-                .await?
-                .into_iter()
-                .map(|f| f.family_key_id);
-            let community_key_ids = self
-                .list_communities_for_member(&identity)
-                .await?
-                .into_iter()
-                .map(|c| c.community_key_id);
+            // ACTIVE membership, not raw containment — the roster is
+            // append-only, so raw `members` counts a revoked member as a
+            // member. See `active_community_key_ids_for` for the full
+            // argument; measured by the revoked-member arm of
+            // `exercise_owner_signed_community_row`.
+            let family_key_ids = self.active_family_key_ids_for(&identity).await?;
+            let community_key_ids = self.active_community_key_ids_for(&identity).await?;
             crate::scope::CallerAdmission::from_resolved(
                 writer_occurrence_key_id.to_owned(),
                 identity,

@@ -443,11 +443,11 @@ impl Backend for SqliteBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let families = self
-            .list_families_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — the ACTIVE fold, not raw containment:
+        // see `FederationDirectory::active_community_key_ids_for`.
+        self.active_family_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
-        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
@@ -457,14 +457,10 @@ impl Backend for SqliteBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let communities = self
-            .list_communities_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — same ONE fold as the write gate.
+        self.active_community_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
-        Ok(communities
-            .into_iter()
-            .map(|c| c.community_key_id)
-            .collect())
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))
     }
 
     async fn insert_trace_events_batch(
@@ -3919,9 +3915,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.attesting_key_id,
             "put_attestation",
             &row.cohort_scope,
-            None,
+            // v38.2.0 (#757) — the target the producer SIGNED into the
+            // envelope. Was hardcoded `None`, which made AV-45 refuse every
+            // family/community placement and left an owner-signed community
+            // row inexpressible (promotion, the only other door, re-seals
+            // with this node's key).
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
         )
         .await?;
+
+        // v38.2.0 (CIRISPersist#757) — **AV-84 MOVES TO THIS DOOR TOO.**
+        // `check_promotion_cohort_standing` refuses a targeted-cohort row
+        // that names any party but its producer, and it justified being
+        // promote-ONLY with a claim about THIS door: "put_attestation
+        // therefore refuses those two placements outright, and that door is
+        // SHUT, not leaking". The AV-45 call above just unshut it. Without
+        // this line a member could place a row ABOUT A THIRD PARTY into the
+        // whole community's plane — the exact claim AV-84 exists to refuse,
+        // arriving through the door its own doc said could not be reached.
+        // Pure (no directory read, no clock), so it stays in the cheap tier.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Same shape as the postgres backend; see
@@ -6062,34 +6075,56 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             "community_key_id",
             &row.community_key_id,
         )]);
+        // v38.2.0 (#758) — kept for the re-read decision below.
+        let offered_hash_for_compare = row.persist_row_hash.clone();
+        let id_for_msg = row.community_key_id.clone();
+        let community_key_id = row.community_key_id.clone();
+        let offered_hash = row.persist_row_hash.clone();
         let conn = self.conn.clone();
-        (move || -> Result<(), rusqlite::Error> {
+        let outcome = (move || -> Result<Option<String>, rusqlite::Error> {
             let conn = conn.lock();
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at =
                 sqlite_next_plane_position(&conn, "federation_communities", POS_FOUNDED)?;
-            conn.execute(
-                "INSERT INTO federation_communities (\
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO federation_communities (\
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
-                    row.community_key_id,
+                    community_key_id,
                     row.community_name,
                     members_json,
                     row.founded_at.to_rfc3339(),
                     row.consensus_protocol,
                     policy_blob_json,
-                    row.persist_row_hash,
+                    offered_hash,
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     admitted_at.to_rfc3339(),
                 ],
             )?;
-            Ok(())
+            if inserted == 1 {
+                return Ok(None);
+            }
+            // v38.2.0 (CIRISPersist#758) — occupied id: re-read to DECIDE.
+            // Convergent derivation (CIRISServer's pair chat mints one
+            // deterministic community per pair) means two nodes author
+            // BYTE-IDENTICAL content and each signs as itself, so a plain
+            // INSERT refused every replicated copy. `INSERT OR IGNORE`
+            // alone would be the opposite error — it would silently accept
+            // a DIFFERING roster under an occupied id. The stored content
+            // hash decides, which is the #719 absorb-then-re-read shape.
+            let stored: String = conn.query_row(
+                "SELECT persist_row_hash FROM federation_communities \
+                 WHERE community_key_id = ?1",
+                [&community_key_id],
+                |r| r.get(0),
+            )?;
+            Ok(Some(stored))
         })()
         .map_err(|e| {
             let msg = e.to_string();
@@ -6101,6 +6136,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert community: {msg}"))
             }
         })?;
+        if let Some(stored_hash) = outcome {
+            return crate::federation::community_reput_verdict(
+                &stored_hash,
+                &offered_hash_for_compare,
+                &id_for_msg,
+            );
+        }
         self.index_stored_record("Community", &wire_index_key)
             .await?;
         Ok(())
@@ -33762,6 +33804,28 @@ mod tests {
     // smokes the edge_detection_events table V020 ships alongside.
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
+
+    /// v38.2.0 (CIRISPersist#757) — owner-signed community row, sqlite arm.
+    #[tokio::test]
+    async fn owner_signed_community_row_sqlite_757() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — the convergent re-put, sqlite arm.
+    #[tokio::test]
+    async fn convergent_community_reput_sqlite_758() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_convergent_community_reput(
+            &backend, "sqlite",
+        )
+        .await;
+    }
 
     async fn trust_test_backend() -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

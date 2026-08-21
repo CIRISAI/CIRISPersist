@@ -1521,11 +1521,11 @@ impl Backend for MemoryBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let families = self
-            .list_families_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — the ACTIVE fold, not raw containment:
+        // see `FederationDirectory::active_community_key_ids_for`.
+        self.active_family_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
-        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
@@ -1535,14 +1535,10 @@ impl Backend for MemoryBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let communities = self
-            .list_communities_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — same ONE fold as the write gate.
+        self.active_community_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
-        Ok(communities
-            .into_iter()
-            .map(|c| c.community_key_id)
-            .collect())
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))
     }
 
     async fn insert_trace_events_batch(
@@ -3005,18 +3001,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
         // cohort_scope admission gate. The writer (`attesting_key_id`) must be
         // a MEMBER of the target cohort they stamp. `self` + broad tiers pass
-        // with no read; family/community (no `cohort_target_id` field on
-        // attestations) are refused as a downgrade with no provable
-        // membership. Runs AFTER the closed-set value validation in tier 1 and
+        // with no read; family/community resolve their target from the
+        // producer's SIGNED envelope (v38.2.0, #757 — it was a hardcoded
+        // `None` here, which refused every such placement and left an
+        // owner-signed community row inexpressible on the whole substrate).
+        // Runs AFTER the closed-set value validation in tier 1 and
         // BEFORE persist (verify-then-gate-then-persist, MISSION §1.6).
         crate::federation::FederationDirectory::check_write_cohort_scope_for(
             self,
             &row.attesting_key_id,
             "put_attestation",
             &row.cohort_scope,
-            None,
+            // v38.2.0 (#757) — the target the producer SIGNED into the
+            // envelope. Was hardcoded `None`, which made AV-45 refuse every
+            // family/community placement and left an owner-signed community
+            // row inexpressible (promotion, the only other door, re-seals
+            // with this node's key).
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
         )
         .await?;
+
+        // v38.2.0 (CIRISPersist#757) — **AV-84 MOVES TO THIS DOOR TOO.**
+        // `check_promotion_cohort_standing` refuses a targeted-cohort row
+        // that names any party but its producer, and it justified being
+        // promote-ONLY with a claim about THIS door: "put_attestation
+        // therefore refuses those two placements outright, and that door is
+        // SHUT, not leaking". The AV-45 call above just unshut it. Without
+        // this line a member could place a row ABOUT A THIRD PARTY into the
+        // whole community's plane — the exact claim AV-84 exists to refuse,
+        // arriving through the door its own doc said could not be reached.
+        // Pure (no directory read, no clock), so it stays in the cheap tier.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission hook.
         // Same shape and same tier position as the sqlite + postgres backends;
@@ -5297,6 +5312,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v38.2.0 (CIRISPersist#758) — **memory used to silently
+            // OVERWRITE.** `HashMap::insert` replaced the stored row AND its
+            // authority signature, so on a memory-backed node a replicated
+            // peer copy could displace the row this node authored — the
+            // opposite failure from the SQL backends, which refused every
+            // re-put. One predicate now answers for all three: identical
+            // content is an idempotent no-op, differing content is refused.
+            if let Some(existing) = state.federation_communities.get(&row.community_key_id) {
+                let stored = existing.persist_row_hash.clone();
+                let offered = row.persist_row_hash.clone();
+                let id = row.community_key_id.clone();
+                drop(state);
+                return crate::federation::community_reput_verdict(&stored, &offered, &id);
+            }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `community.*`.
             let wire_index_key = crate::federation::wire_index::record_key(&[(
@@ -10806,6 +10835,26 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.2.0 (CIRISPersist#757) — owner-signed community row, memory arm.
+    #[tokio::test]
+    async fn owner_signed_community_row_memory_757() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — the convergent re-put, memory arm.
+    #[tokio::test]
+    async fn convergent_community_reput_memory_758() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_convergent_community_reput(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn trust_doors_refuse_the_unproven_721() {
         use crate::federation::tier_ingest::test_support as ts;

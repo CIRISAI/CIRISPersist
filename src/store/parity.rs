@@ -228,8 +228,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("insert_trace_llm_calls_batch", Class::Delegates),
     ("iter", Class::Plumbing),
     ("list_attestations_by", Class::Delegates),
-    ("list_communities_for_member", Class::Delegates),
-    ("list_families_for_member", Class::Delegates),
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),

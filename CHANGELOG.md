@@ -5,6 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.2.0] - 2026-08-20
+
+Downstream (CIRISServer) wired 2-member-community chat — messages as
+attestations, the same primitive testimony rides — and the wiring found all of
+this: one replication defect (#758) and one structural wall (#757, "an
+owner-signed community row is not expressible on this substrate").
+
+### Added
+
+- **#757 — signer-explicit community writes.** The put doors resolve the
+  row's cohort target from the producer's SIGNED envelope
+  (`envelope_cohort_target` over `COHORT_TARGET_ENVELOPE_FIELDS` — the same
+  four field names the moderator gate has read since v13.0.0) instead of a
+  hardcoded `None`. AV-45's membership question becomes askable at the door
+  that PRESERVES the author's signature. Previously every
+  `cohort_scope: family|community` put refused unconditionally and the only
+  minting door — promotion — re-seals with the node's key, so a
+  community-scope attestation was node-signed BY CONSTRUCTION. No schema
+  change, no migration, no preimage move: the target was always in the signed
+  bytes; it was missing from the CALL. Witnessed on all three backends
+  (member's row lands with the author's `scrub_key_id` intact; non-member
+  refused; targetless community row still refused); the hardcoded-`None`
+  mutation reproduces the consumer-reported refusal verbatim.
+
+- **#757 — the decided `chat:*` projection-registry row.** Whole-prefix
+  classifier arm, `AttestationFamily::Chat` with the contextual-integrity
+  argument recorded, live arms enumerated to the last tier (Cohort ceiling at
+  every commons tier — a trust root is not a party to someone else's
+  conversation, so the commons cells take no `authority` branch), tombstone
+  row-max Cohort, representative dimension in the property corpus.
+  Whole-prefix on purpose: superset members (e.g. on-behalf attribution) are
+  blessed the day they are minted.
+
+### Fixed
+
+- **#757 — AV-84 moves to the put door.** `check_promotion_cohort_standing`
+  ran promote-only, justified in prose by "the put door is SHUT". #757 unshut
+  it: a member could have placed a row ABOUT A THIRD PARTY into the whole
+  community's plane. Measured by a probe before the fix (it got through);
+  refused by a permanent witness arm after; both prose sites that asserted
+  the shut door are corrected in place. AV-45 at the promote door itself
+  stays deliberately unanswered — whose membership a promotion asserts
+  (producer's or promoting node's) is an open question, not one to settle
+  silently inside an urgent fix.
+
+- **#757 follow-on — admission membership is the ACTIVE fold, not raw
+  containment.** `check_write_cohort_scope_for` and the backends'
+  `admission_*_key_ids` consulted `list_*_for_member` — raw roster
+  containment, which counts a REVOKED member as a member. Vacuously
+  unreachable while the door refused everything; load-bearing the moment it
+  opened (a removed member could have kept writing into the community's
+  plane forever — the exact failure the removal primitive exists to
+  prevent). Both paths now filter through the ONE #709 fold
+  (`active_*_members`: admitted AND NOT revoked), spelled once as
+  `FederationDirectory::active_family_key_ids_for` /
+  `active_community_key_ids_for`. Mutation: restoring the raw fold reds the
+  revoked-member witness arm by name.
+
+- **#758 — a convergent community re-put is an idempotent no-op, and the three
+  backends stop answering it three ways.** The pair chat derives one
+  deterministic community per member pair, so both ends author BYTE-IDENTICAL
+  roster content and each signs as itself. sqlite and postgres were plain
+  INSERTs that refused every replicated copy (a standing replication error on
+  every pair community); memory was worse and unreported — `HashMap::insert`
+  silently OVERWROTE the stored row and its authority signature, so a peer's
+  copy could displace the row this node authored.
+
+  One predicate now answers for all three (`community_reput_verdict`, spelled
+  once): identical stored content hash is an idempotent no-op, differing
+  content is a typed `Conflict`. Accepting-and-moving-on would have been the
+  opposite defect — silently taking a DIFFERING roster under an occupied id —
+  so the insert absorbs and a zero-row result RE-READS to decide (the #719
+  shape). The authority signature is a WITNESS to the row, not part of its
+  identity: the first-accepted signature is kept and the second dropped; the
+  dyad co-signature form that would retain both stays open on #758.
+
+  Witnessed identically on memory / sqlite / postgres, because the defect WAS
+  a backend divergence and a one-backend witness would have proven nothing.
+  Mutation-tested: removing the memory guard reds the witness by name.
+
 ## [38.0.0] - 2026-08-20
 
 The constitutional-ledger cut, the registry fold's storage, and nine bugs

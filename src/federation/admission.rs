@@ -2151,15 +2151,31 @@ impl std::fmt::Display for CohortStandingRefusal {
 /// # Why this is not AV-45, and must not be
 ///
 /// AV-45 ([`DimensionAdmissionPolicy::check_write_cohort_scope`]) asks *"is the
-/// writer a member of the target cohort it names?"* On `federation_attestations`
-/// that question is **unaskable**: the row carries a `cohort_scope` and no
-/// `cohort_target_id`, so the predicate's `family` / `community` arms refuse on
-/// a `None` target — which, on this table, is every row. `put_attestation`
-/// therefore refuses those two placements outright, and that door is SHUT, not
-/// leaking.
+/// writer a member of the target cohort it names?"* Through v38.0.0 that
+/// question was **unaskable** on `federation_attestations`: the row carries a
+/// `cohort_scope`, the put doors passed a hardcoded `None` target, and the
+/// predicate's `family` / `community` arms refuse on `None` — which, on this
+/// table, was every row. `put_attestation` therefore refused those two
+/// placements outright, and that door was SHUT.
 ///
-/// The promote door cannot copy that answer. Promotion is the ONLY door those
-/// placements have ever had, so refusing them there deletes the #519/#510
+/// **v38.2.0 (CIRISPersist#757) UNSHUT IT**, and this gate had to follow.
+/// The put doors now resolve the target from the producer's SIGNED envelope
+/// ([`envelope_cohort_target`]), so AV-45 can membership-validate a
+/// signer-explicit community write — which is the whole point, because the
+/// put door is the one that PRESERVES the author's signature where promotion
+/// re-seals with the node's key. But the paragraph above was load-bearing
+/// for THIS gate's scope: it ran only at the promote door because the put
+/// door was shut. Opening it without moving this gate would have let a
+/// member place a row ABOUT A THIRD PARTY into the whole cohort's plane —
+/// measured, not theorised (the probe arm of
+/// `exercise_owner_signed_community_row` refuses exactly that). So this
+/// predicate now runs at BOTH doors, in the same position on all three
+/// backends. Its NAME still says "promotion" and no longer should; the
+/// rename is a clean break deliberately not ridden into an urgent fix.
+///
+/// The promote door still cannot copy AV-45's answer for a row it did not
+/// author. Promotion was the ONLY door those placements had before #757, so
+/// refusing them there deletes the #519/#510
 /// audience plane — a product amputation wearing a security fix's clothes, and
 /// the reason CIRISPersist#589 left AV-45 out of
 /// [`check_promotion_admission`]. **This is a different predicate for a
@@ -2335,17 +2351,27 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
 /// left out on purpose, and the reasoning is recorded here rather than in a
 /// commit message because the next reader will ask.
 ///
-/// Attestations carry a `cohort_scope` label but **no** `cohort_target_id`, so
-/// [`DimensionAdmissionPolicy::check_write_cohort_scope`] refuses `family` /
-/// `community` whenever the target is `None` — which, on this table, is always.
-/// Running AV-45 here would therefore not *check* a promotion's placement, it
-/// would make `family` / `community` placements **unreachable**: every
-/// `attestation_promote(id, "community")` and every #510
+/// Attestations carry a `cohort_scope` label and no `cohort_target_id` COLUMN,
+/// so through v38.0.0 [`DimensionAdmissionPolicy::check_write_cohort_scope`]
+/// refused `family` / `community` whenever the target was `None` — which, on
+/// this table, was always. Running AV-45 here would therefore not *check* a
+/// promotion's placement, it would make those placements **unreachable**:
+/// every `attestation_promote(id, "community")` and every #510
 /// `consent:replication:v1` grant naming `audience: community | family` would
-/// refuse. Promotion is the only door those placements have ever had, so
-/// "enforce AV-45 here" reduces to "delete the #519/#510 audience plane". That
-/// is a product amputation wearing a security fix's clothes, and it is not
-/// this issue's defect.
+/// refuse. Promotion was the only door those placements had, so "enforce
+/// AV-45 here" reduced to "delete the #519/#510 audience plane" — a product
+/// amputation wearing a security fix's clothes.
+///
+/// **v38.2.0 (CIRISPersist#757) changes the premise, not yet the conclusion.**
+/// A target is now resolvable from the producer's signed envelope
+/// ([`envelope_cohort_target`]), so AV-45 *is* askable on this table and the
+/// unreachability argument above no longer holds as stated. It is still not
+/// run here, for a different and narrower reason: a promotion re-publishes a
+/// row this node may not have authored, so asking "is the WRITER a member"
+/// requires first deciding whose membership a promotion asserts — the
+/// producer's or the promoting node's. That question is open
+/// (CIRISPersist#757), and answering it silently inside an urgent fix is how
+/// gates come to mean something nobody chose.
 ///
 /// The provenance also differs, which is why the asymmetry is defensible rather
 /// than merely convenient. AV-45 at `put_attestation` polices an INBOUND row
@@ -10117,6 +10143,57 @@ pub async fn check_no_moderator_federate_admission_by_id(
     check_no_moderator_federate_admission(directory, &community).await
 }
 
+/// v38.2.0 (CIRISPersist#757 / CIRISServer chat wiring) — **the envelope keys
+/// a row may name its cohort under**, spelled once.
+///
+/// `federation_attestations` has no `cohort_target_id` column, so a row that
+/// belongs to a named family or community says so in its SIGNED envelope.
+/// These are the field names already in use — [`check_no_moderator_federate_apply`]
+/// has read them since v13.0.0 — hoisted here so the write gate and the
+/// moderator gate cannot drift to two different ideas of where a cohort id
+/// lives.
+pub const COHORT_TARGET_ENVELOPE_FIELDS: &[&str] = &[
+    "community_id",
+    "community_key_id",
+    "cohort_key_id",
+    "family_key_id",
+];
+
+/// v38.2.0 — the cohort id a row NAMES in its signed envelope, if any.
+///
+/// # Why this is the target AV-45 was missing
+///
+/// [`DimensionAdmissionPolicy::check_write_cohort_scope`] asks *"is the writer
+/// a member of the target cohort it names?"* — and every backend's
+/// `put_attestation` passed a hardcoded `None`, so the `family` and
+/// `community` arms refused on a missing target, which on this table was
+/// EVERY row. The consequence was not a narrow gap: an owner-signed
+/// community row was **not expressible on this substrate at all**. The only
+/// door that could place one was promotion, and promotion re-seals the
+/// envelope and stamps `scrub_key_id` with THIS node's derived key
+/// (`Engine::reseal_for_scope`), so the author's own signature could never
+/// survive onto a community-scoped federation row — which is exactly what a
+/// chat message or a testimony needs, since author-only revocation and
+/// third-party verification of authorship both rest on it.
+///
+/// The target was never missing from the ROW — the producer signs it into the
+/// envelope. It was missing from the CALL. Reading it here makes AV-45's
+/// question askable at the put door, which is the door that preserves the
+/// author's signature.
+///
+/// Returns the first non-empty match in [`COHORT_TARGET_ENVELOPE_FIELDS`]
+/// order. The value is inside the signed envelope, so a relay cannot alter it
+/// without breaking the signature the tier-ingest gate verifies.
+#[must_use]
+pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Option<&str> {
+    COHORT_TARGET_ENVELOPE_FIELDS.iter().find_map(|field| {
+        envelope
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+    })
+}
+
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
 /// point for the §11.11 federation-apply re-check (point ii). A
 /// **federation-tier** attestation keyed on a community `C` is a "federation
@@ -10179,8 +10256,12 @@ pub async fn check_no_moderator_federate_apply(
     // Collect every community reference the row carries (deduplicated —
     // a row naming C under several shapes re-checks it once).
     let mut candidates: Vec<&str> = Vec::new();
-    for field in ["community_id", "community_key_id", "cohort_key_id"] {
-        if let Some(cid) = row.attestation_envelope.get(field).and_then(|v| v.as_str()) {
+    for field in COHORT_TARGET_ENVELOPE_FIELDS {
+        if let Some(cid) = row
+            .attestation_envelope
+            .get(*field)
+            .and_then(|v| v.as_str())
+        {
             if !cid.is_empty() && !candidates.contains(&cid) {
                 candidates.push(cid);
             }

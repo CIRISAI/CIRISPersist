@@ -1070,12 +1070,40 @@ mod tests {
         let text = std::fs::read_to_string(manifest_dir().join(rel)).expect("read backend source");
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         // Assembled so this module's own doc text is not a match.
-        let marker = ["INSERT", "INTO"].join(" ");
+        let verb = ["INSERT"].join("");
         for blob in rust_string_literals(&text) {
             let upper = blob.to_ascii_uppercase();
             let mut from = 0usize;
-            while let Some(p) = upper[from..].find(&marker) {
-                let start = from + p + marker.len();
+            while let Some(p) = upper[from..].find(&verb) {
+                let after_verb = from + p + verb.len();
+                from = after_verb;
+                // v38.2.0 (CIRISPersist#758) — **SQLite's conflict-clause form
+                // counts.** This recognizer matched only the contiguous
+                // `INSERT INTO`, so every `INSERT OR IGNORE INTO` was INVISIBLE
+                // to the write-column parity gate — including
+                // `federation_attestations`, the crate's most-written table,
+                // which has used that form since long before this fix. A gate
+                // that silently stops seeing a door is the class this repo
+                // keeps paying for; the door has to stay in view no matter
+                // which conflict clause it carries.
+                let rest_after_verb = upper[after_verb..].trim_start();
+                let skipped = upper[after_verb..].len() - rest_after_verb.len();
+                let mut cursor = after_verb + skipped;
+                if let Some(tail) = upper[cursor..].strip_prefix("OR ") {
+                    // `OR IGNORE` / `OR REPLACE` / `OR ABORT` / `OR ROLLBACK` / `OR FAIL`
+                    let tail_trimmed = tail.trim_start();
+                    let ws = tail.len() - tail_trimmed.len();
+                    let word_len = tail_trimmed
+                        .find(|c: char| c.is_whitespace())
+                        .unwrap_or(tail_trimmed.len());
+                    cursor = cursor + "OR ".len() + ws + word_len;
+                    let after_word = upper[cursor..].trim_start();
+                    cursor += upper[cursor..].len() - after_word.len();
+                }
+                let Some(_) = upper[cursor..].strip_prefix("INTO") else {
+                    continue;
+                };
+                let start = cursor + "INTO".len();
                 from = start;
                 let rest = blob[start..].trim_start();
                 let Some(open) = rest.find('(') else { continue };
@@ -1103,6 +1131,36 @@ mod tests {
             }
         }
         out
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — **the recognizer sees SQLite's
+    /// conflict-clause inserts.**
+    ///
+    /// [`insert_columns`] matched only a contiguous `INSERT` + `INTO`, so
+    /// every `INSERT OR IGNORE INTO …` was invisible to the write-column
+    /// parity gate above — silently, and including `federation_attestations`,
+    /// which has carried that form for many releases. The gate went on
+    /// reporting green about a door it could no longer see.
+    ///
+    /// This pins the recognizer against the two real tables that use the
+    /// form. Reverting the recognizer to the contiguous marker drops both
+    /// entries and reds this test by name.
+    #[test]
+    fn the_insert_recognizer_sees_conflict_clause_form_758() {
+        let sq = insert_columns("src/store/sqlite.rs");
+        for table in ["federation_attestations", "federation_communities"] {
+            let cols = sq.get(table).unwrap_or_else(|| {
+                panic!(
+                    "{table} writes through `INSERT OR IGNORE INTO` and the recognizer must \
+                     SEE it — a write-column gate blind to a door reports green about nothing"
+                )
+            });
+            assert!(
+                cols.len() >= 5,
+                "{table}: recognizer found only {cols:?} — that is a truncated parse, \
+                 not a column set"
+            );
+        }
     }
 
     /// **CIRISPersist#656 as a gate.** Where one dialect's INSERT binds a
