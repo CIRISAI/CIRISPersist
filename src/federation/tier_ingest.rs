@@ -1603,6 +1603,165 @@ pub mod test_support {
         );
     }
 
+    /// v38.3.0 (CIRISPersist#765 + #764) — **a node speaks for its owner**:
+    /// the exact shape CIRISServer's two-node chat ladder refused forever at
+    /// v38.2's community door.
+    ///
+    /// The writer is a NODE whose identity-occurrence row is self-referential
+    /// (the CIRISServer#454 sealing shape), so the occurrence axis resolves
+    /// it to itself and it is a member of nothing. Its authority lives on
+    /// the live `delegates_to(owner → node)` OWNER-BINDING (CC 1.13.3.3),
+    /// which v38.2 never walked — the membership refusal was labelled
+    /// TRANSIENT (`retry_after_community_roster`) but could never
+    /// transition, because the roster's members are persons.
+    ///
+    /// Arms: the binding resolves BOTH directions (`owner_of` /
+    /// `nodes_owned_by`, #764); the bound node's on-behalf community row
+    /// LANDS node-signed; an unbound node refuses; a WITHDRAWN binding
+    /// stops lifting (liveness is `owner_of`'s one fold, #578/#584); the
+    /// bound node naming a THIRD person still refuses (the principal
+    /// equivalence widens to the owner, never past it).
+    pub(crate) async fn exercise_node_speaks_for_owner(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{
+            attestation_type, cohort_scope, delegation_scope as ds, owner_binding,
+        };
+
+        let owner = format!("owner-765-{suffix}");
+        let node = format!("node-765-{suffix}");
+        let stranger_node = format!("lone-node-765-{suffix}");
+        let third = format!("third-765-{suffix}");
+        let cid = format!("pair-765-{suffix}");
+        register_user_role_key(dir, &owner).await;
+        register_user_role_key(dir, &third).await;
+        for k in [&node, &stranger_node, &cid] {
+            register_hybrid_key(dir, k).await;
+        }
+        seed_two_member_community(dir, &cid, &owner, &owner).await;
+
+        // The owner-binding: delegates_to(owner → node), the CC 1.13.3.3
+        // ownership dimension, sealed by the OWNER, through the real door.
+        let binding_id = uuid::Uuid::new_v4().to_string();
+        let mut binding = bare_attestation(
+            &binding_id,
+            &owner,
+            &node,
+            &serde_json::json!({
+                "id": binding_id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        seal_row_in_place(&owner, &mut binding);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
+
+        // (1) BOTH directions resolve through the one fold (#764).
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(owner.as_str()),
+            "({suffix}) owner_of walks the binding"
+        );
+        assert_eq!(
+            crate::federation::admission::nodes_owned_by(dir, &owner)
+                .await
+                .unwrap(),
+            vec![node.clone()],
+            "({suffix}) #764: nodes_owned_by is owner_of's exact reverse"
+        );
+
+        // The on-behalf chat row: node-signed, about the owner, into the
+        // owner's pair community.
+        let chat_row = |producer: &str, about: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut r = bare_attestation(
+                &id,
+                producer,
+                about,
+                &serde_json::json!({
+                    "id": id,
+                    "dimension": "chat:message:v1",
+                    "community_id": cid,
+                    "on_behalf_of_key_id": about,
+                }),
+            );
+            r.attestation_type = attestation_type::SCORES.to_owned();
+            r.cohort_scope = cohort_scope::COMMUNITY.to_owned();
+            r.subject_key_ids = vec![about.to_owned()];
+            seal_row_in_place(producer, &mut r);
+            r
+        };
+
+        // (2) THE LADDER ARM — the bound node's on-behalf row LANDS,
+        // node-signed (authorship survives; attribution rides the envelope).
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: chat_row(&node, &owner),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({suffix}) #765: the bound node's on-behalf community row must land — \
+                 this is the refusal CIRISServer's ladder measured as a transient that \
+                 never transitions: {e}"
+            )
+        });
+
+        // (3) An UNBOUND node is nobody's principal — refused.
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: chat_row(&stranger_node, &owner),
+            })
+            .await
+            .is_err(),
+            "({suffix}) #765: an unbound node must not inherit anyone's membership"
+        );
+
+        // (4) The bound node naming a THIRD person refuses — the principal
+        // equivalence class widens to the OWNER, never past it.
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: chat_row(&node, &third),
+            })
+            .await
+            .is_err(),
+            "({suffix}) #765: on-behalf covers the PRINCIPAL only — a third party is \
+             still a third party"
+        );
+
+        // (5) A WITHDRAWN binding stops lifting — liveness is owner_of's one
+        // fold, so the walk dies the moment the binding does.
+        put_retraction(dir, &owner, &node, &binding_id, "withdraws")
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) withdraw the binding: {e}"));
+        assert!(
+            crate::federation::admission::nodes_owned_by(dir, &owner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "({suffix}) #764: a withdrawn binding leaves the reverse walk empty"
+        );
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: chat_row(&node, &owner),
+            })
+            .await
+            .is_err(),
+            "({suffix}) #765: a withdrawn owner-binding must stop lifting the node — \
+             a decommissioned instrument keeps nothing"
+        );
+    }
+
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role
     /// identity, so it steward-binds ITSELF (clause 1 of
     /// `steward_bindings_of`). Non-infrastructure community membership is an

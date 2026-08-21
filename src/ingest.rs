@@ -1198,12 +1198,17 @@ where
     ) -> Result<&'c crate::scope::CallerAdmission, IngestError> {
         let needs_build = !matches!(cache, Some((k, _)) if k == signer);
         if needs_build {
-            let identity = self
-                .backend
-                .resolve_identity_for_occurrence(signer)
-                .await
-                .map_err(IngestError::Store)?
-                .unwrap_or_else(|| signer.to_owned());
+            // THE PRINCIPAL FOLD (v38.3.0, #765): occurrence axis, then the
+            // live owner-binding axis — a node's occurrence is
+            // self-referential (#454), so without the second axis a
+            // node-signed ingest exercised NO memberships. One spelling,
+            // shared with the community write gate and AV-84.
+            let identity =
+                crate::federation::admission::admission_identity_for_writer(self.backend, signer)
+                    .await
+                    .map_err(|e| {
+                        IngestError::Store(StoreError::Backend(format!("writer principal: {e}")))
+                    })?;
             let families = self
                 .backend
                 .admission_family_key_ids(&identity)

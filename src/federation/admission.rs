@@ -2215,7 +2215,7 @@ pub async fn check_cohort_standing_resolved(
     // same comparisons, same refusal variants, in the same order — the
     // witness arms exercise both.
     let producer = row.attesting_key_id.as_str();
-    let producer_identity = directory.active_identity_for_occurrence(producer).await?;
+    let producer_identity = admission_identity_for_writer(directory, producer).await?;
     let refuse = |reason: CohortStandingRefusal, foreign: &str| {
         Err(Error::CohortStandingRefused {
             cohort_scope: row.cohort_scope.clone(),
@@ -2225,16 +2225,14 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
-        && directory
-            .active_identity_for_occurrence(&row.attested_key_id)
-            .await?
+        && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
     {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
     for subject in &row.subject_key_ids {
         if subject.as_str() != producer
-            && directory.active_identity_for_occurrence(subject).await? != producer_identity
+            && admission_identity_for_writer(directory, subject).await? != producer_identity
         {
             return refuse(CohortStandingRefusal::NamedSubject, subject);
         }
@@ -6985,8 +6983,8 @@ enum DelegationEdgeFilter {
 /// is a reach limit of the row index, not of this fold; widening it means a
 /// per-granter fan-out read on every steward-binding check, which is a
 /// separate decision with its own cost.
-async fn live_delegation_granters(
-    directory: &dyn super::FederationDirectory,
+async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
     subject: &str,
     filter: DelegationEdgeFilter,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
@@ -7318,11 +7316,63 @@ pub async fn nodes_stewarded_by(
 /// unrepaired at the three steward-binding sites; the walk now lives in one
 /// place, so `owner_of(node) ⊆ steward_bindings_of(node)` holds by construction
 /// rather than by two functions being edited in step.
-async fn live_owner_binding_granters(
-    directory: &dyn super::FederationDirectory,
+async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
     node: &str,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
     live_delegation_granters(directory, node, DelegationEdgeFilter::OwnerBindingOnly).await
+}
+
+/// v38.3.0 (CIRISPersist#765, measured by CIRISServer's two-node chat
+/// ladder) — **the writer-admission PRINCIPAL fold**: the identity whose
+/// memberships and standing a writer exercises at the cohort gates.
+///
+/// Two axes, walked in order, each through its own ONE blessed fold:
+///
+/// 1. **Occurrence axis** ([`FederationDirectory::active_identity_for_occurrence`],
+///    §4.4): a person's device occurrence resolves to the person. If this
+///    answers with a DISTINCT identity, it wins — a bound occurrence is that
+///    identity, full stop.
+/// 2. **Owner-binding axis** ([`owner_of`], CC 1.13.3.3 / CC 3.2): every
+///    NODE's identity-occurrence row is self-referential (the
+///    CIRISServer#454 sealing shape), so axis 1 leaves a node as itself —
+///    but a node is its single responsible owner's INSTRUMENT, and its
+///    authority to speak lives on the live `delegates_to(owner → node)`
+///    owner-binding. When axis 1 is self-referential, the single live owner
+///    lifts the node to its owner. `owner_of` is the same liveness fold the
+///    single-owner admission gate polices (expiry + admitted `withdraws`,
+///    #578/#584, spelled once), so a lapsed or withdrawn binding stops
+///    lifting the moment it dies.
+///
+/// Neither axis answering leaves the writer as itself (the singleton rule).
+/// [`Error::AmbiguousNodeOwner`] propagates — fail-closed, per
+/// [`owner_of`]'s contract: an ambiguous principal is not a resolvable
+/// authority.
+///
+/// **Why this exists** (#765): the community write gate resolved axis 1
+/// only, so a node-signed on-behalf chat row refused
+/// `retry_after_community_roster` FOREVER — a "transient" that could never
+/// transition, because the roster's members are PERSONS and the node
+/// resolves to itself. The membership question was being asked about the
+/// instrument instead of the principal.
+///
+/// Consumed by the membership gate
+/// ([`FederationDirectory::check_write_cohort_scope_for`]), the standing
+/// gate ([`check_cohort_standing_resolved`] — fixing only membership would
+/// have moved the ladder exactly one gate deeper, onto AV-84's
+/// third-party refusal), and trace-ingest's `writer_admission`.
+pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    writer: &str,
+) -> Result<String, Error> {
+    let identity = directory.active_identity_for_occurrence(writer).await?;
+    if identity != writer {
+        return Ok(identity);
+    }
+    if let Some(owner) = owner_of(directory, writer).await? {
+        return Ok(owner);
+    }
+    Ok(writer.to_owned())
 }
 
 /// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single responsible owner
@@ -7338,8 +7388,8 @@ async fn live_owner_binding_granters(
 /// error as **fail-closed**: an ambiguous owner is not a resolvable `self`
 /// boundary. NEVER silently pick one (unlike the historical
 /// `is_steward_bound(..).next()` on a sorted set).
-pub async fn owner_of(
-    directory: &dyn super::FederationDirectory,
+pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
     node: &str,
 ) -> Result<Option<String>, Error> {
     let owners = live_owner_binding_granters(directory, node).await?;
@@ -7351,6 +7401,54 @@ pub async fn owner_of(
             owners: owners.into_iter().collect(),
         }),
     }
+}
+
+/// v38.3.0 (CIRISPersist#764, for CIRISEdge#524's send-set) — **the reverse
+/// owner-binding walk**: the nodes a PERSON is the single responsible owner
+/// of, as an indexed verb.
+///
+/// [`owner_of`] answers node → owner; consent routing needs person → nodes —
+/// a `consent:replication:v1` grant naming a PERSON (the natural subject:
+/// consent is between people) was silently unroutable, because a person's
+/// key has no transport binding and nothing could resolve *the nodes that
+/// person is bound to*.
+///
+/// **One fold, not two**: candidates come from the granter-side index
+/// ([`FederationDirectory::list_attestations_by`] filtered to owner-binding
+/// `delegates_to` envelopes), but each candidate's VERDICT is
+/// [`owner_of`] itself — so liveness (expiry + admitted `withdraws`,
+/// #578/#584) and the single-owner rule are answered by the same spelling
+/// the forward walk uses, and `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U`
+/// holds by construction rather than by two folds edited in step.
+///
+/// A candidate that resolves [`Error::AmbiguousNodeOwner`] is SKIPPED, not
+/// an error: the anomaly is that node's (pre-#23-gate history), and one
+/// poisoned node must not make its owner's every consent grant unroutable.
+/// The forward walk still fails closed when that node is asked about
+/// directly.
+pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    person: &str,
+) -> Result<Vec<String>, Error> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for row in directory.list_attestations_by(person).await? {
+        if row.attestation_type == super::types::attestation_type::DELEGATES_TO
+            && is_owner_binding_envelope(&row.attestation_envelope)
+            && !row.attested_key_id.is_empty()
+        {
+            candidates.insert(row.attested_key_id);
+        }
+    }
+    let mut out = Vec::new();
+    for node in candidates {
+        match owner_of(directory, &node).await {
+            Ok(Some(owner)) if owner == person => out.push(node),
+            Ok(_) => {}
+            Err(Error::AmbiguousNodeOwner { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
 }
 
 /// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single-owner admission

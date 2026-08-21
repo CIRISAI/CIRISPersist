@@ -30393,6 +30393,25 @@ mod tests {
     // against a real Postgres deployment. Gated on
     // CIRIS_PERSIST_TEST_PG_URL like the rest of this test module.
 
+    /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn node_speaks_for_owner_pg_765() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_node_speaks_for_owner(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, postgres arm.
     #[tokio::test]
     #[serial_test::serial(postgres)]

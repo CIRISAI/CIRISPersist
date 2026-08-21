@@ -33824,6 +33824,17 @@ mod tests {
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
 
+    /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, sqlite arm.
+    #[tokio::test]
+    async fn node_speaks_for_owner_sqlite_765() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_node_speaks_for_owner(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, sqlite arm.
     #[tokio::test]
     async fn owner_signed_community_row_sqlite_757() {
