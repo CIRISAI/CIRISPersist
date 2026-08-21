@@ -2201,24 +2201,45 @@ pub async fn check_cohort_standing_resolved(
     if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
         return Ok(());
     }
-    // Resolve every distinct party once, up front — the core is sync.
-    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for k in std::iter::once(row.attesting_key_id.as_str())
-        .chain(std::iter::once(row.attested_key_id.as_str()))
-        .chain(row.subject_key_ids.iter().map(String::as_str))
+    // INCREMENTAL, fail-fast (PR #761 review): a row may carry thousands of
+    // `subject_key_ids` under the envelope cap, and each resolution is an
+    // awaited directory read — resolving ALL parties before comparing turned
+    // a row that refuses on its FIRST foreign subject into an O(n)
+    // amplification path. Parties are resolved one at a time, in row order,
+    // and the first foreign identity refuses immediately. Resolution is the
+    // ACTIVE binding (`active_identity_for_occurrence`): the historical
+    // lookup would keep a REVOKED device co-self with its former owner,
+    // regaining exactly the membership the revocation severs.
+    //
+    // Kept in lockstep with [`cohort_standing_core`] (the pure string form):
+    // same comparisons, same refusal variants, in the same order — the
+    // witness arms exercise both.
+    let producer = row.attesting_key_id.as_str();
+    let producer_identity = directory.active_identity_for_occurrence(producer).await?;
+    let refuse = |reason: CohortStandingRefusal, foreign: &str| {
+        Err(Error::CohortStandingRefused {
+            cohort_scope: row.cohort_scope.clone(),
+            producer_key_id: producer.to_owned(),
+            foreign_key_id: foreign.to_owned(),
+            reason,
+        })
+    };
+    if row.attested_key_id != producer
+        && directory
+            .active_identity_for_occurrence(&row.attested_key_id)
+            .await?
+            != producer_identity
     {
-        if k.is_empty() || resolved.contains_key(k) {
-            continue;
-        }
-        let identity = match directory.lookup_identity_for_occurrence(k).await? {
-            Some(io) => io.identity_key_id,
-            None => k.to_owned(),
-        };
-        resolved.insert(k.to_owned(), identity);
+        return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
-    cohort_standing_core(row, |k| {
-        resolved.get(k).cloned().unwrap_or_else(|| k.to_owned())
-    })
+    for subject in &row.subject_key_ids {
+        if subject.as_str() != producer
+            && directory.active_identity_for_occurrence(subject).await? != producer_identity
+        {
+            return refuse(CohortStandingRefusal::NamedSubject, subject);
+        }
+    }
+    Ok(())
 }
 
 /// CIRISPersist#592 (AV-84) — **THE TARGETED-COHORT STANDING GATE**:
@@ -2529,6 +2550,10 @@ pub async fn check_promotion_admission(
     // the walks; and #589's justification for AV-45's absence from this stack
     // is precisely the sentence this arm turns into a check.
     check_cohort_standing_resolved(directory, row).await?;
+    // PR #761 review — the reseal REPLACES the envelope, so alias agreement
+    // must be re-asked on the bytes this row will federate as; the put-door
+    // check saw the pre-promotion envelope, not this one.
+    envelope_cohort_target(&row.attestation_envelope)?;
 
     // v31.0.0 (CIRISPersist#598) — the consent instant BINDING, asked at the
     // promote door for the B8 reason: a row must not escape a put-gate by
@@ -10224,17 +10249,40 @@ pub async fn check_no_moderator_federate_admission_by_id(
 /// unaffected: an author's community row rides FEDERATION tier, where
 /// `verify_row_hybrid_signature` runs in full. Precedent:
 /// [`check_capacity_never_local`] (AV-83), the same never-local shape.
-pub fn check_targeted_cohort_never_local(tier: &str, cohort_scope: &str) -> Result<(), Error> {
+pub fn check_targeted_cohort_requires_federation_tier(
+    tier: &str,
+    cohort_scope: &str,
+) -> Result<(), Error> {
     use crate::federation::types::{attestation_tier, cohort_scope as cs};
-    if tier == attestation_tier::LOCAL
+    if tier != attestation_tier::FEDERATION
         && (cohort_scope == cs::FAMILY || cohort_scope == cs::COMMUNITY)
     {
         return Err(Error::InvalidArgument(format!(
-            "a {cohort_scope}-scoped placement is a membership claim and local-tier \
-             rows defer signature verification (CC 5.3.2.2) — an unverified \
-             membership claim is mintable by anyone, so targeted cohorts are \
-             never local. Write it at federation tier under the author's \
-             signature (PR #759 review)"
+            "a {cohort_scope}-scoped placement is a membership claim, and only \
+             federation-tier rows have their author signature verified \
+             (`verify_federation_tier_ingest` exempts every other tier, CC \
+             5.3.2.2) — an unverified membership claim is mintable by anyone, \
+             so a targeted cohort requires federation tier. Stated as a \
+             REQUIREMENT rather than `!= local` so an unknown tier string \
+             cannot slip between the two vocabularies (PR #761 review; the \
+             first form refused only `local`)"
+        )));
+    }
+    Ok(())
+}
+
+/// v38.2.0 (PR #761 review) — the tier value itself is a CLOSED set. Pure
+/// tier-1 refusal. The SQL schemas enforce this with a `CHECK`; memory
+/// enforced nothing, so the backends disagreed about whether a row with an
+/// unknown tier exists at all — and an unknown tier is signature-EXEMPT (see
+/// [`check_targeted_cohort_requires_federation_tier`]), which upgraded the
+/// divergence from cosmetic to a gate bypass.
+pub fn check_attestation_tier_vocabulary(tier: &str) -> Result<(), Error> {
+    if !crate::federation::types::attestation_tier::is_valid(tier) {
+        return Err(Error::InvalidArgument(format!(
+            "unknown attestation tier {tier:?} — the vocabulary is closed \
+             (local | federation); an unrecognised tier would be \
+             signature-exempt (PR #761 review)"
         )));
     }
     Ok(())

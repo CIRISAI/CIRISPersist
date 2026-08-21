@@ -1184,11 +1184,13 @@ impl Backend for PostgresBackend {
         occurrence_key_id: &str,
     ) -> Result<Option<String>, Error> {
         use crate::federation::FederationDirectory;
-        let io = self
-            .lookup_identity_for_occurrence(occurrence_key_id)
+        // ACTIVE binding only (PR #761 review) — a revoked occurrence falls
+        // back to its singleton identity, severing inherited membership.
+        let identity = self
+            .active_identity_for_occurrence(occurrence_key_id)
             .await
             .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
-        Ok(io.map(|o| o.identity_key_id))
+        Ok((identity != occurrence_key_id).then_some(identity))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
@@ -4852,7 +4854,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // identity is not a third party), and a targeted placement is never
         // local-tier (local rows defer signature verification, and an
         // unverified membership claim is mintable by anyone).
-        crate::federation::admission::check_targeted_cohort_never_local(
+        crate::federation::admission::check_attestation_tier_vocabulary(&row.tier)?;
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
             &row.tier,
             &row.cohort_scope,
         )?;
@@ -5752,7 +5755,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `promote_attestation` would have a door beside it, which is this
         // repo's own recurring class (a rule shipped behind one door while the
         // motion uses another). Verify-before-mutation (AV-9): `row` is a
-        // loaded copy and nothing has been written yet.
+        // loaded copy and nothing has been written yet. PR #761 review: the
+        // stored tier must support a targeted placement (non-federation tiers
+        // are signature-exempt), and the caller-supplied reseal envelope must
+        // not smuggle a split-brain cohort target past the put-door alias
+        // gate.
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
+            &row.tier,
+            &row.cohort_scope,
+        )?;
+        crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?;
         crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
         // v31.0.0 (CIRISPersist#649) — and the typed-column binding at the same
         // door, for the same "one rule, both doors" reason.

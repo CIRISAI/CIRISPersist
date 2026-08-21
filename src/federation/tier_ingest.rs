@@ -1465,8 +1465,8 @@ pub mod test_support {
                 )
             });
         assert!(
-            format!("{err}").contains("never local"),
-            "({suffix}) the refusal names the never-local rule: {err}"
+            format!("{err}").contains("federation tier"),
+            "({suffix}) the refusal names the federation-tier requirement: {err}"
         );
 
         // (7) A DEVICE OCCURRENCE WRITES AS ITS OWNING IDENTITY (PR #759
@@ -1504,6 +1504,103 @@ pub mod test_support {
                  identity is the producer, not a third party — refused with: {e}"
             )
         });
+
+        // (8) AN UNKNOWN TIER REFUSES (PR #761 review). The SQL schemas
+        // CHECK the tier vocabulary; memory checked nothing — and an unknown
+        // tier is signature-EXEMPT (`verify_federation_tier_ingest` verifies
+        // only `federation`), so tier "bogus" was a signature bypass on
+        // exactly one backend. The vocabulary gate is tier-1 and
+        // backend-shared, so all three answer alike.
+        let mut bogus = row(&bob_observer, Some(&cid2));
+        bogus.tier = "bogus".to_owned();
+        stamp_mirror(&mut bogus);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: bogus })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("({suffix}) PR#761: an unknown tier is signature-exempt and must refuse")
+            });
+        assert!(
+            format!("{err}").contains("vocabulary is closed"),
+            "({suffix}) the refusal names the closed tier vocabulary: {err}"
+        );
+
+        // (9) A LOCAL ROW CANNOT BE RE-SCOPED INTO A TARGETED COHORT
+        // (PR #761 review). `set_attestation_cohort_scope` preserves the
+        // stored tier, so re-scoping a local (signature-deferred) row to
+        // `community` would mint the same unverified membership claim the
+        // put door now refuses — the recurring "a rule shipped behind one
+        // door while the motion uses another" class, caught at the door
+        // BESIDE the one the last fix gated.
+        let mut local_row = row(&bob_observer, Some(&cid2));
+        local_row.cohort_scope = crate::federation::types::cohort_scope::SELF.to_owned();
+        local_row.tier = attestation_tier::LOCAL.to_owned();
+        seal_row_in_place(&bob_observer, &mut local_row);
+        let local_id = local_row.attestation_id.clone();
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: local_row.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) seed local self row: {e}"));
+        let reseal = reseal_for_scope(
+            &bob_observer,
+            &local_row,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        );
+        let err = dir
+            .set_attestation_cohort_scope(
+                &local_id,
+                crate::federation::types::cohort_scope::COMMUNITY,
+                &reseal,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) PR#761: re-scoping a LOCAL row into a community is an \
+                     unverified membership claim and must refuse"
+                )
+            });
+        assert!(
+            format!("{err}").contains("federation tier"),
+            "({suffix}) the re-scope refusal names the federation-tier requirement: {err}"
+        );
+
+        // (10) A REVOKED DEVICE LOSES ITS OWNER'S MEMBERSHIP (PR #761
+        // review). `lookup_identity_for_occurrence` returns the HISTORICAL
+        // binding — revocation leaves the row intact — so resolving through
+        // it kept a lost/stolen device co-self with its former owner,
+        // regaining exactly the family/community write access the
+        // revocation exists to sever. Resolution now rides the ACTIVE fold;
+        // the revoked device falls back to its singleton identity, which is
+        // not a member.
+        dir.put_identity_occurrence_revocation_local(
+            crate::federation::types::IdentityOccurrenceRevocation {
+                identity_key_id: bob_observer.clone(),
+                occurrence_key_id: device.clone(),
+                revoked_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
+        let mut via_revoked = row(&device, Some(&cid2));
+        via_revoked.attested_key_id = bob_observer.clone();
+        via_revoked.subject_key_ids = vec![bob_observer.clone()];
+        seal_row_in_place(&device, &mut via_revoked);
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: via_revoked,
+            })
+            .await
+            .is_err(),
+            "({suffix}) PR#761: a REVOKED device wrote with its former owner's community \
+             membership — resolution consulted the historical binding, not the active fold"
+        );
     }
 
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role

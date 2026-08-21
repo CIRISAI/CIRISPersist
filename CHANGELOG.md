@@ -40,6 +40,27 @@ owner-signed community row is not expressible on this substrate").
 
 ### Fixed
 
+- **PR #761 review (pre-tag) — five more verified findings, fixed in the same
+  window.** (1) *Targeted cohorts REQUIRE federation tier* — the never-local
+  form refused only `local`, and an unknown tier string ("bogus") was
+  signature-exempt AND landed on memory (no schema CHECK there): the
+  predicate is now a positive requirement and the tier vocabulary is a
+  closed-set tier-1 gate on every backend. (2) *The same gates run at the
+  re-scope door* — `set_attestation_cohort_scope` preserves the stored tier
+  and takes a caller-supplied reseal envelope, so a local row re-scoped to
+  `community` (or a split-brain reseal) minted the same unverified claim the
+  put door refuses; refused now, plus alias agreement at the promote door on
+  the post-reseal envelope. (3) *Occurrence resolution rides the ACTIVE
+  binding* — `lookup_identity_for_occurrence` returns the historical row, so
+  a REVOKED (lost/stolen) device stayed co-self with its former owner and
+  regained the owner's community write access; `active_identity_for_occurrence`
+  (the #421 re-assert fold) is now the ONE resolution rule at the standing
+  gates, the membership gate, and `resolve_identity_for_occurrence`.
+  (4) *Standing resolution is incremental* — a row with thousands of
+  subjects refused after O(n) directory reads; the first foreign party now
+  refuses immediately. Witness grown to ten arms; every gate mutation-tested
+  by name.
+
 - **PR #759 review (pre-tag) — four verified findings, all fixed before the
   tag was minted.** (1) *Targeted cohorts are never local-tier*: local rows
   defer signature verification (CC 5.3.2.2), so a family/community placement

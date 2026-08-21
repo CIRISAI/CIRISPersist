@@ -1507,11 +1507,13 @@ impl Backend for MemoryBackend {
         occurrence_key_id: &str,
     ) -> Result<Option<String>, Error> {
         use crate::federation::FederationDirectory;
-        let io = self
-            .lookup_identity_for_occurrence(occurrence_key_id)
+        // ACTIVE binding only (PR #761 review) — a revoked occurrence falls
+        // back to its singleton identity, severing inherited membership.
+        let identity = self
+            .active_identity_for_occurrence(occurrence_key_id)
             .await
             .map_err(|e| Error::Backend(format!("resolve_identity_for_occurrence: {e}")))?;
-        Ok(io.map(|o| o.identity_key_id))
+        Ok((identity != occurrence_key_id).then_some(identity))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — family-half of the writer
@@ -3035,7 +3037,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // identity is not a third party), and a targeted placement is never
         // local-tier (local rows defer signature verification, and an
         // unverified membership claim is mintable by anyone).
-        crate::federation::admission::check_targeted_cohort_never_local(
+        crate::federation::admission::check_attestation_tier_vocabulary(&row.tier)?;
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
             &row.tier,
             &row.cohort_scope,
         )?;
@@ -4074,6 +4077,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut candidate = gated.clone();
         candidate.cohort_scope = cohort_scope.to_owned();
         candidate.attestation_envelope = reseal.attestation_envelope.clone();
+        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
+            &candidate.tier,
+            &candidate.cohort_scope,
+        )?;
+        crate::federation::admission::envelope_cohort_target(&candidate.attestation_envelope)?;
         crate::federation::admission::check_cohort_standing_resolved(self, &candidate).await?;
 
         let wire_index_key = {

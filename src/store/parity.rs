@@ -182,9 +182,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Refuses a split-brain row whose cohort-target aliases disagree; a
     // refusal, so it contributes to the compared sequence.
     ("envelope_cohort_target", Class::Gate),
-    // Targeted cohorts are never local-tier (local rows defer signature
-    // verification; a membership claim needs the verified signature).
-    ("check_targeted_cohort_never_local", Class::Gate),
+    // Targeted cohorts REQUIRE federation tier (every other tier is
+    // signature-exempt; a membership claim needs the verified signature) —
+    // PR #761 strengthened the v38.2.0 never-local form, which an unknown
+    // tier string slipped past.
+    (
+        "check_targeted_cohort_requires_federation_tier",
+        Class::Gate,
+    ),
+    // The tier vocabulary is a closed set; memory had no CHECK constraint,
+    // and an unknown tier is signature-exempt.
+    ("check_attestation_tier_vocabulary", Class::Gate),
     ("check_purge_admission", Class::Gate),
     ("check_put_blob_admission", Class::Gate),
     ("check_reseal_admission", Class::Gate),
@@ -243,7 +251,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("load_or_init_content_master", Class::Delegates),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
-    ("lookup_identity_for_occurrence", Class::Delegates),
+    // PR #761 review — occurrence resolution rides the ACTIVE fold: a
+    // revoked device falls back to its singleton identity instead of
+    // remaining co-self with its former owner.
+    ("active_identity_for_occurrence", Class::Delegates),
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
     ("memory_idempotent_insert", Class::Delegates),
