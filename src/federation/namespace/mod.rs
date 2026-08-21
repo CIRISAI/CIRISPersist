@@ -597,6 +597,21 @@ pub fn projection_for(
                 | cohort_scope::FEDERATION => Projection::Cohort,
                 _ => Projection::Cohort,
             },
+            // chat:* — interpersonal communication inside a named group
+            // (v38.2.0, #757, decided for CIRISServer). Enumerated to the
+            // last tier ON PURPOSE: the commons cells are the ones a
+            // symmetry sweep would widen, and the ceiling is the whole
+            // point of the row. No `authority` branch — a trust root is not
+            // a party to someone else's conversation.
+            AttestationFamily::Chat => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS
+                | cohort_scope::SPECIES
+                | cohort_scope::BIOSPHERE
+                | cohort_scope::FEDERATION => Projection::Cohort,
+                _ => Projection::Cohort,
+            },
             // provenance:build_manifest:* — the binary-verification surface
             // (v36.1.0, #713, decided by edge). The KeyRecord shape, ✱ at
             // EVERY commons tier: a trust-root-blessed manifest must be
@@ -790,6 +805,42 @@ pub enum AttestationFamily {
     /// mattered. A default that cannot be observed by the consumer it harms
     /// is the reason this row exists.
     ProvenanceBuildManifest,
+    /// v38.2.0 (CIRISPersist#757, decided for CIRISServer's chat wiring) —
+    /// `chat:*`, INTERPERSONAL COMMUNICATION inside a named group. Messages
+    /// are attestations (the same primitive testimony rides), so the plane
+    /// that carries a two-member conversation is this one.
+    ///
+    /// **Why it is decided rather than left to the default.** The
+    /// conservative default already answers `Cohort` at community, and the
+    /// consumer measured that chat is not blocked by it — so this row buys
+    /// no behaviour today. It buys the row's REASON, and the commons cells
+    /// spelled out. `Moderation` (above) is the standing warning: its
+    /// ceiling was correct but INHERITED FROM A WILDCARD, and a tidying
+    /// sweep that "finished" the row to match its neighbours would have
+    /// written `=> Global` and lifted the ceiling silently, because no test
+    /// looked at the cell. A family whose ceiling is load-bearing must say
+    /// so where the edit happens.
+    ///
+    /// **The ceiling, and why it is Cohort at every commons tier.**
+    /// Contextual integrity answers directly: the information type is a
+    /// message between people, and what makes its transmission appropriate
+    /// is membership in the group it was sent to. Projecting it Global
+    /// republishes private conversation to non-members — strictly worse
+    /// than the moderation case, which at least has an adjudicative purpose.
+    /// There is no authority that widens it either: a trust root is not a
+    /// party to someone else's conversation, so unlike
+    /// [`ProvenanceBuildManifest`](Self::ProvenanceBuildManifest) the
+    /// commons cells take no `authority` branch at all.
+    ///
+    /// **What this row does NOT decide**, stated so it does not quietly
+    /// become untrue: it does not make a `chat:*` row able to NAME the
+    /// community it belongs to — `federation_attestations` carries a
+    /// `cohort_scope` and no cohort target, so the audience is resolved by
+    /// the consumer at read time (CIRISEdge's derived group addressing: a
+    /// peer holds a group address iff it is a member at a live epoch). That
+    /// residual is CIRISPersist#757, and it is a legibility gap, not a
+    /// delivery hole.
+    Chat,
     /// Any dimension outside the decided families — the conservative row.
     Unknown,
 }
@@ -860,6 +911,14 @@ pub fn attestation_family(dimension: &str) -> AttestationFamily {
     }
     if under(dimension, "moderation:") {
         return AttestationFamily::Moderation;
+    }
+    // v38.2.0 (#757, decided for CIRISServer's chat wiring). The WHOLE
+    // `chat:` prefix: a message, a reaction and a read-receipt are the same
+    // information type on the same audience, and splitting them would invite
+    // exactly the "one leaf decided, its siblings defaulted" shape #713 spent
+    // a cut removing.
+    if under(dimension, "chat:") {
+        return AttestationFamily::Chat;
     }
     AttestationFamily::Unknown
 }
@@ -1000,6 +1059,10 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
             // republish the allegation to parties who never held it, which is
             // the tombstone principle this cut already recorded.
             AttestationFamily::Moderation => Projection::Cohort,
+            // Row-max: chat never widens past Cohort live, so a retraction
+            // does not either — a withdrawn message must not be republished
+            // to parties who never held it.
+            AttestationFamily::Chat => Projection::Cohort,
             AttestationFamily::Unknown => Projection::Cohort,
         },
     }
@@ -1561,7 +1624,7 @@ mod tests {
     /// One representative dimension per decided Attestation family, plus one
     /// resolving the conservative default — LITERALS, never derived from the
     /// classifier under test.
-    const FAMILY_DIMS: [&str; 11] = [
+    const FAMILY_DIMS: [&str; 12] = [
         "consent:replication:v1",
         "trace:complete:v1",
         "scores:medical",
@@ -1592,6 +1655,8 @@ mod tests {
         "accord:lifecycle:v1",
         "moderation:rogue_action:v1",
         "provenance:build_manifest:v1",
+        // v38.2.0 (CIRISPersist#757) — decided for CIRISServer's chat wiring.
+        "chat:message:v1",
         "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
     ];
 
@@ -1652,6 +1717,7 @@ mod tests {
                 AttestationFamily::Accord => Some("accord:lifecycle:v1"),
                 AttestationFamily::Moderation => Some("moderation:rogue_action:v1"),
                 AttestationFamily::ProvenanceBuildManifest => Some("provenance:build_manifest:v1"),
+                AttestationFamily::Chat => Some("chat:message:v1"),
                 // The conservative default is not a decided family; its
                 // representative rides FAMILY_DIMS separately so the sweeps
                 // still exercise the fall-through.
@@ -1668,6 +1734,7 @@ mod tests {
             AttestationFamily::SubstrateHealth,
             AttestationFamily::Accord,
             AttestationFamily::Moderation,
+            AttestationFamily::Chat,
             AttestationFamily::ProvenanceBuildManifest,
         ] {
             let dim = representative(family).unwrap_or_else(|| {

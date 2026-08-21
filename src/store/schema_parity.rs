@@ -1077,7 +1077,7 @@ mod tests {
             while let Some(p) = upper[from..].find(&verb) {
                 let after_verb = from + p + verb.len();
                 from = after_verb;
-                // v38.1.0 (CIRISPersist#758) — **SQLite's conflict-clause form
+                // v38.2.0 (CIRISPersist#758) — **SQLite's conflict-clause form
                 // counts.** This recognizer matched only the contiguous
                 // `INSERT INTO`, so every `INSERT OR IGNORE INTO` was INVISIBLE
                 // to the write-column parity gate — including
@@ -1133,7 +1133,7 @@ mod tests {
         out
     }
 
-    /// v38.1.0 (CIRISPersist#758) — **the recognizer sees SQLite's
+    /// v38.2.0 (CIRISPersist#758) — **the recognizer sees SQLite's
     /// conflict-clause inserts.**
     ///
     /// [`insert_columns`] matched only a contiguous `INSERT` + `INTO`, so

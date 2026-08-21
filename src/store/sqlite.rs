@@ -443,11 +443,11 @@ impl Backend for SqliteBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let families = self
-            .list_families_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — the ACTIVE fold, not raw containment:
+        // see `FederationDirectory::active_community_key_ids_for`.
+        self.active_family_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
-        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
@@ -457,14 +457,10 @@ impl Backend for SqliteBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let communities = self
-            .list_communities_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — same ONE fold as the write gate.
+        self.active_community_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
-        Ok(communities
-            .into_iter()
-            .map(|c| c.community_key_id)
-            .collect())
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))
     }
 
     async fn insert_trace_events_batch(
@@ -3919,9 +3915,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.attesting_key_id,
             "put_attestation",
             &row.cohort_scope,
-            None,
+            // v38.2.0 (#757) — the target the producer SIGNED into the
+            // envelope. Was hardcoded `None`, which made AV-45 refuse every
+            // family/community placement and left an owner-signed community
+            // row inexpressible (promotion, the only other door, re-seals
+            // with this node's key).
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
         )
         .await?;
+
+        // v38.2.0 (CIRISPersist#757) — **AV-84 MOVES TO THIS DOOR TOO.**
+        // `check_promotion_cohort_standing` refuses a targeted-cohort row
+        // that names any party but its producer, and it justified being
+        // promote-ONLY with a claim about THIS door: "put_attestation
+        // therefore refuses those two placements outright, and that door is
+        // SHUT, not leaking". The AV-45 call above just unshut it. Without
+        // this line a member could place a row ABOUT A THIRD PARTY into the
+        // whole community's plane — the exact claim AV-84 exists to refuse,
+        // arriving through the door its own doc said could not be reached.
+        // Pure (no directory read, no clock), so it stays in the cheap tier.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Same shape as the postgres backend; see
@@ -6062,7 +6075,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             "community_key_id",
             &row.community_key_id,
         )]);
-        // v38.1.0 (#758) — kept for the re-read decision below.
+        // v38.2.0 (#758) — kept for the re-read decision below.
         let offered_hash_for_compare = row.persist_row_hash.clone();
         let id_for_msg = row.community_key_id.clone();
         let community_key_id = row.community_key_id.clone();
@@ -6097,7 +6110,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             if inserted == 1 {
                 return Ok(None);
             }
-            // v38.1.0 (CIRISPersist#758) — occupied id: re-read to DECIDE.
+            // v38.2.0 (CIRISPersist#758) — occupied id: re-read to DECIDE.
             // Convergent derivation (CIRISServer's pair chat mints one
             // deterministic community per pair) means two nodes author
             // BYTE-IDENTICAL content and each signs as itself, so a plain
@@ -33792,7 +33805,18 @@ mod tests {
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
 
-    /// v38.1.0 (CIRISPersist#758) — the convergent re-put, sqlite arm.
+    /// v38.2.0 (CIRISPersist#757) — owner-signed community row, sqlite arm.
+    #[tokio::test]
+    async fn owner_signed_community_row_sqlite_757() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — the convergent re-put, sqlite arm.
     #[tokio::test]
     async fn convergent_community_reput_sqlite_758() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

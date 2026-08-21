@@ -1198,11 +1198,11 @@ impl Backend for PostgresBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let families = self
-            .list_families_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — the ACTIVE fold, not raw containment:
+        // see `FederationDirectory::active_community_key_ids_for`.
+        self.active_family_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))?;
-        Ok(families.into_iter().map(|f| f.family_key_id).collect())
+            .map_err(|e| Error::Backend(format!("admission_family_key_ids: {e}")))
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — community-half of the writer
@@ -1212,14 +1212,10 @@ impl Backend for PostgresBackend {
         member_identity_key_id: &str,
     ) -> Result<Vec<String>, Error> {
         use crate::federation::FederationDirectory;
-        let communities = self
-            .list_communities_for_member(member_identity_key_id)
+        // v38.2.0 (#757 follow-on) — same ONE fold as the write gate.
+        self.active_community_key_ids_for(member_identity_key_id)
             .await
-            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))?;
-        Ok(communities
-            .into_iter()
-            .map(|c| c.community_key_id)
-            .collect())
+            .map_err(|e| Error::Backend(format!("admission_community_key_ids: {e}")))
     }
 
     async fn insert_trace_events_batch(
@@ -4833,9 +4829,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &row.attesting_key_id,
             "put_attestation",
             &row.cohort_scope,
-            None,
+            // v38.2.0 (#757) — the target the producer SIGNED into the
+            // envelope. Was hardcoded `None`, which made AV-45 refuse every
+            // family/community placement and left an owner-signed community
+            // row inexpressible (promotion, the only other door, re-seals
+            // with this node's key).
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope),
         )
         .await?;
+
+        // v38.2.0 (CIRISPersist#757) — **AV-84 MOVES TO THIS DOOR TOO.**
+        // `check_promotion_cohort_standing` refuses a targeted-cohort row
+        // that names any party but its producer, and it justified being
+        // promote-ONLY with a claim about THIS door: "put_attestation
+        // therefore refuses those two placements outright, and that door is
+        // SHUT, not leaking". The AV-45 call above just unshut it. Without
+        // this line a member could place a row ABOUT A THIRD PARTY into the
+        // whole community's plane — the exact claim AV-84 exists to refuse,
+        // arriving through the door its own doc said could not be reached.
+        // Pure (no directory read, no clock), so it stays in the cheap tier.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
         // hook. Runs AFTER the dimension gate; only fires on `scores`
@@ -7020,7 +7033,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_communities")
             .await?;
-        // v38.1.0 (CIRISPersist#758) — absorb, then RE-READ to decide. A
+        // v38.2.0 (CIRISPersist#758) — absorb, then RE-READ to decide. A
         // convergent community id (CIRISServer's pair chat derives one per
         // member pair) means two nodes author byte-identical content and
         // each signs as itself; a plain INSERT refused every replicated
@@ -30360,7 +30373,26 @@ mod tests {
     // against a real Postgres deployment. Gated on
     // CIRIS_PERSIST_TEST_PG_URL like the rest of this test module.
 
-    /// v38.1.0 (CIRISPersist#758) — the convergent re-put, postgres arm.
+    /// v38.2.0 (CIRISPersist#757) — owner-signed community row, postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn owner_signed_community_row_pg_757() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_owner_signed_community_row(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — the convergent re-put, postgres arm.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn convergent_community_reput_pg_758() {

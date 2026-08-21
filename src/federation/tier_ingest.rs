@@ -389,7 +389,7 @@ where
     .map(|_| ())
 }
 
-/// v38.1.0 (CIRISPersist#758) — **the re-put verdict for a convergent
+/// v38.2.0 (CIRISPersist#758) — **the re-put verdict for a convergent
 /// community row**, spelled ONCE so the three backends cannot answer it
 /// three ways (they did: sqlite and postgres refused every re-put with a PK
 /// error, while memory silently OVERWROTE the stored row and its authority
@@ -1237,7 +1237,256 @@ pub mod test_support {
         }
     }
 
-    /// v38.1.0 (CIRISPersist#758) — **the convergent-community re-put,
+    /// v38.2.0 (CIRISPersist#757 / CIRISServer chat wiring) — **an
+    /// owner-signed community row is expressible.**
+    ///
+    /// Before this cut it was not, anywhere on the substrate: every
+    /// backend's `put_attestation` passed a hardcoded `None` target, so
+    /// AV-45's community arm refused the placement outright, and the only
+    /// other door — promotion — re-seals the envelope and stamps
+    /// `scrub_key_id` with the promoting node's own key. A chat message or a
+    /// testimony could therefore never carry its AUTHOR's signature at
+    /// community scope, which is what author-only revocation and
+    /// third-party verification of authorship both rest on.
+    ///
+    /// Three arms: a member's own row lands with the author's signature
+    /// intact; a NON-member naming the same community is refused (the
+    /// membership question AV-45 exists to ask, now askable); and a row
+    /// naming no community at all is still refused, so the fix did not turn
+    /// the community placement into a free-for-all.
+    pub(crate) async fn exercise_owner_signed_community_row(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+
+        let cid = format!("chat-comm-757-{suffix}");
+        let author = format!("author-757-{suffix}");
+        let stranger = format!("stranger-757-{suffix}");
+        register_hybrid_key(dir, &cid).await;
+        for k in [&author, &stranger] {
+            register_user_role_key(dir, k).await;
+        }
+        seed_two_member_community(dir, &cid, &author, &author).await;
+
+        let row = |producer: &str, target: Option<&str>| {
+            let mut env = serde_json::json!({ "dimension": "chat:message:v1" });
+            if let Some(t) = target {
+                env["community_id"] = serde_json::Value::String(t.to_owned());
+            }
+            crate::federation::types::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: producer.to_owned(),
+                attested_key_id: producer.to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: chrono::Utc::now(),
+                expires_at: None,
+                attestation_envelope: env,
+                original_content_hash: "ab".repeat(32),
+                scrub_signature_classical: "c2ln".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: producer.to_owned(),
+                scrub_timestamp: chrono::Utc::now(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![producer.to_owned()],
+                withdraws_admission_rule: None,
+                cohort_scope: cohort_scope::COMMUNITY.to_owned(),
+                tier: attestation_tier::LOCAL.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            }
+        };
+        // #598 — the signed instants + RowMirror the door requires of any
+        // row. Not part of what this witness is about; without it the row is
+        // refused for an unrelated reason and the wall would look fixed.
+        let row = |producer: &str, target: Option<&str>| {
+            let mut r = row(producer, target);
+            stamp_mirror(&mut r);
+            r
+        };
+
+        // (1) THE UNBLOCK — a member's own community row, signed by the
+        // author, admitted at the door that preserves that signature.
+        let mine = row(&author, Some(&cid));
+        let signed_author = mine.scrub_key_id.clone();
+        dir.put_attestation(crate::federation::SignedAttestation { attestation: mine })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({suffix}) #757: a member's own community-scoped row must be expressible \
+                     — this is the wall CIRISServer's chat wiring hit: {e}"
+                )
+            });
+        assert_eq!(
+            signed_author, author,
+            "({suffix}) the row carries the AUTHOR's scrub key, not the node's"
+        );
+
+        // (PROBE) A member's row ABOUT A THIRD PARTY, published to the whole
+        // community. AV-84 refuses this at the promote door; the put door
+        // was SHUT, so nothing asked there. Opening the put door without
+        // AV-84 would let it through.
+        let mut third_party = row(&author, Some(&cid));
+        third_party.attested_key_id = stranger.clone();
+        third_party.subject_key_ids = vec![stranger.clone()];
+        stamp_mirror(&mut third_party);
+        let probe = dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: third_party,
+            })
+            .await;
+        assert!(
+            probe.is_err(),
+            "({suffix}) #757 REGRESSION: a member placed a row ABOUT A THIRD PARTY into the \
+             community plane. AV-84 (check_promotion_cohort_standing) refuses exactly this at \
+             the promote door, and justifies being promote-only by asserting the put door is \
+             SHUT. Opening the put door means AV-84 must run there too."
+        );
+
+        // (2) A non-member naming the same community is refused — the
+        // membership question AV-45 exists to ask, now askable.
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: row(&stranger, Some(&cid)),
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) #757: a NON-member must not place a row into a community it \
+                     does not belong to — reading the target must not become admitting anyone"
+                )
+            });
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("communit") || msg.to_lowercase().contains("scope"),
+            "({suffix}) the refusal names the membership question: {msg}"
+        );
+
+        // (3) A community-scoped row naming NO community is still refused —
+        // the placement is not a free-for-all now that the target is read.
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: row(&author, None)
+            })
+            .await
+            .is_err(),
+            "({suffix}) #757: a community placement with no named community must still refuse"
+        );
+
+        // (4) REVOCATION BITES AT THE WRITE DOOR. The roster is append-only;
+        // effective membership is admitted AND NOT revoked (the #709 fold,
+        // `active_community_members`). Raw `members` containment counts a
+        // revoked member as a member — and through v38.0.0 that mismatch was
+        // vacuously unreachable here, because the door refused everything.
+        // Opening the door (#757) made the fold choice load-bearing: with the
+        // raw fold, a REMOVED member keeps writing into the community's plane
+        // forever, the exact failure the removal primitive exists to prevent.
+        dir.put_community_membership_revocation(sign_community_membership_revocation(
+            &cid,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: cid.clone(),
+                removed_identity_key_id: author.clone(),
+                removed_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) revoke author's membership: {e}"));
+        assert!(
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: row(&author, Some(&cid)),
+            })
+            .await
+            .is_err(),
+            "({suffix}) #757: a REVOKED member wrote into the community plane — the write \
+             gate consulted raw roster containment instead of the active fold \
+             (admitted AND NOT revoked)"
+        );
+    }
+
+    /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role
+    /// identity, so it steward-binds ITSELF (clause 1 of
+    /// `steward_bindings_of`). Non-infrastructure community membership is an
+    /// authority act (CC 3.2 / CC 3.4.7.1) and the members of a chat are
+    /// people; [`register_hybrid_key`] mints `agent`, which those gates
+    /// correctly refuse.
+    pub(crate) async fn register_user_role_key(
+        dir: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+    ) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let now = {
+            use chrono::Timelike as _;
+            let dt = chrono::Utc::now();
+            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
+                .unwrap_or(dt)
+        };
+        let rec = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::USER.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await
+            .expect("register user-role key");
+    }
+
+    /// v38.2.0 — seed a community authored by its first member.
+    pub(crate) async fn seed_two_member_community(
+        dir: &dyn crate::federation::FederationDirectory,
+        community_key_id: &str,
+        member_a: &str,
+        member_b: &str,
+    ) {
+        let member = |k: &str| crate::federation::types::CommunityMember {
+            key_id: k.to_owned(),
+            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            role: Some("founder".into()),
+        };
+        let mut members = vec![member(member_a)];
+        if member_b != member_a {
+            members.push(member(member_b));
+        }
+        dir.put_community(sign_community(
+            member_a,
+            crate::federation::types::Community {
+                community_key_id: community_key_id.to_owned(),
+                community_name: "chat-pair".to_owned(),
+                members,
+                founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS.into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("seed community");
+    }
+
+    /// v38.2.0 (CIRISPersist#758) — **the convergent-community re-put,
     /// asserted identically on every backend.**
     ///
     /// This defect WAS a backend divergence, so a one-backend witness would
@@ -1261,38 +1510,7 @@ pub mod test_support {
         // community membership is an authority act (CC 3.2 / CC 3.4.7.1), and
         // the pair-chat members are people.
         for k in [&alice, &bob] {
-            let (ed_pk, mldsa_pk) = hybrid_pubkeys(k);
-            let now = {
-                use chrono::Timelike as _;
-                let dt = chrono::Utc::now();
-                dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
-                    .unwrap_or(dt)
-            };
-            let rec = crate::federation::KeyRecord {
-                key_id: k.clone(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                identity_type: crate::federation::types::identity_type::USER.to_owned(),
-                identity_ref: k.clone(),
-                valid_from: now,
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": k }),
-                original_content_hash: "deadbeef".to_owned(),
-                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-                scrub_signature_pqc: None,
-                scrub_key_id: k.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                attestation_evidence: None,
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            };
-            dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
-                .await
-                .expect("register user-role member");
+            register_user_role_key(dir, k).await;
         }
 
         // Both ends DERIVE the same community from the same member pair, so
