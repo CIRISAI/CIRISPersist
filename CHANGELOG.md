@@ -40,6 +40,17 @@ owner-signed community row is not expressible on this substrate").
 
 ### Fixed
 
+- **CI mac lanes un-redded (#762, release-blocking).** The `darwin-x86_64`
+  warm job pinned retired `macos-13` and queued forever on every main/tag
+  push — the run could never conclude, so no tag run could go green (and
+  auto-retry never fired). The `darwin-aarch64` CIRISCache SAVE step killed
+  the hosted runner 3/3 after green tests (v37.1.0, v38.0.0, e119eff);
+  disabled restore-only — three attempts had warmed nothing, so nothing that
+  exists is lost. Re-enable paths tracked on #762 (arm64 cross-compile for
+  the #463 blob; resource-bounded save). The v38.0.0 tag run's `failure` is
+  hereby classified: every test leg green, the red was this save step —
+  second recorded tag-before-verdict instance, evidence to #756.
+
 - **PR #761 review (pre-tag) — five more verified findings, fixed in the same
   window.** (1) *Targeted cohorts REQUIRE federation tier* — the never-local
   form refused only `local`, and an unknown tier string ("bogus") was

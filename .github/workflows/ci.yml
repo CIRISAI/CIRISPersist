@@ -546,8 +546,17 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
+      # CIRISPersist#762 — SAVE DISABLED on this leg (restore-only). The
+      # tar+gzip+push of target/ starved the macos-14 hosted runner to death
+      # 3/3 on main/tag runs (v37.1.0, v38.0.0 run 32372467201, e119eff run
+      # 32492420694): tests green, then "the hosted runner lost communication
+      # with the server" at this step, ~62 min in. continue-on-error cannot
+      # rescue a job whose VM died. Three attempts warmed NOTHING — the save
+      # never completed — so restore-only loses no cache that exists, while
+      # un-redding every tag run. Re-enable via #762 when CIRISCache can save
+      # under the mac VM resource ceiling.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
+        if: false   # CIRISPersist#762 — see above; was: main + tags/v*
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -593,7 +602,14 @@ jobs:
     # the shared cache). Off the release needs graph, so warming on a tag
     # doesn't delay the release; it just guarantees the released version's blob
     # exists for CIRISServer instead of leaving it to cold-compile.
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    # CIRISPersist#762 — DISABLED: GitHub retired macos-13 (the last Intel
+    # image), so this job can never be scheduled — it queued forever on every
+    # main/tag push, holding the whole run open so it could never conclude
+    # (and auto-retry, keyed on a concluded run, never fired). The #463
+    # macos-x86_64 blob has not re-published since the retirement, so nothing
+    # that exists today is lost. Re-enable via #762 as a macos-14 (arm64)
+    # cross-compile with --target x86_64-apple-darwin.
+    if: false   # CIRISPersist#762 — see above; was: main + tags/v*
     runs-on: macos-13
     # Bound a hung Intel build (the runner-capacity caveat is about QUEUE time,
     # which GitHub caps on its own; this caps a stuck build so it can't leave the
