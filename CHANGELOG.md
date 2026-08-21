@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.1.0] - 2026-08-20
+
+Downstream (CIRISServer) began wiring 2-member-community chat — messages as
+attestations, the same primitive testimony rides — and the wiring found this.
+
+### Fixed
+
+- **#758 — a convergent community re-put is an idempotent no-op, and the three
+  backends stop answering it three ways.** The pair chat derives one
+  deterministic community per member pair, so both ends author BYTE-IDENTICAL
+  roster content and each signs as itself. sqlite and postgres were plain
+  INSERTs that refused every replicated copy (a standing replication error on
+  every pair community); memory was worse and unreported — `HashMap::insert`
+  silently OVERWROTE the stored row and its authority signature, so a peer's
+  copy could displace the row this node authored.
+
+  One predicate now answers for all three (`community_reput_verdict`, spelled
+  once): identical stored content hash is an idempotent no-op, differing
+  content is a typed `Conflict`. Accepting-and-moving-on would have been the
+  opposite defect — silently taking a DIFFERING roster under an occupied id —
+  so the insert absorbs and a zero-row result RE-READS to decide (the #719
+  shape). The authority signature is a WITNESS to the row, not part of its
+  identity: the first-accepted signature is kept and the second dropped; the
+  dyad co-signature form that would retain both stays open on #758.
+
+  Witnessed identically on memory / sqlite / postgres, because the defect WAS
+  a backend divergence and a one-backend witness would have proven nothing.
+  Mutation-tested: removing the memory guard reds the witness by name.
+
 ## [38.0.0] - 2026-08-20
 
 The constitutional-ledger cut, the registry fold's storage, and nine bugs

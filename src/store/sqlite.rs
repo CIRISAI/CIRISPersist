@@ -6062,34 +6062,56 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             "community_key_id",
             &row.community_key_id,
         )]);
+        // v38.1.0 (#758) — kept for the re-read decision below.
+        let offered_hash_for_compare = row.persist_row_hash.clone();
+        let id_for_msg = row.community_key_id.clone();
+        let community_key_id = row.community_key_id.clone();
+        let offered_hash = row.persist_row_hash.clone();
         let conn = self.conn.clone();
-        (move || -> Result<(), rusqlite::Error> {
+        let outcome = (move || -> Result<Option<String>, rusqlite::Error> {
             let conn = conn.lock();
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at =
                 sqlite_next_plane_position(&conn, "federation_communities", POS_FOUNDED)?;
-            conn.execute(
-                "INSERT INTO federation_communities (\
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO federation_communities (\
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
-                    row.community_key_id,
+                    community_key_id,
                     row.community_name,
                     members_json,
                     row.founded_at.to_rfc3339(),
                     row.consensus_protocol,
                     policy_blob_json,
-                    row.persist_row_hash,
+                    offered_hash,
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     admitted_at.to_rfc3339(),
                 ],
             )?;
-            Ok(())
+            if inserted == 1 {
+                return Ok(None);
+            }
+            // v38.1.0 (CIRISPersist#758) — occupied id: re-read to DECIDE.
+            // Convergent derivation (CIRISServer's pair chat mints one
+            // deterministic community per pair) means two nodes author
+            // BYTE-IDENTICAL content and each signs as itself, so a plain
+            // INSERT refused every replicated copy. `INSERT OR IGNORE`
+            // alone would be the opposite error — it would silently accept
+            // a DIFFERING roster under an occupied id. The stored content
+            // hash decides, which is the #719 absorb-then-re-read shape.
+            let stored: String = conn.query_row(
+                "SELECT persist_row_hash FROM federation_communities \
+                 WHERE community_key_id = ?1",
+                [&community_key_id],
+                |r| r.get(0),
+            )?;
+            Ok(Some(stored))
         })()
         .map_err(|e| {
             let msg = e.to_string();
@@ -6101,6 +6123,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert community: {msg}"))
             }
         })?;
+        if let Some(stored_hash) = outcome {
+            return crate::federation::community_reput_verdict(
+                &stored_hash,
+                &offered_hash_for_compare,
+                &id_for_msg,
+            );
+        }
         self.index_stored_record("Community", &wire_index_key)
             .await?;
         Ok(())
@@ -33762,6 +33791,17 @@ mod tests {
     // smokes the edge_detection_events table V020 ships alongside.
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
+
+    /// v38.1.0 (CIRISPersist#758) — the convergent re-put, sqlite arm.
+    #[tokio::test]
+    async fn convergent_community_reput_sqlite_758() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_convergent_community_reput(
+            &backend, "sqlite",
+        )
+        .await;
+    }
 
     async fn trust_test_backend() -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

@@ -387,6 +387,7 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
+pub(crate) use tier_ingest::community_reput_verdict;
 pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
     verify_envelope_hybrid_signature, verify_family_admission,

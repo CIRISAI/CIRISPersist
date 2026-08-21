@@ -5297,6 +5297,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v38.1.0 (CIRISPersist#758) — **memory used to silently
+            // OVERWRITE.** `HashMap::insert` replaced the stored row AND its
+            // authority signature, so on a memory-backed node a replicated
+            // peer copy could displace the row this node authored — the
+            // opposite failure from the SQL backends, which refused every
+            // re-put. One predicate now answers for all three: identical
+            // content is an idempotent no-op, differing content is refused.
+            if let Some(existing) = state.federation_communities.get(&row.community_key_id) {
+                let stored = existing.persist_row_hash.clone();
+                let offered = row.persist_row_hash.clone();
+                let id = row.community_key_id.clone();
+                drop(state);
+                return crate::federation::community_reput_verdict(&stored, &offered, &id);
+            }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `community.*`.
             let wire_index_key = crate::federation::wire_index::record_key(&[(
@@ -10806,6 +10820,16 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.1.0 (CIRISPersist#758) — the convergent re-put, memory arm.
+    #[tokio::test]
+    async fn convergent_community_reput_memory_758() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_convergent_community_reput(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn trust_doors_refuse_the_unproven_721() {
         use crate::federation::tier_ingest::test_support as ts;

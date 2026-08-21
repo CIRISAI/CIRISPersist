@@ -7020,14 +7020,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_communities")
             .await?;
-        client
+        // v38.1.0 (CIRISPersist#758) — absorb, then RE-READ to decide. A
+        // convergent community id (CIRISServer's pair chat derives one per
+        // member pair) means two nodes author byte-identical content and
+        // each signs as itself; a plain INSERT refused every replicated
+        // copy. `DO NOTHING` alone would be the opposite error — silently
+        // accepting a DIFFERING roster under an occupied id — so the stored
+        // content hash decides (the #719 shape).
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_communities (\
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT DO NOTHING",
                 &[
                     &row.community_key_id,
                     &row.community_name,
@@ -7053,6 +7061,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert community: {msg}"))
                 }
             })?;
+        if inserted == 0 {
+            let stored: String = client
+                .query_one(
+                    "SELECT persist_row_hash FROM cirislens.federation_communities \
+                     WHERE community_key_id = $1",
+                    &[&row.community_key_id],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("community re-read: {e}")))?
+                .try_get(0)
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            return crate::federation::community_reput_verdict(
+                &stored,
+                &row.persist_row_hash,
+                &row.community_key_id,
+            );
+        }
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
         // (`row` still owns its final `persist_row_hash`; the execute call
         // above only borrowed it).
@@ -30334,6 +30359,25 @@ mod tests {
     // V020 column additions + CHECK constraints + UPSERT semantics
     // against a real Postgres deployment. Gated on
     // CIRIS_PERSIST_TEST_PG_URL like the rest of this test module.
+
+    /// v38.1.0 (CIRISPersist#758) — the convergent re-put, postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn convergent_community_reput_pg_758() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_convergent_community_reput(
+            &backend, &suffix,
+        )
+        .await;
+    }
 
     async fn trust_steward(backend: &PostgresBackend) -> String {
         let kid = format!("trust-steward-{}", uuid_like());

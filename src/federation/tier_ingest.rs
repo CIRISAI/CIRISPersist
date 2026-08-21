@@ -389,6 +389,50 @@ where
     .map(|_| ())
 }
 
+/// v38.1.0 (CIRISPersist#758) — **the re-put verdict for a convergent
+/// community row**, spelled ONCE so the three backends cannot answer it
+/// three ways (they did: sqlite and postgres refused every re-put with a PK
+/// error, while memory silently OVERWROTE the stored row and its authority
+/// signature — a peer's copy replacing the one this node authored).
+///
+/// # Why identical content is a no-op rather than an error
+///
+/// A community id may be DERIVED rather than minted: CIRISServer's pair
+/// chat mints one deterministic community per member pair (`chat:pair:v1:` +
+/// a hash of the sorted member ids), so both ends author byte-identical
+/// roster content and each signs as ITSELF. Refusing that is refusing
+/// convergence — the far side can never accept the peer's copy, and every
+/// pair community carries a standing replication error.
+///
+/// # Why differing content is still a refusal
+///
+/// The permissive twin (`INSERT … DO NOTHING` and move on) is the opposite
+/// defect: it silently accepts a DIFFERENT roster under an occupied id,
+/// which is the one thing the community plane's identity has to mean. The
+/// stored `persist_row_hash` decides — the same absorb-then-re-read shape
+/// CIRISPersist#719 settled for `put_accord_participation`.
+///
+/// The authority signature is deliberately NOT part of the comparison: it
+/// is a WITNESS to the row, not part of the row's identity. On an accepted
+/// no-op the first-accepted signature is kept and the second is dropped
+/// (see #758 for the dyad co-signature form that would retain both).
+pub(crate) fn community_reput_verdict(
+    stored_persist_row_hash: &str,
+    offered_persist_row_hash: &str,
+    community_key_id: &str,
+) -> Result<(), crate::federation::Error> {
+    if stored_persist_row_hash == offered_persist_row_hash {
+        return Ok(());
+    }
+    Err(crate::federation::Error::Conflict(format!(
+        "community {community_key_id} already exists with DIFFERENT content \
+         (stored persist_row_hash {stored_persist_row_hash}, offered \
+         {offered_persist_row_hash}) — a convergent re-put of identical content is \
+         an idempotent no-op, but a differing roster under an occupied id is refused \
+         (CIRISPersist#758)"
+    )))
+}
+
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedCommunity`](super::SignedCommunity). Structural mirror of
 /// [`verify_family_admission`]; verifies over
@@ -1191,6 +1235,141 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
         }
+    }
+
+    /// v38.1.0 (CIRISPersist#758) — **the convergent-community re-put,
+    /// asserted identically on every backend.**
+    ///
+    /// This defect WAS a backend divergence, so a one-backend witness would
+    /// have proven nothing: sqlite and postgres refused every re-put with a
+    /// PK error, while memory silently OVERWROTE the stored row and its
+    /// authority signature. The three arms below are the three distinct
+    /// facts — first write lands, identical re-put by a DIFFERENT authority
+    /// is an idempotent no-op that does not disturb the stored row, and a
+    /// DIFFERING roster under the same id is refused.
+    pub(crate) async fn exercise_convergent_community_reput(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        let cid = format!("chat-pair-758-{suffix}");
+        let alice = format!("alice-758-{suffix}");
+        let bob = format!("bob-758-{suffix}");
+        register_hybrid_key(dir, &cid).await;
+        // The members are USER-role from the START (a re-register with
+        // different content is correctly refused), so they steward-bind
+        // THEMSELVES via clause 1 of `steward_bindings_of` — non-infrastructure
+        // community membership is an authority act (CC 3.2 / CC 3.4.7.1), and
+        // the pair-chat members are people.
+        for k in [&alice, &bob] {
+            let (ed_pk, mldsa_pk) = hybrid_pubkeys(k);
+            let now = {
+                use chrono::Timelike as _;
+                let dt = chrono::Utc::now();
+                dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
+                    .unwrap_or(dt)
+            };
+            let rec = crate::federation::KeyRecord {
+                key_id: k.clone(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::USER.to_owned(),
+                identity_ref: k.clone(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": k }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: k.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            };
+            dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
+                .await
+                .expect("register user-role member");
+        }
+
+        // Both ends DERIVE the same community from the same member pair, so
+        // the content is byte-identical; only the signer differs.
+        let derived = |name: &str| crate::federation::types::Community {
+            community_key_id: cid.clone(),
+            community_name: name.to_owned(),
+            members: vec![
+                crate::federation::types::CommunityMember {
+                    key_id: alice.clone(),
+                    joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    role: Some("founder".into()),
+                },
+                crate::federation::types::CommunityMember {
+                    key_id: bob.clone(),
+                    joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    role: Some("founder".into()),
+                },
+            ],
+            founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS.into(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+
+        // (1) Alice's end authors it.
+        dir.put_community(sign_community(&alice, derived("pair-chat")))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) the first author must land: {e}"));
+
+        // (2) Bob's end replicates the IDENTICAL content, signed as itself.
+        // Refusing this is refusing convergence; overwriting is worse.
+        dir.put_community(sign_community(&bob, derived("pair-chat")))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({suffix}) #758: a convergent re-put of byte-identical content must be an \
+                     idempotent no-op — the far side can never accept a peer's copy otherwise: {e}"
+                )
+            });
+
+        // …and it did not DISTURB the stored row: the first-accepted
+        // authority survives (memory used to replace it wholesale).
+        let served = dir
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .expect("serve communities");
+        let stored = served
+            .iter()
+            .find(|c| c.community.community.community_key_id == cid)
+            .unwrap_or_else(|| panic!("({suffix}) the community must still be served"));
+        assert_eq!(
+            stored.community.authority_key_id, alice,
+            "({suffix}) #758: the no-op must not replace the first-accepted authority"
+        );
+        assert_eq!(
+            stored.community.community.members.len(),
+            2,
+            "({suffix}) the stored roster is untouched"
+        );
+
+        // (3) A DIFFERING roster under the same id is a real disagreement.
+        let err = dir
+            .put_community(sign_community(&bob, derived("a-different-community")))
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) #758: differing content under an occupied community id must be \
+                     REFUSED — accepting it silently is what `DO NOTHING` alone would have done"
+                )
+            });
+        assert_eq!(
+            err.kind(),
+            "federation_conflict",
+            "({suffix}) the refusal is a typed Conflict: {err}"
+        );
     }
 
     /// v21.0.0 (CIRISPersist#502 E4) — sign a
