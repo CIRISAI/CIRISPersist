@@ -393,7 +393,25 @@ impl SqliteBackend {
                 "PRAGMA foreign_keys = ON;\n\
                  PRAGMA journal_mode = WAL;\n\
                  PRAGMA synchronous = NORMAL;\n\
-                 PRAGMA busy_timeout = 30000;",
+                 PRAGMA busy_timeout = 30000;\n\
+                 PRAGMA wal_autocheckpoint = 1000;",
+                // v38.4.0 (CIRISPersist#768) — **the WAL bound, which was
+                // ours by omission.** We set `journal_mode = WAL` here and
+                // never set a checkpoint threshold or issued one, so the
+                // -wal file grew unbounded next to the store: 218 MB
+                // against a 1.26 GB database on one production node, 280 MB
+                // against 388 MB on another — 72% of that node's footprint
+                // in a file nobody was accounting for. No consumer could
+                // reasonably fix this: persist opens the database and owns
+                // its pragmas, so a checkpoint policy is not something a
+                // caller can be expected to know it must supply.
+                //
+                // 1000 pages is SQLite's own documented default threshold;
+                // the value is not the point, having ONE is. Autocheckpoint
+                // is a passive bound (it runs on the writer that crosses
+                // the threshold) so it costs no background machinery, and
+                // it degrades safely: a busy reader defers the checkpoint
+                // rather than blocking the write.
             )?;
             Ok(conn)
         })()
@@ -4673,6 +4691,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
     /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106).
+    /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let now_s = now.to_rfc3339();
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn_handle();
+        let ids = (move || -> Result<Vec<String>, rusqlite::Error> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT attestation_id FROM federation_attestations \
+                 WHERE expires_at IS NOT NULL AND expires_at < ?1 \
+                 ORDER BY expires_at LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![now_s, lim], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_expired_attestation_ids: {e}"))
+        })?;
+        Ok(ids)
+    }
+
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,

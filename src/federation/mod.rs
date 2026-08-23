@@ -1207,6 +1207,81 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v38.4.0 (CIRISPersist#768) — the ids of attestations whose producer
+    /// stated an expiry that has now passed, oldest first, bounded.
+    ///
+    /// Backends override; the default refuses rather than silently reporting
+    /// "nothing expired", which is the shape that would make
+    /// [`Self::reap_expired_attestations`] a check that cannot fail.
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (now, limit);
+        Err(Error::Unsupported {
+            method: "list_expired_attestation_ids",
+        })
+    }
+
+    /// v38.4.0 (CIRISPersist#768) — **reap attestations whose stated shelf
+    /// life has passed.** Bounded batch, driven by the caller's cadence,
+    /// purging through [`Self::purge_attestation_v31`] so that door's
+    /// refusals still apply to every row.
+    ///
+    /// # The question this answers, and why the gate already answered it
+    ///
+    /// #768 asked persist to decide once, rather than let every consumer
+    /// infer it: *is an expired attestation still evidence?* Measured, the
+    /// problem was real — one node held 49,292 expired rows of 52,107 (95%),
+    /// another had rows expired for two weeks — and `expires_at` was written
+    /// by producers and enforced by nothing anywhere in the tree.
+    ///
+    /// The answer is not a new policy: [`check_purge_admission`] already
+    /// discriminates, per row, and it is the correct discriminator.
+    /// `supersedes` / `withdraws` / `recants` are structural composers, a
+    /// `delegates_to` is a standing grant, and an exclusion-bearing row is
+    /// the thing a reset excludes — all REFUSED, whatever the caller
+    /// believes, and refused fail-secure when the dimension cannot even be
+    /// read. What remains reapable is the class that actually motivated the
+    /// ask: a re-derivable claim whose producer signed a shelf life. So a
+    /// `withdraws` carrying an `expires_at` is not deleted here — not
+    /// because this loop is careful, but because the door refuses it.
+    ///
+    /// That distinction is the whole reason this drives the per-row door
+    /// instead of issuing `DELETE ... WHERE expires_at < now`: a bulk
+    /// statement would be faster and would silently delete every one of
+    /// those rows. It is also why this is NOT the disk-pressure prune #767
+    /// explicitly did not ask for — the producer's own instruction is the
+    /// authority, not free space.
+    ///
+    /// Returns `(purged, refused)`. A refusal is expected traffic, not an
+    /// error: it means the gate protected a row this sweep should not have
+    /// offered. Both counts are reported so a caller can see a sweep that
+    /// is refusing everything instead of reading it as "nothing to do".
+    async fn reap_expired_attestations(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<(usize, usize), Error> {
+        if max_rows == 0 {
+            return Ok((0, 0));
+        }
+        let ids = self.list_expired_attestation_ids(now, max_rows).await?;
+        let (mut purged, mut refused) = (0usize, 0usize);
+        for id in ids {
+            match self.purge_attestation_v31(&id).await {
+                Ok(true) => purged += 1,
+                // Already gone (a concurrent sweep, or a cascade) — not a
+                // refusal and not an error.
+                Ok(false) => {}
+                Err(Error::InvalidArgument(_)) => refused += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((purged, refused))
+    }
+
     /// v31.0.0 (CIRISPersist#650) — **hard-delete ONE attestation row** by id.
     /// `Ok(true)` if a row was removed, `Ok(false)` if it was already gone (so
     /// a re-run of an interrupted migration is a no-op, not an error).

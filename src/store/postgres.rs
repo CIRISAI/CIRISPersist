@@ -5650,6 +5650,36 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106), and
     /// `identity_canonical_binding.binding_attestation_id` via `ON DELETE SET
     /// NULL` (V121).
+    /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
+        })?;
+        let rows = client
+            .query(
+                "SELECT attestation_id FROM cirislens.federation_attestations \
+                 WHERE expires_at IS NOT NULL AND expires_at < $1 \
+                 ORDER BY expires_at LIMIT $2",
+                &[&now, &lim],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_expired_attestation_ids: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<_, String>("attestation_id").map_err(|e| {
+                    crate::federation::Error::Backend(format!("decode expired id: {e}"))
+                })
+            })
+            .collect()
+    }
+
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,

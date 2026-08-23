@@ -3967,6 +3967,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row, and the
     /// V106 subject projection with it (the SQL backends get that from `ON
     /// DELETE CASCADE`; memory has to say it).
+    /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<(chrono::DateTime<chrono::Utc>, String)> = state
+            .federation_attestations
+            .iter()
+            .filter_map(|a| {
+                a.expires_at
+                    .filter(|e| *e < now)
+                    .map(|e| (e, a.attestation_id.clone()))
+            })
+            .collect();
+        rows.sort();
+        Ok(rows.into_iter().take(limit).map(|(_, id)| id).collect())
+    }
+
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,
@@ -10873,6 +10893,109 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.4.0 (CIRISPersist#768) — **the reaper honours the producer's
+    /// stated shelf life, and CANNOT eat evidence.**
+    ///
+    /// Three arms, because the middle one is the whole reason this drives
+    /// the per-row purge door instead of `DELETE ... WHERE expires_at <
+    /// now`: an expired `scores` row is reaped, an expired `withdraws` is
+    /// REFUSED by [`check_purge_admission`] (structural composer), and an
+    /// unexpired row is untouched. A bulk statement would delete all three.
+    #[tokio::test]
+    async fn reaper_purges_expired_but_never_evidence_768() {
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::hours(2);
+        let future = now + chrono::Duration::hours(2);
+
+        for k in ["reap-a", "reap-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Expired, re-derivable claim → reapable.
+        let mut expired = fix_attestation("reap-expired", "reap-a", "reap-b", "reap-a");
+        expired.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        expired.expires_at = Some(past);
+        resign_fix(&mut expired);
+        // Expired WITHDRAWAL → evidence; the door must refuse it.
+        let mut expired_withdraws = fix_attestation("reap-withdraws", "reap-a", "reap-b", "reap-a");
+        expired_withdraws.attestation_type =
+            crate::federation::types::attestation_type::WITHDRAWS.into();
+        expired_withdraws.expires_at = Some(past);
+        resign_fix(&mut expired_withdraws);
+        // Not yet expired → not offered at all.
+        let mut live = fix_attestation("reap-live", "reap-a", "reap-b", "reap-a");
+        live.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        live.expires_at = Some(future);
+        resign_fix(&mut live);
+
+        for row in [expired, expired_withdraws, live] {
+            backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .expect("seed");
+        }
+
+        // The sweep only ever offers rows past their stated expiry.
+        let offered = backend
+            .list_expired_attestation_ids(now, 100)
+            .await
+            .expect("list expired");
+        assert!(
+            !offered.contains(&"reap-live".to_string()),
+            "#768: an UNEXPIRED row must never be offered to the reaper: {offered:?}"
+        );
+
+        let (purged, refused) = backend
+            .reap_expired_attestations(now, 100)
+            .await
+            .expect("reap");
+        assert_eq!(
+            (purged, refused),
+            (1, 1),
+            "#768: exactly one reapable claim and one refused piece of evidence"
+        );
+        assert!(
+            backend
+                .get_attestation("reap-expired")
+                .await
+                .unwrap()
+                .is_none(),
+            "#768: the expired claim is gone — its producer said when it stops speaking"
+        );
+        assert!(
+            backend
+                .get_attestation("reap-withdraws")
+                .await
+                .unwrap()
+                .is_some(),
+            "#768: an expired WITHDRAWS must survive — a retraction is a statement about \
+             the past, and the purge door refuses it whatever this sweep believes. A bulk \
+             DELETE on expires_at would have removed it silently."
+        );
+        assert!(
+            backend
+                .get_attestation("reap-live")
+                .await
+                .unwrap()
+                .is_some(),
+            "#768: an unexpired row is untouched"
+        );
+
+        // Bound: max_rows=0 is a no-op, never a full sweep.
+        assert_eq!(
+            backend.reap_expired_attestations(now, 0).await.unwrap(),
+            (0, 0),
+            "#768: a zero batch reaps nothing"
+        );
+    }
+
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, memory arm.
     #[tokio::test]
     async fn node_speaks_for_owner_memory_765() {

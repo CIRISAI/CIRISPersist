@@ -5,6 +5,67 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.4.0] - 2026-08-22
+
+The production-retention cut. Filed from a node that blew past its capacity
+while every retention pass reported health (CIRISPersist#767, #768).
+
+### Added
+
+- **#767 — `StorageSummary` names EVERY table, from the catalogue.** The
+  six named fields were a hand-maintained list, and it went stale: a node
+  filled up while the summary reported a healthy, near-empty set of tables
+  and the weight sat in `federation_attestations`, `signed_wire_index`,
+  `attestation_subjects`, `transport_destinations` and `announced_peers` —
+  none of them named. The ask offered "name the five, or add one
+  `unclassified` bucket"; neither closes the class, since the NEXT table is
+  invisible again. `StorageSummary::tables` is now enumerated from the
+  database catalogue on both backends, so a table cannot enter the schema
+  without appearing, plus `dark_bytes` as the derived residual.
+- **#767 — REAL per-table bytes on SQLite.** `bytes` was hardcoded `0` for
+  six releases on the stated belief that `dbstat` "is not compiled in by
+  default". Probed: it IS available in this crate's bundled SQLite and
+  answers. That belief cost operators the one reading that localises disk
+  growth. `bytes_measurable` reports the probe, so a build genuinely
+  without it degrades visibly instead of looking like an empty store.
+- **#767 Ask 2 — bounded observation-table prunes**
+  (`prune_announced_peers_not_seen_since` /
+  `prune_transport_destinations_not_seen_since`, both backends), batching
+  like `delete_traces_older_than`. `transport_destinations` ages on
+  `COALESCE(last_seen_at, asserted_at)` — its `last_seen_at` is nullable
+  and advisory, and a NULL must not make a row immortal.
+- **#768 — `reap_expired_attestations`.** `expires_at` was written by
+  producers and enforced by NOTHING (one node held 49,292 expired rows of
+  52,107; another had rows expired two weeks). Bounded batch, driven
+  through the existing `purge_attestation_v31` door so its refusals still
+  apply per row.
+
+  On the question #768 asked persist to decide once — *is an expired
+  attestation still evidence?* — the answer needed no new policy:
+  `check_purge_admission` already discriminates. `supersedes` /
+  `withdraws` / `recants`, `delegates_to`, and exclusion-bearing rows are
+  refused whatever the caller believes, fail-secure on an unreadable
+  dimension. So an expired `withdraws` survives because the DOOR refuses
+  it — which is why the reaper drives the per-row door instead of issuing
+  `DELETE ... WHERE expires_at < now`, a statement that would be faster
+  and would silently delete exactly those rows. Witnessed and
+  mutation-tested: neutering the gate reds the withdrawal arm by name.
+
+### Fixed
+
+- **#768 — the WAL bound, ours by omission.** We set `journal_mode = WAL`
+  at boot and never set a checkpoint threshold or issued one: 218 MB of
+  `-wal` against a 1.26 GB store on one node, 280 MB against 388 MB on
+  another. No consumer could fix this — persist opens the database and
+  owns its pragmas. `wal_autocheckpoint = 1000` (SQLite's own documented
+  default) now bounds it passively.
+- **#767 — the prune cutoff compared two spellings of the same instant.**
+  These rows are written with chrono's plain `to_rfc3339()` (`+00:00`)
+  while retention's own `fmt_rfc3339` emits `Z` with micros; the SQL
+  comparison is lexicographic, so the boundary was decided by punctuation
+  and rows AT the cutoff were pruned when `<` should keep them. Found by a
+  witness whose arithmetic disagreed with the code, not by review.
+
 ## [38.3.0] - 2026-08-21
 
 The chat ladder's last door (measured by CIRISServer against v38.2.0 +

@@ -26,6 +26,101 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
+/// v38.4.0 (CIRISPersist#767 Ask 2) — **bounded, age-based prune for the two
+/// OBSERVATION tables.**
+///
+/// `announced_peers` and `transport_destinations` are not evidence — they are
+/// this node's running notes about who it has heard from and where. They grow
+/// with every announce and nothing ever removed a row: a production node held
+/// 10,460 destinations for ~700 keys, and the intake that produced them is
+/// unbounded by construction (CIRISPersist#672).
+///
+/// Deliberately NOT a general attestation prune. #767 asked for exactly this
+/// and explicitly did not ask for attestation deletion: an attestation is
+/// signed evidence, and a node that deletes evidence to save disk is deleting
+/// the corpus. Expiry is a different question with a different door
+/// (CIRISPersist#768) and it goes through the purge gate, not here.
+///
+/// Batching mirrors [`delete_traces_older_than_sqlite`] so the retention loop
+/// drives all three the same way: bounded rows per pass, oldest first, caller
+/// re-invokes until it returns less than `max_rows`.
+pub async fn prune_announced_peers_not_seen_since_sqlite(
+    backend: &SqliteBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_sqlite(backend, "announced_peers", "last_seen_at", cutoff, max_rows)
+        .await
+}
+
+/// v38.4.0 (#767 Ask 2) — the `transport_destinations` twin.
+///
+/// Ordered by `COALESCE(last_seen_at, asserted_at)`: `last_seen_at` is
+/// advisory and nullable on this table (V078), so a row that was never
+/// re-seen falls back to when it was asserted rather than being immortal
+/// because its advisory column is NULL — the exact shape that lets a prune
+/// silently skip the oldest rows it exists to remove.
+pub async fn prune_transport_destinations_not_seen_since_sqlite(
+    backend: &SqliteBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_sqlite(
+        backend,
+        "transport_destinations",
+        "COALESCE(last_seen_at, asserted_at)",
+        cutoff,
+        max_rows,
+    )
+    .await
+}
+
+/// The one prune body both observation tables share. `age_expr` is a column
+/// or expression, never caller-supplied — both call sites are literals above.
+async fn prune_observation_table_sqlite(
+    backend: &SqliteBackend,
+    table: &'static str,
+    age_expr: &'static str,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    // v38.4.0 (#767) — format the cutoff the way the WRITER formats the
+    // column, not the way retention formats its own timestamps.
+    //
+    // These rows are stored with chrono's plain `to_rfc3339()`, which spells
+    // UTC as `+00:00`; `fmt_rfc3339` here spells it `Z` and pads micros. The
+    // comparison below is a STRING comparison, so mixing the two compares
+    // `...00:00+00:00` against `...00:00.000000Z` and decides the boundary on
+    // the punctuation ('+' sorts before '.'), quietly pruning rows AT the
+    // cutoff that `<` should keep. Same spelling on both sides makes the
+    // lexicographic order agree with the chronological one, and keeps the
+    // predicate index-usable — which `datetime()` on the column would not.
+    let cutoff_str = cutoff.to_rfc3339();
+    let limit_i64 = i64::try_from(max_rows)
+        .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
+    let conn = backend.conn_handle();
+    let deleted = (move || -> Result<usize, RetentionError> {
+        let guard = conn.lock();
+        let sql = format!(
+            "DELETE FROM {table} \
+             WHERE rowid IN ( \
+                 SELECT rowid FROM {table} \
+                 WHERE {age_expr} < ?1 \
+                 ORDER BY {age_expr} \
+                 LIMIT ?2 \
+             )"
+        );
+        let n = guard
+            .execute(&sql, params![cutoff_str, limit_i64])
+            .map_err(|e| RetentionError::Backend(format!("prune {table}: {e}")))?;
+        Ok(n)
+    })()?;
+    Ok(deleted)
+}
+
 #[cfg(feature = "cirisaudit")]
 use sha2::{Digest, Sha256};
 
@@ -61,15 +156,40 @@ fn storage_summary_blocking(
         .map_err(|e| RetentionError::Backend(format!("pragma page_size: {e}")))?;
     let total_disk_bytes = u64::try_from(page_count.saturating_mul(page_size)).unwrap_or(0);
 
-    let trace_events = table_usage_sqlite(&guard, "trace_events", "ts", Some("admitted_at"))?;
-    let trace_llm_calls = table_usage_sqlite(&guard, "trace_llm_calls", "ts", None)?;
-    let detection_events =
-        table_usage_sqlite(&guard, "cirislens_derived_detection_events", "ts", None)?;
+    // v38.4.0 (#767) — probe ONCE per summary, and report the answer.
+    let dbstat_ok = guard
+        .query_row("SELECT COALESCE(SUM(pgsize),0) FROM dbstat", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .is_ok();
+
+    let trace_events = table_usage_sqlite(
+        &guard,
+        "trace_events",
+        Some("ts"),
+        Some("admitted_at"),
+        dbstat_ok,
+    )?;
+    let trace_llm_calls =
+        table_usage_sqlite(&guard, "trace_llm_calls", Some("ts"), None, dbstat_ok)?;
+    let detection_events = table_usage_sqlite(
+        &guard,
+        "cirislens_derived_detection_events",
+        Some("ts"),
+        None,
+        dbstat_ok,
+    )?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_sqlite(&guard, "cirislens_audit_log", "recorded_at", None)?
+            table_usage_sqlite(
+                &guard,
+                "cirislens_audit_log",
+                Some("recorded_at"),
+                None,
+                dbstat_ok,
+            )?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -77,9 +197,50 @@ fn storage_summary_blocking(
         }
     };
 
-    let edge_outbound_queue =
-        table_usage_sqlite(&guard, "edge_outbound_queue", "enqueued_at", None)?;
-    let federation_keys = table_usage_sqlite(&guard, "federation_keys", "valid_from", None)?;
+    let edge_outbound_queue = table_usage_sqlite(
+        &guard,
+        "edge_outbound_queue",
+        Some("enqueued_at"),
+        None,
+        dbstat_ok,
+    )?;
+    let federation_keys = table_usage_sqlite(
+        &guard,
+        "federation_keys",
+        Some("valid_from"),
+        None,
+        dbstat_ok,
+    )?;
+
+    // v38.4.0 (#767) — EVERY table, enumerated from the catalogue.
+    //
+    // Ask 1 offered a choice: name the five tables the incident exposed, or
+    // add one `unclassified` bucket. Neither closes the CLASS — the next
+    // table added is invisible again, exactly as these five were. The
+    // catalogue answers permanently: a table cannot be added to this
+    // schema without appearing here, and `dark_bytes` below is then a
+    // derived residual rather than a hand-maintained list's blind spot.
+    let mut tables = std::collections::BTreeMap::new();
+    {
+        let mut stmt = guard
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .map_err(|e| RetentionError::Backend(format!("catalogue: {e}")))?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| RetentionError::Backend(format!("catalogue rows: {e}")))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| RetentionError::Backend(format!("catalogue collect: {e}")))?;
+        drop(stmt);
+        for name in names {
+            let usage =
+                table_usage_sqlite(&guard, &name, super::ts_column_for(&name), None, dbstat_ok)?;
+            tables.insert(name, usage);
+        }
+    }
+    let dark_bytes = total_disk_bytes.saturating_sub(tables.values().map(|u| u.bytes).sum());
 
     Ok(StorageSummary {
         trace_events,
@@ -88,6 +249,9 @@ fn storage_summary_blocking(
         audit_log,
         edge_outbound_queue,
         federation_keys,
+        tables,
+        dark_bytes,
+        bytes_measurable: dbstat_ok,
         total_disk_bytes,
     })
 }
@@ -102,11 +266,38 @@ fn storage_summary_blocking(
 fn table_usage_sqlite(
     conn: &Connection,
     table: &str,
-    ts_column: &str,
+    ts_column: Option<&str>,
     admitted_col: Option<&str>,
+    dbstat_ok: bool,
 ) -> Result<TableUsage, RetentionError> {
-    // Bytes is 0 on SQLite (no dbstat compiled in). See module docs.
-    let bytes = 0u64;
+    // v38.4.0 (CIRISPersist#767) — **REAL per-table bytes on SQLite.**
+    //
+    // This was hardcoded `0` for six releases on the stated belief that
+    // "the dbstat virtual table is not compiled in by default". MEASURED
+    // against this crate's own bundled SQLite: `dbstat` IS available and
+    // answers. The belief was never probed, and it cost the operator the
+    // one reading that localises disk growth — a production node filled up
+    // while the summary reported per-table `bytes: 0` across the board and
+    // only `total_disk_bytes` carried the weight.
+    //
+    // Still soft-failed to 0 rather than erroring: a build genuinely
+    // without `SQLITE_ENABLE_DBSTAT_VTAB` must degrade to the old reading,
+    // not refuse to report. `dbstat_available()` probes once per summary
+    // so the degradation is VISIBLE in `StorageSummary::bytes_measurable`
+    // instead of being indistinguishable from an empty table.
+    let bytes = if dbstat_ok {
+        conn.query_row(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| RetentionError::Backend(format!("dbstat {table}: {e}")))?
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(0)
+    } else {
+        0
+    };
 
     // Table-existence check via sqlite_master — non-existing tables
     // soft-fail with default TableUsage (matches the PG soft-fail
@@ -124,11 +315,15 @@ fn table_usage_sqlite(
         return Ok(TableUsage::default());
     }
 
-    let stats_sql = format!(
-        "SELECT count(*), MIN({col}), MAX({col}) FROM {tbl}",
-        col = ts_column,
-        tbl = table,
-    );
+    // A table with no time-series column (a projection like
+    // `attestation_subjects`, a resolver like `signed_wire_index`) still
+    // has weight and rows — it just cannot answer "how old". Counting it
+    // with `oldest/newest = None` is the honest reading; omitting it
+    // entirely is what made the store dark (#767).
+    let stats_sql = match ts_column {
+        Some(col) => format!("SELECT count(*), MIN({col}), MAX({col}) FROM {table}"),
+        None => format!("SELECT count(*), NULL, NULL FROM {table}"),
+    };
     let (rows_i, oldest_raw, newest_raw): (i64, Option<String>, Option<String>) = conn
         .query_row(&stats_sql, [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))

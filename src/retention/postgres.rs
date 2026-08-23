@@ -59,18 +59,29 @@ pub async fn storage_summary_pg(
         u64::try_from(sz).unwrap_or(0)
     };
 
-    let trace_events =
-        table_usage_pg(&client, "cirislens.trace_events", "ts", Some("admitted_at")).await?;
-    let trace_llm_calls = table_usage_pg(&client, "cirislens.trace_llm_calls", "ts", None).await?;
+    let trace_events = table_usage_pg(
+        &client,
+        "cirislens.trace_events",
+        Some("ts"),
+        Some("admitted_at"),
+    )
+    .await?;
+    let trace_llm_calls =
+        table_usage_pg(&client, "cirislens.trace_llm_calls", Some("ts"), None).await?;
     // detection_events lives in cirislens_derived (V008). Always
     // built — DerivedSchema is feature-flag-independent.
-    let detection_events =
-        table_usage_pg(&client, "cirislens_derived.detection_events", "ts", None).await?;
+    let detection_events = table_usage_pg(
+        &client,
+        "cirislens_derived.detection_events",
+        Some("ts"),
+        None,
+    )
+    .await?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_pg(&client, "cirislens.audit_log", "recorded_at", None).await?
+            table_usage_pg(&client, "cirislens.audit_log", Some("recorded_at"), None).await?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -81,13 +92,47 @@ pub async fn storage_summary_pg(
     let edge_outbound_queue = table_usage_pg(
         &client,
         "cirislens.edge_outbound_queue",
-        "enqueued_at",
+        Some("enqueued_at"),
         None,
     )
     .await?;
 
-    let federation_keys =
-        table_usage_pg(&client, "cirislens.federation_keys", "valid_from", None).await?;
+    let federation_keys = table_usage_pg(
+        &client,
+        "cirislens.federation_keys",
+        Some("valid_from"),
+        None,
+    )
+    .await?;
+
+    // v38.4.0 (#767) — EVERY table, from the catalogue. Same rule as the
+    // SQLite backend: a table cannot enter the schema without appearing
+    // here, so the hand-maintained list above can no longer be the limit of
+    // what an operator is able to see.
+    let mut tables = std::collections::BTreeMap::new();
+    {
+        let rows = client
+            .query(
+                "SELECT schemaname || '.' || tablename AS qname \
+                 FROM pg_tables \
+                 WHERE schemaname IN ('cirislens', 'cirislens_derived', 'public') \
+                 ORDER BY 1",
+                &[],
+            )
+            .await
+            .map_err(|e| RetentionError::Backend(format!("catalogue: {e}")))?;
+        for row in rows {
+            let qname: String = row
+                .try_get("qname")
+                .map_err(|e| RetentionError::Backend(format!("decode catalogue: {e}")))?;
+            // Key on the BARE table name so a consumer reads the same key
+            // on either backend; the qualified name is a PG detail.
+            let bare = qname.rsplit('.').next().unwrap_or(&qname).to_owned();
+            let usage = table_usage_pg(&client, &qname, super::ts_column_for(&bare), None).await?;
+            tables.insert(bare, usage);
+        }
+    }
+    let dark_bytes = total_disk_bytes.saturating_sub(tables.values().map(|u| u.bytes).sum());
 
     Ok(StorageSummary {
         trace_events,
@@ -96,6 +141,10 @@ pub async fn storage_summary_pg(
         audit_log,
         edge_outbound_queue,
         federation_keys,
+        tables,
+        dark_bytes,
+        // PostgreSQL always answers `pg_total_relation_size`.
+        bytes_measurable: true,
         total_disk_bytes,
     })
 }
@@ -117,7 +166,7 @@ pub async fn storage_summary_pg(
 async fn table_usage_pg(
     client: &deadpool_postgres::Client,
     qualified: &str,
-    ts_column: &str,
+    ts_column: Option<&str>,
     admitted_col: Option<&str>,
 ) -> Result<TableUsage, RetentionError> {
     // pg_relation_size accepts a regclass; a missing table errors
@@ -152,7 +201,7 @@ async fn table_usage_pg(
 
     let stats_sql = format!(
         "SELECT count(*)::BIGINT AS rows, MIN({col})::TIMESTAMPTZ AS oldest, MAX({col})::TIMESTAMPTZ AS newest FROM {tbl}",
-        col = ts_column,
+        col = ts_column.unwrap_or("NULL"),
         tbl = qualified,
     );
     let row = client
@@ -198,6 +247,82 @@ async fn table_usage_pg(
         newest_ts,
         newest_admitted_at,
     })
+}
+
+/// v38.4.0 (CIRISPersist#767 Ask 2) — the `announced_peers` prune, PG arm.
+/// See the SQLite twin for why these two tables are prunable where an
+/// attestation is not.
+pub async fn prune_announced_peers_not_seen_since_pg(
+    backend: &PostgresBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_pg(
+        backend,
+        "cirislens.announced_peers",
+        "key_id",
+        "last_seen_at",
+        cutoff,
+        max_rows,
+    )
+    .await
+}
+
+/// v38.4.0 (#767 Ask 2) — the `transport_destinations` prune, PG arm. Ages on
+/// `COALESCE(last_seen_at, asserted_at)` for the same reason as the SQLite
+/// twin: `last_seen_at` is advisory and nullable, and a NULL must not make a
+/// row immortal.
+pub async fn prune_transport_destinations_not_seen_since_pg(
+    backend: &PostgresBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_pg(
+        backend,
+        "cirislens.transport_destinations",
+        "(occurrence_key_id, transport_kind, destination)",
+        "COALESCE(last_seen_at, asserted_at)",
+        cutoff,
+        max_rows,
+    )
+    .await
+}
+
+/// The shared PG prune body. `key_expr` is the table's primary key (a tuple
+/// for the composite one) so the bounded sub-select deletes exactly the rows
+/// it selected; both call sites pass literals.
+async fn prune_observation_table_pg(
+    backend: &PostgresBackend,
+    table: &'static str,
+    key_expr: &'static str,
+    age_expr: &'static str,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    let limit_i64 = i64::try_from(max_rows)
+        .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
+    let client = backend
+        .pool()
+        .get()
+        .await
+        .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
+    let sql = format!(
+        "DELETE FROM {table} \
+         WHERE {key_expr} IN ( \
+             SELECT {key_expr} FROM {table} \
+             WHERE {age_expr} < $1 \
+             ORDER BY {age_expr} \
+             LIMIT $2 \
+         )"
+    );
+    let deleted = client
+        .execute(&sql, &[&cutoff, &limit_i64])
+        .await
+        .map_err(|e| RetentionError::Backend(format!("prune {table}: {e}")))?;
+    Ok(usize::try_from(deleted).unwrap_or(0))
 }
 
 /// v2.7.0 — bounded-batch DELETE on `cirislens.trace_events` for

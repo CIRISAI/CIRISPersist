@@ -102,9 +102,73 @@ pub struct StorageSummary {
     /// directory). Timestamp column: `valid_from` (the key's
     /// validity-window start).
     pub federation_keys: TableUsage,
+    /// v38.4.0 (CIRISPersist#767) — **every table in the store, by name.**
+    ///
+    /// The named fields above are a hand-maintained list, and a
+    /// hand-maintained list of tables goes stale the day someone adds one.
+    /// It did: a production node filled up while this summary reported a
+    /// healthy, near-empty set of tables and 389 MB sat in
+    /// `federation_attestations`, `signed_wire_index`,
+    /// `attestation_subjects`, `transport_destinations` and
+    /// `announced_peers` — none of which it named. The operator could see
+    /// that bytes existed ([`Self::total_disk_bytes`]) and not WHERE.
+    ///
+    /// This is enumerated from the database catalogue, so a table cannot be
+    /// added to the schema without appearing here — the named fields stay
+    /// for their time-column readings and API compatibility, but coverage
+    /// no longer depends on anyone remembering to extend them.
+    ///
+    /// `oldest_ts` / `newest_ts` are populated for tables whose time column
+    /// this crate knows ([`ts_column_for`]); a projection or resolver table
+    /// with no time column reports rows and bytes with both `None`.
+    pub tables: std::collections::BTreeMap<String, TableUsage>,
+    /// v38.4.0 (#767) — bytes the catalogue does not account for:
+    /// `total_disk_bytes` minus the sum of every entry in [`Self::tables`]
+    /// (freelist, WAL-adjacent pages, indexes attributed elsewhere).
+    ///
+    /// Non-zero is normal and small. LARGE is the reading that says the
+    /// weight is somewhere this summary still cannot see — the question an
+    /// operator could not previously ask at all. Meaningless when
+    /// [`Self::bytes_measurable`] is false, since every table then reports
+    /// zero bytes and the residual is simply the whole database.
+    pub dark_bytes: u64,
+    /// v38.4.0 (#767) — **were per-table bytes actually measurable?**
+    ///
+    /// SQLite needs the `dbstat` virtual table. This crate's bundled SQLite
+    /// HAS it — measured, after six releases of a doc comment asserting the
+    /// opposite and hardcoding `bytes: 0` on that belief. A build without
+    /// it degrades to zeros, and this flag is what stops that degradation
+    /// from being indistinguishable from an empty store. Always `true` on
+    /// PostgreSQL.
+    pub bytes_measurable: bool,
     /// Whole-database disk usage in bytes. PG: `pg_database_size`.
     /// SQLite: `page_count * page_size`.
     pub total_disk_bytes: u64,
+}
+
+/// v38.4.0 (CIRISPersist#767) — the time-series column for a table the
+/// catalogue walk finds, or `None` for tables that carry no instant.
+///
+/// Spelled once and consulted by both backends, so a table's "how old"
+/// reading cannot differ between SQLite and PostgreSQL — the backend-
+/// divergence class this crate treats as a defect on sight.
+#[must_use]
+pub fn ts_column_for(table: &str) -> Option<&'static str> {
+    match table {
+        "trace_events" | "trace_llm_calls" | "cirislens_derived_detection_events" => Some("ts"),
+        "cirislens_audit_log" => Some("recorded_at"),
+        "edge_outbound_queue" => Some("enqueued_at"),
+        "federation_keys" => Some("valid_from"),
+        // The five the incident exposed.
+        "federation_attestations" => Some("asserted_at"),
+        "announced_peers" => Some("last_seen_at"),
+        "transport_destinations" => Some("asserted_at"),
+        // Projection / resolver tables: weight and rows, no instant of
+        // their own. Named explicitly rather than defaulted, so a new
+        // table is a deliberate `None` instead of an accidental one.
+        "attestation_subjects" | "signed_wire_index" => None,
+        _ => None,
+    }
 }
 
 /// v2.7.0 (CIRISPersist#107) — one table's usage breakdown.
@@ -773,6 +837,201 @@ mod tests {
     // ── delete_traces_older_than + storage_summary smoke tests ──
 
     #[cfg(feature = "sqlite")]
+    /// v38.4.0 (CIRISPersist#767) — **the store is nameable, and its bytes
+    /// are real.**
+    ///
+    /// The incident this closes: a node filled up while `StorageSummary`
+    /// reported a healthy, near-empty set of tables, because the five
+    /// tables holding the weight were not in its hand-maintained list and
+    /// every per-table `bytes` was hardcoded `0` on a belief about SQLite
+    /// that had never been probed.
+    ///
+    /// Asserted structurally rather than by naming the five: the catalogue
+    /// must cover every table the schema has, so this cannot pass while a
+    /// SIXTH unnamed table is invisible — which is the failure mode that
+    /// produced the incident in the first place.
+    #[tokio::test]
+    async fn storage_summary_names_every_table_with_real_bytes_767() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x07; 32]),
+            "test-summary-767".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        let summary = crate::retention::sqlite::storage_summary_sqlite(sq)
+            .await
+            .expect("summary");
+
+        // dbstat IS compiled into this crate's SQLite. If this ever flips,
+        // the flag must say so — a silent return to `bytes: 0` everywhere
+        // is the exact regression #767 was filed about.
+        assert!(
+            summary.bytes_measurable,
+            "#767: per-table bytes must be measurable — dbstat was probed and answered"
+        );
+
+        // Every table the schema holds appears, keyed by bare name.
+        let catalogue: std::collections::BTreeSet<String> = {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'sqlite_%'",
+                )
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows.into_iter().collect()
+        };
+        let named: std::collections::BTreeSet<String> = summary.tables.keys().cloned().collect();
+        assert_eq!(
+            catalogue, named,
+            "#767: every table in the schema must be nameable in the summary — the five \
+             that held the weight were invisible, and a hand-maintained list is what made \
+             them so"
+        );
+
+        // The five the incident exposed are covered by the rule above; named
+        // here so a reader sees the concrete claim.
+        for t in [
+            "federation_attestations",
+            "signed_wire_index",
+            "attestation_subjects",
+            "transport_destinations",
+            "announced_peers",
+        ] {
+            assert!(summary.tables.contains_key(t), "#767: {t} must be visible");
+        }
+
+        // Real bytes: the store is non-empty (migrations ran), so at least
+        // one table must carry weight. `bytes: 0` across the board was the
+        // old, useless reading.
+        assert!(
+            summary.tables.values().any(|u| u.bytes > 0),
+            "#767: at least one table must report REAL bytes — all-zero is the reading \
+             that could not localise 389 MB"
+        );
+        assert!(
+            summary.total_disk_bytes > 0,
+            "#767: whole-DB bytes still reported"
+        );
+    }
+
+    /// v38.4.0 (CIRISPersist#767 Ask 2) — the observation prunes are bounded
+    /// and age-ordered, and they leave rows the cutoff does not cover.
+    #[tokio::test]
+    async fn observation_prunes_are_bounded_and_age_ordered_767() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x09; 32]),
+            "test-prune-767".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+
+        {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            for i in 0..10 {
+                guard
+                    .execute(
+                        "INSERT INTO announced_peers \
+                         (key_id, pubkey_ed25519_base64, first_seen_at, last_seen_at) \
+                         VALUES (?1, 'cHVia2V5', ?2, ?2)",
+                        rusqlite::params![
+                            format!("peer-{i}"),
+                            chrono::DateTime::parse_from_rfc3339(&format!(
+                                "2026-01-{:02}T00:00:00Z",
+                                i + 1
+                            ))
+                            .unwrap()
+                            .with_timezone(&chrono::Utc)
+                            .to_rfc3339()
+                        ],
+                    )
+                    .expect("seed announced_peers");
+            }
+        }
+
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-01-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Bounded: 3 of the 5 eligible rows.
+        let n =
+            crate::retention::sqlite::prune_announced_peers_not_seen_since_sqlite(sq, cutoff, 3)
+                .await
+                .expect("prune");
+        assert_eq!(n, 3, "#767: the batch bound is honoured");
+
+        // Age-ordered: the OLDEST went first.
+        let survivors: Vec<String> = {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare("SELECT key_id FROM announced_peers ORDER BY key_id")
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(
+            !survivors.iter().any(|k| k == "peer-0"),
+            "#767: the oldest row is pruned first — a prune that skips the oldest rows is \
+             the one shape that lets a table grow forever while reporting progress"
+        );
+
+        // The remainder drains; rows newer than the cutoff are untouched.
+        let n2 =
+            crate::retention::sqlite::prune_announced_peers_not_seen_since_sqlite(sq, cutoff, 100)
+                .await
+                .expect("prune rest");
+        assert_eq!(n2, 2, "#767: exactly the remaining eligible rows");
+        let left: i64 = {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            guard
+                .query_row("SELECT count(*) FROM announced_peers", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            left, 5,
+            "#767: rows at or after the cutoff survive — a prune is not a truncate"
+        );
+
+        // Zero batch is a no-op, never a full sweep.
+        assert_eq!(
+            crate::retention::sqlite::prune_announced_peers_not_seen_since_sqlite(sq, cutoff, 0)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn delete_traces_older_than_caps_rows_sqlite() {
         use crate::engine::Engine;
@@ -830,8 +1089,17 @@ mod tests {
             .await
             .expect("storage_summary succeeds");
         assert_eq!(summary.trace_events.rows, 15);
-        // SQLite per-table-bytes is 0 (dbstat not compiled in).
-        assert_eq!(summary.trace_events.bytes, 0);
+        // v38.4.0 (#767) — per-table bytes are REAL on SQLite.
+        //
+        // This assertion previously PINNED the defect: `bytes == 0`, on the
+        // belief that dbstat is not compiled in. It is, and the pin is why
+        // six releases of "why can I not see where the bytes are" never
+        // surfaced as a test failure — the suite agreed with the bug.
+        assert!(
+            summary.trace_events.bytes > 0,
+            "#767: a populated table must report real bytes, not the hardcoded 0 this \
+             assertion used to pin"
+        );
         // total_disk_bytes is >0 (in-memory DB still has pages).
         assert!(summary.total_disk_bytes > 0);
 
