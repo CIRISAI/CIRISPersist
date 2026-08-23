@@ -76,7 +76,31 @@ pub async fn prune_transport_destinations_not_seen_since_sqlite(
         backend,
         "transport_destinations",
         "COALESCE(last_seen_at, asserted_at)",
-        // v38.4.0 (PR #769 review) — **never prune a TOMBSTONE.**
+        // v38.4.0 (PR #769 review) — **only UNSIGNED, unretired rows.**
+        //
+        // Two different records share this table, and only one of them is
+        // an observation:
+        //
+        // - `signature IS NULL` — a trusted-LOCAL row. This node's running
+        //   note about where it last saw a peer. Prunable.
+        // - `signature IS NOT NULL` — a SIGNED, replicated route carrying
+        //   V105's `epoch`, the durable monotonic supersession counter.
+        //   Its epoch is what REFUSES older gossip: the upsert admits an
+        //   incoming route only when `excluded.epoch > stored.epoch`.
+        //   Deleting a live signed row deletes the number that does the
+        //   refusing, so a peer could then re-insert a stale LOWER-epoch
+        //   route into an empty slot and win. Never prunable.
+        // - `retired_at IS NOT NULL` — the replicated TOMBSTONE, kept for
+        //   the same reason: a route retired by a signed put stays retired
+        //   against older gossip.
+        //
+        // Both exclusions are the same principle: an epoch-versioned
+        // replicated record is not an observation, and ageing it out on an
+        // observation's clock destroys a convergence guarantee. Signed
+        // routes do not grow unboundedly anyway — V105 made the table one
+        // route per (peer, kind), superseded in place — so the unbounded
+        // growth this prune exists to bound is entirely in the unsigned
+        // rows it still removes.
         // V105 (#443) makes `retired_at` a REPLICATED tombstone: a route
         // retired by a signed act, kept so older signed route gossip cannot
         // become authoritative again. Ageing it out on the same clock as an
@@ -84,7 +108,7 @@ pub async fn prune_transport_destinations_not_seen_since_sqlite(
         // stale route, and a peer could then reintroduce the pre-retirement
         // destination. The tombstone outlives the observation by design, so
         // this prune only ever removes rows that are still just notes.
-        Some("retired_at IS NULL"),
+        Some("signature IS NULL AND retired_at IS NULL"),
         cutoff,
         max_rows,
     )

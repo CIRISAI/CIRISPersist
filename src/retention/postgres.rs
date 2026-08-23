@@ -3,7 +3,7 @@
 //! Three operations:
 //!
 //! - `storage_summary` — per-table introspection via
-//!   `pg_relation_size` + `count(*) / MIN / MAX`. Reads only; one
+//!   `pg_total_relation_size` + `count(*) / MIN / MAX`. Reads only; one
 //!   pool connection.
 //! - `delete_traces_older_than` — bounded-batch DELETE on
 //!   `cirislens.trace_events` keyed by the `ts` column. Uses a CTE
@@ -30,7 +30,7 @@ use crate::store::postgres::PostgresBackend;
 
 /// v2.7.0 — [`StorageSummary`] for a `PostgresBackend`.
 ///
-/// Per-table reporting via `pg_relation_size` (bytes; includes
+/// Per-table reporting via `pg_total_relation_size` (bytes; includes
 /// indexes/TOAST) + `count(*)` + `MIN(<ts>) / MAX(<ts>)` for the
 /// oldest/newest rows. Tables that aren't part of the current
 /// cargo feature set surface as [`TableUsage::default`] so the
@@ -126,6 +126,7 @@ pub async fn storage_summary_pg(
                  FROM pg_tables \
                  WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
                  AND schemaname NOT LIKE 'pg\\_%' \
+                 AND has_table_privilege(schemaname || '.' || tablename, 'SELECT') \
                  ORDER BY 1",
                 &[],
             )
@@ -159,7 +160,7 @@ pub async fn storage_summary_pg(
     })
 }
 
-/// Per-table read helper: bytes (`pg_relation_size`) + row count + ts
+/// Per-table read helper: bytes (`pg_total_relation_size`) + row count + ts
 /// bounds. `qualified` is the fully-qualified `schema.table` string;
 /// `ts_column` is the timestamp column for `MIN` / `MAX`.
 ///
@@ -179,13 +180,16 @@ async fn table_usage_pg(
     ts_column: Option<&str>,
     admitted_col: Option<&str>,
 ) -> Result<TableUsage, RetentionError> {
-    // pg_relation_size accepts a regclass; a missing table errors
+    // pg_total_relation_size accepts a regclass; a missing table errors
     // with `relation "..." does not exist`. We map that to an empty
     // TableUsage rather than failing — the cohabitation store has
     // optional tables.
     let bytes = match client
         .query_one(
-            &format!("SELECT pg_relation_size('{}')::BIGINT AS sz", qualified),
+            &format!(
+                "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
+                qualified
+            ),
             &[],
         )
         .await
@@ -204,7 +208,7 @@ async fn table_usage_pg(
                 }
             }
             return Err(RetentionError::Backend(format!(
-                "pg_relation_size {qualified}: {e}"
+                "pg_total_relation_size {qualified}: {e}"
             )));
         }
     };
@@ -293,7 +297,7 @@ pub async fn prune_transport_destinations_not_seen_since_pg(
         "COALESCE(last_seen_at, asserted_at)",
         // PR #769 review — never prune a V105 replicated tombstone; see the
         // SQLite twin for why a retired route must outlive its observation.
-        Some("retired_at IS NULL"),
+        Some("signature IS NULL AND retired_at IS NULL"),
         cutoff,
         max_rows,
     )

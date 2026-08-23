@@ -1218,6 +1218,17 @@ pub trait FederationDirectory: Send + Sync {
     /// Backends override; the default refuses rather than silently reporting
     /// "nothing expired", which is the shape that would make
     /// [`Self::reap_expired_attestations`] a check that cannot fail.
+    ///
+    /// Implementations MUST exclude the types the purge door refuses
+    /// structurally (`supersedes` / `withdraws` / `recants` /
+    /// `delegates_to`). Paging past refusals bounds a short immovable
+    /// prefix, but only bounded-ly: with a batch of one and seventeen
+    /// expired withdrawals ahead of a purgeable row, every sweep would
+    /// exhaust its page cap on the same prefix and never reach it
+    /// (PR #769 review round 2). Not offering what the door will certainly
+    /// refuse removes the prefix instead of walking it. Dimension-based
+    /// exclusions are still discovered at the door and still paged past —
+    /// this narrows the common case, it does not replace the gate.
     async fn list_expired_attestation_ids(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -1327,18 +1338,41 @@ pub trait FederationDirectory: Send + Sync {
             }
             let mut refused_this_page = 0usize;
             for id in ids {
+                // RE-READ before mutating (PR #769 review round 2). One load
+                // answers three questions the candidate list cannot:
+                //
+                // 1. Is it still there? (a concurrent sweep may have taken it)
+                // 2. Is it still EXPIRED? `reseal_attestation_v31` can move
+                //    `expires_at` forward between the page read and here, and
+                //    the purge door checks admission, never expiry — so
+                //    without this the reaper could delete a row that is
+                //    current by the time it is deleted.
+                // 3. Will the door refuse it? Asking HERE, before touching
+                //    the projections, is what keeps a refused row from
+                //    losing them: ordering the projection delete after a
+                //    successful purge instead would orphan them permanently
+                //    whenever the projection step failed, since the id is no
+                //    longer listed on the next sweep and could never be
+                //    retried.
+                let Some(row) = self.get_attestation(&id).await? else {
+                    continue;
+                };
+                if row.expires_at.is_none_or(|e| e >= now) {
+                    continue;
+                }
+                if crate::federation::migration::check_purge_admission(&row).is_err() {
+                    refused += 1;
+                    refused_this_page += 1;
+                    continue;
+                }
+                // Projections first, then the row. If the purge fails here
+                // the row simply survives with its projections dropped, and
+                // the NEXT sweep re-offers it and completes — self-healing,
+                // where the other order is not.
+                self.purge_attestation_projections(&id).await?;
                 match self.purge_attestation_v31(&id).await {
-                    Ok(true) => {
-                        // The row is gone; its projections must go with it,
-                        // or the sweep leaks storage and authority.
-                        self.purge_attestation_projections(&id).await?;
-                        purged += 1;
-                    }
-                    // Already gone (a concurrent sweep, or a cascade) — not a
-                    // refusal and not an error. Its projections may still be
-                    // resident, so clean them anyway; the cleanup is
-                    // idempotent.
-                    Ok(false) => self.purge_attestation_projections(&id).await?,
+                    Ok(true) => purged += 1,
+                    Ok(false) => {}
                     Err(Error::InvalidArgument(_)) => {
                         refused += 1;
                         refused_this_page += 1;

@@ -4722,6 +4722,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let mut stmt = guard.prepare(
                 "SELECT attestation_id FROM federation_attestations \
                  WHERE expires_at IS NOT NULL AND expires_at < ?1 \
+                   AND attestation_type NOT IN \
+                       ('supersedes', 'withdraws', 'recants', 'delegates_to') \
                  ORDER BY expires_at LIMIT ?2 OFFSET ?3",
             )?;
             let off = i64::try_from(offset).unwrap_or(0);
