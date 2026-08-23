@@ -53,12 +53,33 @@ while every retention pass reported health (CIRISPersist#767, #768).
 
 ### Fixed
 
+- **PR #769 review — eleven verified findings fixed pre-merge** (one
+  refuted). Four P1s in this cut's own new code: the PG composite-key
+  prune was invalid SQL and failed on every call; the transport prune
+  deleted V105 REPLICATED TOMBSTONES, which would let a peer reintroduce
+  a retired route; the reaper orphaned `signed_wire_index` and
+  `consent_peer_set` rows, the latter leaving a peer authorised after its
+  expired grant was purged; and the sweep STARVED behind a prefix of
+  deterministically-refused rows, so a 95%-expired node made no progress.
+  Plus: SQLite per-table bytes omitted index pages; the PG catalogue
+  walked three schemas when migrations create five; `ts_column_for` knew
+  only the SQLite spellings; and the prunes had no `Engine` facade. The
+  refuted one: `MIN(NULL)::TIMESTAMPTZ` was reported to break the
+  summary — probed against live PG, it walks 90 tables and succeeds.
+
 - **#768 — the WAL bound, ours by omission.** We set `journal_mode = WAL`
   at boot and never set a checkpoint threshold or issued one: 218 MB of
   `-wal` against a 1.26 GB store on one node, 280 MB against 388 MB on
   another. No consumer could fix this — persist opens the database and
-  owns its pragmas. `wal_autocheckpoint = 1000` (SQLite's own documented
-  default) now bounds it passively.
+  owns its pragmas. The bound is `journal_size_limit = 64 MiB`, which
+  truncates the WAL after checkpoint instead of leaving it at its
+  high-water mark; its default is `-1`, unlimited, which is exactly how a
+  `-wal` reaches 72% of a store. `wal_autocheckpoint` is stated explicitly
+  but is NOT the bound — probed, its default is ALREADY 1000, so the
+  observed WAL grew with that setting active and a passive checkpoint
+  recycles pages rather than shrinking the file. Neither pragma can force
+  a checkpoint past a long-running reader, and the code says so rather
+  than implying a guarantee it does not give.
 - **#767 — the prune cutoff compared two spellings of the same instant.**
   These rows are written with chrono's plain `to_rfc3339()` (`+00:00`)
   while retention's own `fmt_rfc3339` emits `Z` with micros; the SQL

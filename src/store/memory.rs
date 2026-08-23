@@ -3972,6 +3972,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         now: chrono::DateTime<chrono::Utc>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<String>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<(chrono::DateTime<chrono::Utc>, String)> = state
@@ -3984,7 +3985,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })
             .collect();
         rows.sort();
-        Ok(rows.into_iter().take(limit).map(|(_, id)| id).collect())
+        Ok(rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, id)| id)
+            .collect())
     }
 
     async fn purge_attestation_v31(
@@ -10944,7 +10950,7 @@ mod tests {
 
         // The sweep only ever offers rows past their stated expiry.
         let offered = backend
-            .list_expired_attestation_ids(now, 100)
+            .list_expired_attestation_ids(now, 100, 0)
             .await
             .expect("list expired");
         assert!(
@@ -10986,6 +10992,55 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "#768: an unexpired row is untouched"
+        );
+
+        // PR #769 review — **the sweep must not wedge behind refusals.**
+        // A prefix of expired-but-unpurgeable rows (a withdrawal is refused
+        // today and forever) previously re-offered itself every pass, so a
+        // purgeable row behind it was never reached. Seed one more expired
+        // withdrawal OLDER than a purgeable claim and require the claim to
+        // still be reaped.
+        let older = now - chrono::Duration::hours(9);
+        let mut blocker = fix_attestation("reap-blocker", "reap-a", "reap-b", "reap-a");
+        blocker.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        blocker.expires_at = Some(older);
+        resign_fix(&mut blocker);
+        let mut behind = fix_attestation("reap-behind", "reap-a", "reap-b", "reap-a");
+        behind.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        behind.expires_at = Some(older + chrono::Duration::minutes(1));
+        resign_fix(&mut behind);
+        for row in [blocker, behind] {
+            backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .expect("seed blocked pair");
+        }
+        // A batch of ONE: the oldest expired row is the immovable withdrawal.
+        let (p2, r2) = backend
+            .reap_expired_attestations(now, 1)
+            .await
+            .expect("reap past the blocker");
+        assert_eq!(
+            (p2, r2),
+            (1, 1),
+            "#768: the sweep must page PAST a refused row and still reap the purgeable \
+             one behind it — otherwise a node that is 95% expired never makes progress"
+        );
+        assert!(
+            backend
+                .get_attestation("reap-behind")
+                .await
+                .unwrap()
+                .is_none(),
+            "#768: the row behind the immovable prefix was reaped"
+        );
+        assert!(
+            backend
+                .get_attestation("reap-blocker")
+                .await
+                .unwrap()
+                .is_some(),
+            "#768: and the withdrawal it paged past is still there"
         );
 
         // Bound: max_rows=0 is a no-op, never a full sweep.

@@ -394,7 +394,8 @@ impl SqliteBackend {
                  PRAGMA journal_mode = WAL;\n\
                  PRAGMA synchronous = NORMAL;\n\
                  PRAGMA busy_timeout = 30000;\n\
-                 PRAGMA wal_autocheckpoint = 1000;",
+                 PRAGMA wal_autocheckpoint = 1000;\n\
+                 PRAGMA journal_size_limit = 67108864;",
                 // v38.4.0 (CIRISPersist#768) — **the WAL bound, which was
                 // ours by omission.** We set `journal_mode = WAL` here and
                 // never set a checkpoint threshold or issued one, so the
@@ -406,12 +407,27 @@ impl SqliteBackend {
                 // its pragmas, so a checkpoint policy is not something a
                 // caller can be expected to know it must supply.
                 //
-                // 1000 pages is SQLite's own documented default threshold;
-                // the value is not the point, having ONE is. Autocheckpoint
-                // is a passive bound (it runs on the writer that crosses
-                // the threshold) so it costs no background machinery, and
-                // it degrades safely: a busy reader defers the checkpoint
-                // rather than blocking the write.
+                // **`wal_autocheckpoint` alone does NOT bound the file, and
+                // saying so was wrong** (PR #769 review; probed rather than
+                // argued). SQLite's default autocheckpoint is ALREADY 1000
+                // pages — the 218 MB WAL grew with that setting active — and
+                // a passive checkpoint RECYCLES the WAL's pages rather than
+                // shrinking the file, so an already-expanded `-wal` stays
+                // expanded. It is kept here as an explicit statement of the
+                // threshold, not as the bound.
+                //
+                // `journal_size_limit` is the bound: it truncates the WAL
+                // back down after each checkpoint instead of leaving it at
+                // its high-water mark. The default is -1 — UNLIMITED, which
+                // is precisely how a `-wal` reaches 72% of a store's
+                // footprint. 64 MiB is a working ceiling well above normal
+                // transaction volume and far below the observed 218/280 MB.
+                //
+                // Neither pragma can force a checkpoint past a long-running
+                // reader; a reader that never yields still defers one. That
+                // is a liveness property of the reader, not something a
+                // pragma can fix, and it is stated here so the next person
+                // does not read this block as a guarantee it is not.
             )?;
             Ok(conn)
         })()
@@ -4696,6 +4712,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         now: chrono::DateTime<chrono::Utc>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<String>, crate::federation::Error> {
         let now_s = now.to_rfc3339();
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -4705,15 +4722,47 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let mut stmt = guard.prepare(
                 "SELECT attestation_id FROM federation_attestations \
                  WHERE expires_at IS NOT NULL AND expires_at < ?1 \
-                 ORDER BY expires_at LIMIT ?2",
+                 ORDER BY expires_at LIMIT ?2 OFFSET ?3",
             )?;
-            let rows = stmt.query_map(rusqlite::params![now_s, lim], |r| r.get::<_, String>(0))?;
+            let off = i64::try_from(offset).unwrap_or(0);
+            let rows = stmt.query_map(rusqlite::params![now_s, lim, off], |r| {
+                r.get::<_, String>(0)
+            })?;
             rows.collect()
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_expired_attestation_ids: {e}"))
         })?;
         Ok(ids)
+    }
+
+    /// v38.4.0 (PR #769 review) — drop the projections the purged row owned.
+    /// Idempotent; see the trait doc for why an orphaned `consent_peer_set`
+    /// row is an authority leak rather than mere clutter.
+    async fn purge_attestation_projections(
+        &self,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let record_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        (move || -> Result<(), rusqlite::Error> {
+            let guard = conn.lock();
+            guard.execute(
+                "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
+                rusqlite::params![record_key],
+            )?;
+            guard.execute(
+                "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_attestation_projections: {e}"))
+        })?;
+        Ok(())
     }
 
     async fn purge_attestation_v31(

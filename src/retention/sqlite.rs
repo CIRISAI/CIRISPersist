@@ -49,8 +49,15 @@ pub async fn prune_announced_peers_not_seen_since_sqlite(
     cutoff: DateTime<Utc>,
     max_rows: usize,
 ) -> Result<usize, RetentionError> {
-    prune_observation_table_sqlite(backend, "announced_peers", "last_seen_at", cutoff, max_rows)
-        .await
+    prune_observation_table_sqlite(
+        backend,
+        "announced_peers",
+        "last_seen_at",
+        None,
+        cutoff,
+        max_rows,
+    )
+    .await
 }
 
 /// v38.4.0 (#767 Ask 2) — the `transport_destinations` twin.
@@ -69,6 +76,15 @@ pub async fn prune_transport_destinations_not_seen_since_sqlite(
         backend,
         "transport_destinations",
         "COALESCE(last_seen_at, asserted_at)",
+        // v38.4.0 (PR #769 review) — **never prune a TOMBSTONE.**
+        // V105 (#443) makes `retired_at` a REPLICATED tombstone: a route
+        // retired by a signed act, kept so older signed route gossip cannot
+        // become authoritative again. Ageing it out on the same clock as an
+        // ordinary observation would delete the very record that refuses the
+        // stale route, and a peer could then reintroduce the pre-retirement
+        // destination. The tombstone outlives the observation by design, so
+        // this prune only ever removes rows that are still just notes.
+        Some("retired_at IS NULL"),
         cutoff,
         max_rows,
     )
@@ -81,6 +97,7 @@ async fn prune_observation_table_sqlite(
     backend: &SqliteBackend,
     table: &'static str,
     age_expr: &'static str,
+    keep_predicate: Option<&'static str>,
     cutoff: DateTime<Utc>,
     max_rows: usize,
 ) -> Result<usize, RetentionError> {
@@ -104,11 +121,14 @@ async fn prune_observation_table_sqlite(
     let conn = backend.conn_handle();
     let deleted = (move || -> Result<usize, RetentionError> {
         let guard = conn.lock();
+        let keep = keep_predicate
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
         let sql = format!(
             "DELETE FROM {table} \
              WHERE rowid IN ( \
                  SELECT rowid FROM {table} \
-                 WHERE {age_expr} < ?1 \
+                 WHERE {age_expr} < ?1{keep} \
                  ORDER BY {age_expr} \
                  LIMIT ?2 \
              )"
@@ -286,8 +306,26 @@ fn table_usage_sqlite(
     // so the degradation is VISIBLE in `StorageSummary::bytes_measurable`
     // instead of being indistinguishable from an empty table.
     let bytes = if dbstat_ok {
+        // v38.4.0 (PR #769 review) — count the table's INDEXES too.
+        //
+        // dbstat reports every b-tree under its OWN name, so a table's
+        // indexes — including the `sqlite_autoindex_*` a PRIMARY KEY
+        // creates — are separate rows. Matching `name = ?1` alone counted
+        // only the table b-tree and left the index pages anonymous in
+        // `dark_bytes`, which for an index-heavy table like
+        // `signed_wire_index` is most of its footprint. Measured: a table
+        // with a PK and one index reports as three dbstat names.
+        //
+        // `sqlite_master` is the ownership map — autoindexes appear there
+        // with `tbl_name` set, so this catches them without name-pattern
+        // guessing.
         conn.query_row(
-            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?1",
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat \
+             WHERE name = ?1 \
+                OR name IN ( \
+                    SELECT name FROM sqlite_master \
+                    WHERE type = 'index' AND tbl_name = ?1 \
+                )",
             params![table],
             |row| row.get::<_, i64>(0),
         )

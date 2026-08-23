@@ -5655,8 +5655,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         now: chrono::DateTime<chrono::Utc>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<String>, crate::federation::Error> {
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let off = i64::try_from(offset).unwrap_or(0);
         let client = self.pool().get().await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
         })?;
@@ -5664,8 +5666,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT attestation_id FROM cirislens.federation_attestations \
                  WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                 ORDER BY expires_at LIMIT $2",
-                &[&now, &lim],
+                 ORDER BY expires_at LIMIT $2 OFFSET $3",
+                &[&now, &lim, &off],
             )
             .await
             .map_err(|e| {
@@ -5678,6 +5680,38 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 })
             })
             .collect()
+    }
+
+    /// v38.4.0 (PR #769 review) — drop the projections the purged row owned.
+    /// Idempotent; see the trait doc for why an orphaned `consent_peer_set`
+    /// row is an authority leak rather than mere clutter.
+    async fn purge_attestation_projections(
+        &self,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let record_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_attestation_projections pool: {e}"))
+        })?;
+        client
+            .execute(
+                "DELETE FROM cirislens.signed_wire_index \
+                 WHERE kind = 'Attestation' AND record_key = $1",
+                &[&record_key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+        client
+            .execute(
+                "DELETE FROM cirislens.consent_peer_set WHERE source_attestation_id = $1",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge consent_peer_set: {e}"))
+            })?;
+        Ok(())
     }
 
     async fn purge_attestation_v31(

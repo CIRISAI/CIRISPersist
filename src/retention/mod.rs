@@ -155,8 +155,17 @@ pub struct StorageSummary {
 #[must_use]
 pub fn ts_column_for(table: &str) -> Option<&'static str> {
     match table {
-        "trace_events" | "trace_llm_calls" | "cirislens_derived_detection_events" => Some("ts"),
-        "cirislens_audit_log" => Some("recorded_at"),
+        // Both backend SPELLINGS (PR #769 review): SQLite flattens the
+        // schema into the table name (`cirislens_derived_detection_events`)
+        // while the PG catalogue walk passes the bare name
+        // (`detection_events`). Matching only one silently dropped the other
+        // backend's time bounds to `None` — a parity gap in the helper whose
+        // whole purpose is that the two backends answer alike.
+        "trace_events"
+        | "trace_llm_calls"
+        | "cirislens_derived_detection_events"
+        | "detection_events" => Some("ts"),
+        "cirislens_audit_log" | "audit_log" => Some("recorded_at"),
         "edge_outbound_queue" => Some("enqueued_at"),
         "federation_keys" => Some("valid_from"),
         // The five the incident exposed.
@@ -932,6 +941,7 @@ mod tests {
 
     /// v38.4.0 (CIRISPersist#767 Ask 2) — the observation prunes are bounded
     /// and age-ordered, and they leave rows the cutoff does not cover.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn observation_prunes_are_bounded_and_age_ordered_767() {
         use crate::engine::Engine;
@@ -1032,6 +1042,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn delete_traces_older_than_caps_rows_sqlite() {
         use crate::engine::Engine;
