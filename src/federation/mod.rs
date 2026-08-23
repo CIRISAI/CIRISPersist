@@ -575,6 +575,11 @@ fn overdue_row(
     }
 }
 
+/// v38.4.0 (PR #769 review) — how many candidate pages one reap sweep will
+/// walk past refusals before giving up. Bounds a store whose expired set is
+/// entirely unpurgeable, so the sweep terminates rather than scanning it all.
+const MAX_REAP_PAGES: usize = 16;
+
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///
@@ -1205,6 +1210,182 @@ pub trait FederationDirectory: Send + Sync {
         Err(Error::Unsupported {
             method: "reseal_attestation_v31",
         })
+    }
+
+    /// v38.4.0 (CIRISPersist#768) — the ids of attestations whose producer
+    /// stated an expiry that has now passed, oldest first, bounded.
+    ///
+    /// Backends override; the default refuses rather than silently reporting
+    /// "nothing expired", which is the shape that would make
+    /// [`Self::reap_expired_attestations`] a check that cannot fail.
+    ///
+    /// Implementations MUST exclude the types the purge door refuses
+    /// structurally (`supersedes` / `withdraws` / `recants` /
+    /// `delegates_to`). Paging past refusals bounds a short immovable
+    /// prefix, but only bounded-ly: with a batch of one and seventeen
+    /// expired withdrawals ahead of a purgeable row, every sweep would
+    /// exhaust its page cap on the same prefix and never reach it
+    /// (PR #769 review round 2). Not offering what the door will certainly
+    /// refuse removes the prefix instead of walking it. Dimension-based
+    /// exclusions are still discovered at the door and still paged past —
+    /// this narrows the common case, it does not replace the gate.
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (now, limit, offset);
+        Err(Error::Unsupported {
+            method: "list_expired_attestation_ids",
+        })
+    }
+
+    /// v38.4.0 (CIRISPersist#768, PR #769 review) — remove the node-local
+    /// PROJECTIONS an attestation owns, after its row is purged.
+    ///
+    /// [`Self::purge_attestation_v31`] deletes the attestation row and
+    /// nothing else — the migration caller compensates separately by calling
+    /// [`Self::rebuild_signed_wire_index`], which a per-row reaper cannot do
+    /// once per row. Two projections outlive the row and must not:
+    ///
+    /// - `signed_wire_index` (V111): a `(kind, content_hash)` resolver entry
+    ///   whose record now reloads as `None`. It is also one of the tables
+    ///   #767 measured as carrying the weight — a reaper that leaves them
+    ///   behind fails at the storage job it exists to do.
+    /// - `consent_peer_set` (V109): the live-peer projection that
+    ///   replication admission reads DIRECTLY. An expired
+    ///   `consent:replication:v1` grant is not exclusion-bearing, so it
+    ///   purges — and without this the peer stays authorised indefinitely
+    ///   after the signed grant that authorised it is gone. That is an
+    ///   authority leak, and it is the reason this runs on every successful
+    ///   purge rather than being left to a periodic rebuild.
+    ///
+    /// Backends override; the default is a no-op for stores that hold no
+    /// such projections (memory).
+    async fn purge_attestation_projections(&self, attestation_id: &str) -> Result<(), Error> {
+        let _ = attestation_id;
+        Ok(())
+    }
+
+    /// v38.4.0 (CIRISPersist#768) — **reap attestations whose stated shelf
+    /// life has passed.** Bounded batch, driven by the caller's cadence,
+    /// purging through [`Self::purge_attestation_v31`] so that door's
+    /// refusals still apply to every row.
+    ///
+    /// # The question this answers, and why the gate already answered it
+    ///
+    /// #768 asked persist to decide once, rather than let every consumer
+    /// infer it: *is an expired attestation still evidence?* Measured, the
+    /// problem was real — one node held 49,292 expired rows of 52,107 (95%),
+    /// another had rows expired for two weeks — and `expires_at` was written
+    /// by producers and enforced by nothing anywhere in the tree.
+    ///
+    /// The answer is not a new policy: [`check_purge_admission`] already
+    /// discriminates, per row, and it is the correct discriminator.
+    /// `supersedes` / `withdraws` / `recants` are structural composers, a
+    /// `delegates_to` is a standing grant, and an exclusion-bearing row is
+    /// the thing a reset excludes — all REFUSED, whatever the caller
+    /// believes, and refused fail-secure when the dimension cannot even be
+    /// read. What remains reapable is the class that actually motivated the
+    /// ask: a re-derivable claim whose producer signed a shelf life. So a
+    /// `withdraws` carrying an `expires_at` is not deleted here — not
+    /// because this loop is careful, but because the door refuses it.
+    ///
+    /// That distinction is the whole reason this drives the per-row door
+    /// instead of issuing `DELETE ... WHERE expires_at < now`: a bulk
+    /// statement would be faster and would silently delete every one of
+    /// those rows. It is also why this is NOT the disk-pressure prune #767
+    /// explicitly did not ask for — the producer's own instruction is the
+    /// authority, not free space.
+    ///
+    /// Returns `(purged, refused)`. A refusal is expected traffic, not an
+    /// error: it means the gate protected a row this sweep should not have
+    /// offered. Both counts are reported so a caller can see a sweep that
+    /// is refusing everything instead of reading it as "nothing to do".
+    async fn reap_expired_attestations(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<(usize, usize), Error> {
+        if max_rows == 0 {
+            return Ok((0, 0));
+        }
+        let (mut purged, mut refused) = (0usize, 0usize);
+        // PR #769 review — PAGE PAST REFUSALS.
+        //
+        // The first shape asked for the oldest `max_rows` expired ids every
+        // time. Refusals are DETERMINISTIC (a `withdraws` is refused today
+        // and forever), so a prefix of expired-but-unpurgeable rows wedged
+        // the sweep permanently: every invocation re-offered the same ids,
+        // counted them refused, and never reached a single purgeable row
+        // behind them. On a node that is 95% expired that is not a corner
+        // case, it is the expected state.
+        //
+        // The offset advances by exactly the refusals seen, so each pass
+        // starts after the immovable prefix; `attempts` bounds the walk so a
+        // store of nothing but refusals terminates instead of scanning to
+        // the end.
+        let mut offset = 0usize;
+        let mut attempts = 0usize;
+        while purged < max_rows && attempts < MAX_REAP_PAGES {
+            attempts += 1;
+            let ids = self
+                .list_expired_attestation_ids(now, max_rows - purged, offset)
+                .await?;
+            if ids.is_empty() {
+                break;
+            }
+            let mut refused_this_page = 0usize;
+            for id in ids {
+                // RE-READ before mutating (PR #769 review round 2). One load
+                // answers three questions the candidate list cannot:
+                //
+                // 1. Is it still there? (a concurrent sweep may have taken it)
+                // 2. Is it still EXPIRED? `reseal_attestation_v31` can move
+                //    `expires_at` forward between the page read and here, and
+                //    the purge door checks admission, never expiry — so
+                //    without this the reaper could delete a row that is
+                //    current by the time it is deleted.
+                // 3. Will the door refuse it? Asking HERE, before touching
+                //    the projections, is what keeps a refused row from
+                //    losing them: ordering the projection delete after a
+                //    successful purge instead would orphan them permanently
+                //    whenever the projection step failed, since the id is no
+                //    longer listed on the next sweep and could never be
+                //    retried.
+                let Some(row) = self.get_attestation(&id).await? else {
+                    continue;
+                };
+                if row.expires_at.is_none_or(|e| e >= now) {
+                    continue;
+                }
+                if crate::federation::migration::check_purge_admission(&row).is_err() {
+                    refused += 1;
+                    refused_this_page += 1;
+                    continue;
+                }
+                // Projections first, then the row. If the purge fails here
+                // the row simply survives with its projections dropped, and
+                // the NEXT sweep re-offers it and completes — self-healing,
+                // where the other order is not.
+                self.purge_attestation_projections(&id).await?;
+                match self.purge_attestation_v31(&id).await {
+                    Ok(true) => purged += 1,
+                    Ok(false) => {}
+                    Err(Error::InvalidArgument(_)) => {
+                        refused += 1;
+                        refused_this_page += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if refused_this_page == 0 {
+                break;
+            }
+            offset += refused_this_page;
+        }
+        Ok((purged, refused))
     }
 
     /// v31.0.0 (CIRISPersist#650) — **hard-delete ONE attestation row** by id.

@@ -5,6 +5,88 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.4.0] - 2026-08-22
+
+The production-retention cut. Filed from a node that blew past its capacity
+while every retention pass reported health (CIRISPersist#767, #768).
+
+### Added
+
+- **#767 — `StorageSummary` names EVERY table, from the catalogue.** The
+  six named fields were a hand-maintained list, and it went stale: a node
+  filled up while the summary reported a healthy, near-empty set of tables
+  and the weight sat in `federation_attestations`, `signed_wire_index`,
+  `attestation_subjects`, `transport_destinations` and `announced_peers` —
+  none of them named. The ask offered "name the five, or add one
+  `unclassified` bucket"; neither closes the class, since the NEXT table is
+  invisible again. `StorageSummary::tables` is now enumerated from the
+  database catalogue on both backends, so a table cannot enter the schema
+  without appearing, plus `dark_bytes` as the derived residual.
+- **#767 — REAL per-table bytes on SQLite.** `bytes` was hardcoded `0` for
+  six releases on the stated belief that `dbstat` "is not compiled in by
+  default". Probed: it IS available in this crate's bundled SQLite and
+  answers. That belief cost operators the one reading that localises disk
+  growth. `bytes_measurable` reports the probe, so a build genuinely
+  without it degrades visibly instead of looking like an empty store.
+- **#767 Ask 2 — bounded observation-table prunes**
+  (`prune_announced_peers_not_seen_since` /
+  `prune_transport_destinations_not_seen_since`, both backends), batching
+  like `delete_traces_older_than`. `transport_destinations` ages on
+  `COALESCE(last_seen_at, asserted_at)` — its `last_seen_at` is nullable
+  and advisory, and a NULL must not make a row immortal.
+- **#768 — `reap_expired_attestations`.** `expires_at` was written by
+  producers and enforced by NOTHING (one node held 49,292 expired rows of
+  52,107; another had rows expired two weeks). Bounded batch, driven
+  through the existing `purge_attestation_v31` door so its refusals still
+  apply per row.
+
+  On the question #768 asked persist to decide once — *is an expired
+  attestation still evidence?* — the answer needed no new policy:
+  `check_purge_admission` already discriminates. `supersedes` /
+  `withdraws` / `recants`, `delegates_to`, and exclusion-bearing rows are
+  refused whatever the caller believes, fail-secure on an unreadable
+  dimension. So an expired `withdraws` survives because the DOOR refuses
+  it — which is why the reaper drives the per-row door instead of issuing
+  `DELETE ... WHERE expires_at < now`, a statement that would be faster
+  and would silently delete exactly those rows. Witnessed and
+  mutation-tested: neutering the gate reds the withdrawal arm by name.
+
+### Fixed
+
+- **PR #769 review — eleven verified findings fixed pre-merge** (one
+  refuted). Four P1s in this cut's own new code: the PG composite-key
+  prune was invalid SQL and failed on every call; the transport prune
+  deleted V105 REPLICATED TOMBSTONES, which would let a peer reintroduce
+  a retired route; the reaper orphaned `signed_wire_index` and
+  `consent_peer_set` rows, the latter leaving a peer authorised after its
+  expired grant was purged; and the sweep STARVED behind a prefix of
+  deterministically-refused rows, so a 95%-expired node made no progress.
+  Plus: SQLite per-table bytes omitted index pages; the PG catalogue
+  walked three schemas when migrations create five; `ts_column_for` knew
+  only the SQLite spellings; and the prunes had no `Engine` facade. The
+  refuted one: `MIN(NULL)::TIMESTAMPTZ` was reported to break the
+  summary — probed against live PG, it walks 90 tables and succeeds.
+
+- **#768 — the WAL bound, ours by omission.** We set `journal_mode = WAL`
+  at boot and never set a checkpoint threshold or issued one: 218 MB of
+  `-wal` against a 1.26 GB store on one node, 280 MB against 388 MB on
+  another. No consumer could fix this — persist opens the database and
+  owns its pragmas. The bound is `journal_size_limit = 64 MiB`, which
+  truncates the WAL after checkpoint instead of leaving it at its
+  high-water mark; its default is `-1`, unlimited, which is exactly how a
+  `-wal` reaches 72% of a store. `wal_autocheckpoint` is stated explicitly
+  but is NOT the bound — probed, its default is ALREADY 1000, so the
+  observed WAL grew with that setting active and a passive checkpoint
+  recycles pages rather than shrinking the file. Neither pragma can force
+  a checkpoint past a long-running reader, and the code says so rather
+  than implying a guarantee it does not give.
+- **#767 — the prune cutoff compared two spellings of the same instant.**
+  These rows are written with chrono's plain `to_rfc3339()` (`+00:00`)
+  while retention's own `fmt_rfc3339` emits `Z` with micros; the SQL
+  comparison is lexicographic, so the boundary was decided by punctuation
+  and rows AT the cutoff were pruned when `<` should keep them. Found by a
+  witness whose arithmetic disagreed with the code, not by review.
+
 ## [38.3.0] - 2026-08-21
 
 The chat ladder's last door (measured by CIRISServer against v38.2.0 +

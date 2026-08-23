@@ -3,7 +3,7 @@
 //! Three operations:
 //!
 //! - `storage_summary` — per-table introspection via
-//!   `pg_relation_size` + `count(*) / MIN / MAX`. Reads only; one
+//!   `pg_total_relation_size` + `count(*) / MIN / MAX`. Reads only; one
 //!   pool connection.
 //! - `delete_traces_older_than` — bounded-batch DELETE on
 //!   `cirislens.trace_events` keyed by the `ts` column. Uses a CTE
@@ -30,7 +30,7 @@ use crate::store::postgres::PostgresBackend;
 
 /// v2.7.0 — [`StorageSummary`] for a `PostgresBackend`.
 ///
-/// Per-table reporting via `pg_relation_size` (bytes; includes
+/// Per-table reporting via `pg_total_relation_size` (bytes; includes
 /// indexes/TOAST) + `count(*)` + `MIN(<ts>) / MAX(<ts>)` for the
 /// oldest/newest rows. Tables that aren't part of the current
 /// cargo feature set surface as [`TableUsage::default`] so the
@@ -59,18 +59,29 @@ pub async fn storage_summary_pg(
         u64::try_from(sz).unwrap_or(0)
     };
 
-    let trace_events =
-        table_usage_pg(&client, "cirislens.trace_events", "ts", Some("admitted_at")).await?;
-    let trace_llm_calls = table_usage_pg(&client, "cirislens.trace_llm_calls", "ts", None).await?;
+    let trace_events = table_usage_pg(
+        &client,
+        "cirislens.trace_events",
+        Some("ts"),
+        Some("admitted_at"),
+    )
+    .await?;
+    let trace_llm_calls =
+        table_usage_pg(&client, "cirislens.trace_llm_calls", Some("ts"), None).await?;
     // detection_events lives in cirislens_derived (V008). Always
     // built — DerivedSchema is feature-flag-independent.
-    let detection_events =
-        table_usage_pg(&client, "cirislens_derived.detection_events", "ts", None).await?;
+    let detection_events = table_usage_pg(
+        &client,
+        "cirislens_derived.detection_events",
+        Some("ts"),
+        None,
+    )
+    .await?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_pg(&client, "cirislens.audit_log", "recorded_at", None).await?
+            table_usage_pg(&client, "cirislens.audit_log", Some("recorded_at"), None).await?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -81,13 +92,58 @@ pub async fn storage_summary_pg(
     let edge_outbound_queue = table_usage_pg(
         &client,
         "cirislens.edge_outbound_queue",
-        "enqueued_at",
+        Some("enqueued_at"),
         None,
     )
     .await?;
 
-    let federation_keys =
-        table_usage_pg(&client, "cirislens.federation_keys", "valid_from", None).await?;
+    let federation_keys = table_usage_pg(
+        &client,
+        "cirislens.federation_keys",
+        Some("valid_from"),
+        None,
+    )
+    .await?;
+
+    // v38.4.0 (#767) — EVERY table, from the catalogue. Same rule as the
+    // SQLite backend: a table cannot enter the schema without appearing
+    // here, so the hand-maintained list above can no longer be the limit of
+    // what an operator is able to see.
+    //
+    // EXCLUDES system schemas rather than listing app ones (PR #769
+    // review). The first shape named three — and this repo's migrations
+    // create FIVE (`cirisgraph`, `cirislens`, `cirislens_derived`,
+    // `cirislens_secrets`, `cirisnode`), so `cirisgraph`, `cirisnode` and
+    // `cirislens_secrets` were invisible and their bytes fell anonymously
+    // into `dark_bytes` — the exact defect this walk exists to end,
+    // reintroduced one level up. A deny-list of system schemas covers a new
+    // schema the day it is created; an allow-list of app schemas does not.
+    let mut tables = std::collections::BTreeMap::new();
+    {
+        let rows = client
+            .query(
+                "SELECT schemaname || '.' || tablename AS qname \
+                 FROM pg_tables \
+                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                 AND schemaname NOT LIKE 'pg\\_%' \
+                 AND has_table_privilege(schemaname || '.' || tablename, 'SELECT') \
+                 ORDER BY 1",
+                &[],
+            )
+            .await
+            .map_err(|e| RetentionError::Backend(format!("catalogue: {e}")))?;
+        for row in rows {
+            let qname: String = row
+                .try_get("qname")
+                .map_err(|e| RetentionError::Backend(format!("decode catalogue: {e}")))?;
+            // Key on the BARE table name so a consumer reads the same key
+            // on either backend; the qualified name is a PG detail.
+            let bare = qname.rsplit('.').next().unwrap_or(&qname).to_owned();
+            let usage = table_usage_pg(&client, &qname, super::ts_column_for(&bare), None).await?;
+            tables.insert(bare, usage);
+        }
+    }
+    let dark_bytes = total_disk_bytes.saturating_sub(tables.values().map(|u| u.bytes).sum());
 
     Ok(StorageSummary {
         trace_events,
@@ -96,11 +152,15 @@ pub async fn storage_summary_pg(
         audit_log,
         edge_outbound_queue,
         federation_keys,
+        tables,
+        dark_bytes,
+        // PostgreSQL always answers `pg_total_relation_size`.
+        bytes_measurable: true,
         total_disk_bytes,
     })
 }
 
-/// Per-table read helper: bytes (`pg_relation_size`) + row count + ts
+/// Per-table read helper: bytes (`pg_total_relation_size`) + row count + ts
 /// bounds. `qualified` is the fully-qualified `schema.table` string;
 /// `ts_column` is the timestamp column for `MIN` / `MAX`.
 ///
@@ -117,16 +177,19 @@ pub async fn storage_summary_pg(
 async fn table_usage_pg(
     client: &deadpool_postgres::Client,
     qualified: &str,
-    ts_column: &str,
+    ts_column: Option<&str>,
     admitted_col: Option<&str>,
 ) -> Result<TableUsage, RetentionError> {
-    // pg_relation_size accepts a regclass; a missing table errors
+    // pg_total_relation_size accepts a regclass; a missing table errors
     // with `relation "..." does not exist`. We map that to an empty
     // TableUsage rather than failing — the cohabitation store has
     // optional tables.
     let bytes = match client
         .query_one(
-            &format!("SELECT pg_relation_size('{}')::BIGINT AS sz", qualified),
+            &format!(
+                "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
+                qualified
+            ),
             &[],
         )
         .await
@@ -145,14 +208,14 @@ async fn table_usage_pg(
                 }
             }
             return Err(RetentionError::Backend(format!(
-                "pg_relation_size {qualified}: {e}"
+                "pg_total_relation_size {qualified}: {e}"
             )));
         }
     };
 
     let stats_sql = format!(
         "SELECT count(*)::BIGINT AS rows, MIN({col})::TIMESTAMPTZ AS oldest, MAX({col})::TIMESTAMPTZ AS newest FROM {tbl}",
-        col = ts_column,
+        col = ts_column.unwrap_or("NULL"),
         tbl = qualified,
     );
     let row = client
@@ -198,6 +261,106 @@ async fn table_usage_pg(
         newest_ts,
         newest_admitted_at,
     })
+}
+
+/// v38.4.0 (CIRISPersist#767 Ask 2) — the `announced_peers` prune, PG arm.
+/// See the SQLite twin for why these two tables are prunable where an
+/// attestation is not.
+pub async fn prune_announced_peers_not_seen_since_pg(
+    backend: &PostgresBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_pg(
+        backend,
+        "cirislens.announced_peers",
+        "last_seen_at",
+        None,
+        cutoff,
+        max_rows,
+    )
+    .await
+}
+
+/// v38.4.0 (#767 Ask 2) — the `transport_destinations` prune, PG arm. Ages on
+/// `COALESCE(last_seen_at, asserted_at)` for the same reason as the SQLite
+/// twin: `last_seen_at` is advisory and nullable, and a NULL must not make a
+/// row immortal.
+pub async fn prune_transport_destinations_not_seen_since_pg(
+    backend: &PostgresBackend,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    prune_observation_table_pg(
+        backend,
+        "cirislens.transport_destinations",
+        "COALESCE(last_seen_at, asserted_at)",
+        // PR #769 review — never prune a V105 replicated tombstone; see the
+        // SQLite twin for why a retired route must outlive its observation.
+        Some("signature IS NULL AND retired_at IS NULL"),
+        cutoff,
+        max_rows,
+    )
+    .await
+}
+
+/// The shared PG prune body. Bounded by `ctid` so the SQL is identical
+/// whatever the table's key shape, with the age predicate repeated in the
+/// outer statement so a concurrent refresh cannot be deleted. Both call
+/// sites pass literals; nothing here is caller-supplied.
+async fn prune_observation_table_pg(
+    backend: &PostgresBackend,
+    table: &'static str,
+    age_expr: &'static str,
+    keep_predicate: Option<&'static str>,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<usize, RetentionError> {
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    let limit_i64 = i64::try_from(max_rows)
+        .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
+    let client = backend
+        .pool()
+        .get()
+        .await
+        .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
+    // v38.4.0 (PR #769 review) — bound by `ctid`, and RE-CHECK the age in the
+    // outer DELETE.
+    //
+    // The first shape reused one parenthesised key expression on both sides,
+    // which for the composite key produced
+    // `WHERE (a,b,c) IN (SELECT (a,b,c) ...)` — a row-valued single column on
+    // the right against a three-column row on the left. PostgreSQL rejects
+    // it, and the destination prune failed on every call. Measured, not
+    // reviewed: the probe returned `PRUNE_DEST_ERR` while the single-column
+    // peer prune succeeded.
+    //
+    // `ctid` sidesteps key SHAPE entirely — one physical row identifier,
+    // identical SQL for both tables. And repeating `{age_expr} < $1` in the
+    // outer statement closes the refresh race: between the sub-select's
+    // snapshot and the delete, an announce can refresh `last_seen_at`, and
+    // without the re-check the DELETE would remove a row that is no longer
+    // stale because its ctid was selected a moment earlier.
+    let keep = keep_predicate
+        .map(|p| format!(" AND {p}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "DELETE FROM {table} \
+         WHERE ctid IN ( \
+             SELECT ctid FROM {table} \
+             WHERE {age_expr} < $1{keep} \
+             ORDER BY {age_expr} \
+             LIMIT $2 \
+         ) \
+         AND {age_expr} < $1{keep}"
+    );
+    let deleted = client
+        .execute(&sql, &[&cutoff, &limit_i64])
+        .await
+        .map_err(|e| RetentionError::Backend(format!("prune {table}: {e}")))?;
+    Ok(usize::try_from(deleted).unwrap_or(0))
 }
 
 /// v2.7.0 — bounded-batch DELETE on `cirislens.trace_events` for

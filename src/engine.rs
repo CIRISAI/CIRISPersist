@@ -6897,6 +6897,76 @@ impl Engine {
         }
     }
 
+    /// v38.4.0 (CIRISPersist#767 Ask 2, PR #769 review) — prune `announced_peers` rows not seen since `cutoff`, bounded.
+    ///
+    /// The backend-dispatching facade. Without it a consumer holding an
+    /// ordinary `Engine` could not call the advertised prune without
+    /// feature-gated backend extraction — `delete_traces_older_than` has had
+    /// this shape since v2.7.0 and the new prunes must match it. Re-invoke
+    /// until it returns less than `max_rows`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn prune_announced_peers_not_seen_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<usize, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::prune_announced_peers_not_seen_since_pg(
+                    b, cutoff, max_rows,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::prune_announced_peers_not_seen_since_sqlite(
+                    b, cutoff, max_rows,
+                )
+                .await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::retention::RetentionError::Backend(
+                "prune_announced_peers_not_seen_since: unsupported backend".into(),
+            )),
+        }
+    }
+
+    /// v38.4.0 (CIRISPersist#767 Ask 2, PR #769 review) — the `transport_destinations` twin; never removes a V105 replicated tombstone.
+    ///
+    /// The backend-dispatching facade. Without it a consumer holding an
+    /// ordinary `Engine` could not call the advertised prune without
+    /// feature-gated backend extraction — `delete_traces_older_than` has had
+    /// this shape since v2.7.0 and the new prunes must match it. Re-invoke
+    /// until it returns less than `max_rows`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn prune_transport_destinations_not_seen_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<usize, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::prune_transport_destinations_not_seen_since_pg(
+                    b, cutoff, max_rows,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::prune_transport_destinations_not_seen_since_sqlite(
+                    b, cutoff, max_rows,
+                )
+                .await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::retention::RetentionError::Backend(
+                "prune_transport_destinations_not_seen_since: unsupported backend".into(),
+            )),
+        }
+    }
+
     /// v2.7.0 (CIRISPersist#107) — bounded-batch DELETE on
     /// `trace_events` for rows whose `ts < threshold`, capped at
     /// `max_rows`. Returns the actual rows deleted.
