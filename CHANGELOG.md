@@ -5,6 +5,63 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.6.0] - 2026-08-26
+
+CC 3.4.7.3 graduation (CIRISConstitution#95, rc4.5 `87e4095`;
+CIRISPersist#773). Claim rows `CLM-actor-substrate` and `CLM-common-human`
+graduate from `staged:CIRISConstitution#95`.
+
+### Fixed
+
+- **#773 — `check_node_agency_admission` is a MEMBERSHIP test.** It
+  constrained only a recipient whose `identity_type` was `node` and nothing
+  else, so fusing `agent` onto a node key made "infrastructure must not have
+  agency" stop firing — an escape hatch spelled as a simplification, where
+  consolidating two keys into one hybrid silently repealed the property.
+  Now `node ∈ identity_type` (CC 3.4.7.3 Clause B).
+
+  **This was CC's text, not a misreading**: CC 4.4.3.4.3 said "an identity
+  whose `identity_type` is `node`-only", and persist implemented that
+  faithfully. Clause A (non-cohabitable `{node,agent}`) does not substitute
+  for it — Clause A stops such a key being MINTED, while a non-conformant
+  key that already exists is still a possible `delegates_to` recipient.
+  Non-conformance is a reason to re-mint, never a reason the gate stops
+  applying.
+
+  Two existing tests **pinned the loophole** as correct
+  (`node_agent_hybrid_carries_agency_admitted`, memory + sqlite), written
+  as a negative control under the old text. They are inverted, with the
+  over-rejection guard they existed for preserved separately: a key with no
+  `node` role still carries agency freely.
+
+### Added
+
+- **#773 — `may_act_through(agent, node)`** (CC 3.4.7.3 Clause D):
+  `∃ h . h = owner_of(node) ∧ h ∈ stewards_of(agent)`. A comparison over
+  walks that already exist — no new verb, no new dimension, nothing added
+  to the closed attestation-type set. The asymmetry is load-bearing:
+  ownership is single-valued, stewardship multi-parent, so the rule is *the
+  node's one owner appears somewhere in the agent's steward set*, not "the
+  same human".
+
+  Fail-closed is normative, not boilerplate: an unowned or ambiguous node
+  is an `Err`, never `Ok(false)`. On the person/node axis the signature
+  failure is a silent withhold, where an unresolved walk reads as
+  permission — so "different humans" and "could not resolve" are kept as
+  different values, and the witness asserts that distinction directly.
+
+### Changed
+
+- **#773 — 28 CC 1.13.5 citations swept to CC 3.4.7.3.** The rule existed
+  only as a bullet inside CC 3.2, so there was no stable target to cite and
+  the wrong pointer spread; a reader following it landed on the
+  operational-language (safety-vs-censorship) section, which says nothing
+  about agency. Each site was checked for which rule it meant rather than
+  swept blindly — none of persist's carried the operational-language
+  meaning. The `NodeAgencyForbidden` message and the stale "node-only"
+  prose across seven files moved with them, since that text is now emitted
+  for hybrids too.
+
 ## [38.5.0] - 2026-08-26
 
 ### Added

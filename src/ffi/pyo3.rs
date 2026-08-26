@@ -7147,7 +7147,7 @@ impl PyEngine {
 
     /// v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by
     /// granting it `infra:*`-only scopes (passes the node-agency gate on a
-    /// node-only key). A `grant_delegation` specialization,
+    /// node-role key). A `grant_delegation` specialization,
     /// `sub_delegation=false`.
     ///
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
@@ -30265,9 +30265,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // replicated yet) from a substantive verdict, but only `kind()` crosses
         // the FFI — so a caller that must distinguish them reads the message.
         crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
-        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
-        // node-only key is caller-side authorization failure; ValueError
+        // node-role key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected

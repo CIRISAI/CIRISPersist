@@ -4998,10 +4998,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
         // on-node-key gate (parity with the sqlite + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
-        // recipient (`attested_key_id`) resolves to a node-ONLY identity it
+        // recipient (`attested_key_id`) resolves to an identity CONTAINING `node` it
         // REJECTS any scope set that is not `infra:*`-only (agency:* / legacy
         // unprefixed agency / empty / other) — "infrastructure must not have
         // agency" made cryptographic. Resolution uses the trait's own
@@ -31481,7 +31481,7 @@ mod tests {
         );
     }
 
-    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
     /// on-node-key gate, PG backend (3-backend parity with memory +
     /// sqlite). Covers (a) infra-only → ADMITTED, (b) agency:* → REJECTED
     /// + not stored, (b') legacy unprefixed agency → REJECTED, (c) empty
@@ -31536,7 +31536,7 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].attestation_id, id_a);
 
-        // (b) agency:* → REJECTED + not stored. THE CC 1.13.5 guard.
+        // (b) agency:* → REJECTED + not stored. THE CC 3.4.7.3 guard.
         let (id_b, att_b) = put(
             &owner,
             &node,
@@ -31610,7 +31610,7 @@ mod tests {
 
     /// SecReview F1 (PG parity): a DUPLICATE / whitespace node token
     /// (`"node,node"` / `"node, node"`) must NOT bypass the node-agency gate
-    /// — `agency:*` on such a node-only key is REJECTED + not stored. A
+    /// — `agency:*` on such a node-role key is REJECTED + not stored. A
     /// genuine `node,agent` hybrid is still ADMITTED (no over-reject).
     /// Run-scoped uuid-suffixed key ids.
     #[tokio::test]
@@ -31669,21 +31669,37 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
-        // Genuine node,agent hybrid → ADMITTED.
+        // v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — INVERTED, and
+        // the PG twin of the memory/sqlite pair.
+        //
+        // This asserted "a node,agent hybrid legitimately carries agency",
+        // which was correct under CC 4.4.3.4.3's `node`-ONLY wording. The
+        // amended rule is `node ∈ identity_type`, because the old form let a
+        // fused key slip the gate — consolidating two keys into one hybrid
+        // silently repealed "infrastructure must not have agency".
+        //
+        // Note this arm only runs against a LIVE postgres, which is why the
+        // hook's feature set stayed green while it was stale: the same
+        // certify-per-feature-set rule, on the backend axis.
         let att = pg_delegates_to(
             &owner,
             &hybrid,
             serde_json::json!([ds::AGENCY_ACT_ON_BEHALF]),
             false,
         );
-        let id = att.attestation_id.clone();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
-            .expect("a node,agent hybrid legitimately carries agency");
+            .expect_err(
+                "#773: a {node,agent} hybrid must now be REFUSED — membership, not \
+                 exclusivity",
+            );
+        // Verify-before-mutation: the refusal leaves no trace.
         let on_hybrid = backend.list_attestations_for(&hybrid).await.unwrap();
-        assert_eq!(on_hybrid.len(), 1);
-        assert_eq!(on_hybrid[0].attestation_id, id);
+        assert!(
+            on_hybrid.is_empty(),
+            "#773: a refused delegation must not be stored"
+        );
     }
 
     /// v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for

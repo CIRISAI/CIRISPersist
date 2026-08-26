@@ -574,7 +574,7 @@ mod tests {
             crate::federation::admission::scopes_are_infra_only(
                 &std::iter::once(delegation_scope::INFRA_CLASSIFY_CONTENT.to_owned()).collect()
             ),
-            "CC 1.13.5 / CC 4.4.3.4.3 — a pure node delegate can actually hold it"
+            "CC 3.4.7.3 / CC 4.4.3.4.3 — a pure node delegate can actually hold it"
         );
     }
 

@@ -3139,10 +3139,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // scoped delegates_to chain. Absence ⇒ REJECT.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
         // on-node-key gate. A no-op for non-`delegates_to` rows; for a
         // `delegates_to` whose recipient (`attested_key_id`) resolves to a
-        // node-ONLY identity it REJECTS any scope set that is not
+        // identity CONTAINING `node` it REJECTS any scope set that is not
         // `infra:*`-only (agency:* / legacy unprefixed agency / empty /
         // other) — "infrastructure must not have agency" made cryptographic.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
@@ -10953,6 +10953,14 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.6.0 (CIRISPersist#773) — may_act_through, memory arm.
+    #[tokio::test]
+    async fn may_act_through_memory_773() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_may_act_through(&backend, "mem")
+            .await;
+    }
+
     /// v38.5.0 (CIRISPersist#771) — duplicate is AlreadyHeld, memory arm.
     #[tokio::test]
     async fn duplicate_is_already_held_memory_771() {
@@ -11593,7 +11601,7 @@ mod tests {
         })
     }
 
-    // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
+    // ── #236 CC 4.4.3.4.3 / CC 3.4.7.3 — reject-agency-on-node-key gate ───
 
     /// Build a `delegates_to` row from `attesting` to `attested` carrying
     /// the given scope set (array wire shape). Re-uses `fix_attestation`
@@ -11698,7 +11706,80 @@ mod tests {
     }
 
     /// (b) delegates_to → node key carrying agency:* → REJECTED + not stored.
-    /// THE load-bearing CC 1.13.5 guard.
+    /// THE load-bearing CC 3.4.7.3 guard.
+    /// v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — **the hybrid
+    /// loophole: fusing `agent` onto a node key must NOT repeal the gate.**
+    ///
+    /// The gate used to test `identity_type == {node}` exactly, so a
+    /// `{node,agent}` recipient fell through and "infrastructure must not
+    /// have agency" silently stopped applying. Nothing witnessed it — the
+    /// rejection test below only ever used a pure-node key, so the gate
+    /// could be repealed by a one-token edit and the suite stayed green.
+    ///
+    /// Clause A forbids MINTING such a key, but a non-conformant key that
+    /// already exists is still a key in the data and still a possible
+    /// `delegates_to` recipient. Non-conformance is a reason to re-mint,
+    /// never a reason the gate stops applying.
+    #[tokio::test]
+    async fn hybrid_node_agent_key_still_refuses_agency_773() {
+        use crate::federation::types::{delegation_scope as ds, identity_type};
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+
+        // A key carrying BOTH roles — the shape a "consolidation" produces.
+        let mut hybrid = fix_key("hybrid-key", "hybrid", "registry-steward");
+        hybrid.identity_type = format!("{},{}", identity_type::NODE, identity_type::AGENT);
+        backend
+            .put_public_key(SignedKeyRecord { record: hybrid })
+            .await
+            .expect("register hybrid key");
+
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-agency-hybrid",
+                    "owner",
+                    "hybrid-key",
+                    "owner",
+                    &[ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .expect_err(
+                "#773: a {node,agent} recipient must STILL be refused — membership, not \
+                 exclusivity. Passing here is the escape hatch: consolidating two keys into \
+                 one hybrid would silently switch the property off.",
+            );
+        assert!(
+            matches!(err, crate::federation::Error::NodeAgencyForbidden { .. }),
+            "#773: and it refuses by the SAME typed error, not some neighbouring gate: {err}"
+        );
+
+        // The other half of the rule: a key with NO node role is untouched —
+        // an agent legitimately carries agency, and this must not over-reject.
+        let mut brain = fix_key("brain-key", "brain", "registry-steward");
+        brain.identity_type = identity_type::AGENT.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: brain })
+            .await
+            .expect("register agent key");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-agency-brain",
+                    "owner",
+                    "brain-key",
+                    "owner",
+                    &[ds::AGENCY_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .expect(
+                "#773: an agent key legitimately carries agency — the gate is about the \
+                     NODE role, not about all keys",
+            );
+    }
+
     #[tokio::test]
     async fn node_delegation_agency_rejected_not_stored() {
         use crate::federation::types::delegation_scope as ds;
@@ -11814,9 +11895,9 @@ mod tests {
 
     /// SecReview F1: a DUPLICATE `identity_type` token (`"node,node"` /
     /// `"node, node"`) must NOT bypass the node-agency gate. The gate tests
-    /// the identity_type *set*, so a node-only key carrying `agency:*` is
+    /// the identity_type *set*, so a node-role key carrying `agency:*` is
     /// REJECTED + not stored regardless of dup/whitespace tokens — closing
-    /// the `parse_set` non-dedup bypass (CC 1.13.5 / CC 4.4.3.4.3).
+    /// the `parse_set` non-dedup bypass (CC 3.4.7.3 / CC 4.4.3.4.3).
     #[tokio::test]
     async fn node_delegation_agency_rejected_with_duplicate_identity_type_token() {
         use crate::federation::types::delegation_scope as ds;
@@ -11868,9 +11949,27 @@ mod tests {
         }
     }
 
-    /// SecReview F1 (negative control): a genuine `node,agent` HYBRID key is
-    /// NOT node-only, so it legitimately carries `agency:*` — the set-based
-    /// gate must still ADMIT it (no over-reject from the dedup fix).
+    /// v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — **INVERTED: the
+    /// hybrid is now REFUSED.**
+    ///
+    /// This test used to assert the opposite, as a negative control for the
+    /// SecReview F1 dedup fix: "a genuine `node,agent` HYBRID key is NOT
+    /// node-only, so it legitimately carries `agency:*`". Under CC's text at
+    /// the time that was correct — CC 4.4.3.4.3 said the rule applied to an
+    /// identity that is `node`-ONLY. So this test was not wrong; it pinned
+    /// the constitution as written.
+    ///
+    /// CC 3.4.7.3 amends the rule to `node ∈ identity_type`, because the
+    /// old form was an escape hatch spelled as a simplification: fusing
+    /// `agent` onto a node key silently repealed "infrastructure must not
+    /// have agency". Clause A separately forbids MINTING such a key, but a
+    /// non-conformant key that already exists is still a possible
+    /// `delegates_to` recipient — non-conformance is a reason to re-mint,
+    /// never a reason the gate stops applying.
+    ///
+    /// The over-rejection guard the negative control existed for has NOT
+    /// been dropped: `hybrid_node_agent_key_still_refuses_agency_773`
+    /// asserts that a key with NO node role still carries agency freely.
     #[tokio::test]
     async fn node_agent_hybrid_carries_agency_admitted() {
         use crate::federation::types::delegation_scope as ds;
@@ -11905,10 +12004,18 @@ mod tests {
                 ),
             })
             .await
-            .expect("a node,agent hybrid legitimately carries agency");
+            .expect_err(
+                "#773 / CC 3.4.7.3 Clause B: a {node,agent} hybrid must now be REFUSED — \
+                 membership, not exclusivity. Admitting here is the escape hatch the \
+                 amendment closes.",
+            );
+        // Verify-before-mutation: the refusal leaves NO trace.
         let stored = backend.list_attestations_for("node-agent").await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].attestation_id, "d-hybrid");
+        assert!(
+            stored.is_empty(),
+            "#773: a refused delegation must not be stored — the gate runs before the row \
+             is hashed and INSERTed"
+        );
     }
 
     #[tokio::test]
@@ -16307,7 +16414,7 @@ mod tests {
     }
 
     /// An STEWARD-BOUND agent member (live `delegates_to(user → agent)`) →
-    /// ADMITTED. Agent is not node-only, so the delegation needs no infra
+    /// ADMITTED. The agent carries no `node` role, so the delegation needs no infra
     /// scope to store.
     #[tokio::test]
     async fn community_steward_bound_agent_member_admitted() {

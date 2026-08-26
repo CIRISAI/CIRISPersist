@@ -4368,7 +4368,9 @@ impl Engine {
     ///
     /// `delegate_key_id` MUST exist in `federation_keys` (the
     /// `attested_key_id` FK). The CC 4.4.3.4.3 node-agency gate runs on the
-    /// emitted row: a node-ONLY recipient may carry only `infra:*` scopes —
+    /// emitted row: a recipient whose `identity_type` contains `node` may
+    /// carry only `infra:*` scopes (CC 3.4.7.3 Clause B — membership, not
+    /// exclusivity) —
     /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
     ///
@@ -4433,7 +4435,7 @@ impl Engine {
     /// scopes. A [`Self::grant_delegation`] specialization that carries ONLY
     /// server-class (`infra:*`) authority, so it passes the CC 4.4.3.4.3
     /// node-agency gate even when `node_or_agent_key_id` resolves to a
-    /// node-ONLY identity (the gate rejects any non-`infra:*` token on such
+    /// identity CONTAINING `node` (the gate rejects any non-`infra:*` token on such
     /// a key). `sub_delegation` is `false` — an steward-binding is a leaf
     /// authorization, not a deputization. Returns the `attestation_id`.
     ///
@@ -14853,7 +14855,7 @@ mod tests {
     }
 
     /// #249 — `steward_bind` emits an `infra:*`-only `delegates_to` from an
-    /// steward-bound (user) signer to a node-ONLY key: it PASSES the CC
+    /// steward-bound (user) signer to a node-role key: it PASSES the CC
     /// 4.4.3.4.3 node-agency gate (so it stores), and afterward
     /// `is_steward_bound(node)` is true (the edge the reader walks).
     #[cfg(feature = "sqlite")]
@@ -14872,7 +14874,7 @@ mod tests {
         sq.put_public_key(user_test_key_derived_for(&derived, "owner"))
             .await
             .expect("seed owner");
-        // The recipient is a NODE-ONLY key (the gate constrains it).
+        // The recipient carries the `node` role (the gate constrains it).
         let mut node_key = sweeper_test_key("node-1");
         node_key.record.identity_type = crate::federation::types::identity_type::NODE.into();
         sq.put_public_key(node_key).await.expect("seed node");
