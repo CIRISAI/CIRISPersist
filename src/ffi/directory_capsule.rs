@@ -243,7 +243,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 4;
+pub const DIRECTORY_ABI_VERSION: u32 = 5;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -917,9 +917,16 @@ pub enum DirectoryOpResult {
     /// structured [`crate::federation::Error`] does not cross the ABI;
     /// the consumer maps this to a generic error on its side.
     Err(String),
+    /// v38.5.0 (#771) — what a `put_attestation` DID.
+    ///
+    /// `Unit` cannot carry it, and collapsing `AlreadyHeld` into `Unit` here
+    /// would reproduce the very defect #771 filed: a classification lost at
+    /// a crate boundary, leaving the caller unable to tell idempotent
+    /// success from a state change. The ABI version moves with it.
+    AttestationOutcome(crate::federation::AttestationOutcome),
     /// The `()` returns: `put_transport_destination`, `put_revocation`,
     /// `put_public_key`, `put_location_proof`, `put_identity_occurrence`,
-    /// `put_family`, `put_community`, `put_attestation`,
+    /// `put_family`, `put_community`,
     /// `release_shared_instance_lease`.
     Unit,
     /// `lookup_public_key`.
@@ -1445,7 +1452,7 @@ pub async fn dispatch_directory_op(
         },
         DirectoryOp::PutAttestation { attestation } => match dir.put_attestation(attestation).await
         {
-            Ok(()) => DirectoryOpResult::Unit,
+            Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PeerMetadataFor { key_id } => match dir.peer_metadata_for(&key_id).await {
@@ -2222,12 +2229,15 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error> {
+    async fn put_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<crate::federation::AttestationOutcome, Error> {
         match self
             .run_op(&DirectoryOp::PutAttestation { attestation })
             .await?
         {
-            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::AttestationOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4143,18 +4153,22 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_4() {
+    fn abi_version_pinned_at_5() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 4,
-            "an existing DirectoryOp variant's shape changed in v38.0.0 \
-             (RemovePeerRecord gained reason + acting_under_delegation_id, \
-             CIRISPersist#721); the load-time gate is the only signal a \
-             consumer gets BEFORE it dispatches an op, so a shape break must \
+            DIRECTORY_ABI_VERSION, 5,
+            "the RESULT wire gained a variant in v38.5.0 \
+             (DirectoryOpResult::AttestationOutcome, CIRISPersist#771): a \
+             consumer built against 4 decodes `Unit` for put_attestation and \
+             would fail to decode the new variant, so the load-time gate must \
+             say so. Previous move: v38.0.0, an existing DirectoryOp shape \
+             change (RemovePeerRecord, #721); the load-time gate is the only \
+             signal a consumer gets BEFORE it dispatches an op, so a shape \
+             break must \
              move this or the gate certifies a contract the consumer was not \
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 4,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 5,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -4249,7 +4263,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "f3dbfcfd6747d72c343b4e475270be861aeb0f83f804eeb2541effd51ca579d9",
+            "6ef59d4f1da1ca8346961496a5aad4a4488ce4ff80ac87e917c4d2b3fd5e1d24",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

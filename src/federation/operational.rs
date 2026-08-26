@@ -2280,6 +2280,7 @@ pub mod test_support {
         directory
             .put_attestation(crate::federation::SignedAttestation { attestation: edge })
             .await
+            .map(|_| ())
     }
 
     /// **v31.0.0 (CIRISPersist#659) — THE UNREPLICATED-NODE RACE, at the real
@@ -4454,6 +4455,7 @@ pub mod test_support {
         directory
             .put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
+            .map(|_| ())
     }
 
     /// **CIRISPersist#561 — transport-hop eligibility, end to end, on any

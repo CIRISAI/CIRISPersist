@@ -4538,7 +4538,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_attestation(
         &self,
         attestation: crate::federation::SignedAttestation,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error> {
         let mut row = attestation.attestation;
 
         // ── AV-76 TIER 0 — the free prologue ────────────────────────
@@ -4965,7 +4965,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         ))
                     })?;
                 if exists.is_some() {
-                    return Ok(());
+                    // v38.5.0 (#771) — the dedup path names its outcome.
+                    return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
                 }
             }
         }
@@ -5153,7 +5154,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_attestations")
             .await?;
-        client
+        // v38.5.0 (#771) — absorb, then re-read to decide. See the SQLite
+        // twin and `attestation_reput_verdict`: a re-delivered identical row
+        // is idempotent success the sender must be able to recognise, while
+        // a DIFFERENT row under an occupied id stays a typed Conflict.
+        let inserted_rows = client
             .execute(
                 "INSERT INTO cirislens.federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
@@ -5162,7 +5167,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                     subject_key_ids, withdraws_admission_rule, cohort_scope, \
                     tier, promoted_at, additional_scrubs, admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
+                 ON CONFLICT (attestation_id) DO NOTHING",
                 &[
                     &row.attestation_id,
                     &row.attesting_key_id,
@@ -5201,6 +5207,40 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_attestation_pg_err("insert attestation"))?;
+
+        if inserted_rows == 0 {
+            // The id was occupied. RE-READ decides which case this is.
+            let stored: Option<String> = client
+                .query_opt(
+                    "SELECT persist_row_hash FROM cirislens.federation_attestations \
+                     WHERE attestation_id = $1",
+                    &[&row.attestation_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("re-read attestation: {e}"))
+                })?
+                .map(|r| {
+                    r.safe_get_with::<String, _, _, _>(
+                        "persist_row_hash",
+                        crate::federation::Error::Backend,
+                    )
+                })
+                .transpose()?;
+            let Some(stored_hash) = stored else {
+                return Err(crate::federation::Error::Backend(format!(
+                    "attestation {} was absorbed as a duplicate but is not present on \
+                     re-read",
+                    row.attestation_id
+                )));
+            };
+            crate::federation::attestation_reput_verdict(
+                &stored_hash,
+                &row.persist_row_hash,
+                &row.attestation_id,
+            )?;
+            return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+        }
         // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
         // only, the E5 invariant; `put_attestation` is the federation write
         // path so this always holds in practice). `Attestation` IS its own
@@ -5260,7 +5300,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self.index_stored_record("Attestation", &wire_index_key)
                 .await?;
         }
-        Ok(())
+        Ok(crate::federation::AttestationOutcome::Inserted)
     }
 
     async fn attestation_upsert_local(
@@ -30458,6 +30498,25 @@ mod tests {
     // V020 column additions + CHECK constraints + UPSERT semantics
     // against a real Postgres deployment. Gated on
     // CIRIS_PERSIST_TEST_PG_URL like the rest of this test module.
+
+    /// v38.5.0 (CIRISPersist#771) — duplicate is AlreadyHeld, postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn duplicate_is_already_held_pg_771() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_duplicate_is_already_held(
+            &backend, &suffix,
+        )
+        .await;
+    }
 
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, postgres arm.
     #[tokio::test]

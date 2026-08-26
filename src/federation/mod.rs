@@ -387,7 +387,7 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
-pub(crate) use tier_ingest::community_reput_verdict;
+pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
     verify_envelope_hybrid_signature, verify_family_admission,
@@ -573,6 +573,37 @@ fn overdue_row(
         age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
         tier: rev.tier.clone(),
     }
+}
+
+/// v38.5.0 (CIRISPersist#771) — **what a `put_attestation` actually did.**
+///
+/// The Attestation plane's counterpart to [`ReplicatedKeyOutcome`](register::ReplicatedKeyOutcome),
+/// which the Key plane has had since v24.2.0 (#565) and which this plane
+/// never got. Without it "already held" and "backend broken" reached the
+/// consumer as one token, so a re-delivered row could not be recognised as
+/// routine non-progress: measured at 7,536 refusals in six hours on the
+/// production canonical, 428 rows re-sent up to 82 times each, none of them
+/// lost and none of them acknowledged.
+///
+/// Deliberately NOT an error variant. "I already hold this" is idempotent
+/// SUCCESS — it is the anti-entropy protocol working — and modelling it as a
+/// failure would put a permanent, benign condition on the error path where
+/// every consumer must special-case it back out again. Consumers key on the
+/// variant, never on message prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum AttestationOutcome {
+    /// A new row landed; this node's state changed. The anti-entropy
+    /// progress signal.
+    Inserted,
+    /// This node already held a BYTE-IDENTICAL row (same `attestation_id`,
+    /// same `persist_row_hash`). Nothing changed and nothing is wrong —
+    /// consumers should count this as a duplicate, not a refusal.
+    ///
+    /// A same-id row with DIFFERENT bytes never reaches here: that is a
+    /// typed [`Error::Conflict`], because two rows claiming one identity is
+    /// a real disagreement (see `attestation_reput_verdict`).
+    AlreadyHeld,
 }
 
 /// v38.4.0 (PR #769 review) — how many candidate pages one reap sweep will
@@ -890,7 +921,10 @@ pub trait FederationDirectory: Send + Sync {
     // ── Attestations ───────────────────────────────────────────────
 
     /// Insert a new attestation row.
-    async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error>;
+    async fn put_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<AttestationOutcome, Error>;
 
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
     /// Attestation-plane apply**: the Key plane's #565 twin
@@ -964,7 +998,7 @@ pub trait FederationDirectory: Send + Sync {
             Some(Plan::Insert) | None => {}
         }
         match self.put_attestation(attestation).await {
-            Ok(()) => {
+            Ok(_) => {
                 // §6.1: a structural-composer replay is a silent `Ok` with NO
                 // row written. Ask the store what it actually did, so
                 // `Inserted` keeps meaning inserted. Skipped on the plan-free

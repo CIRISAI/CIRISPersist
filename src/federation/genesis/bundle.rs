@@ -758,7 +758,12 @@ where
             // Nothing there, or a row this bundle does not own: the ordinary
             // insert, with every gate running.
             None => match directory.put_attestation(sa.clone()).await {
-                Ok(()) => BakeItemOutcome::Anchored,
+                Ok(crate::federation::AttestationOutcome::Inserted) => BakeItemOutcome::Anchored,
+                // v38.5.0 (#771) — `AlreadyHeld` reaches the same classifier
+                // as the duplicate-key arm below, for the reason that arm
+                // states: a collision proves somebody won, NOT that your row
+                // is the one present.
+                Ok(_) => classify_after_duplicate(directory, sa).await?,
                 // v31.1.0 (CIRISPersist#665 review) — A DUPLICATE KEY PROVES
                 // SOMEBODY WON, NOT THAT **YOUR** ROW IS PRESENT.
                 //
@@ -821,7 +826,15 @@ where
                         .await?
                     {
                         match directory.put_attestation(sa.clone()).await {
-                            Ok(()) => BakeItemOutcome::ReAnchored,
+                            Ok(crate::federation::AttestationOutcome::Inserted) => {
+                                BakeItemOutcome::ReAnchored
+                            }
+                            // v38.5.0 (#771) — `AlreadyHeld` is the same
+                            // condition the duplicate-key arm handles, now
+                            // typed instead of string-tested. It must reach
+                            // the SAME classifier: a collision proves somebody
+                            // won, not that YOUR row is present.
+                            Ok(_) => classify_after_duplicate(directory, sa).await?,
                             Err(e) if e.is_duplicate_key() => {
                                 classify_after_duplicate(directory, sa).await?
                             }
@@ -915,7 +928,15 @@ where
                         // branch uses, so one rule answers "what is actually
                         // there" at both sites.
                         match directory.put_attestation(sa.clone()).await {
-                            Ok(()) => BakeItemOutcome::ReAnchored,
+                            Ok(crate::federation::AttestationOutcome::Inserted) => {
+                                BakeItemOutcome::ReAnchored
+                            }
+                            // v38.5.0 (#771) — `AlreadyHeld` is the same
+                            // condition the duplicate-key arm handles, now
+                            // typed instead of string-tested. It must reach
+                            // the SAME classifier: a collision proves somebody
+                            // won, not that YOUR row is present.
+                            Ok(_) => classify_after_duplicate(directory, sa).await?,
                             Err(e) if e.is_duplicate_key() => {
                                 classify_after_duplicate(directory, sa).await?
                             }

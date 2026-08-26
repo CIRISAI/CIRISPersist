@@ -565,7 +565,10 @@ pub(crate) mod test_support {
         sealed_row_
     }
 
-    fn expect_510_reject(result: &Result<(), crate::federation::Error>, what: &str) {
+    fn expect_510_reject(
+        result: &Result<crate::federation::AttestationOutcome, crate::federation::Error>,
+        what: &str,
+    ) {
         match result {
             Err(crate::federation::Error::InvalidArgument(msg)) => {
                 assert!(

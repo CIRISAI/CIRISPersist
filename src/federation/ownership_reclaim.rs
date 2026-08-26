@@ -1520,6 +1520,7 @@ pub(crate) mod test_support {
             attestation: row.clone(),
         })
         .await
+        .map(|_| ())
     }
 
     /// A hybrid-signed `self_touch` freshness claim.

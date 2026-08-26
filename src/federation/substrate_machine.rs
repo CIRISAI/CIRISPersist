@@ -1009,7 +1009,7 @@ pub mod test_support {
                 .put_attestation(SignedAttestation { attestation: row })
                 .await;
             match res {
-                Ok(()) => {
+                Ok(_) => {
                     self.remember(&id);
                     self.occupy(occupied);
                     OpOutcome {
@@ -2410,7 +2410,7 @@ pub mod test_support {
                         .put_attestation(SignedAttestation { attestation: row })
                         .await
                     {
-                        Ok(()) => {
+                        Ok(_) => {
                             self.remember(&id);
                             OpOutcome {
                                 admitted: true,

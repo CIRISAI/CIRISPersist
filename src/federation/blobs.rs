@@ -2265,6 +2265,7 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     directory
         .put_attestation(crate::federation::SignedAttestation { attestation: row })
         .await
+        .map(|_| ())
         .map_err(|e| BlobError::Backend(format!("withdraws put_attestation: {e}")))
 }
 

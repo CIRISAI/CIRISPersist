@@ -174,7 +174,10 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.set_consent_role(key_id, consent_role).await
     }
-    async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error> {
+    async fn put_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<crate::federation::AttestationOutcome, Error> {
         if let Some(e) = self.faulted("put_attestation") {
             return Err(e);
         }

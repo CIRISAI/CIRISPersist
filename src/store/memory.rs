@@ -2733,7 +2733,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_attestation(
         &self,
         attestation: crate::federation::SignedAttestation,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error> {
         let mut row = attestation.attestation;
 
         // ── AV-76 TIER 0 — the free prologue ────────────────────────
@@ -3107,7 +3107,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let state = self.state.lock().expect("memory backend lock");
             for existing in &state.federation_attestations {
                 if crate::federation::precedence::is_dedup_match(existing, &row) {
-                    return Ok(());
+                    // v38.5.0 (#771) — this dedup already existed and already
+                    // returned success; it just could not SAY that the row
+                    // was a duplicate rather than newly stored.
+                    return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
                 }
             }
         }
@@ -3273,17 +3276,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // hard-asserts `error_kind` equality across backends. §6.1 replay is
             // unaffected: a structural composer replaying an existing triple
             // short-circuits at tier 4b and never reaches this line.
-            if state
-                .federation_attestations
-                .iter()
-                .any(|existing| existing.attestation_id == row.attestation_id)
-            {
-                return Err(crate::federation::Error::Backend(
-                    "insert attestation: UNIQUE constraint failed: \
-                     federation_attestations.attestation_id"
-                        .to_string(),
-                ));
-            }
 
             // v24.0.0 (CIRISPersist#557) — the attested-subject rule moved to
             // the shared `check_attested_subject_admission` predicate (run at
@@ -3293,6 +3285,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // emulation and the FK are now the same predicate.
 
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+            // v38.5.0 (CIRISPersist#771) — the emulation MOVES WITH the thing
+            // it emulates.
+            //
+            // This backend reproduced sqlite's UNIQUE failure byte for byte so
+            // `assert_parity` saw one `error_kind` everywhere. sqlite now
+            // absorbs the duplicate and decides by RE-READ, so this decides
+            // the same way — otherwise the parity gate would be pinning a
+            // behaviour only this backend still has, which is the opposite of
+            // what it exists for.
+            //
+            // Placed AFTER `persist_row_hash` is computed (the verdict
+            // compares hashes, and the offered one does not exist before this
+            // line) and BEFORE any state mutation, so a duplicate leaves no
+            // trace — the subject-index push immediately below would
+            // otherwise record a row this call never stored. Still below the
+            // tier-4 authority gates, so the refusal-ordering parity the
+            // original placement protected is unchanged.
+            if let Some(existing) = state
+                .federation_attestations
+                .iter()
+                .find(|existing| existing.attestation_id == row.attestation_id)
+            {
+                let stored_hash = existing.persist_row_hash.clone();
+                let offered_hash = row.persist_row_hash.clone();
+                let id = row.attestation_id.clone();
+                drop(state);
+                crate::federation::attestation_reput_verdict(&stored_hash, &offered_hash, &id)?;
+                return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+            }
+
             // v17.4.0 (V106) — maintain the subject-index mirror.
             for subj in &row.subject_key_ids {
                 state
@@ -3374,7 +3397,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             self.index_stored_record("Attestation", &wire_index_key)
                 .await?;
         }
-        Ok(())
+        Ok(crate::federation::AttestationOutcome::Inserted)
     }
 
     async fn list_scores(
@@ -10930,6 +10953,16 @@ mod tests {
     /// `revoke_trust` literally discarded `revoked_by`. Now: a forged
     /// signature refuses; an imposter signing someone else's granter name
     /// refuses; the honest granter's grant lands; only the granter revokes.
+    /// v38.5.0 (CIRISPersist#771) — duplicate is AlreadyHeld, memory arm.
+    #[tokio::test]
+    async fn duplicate_is_already_held_memory_771() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_duplicate_is_already_held(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     /// v38.4.0 (CIRISPersist#768) — **the reaper honours the producer's
     /// stated shelf life, and CANNOT eat evidence.**
     ///
@@ -13597,7 +13630,10 @@ mod tests {
             g
         }
 
-        fn expect_510_reject(result: &Result<(), crate::federation::Error>, what: &str) {
+        fn expect_510_reject(
+            result: &Result<crate::federation::AttestationOutcome, crate::federation::Error>,
+            what: &str,
+        ) {
             match result {
                 Err(crate::federation::Error::InvalidArgument(msg)) => {
                     assert!(
@@ -20320,6 +20356,10 @@ mod tests {
         put_typed_key(backend, key_id, it).await;
         // The root charters itself (key root), this node accepts it, and it
         // confers `scope` on the emitter.
+        //
+        // v38.5.0 (#771) — rows already placed by an earlier conferral in
+        // this test are SKIPPED below, not re-offered: their ids are derived
+        // and stable while `asserted_at` is not.
         for (id, from, to, dim, sc) in [
             // The root charters ITSELF (key root). It must carry a
             // pre_rotation_commitment: without a pre-committed successor set,
@@ -20362,6 +20402,17 @@ mod tests {
                     .expect("commitment"));
             }
             let envelope = envelope;
+            // v38.5.0 (#771) — skip what an earlier conferral in this test
+            // already placed, rather than re-offering it with a fresh
+            // `asserted_at` under the same derived id.
+            if crate::federation::FederationDirectory::get_attestation(backend, id)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
             let mut a = fix_attestation(id, from, to, from);
             a.attestation_type =
                 crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
@@ -20379,12 +20430,11 @@ mod tests {
                 .put_attestation(crate::federation::SignedAttestation { attestation: a })
                 .await
             {
-                Ok(()) => {}
-                // Re-asserting the shared charter / accept row is expected when
-                // a test confers on more than one key. A UNIQUE violation on
-                // the SAME id is idempotence, not a failure — anything else
-                // still fails loudly.
-                Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
+                Ok(_) => {}
+                // v38.5.0 (CIRISPersist#771) — see the twin in
+                // `admission.rs`: this "idempotence" was a DIFFERENT row
+                // (fresh `asserted_at`) under a derived id, silently
+                // discarded. The fixture now skips what it already placed.
                 Err(e) => panic!("conferral edge must admit: {e}"),
             }
         }

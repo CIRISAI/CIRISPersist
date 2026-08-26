@@ -205,6 +205,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_revocation_scrub_skew", Class::Gate),
     ("check_role_authority", Class::Gate),
     ("check_row_column_binding", Class::Gate),
+    // v38.5.0 (CIRISPersist#771) — refuses a DIFFERENT row under an occupied
+    // `attestation_id`. A Gate, not Plumbing: identical bytes are an
+    // idempotent no-op and only a genuine disagreement refuses, which is a
+    // policy question about the caller's input rather than a substrate one.
+    ("attestation_reput_verdict", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),

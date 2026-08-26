@@ -5,6 +5,46 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.5.0] - 2026-08-26
+
+### Added
+
+- **#771 — `AttestationOutcome { Inserted, AlreadyHeld }`.** A re-delivered
+  attestation used to raise a UNIQUE violation that the error mapping
+  defaulted to `Error::Backend`, so *"I already hold this"* — idempotent
+  success, and the anti-entropy protocol working — reached the sender with
+  the same token as *"the database is broken"* (`federation_backend`).
+  The sender could never learn the row landed, so it retried forever:
+  measured on the production canonical at **7,536 refusals in six hours,
+  428 distinct rows re-sent up to 82 times each**, 58% of all refusals on
+  that node, drowning the genuine ones that the consumer's `Duplicate`
+  branch exists to keep visible.
+
+  The Key plane has had `ReplicatedKeyOutcome` since v24.2.0 (#565); the
+  Attestation plane never got it. It has it now, deliberately as an
+  OUTCOME rather than an error variant — a permanent, benign condition on
+  the error path is something every consumer must special-case back out.
+
+  Decided by the #758/#719 discipline, one predicate
+  (`attestation_reput_verdict`): absorb the insert (`OR IGNORE` /
+  `ON CONFLICT DO NOTHING`), then RE-READ to choose — identical
+  `persist_row_hash` is `AlreadyHeld`, a DIFFERENT row under an occupied id
+  is a typed `Error::Conflict`. Quieting duplicates must not become
+  accepting anything: two rows claiming one identity is a real
+  disagreement, the same line the Key plane draws between
+  `AlreadyAnchoredIdentical` and `ConflictingVersion`.
+
+### Changed
+
+- **`DIRECTORY_ABI_VERSION` 4 → 5.** `DirectoryOpResult` gains
+  `AttestationOutcome`. `Unit` cannot carry the distinction, and collapsing
+  `AlreadyHeld` into it at the capsule boundary would reproduce #771's own
+  defect one layer down — a classification lost at a crate boundary. The
+  memory backend's byte-for-byte emulation of sqlite's UNIQUE error moved
+  with it: it exists so `assert_parity` sees one `error_kind` everywhere,
+  so pinning a behaviour only that backend still had would invert its
+  purpose.
+
 ## [38.4.0] - 2026-08-22
 
 The production-retention cut. Filed from a node that blew past its capacity
