@@ -177,7 +177,7 @@ impl FederationDirectory for FaultInjectingDirectory {
     async fn put_attestation(
         &self,
         attestation: SignedAttestation,
-    ) -> Result<crate::federation::AttestationOutcome, Error> {
+    ) -> Result<AttestationOutcome, Error> {
         if let Some(e) = self.faulted("put_attestation") {
             return Err(e);
         }
