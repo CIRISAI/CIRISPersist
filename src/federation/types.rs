@@ -160,11 +160,11 @@ pub mod identity_type {
         LENSCORE_DETECTOR,
         VERIFY,
     ];
-    /// v9.0.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
+    /// v9.0.0 (CIRISPersist#235, CC 3.4.7.1 / CC 3.4.7.3) — the
     /// fabric/infrastructure role. A CIRISServer (or any pure
     /// infrastructure node) self-registers its federation signing key
     /// with this `identity_type`. **A `node`-role key MUST NOT carry
-    /// agency** (CC 1.13.5): a `delegates_to` whose recipient resolves
+    /// agency** (CC 3.4.7.3): a `delegates_to` whose recipient resolves
     /// to a `node`-only identity may carry ONLY [`super::delegation_scope`]
     /// `infra:*` scopes — the admission gate in
     /// [`super::admission::check_node_agency_admission`] rejects any
@@ -727,7 +727,7 @@ pub mod owner_binding {
     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
 }
 
-/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the reserved
 /// **two-prefix delegation scope split** that makes "infrastructure
 /// must not have agency" wire-checkable.
 ///
@@ -741,7 +741,7 @@ pub mod owner_binding {
 ///   [`INFRA_SERVE`], [`INFRA_STORE`],
 ///   [`INFRA_TRANSPORT`], [`INFRA_ATTEST`].
 /// - [`AGENCY_PREFIX`] (`agency:*`) — **brain-only** authority, FORBIDDEN
-///   for a `node`-role delegate (CC 1.13.5). Canonical agency scopes:
+///   for a `node`-role delegate (CC 3.4.7.3). Canonical agency scopes:
 ///   [`AGENCY_ACT_ON_BEHALF`], [`AGENCY_MESSAGE_IO`], [`AGENCY_REASON`],
 ///   [`AGENCY_DECIDE`].
 ///
@@ -752,14 +752,14 @@ pub mod owner_binding {
 /// Note `network_presence` is NOT a legacy-agency kind — it maps to
 /// [`INFRA_NETWORK_PRESENCE`] (presence is an infra duty, not agency).
 ///
-/// The CC 1.13.5 verifier is [`super::admission::scopes_are_infra_only`];
+/// The CC 3.4.7.3 verifier is [`super::admission::scopes_are_infra_only`];
 /// the CC 4.4.3.4.3 admission gate is
 /// [`super::admission::check_node_agency_admission`].
 pub mod delegation_scope {
     /// CC 4.4.3.4.3 — the server-class scope prefix. A `node`-role
     /// delegate may carry ONLY scopes under this prefix.
     pub const INFRA_PREFIX: &str = "infra:";
-    /// CC 4.4.3.4.3 / CC 1.13.5 — the brain-only scope prefix. FORBIDDEN
+    /// CC 4.4.3.4.3 / CC 3.4.7.3 — the brain-only scope prefix. FORBIDDEN
     /// for a `node`-role delegate.
     pub const AGENCY_PREFIX: &str = "agency:";
 
@@ -893,7 +893,7 @@ pub mod delegation_scope {
     /// vocabulary, CIRISPersist#487; CIRISServer `TRUST_ROOT_CAPABILITY_GATE`
     /// / CC 4.4.3.4.3). `hold_` names the persistent STANDING — not the join
     /// ceremony, not grant/manage authority (steward/moderator are judgment
-    /// roles bestowed on the MEMBER, never node-holdable per CC 1.13.5).
+    /// roles bestowed on the MEMBER, never node-holdable per CC 3.4.7.3).
     /// Owner-granted (the node's standing), NEVER charter-granted — see the
     /// two-granter split in `TRUST_ROOT_CAPABILITY_GATE`. Replaced the vague
     /// `infra:join_communities` (hard cut, no alias — pre-fleet).
@@ -1199,7 +1199,7 @@ pub mod delegation_scope {
         ),
     ];
 
-    /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
+    /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
     /// `self_at_login` agency profile + `reason`/`decide`) that MUST also
     /// be rejected on a node key. `network_presence` is deliberately
     /// EXCLUDED (it is the infra presence duty, not agency). The
@@ -1213,7 +1213,7 @@ pub mod delegation_scope {
         crate::federation::self_at_login::SCOPE_SUB_DELEGATION,
     ];
 
-    /// CC 1.13.5 — is `scope` one of the legacy unprefixed agency kinds
+    /// CC 3.4.7.3 — is `scope` one of the legacy unprefixed agency kinds
     /// ([`LEGACY_AGENCY_KINDS`])? Used by the node-agency gate so a
     /// pre-split delegation cannot smuggle agency onto a node key by
     /// dropping the `agency:` prefix.

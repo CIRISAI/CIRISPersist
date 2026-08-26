@@ -4125,10 +4125,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
+        // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
         // on-node-key gate (parity with the postgres + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
-        // recipient (`attested_key_id`) resolves to a node-ONLY identity it
+        // recipient (`attested_key_id`) resolves to an identity CONTAINING `node` it
         // REJECTS any scope set that is not `infra:*`-only (agency:* / legacy
         // unprefixed agency / empty / other) — "infrastructure must not have
         // agency" made cryptographic. Runs AFTER the delegated-duty gate and
@@ -33973,6 +33973,15 @@ mod tests {
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
 
+    /// v38.6.0 (CIRISPersist#773) — may_act_through, sqlite arm.
+    #[tokio::test]
+    async fn may_act_through_sqlite_773() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_may_act_through(&backend, "sqlite")
+            .await;
+    }
+
     /// v38.5.0 (CIRISPersist#771) — duplicate is AlreadyHeld, sqlite arm.
     #[tokio::test]
     async fn duplicate_is_already_held_sqlite_771() {
@@ -37815,7 +37824,7 @@ mod tests {
         assert!(e.withdrawn_by.is_none());
     }
 
-    // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
+    // ── #236 CC 4.4.3.4.3 / CC 3.4.7.3 — reject-agency-on-node-key gate ───
 
     /// Build a `delegates_to` row carrying a scope SET (array wire shape)
     /// from `attesting` → `attested`. Mirrors the gate's array acceptance.
@@ -37882,7 +37891,7 @@ mod tests {
     }
 
     /// (b) delegates_to → node key carrying agency:* → REJECTED + not
-    /// stored. THE load-bearing CC 1.13.5 guard.
+    /// stored. THE load-bearing CC 3.4.7.3 guard.
     #[tokio::test]
     async fn node_delegation_agency_rejected_not_stored_sqlite() {
         use crate::federation::types::delegation_scope as ds;
@@ -37984,7 +37993,7 @@ mod tests {
 
     /// SecReview F1 (sqlite parity): a DUPLICATE / whitespace node token
     /// (`"node,node"` / `"node, node"`) must NOT bypass the node-agency
-    /// gate — `agency:*` on such a node-only key is REJECTED + not stored.
+    /// gate — `agency:*` on such a node-role key is REJECTED + not stored.
     #[tokio::test]
     async fn node_delegation_agency_rejected_with_duplicate_identity_type_token_sqlite() {
         use crate::federation::types::delegation_scope as ds;
@@ -38032,8 +38041,27 @@ mod tests {
         }
     }
 
-    /// SecReview F1 negative control (sqlite): a genuine `node,agent` hybrid
-    /// legitimately carries `agency:*` — still ADMITTED.
+    /// v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — **INVERTED: the
+    /// hybrid is now REFUSED.**
+    ///
+    /// This test used to assert the opposite, as a negative control for the
+    /// SecReview F1 dedup fix: "a genuine `node,agent` HYBRID key is NOT
+    /// node-only, so it legitimately carries `agency:*`". Under CC's text at
+    /// the time that was correct — CC 4.4.3.4.3 said the rule applied to an
+    /// identity that is `node`-ONLY. So this test was not wrong; it pinned
+    /// the constitution as written.
+    ///
+    /// CC 3.4.7.3 amends the rule to `node ∈ identity_type`, because the
+    /// old form was an escape hatch spelled as a simplification: fusing
+    /// `agent` onto a node key silently repealed "infrastructure must not
+    /// have agency". Clause A separately forbids MINTING such a key, but a
+    /// non-conformant key that already exists is still a possible
+    /// `delegates_to` recipient — non-conformance is a reason to re-mint,
+    /// never a reason the gate stops applying.
+    ///
+    /// The over-rejection guard the negative control existed for has NOT
+    /// been dropped: `hybrid_node_agent_key_still_refuses_agency_773`
+    /// asserts that a key with NO node role still carries agency freely.
     #[tokio::test]
     async fn node_agent_hybrid_carries_agency_admitted_sqlite() {
         use crate::federation::types::delegation_scope as ds;
@@ -38063,13 +38091,22 @@ mod tests {
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
-            .expect("a node,agent hybrid legitimately carries agency");
+            .expect_err(
+                "#773 / CC 3.4.7.3 Clause B: a {node,agent} hybrid must now be REFUSED — \
+                 membership, not exclusivity. Admitting here is the escape hatch the \
+                 amendment closes.",
+            );
+        // Verify-before-mutation: the refusal leaves NO trace.
         let stored =
             crate::federation::FederationDirectory::list_attestations_for(&backend, "node-agent")
                 .await
                 .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].attestation_id, id);
+        assert!(
+            stored.is_empty(),
+            "#773: a refused delegation must not be stored — the gate runs before the row \
+             is hashed and INSERTed"
+        );
+        let _ = id;
     }
 
     // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for

@@ -5180,7 +5180,7 @@ pub fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::H
     }
 }
 
-/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the CC 1.13.5
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the CC 3.4.7.3
 /// verifier: is `scopes` a delegation scope set a pure `node`-role
 /// delegate is allowed to carry?
 ///
@@ -7401,6 +7401,64 @@ pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
             owners: owners.into_iter().collect(),
         }),
     }
+}
+
+/// v38.6.0 (CIRISPersist#773, **CC 3.4.7.3 Clause D**) — **may this agent
+/// act through this node?**
+///
+/// ```text
+/// may_act_through(agent, node)  ≔  ∃ h .  h = owner_of(node)  ∧  h ∈ stewards_of(agent)
+/// ```
+///
+/// # The asymmetry is load-bearing
+///
+/// Node ownership is **single-valued** ([`owner_of`], policed by
+/// [`check_single_node_owner_admission`]); stewardship is **multi-parent by
+/// design** ([`steward_bindings_of`]). So the rule is *the node's one owner
+/// must appear SOMEWHERE in the agent's steward set* — deliberately not
+/// "the same human", which would wrongly imply the agent has exactly one
+/// steward. That existential is what makes the community-server case
+/// expressible today through co-stewardship, with no new grant type.
+///
+/// # Not new grammar
+///
+/// A comparison over two walks that already exist. No new verb, no new
+/// dimension, nothing added to the closed
+/// `[SCORES, DELEGATES_TO, SUPERSEDES, WITHDRAWS, RECANTS]` set.
+///
+/// # Fail-closed is NORMATIVE here, not boilerplate
+///
+/// An unowned node ([`owner_of`] → `None`) and an ambiguous one
+/// ([`Error::AmbiguousNodeOwner`]) are **not permitted**, never "unknown".
+/// This is the person/node axis, whose signature failure mode is a SILENT
+/// WITHHOLD: without this, an unresolved walk reads as permission. The two
+/// conditions are also kept distinguishable from a plain "different
+/// humans" answer — `Ok(false)` means the walks resolved and disagreed,
+/// while an unresolvable owner is an `Err`, because a caller that cannot
+/// tell those apart will eventually treat one as the other.
+///
+/// Hosting an agent whose steward set EXCLUDES the node owner stays
+/// inadmissible. CC names that case deferred, requiring an explicit
+/// node-owner conferral rather than a relaxation of Clause D — so this
+/// returns `Ok(false)` for it and does not invent a permission.
+pub async fn may_act_through(
+    directory: &dyn super::FederationDirectory,
+    agent: &str,
+    node: &str,
+) -> Result<bool, Error> {
+    // `owner_of` propagates `AmbiguousNodeOwner` — deliberately NOT caught
+    // here. An ambiguous owner is not a resolvable `self` boundary, and
+    // swallowing it to `false` would make "we could not tell" and "the
+    // answer is no" the same value.
+    let Some(owner) = owner_of(directory, node).await? else {
+        return Err(Error::InvalidArgument(format!(
+            "may_act_through: node {node:?} has no live owner-binding, so there is no owner \
+             to compare against the agent's stewards. CC 3.4.7.3 Clause D is fail-closed: an \
+             unresolved owner is a refusal, never an unknown that reads as permission"
+        )));
+    };
+    let stewards = steward_bindings_of(directory, agent).await?;
+    Ok(stewards.contains(&owner))
 }
 
 /// v38.3.0 (CIRISPersist#764, for CIRISEdge#524's send-set) — **the reverse
@@ -11190,17 +11248,18 @@ pub async fn check_delegated_duty_scores_admission(
     .await
 }
 
-/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the
+/// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the
 /// reject-agency-on-node-key gate: the `put_attestation` entry point that
 /// makes "infrastructure must not have agency" cryptographically enforced.
 ///
 /// A no-op (`Ok(())`) for any row that is NOT a
 /// [`attestation_type::DELEGATES_TO`]. For a `delegates_to` it resolves the
 /// recipient's (`attested_key_id`'s) `identity_type` via
-/// [`FederationDirectory::lookup_public_key`]; the gate **only constrains a
-/// recipient that resolves to a `node`-ONLY identity** (the resolved
-/// `identity_type` set contains `node` and NOTHING else — a `{node}` key,
-/// not a `{node,agent}` hybrid). For such a node-only recipient the
+/// [`FederationDirectory::lookup_public_key`]; the gate **constrains any
+/// recipient whose resolved `identity_type` CONTAINS `node`** — a `{node}`
+/// key AND a `{node,agent}` / `{node,user}` hybrid alike (CC 3.4.7.3
+/// Clause B; before v38.6.0 this tested for `node` and nothing else, which
+/// let a fused key slip the gate). For such a node-role recipient the
 /// delegation's [`delegation_scope_set`] MUST satisfy
 /// [`scopes_are_infra_only`]; otherwise the row is REJECTED with
 /// [`Error::NodeAgencyForbidden`] (CC 4.4.3.4.3) and never stored.
@@ -11216,11 +11275,15 @@ pub async fn check_delegated_duty_scores_admission(
 ///   at all — and once a key IS registered as `node` it resolves here and
 ///   the gate fires. A node key can therefore never receive an agency
 ///   delegation.
-/// - **Recipient resolves to a non-node identity** (`agent`, `user`, a
-///   `{node,agent}` hybrid, …): the gate **passes** (returns `Ok(())`).
-///   The gate ONLY constrains pure-node recipients — it does not
+/// - **Recipient's roles CONTAIN `node`** (`{node}`, and since v38.6.0 also
+///   `{node,agent}` / `{node,user}`): the gate **fires**. Membership, not
+///   exclusivity — CC 3.4.7.3 Clause B. The previous rule tested
+///   `set == {node}`, so fusing `agent` onto a node key made the gate stop
+///   firing and silently repealed the property.
+/// - **Recipient resolves to an identity with NO `node` role** (`agent`,
+///   `user`, …): the gate **passes** (returns `Ok(())`). It does not
 ///   over-reject `agency:*` on a brain/agent key, which legitimately
-///   carries agency (CC 1.13.5 is about *infrastructure*, not all keys).
+///   carries agency — CC 3.4.7.3 is about *infrastructure*, not all keys.
 ///
 /// Verify-before-mutation (AV-9): runs alongside the withdraws /
 /// delegated-duty gates BEFORE the row is hashed + INSERTed — a rejected
@@ -11237,29 +11300,50 @@ pub async fn check_node_agency_admission(
         return Ok(());
     }
     // Resolve the recipient's identity_type set. Only a recipient that
-    // resolves to a *node-only* identity is constrained here.
+    // resolves to an identity CONTAINING `node` is constrained here.
     let Some(recipient) = directory.lookup_public_key(&row.attested_key_id).await? else {
         // Unresolved recipient: out of scope for this gate (and FK-rejected
         // downstream — it can never be persisted). See doc note.
         return Ok(());
     };
-    // Test the identity_type *set*, robust to duplicate/whitespace/order
-    // tokens (`"node,node"`, `"node, node"`). `parse_set` does NOT dedup,
-    // so an equality check against `[NODE]` is bypassable by a repeated
-    // token; collect into a `HashSet` and assert it is exactly `{node}`.
+    // v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — **MEMBERSHIP, not
+    // exclusivity.**
+    //
+    // This read `set == {node}`, so a recipient whose roles were
+    // `{node, agent}` fell straight through and the gate stopped firing.
+    // Adding `agent` to a node key silently REPEALED "infrastructure must
+    // not have agency" — an escape hatch that looks like a tidy-up: anyone
+    // consolidating two keys into one hybrid would have taken it without
+    // knowing what they were switching off.
+    //
+    // Not a misreading on persist's side: CC 4.4.3.4.3 said "an identity
+    // whose `identity_type` is `node`-only (no agent/brain)", and this
+    // implemented that faithfully. CC 3.4.7.3 amends the rule to
+    // `node ∈ identity_type`, and the gate follows.
+    //
+    // Clause A (`{node,agent}` / `{node,user}` non-cohabitable) does NOT
+    // substitute for this, and the ruling is emphatic about why: Clause A
+    // stops a fused key being MINTED; it does nothing about fused keys that
+    // already exist, and a non-conformant key is still a key in the data and
+    // still a possible `delegates_to` recipient. Non-conformance is a reason
+    // to re-mint, never a reason the gate stops applying. Both clauses are
+    // normative and neither implies the other.
+    //
+    // The `HashSet` remains for the reason it was introduced: `parse_set`
+    // does not dedup, so `"node,node"` must not read differently from
+    // `"node"`.
     let member_set: std::collections::HashSet<&str> =
         identity_type::parse_set(&recipient.identity_type)
             .into_iter()
             .collect();
-    let is_node_only = member_set.len() == 1 && member_set.contains(identity_type::NODE);
-    if !is_node_only {
+    if !member_set.contains(identity_type::NODE) {
         return Ok(());
     }
     let scopes = delegation_scope_set(&row.attestation_envelope);
     if scopes_are_infra_only(&scopes) {
         return Ok(());
     }
-    // Reject: a node-only key may carry ONLY infra:* scopes. Report the
+    // Reject: a node-role key may carry ONLY infra:* scopes. Report the
     // offending (non-infra) tokens, sorted for a stable error string.
     let mut offending_scopes: Vec<String> = scopes
         .into_iter()
@@ -14977,7 +15061,7 @@ mod tests {
         );
     }
 
-    // ── #236 CC 1.13.5 — scopes_are_infra_only verifier unit table ─────
+    // ── #236 CC 3.4.7.3 — scopes_are_infra_only verifier unit table ─────
 
     /// Build a `HashSet<String>` from string slices for the table tests.
     fn scope_set(items: &[&str]) -> std::collections::HashSet<String> {
@@ -22399,7 +22483,7 @@ pub(crate) mod ungated_doors_test_support {
         let granter = format!("aw-granter-{suffix}");
         let recipient = format!("aw-recipient-{suffix}");
         let foreign = format!("aw-foreign-{suffix}");
-        // The recipient is an AGENT, not a NODE: CC 1.13.5 forbids a node-role
+        // The recipient is an AGENT, not a NODE: CC 3.4.7.3 forbids a node-role
         // delegate from carrying an agency scope, and `consent_revocation` is
         // one — the scope whose severance is the escalation this witness is
         // about.

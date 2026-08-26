@@ -6864,14 +6864,14 @@ pub enum Error {
         scope: String,
     },
 
-    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
+    /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3). A `delegates_to`
     /// was REFUSED because its `attested_key_id` resolves to a `node`-only
     /// [`crate::federation::types::identity_type::NODE`] identity but the
     /// delegation carries a scope that is NOT `infra:*` — i.e. an
     /// `agency:*` scope, a legacy unprefixed agency kind
     /// (`act_on_behalf` / `message_io` / `reason` / `decide` /
     /// `sub_delegation`), an empty scope set, or any other non-`infra:`
-    /// token. This is the gate that makes CC 1.13.5 ("infrastructure must
+    /// token. This is the gate that makes CC 3.4.7.3 ("infrastructure must
     /// not have agency") cryptographically enforced: a node key can never
     /// receive agency. The row is not stored (verify-before-mutation,
     /// AV-9). Distinct from [`Error::InvalidArgument`] so consumers can
@@ -6880,12 +6880,14 @@ pub enum Error {
     /// [`admission::check_node_agency_admission`] /
     /// [`admission::scopes_are_infra_only`].
     #[error(
-        "delegates_to to node-only key {attested_key_id:?} carries non-infra scope(s) \
-         {offending_scopes:?}: a node-role delegate may carry ONLY infra:* scopes \
-         (CC 4.4.3.4.3 / CC 1.13.5 — infrastructure must not have agency)"
+        "delegates_to to node-role key {attested_key_id:?} carries non-infra scope(s) \
+         {offending_scopes:?}: a key whose identity_type CONTAINS `node` may carry ONLY \
+         infra:* scopes (CC 3.4.7.3 Clause B — infrastructure must not have agency)"
     )]
     NodeAgencyForbidden {
-        /// The `attested_key_id` (recipient) that resolved to `node`-only.
+        /// The `attested_key_id` (recipient) whose `identity_type` CONTAINS
+        /// `node`. Membership, not exclusivity: since v38.6.0 (#773 /
+        /// CC 3.4.7.3 Clause B) a `{node,agent}` hybrid resolves here too.
         attested_key_id: String,
         /// The offending non-`infra:` scope tokens carried by the
         /// delegation (sorted for a stable error string); empty vec when
