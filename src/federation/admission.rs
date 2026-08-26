@@ -18352,6 +18352,11 @@ pub(crate) mod r2_test_support {
             ),
         ];
         for (id, from, to, _dim, envelope) in rows {
+            // Already placed by an earlier conferral in this test: re-offering
+            // it would carry a fresh `asserted_at` under the same derived id.
+            if dir.get_attestation(&id).await.ok().flatten().is_some() {
+                continue;
+            }
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
             let mut att = Attestation {
@@ -18383,11 +18388,15 @@ pub(crate) mod r2_test_support {
                 .put_attestation(crate::federation::SignedAttestation { attestation: att })
                 .await
             {
-                Ok(()) => {}
-                // Re-asserting the shared charter / accept row is idempotence when
-                // a test confers on several subjects, not a failure.
-                Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
-                Err(e) if e.to_string().contains("duplicate key") => {}
+                Ok(_) => {}
+                // v38.5.0 (CIRISPersist#771) — this arm used to swallow the
+                // UNIQUE violation and call it idempotence. It was not:
+                // `uid()` derives a STABLE id while `asserted_at` is
+                // `Utc::now()`, so each re-assertion offered a DIFFERENT row
+                // under the same id and the difference was silently
+                // discarded. The typed verdict refuses that now, correctly,
+                // so the fixture skips a row it already placed instead of
+                // re-offering a changed one.
                 Err(e) => panic!("conferral row must admit: {e}"),
             }
         }
@@ -19959,6 +19968,7 @@ pub(crate) mod steward_liveness_test_support {
             attestation: row.clone(),
         })
         .await
+        .map(|_| ())
     }
 
     /// **THE BICONDITIONAL.** The three steward-binding readers are three

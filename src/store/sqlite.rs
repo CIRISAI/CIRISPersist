@@ -3663,7 +3663,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_attestation(
         &self,
         attestation: crate::federation::SignedAttestation,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error> {
         let mut row = attestation.attestation;
 
         // ── AV-76 TIER 0 — the free prologue ────────────────────────
@@ -4091,7 +4091,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     ))
                 })?;
                 if dup_exists {
-                    return Ok(());
+                    // v38.5.0 (#771) — the dedup path already returned
+                    // success; now it can say WHICH success it was.
+                    return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
                 }
             }
         }
@@ -4258,13 +4260,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )])
             });
         let conn = self.conn.clone();
-        (move || -> Result<(), rusqlite::Error> {
+        // v38.5.0 (#771) — ABSORB, then RE-READ to decide (the #719 shape,
+        // already used for the roster in #758). `OR IGNORE` makes a
+        // re-delivered row stop raising a UNIQUE violation, and the zero-row
+        // result is then resolved by comparing the STORED row's hash against
+        // the offered one: identical is `AlreadyHeld`, differing is a typed
+        // Conflict. `DO NOTHING` alone would silently accept a DIFFERENT row
+        // under an occupied id, which is the opposite defect.
+        let offered_hash_for_compare = row.persist_row_hash.clone();
+        let id_for_compare = row.attestation_id.clone();
+        let inserted = (move || -> Result<bool, rusqlite::Error> {
             let conn = conn.lock();
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at =
                 sqlite_next_plane_position(&conn, "federation_attestations", POS_ATTESTATION)?;
             conn.execute(
-                "INSERT INTO federation_attestations (\
+                "INSERT OR IGNORE INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -4307,6 +4318,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     admitted_at.to_rfc3339(),
                 ],
             )?;
+            // v38.5.0 (#771) — zero rows means the id was already occupied.
+            // Return without touching the projections: they were derived
+            // from these same bytes when the row first landed, and
+            // re-deriving them for a duplicate is at best wasted work.
+            let changed = conn.changes() > 0;
+            if !changed {
+                return Ok(false);
+            }
             // v17.4.0 (V106) — maintain the subject projection (federation
             // tier: put_attestation writes federation-visible rows).
             sqlite_project_attestation_subjects(
@@ -4318,7 +4337,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
             sqlite_project_consent_peer_set(&conn, &row)?;
-            Ok(())
+            Ok(true)
         })()
         .map_err(|e| {
             let msg = e.to_string();
@@ -4330,6 +4349,42 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert attestation: {msg}"))
             }
         })?;
+
+        if !inserted {
+            // RE-READ decides (#771): identical bytes are an idempotent
+            // no-op the sender must be able to recognise; different bytes
+            // under an occupied id are a real disagreement.
+            let stored = {
+                let conn = self.conn.clone();
+                let guard = conn.lock();
+                guard
+                    .query_row(
+                        "SELECT persist_row_hash FROM federation_attestations \
+                         WHERE attestation_id = ?1",
+                        rusqlite::params![id_for_compare],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("re-read attestation: {e}"))
+                    })?
+            };
+            let Some(stored_hash) = stored else {
+                // The row vanished between the insert and the re-read (a
+                // concurrent purge). Report it as a backend condition rather
+                // than inventing an outcome for a row nobody holds.
+                return Err(crate::federation::Error::Backend(format!(
+                    "attestation {id_for_compare} was absorbed as a duplicate but is not \
+                     present on re-read"
+                )));
+            };
+            crate::federation::attestation_reput_verdict(
+                &stored_hash,
+                &offered_hash_for_compare,
+                &id_for_compare,
+            )?;
+            return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+        }
         if let Some(wire_index_key) = &wire_index_key {
             self.index_stored_record("Attestation", wire_index_key)
                 .await?;
@@ -4356,7 +4411,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     })?;
             }
         }
-        Ok(())
+        Ok(crate::federation::AttestationOutcome::Inserted)
     }
 
     async fn attestation_upsert_local(
@@ -33917,6 +33972,17 @@ mod tests {
     // smokes the edge_detection_events table V020 ships alongside.
 
     use crate::federation::{TrustFilter, TrustGrant, TrustRelationship, TrustType};
+
+    /// v38.5.0 (CIRISPersist#771) — duplicate is AlreadyHeld, sqlite arm.
+    #[tokio::test]
+    async fn duplicate_is_already_held_sqlite_771() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_duplicate_is_already_held(
+            &backend, "sqlite",
+        )
+        .await;
+    }
 
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, sqlite arm.
     #[tokio::test]

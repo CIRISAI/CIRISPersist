@@ -1373,7 +1373,7 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
                 // as "still absent". One transcription of a predicate is a
                 // predicate; two are a disagreement waiting to happen.
                 match dir.put_attestation(att.clone()).await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(e) if e.is_duplicate_key() => {}
                     Err(e) => {
                         panic!("genesis attestation {id:?} must install on EVERY backend: {e}")
@@ -2823,23 +2823,36 @@ pub(crate) async fn exercise_duplicate_insert_leaves_plane_fully_seeded(
         "[{tag}] a node that lost a seed race still boots entrenched"
     );
 
-    // The duplicate-key predicate is measured against THIS backend's real
-    // error, not assumed: the whole finding was that it is not `Conflict`.
+    // v38.5.0 (CIRISPersist#771) — **the duplicate is now measured as an
+    // OUTCOME, not an error.**
+    //
+    // This block used to assert the opposite: that a second insert of a
+    // present id FAILS, that the failure is recognised by the shared
+    // `is_duplicate_key` string predicate, and that its kind is
+    // `federation_backend` rather than `Conflict`. All three were true, and
+    // the last one was the defect — reporting "I already hold this" with the
+    // same token as "the database is broken" is what made senders retry
+    // forever (7,536 refusals in six hours on the canonical).
+    //
+    // The #665 comment that stood here said the string test was provisional
+    // and recorded "what would have to change to make it a typed one". This
+    // is that change. What the test is really guarding — that a re-offered
+    // row is absorbed and the plane still completes — is unchanged and
+    // asserted above; only the shape of the signal moved.
     let dup = dir
         .put_attestation(first.clone())
         .await
-        .expect_err("a second insert of a present id must fail");
-    assert!(
-        dup.is_duplicate_key(),
-        "[{tag}] this backend's duplicate-key error must be recognized by the ONE shared \
-         predicate (kind={}, err={dup})",
-        dup.kind()
-    );
+        .unwrap_or_else(|e| {
+            panic!(
+                "[{tag}] a second insert of an IDENTICAL present row is idempotent success, \
+                 not a failure (CIRISPersist#771): {e}"
+            )
+        });
     assert_eq!(
-        dup.kind(),
-        "federation_backend",
-        "[{tag}] and it is `Backend`, not `Conflict` — which is exactly why matching \
-         `Error::Conflict` alone silently never fired"
+        dup,
+        crate::federation::AttestationOutcome::AlreadyHeld,
+        "[{tag}] and it must be distinguishable from a fresh insert, or a consumer cannot \
+         tell routine non-progress from a state change"
     );
 }
 
@@ -3323,7 +3336,11 @@ where
     }
 
     match dir.put_attestation(sa.clone()).await {
-        Ok(()) => Ok(DelegationRowOutcome::Installed),
+        // v38.5.0 (CIRISPersist#771) — the TYPED duplicate signal the #665
+        // comment below said would have to exist. `AlreadyHeld` IS the lost
+        // race: the row is present and this call did not put it there.
+        Ok(crate::federation::AttestationOutcome::Inserted) => Ok(DelegationRowOutcome::Installed),
+        Ok(_) => Ok(DelegationRowOutcome::Raced),
         // v31.1.0 (CIRISPersist#665) — A LOST PRIMARY-KEY RACE IS SUCCESS.
         //
         // Two engines initializing one database both read `None` above and both
@@ -3514,7 +3531,10 @@ where
         }
     }
     match dir.put_attestation(sa.clone()).await {
-        Ok(()) => Ok(outcome),
+        // v38.5.0 (#771) — same typed split as above; a duplicate is the race
+        // arm, never a fresh install.
+        Ok(crate::federation::AttestationOutcome::Inserted) => Ok(outcome),
+        Ok(_) => Ok(DelegationRowOutcome::Raced),
         // Somebody else completed the same replacement first. The plane holds
         // the baked row either way, which is what this was for.
         Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),

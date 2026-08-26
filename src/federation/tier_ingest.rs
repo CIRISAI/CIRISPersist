@@ -389,6 +389,43 @@ where
     .map(|_| ())
 }
 
+/// v38.5.0 (CIRISPersist#771) — **the attestation twin of
+/// [`community_reput_verdict`]**: is a re-offered `attestation_id` the row we
+/// already hold, or a different row wearing the same id?
+///
+/// Measured on the production canonical: 7,536 refusals in six hours, 428
+/// distinct content hashes re-sent up to 82 times each, every one of them a
+/// row the node ALREADY HELD. The plain INSERT raised a UNIQUE violation and
+/// the error mapping defaulted it to `Error::Backend` — so "I already have
+/// this", which is idempotent success, arrived at the sender wearing the same
+/// token as "the database is broken" (`federation_backend`). The sender
+/// cannot learn the row landed, so it retries forever, and the noise drowns
+/// the genuine refusals that the consumer's `Duplicate` branch exists to keep
+/// visible.
+///
+/// The line this draws is the same one the Key plane draws between
+/// `AlreadyAnchoredIdentical` and `ConflictingVersion`, and the same one #758
+/// drew for the roster: **identical bytes are a no-op, differing bytes under
+/// an occupied id are a Conflict.** An id collision carrying different
+/// content is not a duplicate — it is two rows claiming one identity, and
+/// silently accepting either would be the opposite defect.
+pub(crate) fn attestation_reput_verdict(
+    stored_persist_row_hash: &str,
+    offered_persist_row_hash: &str,
+    attestation_id: &str,
+) -> Result<(), crate::federation::Error> {
+    if stored_persist_row_hash == offered_persist_row_hash {
+        return Ok(());
+    }
+    Err(crate::federation::Error::Conflict(format!(
+        "attestation {attestation_id} already exists with DIFFERENT content \
+         (stored persist_row_hash {stored_persist_row_hash}, offered \
+         {offered_persist_row_hash}) — a re-delivery of identical bytes is an \
+         idempotent no-op, but a differing row under an occupied id is refused \
+         (CIRISPersist#771)"
+    )))
+}
+
 /// v38.2.0 (CIRISPersist#758) — **the re-put verdict for a convergent
 /// community row**, spelled ONCE so the three backends cannot answer it
 /// three ways (they did: sqlite and postgres refused every re-put with a PK
@@ -1603,6 +1640,100 @@ pub mod test_support {
         );
     }
 
+    /// v38.5.0 (CIRISPersist#771) — **a re-delivered row is a DUPLICATE, not
+    /// a backend failure.**
+    ///
+    /// The production shape, exactly: the same signed attestation delivered
+    /// twice. Before this cut the second delivery raised a UNIQUE violation
+    /// that the error mapping defaulted to `Error::Backend`, so the sender
+    /// saw `federation_backend` — indistinguishable from a broken database —
+    /// and retried forever. 7,536 refusals in six hours on the canonical,
+    /// 428 rows re-sent up to 82 times, none of them lost.
+    ///
+    /// Three arms: the first delivery reports `Inserted`; the byte-identical
+    /// re-delivery reports `AlreadyHeld` (Ok, not Err); and a DIFFERENT row
+    /// under the same id is still a typed `Conflict`, because two rows
+    /// claiming one identity is a real disagreement and the fix for noisy
+    /// refusals must not become "accept anything".
+    pub(crate) async fn exercise_duplicate_is_already_held(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::AttestationOutcome;
+
+        let a = format!("dup-a-771-{suffix}");
+        let b = format!("dup-b-771-{suffix}");
+        for k in [&a, &b] {
+            register_hybrid_key(dir, k).await;
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = bare_attestation(
+            &id,
+            &a,
+            &b,
+            &serde_json::json!({ "id": id, "dimension": "scores:medical:v1" }),
+        );
+        row.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
+        seal_row_in_place(&a, &mut row);
+
+        // (1) First delivery: a real state change.
+        let first = dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) first delivery must land: {e}"));
+        assert_eq!(
+            first,
+            AttestationOutcome::Inserted,
+            "({suffix}) #771: the first delivery is the anti-entropy progress signal"
+        );
+
+        // (2) THE STORM'S SHAPE — the identical row delivered again.
+        let second = dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({suffix}) #771: a re-delivered IDENTICAL row must be idempotent \
+                     success, not an error — reporting it as `federation_backend` is what \
+                     made the sender retry forever (7,536 refusals / 6h): {e}"
+                )
+            });
+        assert_eq!(
+            second,
+            AttestationOutcome::AlreadyHeld,
+            "({suffix}) #771: and it must be distinguishable from Inserted, or the \
+             consumer cannot count it as routine non-progress"
+        );
+
+        // (3) A DIFFERENT row under the same id is still refused.
+        let mut impostor = row.clone();
+        impostor.attestation_envelope["dimension"] =
+            serde_json::Value::String("scores:dental:v1".into());
+        seal_row_in_place(&a, &mut impostor);
+        let err = dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: impostor,
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "({suffix}) #771: a DIFFERENT row under an occupied id is two rows \
+                     claiming one identity — quieting duplicates must not become \
+                     accepting anything"
+                )
+            });
+        assert!(
+            matches!(err, crate::federation::Error::Conflict(_)),
+            "({suffix}) #771: and the disagreement is TYPED, not a backend error: {err}"
+        );
+    }
+
     /// v38.3.0 (CIRISPersist#765 + #764) — **a node speaks for its owner**:
     /// the exact shape CIRISServer's two-node chat ladder refused forever at
     /// v38.2's community door.
@@ -2036,6 +2167,7 @@ pub mod test_support {
         seal_row_in_place(granter, &mut row);
         dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
+            .map(|_| ())
     }
 
     /// The unsealed skeleton [`put_delegates_to`] / [`put_retraction`] share.
