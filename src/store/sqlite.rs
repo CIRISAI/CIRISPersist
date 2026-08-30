@@ -4179,6 +4179,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
+        // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
+        // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
+        // live `owner_of`. CC 3.4.7 holds every 3.4.5 emitter rule with three
+        // things — substrate admission, consumer re-check, producer obligation
+        // — and persist had only the third, so a peer could attest
+        // `config:replication` / `config:load` ABOUT A NODE IT DOES NOT OWN
+        // and every honest consumer would believe a healthy node was shedding.
+        // AV-76 TIER 4: the owner arm walks the directory, so it may not lead
+        // the crypto. Placed immediately after the consent gate so the two CC
+        // 3.4.5 gates sit together and a reader finds both at one line.
+        // Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
         // tier, BEFORE any crypto or DB-walking gate — so an abuser this node
@@ -21902,6 +21915,146 @@ mod tests {
             row.scrub_key_id, "apply-amb-node",
             "ambiguous-owner refusal must leave the self-signed row untouched"
         );
+    }
+
+    /// v38.7.0 (CIRISPersist#778, CC 3.4.5) — **an AMBIGUOUS owner is an
+    /// `Err`, never a refusal.**
+    ///
+    /// [`check_config_self_or_owner_admission`](crate::federation::admission::check_config_self_or_owner_admission)
+    /// lets [`Error::AmbiguousNodeOwner`](crate::federation::Error::AmbiguousNodeOwner)
+    /// propagate rather than catching it and returning the ordinary
+    /// self-or-owner refusal. This witnesses the distinction, because the two
+    /// verdicts say different things and a caller that cannot tell them apart
+    /// will eventually treat one as the other: `InvalidArgument` means *"the
+    /// walks resolved and you are not the owner"*, `AmbiguousNodeOwner` means
+    /// *"this node has two live owners and the substrate cannot say who speaks
+    /// for it"* — which is an operator's problem, not the writer's.
+    ///
+    /// Sqlite-only for the same reason its sibling above is: the two-owner
+    /// state is a PRE-GATE anomaly that
+    /// `check_single_node_owner_admission` makes unreachable through any door,
+    /// so it has to be raw-inserted. The gate under test is backend-agnostic
+    /// (one predicate, called at the same point on all three), so the arm the
+    /// three backends share is covered by
+    /// `federation::admission::tests::config_self_or_owner_gate_*_778`.
+    #[tokio::test]
+    async fn config_self_or_owner_ambiguous_owner_fails_closed_sqlite_778() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{
+            attestation_tier, attestation_type, cohort_scope, identity_type,
+        };
+        use crate::federation::{Attestation, SignedAttestation};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        ts::register_identity_key(&backend, "cfg-amb-node", identity_type::NODE).await;
+        ts::register_identity_key(&backend, "cfg-amb-owner1", identity_type::USER).await;
+        ts::register_identity_key(&backend, "cfg-amb-owner2", identity_type::USER).await;
+        ts::register_hybrid_key(&backend, "cfg-amb-stranger").await;
+
+        // owner1 binds through the real gate…
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: ts::owner_binding_attestation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "cfg-amb-owner1",
+                    "cfg-amb-node",
+                ),
+            })
+            .await
+            .unwrap();
+        // …owner2's is the anomaly, raw-inserted exactly as the sibling test
+        // above does (the state a pre-v12.6.0 corpus can hold).
+        {
+            let anomaly = ts::owner_binding_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                "cfg-amb-owner2",
+                "cfg-amb-node",
+            );
+            let env_text = serde_json::to_string(&anomaly.attestation_envelope).unwrap();
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    asserted_at, attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, scrub_timestamp, \
+                    persist_row_hash\
+                 ) VALUES (?1, 'cfg-amb-owner2', 'cfg-amb-node', 'delegates_to', \
+                    '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', 'cfg-amb-owner2', \
+                    '2026-05-01T00:00:00+00:00', '0')",
+                rusqlite::params![anomaly.attestation_id, env_text],
+            )
+            .unwrap();
+        }
+
+        let config_row = |id: &str, author: &str| {
+            let now = chrono::Utc::now();
+            let envelope = serde_json::json!({ "dimension": "config:load:v1", "score": 1.0 });
+            SignedAttestation {
+                attestation: ts::seal_row(
+                    author,
+                    Attestation {
+                        attestation_id: id.to_owned(),
+                        attesting_key_id: author.to_owned(),
+                        attested_key_id: "cfg-amb-node".to_owned(),
+                        attestation_type: attestation_type::SCORES.to_owned(),
+                        weight: Some(1.0),
+                        asserted_at: now,
+                        expires_at: None,
+                        attestation_envelope: envelope,
+                        original_content_hash: String::new(),
+                        scrub_signature_classical: String::new(),
+                        scrub_signature_pqc: None,
+                        scrub_key_id: author.to_owned(),
+                        scrub_timestamp: now,
+                        pqc_completed_at: None,
+                        persist_row_hash: String::new(),
+                        subject_key_ids: Vec::new(),
+                        withdraws_admission_rule: None,
+                        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+                        tier: attestation_tier::FEDERATION.to_owned(),
+                        promoted_at: None,
+                        additional_scrubs: Vec::new(),
+                    },
+                ),
+            }
+        };
+
+        // A third party's row: the walk cannot resolve an owner, so the door
+        // fails CLOSED with the AMBIGUITY, not with the ordinary refusal.
+        let rumour = uuid::Uuid::new_v4().to_string();
+        let err = backend
+            .put_attestation(config_row(&rumour, "cfg-amb-stranger"))
+            .await
+            .expect_err("an unresolvable owner must refuse, never admit");
+        assert_eq!(
+            err.kind(),
+            "federation_ambiguous_node_owner",
+            "the ambiguity must PROPAGATE — flattening it into the plain \
+             self-or-owner refusal tells an operator to fix the writer when the \
+             defect is two live owner-bindings on the node: {err}"
+        );
+        assert!(
+            FederationDirectory::get_attestation(&backend, &rumour)
+                .await
+                .unwrap()
+                .is_none(),
+            "verify-before-mutation: the fail-closed refusal must leave no row"
+        );
+
+        // The node's OWN self-report is unaffected: arm 1 settles before any
+        // owner walk, so an ambiguity in the node's ownership does not silence
+        // the node's own `config:load`.
+        let self_id = uuid::Uuid::new_v4().to_string();
+        backend
+            .put_attestation(config_row(&self_id, "cfg-amb-node"))
+            .await
+            .expect("a self-report must not be collateral damage of an ambiguous owner");
+        assert!(FederationDirectory::get_attestation(&backend, &self_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s
