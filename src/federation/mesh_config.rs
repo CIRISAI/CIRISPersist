@@ -50,11 +50,11 @@
 //! and every comparison in this module goes through
 //! [`MeshConfigKey::more_restrictive_of`] and
 //! [`MeshConfigKey::expands_beyond`], which are the same predicate read in two
-//! directions. Writing "take the min" would have been correct for five of the
-//! eleven keys and silently inverted for four — `antientropy.round_secs` LARGER
-//! is less traffic, `backpressure.summary_only` TRUE is less traffic. A fold
-//! that minimises is not most-restrictive; it is most-restrictive on the keys
-//! where the two coincide, which is the kind of bug that ships.
+//! directions. Writing "take the min" would have been correct for nine of the
+//! twelve keys and silently inverted for three — `antientropy.round_secs`
+//! LARGER is less traffic, `backpressure.summary_only` TRUE is less traffic. A
+//! fold that minimises is not most-restrictive; it is most-restrictive on the
+//! keys where the two coincide, which is the kind of bug that ships.
 //!
 //! # A MARKER, not a command (the #570 design wall, inherited)
 //!
@@ -223,16 +223,19 @@ pub mod field {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowPolarity {
-    /// A LARGER value means more flows. `redundancy.k_repair_target` (more
+    /// A LARGER value means more flows. `redundancy.k_repair_symbols` (more
     /// copies pushed), `antientropy.page_limit` (bigger pages),
-    /// `admission.rate_per_key` (more rows admitted).
+    /// `admission.rate_per_key` (more rows admitted), `load.ceiling` (more
+    /// background work carried at once — *"do less work"* is the clause's own
+    /// first permitted direction, so work is on this axis exactly as traffic
+    /// is).
     HigherMeansMoreFlow,
     /// A SMALLER value means more flows. `antientropy.round_secs` (rounds more
     /// often), `backpressure.summary_only` (0 = full rows, not summaries),
     /// `descent.pressure_multiplier` (less descent pressure).
     ///
-    /// **Four of the eleven keys are on this arm**, which is why the fold cannot
-    /// be a `min()`.
+    /// **Three of the twelve keys are on this arm**, which is why the fold
+    /// cannot be a `min()`.
     LowerMeansMoreFlow,
 }
 
@@ -255,7 +258,8 @@ impl FlowPolarity {
 #[serde(rename_all = "snake_case")]
 pub enum MeshConfigUnit {
     /// A plain count of things with no redundancy axis — rows, pages,
-    /// admissions. **No longer "copies, rows, symbols"**: that gloss is what
+    /// admissions, concurrent background tasks. **No longer "copies, rows,
+    /// symbols"**: that gloss is what
     /// let [`MeshConfigKey`] carry a symbol quantity and a holder quantity
     /// under one unit, so the manifest could not express the difference
     /// (CIRISPersist#602, the same gap #532 closed with `ci_axis`).
@@ -310,9 +314,10 @@ impl MeshConfigUnit {
 /// lesson — a conferral nothing gates on is decoration — enforced by the type
 /// system rather than by a lookup someone can forget to call.
 ///
-/// The nine are #570's own initial registry, verbatim. Each carries the four
-/// facts the plane needs and nothing else: its wire spelling, its
-/// [`FlowPolarity`], its domain, and its consumer processor.
+/// #570's own initial registry, verbatim, plus the two axes CIRISPersist#602
+/// split out of its fused redundancy pair and CIRISPersist#777's load ceiling.
+/// Each carries the four facts the plane needs and nothing else: its wire
+/// spelling, its [`FlowPolarity`], its domain, and its consumer processor.
 ///
 /// # About `consumer`
 ///
@@ -362,6 +367,60 @@ pub enum MeshConfigKey {
     /// Admission rate ceiling per attesting key, rows per burst window. Higher
     /// = more admitted = more flow.
     AdmissionRatePerKey,
+    /// CIRISPersist#777 — the upper bound on the **concurrent background
+    /// work** a node carries: reconcile rounds, scorer passes, holonomic
+    /// publish. Higher = the node does more at once = more flow.
+    ///
+    /// # A ceiling, not a switch
+    ///
+    /// CIRISServer#501 was a 2-vCPU canonical that measured its own CPU stall,
+    /// raised `resource.cpu_stall` correctly, and went dark anyway — detection
+    /// with no consequence. What relieves that node is *less of its own
+    /// housekeeping at once*, and that is a QUANTITY. A flag could only take
+    /// the work to zero, and a node that never reconciles never converges: it
+    /// would stop being a mesh member rather than be relieved as one. So the
+    /// domain floors at `1` — a ceiling of `0` is a halt, and the halt is a
+    /// different plane with different authority and no TTL (CC 4.2.1 rule 4's
+    /// asymmetry, which this module quotes on
+    /// [`MeshConfigForm::Emergency`]). Relief that can reach zero is not the
+    /// relief tier.
+    ///
+    /// # It can only ever LOWER what the node does
+    ///
+    /// `owner_default` is the consent CEILING, so
+    /// [`MeshConfigKey::expands_beyond`] refuses a bigger number at the door
+    /// and [`fold_mesh_config`] clamps one that arrives by any other route.
+    /// The worst a subscribed root can do to a node through this key is make
+    /// it slower — never busier — which is what lets it compose under PLURAL
+    /// roots with no coordination between them: two roots asking 24 and 6 fold
+    /// to **6** through [`MeshConfigKey::more_restrictive_of`], on every node,
+    /// in any order. Restrictions compose; grants do not, and a key that could
+    /// raise the ceiling would need the roots to agree before it was safe.
+    ///
+    /// # Why a node cannot author it
+    ///
+    /// The node DETECTS, the owner RELIEVES, the node CONSUMES. Self-measured
+    /// stall needs no authority — it declares nothing, is invisible to peers
+    /// and binds nobody — but a *value the node then runs under* is a
+    /// governance act, and CIRISServer#503 tried the node-local form and was
+    /// withdrawn on the constitution rather than on engineering: CC 4.2.1 puts
+    /// the mesh-config author on the CC 3.2 delegation plane, and a node holds
+    /// no delegation to itself.
+    ///
+    /// That refusal needs no new vocabulary, which is the point.
+    /// [`trusted_roots_of`](super::trust_root::trusted_roots_of) excludes
+    /// self-edges by construction (`attested_key_id != node_key_id`), so a
+    /// node naming itself as its own root is refused
+    /// [`RootNotTrusted`](MeshConfigRefusalReason::RootNotTrusted) even when it
+    /// charters ITSELF as one, and a node signing under a root that never
+    /// conferred on it is refused
+    /// [`AuthorNotRootAuthorized`](MeshConfigRefusalReason::AuthorNotRootAuthorized).
+    /// Both are witnessed on every backend by
+    /// [`tests::a_node_cannot_author_its_own_load_ceiling_memory`] and its
+    /// siblings. The TTL that makes unilateral relief safe attaches to a root
+    /// HOLDER's standing (rule 3); a node has none, so there would be nothing
+    /// for a TTL to bound.
+    LoadCeiling,
 }
 
 /// One registered key's full specification. Returned by
@@ -454,6 +513,7 @@ impl MeshConfigKey {
         Self::FeatureTraceReplication,
         Self::DescentPressureMultiplier,
         Self::AdmissionRatePerKey,
+        Self::LoadCeiling,
     ];
 
     /// This key's full specification — the ONE place its five facts live.
@@ -582,6 +642,35 @@ impl MeshConfigKey {
                 owner_default: 600,
                 consumer: "peer_write_quota",
                 knob: "per_key_rows_per_window",
+            },
+            Self::LoadCeiling => MeshConfigKeySpec {
+                wire_name: "load.ceiling",
+                // More work carried at once is more flow. CC 4.2.1's "what
+                // flows" covers work as well as traffic — *"relieving a
+                // constraint (do less work)"* is the clause's own first
+                // permitted direction.
+                polarity: HigherMeansMoreFlow,
+                unit: Count,
+                // FLOORED AT 1, not 0. Relief that reaches zero is a halt, and
+                // the halt is the other tier of the graded response — different
+                // authority, no TTL. A node held at 1 still converges, slowly,
+                // and recovers on its own when the relief expires; a node at 0
+                // converges never and would sit there until a TTL nobody is
+                // watching runs out.
+                min: 1,
+                max: 4096,
+                // A CEILING, not a recommendation — the same reading every
+                // other key's default carries. Deliberately generous: roots may
+                // only tighten beneath it, so a high ceiling merely permits,
+                // while one below the consumer's own operating concurrency
+                // would make the knob unsatisfiable by any root (#602, and the
+                // reason CONSUMER_FLOORS exists). No entry there for this key
+                // yet: the consumer is being filed against CIRISServer as the
+                // key lands, and a floor transcribed before it exists would be
+                // a number invented here and then gated against.
+                owner_default: 64,
+                consumer: "background_scheduler",
+                knob: "max_concurrent_tasks",
             },
         }
     }
@@ -1273,7 +1362,7 @@ pub struct MeshConfigFold {
     /// Every trust root folded, sorted. A node with two roots folds both and
     /// takes the tightest per key.
     pub roots: Vec<String>,
-    /// One entry per registered key — **all nine, always**, even when no root
+    /// One entry per registered key — **all twelve, always**, even when no root
     /// has spoken about it. A consumer reading a config plane should never have
     /// to distinguish "not set" from "not returned"; an absent key is exactly
     /// how a knob silently keeps a stale value.
@@ -1282,7 +1371,7 @@ pub struct MeshConfigFold {
     /// **could not be read**, sorted. Empty on every backend that can answer.
     ///
     /// **The field above states the rule this one was breaking.** `settings`
-    /// returns all eleven keys always, because *"a consumer should never have to
+    /// returns all twelve keys always, because *"a consumer should never have to
     /// distinguish 'not set' from 'not returned'"*. [`resolve_mesh_config`] then
     /// swallowed `Error::Unsupported` per root, so **"this backend cannot answer
     /// for root R" and "root R said nothing" were the same answer** — the
@@ -2117,13 +2206,14 @@ mod tests {
     #[test]
     fn the_key_registry_is_closed_and_round_trips() {
         // 9 at #570; 11 after CIRISPersist#602 split the two redundancy knobs
-        // into their symbol and holder axes. Update BOTH this number and the
-        // prose above when the registry moves — the doc counts are checked by
+        // into their symbol and holder axes; 12 after CIRISPersist#777 added
+        // `load.ceiling`. Update BOTH this number and the prose above when the
+        // registry moves — the doc counts are checked by
         // `the_doc_counts_match_the_registry` for exactly that reason.
         assert_eq!(
             MeshConfigKey::ALL.len(),
-            11,
-            "#570's registry + #602's axis split"
+            12,
+            "#570's registry + #602's axis split + #777's load ceiling"
         );
         for &k in MeshConfigKey::ALL {
             assert_eq!(MeshConfigKey::from_wire(k.wire_name()), Some(k));
@@ -2291,6 +2381,9 @@ mod tests {
             (K::FeatureAvStreams, 1, 0),
             (K::FeatureTraceReplication, 1, 0),
             (K::AdmissionRatePerKey, 600, 60),
+            // #777 — a HIGHER ceiling is more concurrent background work, so
+            // relieving a stalled node means moving this DOWN.
+            (K::LoadCeiling, 64, 8),
         ] {
             assert_eq!(k.polarity(), FlowPolarity::HigherMeansMoreFlow, "{k}");
             assert_eq!(k.more_restrictive_of(more, less), less, "{k}");
@@ -2300,7 +2393,7 @@ mod tests {
             );
             assert!(!k.expands_beyond(less, more), "{k}");
         }
-        // LOWER = more flow. These four are why the fold cannot be a min().
+        // LOWER = more flow. These three are why the fold cannot be a min().
         for (k, more, less) in [
             (K::AntientropyRoundSecs, 30, 300),
             (K::BackpressureSummaryOnly, 0, 1),
@@ -2431,6 +2524,154 @@ mod tests {
         assert!(s.clamped_roots.is_empty());
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // `load.ceiling` (CIRISPersist#777)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// **The key exists on the wire and points the way its English does.**
+    ///
+    /// Asserted against the MEANING of a ceiling rather than against the
+    /// registry's own answer: a bigger ceiling is more concurrent background
+    /// work, so `8` relieves a node that `64` was stalling. Every other
+    /// assertion in this section is downstream of that one fact.
+    #[test]
+    fn the_load_ceiling_key_round_trips_and_points_the_way_its_english_does() {
+        use MeshConfigKey as K;
+        let spec = K::LoadCeiling.spec();
+
+        assert_eq!(spec.wire_name, "load.ceiling");
+        assert_eq!(K::from_wire("load.ceiling"), Some(K::LoadCeiling));
+        assert_eq!(K::LoadCeiling.dimension(), "mesh_config:load.ceiling:v1");
+        assert_eq!(
+            K::from_dimension("mesh_config:load.ceiling:v1"),
+            Some(K::LoadCeiling)
+        );
+        assert_eq!(
+            serde_json::to_string(&K::LoadCeiling).expect("serialize"),
+            "\"load.ceiling\""
+        );
+        assert_eq!(
+            serde_json::from_str::<K>("\"load.ceiling\"").expect("deserialize"),
+            K::LoadCeiling
+        );
+
+        // Typed to the ONE field it names (#602's discipline): a count of
+        // concurrent background tasks, on neither redundancy axis.
+        assert_eq!(spec.unit, MeshConfigUnit::Count);
+        assert_eq!(
+            spec.polarity,
+            FlowPolarity::HigherMeansMoreFlow,
+            "a HIGHER ceiling lets the node carry MORE background work at once. On the other \
+             arm the fold would relieve a stalled node by raising its ceiling."
+        );
+        // A ceiling of 0 is a halt, not relief — the halt is the other tier of
+        // the graded response, with different authority and no TTL.
+        assert_eq!(
+            spec.min, 1,
+            "`load.ceiling` must not be able to express 0: a node that does no background work \
+             never converges, and stopping a node is the halt plane's act, not this one's"
+        );
+        assert!(
+            K::LoadCeiling.in_domain(spec.owner_default),
+            "the consent ceiling must itself be settable"
+        );
+        assert!(!K::LoadCeiling.in_domain(0), "0 is out of domain");
+
+        // relieve-never-expand, in this key's own terms.
+        assert!(
+            K::LoadCeiling.expands_beyond(64, 8),
+            "raising a node's ceiling is EXPANSION and no root may do it"
+        );
+        assert!(
+            !K::LoadCeiling.expands_beyond(8, 64),
+            "lowering it is relief, which is the whole point of the key"
+        );
+        assert_eq!(K::LoadCeiling.more_restrictive_of(64, 8), 8);
+        assert_eq!(K::LoadCeiling.clamp_to_consent(64, 8), 8);
+    }
+
+    /// **Plural roots, and the LOWER ceiling binds.**
+    ///
+    /// The safety argument for letting several trust roots turn one knob is
+    /// that this key can only ever lower it, so their answers compose without
+    /// their agreement. That is only true if the fold takes the tighter one —
+    /// and "tighter" is a per-key fact, not `min` (three of the twelve keys
+    /// invert it), so it is asserted here rather than assumed from arithmetic.
+    ///
+    /// Constructed so the wrong answers are distinguishable: `root-b` is the
+    /// LATER root alphabetically, files the LATER row, and asks for the TIGHTER
+    /// value — so a fold that took the last root, the newest row, the first
+    /// root, or the higher value would each answer something other than 6.
+    #[test]
+    fn the_lower_load_ceiling_binds_when_two_roots_disagree() {
+        use MeshConfigKey as K;
+        let base = MeshConfigBaseline::owner_defaults().with(K::LoadCeiling, 32);
+        let roots = vec!["root-a".to_owned(), "root-b".to_owned()];
+        let rows = vec![
+            row(
+                "m-lc-a",
+                "root-a",
+                "root-a",
+                K::LoadCeiling,
+                24,
+                "2026-08-03T10:00:00Z",
+                None,
+            ),
+            row(
+                "m-lc-b",
+                "root-b",
+                "root-b",
+                K::LoadCeiling,
+                6,
+                "2026-08-03T11:00:00Z",
+                None,
+            ),
+        ];
+        let fold = fold_mesh_config("node-1", &base, &roots, &rows, ts(NOW));
+        let s = fold.setting(K::LoadCeiling).expect("registered key");
+
+        assert_eq!(s.baseline, 32, "what this node's owner consented to");
+        assert_eq!(
+            s.effective, 6,
+            "most-restrictive-across-roots: the LOWER ceiling binds. 24 would be the answer of \
+             every wrong fold — last root, newest row, or the looser value"
+        );
+        assert_eq!(fold.effective(K::LoadCeiling), 6);
+        assert!(s.relieved);
+        assert_eq!(s.decided_by_root.as_deref(), Some("root-b"));
+        assert_eq!(s.row_id.as_deref(), Some("m-lc-b"));
+
+        // Evidence, not verdict: the root that LOST is still carried, so an
+        // operator can see the two roots disagreed rather than only the answer.
+        assert_eq!(s.per_root.len(), 2);
+        assert_eq!(s.per_root[0].root_ref, "root-a");
+        assert_eq!(s.per_root[0].asked, 24);
+        assert_eq!(s.per_root[1].asked, 6);
+        // Neither root expanded, so neither is named as clamped — 24 and 6 are
+        // both beneath the node's own 32.
+        assert!(s.clamped_roots.is_empty());
+
+        // And the direction is the only thing holding: a root asking to RAISE
+        // the ceiling contributes the baseline and is named for it.
+        let greedy = vec![row(
+            "m-lc-greedy",
+            "root-a",
+            "root-a",
+            K::LoadCeiling,
+            4096,
+            "2026-08-03T12:00:00Z",
+            None,
+        )];
+        let fold = fold_mesh_config("node-1", &base, &roots[..1], &greedy, ts(NOW));
+        let s = fold.setting(K::LoadCeiling).expect("registered key");
+        assert_eq!(
+            s.effective, 32,
+            "a root may not make a node busier than its owner consented to"
+        );
+        assert!(!s.relieved);
+        assert_eq!(s.clamped_roots, vec!["root-a".to_owned()]);
+    }
+
     /// The most-flow end of a key's domain — the value a hostile root asks for.
     fn most_flow_value(k: MeshConfigKey) -> i64 {
         let s = k.spec();
@@ -2443,7 +2684,7 @@ mod tests {
     /// The least-flow end — the baseline this adversarial test pins, so that
     /// EVERY other value in the domain expands past it on every key.
     ///
-    /// A midpoint would have been more realistic and is wrong here: the four
+    /// A midpoint would have been more realistic and is wrong here: the three
     /// `Flag` keys have domain `[0, 1]`, whose midpoint is `0`, which is
     /// already the most-flow end for `backpressure.summary_only`. A baseline a
     /// root cannot expand past makes the clamp unreachable for that key — the
@@ -2484,7 +2725,7 @@ mod tests {
             // The node consents to the LEAST flow the key can express, so every
             // other value in the domain expands past it — see
             // `least_flow_value` for why a midpoint would silently disarm the
-            // four Flag keys.
+            // three Flag keys.
             base = base.with(k, least_flow_value(k));
             for (ri, root) in roots.iter().enumerate() {
                 for step in 0..5i64 {
@@ -3013,10 +3254,32 @@ mod tests {
 
     /// A really-hybrid-signed `delegates_to` carrying a `trust:*` job label.
     fn trust_edge(id: &str, from: &str, to: &str, job: &str) -> Attestation {
-        let envelope = serde_json::json!({
+        trust_edge_with(id, from, to, job, &[])
+    }
+
+    /// [`trust_edge`] with `extra` envelope fields merged in BEFORE signing.
+    ///
+    /// A SELF-loop `delegates_to` carrying an `infra:*` scope is a root charter
+    /// (CIRISPersist#488) and the write door refuses one without a
+    /// `pre_rotation_commitment` — so a test that wants a node to charter
+    /// itself has to build the field into the envelope. It cannot be added
+    /// afterwards: the envelope is what the row is signed over, and
+    /// "construct the signed bytes, then mutate the row" is the class v31.0.0
+    /// spent a cut removing from six sites.
+    fn trust_edge_with(
+        id: &str,
+        from: &str,
+        to: &str,
+        job: &str,
+        extra: &[(&str, serde_json::Value)],
+    ) -> Attestation {
+        let mut envelope = serde_json::json!({
             "dimension": job,
             "scope": ["infra:attest", "infra:serve"],
         });
+        for (k, v) in extra {
+            envelope[*k] = v.clone();
+        }
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
         let now = Utc::now();
@@ -3626,6 +3889,206 @@ mod tests {
         // an earlier run against the same database.
         let tag = format!("pg{}", uuid::Uuid::new_v4().simple());
         mesh_config_door_body(&dir, &tag).await;
+    }
+
+    /// **CIRISPersist#777 — the node detects, the OWNER relieves.**
+    ///
+    /// `load.ceiling` is the key a stalling node has the most reason to want to
+    /// set for itself, and the one it may least do so: CC 4.2.1 puts the
+    /// mesh-config author on the CC 3.2 delegation plane, and a node holds no
+    /// delegation to itself. CIRISServer#503 proposed the node-local form and
+    /// was withdrawn on exactly that.
+    ///
+    /// Three claims, in the order that makes the refusals mean something:
+    ///
+    /// 1. the ROOT's relief is **admitted** and binds — without this the other
+    ///    two would pass on a key nothing can set at all, which is a witness
+    ///    for nothing;
+    /// 2. the same row, signed by the NODE under the root it subscribes to, is
+    ///    refused `author_not_root_authorized`;
+    /// 3. the node naming ITSELF as the root is refused `root_not_trusted`
+    ///    **even after it charters itself** — a self-loop `trust:accepts:v1`
+    ///    edge that the write door actually admits, because
+    ///    [`trusted_roots_of`](super::trust_root::trusted_roots_of) drops
+    ///    self-edges before this plane's gates ever run.
+    ///
+    /// No refusal variant was added for any of this, which is the point: the
+    /// authority taxonomy is *root or conferred delegate*, so "a node" is
+    /// already outside it. (The issue states persist "cannot even express
+    /// refusing a node-authored value" — it can, twice, and these are the two
+    /// branches.)
+    async fn node_authored_load_ceiling_body(dir: &dyn FederationDirectory, tag: &str) {
+        use MeshConfigKey as K;
+        let node = format!("lc-node-{tag}");
+        let root = format!("lc-root-{tag}");
+        for k in [&node, &root] {
+            register(dir, k).await;
+        }
+        // The subscription — the trust edge CC 4.2.1 calls the subscription.
+        dir.put_attestation(super::super::SignedAttestation {
+            attestation: trust_edge(
+                &uuid::Uuid::new_v4().to_string(),
+                &node,
+                &root,
+                crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the node's trust edge must admit: {e}"));
+
+        let now = Utc::now();
+        let base = MeshConfigBaseline::owner_defaults();
+        let relief_at = now - Duration::hours(1);
+        let expires = now + Duration::hours(24);
+
+        // ── 1. The OWNER's root relieves the node it subscribes to. Bounded
+        //       emergency relief, which is what CC 4.2.1 gives a single holder.
+        let by_root = signed_config_row(
+            &root,
+            &root,
+            K::LoadCeiling,
+            8,
+            MeshConfigForm::Emergency,
+            relief_at,
+            Some(expires),
+            None,
+            "att-deleg",
+        );
+        assert_eq!(
+            record_mesh_config_row(dir, &node, &base, &by_root, now)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}")),
+            MeshConfigOutcome::Admitted,
+            "[{tag}] the root's own relief must be admitted, or the refusals below prove only \
+             that nothing can set this key"
+        );
+
+        // ── 2. The NODE signs the identical relief, under the root it
+        //       subscribes to. The value is the same and the direction is
+        //       relief; what is refused is the AUTHOR.
+        let by_node = signed_config_row(
+            &node,
+            &root,
+            K::LoadCeiling,
+            8,
+            MeshConfigForm::Emergency,
+            relief_at,
+            Some(expires),
+            None,
+            "att-deleg",
+        );
+        assert_eq!(
+            record_mesh_config_row(dir, &node, &base, &by_node, now)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}"))
+                .refusal(),
+            Some(MeshConfigRefusalReason::AuthorNotRootAuthorized),
+            "[{tag}] the root conferred on nobody, so a node signing under it is not on the \
+             delegation plane CC 4.2.1 names"
+        );
+
+        // ── 3. The NODE names ITSELF as the root, having first chartered
+        //       itself: a self-loop `trust:accepts:v1` edge, born recoverable
+        //       with the pre-rotation commitment CIRISPersist#488 requires, so
+        //       it is ADMITTED and the refusal below is this plane's rather
+        //       than the charter door's. `trusted_roots_of` filters
+        //       `attested_key_id != node_key_id`, so the self-charter is not
+        //       even a trust question by the time this plane looks.
+        dir.put_attestation(super::super::SignedAttestation {
+            attestation: trust_edge_with(
+                &uuid::Uuid::new_v4().to_string(),
+                &node,
+                &node,
+                crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                &[(
+                    crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD,
+                    serde_json::Value::String("11".repeat(32)),
+                )],
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "[{tag}] the node's self-charter must STORE, or step 3 witnesses the charter \
+                 door instead of the mesh-config plane: {e}"
+            )
+        });
+        let self_rooted = signed_config_row(
+            &node,
+            &node,
+            K::LoadCeiling,
+            8,
+            MeshConfigForm::Emergency,
+            relief_at,
+            Some(expires),
+            None,
+            "att-deleg",
+        );
+        assert_eq!(
+            record_mesh_config_row(dir, &node, &base, &self_rooted, now)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}"))
+                .refusal(),
+            Some(MeshConfigRefusalReason::RootNotTrusted),
+            "[{tag}] a node is not a trust root of itself, self-charter or not"
+        );
+
+        // ── 4. And the node runs the OWNER's number, from the real read path.
+        let fold = resolve_mesh_config(dir, &node, &base, now)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
+        let s = fold.setting(K::LoadCeiling).expect("registered key");
+        assert_eq!(
+            s.effective, 8,
+            "[{tag}] the relief the root filed is the ceiling the node runs"
+        );
+        assert_eq!(s.decided_by.as_deref(), Some(root.as_str()));
+        assert_eq!(s.decided_by_root.as_deref(), Some(root.as_str()));
+        assert_eq!(s.form, Some(MeshConfigForm::Emergency));
+        assert_eq!(
+            s.expires_at,
+            Some(expires),
+            "[{tag}] relief that does not expire is government"
+        );
+        assert!(
+            !fold.roots.contains(&node),
+            "[{tag}] the node must not appear among its own trust roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_cannot_author_its_own_load_ceiling_memory() {
+        let dir = crate::store::MemoryBackend::new();
+        node_authored_load_ceiling_body(&dir, "mem").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_node_cannot_author_its_own_load_ceiling_sqlite() {
+        use crate::store::Backend;
+        let dir = crate::store::SqliteBackend::open_in_memory()
+            .await
+            .expect("sqlite");
+        dir.run_migrations().await.expect("migrations");
+        node_authored_load_ceiling_body(&dir, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn a_node_cannot_author_its_own_load_ceiling_postgres() {
+        use crate::store::Backend;
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let dir = crate::store::PostgresBackend::connect(&dsn)
+            .await
+            .expect("pg");
+        dir.run_migrations().await.expect("migrations");
+        // Invocation-unique, so a re-run cannot collide with its own key ids.
+        let tag = format!("pg{}", uuid::Uuid::new_v4().simple());
+        node_authored_load_ceiling_body(&dir, &tag).await;
     }
 
     // ══════════════════════════════════════════════════════════════════
