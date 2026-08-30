@@ -56,11 +56,54 @@ than working around it.
 
 ### Added
 
-- **#778 — `config:{scope}` is a self-report** (CC 3.4.5's missing
-  substrate-admission leg). A third party could attest what a node was
-  running, and a peer could make a healthy node look like it was shedding
-  load. Refused at the put door on all three backends AND at the promote
-  door, fail-closed on an ambiguous owner.
+- **#778 — `check_config_self_or_owner_admission`: `config:{scope}` is a
+  SELF-REPORT.** CC 3.4.5 pins *"`attesting_key_id` MUST be
+  `attested_key_id` or its live `owner_of`"*, and CC 3.4.7 holds every rule
+  in that table with **three** things: substrate admission, consumer
+  re-check, producer obligation. Persist had the third and only the third.
+  Our producer honours the rule by construction (attesting == attested ==
+  subject) — which is exactly the half a malicious producer does not
+  perform.
+
+  So until this cut **any registered key could attest `config:replication`,
+  or CIRISServer 0.5.195's short-lived `config:load`, about a node it does
+  not own**, and the substrate stored it and served it. The harm lands on
+  the honest party: `config:load` steers where peers send work and carries
+  information *only* because it is a self-report, so a peer able to mint
+  one about someone else makes a healthy node look like it is shedding, and
+  every honest consumer — one that re-checks nothing precisely because the
+  substrate admitted the row — backs off from a node that is fine.
+
+  The gate reads [`owner_of`], the CC 3.2 purpose-filtered resolution, not
+  the wider multi-parent steward walk: the clause names one identity and
+  the two sets are not the same set. **An ambiguous owner is an `Err`, not
+  a refusal** — `Error::AmbiguousNodeOwner` propagates rather than being
+  flattened into the ordinary self-or-owner message, because *"you are not
+  the owner"* and *"this node has two live owners and the substrate cannot
+  say who speaks for it"* send an operator to different layers, and a
+  caller that cannot tell them apart will eventually treat one as the
+  other.
+
+  Wired at `put_attestation` on **memory, sqlite and postgres** at the same
+  position (immediately after `check_capacity_consent_admission`, the other
+  CC 3.4.5 gate), and in `check_promotion_admission` — the local tier is
+  not a way around a put-gate, and the owner-binding can lapse between a
+  local write and its promotion. Tier-blind at the put door: a tier-scoped
+  rule is skippable by writing `tier = "local"`, and nothing legitimate is
+  over-refused, since a node's own staged config row is self-attested by
+  definition. Verify-before-mutation (AV-9): a refused row leaves nothing
+  stored, and a refused promotion leaves the row local.
+
+  Witnessed on all three backends through the REAL doors
+  (`config_self_or_owner_gate_{memory,sqlite,postgres}_778`): self-authored
+  admits, owner-authored admits, third-party refuses **by this gate's own
+  message** and stores nothing, a non-`config:` row from the same stranger
+  about the same node still admits (the over-refusal control), and the
+  local-stage→promote path refuses at the promote door. The fail-closed
+  ambiguity arm is sqlite-only
+  (`config_self_or_owner_ambiguous_owner_fails_closed_sqlite_778`) because
+  the two-owner state is a pre-gate anomaly `check_single_node_owner_admission`
+  makes unreachable through any door.
 - **#780 — `list_wire_hashes_since(kind, after_content_hash, limit)`**: the
   complete hash set for one wire kind, read from `signed_wire_index` without
   touching a row page. Consumers were re-deriving it every round by reading

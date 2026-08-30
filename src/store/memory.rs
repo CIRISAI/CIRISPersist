@@ -3196,6 +3196,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
+        // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
+        // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
+        // live `owner_of`. CC 3.4.7 holds every 3.4.5 emitter rule with three
+        // things — substrate admission, consumer re-check, producer obligation
+        // — and persist had only the third, so a peer could attest
+        // `config:replication` / `config:load` ABOUT A NODE IT DOES NOT OWN
+        // and every honest consumer would believe a healthy node was shedding.
+        // AV-76 TIER 4: the owner arm walks the directory, so it may not lead
+        // the crypto. Placed immediately after the consent gate so the two CC
+        // 3.4.5 gates sit together and a reader finds both at one line.
+        // Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
         // the host installed no `self_key_id`: a node that has declared no

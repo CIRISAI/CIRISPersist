@@ -149,6 +149,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_capacity_never_local", Class::Gate),
     ("check_co_steward_role_admission", Class::Gate),
     ("check_cohort_scope", Class::Gate),
+    // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` is a self-report:
+    // a row whose author is neither the attested subject nor its live
+    // `owner_of` is refused. A Gate by the stated rule — it refuses on a policy
+    // question about the caller's row (who is speaking about whom), never on
+    // the substrate's own terms.
+    ("check_config_self_or_owner_admission", Class::Gate),
     ("check_community_membership_steward_binding", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
