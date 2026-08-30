@@ -1716,6 +1716,7 @@ pub mod test_support {
             identity_type,
             pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64,
+            None,
         )
         .expect("bind the #659 subject into the registration envelope");
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
@@ -2056,6 +2057,7 @@ pub mod test_support {
             &record.identity_type,
             &record.pubkey_ed25519_base64,
             record.pubkey_ml_dsa_65_base64.as_deref(),
+            None,
         )
         .expect("bind the #659 subject into the registration envelope");
         let bytes =
@@ -2467,9 +2469,18 @@ pub mod test_support {
             crate::federation::types::identity_type::NODE,
             &v_ed,
             v_pqc.as_deref(),
+            None,
         )
-        .keys()
-        .cloned()
+        // v38.7.0 — only members bound to a VALUE. A member whose expectation
+        // is `null` (an absent PQC leg, or an absent `valid_until` since
+        // CIRISVerify v14.0.0) is exactly the CEG §0.9 carve-out: its
+        // omission is legitimately tolerated, so demanding a refusal for it
+        // would assert the opposite of the contract. Filtered off the
+        // projection rather than named, so a future optional member is
+        // excluded the day verify adds it.
+        .into_iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, _)| k)
         .collect();
         assert!(
             all_members.iter().any(|m| m == "identity_type"),
@@ -6096,32 +6107,48 @@ mod tests {
         use crate::federation::admission::{
             bind_subject_into_envelope, subject_binding, verify_envelope_binds_subject,
         };
-        let bound = subject_binding("k1", "node", "ED", Some("PQC"));
+        let bound = subject_binding("k1", "node", "ED", Some("PQC"), None);
         assert_eq!(
             bound.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "identity_type",
                 "key_id",
                 "pubkey_ed25519_base64",
-                "pubkey_ml_dsa_65_base64"
+                "pubkey_ml_dsa_65_base64",
+                // v38.7.0 — the FIFTH member, added by CIRISVerify v14.0.0.
+                // Unbound, an expiry can be removed or extended while the
+                // envelope, its hash and both signatures stay intact, and a
+                // consumer reading the public field gets the attacker's value.
+                "valid_until"
             ],
-            "13.1.0: persist's projection must be the same four members \
+            "13.1.0: persist's projection must be the same five members \
              `ciris_verify_core::federation_self_record::KeyRecord::check_subject_binding` binds — \
              two implementations of one projection may not drift"
         );
         assert!(
-            subject_binding("k1", "node", "ED", None)["pubkey_ml_dsa_65_base64"].is_null(),
+            subject_binding("k1", "node", "ED", None, None)["pubkey_ml_dsa_65_base64"].is_null(),
             "#659: an absent PQC leg binds `null` — an assertion of ABSENCE, not a missing field"
         );
-        // …and it is the ONLY member that may ever be null, which is what makes
-        // the CEG §0.9 carve-out narrow. Read off the projection, not restated.
-        for (member, value) in subject_binding("k1", "node", "ED", None) {
+        // …and the nullable set is EXACTLY the members verify declares
+        // optional, which is what keeps the CEG §0.9 carve-out narrow. Read
+        // off the projection, not restated.
+        //
+        // v38.7.0 — that set went from one member to two: CIRISVerify v14.0.0
+        // spells `valid_until` with `require_optional`, so an absent expiry
+        // binds `null` exactly as an absent PQC leg does. The carve-out
+        // widened because VERIFY widened it, and this assertion now names
+        // both — a THIRD nullable member still fails here, which is the
+        // property that matters. Enumerated rather than loosened to "any
+        // member may be null".
+        const NULLABLE: &[&str] = &["pubkey_ml_dsa_65_base64", "valid_until"];
+        for (member, value) in subject_binding("k1", "node", "ED", None, None) {
             assert_eq!(
                 value.is_null(),
-                member == "pubkey_ml_dsa_65_base64",
-                "13.1.0: only the PQC leg may bind `null`, because `verify_envelope_binds_subject` \
-                 tolerates an OMITTED member exactly when the expectation is null — a second \
-                 nullable member would silently widen that carve-out to a second field"
+                NULLABLE.contains(&member.as_str()),
+                "13.1.0/v14.0.0: only the members verify spells `require_optional` may bind \
+                 `null`, because `verify_envelope_binds_subject` tolerates an OMITTED member \
+                 exactly when the expectation is null — a further nullable member would \
+                 silently widen that carve-out again"
             );
         }
 
@@ -6148,7 +6175,7 @@ mod tests {
             // the day it is added instead of the day someone remembers. The
             // envelope side is the one tampered with (not the row) because that
             // is generic over members whose row-side spellings differ.
-            for member in subject_binding("k1", "node", "ED", pqc.as_deref()).keys() {
+            for member in subject_binding("k1", "node", "ED", pqc.as_deref(), None).keys() {
                 let mut tampered = rec.clone();
                 tampered.registration_envelope[member] = json!("a-value-nobody-signed-for");
                 let Err(why) = verify_envelope_binds_subject(&tampered) else {
@@ -6192,7 +6219,7 @@ mod tests {
             "pubkey_ml_dsa_65_base64": "SOMEBODY-ELSES-PQC-KEY",
             "purpose": "kept",
         });
-        bind_subject_into_envelope(&mut hostile, "k1", "node", "ED", None).expect("bind");
+        bind_subject_into_envelope(&mut hostile, "k1", "node", "ED", None, None).expect("bind");
         assert_eq!(hostile["key_id"], json!("k1"));
         assert_eq!(hostile["identity_type"], json!("node"));
         assert_eq!(hostile["pubkey_ed25519_base64"], json!("ED"));
@@ -6202,7 +6229,9 @@ mod tests {
         // The producer refuses a non-object envelope rather than dropping the
         // binding on the floor.
         let mut not_an_object = json!("just a string");
-        assert!(bind_subject_into_envelope(&mut not_an_object, "k1", "node", "ED", None).is_err());
+        assert!(
+            bind_subject_into_envelope(&mut not_an_object, "k1", "node", "ED", None, None).is_err()
+        );
     }
 
     /// v31.0.0 (CIRISPersist#659) — [`test_support::accord_conferred`] is the

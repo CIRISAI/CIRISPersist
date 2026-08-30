@@ -2959,6 +2959,11 @@ impl Engine {
             identity_type,
             &pubkey_ed25519_base64,
             pqc_pubkey_b64.as_deref(),
+            // v38.7.0 (verify v14.0.0) — the expiry is BOUND now. A
+            // self-registration has no expiry to bind; a caller that grows
+            // one must pass it here, or the envelope will not satisfy
+            // verify's checker.
+            None,
         )
         .map_err(crate::federation::Error::InvalidArgument)?;
 
@@ -6880,13 +6885,58 @@ impl Engine {
     /// - `edge_outbound_queue.enqueued_at` (row birth)
     /// - `federation_keys.valid_from` (key validity-window start)
     ///
-    /// # SQLite per-table-bytes limitation
+    /// v38.7.0 (CIRISPersist#775) — the summary WITH per-table byte
+    /// localisation. Ask for this only when you want the bytes.
     ///
-    /// On SQLite each `TableUsage.bytes` field is `0` — stock rusqlite
-    /// builds don't enable `SQLITE_ENABLE_DBSTAT_VTAB`. Consult
+    /// On SQLite this walks every page of the database (`dbstat`), so it is
+    /// O(database size) rather than O(tables) — on a 1.3 GiB store that is a
+    /// long, blocking read holding the connection guard, and a
+    /// `#[tokio::main]` runtime sizes to core count, so on a 2-vCPU host it
+    /// occupies half the executor while it runs. Call it from a maintenance
+    /// path, never from a request or a tight monitoring loop.
+    ///
+    /// [`Self::storage_summary`] is the routine shape: same rows, same
+    /// timestamps, same whole-DB total, no page walk.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn storage_summary_with_table_bytes(
+        &self,
+    ) -> Result<crate::retention::StorageSummary, crate::retention::RetentionError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::retention::postgres::storage_summary_pg_with(b, true).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::retention::sqlite::storage_summary_sqlite_with(b, true).await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::retention::RetentionError::Backend(
+                "storage_summary_with_table_bytes: unsupported backend".into(),
+            )),
+        }
+    }
+
+    /// # Per-table bytes are NOT collected here
+    ///
+    /// `TableUsage.bytes` is `0` from this call on both backends, and
+    /// [`StorageSummary::bytes_measurable`](crate::retention::StorageSummary::bytes_measurable)
+    /// says so. Use
+    /// [`Self::storage_summary_with_table_bytes`] when you actually want the
+    /// byte localisation — on SQLite that walks every page of the database
+    /// (`dbstat`), which is O(database size) and blocking, and this call is
+    /// the routine-monitoring shape that must not pay for it
+    /// (CIRISPersist#775).
+    ///
+    /// Two earlier claims that stood here were wrong and are recorded so the
+    /// next reader does not re-derive them: stock rusqlite DOES enable
+    /// `SQLITE_ENABLE_DBSTAT_VTAB` in this crate's build (probed —
+    /// CIRISPersist#767, where `bytes: 0` had been hardcoded on the opposite
+    /// belief), and Postgres reports `pg_total_relation_size`, not
+    /// `pg_relation_size`, so index and TOAST bytes are included.
+    ///
     /// [`StorageSummary::total_disk_bytes`](crate::retention::StorageSummary::total_disk_bytes)
-    /// for whole-DB byte counts on SQLite. Postgres reports
-    /// `pg_relation_size` per table.
+    /// is always present and is cheap on both backends.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn storage_summary(
         &self,
@@ -6897,6 +6947,39 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::retention::sqlite::storage_summary_sqlite(b).await,
         }
+    }
+
+    /// v38.7.0 (CIRISPersist#779) — **reap attestations whose producer-stated
+    /// expiry has passed.** Bounded batch, driven at the caller's cadence.
+    ///
+    /// The capability shipped in v38.4.0 on
+    /// [`FederationDirectory::reap_expired_attestations`] and this facade did
+    /// NOT, so a consumer holding an ordinary `Engine` could not call it
+    /// without feature-gated backend extraction. Downstream read that as "no
+    /// bounded prune for expired attestations exists" and documented an
+    /// attestation-heavy store as bounded only by disk — which is what an
+    /// unreachable capability IS, from outside.
+    ///
+    /// The omission has a precise shape worth recording: PR #769's review
+    /// asked for exactly this facade for the two OBSERVATION prunes, and it
+    /// was added for those two while the reaper sitting beside them was left
+    /// out. Fixing the instances a reviewer names, rather than the class the
+    /// reviewer described, is how a gap survives its own fix.
+    ///
+    /// Returns `(purged, refused)`. A refusal is expected traffic, not an
+    /// error — it means the purge door protected a row this sweep should not
+    /// have offered (a `withdraws`, a delegation, an exclusion-bearing row).
+    /// Both counts are returned so a sweep that is refusing everything cannot
+    /// read as "nothing to do".
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reap_expired_attestations(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<(usize, usize), crate::federation::Error> {
+        let dir = self.federation_directory();
+        crate::federation::FederationDirectory::reap_expired_attestations(&*dir, now, max_rows)
+            .await
     }
 
     /// v38.4.0 (CIRISPersist#767 Ask 2, PR #769 review) — prune `announced_peers` rows not seen since `cutoff`, bounded.
@@ -18578,6 +18661,7 @@ mod register_self_canonicalizer_parity {
             &row.identity_type,
             &row.pubkey_ed25519_base64,
             row.pubkey_ml_dsa_65_base64.as_deref(),
+            None,
         )
         .expect("subject binding");
         env

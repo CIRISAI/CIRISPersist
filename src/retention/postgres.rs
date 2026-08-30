@@ -28,6 +28,17 @@ use super::ArchiveHandle;
 use super::{RetentionError, StorageSummary, TableUsage};
 use crate::store::postgres::PostgresBackend;
 
+/// v38.7.0 (CIRISPersist#775) — the CHEAP summary. PostgreSQL answers
+/// `pg_total_relation_size` from catalogue statistics rather than by walking
+/// pages, so the cost gap is far smaller here than on SQLite — but the two
+/// backends keep the SAME surface so a consumer's call means one thing
+/// regardless of what it is talking to.
+pub async fn storage_summary_pg(
+    backend: &PostgresBackend,
+) -> Result<StorageSummary, RetentionError> {
+    storage_summary_pg_with(backend, false).await
+}
+
 /// v2.7.0 — [`StorageSummary`] for a `PostgresBackend`.
 ///
 /// Per-table reporting via `pg_total_relation_size` (bytes; includes
@@ -35,8 +46,9 @@ use crate::store::postgres::PostgresBackend;
 /// oldest/newest rows. Tables that aren't part of the current
 /// cargo feature set surface as [`TableUsage::default`] so the
 /// struct shape stays stable.
-pub async fn storage_summary_pg(
+pub async fn storage_summary_pg_with(
     backend: &PostgresBackend,
+    with_table_bytes: bool,
 ) -> Result<StorageSummary, RetentionError> {
     let client = backend
         .pool()
@@ -64,10 +76,17 @@ pub async fn storage_summary_pg(
         "cirislens.trace_events",
         Some("ts"),
         Some("admitted_at"),
+        with_table_bytes,
     )
     .await?;
-    let trace_llm_calls =
-        table_usage_pg(&client, "cirislens.trace_llm_calls", Some("ts"), None).await?;
+    let trace_llm_calls = table_usage_pg(
+        &client,
+        "cirislens.trace_llm_calls",
+        Some("ts"),
+        None,
+        with_table_bytes,
+    )
+    .await?;
     // detection_events lives in cirislens_derived (V008). Always
     // built — DerivedSchema is feature-flag-independent.
     let detection_events = table_usage_pg(
@@ -75,13 +94,21 @@ pub async fn storage_summary_pg(
         "cirislens_derived.detection_events",
         Some("ts"),
         None,
+        with_table_bytes,
     )
     .await?;
 
     let audit_log = {
         #[cfg(feature = "cirisaudit")]
         {
-            table_usage_pg(&client, "cirislens.audit_log", Some("recorded_at"), None).await?
+            table_usage_pg(
+                &client,
+                "cirislens.audit_log",
+                Some("recorded_at"),
+                None,
+                with_table_bytes,
+            )
+            .await?
         }
         #[cfg(not(feature = "cirisaudit"))]
         {
@@ -94,6 +121,7 @@ pub async fn storage_summary_pg(
         "cirislens.edge_outbound_queue",
         Some("enqueued_at"),
         None,
+        with_table_bytes,
     )
     .await?;
 
@@ -102,6 +130,7 @@ pub async fn storage_summary_pg(
         "cirislens.federation_keys",
         Some("valid_from"),
         None,
+        with_table_bytes,
     )
     .await?;
 
@@ -139,7 +168,14 @@ pub async fn storage_summary_pg(
             // Key on the BARE table name so a consumer reads the same key
             // on either backend; the qualified name is a PG detail.
             let bare = qname.rsplit('.').next().unwrap_or(&qname).to_owned();
-            let usage = table_usage_pg(&client, &qname, super::ts_column_for(&bare), None).await?;
+            let usage = table_usage_pg(
+                &client,
+                &qname,
+                super::ts_column_for(&bare),
+                None,
+                with_table_bytes,
+            )
+            .await?;
             tables.insert(bare, usage);
         }
     }
@@ -179,37 +215,46 @@ async fn table_usage_pg(
     qualified: &str,
     ts_column: Option<&str>,
     admitted_col: Option<&str>,
+    with_table_bytes: bool,
 ) -> Result<TableUsage, RetentionError> {
     // pg_total_relation_size accepts a regclass; a missing table errors
     // with `relation "..." does not exist`. We map that to an empty
     // TableUsage rather than failing — the cohabitation store has
     // optional tables.
-    let bytes = match client
-        .query_one(
-            &format!(
-                "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
-                qualified
-            ),
-            &[],
-        )
-        .await
-    {
-        Ok(row) => {
-            let sz: i64 = row
-                .try_get("sz")
-                .map_err(|e| RetentionError::Backend(format!("decode {qualified} size: {e}")))?;
-            u64::try_from(sz).unwrap_or(0)
-        }
-        Err(e) => {
-            // 42P01 — undefined_table. Soft-fail with default.
-            if let Some(code) = e.code() {
-                if code.code() == "42P01" {
-                    return Ok(TableUsage::default());
-                }
+    // v38.7.0 (#775) — skip the size query unless per-table bytes were
+    // ASKED FOR, so a "cheap summary" means the same thing on both backends.
+    // PG answers this from catalogue statistics rather than by walking pages,
+    // so the saving here is small — the contract parity is the point.
+    let bytes = if !with_table_bytes {
+        0
+    } else {
+        match client
+            .query_one(
+                &format!(
+                    "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
+                    qualified
+                ),
+                &[],
+            )
+            .await
+        {
+            Ok(row) => {
+                let sz: i64 = row.try_get("sz").map_err(|e| {
+                    RetentionError::Backend(format!("decode {qualified} size: {e}"))
+                })?;
+                u64::try_from(sz).unwrap_or(0)
             }
-            return Err(RetentionError::Backend(format!(
-                "pg_total_relation_size {qualified}: {e}"
-            )));
+            Err(e) => {
+                // 42P01 — undefined_table. Soft-fail with default.
+                if let Some(code) = e.code() {
+                    if code.code() == "42P01" {
+                        return Ok(TableUsage::default());
+                    }
+                }
+                return Err(RetentionError::Backend(format!(
+                    "pg_total_relation_size {qualified}: {e}"
+                )));
+            }
         }
     };
 
@@ -294,10 +339,12 @@ pub async fn prune_transport_destinations_not_seen_since_pg(
     prune_observation_table_pg(
         backend,
         "cirislens.transport_destinations",
-        "COALESCE(last_seen_at, asserted_at)",
+        // v38.7.0 (#776/#770) — `last_seen_at` alone; see the SQLite twin for
+        // why an assertion must not age on an observation's clock.
+        "last_seen_at",
         // PR #769 review — never prune a V105 replicated tombstone; see the
         // SQLite twin for why a retired route must outlive its observation.
-        Some("signature IS NULL AND retired_at IS NULL"),
+        Some("signature IS NULL AND retired_at IS NULL AND last_seen_at IS NOT NULL"),
         cutoff,
         max_rows,
     )

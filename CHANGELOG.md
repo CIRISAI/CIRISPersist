@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.7.0] - 2026-08-30
+
+The retention batch two consumers measured while adopting v38.4.0, plus the
+CIRISVerify v14.0.0 adopt and two CC-driven additions. Four of these are
+defects in v38.4.0's own retention surface: both consumers independently
+declined to call the prune it shipped, and said so on the issues rather
+than working around it.
+
+### Fixed
+
+- **#776 / #770 — the destination prune would have deleted AUTHORITATIVE
+  routes.** It aged rows on `COALESCE(last_seen_at, asserted_at)`, so a row
+  that was never a sighting ran on a sighting's clock. Measured downstream:
+  all 11,034 rows had `last_seen_at IS NULL`, and a 30-day pass would have
+  removed 5,408 quorum-authorized canonical addresses — recreatable only by
+  another quorum, and an explicit-hash canonical cannot announce itself.
+  The v38.4.0 signature exclusion did not cover them, because
+  `TransportDestination` has no `signature` field and every locally
+  asserted row writes NULL. Now ages on `last_seen_at` alone and only where
+  it exists; an asserted route is current until SUPERSEDED and has no
+  staleness clock. The caller-side contract persist cannot check is stated
+  where it is read: the column must advance on confirming sightings, or the
+  prune deletes the healthiest peers first.
+- **#779 — the expiry reaper had no `Engine` facade**, so a
+  backend-agnostic consumer could not call it and documented an
+  attestation-heavy store as bounded only by disk. From outside, an
+  unreachable capability is an absent one. PR #769's review asked for this
+  facade for the two OBSERVATION prunes; it was added for those two and the
+  reaper beside them was missed — fixing named instances rather than the
+  described class.
+- **#775 — `storage_summary()` was O(database size), inline.** Making
+  per-table bytes real in v38.4.0 turned it into a `dbstat` page walk on
+  the caller's async task while holding the connection guard — 1.3 GiB on
+  the canonical, on a 2-vCPU host. Split: the routine summary no longer
+  walks pages (`bytes_measurable` reports it),
+  `storage_summary_with_table_bytes()` does so deliberately. Both backends
+  honour one flag. The doc above it was corrected — it still claimed
+  `dbstat` is unavailable and cited `pg_relation_size`.
+- **#773 follow-on / #750 — persist's subject-binding projection is now
+  BUILT by verify's own type-agnostic builder.** Adopting CIRISVerify
+  v14.0.0 surfaced that verify binds `valid_until` and persist did not, so
+  persist would have minted envelopes verify's checker rejects. Persist's
+  parallel spelling carried a comment promising the two "must not
+  diverge"; a promise in a comment is not a mechanism. Also fixed a
+  signature-path hazard it exposed: the envelope binds `…00:00Z` while
+  persist rendered `…00:00+00:00` — one instant, two RFC-3339 spellings,
+  compared as strings — so `valid_until` now compares as an INSTANT while
+  every other member stays byte-equal.
+
+### Added
+
+- **#778 — `config:{scope}` is a self-report** (CC 3.4.5's missing
+  substrate-admission leg). A third party could attest what a node was
+  running, and a peer could make a healthy node look like it was shedding
+  load. Refused at the put door on all three backends AND at the promote
+  door, fail-closed on an ambiguous owner.
+- **#777 — the `load.ceiling` mesh-config key** (CC 4.2.1), so an owner can
+  relieve a node under contention rather than the node declaring for
+  itself. Relieve-never-expand, so it composes under plural roots with
+  most-restrictive-across-roots.
+
+### Changed
+
+- **CIRISVerify v13.6.1 → v14.0.0**: all seven Cargo pins flipped together
+  plus `pyproject.toml`'s `Requires-Dist`. `non_exhaustive` error enums
+  required wildcards; in the conformance test those wildcards PANIC rather
+  than classify, because that test's own comment warns a silent wildcard
+  "would classify it silently, as convergence, which is the direction that
+  goes green".
+
 ## [38.6.0] - 2026-08-26
 
 CC 3.4.7.3 graduation (CIRISConstitution#95, rc4.5 `87e4095`;

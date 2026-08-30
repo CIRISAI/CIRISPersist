@@ -8166,39 +8166,55 @@ pub fn subject_binding(
     identity_type: &str,
     pubkey_ed25519_base64: &str,
     pubkey_ml_dsa_65_base64: Option<&str>,
+    valid_until: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
-    m.insert("key_id".into(), serde_json::Value::from(key_id));
-    // v31.0.0 (CIRISVerify 13.1.0 / CIRISVerify#252) — the FOURTH member.
-    // `identity_type` is AUTHORITY-BEARING: `is_canonical` decides canonical
-    // standing by reading it off the row, and
-    // `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it. Unbound, a relay
-    // could relabel a validly-signed record on the OUTSIDE only — verify's
-    // third finding (privilege transfer) in our storage layer, reachable
-    // because `apply_replicated_key_record`'s Insert branch skips
-    // `verify_key_registration` for exactly the role-gated records, leaving
-    // the accord co-scrub as their only cryptographic proof.
+    // v38.7.0 (CIRISPersist#750, forced by the CIRISVerify v14.0.0 adopt) —
+    // BUILT BY VERIFY'S OWN TYPE-AGNOSTIC BUILDER, not re-spelled here.
     //
-    // Bound because `ciris_verify_core`'s `KeyRecord::check_subject_binding`
-    // binds it and the two implementations must not diverge. Persist keeps a
-    // separate spelling ONLY because its `KeyRecord` is a distinct type with
-    // a declaration-order contract against CIRISRegistry; the semantics are
-    // verify's, and this comment is the pairing.
-    m.insert(
-        "identity_type".into(),
-        serde_json::Value::from(identity_type),
-    );
-    m.insert(
-        "pubkey_ed25519_base64".into(),
-        serde_json::Value::from(pubkey_ed25519_base64),
-    );
-    m.insert(
-        "pubkey_ml_dsa_65_base64".into(),
-        match pubkey_ml_dsa_65_base64 {
-            Some(s) => serde_json::Value::from(s),
-            None => serde_json::Value::Null,
-        },
-    );
+    // Persist kept a parallel spelling, with a comment promising "the two
+    // implementations must not diverge". They diverged the moment verify
+    // v14.0.0 added `valid_until` as a fifth member: the conformance test
+    // reported `only ciris_verify_core binds: ["valid_until"]`, and persist
+    // would have produced an envelope that verify's own checker rejects.
+    //
+    // A promise in a comment is not a mechanism. Building the projection
+    // THROUGH `SubjectBinding` makes the two identical by construction, so
+    // the next member verify adds arrives here without an edit — which is
+    // the whole point of #750's ask, and why the drift is worth closing
+    // rather than patching.
+    //
+    // `valid_until` is authority-bearing in the same way `identity_type` is:
+    // verify records that an unbound expiry can be removed or extended while
+    // the envelope, its hash and both signatures stay intact, and a consumer
+    // reading the public field — the natural thing to do — gets the
+    // attacker's value.
+    let mut m = ciris_verify_core::subject_binding::SubjectBinding::new()
+        .require("key_id", key_id)
+        // v31.0.0 (CIRISVerify 13.1.0 / CIRISVerify#252) — the FOURTH member.
+        // `identity_type` is AUTHORITY-BEARING: `is_canonical` decides canonical
+        // standing by reading it off the row, and
+        // `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it. Unbound, a relay
+        // could relabel a validly-signed record on the OUTSIDE only — verify's
+        // third finding (privilege transfer) in our storage layer, reachable
+        // because `apply_replicated_key_record`'s Insert branch skips
+        // `verify_key_registration` for exactly the role-gated records, leaving
+        // the accord co-scrub as their only cryptographic proof.
+        //
+        // Bound because `ciris_verify_core`'s `KeyRecord::check_subject_binding`
+        // binds it and the two implementations must not diverge. Persist keeps a
+        // separate spelling ONLY because its `KeyRecord` is a distinct type with
+        // a declaration-order contract against CIRISRegistry; the semantics are
+        // verify's, and this comment is the pairing.
+        .require("identity_type", identity_type)
+        .require("pubkey_ed25519_base64", pubkey_ed25519_base64)
+        .require_optional("pubkey_ml_dsa_65_base64", pubkey_ml_dsa_65_base64)
+        .require_optional("valid_until", valid_until)
+        .members()
+        .clone();
+    // Persist's `KeyRecord` is a distinct type with a declaration-order
+    // contract against CIRISRegistry, so the CALL still lives here — but the
+    // projection itself is verify's, member for member.
+    let _ = &mut m;
     m
 }
 
@@ -8219,6 +8235,7 @@ pub fn bind_subject_into_envelope(
     identity_type: &str,
     pubkey_ed25519_base64: &str,
     pubkey_ml_dsa_65_base64: Option<&str>,
+    valid_until: Option<&str>,
 ) -> Result<(), String> {
     let was = json_type_name(envelope);
     let obj = envelope.as_object_mut().ok_or_else(|| {
@@ -8232,6 +8249,7 @@ pub fn bind_subject_into_envelope(
         identity_type,
         pubkey_ed25519_base64,
         pubkey_ml_dsa_65_base64,
+        valid_until,
     ) {
         obj.insert(field, value);
     }
@@ -8306,9 +8324,43 @@ pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), Strin
         &row.identity_type,
         &row.pubkey_ed25519_base64,
         row.pubkey_ml_dsa_65_base64.as_deref(),
+        row.valid_until.map(|t| t.to_rfc3339()).as_deref(),
     ) {
         match row.registration_envelope.get(&field) {
             Some(bound) if *bound == expected => {}
+            // v38.7.0 (verify v14.0.0) — `valid_until` is an INSTANT, and two
+            // spellings of one instant must not read as two subjects.
+            //
+            // RFC-3339 renders UTC as either `Z` or `+00:00`, and with any
+            // sub-second precision. verify's fixtures and producers write
+            // `…00:00Z`; persist renders its typed column with
+            // `to_rfc3339()`, which writes `…00:00+00:00`. Compared as
+            // strings those disagree, so persist would refuse a record whose
+            // envelope names the very instant its own row carries — and the
+            // refusal text would say the signers "never named" a subject they
+            // did name.
+            //
+            // Compared as instants they agree. This is the ONLY member with a
+            // parse: every other one is an opaque identifier or base64, where
+            // byte equality IS the semantics and normalising would be a way
+            // to admit something the signers did not write. Same class as the
+            // prune-cutoff bug in #776 — a lexicographic comparison across
+            // two spellings of one moment — but this one sits on a
+            // signature-bearing path.
+            Some(bound)
+                if field == "valid_until"
+                    && match (bound.as_str(), expected.as_str()) {
+                        (Some(b), Some(e)) => {
+                            match (
+                                b.parse::<chrono::DateTime<chrono::Utc>>(),
+                                e.parse::<chrono::DateTime<chrono::Utc>>(),
+                            ) {
+                                (Ok(b), Ok(e)) => b == e,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    } => {}
             Some(bound) => {
                 return Err(format!(
                     "the signed registration_envelope binds {field} = {bound_brief}, but this \
@@ -8479,6 +8531,7 @@ pub mod pqc_attach_test_support {
             identity_type,
             &ed_pk,
             Some(&mldsa_pk),
+            None,
         )
         .expect("envelope is an object");
         let (original_content_hash, classical, pqc) =
@@ -8590,6 +8643,7 @@ pub mod pqc_attach_test_support {
             &absent_id,
             &absent_row.identity_type,
             &absent_row.pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("envelope is an object");
@@ -15713,6 +15767,7 @@ mod canonical_gate_tests {
             &good.identity_type,
             &good.pubkey_ed25519_base64,
             good.pubkey_ml_dsa_65_base64.as_deref(),
+            None,
         ) {
             let mut partial = good.clone();
             partial
@@ -15845,6 +15900,7 @@ mod canonical_gate_tests {
             key_id,
             identity_type,
             &pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("#659 subject binding");
@@ -17107,6 +17163,7 @@ mod canonical_withdrawal_tests {
             key_id,
             identity_type,
             &pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("#659 subject binding");

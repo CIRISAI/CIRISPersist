@@ -105,6 +105,21 @@ fn map_holonomic(err: HolonomicError) -> WitnessAdmitError {
             reason: "ww_root_mismatch",
         } => WitnessAdmitError::RootMismatch,
         HolonomicError::Invariant { reason } => WitnessAdmitError::HybridVerify(reason.to_owned()),
+        // v38.7.0 — verify v14.0.0 made `HolonomicError` `#[non_exhaustive]`,
+        // so this match must carry a wildcard even though every variant it
+        // knows is handled above.
+        //
+        // The arm is deliberately the CONSERVATIVE class, not a new one: a
+        // variant this build has never seen is a verification failure whose
+        // meaning we cannot claim to know, and `HybridVerify` is the arm that
+        // refuses. Mapping an unknown verify error to anything narrower —
+        // or, worse, treating it as admissible — would let a future verify
+        // release widen what persist admits without persist ever deciding
+        // to. The `{err:?}` keeps the unmapped variant legible in the
+        // refusal instead of collapsing it to a generic string.
+        other => WitnessAdmitError::HybridVerify(format!(
+            "unmapped verify HolonomicError variant (refusing conservatively): {other:?}"
+        )),
     }
 }
 

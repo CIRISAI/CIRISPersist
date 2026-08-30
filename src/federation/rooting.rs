@@ -979,6 +979,7 @@ mod conformance_helpers {
             identity_type,
             &subject.pubkey_b64(),
             Some(&subject.pubkey_ml_dsa_b64()),
+            None,
         )
         .expect("bind the subject into the provenance link's signed bytes");
         // Sign over `canonical(registration_envelope)` using the SAME

@@ -75,8 +75,53 @@ pub async fn prune_transport_destinations_not_seen_since_sqlite(
     prune_observation_table_sqlite(
         backend,
         "transport_destinations",
-        "COALESCE(last_seen_at, asserted_at)",
-        // v38.4.0 (PR #769 review) — **only UNSIGNED, unretired rows.**
+        // v38.7.0 (CIRISPersist#776/#770) — age on `last_seen_at` ALONE, and
+        // only where it EXISTS. See the keep-predicate below.
+        "last_seen_at",
+        // v38.7.0 (CIRISPersist#776) — **only rows that were ever OBSERVED.**
+        //
+        // The v38.4.0 form aged rows on `COALESCE(last_seen_at, asserted_at)`,
+        // so a row that was never a sighting still ran on a sighting's clock.
+        // Measured downstream: ALL 11,034 rows on their canonical have
+        // `last_seen_at IS NULL`, and a 30-day pass would have deleted 5,408
+        // of them. They withdrew the prune before shipping rather than lose
+        // authoritative routes.
+        //
+        // The rows it would have taken are the expensive ones. A
+        // quorum-authorized canonical address is written with
+        // `BindingProvenance::Rooted`, `last_seen_at: None` — an ASSERTION,
+        // not an observation. It is recreated only by another quorum, and an
+        // explicit-hash canonical cannot announce itself, so once the row is
+        // gone the node falls back to an obsolete bootstrap address or loses
+        // the route outright.
+        //
+        // The v38.4.0 signature exclusion did not save them either:
+        // `TransportDestination` has NO `signature` field, so
+        // `put_transport_destination` writes NULL for every locally asserted
+        // row and the exclusion protects replicated routes and nothing else.
+        //
+        // An asserted route is current until SUPERSEDED. It has no staleness
+        // clock, and this function is therefore not the tool for bounding
+        // asserted rows — that growth is an intake question
+        // (CIRISPersist#672), not a retention one. Requiring
+        // `last_seen_at IS NOT NULL` makes the function do exactly what its
+        // name says and makes it structurally incapable of aging an
+        // assertion.
+        //
+        // ## A contract this substrate CANNOT check, stated where it is read
+        //
+        // Even for observed rows, the caller must ensure `last_seen_at`
+        // advances on every CONFIRMING sighting. CIRISEdge#770 measured the
+        // opposite: `record_announced_peer` reaches its durable writes only
+        // when `newly_rooted_key` is `Some`, so a peer announcing every few
+        // seconds for a month without rotating its epoch has `last_seen_at`
+        // frozen at that rotation. Aging on a column that does not advance
+        // deletes the HEALTHIEST peers first, because a peer that never
+        // rotates is a peer that never refreshes. If your writer does not
+        // refresh on confirmation, this prune is not safe for you to call at
+        // any cutoff.
+        //
+        // v38.4.0 (PR #769 review) — **and only UNSIGNED, unretired rows.**
         //
         // Two different records share this table, and only one of them is
         // an observation:
@@ -108,7 +153,7 @@ pub async fn prune_transport_destinations_not_seen_since_sqlite(
         // stale route, and a peer could then reintroduce the pre-retirement
         // destination. The tombstone outlives the observation by design, so
         // this prune only ever removes rows that are still just notes.
-        Some("signature IS NULL AND retired_at IS NULL"),
+        Some("signature IS NULL AND retired_at IS NULL AND last_seen_at IS NOT NULL"),
         cutoff,
         max_rows,
     )
@@ -173,21 +218,35 @@ use super::ArchiveHandle;
 use super::{RetentionError, StorageSummary, TableUsage};
 use crate::store::sqlite::SqliteBackend;
 
+/// v38.7.0 (CIRISPersist#775) — the CHEAP summary: rows, timestamps and
+/// whole-DB bytes, with no per-table page walk.
+///
+/// This is the routine-monitoring shape. For per-table byte localisation —
+/// which is O(database size), see
+/// [`storage_summary_sqlite_with`] — ask for it explicitly.
+pub async fn storage_summary_sqlite(
+    backend: &SqliteBackend,
+) -> Result<StorageSummary, RetentionError> {
+    storage_summary_sqlite_with(backend, false).await
+}
+
 /// v2.7.0 — [`StorageSummary`] for a `SqliteBackend`.
 ///
 /// Per-table reporting: rows + ts bounds via `SELECT count(*) /
 /// MIN / MAX`. Per-table BYTES is `0` on SQLite (the `dbstat`
 /// virtual table is not compiled into stock rusqlite). Whole-DB
 /// bytes via `PRAGMA page_count * PRAGMA page_size`.
-pub async fn storage_summary_sqlite(
+pub async fn storage_summary_sqlite_with(
     backend: &SqliteBackend,
+    with_table_bytes: bool,
 ) -> Result<StorageSummary, RetentionError> {
     let conn = backend.conn_handle();
-    (move || storage_summary_blocking(&conn))()
+    (move || storage_summary_blocking(&conn, with_table_bytes))()
 }
 
 fn storage_summary_blocking(
     conn: &Arc<Mutex<Connection>>,
+    with_table_bytes: bool,
 ) -> Result<StorageSummary, RetentionError> {
     let guard = conn.lock();
 
@@ -200,12 +259,26 @@ fn storage_summary_blocking(
         .map_err(|e| RetentionError::Backend(format!("pragma page_size: {e}")))?;
     let total_disk_bytes = u64::try_from(page_count.saturating_mul(page_size)).unwrap_or(0);
 
-    // v38.4.0 (#767) — probe ONCE per summary, and report the answer.
-    let dbstat_ok = guard
-        .query_row("SELECT COALESCE(SUM(pgsize),0) FROM dbstat", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .is_ok();
+    // v38.7.0 (CIRISPersist#775) — the page walk is OPT-IN.
+    //
+    // `dbstat` is a virtual table that visits EVERY PAGE of the database, so
+    // asking for per-table bytes is O(database size), not O(tables). On a
+    // 1.3 GiB production store that walk ran inline on the caller's async
+    // task while holding the connection guard — and a `#[tokio::main]`
+    // runtime sizes to core count, so on a 2-vCPU host it occupied half the
+    // executor for the duration.
+    //
+    // v38.4.0 made those bytes REAL (they had been hardcoded 0 on an
+    // unprobed belief) and that reading is worth having — it is the only way
+    // to localise disk growth. But it must not be the price of asking "how
+    // many rows do I hold". Routine monitoring takes the cheap path; an
+    // operator chasing bytes opts in and pays knowingly.
+    let dbstat_ok = with_table_bytes
+        && guard
+            .query_row("SELECT COALESCE(SUM(pgsize),0) FROM dbstat", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .is_ok();
 
     let trace_events = table_usage_sqlite(
         &guard,
