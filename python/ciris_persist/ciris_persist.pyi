@@ -1116,7 +1116,7 @@ class Engine:
         actually run?**
 
         Returns the fold as JSON: ``{node_key_id, roots, settings}``.
-        ``settings`` carries **one entry per registered key, always** (nine on
+        ``settings`` carries **one entry per registered key, always** (twelve on
         this cut), so a consumer never has to tell "not set" from "not
         returned". Each entry is ``{key, polarity, unit, baseline, effective,
         relieved, decided_by_root?, row_id?, decided_by?, delegation_id?,
@@ -1136,7 +1136,8 @@ class Engine:
 
         **Do not assume smaller is tighter.** Which direction is "more flow"
         is per key and is carried in ``polarity``:
-        ``"higher_means_more_flow"`` for ``redundancy.k_repair_target``,
+        ``"higher_means_more_flow"`` for ``redundancy.k_repair_symbols`` and
+        ``load.ceiling`` (a higher ceiling is more concurrent background work),
         ``"lower_means_more_flow"`` for ``antientropy.round_secs`` (longer
         between rounds is *less* gossip) and ``backpressure.summary_only``.
 
