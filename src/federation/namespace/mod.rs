@@ -597,6 +597,20 @@ pub fn projection_for(
                 | cohort_scope::FEDERATION => Projection::Cohort,
                 _ => Projection::Cohort,
             },
+            // session:* — which occurrence of a self holds a given
+            // (community, session) (v38.7.0, #782). Enumerated to the last
+            // tier deliberately: the commons cells are the ones a symmetry
+            // sweep would widen, and `Global` here publishes an attendance
+            // map of someone's devices.
+            AttestationFamily::SessionClaim => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS
+                | cohort_scope::SPECIES
+                | cohort_scope::BIOSPHERE
+                | cohort_scope::FEDERATION => Projection::Cohort,
+                _ => Projection::Cohort,
+            },
             // chat:* — interpersonal communication inside a named group
             // (v38.2.0, #757, decided for CIRISServer). Enumerated to the
             // last tier ON PURPOSE: the commons cells are the ones a
@@ -841,6 +855,32 @@ pub enum AttestationFamily {
     /// residual is CIRISPersist#757, and it is a legibility gap, not a
     /// delivery hole.
     Chat,
+    /// v38.7.0 (CIRISPersist#782) — `session:*`, the SESSION CLAIM plane:
+    /// which occurrence of a self is handling a given `(community,
+    /// session)`.
+    ///
+    /// **Why it is decided rather than left to the default.** The
+    /// conservative row already routes this correctly today — `self` and
+    /// `family` to [`Projection::SelfOwn`] so sibling occurrences learn my
+    /// claims by subject-initiated pull, everything wider to
+    /// [`Projection::Cohort`] so a peer can tell a considered silence from a
+    /// dropped message. So this row buys no behaviour. It buys the row's
+    /// REASON, and it stops a sweep from finishing the cell.
+    ///
+    /// [`Moderation`](Self::Moderation) is the standing warning: its ceiling
+    /// was correct but INHERITED FROM A WILDCARD, and a tidying pass that
+    /// completed the row to match its neighbours would have written
+    /// `=> Global` and lifted it silently, because no test looked at the
+    /// cell. Here `Global` would broadcast WHO IS HANDLING WHICH SESSION to
+    /// the whole mesh — an attendance map of a person's devices, published.
+    /// That is one refactor away for as long as the cell is a default.
+    ///
+    /// **The ceiling, and why Cohort at every commons tier.** A claim is
+    /// addressed-exchange bookkeeping inside a named group: the parties to
+    /// the session need it, nobody else does. There is no authority that
+    /// widens it either — a trust root is not a party to someone else's
+    /// session — so the commons cells take no `authority` branch.
+    SessionClaim,
     /// Any dimension outside the decided families — the conservative row.
     Unknown,
 }
@@ -919,6 +959,12 @@ pub fn attestation_family(dimension: &str) -> AttestationFamily {
     // a cut removing.
     if under(dimension, "chat:") {
         return AttestationFamily::Chat;
+    }
+    // v38.7.0 (#782) — the WHOLE `session:` prefix. A claim, a renewal and a
+    // release are the same information about the same audience; splitting
+    // them would invite the "one leaf decided, its siblings defaulted" shape.
+    if under(dimension, "session:") {
+        return AttestationFamily::SessionClaim;
     }
     AttestationFamily::Unknown
 }
@@ -1059,6 +1105,11 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
             // republish the allegation to parties who never held it, which is
             // the tombstone principle this cut already recorded.
             AttestationFamily::Moderation => Projection::Cohort,
+            // Row-max: releasing a claim is a TOMBSTONE, not a delete, and
+            // it must reach exactly the audience the claim reached — never
+            // wider. #782 relies on the monotonicity guarantee here: a
+            // release can never be out-run by the stale claim it retracts.
+            AttestationFamily::SessionClaim => Projection::Cohort,
             // Row-max: chat never widens past Cohort live, so a retraction
             // does not either — a withdrawn message must not be republished
             // to parties who never held it.
@@ -1624,7 +1675,7 @@ mod tests {
     /// One representative dimension per decided Attestation family, plus one
     /// resolving the conservative default — LITERALS, never derived from the
     /// classifier under test.
-    const FAMILY_DIMS: [&str; 12] = [
+    const FAMILY_DIMS: [&str; 13] = [
         "consent:replication:v1",
         "trace:complete:v1",
         "scores:medical",
@@ -1657,6 +1708,8 @@ mod tests {
         "provenance:build_manifest:v1",
         // v38.2.0 (CIRISPersist#757) — decided for CIRISServer's chat wiring.
         "chat:message:v1",
+        // v38.7.0 (CIRISPersist#782) — the session-claim plane.
+        "session:claim:v1",
         "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
     ];
 
@@ -1718,6 +1771,7 @@ mod tests {
                 AttestationFamily::Moderation => Some("moderation:rogue_action:v1"),
                 AttestationFamily::ProvenanceBuildManifest => Some("provenance:build_manifest:v1"),
                 AttestationFamily::Chat => Some("chat:message:v1"),
+                AttestationFamily::SessionClaim => Some("session:claim:v1"),
                 // The conservative default is not a decided family; its
                 // representative rides FAMILY_DIMS separately so the sweeps
                 // still exercise the fall-through.
@@ -1735,6 +1789,7 @@ mod tests {
             AttestationFamily::Accord,
             AttestationFamily::Moderation,
             AttestationFamily::Chat,
+            AttestationFamily::SessionClaim,
             AttestationFamily::ProvenanceBuildManifest,
         ] {
             let dim = representative(family).unwrap_or_else(|| {

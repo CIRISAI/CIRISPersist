@@ -1243,11 +1243,16 @@ pub const PERSIST_AUTHORED_ABSENCE_FALSIFIERS: &[(&str, &str, &[&str], &str)] = 
             "config_tombstone",
             "check_config_delete_admission",
         ],
-        "Persist gates `config:` as a reserved dimension prefix and CC registers config:{scope}, \
-         but persist has no config write API at all — the ConfigValue::Null tombstone the claim \
-         calls the invisible default path lives in a consumer repo. So the dual can be neither \
-         built nor falsified here; the tripwire fires the moment persist grows a config delete, \
-         which is the moment the question becomes persist's.",
+        "CC registers config:{scope} and persist gates it — since v38.7.0 (#778) through \
+         `check_config_self_or_owner_admission`, CC 3.4.5's self-or-owner emitter rule, NOT \
+         through a reserved-prefix rule (this line used to say 'reserved dimension prefix', which \
+         was wrong in both halves: there is no ReservedPrefixRule for `config:` — the rule is not \
+         identity-type-shaped — and until #778 there was no gate of any kind). What is unchanged \
+         is the CLAIM this row is about: persist still has no config WRITE API — the \
+         ConfigValue::Null tombstone the claim calls the invisible default path lives in a \
+         consumer repo. So the dual can be neither built nor falsified here; the tripwire fires \
+         the moment persist grows a config delete, which is the moment the question becomes \
+         persist's.",
     ),
     (
         "trace:* / consent:*|consent grant promotion (local->federation, cohort_scope stamped)",

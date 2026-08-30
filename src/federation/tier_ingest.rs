@@ -2780,6 +2780,7 @@ pub mod test_support {
             identity_type,
             &ed_pk,
             mldsa_pk.as_deref(),
+            None,
         )
         .expect("bind the #659 subject into the registration envelope");
         let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);

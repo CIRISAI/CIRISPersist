@@ -876,16 +876,42 @@ mod tests {
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite backend");
-        let summary = crate::retention::sqlite::storage_summary_sqlite(sq)
+        let summary = crate::retention::sqlite::storage_summary_sqlite_with(sq, true)
             .await
             .expect("summary");
 
-        // dbstat IS compiled into this crate's SQLite. If this ever flips,
-        // the flag must say so — a silent return to `bytes: 0` everywhere
-        // is the exact regression #767 was filed about.
+        // The CHEAP default must not walk pages — and must say so rather
+        // than looking like an empty store (#775).
+        let cheap = crate::retention::sqlite::storage_summary_sqlite(sq)
+            .await
+            .expect("cheap summary");
+        assert!(
+            !cheap.bytes_measurable,
+            "#775: the routine summary does not collect per-table bytes, and reports that"
+        );
+        assert!(
+            cheap.tables.values().all(|u| u.bytes == 0),
+            "#775: no per-table bytes on the cheap path"
+        );
+        assert!(
+            cheap.total_disk_bytes > 0,
+            "#775: whole-DB bytes are still cheap and still reported"
+        );
+        assert_eq!(
+            cheap.tables.len(),
+            summary.tables.len(),
+            "#775: the cheap path still NAMES every table — #767's blind spot stays closed"
+        );
+
+        // v38.7.0 (#775) — this now calls the DETAILED variant, because the
+        // routine `storage_summary_sqlite` no longer walks pages: asking
+        // "how many rows" must not cost O(database size). The #767 property
+        // is unchanged and still asserted here — bytes ARE measurable when
+        // asked for — it just is not the default any more.
         assert!(
             summary.bytes_measurable,
-            "#767: per-table bytes must be measurable — dbstat was probed and answered"
+            "#767: per-table bytes must be measurable when REQUESTED — dbstat was probed \
+             and answered"
         );
 
         // Every table the schema holds appears, keyed by bare name.
@@ -936,6 +962,98 @@ mod tests {
         assert!(
             summary.total_disk_bytes > 0,
             "#767: whole-DB bytes still reported"
+        );
+    }
+
+    /// v38.7.0 (CIRISPersist#776/#770) — **an ASSERTION is not a stale
+    /// observation, and the prune must not age it as one.**
+    ///
+    /// The v38.4.0 form aged rows on `COALESCE(last_seen_at, asserted_at)`.
+    /// Downstream measured the consequence on production data: all 11,034
+    /// rows had `last_seen_at IS NULL`, and a 30-day pass would have deleted
+    /// 5,408 authoritative routes — quorum-authorized canonical addresses
+    /// that only another quorum can recreate. Both consumers withdrew the
+    /// prune rather than call it.
+    ///
+    /// This pins the distinction directly: a row that was never observed
+    /// survives any cutoff, and a row that WAS observed and went stale is
+    /// removed. Without it the function's name is a lie about what it ages.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn transport_prune_spares_assertions_and_takes_stale_observations_776() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x11; 32]),
+            "test-776".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+
+        let old = "2026-01-01T00:00:00+00:00";
+        {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            // An ASSERTION: never observed. `last_seen_at` is NULL and
+            // `asserted_at` is ancient — exactly the shape of a
+            // quorum-authorized canonical address.
+            guard
+                .execute(
+                    "INSERT INTO transport_destinations \
+                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
+                     VALUES ('assert-key', 'reticulum', 'dest-assert', ?1, NULL)",
+                    rusqlite::params![old],
+                )
+                .expect("seed assertion");
+            // A stale OBSERVATION: seen once, long ago.
+            guard
+                .execute(
+                    "INSERT INTO transport_destinations \
+                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
+                     VALUES ('seen-key', 'reticulum', 'dest-seen', ?1, ?1)",
+                    rusqlite::params![old],
+                )
+                .expect("seed observation");
+        }
+
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let n = engine
+            .prune_transport_destinations_not_seen_since(cutoff, 100)
+            .await
+            .expect("prune");
+        assert_eq!(
+            n, 1,
+            "#776: exactly the stale OBSERVATION is removed — not the assertion beside it"
+        );
+
+        let survivors: Vec<String> = {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare("SELECT occurrence_key_id FROM transport_destinations ORDER BY 1")
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(
+            survivors,
+            vec!["assert-key".to_string()],
+            "#776: a route that was never a sighting has no staleness clock — it is current \
+             until SUPERSEDED, and only another quorum can recreate it. Ageing it on an \
+             observation's clock is how 5,408 authoritative routes would have been deleted."
         );
     }
 
@@ -1100,6 +1218,14 @@ mod tests {
             .await
             .expect("storage_summary succeeds");
         assert_eq!(summary.trace_events.rows, 15);
+        // v38.7.0 (#775) — bytes come from the DETAILED variant now; the
+        // routine summary deliberately skips the page walk, so this asserts
+        // the #767 property where it still lives rather than where it used
+        // to.
+        let detailed = engine
+            .storage_summary_with_table_bytes()
+            .await
+            .expect("detailed summary succeeds");
         // v38.4.0 (#767) — per-table bytes are REAL on SQLite.
         //
         // This assertion previously PINNED the defect: `bytes == 0`, on the
@@ -1107,7 +1233,7 @@ mod tests {
         // six releases of "why can I not see where the bytes are" never
         // surfaced as a test failure — the suite agreed with the bug.
         assert!(
-            summary.trace_events.bytes > 0,
+            detailed.trace_events.bytes > 0,
             "#767: a populated table must report real bytes, not the hardcoded 0 this \
              assertion used to pin"
         );

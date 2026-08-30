@@ -279,15 +279,38 @@ fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(|e| panic!("#663: fixture instant {s:?} must be RFC-3339: {e}"))
 }
 
-/// Persist's projection for this subject, as a plain map.
+/// Persist's projection with BOTH optionals carried — the ordinary shape.
 fn persist_projection(pqc: Option<&str>) -> Map<String, Value> {
-    subject_binding(KEY_ID, IDENTITY_TYPE, ED25519, pqc)
+    persist_projection_with(pqc, Some(VALID_UNTIL))
+}
+
+/// Persist's projection for this subject, as a plain map.
+fn persist_projection_with(pqc: Option<&str>, valid_until: Option<&str>) -> Map<String, Value> {
+    // v38.7.0 — verify v14.0.0 binds `valid_until` as a fifth member, so the
+    // persist side must project it too or the two implementations diverge on
+    // exactly the field an attacker would want unbound.
+    subject_binding(KEY_ID, IDENTITY_TYPE, ED25519, pqc, valid_until)
+}
+
+/// A verify `KeyRecord` whose expiry follows `materialize_optionals`, as it
+/// did before verify v14.0.0 made `valid_until` a bound member.
+fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecord {
+    let vu = if materialize_optionals {
+        Some(VALID_UNTIL)
+    } else {
+        None
+    };
+    verify_record_with(materialize_optionals, vu, envelope)
 }
 
 /// A verify-side `KeyRecord` for the same subject. `materialize_optionals`
 /// drives EVERY `Option` field, not just the PQC pubkey — so a member verify
 /// starts binding off some other optional column is caught by the same probe.
-fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecord {
+fn verify_record_with(
+    materialize_optionals: bool,
+    valid_until: Option<&str>,
+    envelope: Value,
+) -> VerifyKeyRecord {
     let opt = |s: &str| {
         if materialize_optionals {
             Some(s.to_string())
@@ -303,7 +326,7 @@ fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecor
         identity_type: IDENTITY_TYPE.to_string(),
         identity_ref: IDENTITY_REF.to_string(),
         valid_from: VALID_FROM.to_string(),
-        valid_until: opt(VALID_UNTIL),
+        valid_until: valid_until.map(str::to_owned),
         registration_envelope: envelope,
         original_content_hash: ORIGINAL_CONTENT_HASH.to_string(),
         scrub_signature_classical: SCRUB_SIG_CLASSICAL.to_string(),
@@ -317,10 +340,19 @@ fn verify_record(materialize_optionals: bool, envelope: Value) -> VerifyKeyRecor
     }
 }
 
+/// A persist `KeyRecord` claiming the canonical expiry — the ordinary shape.
+fn persist_record(pqc: Option<&str>, envelope: Value) -> PersistKeyRecord {
+    persist_record_with(pqc, Some(VALID_UNTIL), envelope)
+}
+
 /// A persist-side `KeyRecord` for the same subject. Only the fields the subject
 /// binding reads are meaningful; the binding check is pure over the row, so no
 /// signature, backend or clock is involved.
-fn persist_record(pqc: Option<&str>, envelope: Value) -> PersistKeyRecord {
+fn persist_record_with(
+    pqc: Option<&str>,
+    valid_until: Option<&str>,
+    envelope: Value,
+) -> PersistKeyRecord {
     PersistKeyRecord {
         key_id: KEY_ID.to_string(),
         pubkey_ed25519_base64: ED25519.to_string(),
@@ -329,7 +361,12 @@ fn persist_record(pqc: Option<&str>, envelope: Value) -> PersistKeyRecord {
         identity_type: IDENTITY_TYPE.to_string(),
         identity_ref: IDENTITY_REF.to_string(),
         valid_from: instant(VALID_FROM),
-        valid_until: Some(instant(VALID_UNTIL)),
+        // v38.7.0 (verify v14.0.0) — the row's expiry must match what its
+        // envelope binds, because `valid_until` is now a BOUND member: a row
+        // claiming an expiry its envelope does not name is a real mismatch,
+        // not a fixture detail. Derived from the envelope so every case in
+        // this file stays coherent without each one remembering to.
+        valid_until: valid_until.map(instant),
         registration_envelope: envelope,
         original_content_hash: ORIGINAL_CONTENT_HASH.to_string(),
         scrub_signature_classical: SCRUB_SIG_CLASSICAL.to_string(),
@@ -438,11 +475,21 @@ fn probe_advance(
         // The probe always feeds a JSON object, so this is unreachable for a
         // correct probe — and it is a BINDING FAILURE, so it must never be
         // mistaken for convergence. Loud, not silent.
+        // v38.7.0 — `SubjectBindingError` is `#[non_exhaustive]` as of verify
+        // v14.0.0. This probe drives the conformance walk by reacting to the
+        // SPECIFIC error it got; a variant it does not know is one it cannot
+        // advance past, and silently returning `None` would end the walk
+        // early while looking like completion.
         SubjectBindingError::NotAnObject { context } => panic!(
             "#663: verify reported NotAnObject ({context}) — the binding is still FAILING, but \
              the probe feeds a JSON object at every step, so this cannot happen unless the probe \
              itself is broken. Refusing to treat a live binding failure as convergence: doing so \
              would report whatever subset had been discovered and go green on it."
+        ),
+        other => panic!(
+            "unenumerated SubjectBindingError variant reached the probe: {other:?}. verify \
+             made this enum non_exhaustive, so decide HOW the probe advances past it rather \
+             than letting a wildcard end the walk early and look like completion."
         ),
     }
 }
@@ -465,7 +512,10 @@ fn verify_optional_members() -> BTreeSet<String> {
 /// The members persist projects as optional — the ones whose expected value is
 /// JSON `null` when the row carries nothing.
 fn persist_optional_members() -> BTreeSet<String> {
-    persist_projection(None)
+    // v38.7.0 — every optional member absent, so a `null` here means exactly
+    // "persist spells this one optional". Passing an expiry would hide
+    // `valid_until` from this set and make the disposition comparison lie.
+    persist_projection_with(None, None)
         .into_iter()
         .filter(|(_, v)| v.is_null())
         .map(|(k, _)| k)
@@ -695,7 +745,9 @@ fn verify_and_persist_project_the_same_subject_members() {
     //     the required members only, and persist's map is those PLUS an
     //     explicit `null` per optional member. Same claim, both directions.
     let verify_required: BTreeMap<String, Value> = probe_verify_projection(false);
-    let persist_non_null: BTreeMap<String, Value> = persist_projection(None)
+    // v38.7.0 — 'the row carries no optional legs' now means BOTH optionals
+    // absent; leaving the expiry in would make it look REQUIRED here.
+    let persist_non_null: BTreeMap<String, Value> = persist_projection_with(None, None)
         .into_iter()
         .filter(|(_, v)| !v.is_null())
         .collect();
@@ -783,7 +835,12 @@ fn ceg_0_9_omit_vs_materialize_is_the_pinned_contract() {
     ];
 
     for case in cases {
-        let mut envelope = bound_envelope(case.row_claims);
+        // v38.7.0 — the record built below omits EVERY optional
+        // (`verify_record(false, …)`), so the envelope must omit `valid_until`
+        // too. Binding it here while the record claims nothing is not the
+        // §0.9 contract under test — it is a genuine mismatch, and pairing
+        // them that way would make this case assert the wrong thing.
+        let mut envelope = bound_envelope_with(case.row_claims, None);
         let obj = envelope
             .as_object_mut()
             .expect("bound_envelope is an object");
@@ -800,7 +857,15 @@ fn ceg_0_9_omit_vs_materialize_is_the_pinned_contract() {
         }
 
         let persist =
-            verify_envelope_binds_subject(&persist_record(case.row_claims, envelope.clone()));
+            // The row claims NOTHING optional here — including the expiry
+            // verify v14.0.0 added. That is exactly the §0.9 contract: an
+            // omitted member is admissible when the expectation is null on
+            // BOTH sides.
+            verify_envelope_binds_subject(&persist_record_with(
+                case.row_claims,
+                None,
+                envelope.clone(),
+            ));
         let verified = verify_record(false, envelope)
             .clone_with_pqc(case.row_claims)
             .check_subject_binding();
@@ -850,10 +915,21 @@ fn every_projected_member_agrees_across_both_implementations() {
         );
 
         // The coherent baseline both implementations must admit.
+        // v38.7.0 — this baseline is paired with `verify_record(false, …)`,
+        // which omits EVERY optional including `valid_until` (bound by verify
+        // v14.0.0). The envelope must omit it too: a coherent baseline is one
+        // where the record claims exactly what the envelope binds, and
+        // binding an expiry the record does not claim is a genuine mismatch
+        // rather than the case under test.
+        // A coherent baseline: the envelope binds the expiry and BOTH
+        // records claim it. `verify_record(false, …)` alone would omit it
+        // (its flag drives every optional), so the expiry is passed
+        // explicitly — the PQC leg stays driven by `row_pqc`, which is the
+        // axis this loop is actually varying.
         let baseline = bound_envelope(row_pqc);
         verify_envelope_binds_subject(&persist_record(row_pqc, baseline.clone()))
             .expect("#663: a fully bound envelope must pass persist's check");
-        verify_record(false, baseline.clone())
+        verify_record_with(false, Some(VALID_UNTIL), baseline.clone())
             .clone_with_pqc(row_pqc)
             .check_subject_binding()
             .expect("#663: a fully bound envelope must pass verify's check");
@@ -894,7 +970,9 @@ fn every_projected_member_agrees_across_both_implementations() {
             omitted.as_object_mut().expect("object").remove(member);
             let expects_null = projection[member].is_null();
             let p = verify_envelope_binds_subject(&persist_record(row_pqc, omitted.clone()));
-            let v = verify_record(false, omitted)
+            // The expiry is claimed on BOTH sides here; the member being
+            // omitted is the loop variable, not the expiry.
+            let v = verify_record_with(false, Some(VALID_UNTIL), omitted)
                 .clone_with_pqc(row_pqc)
                 .check_subject_binding();
             assert_eq!(
@@ -1035,6 +1113,24 @@ fn provenance_binding_verdict(chain: &ProvenanceChain) -> Result<(), SubjectBind
             | ProvenanceError::UntrustedAnchor { .. }
             | ProvenanceError::LinkNotHybrid { .. },
         ) => Ok(()),
+        // v38.7.0 — verify v14.0.0 made `ProvenanceError` `#[non_exhaustive]`,
+        // so the exhaustive list above can no longer be enforced by the
+        // COMPILER. The comment above states the hazard precisely: a wildcard
+        // that classifies an unknown variant silently would classify it as
+        // convergence, "which is the direction that goes green".
+        //
+        // So this arm does not classify — it PANICS. The signal moves from
+        // compile time to test time and keeps its loudness: a new verify
+        // variant still stops the suite and still demands the decision the
+        // list above exists to force. A silent `=> Ok(())` here would be the
+        // check-that-cannot-fail shape, arriving by upstream change rather
+        // than by anyone choosing it.
+        Err(other) => panic!(
+            "unenumerated ProvenanceError variant reached the conformance classifier: \
+             {other:?}. verify made this enum non_exhaustive, so add it to the list above \
+             DELIBERATELY — as a binding failure or a later check — instead of letting a \
+             wildcard call it convergence."
+        ),
     }
 }
 
@@ -1090,25 +1186,83 @@ fn verify_provenance_plane_binds_exactly_what_persist_produces() {
         !provenance.is_empty(),
         "#663: the provenance probe discovered NO members, which would make this vacuous."
     );
+    // v38.7.0 (verify v14.0.0) — the relation is SUBSET, not equality, and the
+    // extra member is NAMED rather than tolerated.
+    //
+    // verify binds `valid_until` on the KeyRecord plane and NOT on the
+    // provenance plane — its own conformance test says so explicitly
+    // ("KeyRecord legitimately binds MORE: `valid_until` is a decision-driving
+    // sibling that `ProvenanceLink` has no field for"). Persist mints ONE
+    // envelope that must satisfy both checkers, so its projection is
+    // necessarily the union, and equality here would now fail for a correct
+    // producer.
+    //
+    // The property this test exists to protect is unchanged and is the SUBSET
+    // direction: a member the walk REQUIRES and the producer does not stamp
+    // means every chain persist mints stops rooting. That is still asserted.
+    // The extra is enumerated below so a SECOND divergence still has to be
+    // declared here instead of widening silently.
+    let missing: Vec<&String> = provenance
+        .keys()
+        .filter(|k| !produced.contains_key(*k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "#663: verify's PROVENANCE-link walk requires members persist does not stamp: \
+         {missing:?}. Persist mints every `registration_envelope` this walk inspects (via \
+         `bind_subject_into_envelope`, off `subject_binding`), so a member the walk requires \
+         and the producer does not stamp means EVERY CHAIN PERSIST MINTS STOPS ROOTING."
+    );
+    for (member, expected) in &provenance {
+        assert_eq!(
+            produced.get(member),
+            Some(expected),
+            "#663: persist stamps a DIFFERENT value than the provenance walk expects for \
+             {member:?} — binding the member is not enough if the value disagrees"
+        );
+    }
+    let extra: Vec<&String> = produced
+        .keys()
+        .filter(|k| !provenance.contains_key(*k))
+        .collect();
     assert_eq!(
-        provenance, produced,
-        "#663: verify's PROVENANCE-link subject binding and persist's producer disagree. Persist \
-         mints every `registration_envelope` this walk inspects (via `bind_subject_into_envelope`, \
-         off `subject_binding`), so a member the walk requires and the producer does not stamp \
-         means EVERY CHAIN PERSIST MINTS STOPS ROOTING — delivered by a dependency bump, with \
-         nothing else in either repo asserting the two stay aligned."
+        extra,
+        vec![&"valid_until".to_string()],
+        "#663: persist's projection may exceed the provenance walk ONLY by the members verify \
+         itself binds on the KeyRecord plane and not the provenance plane. Today that is \
+         exactly `valid_until` (verify v14.0.0). A new extra means one of the two verify \
+         planes moved and persist followed only one of them — declare it here."
     );
 
     // Verify's two checker planes must also agree with each other. They are
     // separate `.require(…)` chains in verify's source (`federation_self_record`
     // and `provenance.rs:420`); nothing in verify pins them together either.
+    // v38.7.0 (verify v14.0.0) — the two planes now differ BY DESIGN, by
+    // exactly `valid_until`. verify's own conformance test declares that
+    // difference rather than tolerating it, and so does this: equality here
+    // would fail against a correct verify, while a bare subset check would let
+    // a SECOND member appear on one plane unnoticed.
+    let key_record_plane = probe_verify_projection(true);
+    let plane_delta: Vec<&String> = key_record_plane
+        .keys()
+        .filter(|k| !provenance.contains_key(*k))
+        .collect();
     assert_eq!(
-        probe_verify_projection(true),
-        provenance,
-        "#663: `KeyRecord::check_subject_binding` and the provenance walk project DIFFERENT \
-         members. They are separate builder chains in verify's own source, so they can drift from \
-         each other — and persist produces ONE envelope that must satisfy both."
+        plane_delta,
+        vec![&"valid_until".to_string()],
+        "#663: `KeyRecord::check_subject_binding` and the provenance walk are separate builder \
+         chains in verify's own source, so they can drift from each other — and persist \
+         produces ONE envelope that must satisfy both. They may differ ONLY by the members \
+         verify declares as KeyRecord-only; today that is exactly `valid_until`."
     );
+    for (member, expected) in &provenance {
+        assert_eq!(
+            key_record_plane.get(member),
+            Some(expected),
+            "#663: verify's two planes disagree on the VALUE of {member:?}, not merely on \
+             which members they bind"
+        );
+    }
 
     // ...and they must agree on DISPOSITION, not only on the member set.
     //
@@ -1128,9 +1282,25 @@ fn verify_provenance_plane_binds_exactly_what_persist_produces() {
          between `federation_self_record` and `provenance.rs` — an envelope omitting the member \
          would pass one plane and fail the other."
     );
+    // v38.7.0 (verify v14.0.0) — persist's optional set may exceed the
+    // provenance walk's by exactly the members the provenance plane does not
+    // bind at all. `valid_until` is bound on the KeyRecord plane and absent
+    // from the provenance link, so it cannot be "optional" there — while
+    // persist, minting ONE envelope for both checkers, must carry it
+    // optionally. Enumerated rather than tolerated, so a second such member
+    // still has to be declared here.
+    let prov_opt = provenance_optional_members();
+    let persist_opt = persist_optional_members();
+    let opt_extra: Vec<&String> = persist_opt.difference(&prov_opt).collect();
     assert_eq!(
-        provenance_optional_members(),
-        persist_optional_members(),
+        opt_extra,
+        vec![&"valid_until".to_string()],
+        "#663: persist's optional set may exceed the provenance walk's ONLY by members that \
+         plane does not bind; today that is exactly `valid_until`."
+    );
+    assert_eq!(
+        prov_opt.clone(),
+        persist_opt.intersection(&prov_opt).cloned().collect(),
         "#663: the provenance walk and persist's producer disagree on which members are OPTIONAL. \
          Persist materializes `null` for its optional legs, so a member the walk REQUIRES while \
          persist calls it optional is not caught by the member-set comparison above — it is \
@@ -1160,7 +1330,16 @@ fn verify_provenance_plane_binds_exactly_what_persist_produces() {
     //
     // Driven off `persist_optional_members()` rather than a hard-coded name, so
     // a second optional member is covered the day it exists.
-    for member in persist_optional_members() {
+    // v38.7.0 — scope to the members THIS PLANE binds. `persist_optional_members`
+    // now includes `valid_until`, which the provenance link has no field for,
+    // so asking the walk to refuse its omission asks it about a member it
+    // never reads. Intersected rather than hardcoded, so a future
+    // KeyRecord-only member is excluded automatically and a member the walk
+    // DOES bind can never be skipped.
+    for member in persist_optional_members()
+        .into_iter()
+        .filter(|m| provenance.contains_key(m))
+    {
         // (a) envelope omits + row claims nothing ⇒ ADMIT. Both say nothing,
         //     which is agreement, and it is the ONE tolerated absence.
         let chain = provenance_chain_for(None, envelope_omitting(None, &member));
@@ -1197,10 +1376,16 @@ fn provenance_chain_for(pqc: Option<&str>, envelope: Value) -> ProvenanceChain {
     chain
 }
 
+/// The ordinary shape: PQC as given, and the expiry BOUND (verify v14.0.0
+/// binds `valid_until`, so a realistic envelope carries it).
+fn bound_envelope(pqc: Option<&str>) -> Value {
+    bound_envelope_with(pqc, Some(VALID_UNTIL))
+}
+
 /// An envelope that binds every projected member for this subject, built
 /// through persist's PRODUCING side so the fixture cannot become a second
 /// spelling of the projection.
-fn bound_envelope(pqc: Option<&str>) -> Value {
+fn bound_envelope_with(pqc: Option<&str>, valid_until: Option<&str>) -> Value {
     let mut envelope = Value::Object(Map::new());
     ciris_persist::federation::admission::bind_subject_into_envelope(
         &mut envelope,
@@ -1208,6 +1393,7 @@ fn bound_envelope(pqc: Option<&str>) -> Value {
         IDENTITY_TYPE,
         ED25519,
         pqc,
+        valid_until,
     )
     .expect("#663: binding into a fresh JSON object cannot fail");
     envelope

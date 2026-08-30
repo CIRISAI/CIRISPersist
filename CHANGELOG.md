@@ -5,6 +5,183 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [38.7.0] - 2026-08-30
+
+The retention batch two consumers measured while adopting v38.4.0, plus the
+CIRISVerify v14.0.0 adopt and two CC-driven additions. Four of these are
+defects in v38.4.0's own retention surface: both consumers independently
+declined to call the prune it shipped, and said so on the issues rather
+than working around it.
+
+### Fixed
+
+- **#776 / #770 — the destination prune would have deleted AUTHORITATIVE
+  routes.** It aged rows on `COALESCE(last_seen_at, asserted_at)`, so a row
+  that was never a sighting ran on a sighting's clock. Measured downstream:
+  all 11,034 rows had `last_seen_at IS NULL`, and a 30-day pass would have
+  removed 5,408 quorum-authorized canonical addresses — recreatable only by
+  another quorum, and an explicit-hash canonical cannot announce itself.
+  The v38.4.0 signature exclusion did not cover them, because
+  `TransportDestination` has no `signature` field and every locally
+  asserted row writes NULL. Now ages on `last_seen_at` alone and only where
+  it exists; an asserted route is current until SUPERSEDED and has no
+  staleness clock. The caller-side contract persist cannot check is stated
+  where it is read: the column must advance on confirming sightings, or the
+  prune deletes the healthiest peers first.
+- **#779 — the expiry reaper had no `Engine` facade**, so a
+  backend-agnostic consumer could not call it and documented an
+  attestation-heavy store as bounded only by disk. From outside, an
+  unreachable capability is an absent one. PR #769's review asked for this
+  facade for the two OBSERVATION prunes; it was added for those two and the
+  reaper beside them was missed — fixing named instances rather than the
+  described class.
+- **#775 — `storage_summary()` was O(database size), inline.** Making
+  per-table bytes real in v38.4.0 turned it into a `dbstat` page walk on
+  the caller's async task while holding the connection guard — 1.3 GiB on
+  the canonical, on a 2-vCPU host. Split: the routine summary no longer
+  walks pages (`bytes_measurable` reports it),
+  `storage_summary_with_table_bytes()` does so deliberately. Both backends
+  honour one flag. The doc above it was corrected — it still claimed
+  `dbstat` is unavailable and cited `pg_relation_size`.
+- **#773 follow-on / #750 — persist's subject-binding projection is now
+  BUILT by verify's own type-agnostic builder.** Adopting CIRISVerify
+  v14.0.0 surfaced that verify binds `valid_until` and persist did not, so
+  persist would have minted envelopes verify's checker rejects. Persist's
+  parallel spelling carried a comment promising the two "must not
+  diverge"; a promise in a comment is not a mechanism. Also fixed a
+  signature-path hazard it exposed: the envelope binds `…00:00Z` while
+  persist rendered `…00:00+00:00` — one instant, two RFC-3339 spellings,
+  compared as strings — so `valid_until` now compares as an INSTANT while
+  every other member stays byte-equal.
+
+### Added
+
+- **#778 — `check_config_self_or_owner_admission`: `config:{scope}` is a
+  SELF-REPORT.** CC 3.4.5 pins *"`attesting_key_id` MUST be
+  `attested_key_id` or its live `owner_of`"*, and CC 3.4.7 holds every rule
+  in that table with **three** things: substrate admission, consumer
+  re-check, producer obligation. Persist had the third and only the third.
+  Our producer honours the rule by construction (attesting == attested ==
+  subject) — which is exactly the half a malicious producer does not
+  perform.
+
+  So until this cut **any registered key could attest `config:replication`,
+  or CIRISServer 0.5.195's short-lived `config:load`, about a node it does
+  not own**, and the substrate stored it and served it. The harm lands on
+  the honest party: `config:load` steers where peers send work and carries
+  information *only* because it is a self-report, so a peer able to mint
+  one about someone else makes a healthy node look like it is shedding, and
+  every honest consumer — one that re-checks nothing precisely because the
+  substrate admitted the row — backs off from a node that is fine.
+
+  The gate reads [`owner_of`], the CC 3.2 purpose-filtered resolution, not
+  the wider multi-parent steward walk: the clause names one identity and
+  the two sets are not the same set. **An ambiguous owner is an `Err`, not
+  a refusal** — `Error::AmbiguousNodeOwner` propagates rather than being
+  flattened into the ordinary self-or-owner message, because *"you are not
+  the owner"* and *"this node has two live owners and the substrate cannot
+  say who speaks for it"* send an operator to different layers, and a
+  caller that cannot tell them apart will eventually treat one as the
+  other.
+
+  Wired at `put_attestation` on **memory, sqlite and postgres** at the same
+  position (immediately after `check_capacity_consent_admission`, the other
+  CC 3.4.5 gate), and in `check_promotion_admission` — the local tier is
+  not a way around a put-gate, and the owner-binding can lapse between a
+  local write and its promotion. Tier-blind at the put door: a tier-scoped
+  rule is skippable by writing `tier = "local"`, and nothing legitimate is
+  over-refused, since a node's own staged config row is self-attested by
+  definition. Verify-before-mutation (AV-9): a refused row leaves nothing
+  stored, and a refused promotion leaves the row local.
+
+  Witnessed on all three backends through the REAL doors
+  (`config_self_or_owner_gate_{memory,sqlite,postgres}_778`): self-authored
+  admits, owner-authored admits, third-party refuses **by this gate's own
+  message** and stores nothing, a non-`config:` row from the same stranger
+  about the same node still admits (the over-refusal control), and the
+  local-stage→promote path refuses at the promote door. The fail-closed
+  ambiguity arm is sqlite-only
+  (`config_self_or_owner_ambiguous_owner_fails_closed_sqlite_778`) because
+  the two-owner state is a pre-gate anomaly `check_single_node_owner_admission`
+  makes unreachable through any door.
+- **#780 — `list_wire_hashes_since(kind, after_content_hash, limit)`**: the
+  complete hash set for one wire kind, read from `signed_wire_index` without
+  touching a row page. Consumers were re-deriving it every round by reading
+  every ROW of a plane and hashing each one — 35–118 MB/s of continuous
+  reads on the canonical, every page fault taken while holding SQLite's
+  single connection mutex, until the node went unreachable after ~22 h with
+  `restarts=0` and no panic. Index-only: ~50k hashes ≈ 1.6 MB against
+  1.3 GB of rows, and still complete across pages, so the
+  `want = remote ∖ holdings` convergence invariant is untouched. The cursor
+  is the hash rather than the usual `(timestamp, id)` because this index has
+  no time column and adding one would mean reading the row it exists to
+  avoid.
+- **The v14 adopt moved a preimage, and now does not.** Persist adopted
+  verify's `SubjectBinding` builder for the subject projection (#750) and
+  then used that same projection to MINT, so every envelope persist produced
+  grew a `"valid_until": null`. The builder is a *checking* projection where
+  a `null` is the expectation "absent-or-null"; inside an envelope it stops
+  being an expectation and becomes content, in the JCS preimage. Verify's own
+  producer omits an absent `valid_until` precisely so "a no-expiry record
+  reproduces the pre-#267 bytes EXACTLY", and since essentially no record
+  carries an expiry, persist was moving the preimage of nearly every envelope
+  it mints.
+
+  Reachable as: an external harness signs the shape verify's producer emits,
+  persist re-derives the bytes from its own construction, and a signature
+  nobody tampered with stops verifying — the test anchor "cannot root", the
+  same failure that function's doc records from the 13.1.0 move.
+
+  `bind_subject_into_envelope` now omits an absent `valid_until` and keeps
+  materializing the `pubkey_ml_dsa_65_base64` null, which is NOT a
+  special-case: verify types that member `&str`, so a classical-only record
+  is inexpressible in its producer and no byte-identity is at stake, while
+  #657/#659 makes the null an assertion of ABSENCE so an attach attempt is
+  refused against a stated tier rather than against silence. Both directions
+  of "make the spelling uniform" are mutation-killed by a witness that names
+  which member moved.
+
+  Found by an `--all-features` compile error at a call site behind the
+  `test-anchor` feature — no round-trip test could see it, because the #451
+  e2e builds and verifies through the same function, so a preimage move
+  shifts both sides together and stays green.
+- **#782 — the session-claim plane.** A *self* is one federated identity plus
+  the N nodes it stewards; an attestation addressed to a fed id fans out to
+  every occurrence and **exactly one may act**. Keyed by
+  `(community, session)` — "which node is my self?" has no answer, "which
+  node is handling session z in community B?" does — so four occurrences can
+  hold four concurrent sessions across two communities, all correct.
+
+  The invariant: **an unclaimed exchange is never acted on** — not by a
+  quorum, not by the lowest id, and not by a single-node self. Being the only
+  occurrence is not authority to act; it means there is one place where
+  nobody is home. Encoded as absence from the table rather than a weak
+  claim, because a weak-claim variant is a value a careless comparison can
+  promote into a right to act.
+
+  Ships the decided `session:*` registry row, `resolve_claim` (earliest
+  `claimed_at` wins, ties on the lowest occurrence key_id — convergent from
+  either arrival order, no coordination round-trip) and `handler_for`. The
+  row is DECIDED rather than left to the conservative default because
+  `Global` there would publish an attendance map of a person's devices, and
+  a defaulted cell is one tidying sweep from being widened — the
+  `moderation:*` lesson. CC has not ruled on `session:`, so the gap is
+  pinned in `RULES_NOT_ON_THE_ROW` and the ask filed as
+  CIRISConstitution#98.
+- **#777 — the `load.ceiling` mesh-config key** (CC 4.2.1), so an owner can
+  relieve a node under contention rather than the node declaring for
+  itself. Relieve-never-expand, so it composes under plural roots with
+  most-restrictive-across-roots.
+
+### Changed
+
+- **CIRISVerify v13.6.1 → v14.0.0**: all seven Cargo pins flipped together
+  plus `pyproject.toml`'s `Requires-Dist`. `non_exhaustive` error enums
+  required wildcards; in the conformance test those wildcards PANIC rather
+  than classify, because that test's own comment warns a silent wildcard
+  "would classify it silently, as convergence, which is the direction that
+  goes green".
+
 ## [38.6.0] - 2026-08-26
 
 CC 3.4.7.3 graduation (CIRISConstitution#95, rc4.5 `87e4095`;

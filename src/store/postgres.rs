@@ -5052,6 +5052,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
+        // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
+        // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
+        // live `owner_of`. CC 3.4.7 holds every 3.4.5 emitter rule with three
+        // things — substrate admission, consumer re-check, producer obligation
+        // — and persist had only the third, so a peer could attest
+        // `config:replication` / `config:load` ABOUT A NODE IT DOES NOT OWN
+        // and every honest consumer would believe a healthy node was shedding.
+        // AV-76 TIER 4: the owner arm walks the directory, so it may not lead
+        // the crypto. Placed immediately after the consent gate so the two CC
+        // 3.4.5 gates sit together and a reader finds both at one line.
+        // Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
         // tier, BEFORE any crypto or DB-walking gate — so an abuser this node
@@ -5690,6 +5703,39 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106), and
     /// `identity_canonical_binding.binding_attestation_id` via `ON DELETE SET
     /// NULL` (V121).
+    /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let after = after_content_hash.unwrap_or("");
+        let lim = i64::from(limit);
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_wire_hashes_since pool: {e}"))
+        })?;
+        let rows = client
+            .query(
+                "SELECT content_hash FROM cirislens.signed_wire_index \
+                 WHERE kind = $1 AND content_hash > $2 \
+                 ORDER BY content_hash LIMIT $3",
+                &[&kind, &after, &lim],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_wire_hashes_since: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                r.safe_get_with::<String, _, _, _>(
+                    "content_hash",
+                    crate::federation::Error::Backend,
+                )
+            })
+            .collect()
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,

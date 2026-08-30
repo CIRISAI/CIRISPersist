@@ -1182,6 +1182,7 @@ pub mod test_support {
             identity_type,
             pubkey_ed25519_base64,
             pubkey_ml_dsa_65_base64,
+            None,
         )
         .expect("bind the #659 subject into the registration envelope");
         let (och, classical, pqc) = ts::sign_envelope(signer_key_id, &envelope);
@@ -1388,9 +1389,17 @@ pub mod test_support {
             identity_type::NODE,
             &a_ed,
             a_pqc.as_deref(),
+            None,
         )
-        .keys()
-        .cloned()
+        // v38.7.0 — only members bound to a VALUE. A `null` expectation (an
+        // absent PQC leg, or an absent `valid_until` since CIRISVerify
+        // v14.0.0) is the CEG §0.9 carve-out: omitting it is legitimately
+        // tolerated, so this leg would be demanding a refusal the contract
+        // says must not happen — and would then read whatever downstream
+        // error fired instead as if it were the binding gate's.
+        .into_iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, _)| k)
         .collect();
         for field in bound_members {
             let field = field.as_str();
@@ -1455,6 +1464,7 @@ pub mod test_support {
             identity_type::NODE,
             &v_ed,
             v_pqc.as_deref(),
+            None,
         )
         .expect("bind");
         let (och, classical, pqc) = ts::sign_envelope(&attacker, &foreign);
@@ -2634,6 +2644,7 @@ mod tests {
             identity_type,
             &ed_pk_b64,
             mldsa_pk_b64.as_deref(),
+            None,
         )
         .expect("bind the #659 subject into the registration envelope");
         let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");

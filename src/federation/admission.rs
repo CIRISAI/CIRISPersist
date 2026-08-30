@@ -2404,6 +2404,11 @@ pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), E
 ///    [`check_user_target_steward_binding_admission`] — the recipient's
 ///    identity type and the minor/adult proofs behind them are directory state
 ///    that moves.
+/// 7. [`check_config_self_or_owner_admission`] — CC 3.4.5's `config:*`
+///    self-or-owner rule (CIRISPersist#778). The owner-binding it measures
+///    against can lapse or be withdrawn between the local write and the
+///    promotion, and promotion is the door a locally-staged row becomes
+///    federation-visible at.
 ///
 /// # Ordering
 ///
@@ -2577,6 +2582,16 @@ pub async fn check_promotion_admission(
 
     // CC 3.4.5 — CONSENT BEFORE SCORING. The MUST this issue is rated on.
     check_capacity_consent_admission(directory, row).await?;
+
+    // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
+    // is a self-report. Re-run here under this stack's own inclusion rule —
+    // its verdict is a function of directory state (the live owner-binding)
+    // that can have changed since the local write, it mutates nothing, and it
+    // does not assume the row is unstored. Without it the local tier is a way
+    // around the put-door gate: a third-party `config:load` staged at
+    // `tier = "local"` would become federation-visible at the one door that
+    // never asked (the B8 shape #598 closed for the instant binding).
+    check_config_self_or_owner_admission(directory, row).await?;
 
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
@@ -2791,6 +2806,174 @@ pub fn check_capacity_not_self_attested(
         ));
     }
     Ok(())
+}
+
+/// v38.7.0 (CIRISPersist#778, CC 3.4.5) — the dimension stem of the
+/// node-configuration plane, `config:{scope}`. Named once, beside
+/// [`CAPACITY_FAMILY_PREFIX`] and [`TRACE_DIMENSION_PREFIX`], because the three
+/// are rows of ONE table: CC 3.4.5 states a different emitter rule for each,
+/// and persist enforces each in a purpose-built gate rather than in the
+/// prefix→role table — none of the three rules is `identity_type`-shaped, so no
+/// [`ReservedPrefixRule`] can express any of them.
+///
+/// **`mesh_config:` is a DIFFERENT family and is deliberately NOT matched.** It
+/// does not start with `config:` (the first byte is `m`), and its polarity is
+/// the opposite one: a mesh-config row is a trust root turning a knob ON a
+/// subscriber, so its author is by definition not the subject. Its gate is
+/// [`mesh_config::record_mesh_config_row`](crate::federation::mesh_config::record_mesh_config_row)
+/// and its stem is [`MESH_CONFIG_DIMENSION_PREFIX`].
+pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
+
+/// v38.7.0 (CIRISPersist#778, **CC 3.4.5**) — **`config:{scope}` is a
+/// SELF-REPORT.** The author is the subject, or the subject's single live
+/// owner, or the row is refused:
+///
+/// ```text
+/// admissible(row)  ≔  attesting_key_id == attested_key_id
+///                  ∨  attesting_key_id == owner_of(attested_key_id)
+/// ```
+///
+/// # What was unenforced, and what it bought an attacker
+///
+/// CC 3.4.5's emitter table pins the rule — *"`attesting_key_id` MUST be
+/// `attested_key_id` or its live `owner_of`. A node's running configuration is
+/// a self-report; a third-party assertion of what you are running is a
+/// rumour."* — and CC 3.4.7 says every row of that table is held by **three**
+/// things: substrate admission, consumer re-check, producer obligation.
+/// Persist had the third and only the third. Our own producer honours the rule
+/// by construction (attesting == attested == subject), which is exactly the
+/// half a malicious producer does not perform: until this gate, ANY registered
+/// key could write `config:replication` — or CIRISServer 0.5.195's short-lived
+/// `config:load` — **about a node it does not own**, and the substrate stored
+/// it and served it.
+///
+/// The cost is not abstract, and it lands on the honest party. `config:load` is
+/// read by peers deciding where to send work, and it carries information *only*
+/// because it is a self-report. A peer able to author one about someone else
+/// can make a healthy node look like it is shedding; every HONEST consumer —
+/// one that re-checks nothing, precisely because the substrate admitted the
+/// row — then backs off from a node that is fine. The forged row costs the
+/// victim its traffic and costs the forger nothing.
+///
+/// # Why [`owner_of`], and not "some steward"
+///
+/// [`owner_of`] is the CC 3.2 purpose-filtered resolution: the single live
+/// `delegates_to(U → node)` carrying the owner-binding dimension, and at most
+/// one such `U` ([`check_single_node_owner_admission`] is what keeps it
+/// single). [`steward_bindings_of`] is multi-parent **by design** and would
+/// admit any co-steward. The clause says `owner_of`; the two sets are not the
+/// same set, and reading the wider one here would let a co-steward of a node
+/// speak for its configuration — a widening nobody ratified.
+///
+/// Occurrence→identity resolution ([`admission_identity_for_writer`]) is
+/// deliberately NOT applied either. It would lift a node writer to its OWNER,
+/// which is the wrong direction for this comparison, and CC names two
+/// identities here exactly. A gate does not widen its own admitted set past the
+/// clause it implements.
+///
+/// # Fail-closed on an ambiguous owner
+///
+/// [`Error::AmbiguousNodeOwner`] **propagates** — deliberately not caught and
+/// flattened into the ordinary refusal. A node carrying two live owner
+/// bindings is a pre-gate anomaly, not a resolved "no": the substrate cannot
+/// say who the owner is, and a caller that cannot tell *"we could not tell"*
+/// from *"the answer is no"* will eventually treat one as the other. Same
+/// posture [`may_act_through`] and every other consumer of [`owner_of`] takes.
+///
+/// # Tier-blind, on purpose
+///
+/// Asked of every tier, unlike its CC 3.4.5 neighbour
+/// [`check_capacity_consent_admission`] (which no-ops at the local tier because
+/// a local row is not an emission). A tier-scoped rule is skippable by writing
+/// `tier = "local"` and promoting — the #643 lesson — and asking early
+/// over-refuses nothing: a local-tier row is `cohort_scope = self`, so a node's
+/// own staged config row is self-attested by definition and passes the first
+/// arm without a directory read.
+///
+/// # Refusal class
+///
+/// [`Error::InvalidArgument`], the class its sibling
+/// [`check_capacity_not_self_attested`] raises — not a new typed variant. The
+/// two are one row and its neighbour in one table; giving one of the pair a
+/// typed `kind()` and not the other would encode a distinction between them
+/// that CC does not make. The refusal names the dimension, both endpoints and
+/// the owner the walk actually resolved, so a reader is never left asking which
+/// branch refused (#575).
+///
+/// # Where it runs — and the ONE door it deliberately does not
+///
+/// Every backend's `put_attestation`, immediately after
+/// [`check_capacity_consent_admission`] (the other CC 3.4.5 gate), and again in
+/// [`check_promotion_admission`].
+///
+/// **Not** at the local write door
+/// ([`attestation_insert_local`](super::FederationDirectory::attestation_insert_local)
+/// / `attestation_upsert_local`), and that is a boundary rather than an
+/// oversight. A local-tier row is producer authority: it is forced to
+/// `cohort_scope = self` by [`check_local_tier_eligibility`], `put_attestation`
+/// — the door a PEER reaches — refuses a third-party `config:*` row at any
+/// tier, and `list_attestations_for` filters local rows out, so a row staged
+/// there is visible to nobody and reaches no consumer fold. **Promotion is the
+/// door where it stops being private**, and the promote stack asks this gate by
+/// its own stated inclusion rule: the owner-binding can have lapsed or been
+/// withdrawn since the local write. That path is witnessed on all three
+/// backends (arms 6–7 of
+/// [`tests::run_config_self_or_owner_matrix`]) precisely because "the local
+/// tier is not a way around a put-gate" is a claim, not an assumption.
+///
+/// Verify-before-mutation (AV-9): a refused row leaves no stored row on any
+/// backend, and a refused promotion leaves the row at the local tier.
+///
+/// # The residual, recorded rather than left for the next reader to find
+///
+/// The gate reads `attested_key_id`, because that is the field CC 3.4.5 names
+/// and the field
+/// [`list_attestations_for`](super::FederationDirectory::list_attestations_for)
+/// — the read a peer uses to ask *"what is node N running?"* — keys on. It does
+/// **not** constrain `subject_key_ids`, so an attacker can still write a
+/// `config:*` row about ITSELF (`attesting == attested`, which is a true
+/// self-report) while naming a victim in `subject_key_ids`, where the
+/// subject-indexed reads (`list_scores(subject_key_id = victim)`) would surface
+/// it. That is not this clause's axis and widening the gate to cover it would
+/// be persist inventing a rule CC has not written; it is also the shape AV-84
+/// ([`check_cohort_standing_resolved`]) already refuses at the `family` /
+/// `community` placements and deliberately not at `federation`. Recorded here
+/// so the limit is a known boundary rather than an assumed absence.
+pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    // Arm 1 — the subject speaking about itself. The overwhelmingly common
+    // shape, the only one persist's own producer emits, and free: it settles
+    // before any directory read, so the honest path buys no walk.
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
+    // Arm 2 — the subject's single live owner speaking for its instrument.
+    // `owner_of` propagates `Error::AmbiguousNodeOwner`; see the doc above for
+    // why that is NOT collapsed into the refusal below.
+    let owner = owner_of(directory, &row.attested_key_id).await?;
+    if owner.as_deref() == Some(row.attesting_key_id.as_str()) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{dimension} is a SELF-REPORT (CC 3.4.5): attesting_key_id {:?} is neither the attested \
+         subject {:?} nor its live owner_of ({}) — a third-party assertion of what a node is \
+         running is a rumour, and a peer that can mint one can make a healthy node look like it \
+         is shedding",
+        row.attesting_key_id,
+        row.attested_key_id,
+        owner.as_deref().map_or_else(
+            || "the node has no live owner-binding".to_owned(),
+            |o| format!("{o:?}")
+        ),
+    )))
 }
 
 /// v25.1.0 (CIRISPersist#569) — the `capacity:*` prefix, named once. The
@@ -8166,39 +8349,55 @@ pub fn subject_binding(
     identity_type: &str,
     pubkey_ed25519_base64: &str,
     pubkey_ml_dsa_65_base64: Option<&str>,
+    valid_until: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
-    m.insert("key_id".into(), serde_json::Value::from(key_id));
-    // v31.0.0 (CIRISVerify 13.1.0 / CIRISVerify#252) — the FOURTH member.
-    // `identity_type` is AUTHORITY-BEARING: `is_canonical` decides canonical
-    // standing by reading it off the row, and
-    // `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it. Unbound, a relay
-    // could relabel a validly-signed record on the OUTSIDE only — verify's
-    // third finding (privilege transfer) in our storage layer, reachable
-    // because `apply_replicated_key_record`'s Insert branch skips
-    // `verify_key_registration` for exactly the role-gated records, leaving
-    // the accord co-scrub as their only cryptographic proof.
+    // v38.7.0 (CIRISPersist#750, forced by the CIRISVerify v14.0.0 adopt) —
+    // BUILT BY VERIFY'S OWN TYPE-AGNOSTIC BUILDER, not re-spelled here.
     //
-    // Bound because `ciris_verify_core`'s `KeyRecord::check_subject_binding`
-    // binds it and the two implementations must not diverge. Persist keeps a
-    // separate spelling ONLY because its `KeyRecord` is a distinct type with
-    // a declaration-order contract against CIRISRegistry; the semantics are
-    // verify's, and this comment is the pairing.
-    m.insert(
-        "identity_type".into(),
-        serde_json::Value::from(identity_type),
-    );
-    m.insert(
-        "pubkey_ed25519_base64".into(),
-        serde_json::Value::from(pubkey_ed25519_base64),
-    );
-    m.insert(
-        "pubkey_ml_dsa_65_base64".into(),
-        match pubkey_ml_dsa_65_base64 {
-            Some(s) => serde_json::Value::from(s),
-            None => serde_json::Value::Null,
-        },
-    );
+    // Persist kept a parallel spelling, with a comment promising "the two
+    // implementations must not diverge". They diverged the moment verify
+    // v14.0.0 added `valid_until` as a fifth member: the conformance test
+    // reported `only ciris_verify_core binds: ["valid_until"]`, and persist
+    // would have produced an envelope that verify's own checker rejects.
+    //
+    // A promise in a comment is not a mechanism. Building the projection
+    // THROUGH `SubjectBinding` makes the two identical by construction, so
+    // the next member verify adds arrives here without an edit — which is
+    // the whole point of #750's ask, and why the drift is worth closing
+    // rather than patching.
+    //
+    // `valid_until` is authority-bearing in the same way `identity_type` is:
+    // verify records that an unbound expiry can be removed or extended while
+    // the envelope, its hash and both signatures stay intact, and a consumer
+    // reading the public field — the natural thing to do — gets the
+    // attacker's value.
+    let mut m = ciris_verify_core::subject_binding::SubjectBinding::new()
+        .require("key_id", key_id)
+        // v31.0.0 (CIRISVerify 13.1.0 / CIRISVerify#252) — the FOURTH member.
+        // `identity_type` is AUTHORITY-BEARING: `is_canonical` decides canonical
+        // standing by reading it off the row, and
+        // `AUTHORITY_CONFERRING_IDENTITY_TYPES` gates on it. Unbound, a relay
+        // could relabel a validly-signed record on the OUTSIDE only — verify's
+        // third finding (privilege transfer) in our storage layer, reachable
+        // because `apply_replicated_key_record`'s Insert branch skips
+        // `verify_key_registration` for exactly the role-gated records, leaving
+        // the accord co-scrub as their only cryptographic proof.
+        //
+        // Bound because `ciris_verify_core`'s `KeyRecord::check_subject_binding`
+        // binds it. Persist no longer keeps a separate spelling for it — as of
+        // v38.7.0 this whole projection is built by verify's builder, so the
+        // pairing is the CALL above rather than a comment asking two copies to
+        // stay in step.
+        .require("identity_type", identity_type)
+        .require("pubkey_ed25519_base64", pubkey_ed25519_base64)
+        .require_optional("pubkey_ml_dsa_65_base64", pubkey_ml_dsa_65_base64)
+        .require_optional("valid_until", valid_until)
+        .members()
+        .clone();
+    // Persist's `KeyRecord` is a distinct type with a declaration-order
+    // contract against CIRISRegistry, so the CALL still lives here — but the
+    // projection itself is verify's, member for member.
+    let _ = &mut m;
     m
 }
 
@@ -8219,6 +8418,7 @@ pub fn bind_subject_into_envelope(
     identity_type: &str,
     pubkey_ed25519_base64: &str,
     pubkey_ml_dsa_65_base64: Option<&str>,
+    valid_until: Option<&str>,
 ) -> Result<(), String> {
     let was = json_type_name(envelope);
     let obj = envelope.as_object_mut().ok_or_else(|| {
@@ -8232,7 +8432,44 @@ pub fn bind_subject_into_envelope(
         identity_type,
         pubkey_ed25519_base64,
         pubkey_ml_dsa_65_base64,
+        valid_until,
     ) {
+        // v38.7.0 — `valid_until` alone is OMITTED when absent. The two
+        // optional members are spelled differently ON PURPOSE, and a blanket
+        // "skip nulls" here is wrong in one direction while a blanket
+        // "materialize nulls" is wrong in the other.
+        //
+        // This function PRODUCES signed bytes; [`subject_binding`] is a
+        // CHECKING projection. In the projection a `null` is an expectation
+        // ("absent-or-null", which verify's `check` honours). Inserted into an
+        // envelope it stops being an expectation and becomes CONTENT — content
+        // inside the JCS preimage, moving every signature computed over it.
+        //
+        // `valid_until` OMITS because verify's own producer omits it, in those
+        // words: "`None` OMITS the key entirely, so a no-expiry record
+        // reproduces the pre-#267 bytes EXACTLY and every existing record,
+        // signature and golden vector stays valid". Persist must agree with
+        // `build_registration_envelope` byte-for-byte —
+        // `produce_scrubbed_key_record` promises persist "recanonicalizes
+        // byte-identical bytes" — and since essentially no record carries an
+        // expiry, materializing the null would have moved the preimage of
+        // nearly every envelope persist mints. The reachable break: an
+        // external harness (CIRISServer's, and the #451 e2e) signs the shape
+        // verify's producer emits, and persist re-derives the bytes from its
+        // OWN construction; one materialized null and a signature nobody
+        // tampered with stops verifying.
+        //
+        // `pubkey_ml_dsa_65_base64` MATERIALIZES its null, and must keep doing
+        // so. That is not verify's call to make — verify's producer types it
+        // `&str`, so a classical-only record is INEXPRESSIBLE there and no
+        // byte-identity is at stake. It is #657/#659's: an absent PQC leg is
+        // an assertion of ABSENCE, so the envelope states the record's
+        // security tier rather than staying silent about it, and the refusal
+        // an attach attempt earns names the bound null instead of a missing
+        // member. Three tests pin that refusal by identity.
+        if field == "valid_until" && value.is_null() {
+            continue;
+        }
         obj.insert(field, value);
     }
     Ok(())
@@ -8306,9 +8543,43 @@ pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), Strin
         &row.identity_type,
         &row.pubkey_ed25519_base64,
         row.pubkey_ml_dsa_65_base64.as_deref(),
+        row.valid_until.map(|t| t.to_rfc3339()).as_deref(),
     ) {
         match row.registration_envelope.get(&field) {
             Some(bound) if *bound == expected => {}
+            // v38.7.0 (verify v14.0.0) — `valid_until` is an INSTANT, and two
+            // spellings of one instant must not read as two subjects.
+            //
+            // RFC-3339 renders UTC as either `Z` or `+00:00`, and with any
+            // sub-second precision. verify's fixtures and producers write
+            // `…00:00Z`; persist renders its typed column with
+            // `to_rfc3339()`, which writes `…00:00+00:00`. Compared as
+            // strings those disagree, so persist would refuse a record whose
+            // envelope names the very instant its own row carries — and the
+            // refusal text would say the signers "never named" a subject they
+            // did name.
+            //
+            // Compared as instants they agree. This is the ONLY member with a
+            // parse: every other one is an opaque identifier or base64, where
+            // byte equality IS the semantics and normalising would be a way
+            // to admit something the signers did not write. Same class as the
+            // prune-cutoff bug in #776 — a lexicographic comparison across
+            // two spellings of one moment — but this one sits on a
+            // signature-bearing path.
+            Some(bound)
+                if field == "valid_until"
+                    && match (bound.as_str(), expected.as_str()) {
+                        (Some(b), Some(e)) => {
+                            match (
+                                b.parse::<chrono::DateTime<chrono::Utc>>(),
+                                e.parse::<chrono::DateTime<chrono::Utc>>(),
+                            ) {
+                                (Ok(b), Ok(e)) => b == e,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    } => {}
             Some(bound) => {
                 return Err(format!(
                     "the signed registration_envelope binds {field} = {bound_brief}, but this \
@@ -8479,6 +8750,7 @@ pub mod pqc_attach_test_support {
             identity_type,
             &ed_pk,
             Some(&mldsa_pk),
+            None,
         )
         .expect("envelope is an object");
         let (original_content_hash, classical, pqc) =
@@ -8590,6 +8862,7 @@ pub mod pqc_attach_test_support {
             &absent_id,
             &absent_row.identity_type,
             &absent_row.pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("envelope is an object");
@@ -14193,6 +14466,12 @@ mod tests {
     ///   `consent:` / `ownership:` / `trace:` / `trace_summary:` / `trust:`
     ///   carry CC's opaque `"reserved (see table)"`, whose enforcement lives in
     ///   purpose-built gates elsewhere in this file, not in a prefix→role table.
+    ///   `config:`'s is [`check_config_self_or_owner_admission`] (v38.7.0,
+    ///   #778); `ownership:`'s is [`check_single_node_owner_admission`];
+    ///   `trace:`'s is [`check_trace_dimension_admission`]. Naming them is not
+    ///   decoration: #778 was exactly the case where this line asserted a
+    ///   purpose-built gate that did not exist, and a reader had no way to
+    ///   notice from here.
     const RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE: &[&str] = &[
         "config:",
         "consent:",
@@ -15165,6 +15444,251 @@ mod tests {
         assert!(!scopes_are_infra_only(&scope_set(&["network_presence"])));
         assert!(!ds::is_legacy_agency_scope("network_presence"));
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` self-or-owner
+    // ══════════════════════════════════════════════════════════════════
+
+    /// The `config:{scope}` self-or-owner decision table, driven through the
+    /// REAL `put_attestation` door on every backend — not against the
+    /// predicate in isolation, because #778 is precisely a case where the
+    /// predicate did not exist at the door.
+    ///
+    /// Five arms, each answering a question the others cannot:
+    ///
+    /// 1. **self-authored ADMITS** — the shape persist's own producer emits
+    ///    (attesting == attested == the node). The gate must not be collateral
+    ///    damage to the traffic CC 3.4.5 exists to protect.
+    /// 2. **owner-authored ADMITS** — the second identity the clause names,
+    ///    reached through the live `delegates_to(owner → node)` owner-binding.
+    /// 3. **third-party REFUSED** — the defect. The refusal must come from
+    ///    THIS gate (the message is asserted, not merely the error), so a
+    ///    neighbouring gate refusing for its own reason cannot make this pass.
+    /// 4. **the refused row leaves NO STORED ROW** — verify-before-mutation
+    ///    (AV-9). The load-bearing half: an "accept then flag" substrate still
+    ///    lets a consumer read the rumour, which is the whole harm.
+    /// 5. **a non-`config:` dimension from the SAME stranger about the SAME
+    ///    node still ADMITS** — the over-refusal control. Without it, arm 3
+    ///    is satisfied by a gate that refuses everything, and arm 1 could pass
+    ///    on a gate keyed to the wrong axis.
+    ///
+    /// `tag` scopes every key so a run against a shared postgres test db does
+    /// not collide with a prior one. The distinguishing token leads each id:
+    /// `test_support::seed_for` truncates at 32 bytes, so ids sharing a
+    /// 32-byte prefix would be the SAME identity (#659).
+    async fn run_config_self_or_owner_matrix<D>(dir: &D, tag: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+        use crate::federation::{Attestation, SignedAttestation};
+
+        let node = format!("n778-{tag}");
+        let owner = format!("o778-{tag}");
+        let stranger = format!("s778-{tag}");
+
+        // The node whose configuration is being reported on, its single
+        // responsible owner, and an unrelated registered peer. All three are
+        // REGISTERED keys — the point of #778 is that registration alone was
+        // enough to speak for anyone.
+        ts::register_identity_key(dir, &node, identity_type::NODE).await;
+        ts::register_identity_key(dir, &owner, identity_type::USER).await;
+        ts::register_hybrid_key(dir, &stranger).await;
+
+        // The live owner-binding `delegates_to(owner → node)` — the edge
+        // `owner_of` walks. Written through the real door, so the fixture
+        // cannot certify a graph this substrate would not accept.
+        let binding_id = format!("bind-{tag}-{}", uuid::Uuid::new_v4());
+        dir.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&binding_id, &owner, &node),
+        })
+        .await
+        .expect("the owner-binding itself must admit");
+        assert_eq!(
+            owner_of(dir, &node).await.unwrap().as_deref(),
+            Some(owner.as_str()),
+            "precondition: owner_of must resolve the single live owner, or arms 2/3 \
+             are measuring an unowned node rather than the rule"
+        );
+
+        let row = |id: &str, author: &str, subject: &str, dimension: &str| {
+            let now = chrono::Utc::now();
+            let envelope = serde_json::json!({ "dimension": dimension, "score": 1.0 });
+            SignedAttestation {
+                attestation: ts::seal_row(
+                    author,
+                    Attestation {
+                        attestation_id: id.to_owned(),
+                        attesting_key_id: author.to_owned(),
+                        attested_key_id: subject.to_owned(),
+                        attestation_type: attestation_type::SCORES.to_owned(),
+                        weight: Some(1.0),
+                        asserted_at: now,
+                        expires_at: None,
+                        attestation_envelope: envelope,
+                        original_content_hash: String::new(),
+                        scrub_signature_classical: String::new(),
+                        scrub_signature_pqc: None,
+                        scrub_key_id: author.to_owned(),
+                        scrub_timestamp: now,
+                        pqc_completed_at: None,
+                        persist_row_hash: String::new(),
+                        subject_key_ids: Vec::new(),
+                        withdraws_admission_rule: None,
+                        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+                        tier: attestation_tier::FEDERATION.to_owned(),
+                        promoted_at: None,
+                        additional_scrubs: Vec::new(),
+                    },
+                ),
+            }
+        };
+        let id_of = |what: &str| format!("{what}-{tag}-{}", uuid::Uuid::new_v4());
+
+        // (1) SELF-authored — the CIRISServer 0.5.195 `config:load` shape.
+        let self_id = id_of("self");
+        dir.put_attestation(row(&self_id, &node, &node, "config:load:v1"))
+            .await
+            .expect("a node's own config:* self-report must ADMIT");
+        assert!(
+            dir.get_attestation(&self_id).await.unwrap().is_some(),
+            "(1) the self-report must be STORED"
+        );
+
+        // (2) OWNER-authored — the second identity CC 3.4.5 names.
+        let owner_id = id_of("owner");
+        dir.put_attestation(row(&owner_id, &owner, &node, "config:replication:v1"))
+            .await
+            .expect("the node's live owner_of must ADMIT on config:*");
+        assert!(
+            dir.get_attestation(&owner_id).await.unwrap().is_some(),
+            "(2) the owner-authored row must be STORED"
+        );
+
+        // (3) THIRD-PARTY — the rumour. Refused, BY THIS GATE.
+        let rumour_id = id_of("rumour");
+        let err = dir
+            .put_attestation(row(&rumour_id, &stranger, &node, "config:load:v1"))
+            .await
+            .expect_err("a third-party config:* row must be REFUSED (CC 3.4.5 self-or-owner)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SELF-REPORT") && msg.contains("CC 3.4.5"),
+            "(3) the refusal must come from the config self-or-owner gate, not a \
+             neighbour that happened to refuse first: {msg}"
+        );
+        assert!(
+            msg.contains(&stranger) && msg.contains(&node) && msg.contains(&owner),
+            "(3) the refusal must name the author, the subject and the owner the walk \
+             actually resolved — a refusal a reader cannot act on sends them to the \
+             wrong layer: {msg}"
+        );
+
+        // (4) VERIFY-BEFORE-MUTATION (AV-9) — and the reason it is asserted
+        // separately from (3): a substrate that stores the row and then
+        // returns an error has still published the rumour.
+        assert!(
+            dir.get_attestation(&rumour_id).await.unwrap().is_none(),
+            "(4) a REFUSED config:* row must leave NO stored row"
+        );
+
+        // (5) OVER-REFUSAL CONTROL — the same stranger, the same subject, the
+        // same leaf token, on a family CC 3.4.5 does not reserve. Only the
+        // family differs, so a gate keyed on anything but the `config:` stem
+        // fails here.
+        let control_id = id_of("control");
+        dir.put_attestation(row(&control_id, &stranger, &node, "goal:load:v1"))
+            .await
+            .expect(
+                "(5) a NON-config:* third-party row must still ADMIT — the gate is \
+                     keyed on the family, not on third-party-ness",
+            );
+        assert!(
+            dir.get_attestation(&control_id).await.unwrap().is_some(),
+            "(5) the control row must be STORED"
+        );
+
+        // (6) THE LOCAL-THEN-PROMOTE PATH — the door the put gate does not
+        // stand at. The local write door is producer authority
+        // (`cohort_scope = self`, invisible to every consumer and filtered out
+        // of `list_attestations_for`), so a row staged there harms nobody;
+        // PROMOTION is the moment it becomes federation-visible, and
+        // `check_promotion_admission` asks the same question there. Without
+        // that call this arm admits, and the whole gate is one
+        // `tier = "local"` away from being decorative — the B8 shape #598
+        // closed for the instant binding.
+        let staged_id = dir
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: stranger.clone(),
+                attested_key_id: Some(node.clone()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: Some(1.0),
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({ "dimension": "config:load:v1", "score": 1.0 }),
+                )
+                .unwrap(),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect("(6) the local door stages producer-authority rows; it is not the gate");
+        let staged = dir.get_attestation(&staged_id).await.unwrap().unwrap();
+        let reseal = ts::reseal_for_scope(&stranger, &staged, cohort_scope::FEDERATION);
+        let err = dir
+            .promote_attestation(&staged_id, cohort_scope::FEDERATION, &reseal)
+            .await
+            .expect_err("(6) promoting a third-party config:* row must be REFUSED");
+        assert!(
+            err.to_string().contains("SELF-REPORT"),
+            "(6) the promote door must refuse for the CONFIG rule, not a neighbour's: {err}"
+        );
+
+        // (7) …and the refused promotion mutated nothing: the row is still
+        // local, so it is still invisible rather than half-published.
+        assert_eq!(
+            dir.get_attestation(&staged_id).await.unwrap().unwrap().tier,
+            attestation_tier::LOCAL,
+            "(7) a refused promotion must leave the row at the local tier"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_self_or_owner_gate_memory_778() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_config_self_or_owner_matrix(&backend, "mem").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn config_self_or_owner_gate_sqlite_778() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_config_self_or_owner_matrix(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn config_self_or_owner_gate_postgres_778() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!(
+                "skipping config_self_or_owner_gate_postgres_778: CIRIS_PERSIST_TEST_PG_URL unset"
+            );
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_config_self_or_owner_matrix(&backend, "pg").await;
+        })
+        .await;
+    }
 }
 
 /// v13.2.0 (CIRISPersist#383) — run `body` against an **isolated, freshly-created
@@ -15713,6 +16237,7 @@ mod canonical_gate_tests {
             &good.identity_type,
             &good.pubkey_ed25519_base64,
             good.pubkey_ml_dsa_65_base64.as_deref(),
+            None,
         ) {
             let mut partial = good.clone();
             partial
@@ -15845,6 +16370,7 @@ mod canonical_gate_tests {
             key_id,
             identity_type,
             &pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("#659 subject binding");
@@ -17107,6 +17633,7 @@ mod canonical_withdrawal_tests {
             key_id,
             identity_type,
             &pubkey_ed25519_base64,
+            None,
             None,
         )
         .expect("#659 subject binding");

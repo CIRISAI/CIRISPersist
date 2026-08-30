@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
-//! of 20** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
+//! of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
 //!
 //! # What is derived and what is pinned
 //!
@@ -206,6 +206,42 @@ pub struct PersistFamilyRule {
 /// Ordered by gap kind then prefix, so the three populations read as the three
 /// different asks they are.
 pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+    // v38.7.0 (CIRISPersist#782) — the session-claim plane. CC has not ruled
+    // on `session:` yet, so persist states a rule the row does not carry and
+    // pins the gap here rather than letting a downstream read the classifier
+    // as "this family is open".
+    //
+    // The rule has two halves. The EMITTER half: a claim is a self-report —
+    // `attesting_key_id == attested_key_id == the occurrence` — so a row
+    // about an occurrence authored by anyone else is not that occurrence's
+    // claim and is never folded as one. The COMPOSITION half: concurrent
+    // claims are expected rather than prevented (there is no
+    // compare-and-swap across a mesh) and settle on earliest `claimed_at`,
+    // ties broken on the lowest occurrence key_id — convergent from either
+    // arrival order, which is what lets every node compute the same holder
+    // without a coordination round-trip.
+    //
+    // The invariant underneath both: an unclaimed exchange is never acted
+    // on — not by a quorum, not by the lowest id, and not by a single-node
+    // self. Being the only occurrence is not authority to act; it means
+    // there is one place where nobody is home.
+    PersistFamilyRule {
+        prefix: "session:",
+        rule: "SELF-REPORT emitter (attesting == attested == the occurrence) + \
+               convergent claim merge: earliest claimed_at wins, ties on the lowest \
+               occurrence key_id; an unclaimed session has NO handler",
+        enforced_at: &[
+            "federation::session_claim::resolve_claim",
+            "federation::session_claim::handler_for",
+            "federation::namespace::attestation_family",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#98 — CC has not stated a rule for `session:`; the ask is \
+                 a row carrying the self-report emitter rule and the convergent merge, so the \
+                 two validators agree. Until it lands persist enforces both and this entry \
+                 records that it does (CIRISPersist#782).",
+    },
     // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
     // CIRISConstitution#92. Two rules ride the one prefix: the staging latch
     // (R2(b) refuses the whole family at federation tier until the CC row
@@ -697,6 +733,12 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 admission::QUARANTINE_DIMENSION_PREFIX,
                 registry::ACCORD_CO_SCRUB_MATCH_PREFIX,
                 admission::LEDGER_DIMENSION_PREFIX,
+                // v38.7.0 (CIRISPersist#782) — persist rules on `session:`:
+                // the decided registry row fixes its projection ceiling and
+                // `session_claim::resolve_claim` is the merge rule every node
+                // computes identically. Read at the const so the classifier
+                // arm and this table cannot drift.
+                crate::federation::session_claim::SESSION_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -988,9 +1030,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            20,
+            21,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             20\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );
