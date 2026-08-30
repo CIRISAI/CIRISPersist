@@ -5690,6 +5690,39 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106), and
     /// `identity_canonical_binding.binding_attestation_id` via `ON DELETE SET
     /// NULL` (V121).
+    /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let after = after_content_hash.unwrap_or("");
+        let lim = i64::from(limit);
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_wire_hashes_since pool: {e}"))
+        })?;
+        let rows = client
+            .query(
+                "SELECT content_hash FROM cirislens.signed_wire_index \
+                 WHERE kind = $1 AND content_hash > $2 \
+                 ORDER BY content_hash LIMIT $3",
+                &[&kind, &after, &lim],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_wire_hashes_since: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                r.safe_get_with::<String, _, _, _>(
+                    "content_hash",
+                    crate::federation::Error::Backend,
+                )
+            })
+            .collect()
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,

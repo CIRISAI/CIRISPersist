@@ -4014,6 +4014,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let after = after_content_hash.unwrap_or("");
+        let state = self.state.lock().expect("memory backend lock");
+        let mut hashes: Vec<String> = state
+            .signed_wire_index
+            .keys()
+            .filter(|(k, h)| k == kind && h.as_str() > after)
+            .map(|(_, h)| h.clone())
+            .collect();
+        // The SQL backends page over the PRIMARY KEY, so this must order the
+        // same way or a caller's cursor would skip entries on one backend.
+        hashes.sort();
+        hashes.truncate(limit as usize);
+        Ok(hashes)
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,
@@ -10969,6 +10991,82 @@ mod tests {
             &backend, "mem",
         )
         .await;
+    }
+
+    /// v38.7.0 (CIRISPersist#780) — **the index hashes ARE what this node
+    /// advertises, and the page walk is complete.**
+    ///
+    /// The consumer computes `want = remote ∖ holdings`, so two things must
+    /// hold or convergence breaks in opposite directions: a hash here that
+    /// the serve path does not advertise leaves a row in `want` forever,
+    /// and a page walk that drops an entry does the same. Both asserted —
+    /// the alignment is by construction (the index hashes the bare row, not
+    /// the `Served*` wrapper, so node-local `admitted_at` stays out of the
+    /// digest) but "by construction" is what this test exists to check.
+    #[tokio::test]
+    async fn wire_index_hashes_are_what_the_serve_path_advertises_780() {
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+        for k in ["adv-a", "adv-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            let id = format!("adv-{i}");
+            let mut row = fix_attestation(&id, "adv-a", "adv-b", "adv-a");
+            row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+            resign_fix(&mut row);
+            backend
+                .put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .expect("seed");
+            ids.push(id);
+        }
+
+        // Page the index with a deliberately small limit, so the cursor is
+        // exercised rather than one page happening to cover everything.
+        let mut paged: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = backend
+                .list_wire_hashes_since("Attestation", cursor.as_deref(), 2)
+                .await
+                .expect("hash page");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            paged.extend(page);
+        }
+        assert_eq!(
+            paged.len(),
+            ids.len(),
+            "#780: the paged walk must be COMPLETE — a dropped entry leaves a held row in the \
+             consumer's `want` forever, which is the non-convergence this read exists to avoid"
+        );
+
+        // …and each hash is the one the serve path would advertise for that
+        // row: the bare `Attestation`, never a `Served*` wrapper.
+        let mut advertised: Vec<String> = Vec::new();
+        for id in &ids {
+            let row = backend.get_attestation(id).await.unwrap().expect("row");
+            let bytes = serde_json::to_vec(&row).expect("serialize");
+            advertised.push(crate::federation::wire_index::content_hash_of_bytes(&bytes));
+        }
+        advertised.sort();
+        let mut paged_sorted = paged.clone();
+        paged_sorted.sort();
+        assert_eq!(
+            paged_sorted, advertised,
+            "#780: an index hash the serve path does not advertise leaves the row in `want` \
+             forever. They align by construction — the index hashes the bare row so node-local \
+             `admitted_at` stays out — and this is the assertion that keeps it true."
+        );
     }
 
     /// v38.4.0 (CIRISPersist#768) — **the reaper honours the producer's

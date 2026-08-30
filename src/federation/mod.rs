@@ -1246,6 +1246,65 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v38.7.0 (CIRISPersist#780) — **the complete hash set for one wire
+    /// kind, without reading a single row page.**
+    ///
+    /// `signed_wire_index` (V111, #507b) already stores exactly the set a
+    /// peer's anti-entropy needs — `PRIMARY KEY (kind, content_hash)`,
+    /// maintained incrementally by the same write hooks that admit the rows —
+    /// and until now its only reader was a point lookup. So consumers
+    /// re-derived it: reading every ROW of a plane each round and hashing
+    /// each one, because `want = remote ∖ holdings` needs `holdings`
+    /// COMPLETE and a partial view leaves held rows in `want` forever.
+    ///
+    /// Measured on the production canonical (2 vCPU, 1.3 GB corpus, 808 MB
+    /// of page cache for the whole box): 35–118 MB/s of continuous reads,
+    /// every page fault taken while holding SQLite's single connection
+    /// mutex, so every other database task parks behind it. The node went
+    /// unreachable after ~22 h with `restarts=0` and no panic — the health
+    /// endpoint that would have reported it was inside the same convoy.
+    /// Paging that read bounded its MEMORY and deliberately not its I/O.
+    ///
+    /// This is index-only: ~50k hashes ≈ 1.6 MB against 1.3 GB of rows. It
+    /// does not bound the set — the result is still complete across pages,
+    /// so the convergence invariant is untouched.
+    ///
+    /// # Why the cursor is a hash, not the usual `(timestamp, id)`
+    ///
+    /// Every other `*_since` surface here pages on
+    /// `Option<(DateTime<Utc>, String)>`. This one cannot: the index has no
+    /// time column, and giving it one would mean either widening the table
+    /// or reading the row it exists to avoid. Its PRIMARY KEY is
+    /// `(kind, content_hash)`, so `content_hash` IS the keyset — ordered,
+    /// unique within a kind, and covered by the index. Pass the last hash of
+    /// the previous page; pass `None` to start.
+    ///
+    /// **The hashes here must equal what this node ADVERTISES**, or a
+    /// consumer's `want` breaks. They do, by construction: the index hashes
+    /// the bare `Attestation` and `SignedKeyRecord`, never the `Served*`
+    /// wrappers, so node-local `admitted_at` stays out of the digest — the
+    /// same choice the serve path makes. Asserted, not assumed, by
+    /// `wire_index_hashes_are_what_the_serve_path_advertises_780`.
+    ///
+    /// `AccordQuorumEvidence` is absent from the index by construction (an
+    /// aggregate whose hash moves as votes land) and stays on its own cursor
+    /// plane.
+    ///
+    /// Backends override; the default refuses rather than returning an empty
+    /// set, because "no hashes" and "this backend cannot answer" must not be
+    /// the same reading for a caller computing a set difference.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (kind, after_content_hash, limit);
+        Err(Error::Unsupported {
+            method: "list_wire_hashes_since",
+        })
+    }
+
     /// v38.4.0 (CIRISPersist#768) — the ids of attestations whose producer
     /// stated an expiry that has now passed, oldest first, bounded.
     ///

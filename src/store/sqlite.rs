@@ -4762,6 +4762,35 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
     /// `attestation_subjects` follows via `ON DELETE CASCADE` (V106).
+    /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let kind = kind.to_owned();
+        let after = after_content_hash.unwrap_or("").to_owned();
+        let lim = i64::from(limit);
+        let conn = self.conn.clone();
+        let out = (move || -> Result<Vec<String>, rusqlite::Error> {
+            let guard = conn.lock();
+            // Covered by `PRIMARY KEY (kind, content_hash)`: SQLite serves
+            // this from index pages and never visits a row.
+            let mut stmt = guard.prepare(
+                "SELECT content_hash FROM signed_wire_index \
+                 WHERE kind = ?1 AND content_hash > ?2 \
+                 ORDER BY content_hash LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![kind, after, lim], |r| {
+                r.get::<_, String>(0)
+            })?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_wire_hashes_since: {e}")))?;
+        Ok(out)
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,

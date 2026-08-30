@@ -61,6 +61,18 @@ than working around it.
   running, and a peer could make a healthy node look like it was shedding
   load. Refused at the put door on all three backends AND at the promote
   door, fail-closed on an ambiguous owner.
+- **#780 — `list_wire_hashes_since(kind, after_content_hash, limit)`**: the
+  complete hash set for one wire kind, read from `signed_wire_index` without
+  touching a row page. Consumers were re-deriving it every round by reading
+  every ROW of a plane and hashing each one — 35–118 MB/s of continuous
+  reads on the canonical, every page fault taken while holding SQLite's
+  single connection mutex, until the node went unreachable after ~22 h with
+  `restarts=0` and no panic. Index-only: ~50k hashes ≈ 1.6 MB against
+  1.3 GB of rows, and still complete across pages, so the
+  `want = remote ∖ holdings` convergence invariant is untouched. The cursor
+  is the hash rather than the usual `(timestamp, id)` because this index has
+  no time column and adding one would mean reading the row it exists to
+  avoid.
 - **#777 — the `load.ceiling` mesh-config key** (CC 4.2.1), so an owner can
   relieve a node under contention rather than the node declaring for
   itself. Relieve-never-expand, so it composes under plural roots with
