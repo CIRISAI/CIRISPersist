@@ -6234,6 +6234,71 @@ mod tests {
         );
     }
 
+    /// v38.7.0 (CIRISVerify v14.0.0) — the two optional members are spelled
+    /// DIFFERENTLY in the produced envelope, and this is the witness for that
+    /// asymmetry, because getting it uniform in either direction breaks
+    /// something the suite would otherwise report as green.
+    ///
+    /// - `valid_until` absent ⇒ **omitted**. Verify's own producer omits it so
+    ///   that "a no-expiry record reproduces the pre-#267 bytes EXACTLY". Since
+    ///   essentially no record carries an expiry, materializing the null would
+    ///   move the preimage of nearly every envelope persist mints, away from
+    ///   the bytes `produce_scrubbed_key_record` promises persist will
+    ///   recanonicalize identically.
+    /// - `pubkey_ml_dsa_65_base64` absent ⇒ **materialized `null`**. Verify's
+    ///   producer types that member `&str`, so a classical-only record cannot
+    ///   be expressed there and no byte-identity is at stake; #657/#659 makes
+    ///   the null an assertion of ABSENCE so the envelope states the record's
+    ///   security tier rather than being silent about it.
+    ///
+    /// The pin in `test_anchor_envelope_member_set_is_pinned_v14` covers the
+    /// same ground for the genesis envelope, but lives behind the `test-anchor`
+    /// feature — on every leg that does not compile it, this is the only thing
+    /// standing between a tidying "just skip the nulls" and a preimage move
+    /// nobody sees until a downstream harness stops rooting.
+    #[test]
+    fn produced_envelope_omits_valid_until_but_materializes_the_pqc_null_v14() {
+        use crate::federation::admission::bind_subject_into_envelope;
+
+        let mut envelope = json!({ "purpose": "asymmetry witness" });
+        bind_subject_into_envelope(&mut envelope, "vu-k1", "node", "ED", None, None)
+            .expect("a JSON object takes the binding");
+        let obj = envelope.as_object().expect("still an object");
+
+        assert!(
+            !obj.contains_key("valid_until"),
+            "an absent expiry must be OMITTED, not materialized: verify's producer omits it so a \
+             no-expiry record keeps the pre-#267 bytes, and persist mints the same bytes or the \
+             scrub signature over them stops verifying"
+        );
+        assert!(
+            obj.get("pubkey_ml_dsa_65_base64")
+                .is_some_and(Value::is_null),
+            "an absent PQC leg must bind `null`: #657/#659 makes that an assertion of ABSENCE, so \
+             an attach attempt is refused against a stated tier rather than against silence"
+        );
+
+        // A PRESENT expiry still lands — otherwise the omission above would be
+        // indistinguishable from never writing the member at all, which is the
+        // way this witness could pass while binding nothing.
+        let mut with_expiry = json!({});
+        bind_subject_into_envelope(
+            &mut with_expiry,
+            "vu-k1",
+            "node",
+            "ED",
+            None,
+            Some("2027-01-01T00:00:00Z"),
+        )
+        .expect("a JSON object takes the binding");
+        assert_eq!(
+            with_expiry["valid_until"],
+            json!("2027-01-01T00:00:00Z"),
+            "a PRESENT expiry rides inside the signed envelope (CIRISVerify#267) — omitting it \
+             here would put the expiry outside the signed bytes, where anyone can strip it"
+        );
+    }
+
     /// v31.0.0 (CIRISPersist#659) — [`test_support::accord_conferred`] is the
     /// SECOND producer of co-scrubbed records, and it takes a record the caller
     /// built — so it is the one that can be handed a subject-blind envelope.

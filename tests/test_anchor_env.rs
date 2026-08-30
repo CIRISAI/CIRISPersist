@@ -289,6 +289,13 @@ async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
             roles: Vec::new(),
         },
         "2026-07-14T00:00:00Z",
+        // v38.7.0 (CIRISVerify v14.0.0) — `valid_until`, the new fourth
+        // argument. `None` keeps this record's envelope byte-identical to the
+        // pre-v14 one, which is what makes the round-trip below still a
+        // statement about the WIRE SHAPE rather than about an expiry this
+        // test never set. The bound-expiry path is covered where it belongs,
+        // in `verify_subject_binding_conformance`.
+        None,
         &[],
     )
     .await
@@ -330,5 +337,70 @@ async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
         chain.chain.last().unwrap().key_id,
         "test-accord-holder-0",
         "#451: the chain terminates at the SW test root"
+    );
+}
+
+/// v38.7.0 (CIRISVerify v14.0.0 adopt) — the test-anchor envelope's member set
+/// is PINNED, because two copies of these bytes live outside this repository.
+///
+/// `test_anchor_registration_envelope`'s own doc records the failure mode: the
+/// literal is written out three times (here, the #451 e2e, and CIRISServer's
+/// harness), 13.1.0 moved the preimage, and every copy that did not move
+/// became "a terminus that cannot root". v14.0.0 then added `valid_until` as
+/// the fifth subject-binding member and moved the preimage AGAIN — the call
+/// site here failed to compile, which is the only reason it was caught.
+///
+/// The #451 e2e cannot see this class. It builds the envelope and verifies the
+/// signature through the SAME function, so a preimage move shifts both sides
+/// together and the assertion still passes — the very "two copies agreeing
+/// with each other" shape that test's comment warns about, reintroduced one
+/// level up. What is actually exposed is the copy in another repo, and only a
+/// pin on the exact member set can speak for it.
+///
+/// So: `valid_until` must stay ABSENT — not `null`. Verify's builder omits an
+/// unset optional rather than materializing it, and CEG §0.9 admits an omitted
+/// member exactly when the expectation is null on both sides. A test anchor's
+/// lifetime is the runtime AND-gate, not a date. If a future verify
+/// materializes the key, or someone passes `Some(..)` here, these bytes move
+/// and CIRISServer's harness stops rooting — this test is the notice.
+#[test]
+fn test_anchor_envelope_member_set_is_pinned_v14() {
+    let envelope = test_anchor_registration_envelope(
+        "test-accord-holder-0",
+        "ZWQyNTUxOS1wdWJrZXktZm9yLXRoZS1waW4tdGVzdA==",
+        Some("bWwtZHNhLTY1LXB1YmtleS1mb3ItdGhlLXBpbi10ZXN0"),
+    );
+    let obj = envelope
+        .as_object()
+        .expect("the synthesized test-anchor envelope is a JSON object");
+
+    let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            "identity_type",
+            "key_id",
+            "pubkey_ed25519_base64",
+            "pubkey_ml_dsa_65_base64",
+            "test_anchor",
+        ],
+        "the test-anchor envelope's member set moved. These bytes are \
+         transcribed in CIRISServer's harness and the #451 e2e; a member added \
+         or removed here silently stops those copies from rooting. Move them \
+         in the same cut, then update this pin."
+    );
+
+    // Spelled as a separate assertion from the set above, because the set
+    // failing tells you SOMETHING moved and this tells you it was the v14
+    // member specifically — and because `null` vs absent is the distinction
+    // CEG §0.9 turns on, which a key-set comparison alone would not catch if
+    // the builder ever started materializing it.
+    assert!(
+        !obj.contains_key("valid_until"),
+        "a test anchor must not carry an expiry FIELD: its lifetime is bounded \
+         by verify's runtime AND-gate and anti-prod tripwire, and a \
+         `valid_until` in the signed bytes could only weaken that by \
+         suggesting the anchor is good until then"
     );
 }

@@ -8384,10 +8384,10 @@ pub fn subject_binding(
         // the accord co-scrub as their only cryptographic proof.
         //
         // Bound because `ciris_verify_core`'s `KeyRecord::check_subject_binding`
-        // binds it and the two implementations must not diverge. Persist keeps a
-        // separate spelling ONLY because its `KeyRecord` is a distinct type with
-        // a declaration-order contract against CIRISRegistry; the semantics are
-        // verify's, and this comment is the pairing.
+        // binds it. Persist no longer keeps a separate spelling for it — as of
+        // v38.7.0 this whole projection is built by verify's builder, so the
+        // pairing is the CALL above rather than a comment asking two copies to
+        // stay in step.
         .require("identity_type", identity_type)
         .require("pubkey_ed25519_base64", pubkey_ed25519_base64)
         .require_optional("pubkey_ml_dsa_65_base64", pubkey_ml_dsa_65_base64)
@@ -8434,6 +8434,42 @@ pub fn bind_subject_into_envelope(
         pubkey_ml_dsa_65_base64,
         valid_until,
     ) {
+        // v38.7.0 — `valid_until` alone is OMITTED when absent. The two
+        // optional members are spelled differently ON PURPOSE, and a blanket
+        // "skip nulls" here is wrong in one direction while a blanket
+        // "materialize nulls" is wrong in the other.
+        //
+        // This function PRODUCES signed bytes; [`subject_binding`] is a
+        // CHECKING projection. In the projection a `null` is an expectation
+        // ("absent-or-null", which verify's `check` honours). Inserted into an
+        // envelope it stops being an expectation and becomes CONTENT — content
+        // inside the JCS preimage, moving every signature computed over it.
+        //
+        // `valid_until` OMITS because verify's own producer omits it, in those
+        // words: "`None` OMITS the key entirely, so a no-expiry record
+        // reproduces the pre-#267 bytes EXACTLY and every existing record,
+        // signature and golden vector stays valid". Persist must agree with
+        // `build_registration_envelope` byte-for-byte —
+        // `produce_scrubbed_key_record` promises persist "recanonicalizes
+        // byte-identical bytes" — and since essentially no record carries an
+        // expiry, materializing the null would have moved the preimage of
+        // nearly every envelope persist mints. The reachable break: an
+        // external harness (CIRISServer's, and the #451 e2e) signs the shape
+        // verify's producer emits, and persist re-derives the bytes from its
+        // OWN construction; one materialized null and a signature nobody
+        // tampered with stops verifying.
+        //
+        // `pubkey_ml_dsa_65_base64` MATERIALIZES its null, and must keep doing
+        // so. That is not verify's call to make — verify's producer types it
+        // `&str`, so a classical-only record is INEXPRESSIBLE there and no
+        // byte-identity is at stake. It is #657/#659's: an absent PQC leg is
+        // an assertion of ABSENCE, so the envelope states the record's
+        // security tier rather than staying silent about it, and the refusal
+        // an attach attempt earns names the bound null instead of a missing
+        // member. Three tests pin that refusal by identity.
+        if field == "valid_until" && value.is_null() {
+            continue;
+        }
         obj.insert(field, value);
     }
     Ok(())

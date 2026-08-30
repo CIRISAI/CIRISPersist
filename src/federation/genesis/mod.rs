@@ -91,6 +91,21 @@ pub fn test_anchor_registration_envelope(
         crate::federation::types::identity_type::ACCORD_HOLDER,
         pubkey_ed25519_base64,
         pubkey_ml_dsa_65_base64,
+        // v38.7.0 (CIRISVerify v14.0.0) — the FIFTH member, and deliberately
+        // `None` here. A test anchor carries no expiry FIELD because its
+        // lifetime is not a date: it is bounded by the runtime AND-gate and
+        // the anti-prod tripwire in verify's `test_trust_root_override`, which
+        // a `valid_until` in the bytes could only weaken by suggesting the
+        // anchor is good until then. `None` also keeps these bytes IDENTICAL
+        // to the pre-v14 envelope, so the two transcribed copies this doc
+        // names (the #451 e2e and CIRISServer's harness) still root against it
+        // without re-transcription — but only because
+        // `bind_subject_into_envelope` OMITS an absent optional. Verify's
+        // `require_optional` MATERIALIZES `null`, which is right for a
+        // checking projection and wrong inside a preimage; the pin in
+        // `test_anchor_envelope_member_set_is_pinned_v14` is what holds that
+        // distinction still.
+        None,
     )
     .expect("the synthesized test-anchor envelope is a JSON object");
     envelope

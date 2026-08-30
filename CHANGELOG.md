@@ -116,6 +116,35 @@ than working around it.
   is the hash rather than the usual `(timestamp, id)` because this index has
   no time column and adding one would mean reading the row it exists to
   avoid.
+- **The v14 adopt moved a preimage, and now does not.** Persist adopted
+  verify's `SubjectBinding` builder for the subject projection (#750) and
+  then used that same projection to MINT, so every envelope persist produced
+  grew a `"valid_until": null`. The builder is a *checking* projection where
+  a `null` is the expectation "absent-or-null"; inside an envelope it stops
+  being an expectation and becomes content, in the JCS preimage. Verify's own
+  producer omits an absent `valid_until` precisely so "a no-expiry record
+  reproduces the pre-#267 bytes EXACTLY", and since essentially no record
+  carries an expiry, persist was moving the preimage of nearly every envelope
+  it mints.
+
+  Reachable as: an external harness signs the shape verify's producer emits,
+  persist re-derives the bytes from its own construction, and a signature
+  nobody tampered with stops verifying — the test anchor "cannot root", the
+  same failure that function's doc records from the 13.1.0 move.
+
+  `bind_subject_into_envelope` now omits an absent `valid_until` and keeps
+  materializing the `pubkey_ml_dsa_65_base64` null, which is NOT a
+  special-case: verify types that member `&str`, so a classical-only record
+  is inexpressible in its producer and no byte-identity is at stake, while
+  #657/#659 makes the null an assertion of ABSENCE so an attach attempt is
+  refused against a stated tier rather than against silence. Both directions
+  of "make the spelling uniform" are mutation-killed by a witness that names
+  which member moved.
+
+  Found by an `--all-features` compile error at a call site behind the
+  `test-anchor` feature — no round-trip test could see it, because the #451
+  e2e builds and verifies through the same function, so a preimage move
+  shifts both sides together and stays green.
 - **#782 — the session-claim plane.** A *self* is one federated identity plus
   the N nodes it stewards; an attestation addressed to a fed id fans out to
   every occurrence and **exactly one may act**. Keyed by
