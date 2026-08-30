@@ -86,6 +86,9 @@ pub mod location;
 /// folded CEG state from the owner root, then purge what is provably dead.
 pub mod migration;
 pub mod namespace;
+/// v38.7.0 (CIRISPersist#782) — the session-claim plane: which occurrence of a
+/// self handles a given `(community, session)`.
+pub mod session_claim;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /
 // partner_record). Row shapes, the four admission checks, and the two

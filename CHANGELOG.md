@@ -116,6 +116,29 @@ than working around it.
   is the hash rather than the usual `(timestamp, id)` because this index has
   no time column and adding one would mean reading the row it exists to
   avoid.
+- **#782 — the session-claim plane.** A *self* is one federated identity plus
+  the N nodes it stewards; an attestation addressed to a fed id fans out to
+  every occurrence and **exactly one may act**. Keyed by
+  `(community, session)` — "which node is my self?" has no answer, "which
+  node is handling session z in community B?" does — so four occurrences can
+  hold four concurrent sessions across two communities, all correct.
+
+  The invariant: **an unclaimed exchange is never acted on** — not by a
+  quorum, not by the lowest id, and not by a single-node self. Being the only
+  occurrence is not authority to act; it means there is one place where
+  nobody is home. Encoded as absence from the table rather than a weak
+  claim, because a weak-claim variant is a value a careless comparison can
+  promote into a right to act.
+
+  Ships the decided `session:*` registry row, `resolve_claim` (earliest
+  `claimed_at` wins, ties on the lowest occurrence key_id — convergent from
+  either arrival order, no coordination round-trip) and `handler_for`. The
+  row is DECIDED rather than left to the conservative default because
+  `Global` there would publish an attendance map of a person's devices, and
+  a defaulted cell is one tidying sweep from being widened — the
+  `moderation:*` lesson. CC has not ruled on `session:`, so the gap is
+  pinned in `RULES_NOT_ON_THE_ROW` and the ask filed as
+  CIRISConstitution#98.
 - **#777 — the `load.ceiling` mesh-config key** (CC 4.2.1), so an owner can
   relieve a node under contention rather than the node declaring for
   itself. Relieve-never-expand, so it composes under plural roots with
