@@ -116,6 +116,24 @@ threat-model citations because this crate's audit story is the point.
   Same `shipped means host-reachable` class as the directory double above.
   Green on three backends with a live database says nothing about whether a
   consumer on the far side of the ABI can call the method at all.
+- **The capsule routing is witnessed on the CONSUMER side, not just dispatch.**
+  `DirectoryOp` has two halves and only one is compiler-enforced: the dispatch
+  `match` must be exhaustive, so a missing arm fails to build — but
+  `OpsDirectory`'s proxy method has no backstop at all, because the trait
+  method has a default body. Omit one and it compiles clean and answers
+  `Unsupported` at runtime, in exactly the configuration a downstream consumer
+  runs.
+
+  The first witness here tested `run_op` — the dispatch side — and the routing
+  was reported verified when it was not. Deleting one proxy method separates
+  them: the consumer-side test FAILS and the dispatch round-trip PASSES. The
+  test that looked like it covered routing structurally could not.
+
+  The systemic version is filed as **#787**: nothing enumerates ops and asserts
+  each has a working proxy, and this class has now bitten twice — #780 shipped
+  unreachable across the ABI in v38.7.0, and this PR's own first witness missed
+  it the same way. Not bundled here, because a gate whose job is catching what
+  review misses should not ride the commit it would have caught.
 - **Timestamps stored at FIXED width, with the crate's `+00:00` spelling.**
   This column is compared as TEXT, so its rendering has to be
   order-preserving. Measured, because a review finding here turned on a

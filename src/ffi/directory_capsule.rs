@@ -5290,6 +5290,75 @@ mod tests {
         assert_eq!(via_proxy.expect("some").key_id, "primitive-ops");
     }
 
+    /// CIRISPersist#785 — the known-hash surface through the **consumer-side
+    /// proxy**, which is a different claim from the dispatch round-trip above.
+    ///
+    /// `run_op` proves the DISPATCH arm exists; the compiler already forced
+    /// that, since the match must be exhaustive. It proves nothing about
+    /// `OpsDirectory`'s proxy method, and that side has NO compiler backstop:
+    /// omit one and the trait default answers `Unsupported`, silently, in
+    /// exactly the configuration a downstream consumer runs. That is the same
+    /// silent-default class as the directory double, and it is how #780's
+    /// `list_wire_hashes_since` shipped unreachable in v38.7.0.
+    ///
+    /// So every one of the five routed methods is called HERE, through
+    /// `build_ops_directory`, and compared against the same call on the bare
+    /// backend.
+    #[test]
+    fn ops_directory_known_hash_methods_route_785() {
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        let hash = crate::federation::wire_index::content_hash_of_bytes(b"ops-proxy-785");
+        let now = chrono::DateTime::parse_from_rfc3339("2027-05-06T07:08:09Z")
+            .expect("literal is valid RFC-3339")
+            .with_timezone(&chrono::Utc);
+
+        rt.block_on(proxy.insert_known_wire_hash("Key", &hash, Some("peer-1"), now))
+            .expect("#785: insert_known_wire_hash must route through the PROXY");
+
+        assert!(
+            rt.block_on(proxy.known_wire_hash_contains("Key", &hash))
+                .expect("#785: known_wire_hash_contains must route through the PROXY"),
+            "#785: the proxy must see what it wrote"
+        );
+
+        let via_proxy = rt
+            .block_on(proxy.list_known_wire_hashes_since("Key", None, u32::MAX))
+            .expect("#785: list_known_wire_hashes_since must route through the PROXY");
+        let via_direct = rt
+            .block_on(dir.list_known_wire_hashes_since("Key", None, u32::MAX))
+            .expect("direct list");
+        assert_eq!(
+            via_proxy, via_direct,
+            "#785: the proxy's known-set page must equal a direct backend call"
+        );
+
+        // #780's read, whose whole defect was being unreachable from here.
+        let held = rt
+            .block_on(proxy.list_wire_hashes_since("Key", None, u32::MAX))
+            .expect("#785: list_wire_hashes_since must route through the PROXY");
+        assert!(
+            !held.contains(&hash),
+            "#785: a KNOWN-only hash reached the HELD read through the proxy"
+        );
+
+        let report = rt
+            .block_on(proxy.evict_known_wire_hashes(now - chrono::Duration::hours(1), 0))
+            .expect("#785: evict_known_wire_hashes must route through the PROXY");
+        assert_eq!(report.evicted, 0, "#785: nothing is older than the cutoff");
+        assert!(
+            report.over_bound_by >= 1,
+            "#785: the floor wins and the overage is reported, across the ABI too"
+        );
+    }
+
     #[test]
     fn ops_directory_resolve_encryption_keys_is_revocation_aware() {
         // #329 (CIRISServer#260 field hit) — the exact fleet-breaking
