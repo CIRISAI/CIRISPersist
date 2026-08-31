@@ -5,6 +5,80 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Added
+
+- **#785 — the KNOWN-but-not-held wire-hash set.** `signed_wire_index` (V111)
+  answers *what do I hold*; every entry carries a NOT NULL `record_key`
+  pointing at a row. The hash-first directory (CIRISEdge#552) needs a
+  different question answered — *what exists in the federation* — for records
+  whose bodies a node deliberately does not hold, and which therefore can
+  never appear in that index. V134 `known_wire_hashes` is that set, with
+  `insert_known_wire_hash` / `known_wire_hash_contains` /
+  `list_known_wire_hashes_since` / `evict_known_wire_hashes` on all three
+  backends.
+
+  **The two sets must never be unioned into the holdings read.**
+  `want = remote ∖ holdings`; a known-but-not-held hash reaching `holdings`
+  makes the node conclude it already has everything it has merely *heard of*,
+  so it stops fetching and its corpus freezes — CIRISEdge#416's
+  non-convergence with the sign flipped. Nothing errors, and
+  `lookup_signed_record_by_content_hash` cannot report it either: that
+  returns `Ok(None)` on an unresolvable entry BY DESIGN, as a self-healing
+  posture toward index drift. **"We would notice" is not available as a
+  mitigation**, which is why the separation is structural rather than
+  reviewed: a distinct table with no `record_key` column, distinct return
+  types (`Vec<String>` vs `Vec<KnownWireHash>`), and a witness on every
+  backend asserting the two sets are disjoint in both directions.
+
+  Worth recording that the union is *currently unrepresentable* and the
+  obvious design would have spent that: adding these as a flag on
+  `signed_wire_index` requires making `record_key` NULLABLE — retiring the
+  one constraint that makes the mistake impossible, in a migration that reads
+  like housekeeping.
+
+- **The ageing column moves; the cursor does not.** `last_advertised_at` is
+  bumped on every sighting, because edge's advertise axis is a watermark
+  sweep whose rolling re-sweep WRAPS and re-advertises every live hash once
+  per wrap. Built the obvious way — `INSERT OR IGNORE`, first-seen wins — it
+  would reproduce #776 exactly: that prune aged on `asserted_at`, a value the
+  writer freezes, so the cutoff never advanced, the prune never fired, and
+  both consumers independently refused to call it rather than reporting a
+  fault. For the same reason the column is unfit as a CURSOR — a row bumped
+  mid-iteration would jump the cursor and be skipped permanently (v31.1.0's
+  "a wall clock is not a cursor") — so paging is by content hash, as #780
+  does for a different reason.
+
+- **Eviction takes a caller-supplied CUTOFF, never a period.** Eviction is
+  safe only because the re-sweep wraps, so a forgotten hash comes back and
+  the cost is latency rather than correctness. But the safe floor is one wrap
+  period — `corpus ÷ page_budget × cadence` — and all three inputs live in
+  edge. Persist is handed the instant and compares timestamps; it never
+  learns what a wrap period is.
+
+  Deliberately NOT mesh config: mesh config's job is relief, and it SHRINKS
+  bounds. A relief lowering the page budget LENGTHENS the wrap period, which
+  must RAISE the floor — so a config-supplied floor and the config-supplied
+  budget determining it would have to move in opposite directions in
+  lockstep, forever. The first relief applied during an incident would
+  silently drop the floor below the wrap and the set would start forgetting
+  hashes the re-sweep has not returned to.
+
+  Where bound and floor conflict, **the floor wins and the overage is
+  reported** (`KnownHashEviction::over_bound_by`): an over-bound set is
+  visible and actionable, while evicting below the floor is invisible until
+  the sweep wraps back around.
+
+- **`advertised_by` is local-only by construction.** An observation ("this
+  peer advertised H to me"), never a claim ("this peer holds H"). Absent from
+  every replication policy kind and from the wire index; no type carrying it
+  reaches an envelope. Replicating it would build a who-holds-what index over
+  the entire corpus — strictly larger than the disclosure CIRISPersist#784
+  works to keep out of moderation records for a handful of subjects. Keeping
+  it local adds no disclosure, since it is derived from Summaries the peer
+  already sent.
+
 ## [38.7.0] - 2026-08-30
 
 The retention batch two consumers measured while adopting v38.4.0, plus the

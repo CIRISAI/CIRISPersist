@@ -5067,6 +5067,209 @@ pub mod test_support {
         Ok(())
     }
 
+    /// CIRISPersist#785 — **the known set and the holdings set are
+    /// never the same set**, on every backend.
+    ///
+    /// This is the witness for the one property the whole plane exists to
+    /// protect. `want = remote ∖ holdings`; if a known-but-not-held hash
+    /// reaches `holdings`, the node concludes it already has everything it has
+    /// merely HEARD OF, stops fetching, and its corpus freezes — with no error
+    /// on either side. `lookup_signed_record_by_content_hash` cannot report it
+    /// either: it returns `Ok(None)` on an unresolvable entry BY DESIGN, as a
+    /// self-healing posture toward index drift. So "we would notice" is not
+    /// available, and this assertion is what stands in its place.
+    ///
+    /// It asserts BOTH directions, because a one-directional check would pass
+    /// against an implementation that simply aliased the two tables.
+    pub async fn exercise_known_hashes_never_reach_holdings_785(
+        dir: &dyn crate::federation::FederationDirectory,
+        label: &str,
+    ) {
+        let t0 = chrono::Utc::now();
+        // A hash this node has HEARD OF and does not hold. `aaa…`-prefixed so
+        // it would sort FIRST in any accidental union — a cursor-paged union
+        // bug would surface on page one rather than hiding in the tail. The
+        // label is folded in because the postgres leg runs against a SHARED
+        // live database: a fixture that assumed an empty table would be
+        // asserting about other runs' rows, so every assertion below names
+        // THIS run's hash rather than counting the set.
+        let known_only = format!("aaa0{:0>60}", label);
+        dir.insert_known_wire_hash("Key", &known_only, Some("peer-1"), t0)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) insert_known_wire_hash: {e}"));
+
+        // Direction 1: the known hash must NOT appear in the holdings read.
+        let holdings = dir
+            .list_wire_hashes_since("Key", None, u32::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) list_wire_hashes_since: {e}"));
+        assert!(
+            !holdings.contains(&known_only),
+            "({label}) #785: a KNOWN-but-not-held hash reached the holdings read. \
+             `want = remote ∖ holdings` would now exclude it, so this node stops \
+             fetching a record it does not have — silently, and permanently until \
+             something else rebuilds the index"
+        );
+
+        // Direction 2: the known set must not have absorbed the holdings set
+        // either. Checked because an implementation that aliased both to one
+        // table would pass direction 1 whenever the holdings set was empty,
+        // which is exactly the state a fresh node is in.
+        let known = dir
+            .list_known_wire_hashes_since("Key", None, u32::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) list_known_wire_hashes_since: {e}"));
+        let mine = known
+            .iter()
+            .find(|r| r.content_hash == known_only)
+            .unwrap_or_else(|| panic!("({label}) the inserted hash is not in the known set"));
+        assert_eq!(
+            mine.advertised_by.as_deref(),
+            Some("peer-1"),
+            "({label}) the advertising peer is the local-only holder map"
+        );
+
+        // The two sets are DISJOINT over whatever each currently holds. Stated
+        // as an intersection rather than a count so it survives a shared
+        // database, and so it still bites when the holdings set is non-empty —
+        // an implementation that aliased both to one table would pass the
+        // single-hash check above whenever holdings happened to be empty,
+        // which is exactly the state a fresh node is in.
+        let overlap: Vec<&str> = known
+            .iter()
+            .map(|r| r.content_hash.as_str())
+            .filter(|h| holdings.iter().any(|held| held == h))
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "({label}) #785: {overlap:?} is in BOTH the known set and the holdings \
+             read. These must never be unioned: a hash the node has merely heard \
+             of, counted as held, removes itself from `want` and is never fetched"
+        );
+
+        // `contains` answers the KNOWN question only.
+        assert!(
+            dir.known_wire_hash_contains("Key", &known_only)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) known_wire_hash_contains: {e}")),
+            "({label}) the hash just inserted must be known"
+        );
+        assert!(
+            !dir.known_wire_hash_contains("Attestation", &known_only)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) known_wire_hash_contains: {e}")),
+            "({label}) the set is keyed by (kind, hash) — a hash known for one \
+             kind must not answer for another"
+        );
+    }
+
+    /// CIRISPersist#785 — `last_advertised_at` MOVES on
+    /// re-advertisement, and eviction is measured against the caller's cutoff.
+    ///
+    /// The first half is #776's lesson made executable. That prune aged on
+    /// `asserted_at` — a value the writer freezes — so the cutoff never
+    /// advanced, the prune never fired, and both consumers independently
+    /// refused to call it rather than reporting a fault. A known-hash set built
+    /// the obvious way (`INSERT OR IGNORE`, first-seen wins) has the identical
+    /// defect, and this is what fails when someone writes it that way.
+    ///
+    /// The second half pins the asymmetry between the floor and the bound: an
+    /// over-bound set is VISIBLE and reported; evicting below the floor is
+    /// invisible until edge's re-sweep wraps back around, which on a large
+    /// corpus is hours. So the floor wins and the overage is reported.
+    pub async fn exercise_known_hash_ageing_and_eviction_785(
+        dir: &dyn crate::federation::FederationDirectory,
+        label: &str,
+    ) {
+        let old = chrono::Utc::now() - chrono::Duration::hours(4);
+        let fresh = chrono::Utc::now();
+        // Per-run hashes: the postgres leg shares a live table with every other
+        // run, so each assertion below is about THIS run's two entries.
+        let stale_hash = format!("bbb0{label:0>60}");
+        let live_hash = format!("ccc0{label:0>60}");
+
+        // Advertised long ago, and never again.
+        dir.insert_known_wire_hash("Community", &stale_hash, Some("peer-1"), old)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) insert stale: {e}"));
+        // Advertised long ago, then RE-advertised by the wrapping re-sweep.
+        dir.insert_known_wire_hash("Community", &live_hash, Some("peer-1"), old)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) insert live: {e}"));
+        dir.insert_known_wire_hash("Community", &live_hash, Some("peer-2"), fresh)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) re-advertise live: {e}"));
+
+        let rows = dir
+            .list_known_wire_hashes_since("Community", None, u32::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) list: {e}"));
+        let live = rows
+            .iter()
+            .find(|r| r.content_hash == live_hash)
+            .unwrap_or_else(|| panic!("({label}) re-advertised hash vanished"));
+        assert!(
+            live.last_advertised_at > old,
+            "({label}) #785/#776: re-advertising did not move `last_advertised_at`. \
+             Built this way the eviction floor is measured against a value that \
+             cannot move, so the sweep either never fires or evicts live \
+             entries — the #776 shape exactly"
+        );
+        assert_eq!(
+            live.advertised_by.as_deref(),
+            Some("peer-2"),
+            "({label}) the most recent advertiser is the one recorded"
+        );
+
+        // Cutoff between the two: the stale entry goes, the live one stays.
+        // Persist compares timestamps and never derives this instant — edge
+        // owns the wrap period that produced it.
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let report = dir
+            .evict_known_wire_hashes(cutoff, u64::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) evict: {e}"));
+        assert!(
+            report.evicted >= 1,
+            "({label}) the entry not advertised since the cutoff must be evicted"
+        );
+        assert!(
+            dir.known_wire_hash_contains("Community", &live_hash)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
+            "({label}) a hash re-advertised AFTER the cutoff must survive — \
+             evicting it is the invisible failure, recoverable only when edge's \
+             re-sweep wraps back around"
+        );
+        assert!(
+            !dir.known_wire_hash_contains("Community", &stale_hash)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
+            "({label}) the stale hash must be gone"
+        );
+
+        // The floor WINS over the bound: with a bound of 0 and everything
+        // younger than the cutoff, nothing further is evicted and the overage
+        // is REPORTED rather than silently resolved.
+        let report = dir
+            .evict_known_wire_hashes(cutoff, 0)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) evict under bound: {e}"));
+        assert!(
+            report.over_bound_by >= 1,
+            "({label}) #785: the set is over its bound and every entry is younger \
+             than the floor — that must be REPORTED via over_bound_by, because an \
+             over-bound set is visible and actionable while evicting below the \
+             floor is not"
+        );
+        assert!(
+            dir.known_wire_hash_contains("Community", &live_hash)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
+            "({label}) a bound of 0 must NOT evict below the caller's floor"
+        );
+    }
+
     /// v24.1.0 (CIRISPersist#547) — **whatever this node ADVERTISES, it can
     /// SERVE.**
     ///

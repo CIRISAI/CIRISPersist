@@ -406,13 +406,13 @@ pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
     EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
-    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
-    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
-    ServedCommunityMembershipRevocation, ServedFamily, ServedFamilyMembershipRevocation,
-    ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation, ServedKeyRecord,
-    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
-    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
-    SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
+    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord,
+    KnownHashEviction, KnownWireHash, LocationProof, PeerMetadataRow, PeerPolicyBlob, Revocation,
+    ServedAttestation, ServedCommunity, ServedCommunityMembershipRevocation, ServedFamily,
+    ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation,
+    ServedKeyRecord, ServedLocationProof, ServedOrgMembership, ServedOrganization,
+    ServedPartnerRecord, ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination,
+    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
     SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
     SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
@@ -1305,6 +1305,139 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (kind, after_content_hash, limit);
         Err(Error::Unsupported {
             method: "list_wire_hashes_since",
+        })
+    }
+
+    // ─── CIRISPersist#785 — the KNOWN-but-not-held hash set ───
+    //
+    // The method above answers "WHAT DO I HOLD". The four below answer
+    // "WHAT EXISTS IN THE FEDERATION", for records this node deliberately
+    // does not hold. They are neighbours here so the distinction is
+    // legible at the one place someone would reach for the wrong one.
+    //
+    // THEY MUST NEVER BE UNIONED. A known-but-not-held hash reaching
+    // `holdings` makes the node conclude it already has everything it has
+    // merely HEARD OF; it stops fetching, nothing errors, and the corpus
+    // freezes. `lookup_signed_record_by_content_hash` will not catch it —
+    // that returns `Ok(None)` on an unresolvable entry by design. The
+    // return types differ (`Vec<String>` vs `Vec<KnownWireHash>`) so the
+    // union takes an explicit projection rather than a swapped variable.
+
+    /// CIRISPersist#785 — record that a hash EXISTS, without
+    /// holding its body. Idempotent: a repeat advertisement bumps
+    /// `last_advertised_at` (and `advertised_by`) rather than duplicating,
+    /// because the same hash arrives every time edge's re-sweep wraps.
+    ///
+    /// `advertised_by` is stored LOCAL-ONLY and is an observation, never a
+    /// claim — see [`KnownWireHash::advertised_by`].
+    ///
+    /// Backends override; the default refuses rather than silently
+    /// succeeding, because a no-op here is indistinguishable from a
+    /// converged set and would make the whole plane a check that cannot
+    /// fail.
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (kind, content_hash, advertised_by, now);
+        Err(Error::Unsupported {
+            method: "insert_known_wire_hash",
+        })
+    }
+
+    /// CIRISPersist#785 — is this hash known to exist?
+    ///
+    /// Answers ONLY the known set. It is not "do I hold this" and must
+    /// never be substituted for that question: every hash this node holds
+    /// is also one it knows exists, so a caller that swapped them would
+    /// get `true` in exactly the cases that hide the bug.
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, Error> {
+        let _ = (kind, content_hash);
+        Err(Error::Unsupported {
+            method: "known_wire_hash_contains",
+        })
+    }
+
+    /// CIRISPersist#785 — page the known set for one kind,
+    /// cursored on the CONTENT HASH.
+    ///
+    /// # Why the cursor is the hash and not `last_advertised_at`
+    ///
+    /// Because that column's job is to MOVE. Edge re-advertises every live
+    /// hash once per wrap, so a timestamp cursor would let a row bumped
+    /// mid-iteration jump the cursor and be skipped — permanently, since
+    /// the next page starts after it. That is v31.1.0's lesson exactly: a
+    /// wall clock is not a cursor, and five `Utc::now()` replication
+    /// positions could skip a row for good.
+    ///
+    /// So the two facts are in tension by construction and both are
+    /// honoured: `last_advertised_at` is the ageing column PRECISELY
+    /// because it moves, and the hash is the cursor precisely because it
+    /// does not. Same choice #780 made, for a different reason (that index
+    /// has no time column at all).
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<KnownWireHash>, Error> {
+        let _ = (kind, after_content_hash, limit);
+        Err(Error::Unsupported {
+            method: "list_known_wire_hashes_since",
+        })
+    }
+
+    /// CIRISPersist#785 — evict known hashes not advertised since
+    /// `cutoff`, keeping the set under `bound`.
+    ///
+    /// # The cutoff is SUPPLIED, never derived here
+    ///
+    /// Eviction is safe only because edge's advertise axis is a watermark
+    /// sweep whose rolling re-sweep WRAPS: a forgotten hash comes back
+    /// around, so eviction costs latency rather than correctness. But the
+    /// safe floor is one wrap period — `corpus ÷ page_budget × cadence` —
+    /// and all three inputs live in edge. Persist is handed the resulting
+    /// instant and compares timestamps; it never learns what a wrap period
+    /// is.
+    ///
+    /// This is deliberately NOT mesh config. Mesh config's job is relief:
+    /// it SHRINKS bounds. A relief that lowers the page budget LENGTHENS
+    /// the wrap period, which must RAISE this floor — so a config-supplied
+    /// floor and the config-supplied page budget determining it would have
+    /// to move in opposite directions, in lockstep, forever. The first
+    /// relief applied during an incident would silently drop the floor
+    /// below the wrap and the set would start forgetting hashes the
+    /// re-sweep has not yet returned to: the same invisible freeze this
+    /// plane exists to avoid, arrived at from the other end.
+    ///
+    /// It also keeps #776's lesson intact for the right reason. That
+    /// failure was not a badly chosen column; it was a value that COULD
+    /// NOT MOVE being used as though it could. A cutoff supplied by the
+    /// party that watches the mechanism can always move. A period cached
+    /// on this side of the boundary is a frozen copy waiting to happen.
+    ///
+    /// # The floor wins over the bound
+    ///
+    /// If the set is over `bound` but everything is younger than `cutoff`,
+    /// the overage is REPORTED
+    /// ([`KnownHashEviction::over_bound_by`]) and nothing further is
+    /// evicted. Exceeding a bound is visible and actionable; evicting
+    /// below the floor is invisible.
+    async fn evict_known_wire_hashes(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<KnownHashEviction, Error> {
+        let _ = (cutoff, bound);
+        Err(Error::Unsupported {
+            method: "evict_known_wire_hashes",
         })
     }
 
