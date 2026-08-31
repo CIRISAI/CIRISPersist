@@ -4812,6 +4812,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         advertised_by: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
         let kind = kind.to_owned();
         let hash = content_hash.to_owned();
         let by = advertised_by.map(str::to_owned);
@@ -4824,13 +4828,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // that movement is what makes the eviction floor meaningful, and
             // a plain INSERT OR IGNORE would freeze it at first-seen and
             // reproduce #776 precisely.
+            //
+            // The bump is MONOTONIC (`WHERE excluded... > stored...`) because
+            // execution order is not observation order: a caller that stamps
+            // `now` and then hands the write to a delayed task can apply an
+            // OLDER sighting after a newer one, moving the column BACKWARDS.
+            // The next sweep would then evict a hash that was in fact
+            // recently advertised — and that loss is invisible until edge's
+            // re-sweep wraps back around to it, which is the whole failure
+            // this column exists to prevent.
             guard.execute(
                 "INSERT INTO known_wire_hashes \
                      (kind, content_hash, last_advertised_at, advertised_by) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(kind, content_hash) DO UPDATE SET \
                      last_advertised_at = excluded.last_advertised_at, \
-                     advertised_by = excluded.advertised_by",
+                     advertised_by = excluded.advertised_by \
+                 WHERE excluded.last_advertised_at > known_wire_hashes.last_advertised_at",
                 rusqlite::params![kind, hash, now_s, by],
             )?;
             Ok(())
@@ -21180,6 +21194,17 @@ mod accord_tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, sqlite.
+    #[tokio::test]
+    async fn known_hash_monotonic_and_canonical_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend, "sq785",
+        )
+        .await;
     }
 
     /// CIRISPersist#785 — the known set never reaches the holdings

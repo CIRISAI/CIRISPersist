@@ -4068,15 +4068,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         advertised_by: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
         let mut state = self.state.lock().expect("memory backend lock");
-        // Overwrite, matching the SQL backends' upsert: the same hash arrives
-        // on every wrap of edge's re-sweep, and `last_advertised_at` must
-        // MOVE on each sighting or the eviction floor is measured against a
-        // frozen value (#776).
-        state.known_wire_hashes.insert(
-            (kind.to_owned(), content_hash.to_owned()),
-            (now, advertised_by.map(str::to_owned)),
-        );
+        // Matches the SQL backends' upsert: the same hash arrives on every
+        // wrap of edge's re-sweep, and `last_advertised_at` must MOVE on each
+        // sighting or the eviction floor is measured against a frozen value
+        // (#776) — but it must move FORWARDS ONLY. Execution order is not
+        // observation order, so a delayed write carrying an older sighting
+        // would otherwise drag the column backwards and let the next sweep
+        // evict a hash that was recently advertised.
+        let entry = state
+            .known_wire_hashes
+            .entry((kind.to_owned(), content_hash.to_owned()))
+            .or_insert((now, advertised_by.map(str::to_owned)));
+        if now > entry.0 {
+            *entry = (now, advertised_by.map(str::to_owned));
+        }
         Ok(())
     }
 
@@ -15290,6 +15300,16 @@ mod tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, memory.
+    #[tokio::test]
+    async fn known_hash_monotonic_and_canonical_memory_785() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend, "mem785",
+        )
+        .await;
     }
 
     /// CIRISPersist#785 — the known set never reaches the holdings

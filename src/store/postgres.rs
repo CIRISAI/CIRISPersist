@@ -5744,6 +5744,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         advertised_by: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
         let client = self.pool().get().await.map_err(|e| {
             crate::federation::Error::Backend(format!("insert_known_wire_hash pool: {e}"))
         })?;
@@ -5751,6 +5755,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // re-sweep. `last_advertised_at` is bumped on each sighting — that
         // movement is what makes the eviction floor meaningful, and a plain
         // DO NOTHING would freeze it at first-seen and reproduce #776.
+        //
+        // The bump is MONOTONIC because execution order is not observation
+        // order: a caller that stamps `now` and hands the write to a delayed
+        // task can apply an OLDER sighting after a newer one and move the
+        // column BACKWARDS, so the next sweep evicts a hash that was in fact
+        // recently advertised — invisibly, until the re-sweep wraps.
         client
             .execute(
                 "INSERT INTO cirislens.known_wire_hashes \
@@ -5758,7 +5768,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (kind, content_hash) DO UPDATE SET \
                      last_advertised_at = EXCLUDED.last_advertised_at, \
-                     advertised_by = EXCLUDED.advertised_by",
+                     advertised_by = EXCLUDED.advertised_by \
+                 WHERE EXCLUDED.last_advertised_at \
+                       > cirislens.known_wire_hashes.last_advertised_at",
                 &[&kind, &content_hash, &now, &advertised_by],
             )
             .await
@@ -22558,6 +22570,23 @@ mod tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, POSTGRES.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn known_hash_monotonic_and_canonical_postgres_785() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend,
+            &format!("pg785c{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
     }
 
     /// CIRISPersist#785 — the known set never reaches the holdings

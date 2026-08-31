@@ -70,6 +70,35 @@ threat-model citations because this crate's audit story is the point.
   visible and actionable, while evicting below the floor is invisible until
   the sweep wraps back around.
 
+- **Four review findings from Codex on PR #786, all real, all taken.**
+  - *The ageing bump is now MONOTONIC.* Execution order is not observation
+    order: a caller that stamps `now` and hands the write to a delayed task
+    could apply an older sighting after a newer one, dragging
+    `last_advertised_at` backwards so the next sweep evicted a hash that had
+    just been advertised — invisibly, until the re-sweep wrapped.
+  - *The ageing index now LEADS on `last_advertised_at`.* It was
+    kind-leading, but eviction takes no kind and filters on the timestamp
+    alone, so the index could not serve its own range delete and every sweep
+    scanned the whole table — on a set that is larger than the held set by
+    design, which is the O(everything) shape #775 took off the health-poll
+    path. Paging is served by the primary key and never needed it.
+  - *Non-canonical hashes are REFUSED at the door.* An empty hash stored
+    fine and answered `contains`, but every first page asks
+    `content_hash > ''`, so it could never be enumerated — a row whose
+    existence depended on which door you asked. Case variants split one
+    digest into two entries with separate ageing clocks. Refused rather than
+    normalised, since normalising would fix only the second and would
+    silently accept a caller disagreeing with the wire vocabulary.
+  - *The disjointness claim was WRONG and is now stated correctly.* The
+    guarantee is one-directional: a known-only hash never reaches the
+    holdings read. The reverse cannot be maintained cheaply — the re-sweep
+    re-advertises what we hold, so removing an entry when its body arrives
+    would not achieve disjointness either; the next wrap puts it back. Real
+    disjointness would mean consulting holdings on every advertisement,
+    coupling the two sets on the write path to prevent a harmless overlap.
+    Harmless because `want` reads holdings, not this set. The witness had
+    passed only because it never persisted a body matching the hash it
+    inserted; it now exercises that transition directly.
 - **`advertised_by` is local-only by construction.** An observation ("this
   peer advertised H to me"), never a claim ("this peer holds H"). Absent from
   every replication policy kind and from the wire index; no type carrying it

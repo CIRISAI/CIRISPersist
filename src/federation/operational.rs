@@ -5079,21 +5079,28 @@ pub mod test_support {
     /// self-healing posture toward index drift. So "we would notice" is not
     /// available, and this assertion is what stands in its place.
     ///
-    /// It asserts BOTH directions, because a one-directional check would pass
-    /// against an implementation that simply aliased the two tables.
+    /// The guarantee is deliberately ONE-DIRECTIONAL: a known-only hash never
+    /// reaches the holdings read. The reverse — a held hash never appearing in
+    /// the known set — is NOT promised, because the re-sweep re-advertises
+    /// what we hold and maintaining it would mean consulting holdings on every
+    /// advertisement. An earlier draft asserted disjointness and passed only
+    /// because it never persisted a body matching the hash it inserted; the
+    /// overlap case is now exercised directly.
     pub async fn exercise_known_hashes_never_reach_holdings_785(
         dir: &dyn crate::federation::FederationDirectory,
         label: &str,
     ) {
         let t0 = chrono::Utc::now();
-        // A hash this node has HEARD OF and does not hold. `aaa…`-prefixed so
-        // it would sort FIRST in any accidental union — a cursor-paged union
-        // bug would surface on page one rather than hiding in the tail. The
-        // label is folded in because the postgres leg runs against a SHARED
-        // live database: a fixture that assumed an empty table would be
-        // asserting about other runs' rows, so every assertion below names
-        // THIS run's hash rather than counting the set.
-        let known_only = format!("aaa0{:0>60}", label);
+        // A hash this node has HEARD OF and does not hold. A REAL sha256 —
+        // the insert door refuses anything that is not canonical lowercase
+        // 64-hex, and it refused this fixture's earlier hand-built form,
+        // which is the gate doing its job on its own witness. Derived from
+        // the label because the postgres leg runs against a SHARED live
+        // database: every assertion below names THIS run's hash rather than
+        // counting the set.
+        let known_only = crate::federation::wire_index::content_hash_of_bytes(
+            format!("known{label}").as_bytes(),
+        );
         dir.insert_known_wire_hash("Key", &known_only, Some("peer-1"), t0)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert_known_wire_hash: {e}"));
@@ -5129,23 +5136,66 @@ pub mod test_support {
             "({label}) the advertising peer is the local-only holder map"
         );
 
-        // The two sets are DISJOINT over whatever each currently holds. Stated
-        // as an intersection rather than a count so it survives a shared
-        // database, and so it still bites when the holdings set is non-empty —
-        // an implementation that aliased both to one table would pass the
-        // single-hash check above whenever holdings happened to be empty,
-        // which is exactly the state a fresh node is in.
-        let overlap: Vec<&str> = known
-            .iter()
-            .map(|r| r.content_hash.as_str())
-            .filter(|h| holdings.iter().any(|held| held == h))
-            .collect();
-        assert!(
-            overlap.is_empty(),
-            "({label}) #785: {overlap:?} is in BOTH the known set and the holdings \
-             read. These must never be unioned: a hash the node has merely heard \
-             of, counted as held, removes itself from `want` and is never fetched"
-        );
+        // The guarantee is ONE-DIRECTIONAL, and the earlier draft of this
+        // witness over-claimed it as disjointness (caught in review on
+        // PR #786). What is guaranteed and enforced: a KNOWN-only hash never
+        // appears in the holdings read — asserted above, and the only
+        // direction that can break convergence.
+        //
+        // The reverse is NOT guaranteed, and could not be maintained cheaply
+        // if it were promised. A peer keeps advertising hashes we already
+        // hold — that is what a wrapping re-sweep DOES — so `insert_known_
+        // wire_hash` re-records them on every wrap. Removing a known entry
+        // when its body arrives would not achieve disjointness either; the
+        // next wrap puts it straight back. Genuine disjointness would require
+        // consulting the holdings index on every advertisement, coupling the
+        // two sets on the WRITE path — the exact coupling this design exists
+        // to avoid, bought to prevent a harmless overlap.
+        //
+        // Harmless because `want = remote ∖ holdings` reads holdings, not
+        // this set: a hash present in BOTH is one we hold, holdings says so,
+        // and `want` correctly excludes it. The set's own question is "what
+        // exists in the federation", and something we hold does still exist.
+        //
+        // So the assertion below is the real invariant, exercised through the
+        // transition that actually produces overlap.
+        let holdings_before = holdings.len();
+
+        // Take a hash this node genuinely HOLDS — if the backend has one —
+        // and record it as advertised, which is exactly what the next wrap
+        // does. This is the case the earlier witness never reached: it only
+        // ever inserted a hash nothing held, so its intersection was empty by
+        // construction rather than by enforcement.
+        if let Some(held) = holdings.first().cloned() {
+            dir.insert_known_wire_hash("Key", &held, Some("peer-1"), t0)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) insert held-and-known: {e}"));
+
+            let holdings_after = dir
+                .list_wire_hashes_since("Key", None, u32::MAX)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) list_wire_hashes_since: {e}"));
+            assert_eq!(
+                holdings_after.len(),
+                holdings_before,
+                "({label}) #785: recording an advertisement CHANGED the holdings \
+                 read. The known set must be invisible to that read whatever it \
+                 contains — writing through one door and having the other door's \
+                 answer move is the union this plane exists to prevent"
+            );
+            assert!(
+                holdings_after.contains(&held),
+                "({label}) #785: the held hash vanished from holdings"
+            );
+            assert!(
+                dir.known_wire_hash_contains("Key", &held)
+                    .await
+                    .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
+                "({label}) #785: a hash that is BOTH held and advertised belongs \
+                 in the known set — it exists in the federation, which is the \
+                 question this set answers"
+            );
+        }
 
         // `contains` answers the KNOWN question only.
         assert!(
@@ -5161,6 +5211,93 @@ pub mod test_support {
             "({label}) the set is keyed by (kind, hash) — a hash known for one \
              kind must not answer for another"
         );
+    }
+
+    /// CIRISPersist#785 — the ageing column moves FORWARDS ONLY, and the
+    /// insert door refuses a non-canonical hash.
+    ///
+    /// Both found in review on PR #786, and both are the same shape: a write
+    /// that succeeds while quietly making the set mean something other than
+    /// what it says.
+    ///
+    /// **Monotonic.** Execution order is not observation order. A caller that
+    /// stamps `now` and hands the write to a delayed task can apply an OLDER
+    /// sighting after a newer one; an unconditional upsert drags
+    /// `last_advertised_at` backwards, and the next sweep evicts a hash that
+    /// was in fact recently advertised — invisibly, until edge's re-sweep
+    /// wraps back around to it.
+    ///
+    /// **Canonical.** An empty hash stores fine and answers `contains`, but
+    /// every first page asks `content_hash > ''`, so it can never be
+    /// enumerated: a row whose existence depends on which door you ask. And a
+    /// case variant becomes a SECOND entry for one digest with its own ageing
+    /// clock, so re-advertisement bumps one while the other quietly ages out.
+    pub async fn exercise_known_hash_monotonic_and_canonical_785(
+        dir: &dyn crate::federation::FederationDirectory,
+        label: &str,
+    ) {
+        let hash =
+            crate::federation::wire_index::content_hash_of_bytes(format!("mono{label}").as_bytes());
+        let newer = chrono::Utc::now();
+        let older = newer - chrono::Duration::hours(3);
+
+        dir.insert_known_wire_hash("Family", &hash, Some("peer-new"), newer)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) insert newer: {e}"));
+        // The delayed write, carrying the OLDER observation.
+        dir.insert_known_wire_hash("Family", &hash, Some("peer-old"), older)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) insert older: {e}"));
+
+        let row = dir
+            .list_known_wire_hashes_since("Family", None, u32::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) list: {e}"))
+            .into_iter()
+            .find(|r| r.content_hash == hash)
+            .unwrap_or_else(|| panic!("({label}) entry vanished"));
+        // Asserted as "did not go backwards", NOT as byte-equality with
+        // `newer`. Postgres TIMESTAMPTZ is MICROSECOND precision while chrono
+        // carries nanoseconds, so the value round-trips truncated
+        // (…611926112Z stored as …611926Z) — an equality assertion passes on
+        // memory and sqlite and fails on postgres for a reason that has
+        // nothing to do with the property under test. The property is the
+        // ORDERING, and it survives truncation.
+        assert!(
+            row.last_advertised_at > older,
+            "({label}) #785: a LATE-ARRIVING OLDER sighting moved \
+             `last_advertised_at` backwards. The next sweep would then evict a \
+             hash that was recently advertised, and the loss is invisible until \
+             the re-sweep wraps"
+        );
+        assert!(
+            (newer - row.last_advertised_at) < chrono::Duration::milliseconds(1),
+            "({label}) #785: the stored instant is not the newer sighting \
+             (stored {stored}, newer {newer}) — anything beyond storage \
+             truncation means the monotonic guard kept the wrong value",
+            stored = row.last_advertised_at
+        );
+        assert_eq!(
+            row.advertised_by.as_deref(),
+            Some("peer-new"),
+            "({label}) the advertiser must follow the same monotonic rule as the \
+             timestamp it is recorded with, or the holder map names a peer from \
+             an older sighting than the one the clock reports"
+        );
+
+        // Non-canonical hashes are REFUSED at the door, not normalised.
+        for bad in ["", "ABC", &hash.to_uppercase(), &hash[..63]] {
+            let refused = dir
+                .insert_known_wire_hash("Family", bad, None, newer)
+                .await
+                .is_err();
+            assert!(
+                refused,
+                "({label}) #785: {bad:?} was accepted as a content hash. An empty \
+                 value stores but can never be paged, and a case variant splits \
+                 one digest into two entries with separate ageing clocks"
+            );
+        }
     }
 
     /// CIRISPersist#785 — `last_advertised_at` MOVES on
@@ -5183,10 +5320,14 @@ pub mod test_support {
     ) {
         let old = chrono::Utc::now() - chrono::Duration::hours(4);
         let fresh = chrono::Utc::now();
-        // Per-run hashes: the postgres leg shares a live table with every other
-        // run, so each assertion below is about THIS run's two entries.
-        let stale_hash = format!("bbb0{label:0>60}");
-        let live_hash = format!("ccc0{label:0>60}");
+        // Per-run canonical hashes: the postgres leg shares a live table with
+        // every other run, so each assertion below is about THIS run's two
+        // entries, and the insert door requires real 64-hex.
+        let stale_hash = crate::federation::wire_index::content_hash_of_bytes(
+            format!("stale{label}").as_bytes(),
+        );
+        let live_hash =
+            crate::federation::wire_index::content_hash_of_bytes(format!("live{label}").as_bytes());
 
         // Advertised long ago, and never again.
         dir.insert_known_wire_hash("Community", &stale_hash, Some("peer-1"), old)

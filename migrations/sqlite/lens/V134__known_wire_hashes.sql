@@ -93,7 +93,14 @@ CREATE TABLE IF NOT EXISTS known_wire_hashes (
     PRIMARY KEY (kind, content_hash)
 );
 
--- The eviction sweep orders on the column that moves. Kind-leading so a
--- per-kind bound can be enforced without scanning the whole set.
+-- `last_advertised_at` LEADS, because that is what the eviction predicate
+-- filters on and eviction takes no kind: `DELETE ... WHERE
+-- last_advertised_at < $1`. A kind-leading index cannot serve that range
+-- delete at all, so every sweep would scan the whole table — and this set
+-- is larger than the held set BY DESIGN, which is the same O(everything)
+-- shape #775 had to take off the health-poll path.
+--
+-- Paging does not need this index: `list_known_wire_hashes_since` orders by
+-- `(kind, content_hash)` and is served by the PRIMARY KEY.
 CREATE INDEX IF NOT EXISTS known_wire_hashes_age
-    ON known_wire_hashes (kind, last_advertised_at);
+    ON known_wire_hashes (last_advertised_at);
