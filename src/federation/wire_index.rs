@@ -845,7 +845,14 @@ pub fn validate_content_hash(context: &str, content_hash: &str) -> Result<(), Er
     {
         return Ok(());
     }
-    Err(Error::Backend(format!(
+    // `InvalidArgument`, NOT `Backend`. No storage operation has happened and
+    // the refusal is entirely about the CALLER'S INPUT, so the two must not
+    // share a `kind()`: consumers split retryable substrate failures
+    // (`federation_backend`) from input refusals
+    // (`federation_invalid_argument`), and misfiling this one sends a
+    // permanently invalid advertisement down backend-RETRY handling — retried
+    // forever, since no number of attempts makes an empty hash canonical.
+    Err(Error::InvalidArgument(format!(
         "{context}: {content_hash:?} is not a canonical content hash (lowercase \
          64-hex sha256). Uppercase and short values are refused rather than \
          normalised: an empty hash stores but can never be paged \

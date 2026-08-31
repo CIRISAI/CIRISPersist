@@ -5213,6 +5213,82 @@ pub mod test_support {
         );
     }
 
+    /// CIRISPersist#785 — the known-hash surface is REACHABLE THROUGH THE
+    /// PUBLIC DOUBLE, un-faulted, and still faultable on demand.
+    ///
+    /// `FaultInjectingDirectory` is `pub` because CIRISServer/Edge/Agent
+    /// fixtures use it, and its contract is that *"every un-faulted call keeps
+    /// real behaviour"*. That held only for the trait's REQUIRED methods: the
+    /// generator emitted delegations for `;`-terminated signatures alone, so a
+    /// method added with a DEFAULT BODY silently inherited the default and
+    /// answered `Unsupported` even when nothing was faulted. The compiler
+    /// cannot catch that — a default always compiles — so the double diverged
+    /// from a bare backend with nothing failing.
+    ///
+    /// #785 is FOR edge, and edge wraps backends in this double, so a surface
+    /// that is unreachable through it is not shipped
+    /// (`shipped means host-reachable`). Found by review on PR #786.
+    pub async fn exercise_known_hashes_reachable_through_the_double_785(
+        inner: std::sync::Arc<dyn crate::federation::FederationDirectory>,
+        label: &str,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        // The trait itself, so the delegations are callable on the concrete
+        // double — which is also how a downstream fixture reaches them.
+        use crate::federation::FederationDirectory as _;
+
+        let hash = crate::federation::wire_index::content_hash_of_bytes(
+            format!("double{label}").as_bytes(),
+        );
+        let now = chrono::Utc::now();
+
+        // UN-faulted: every call must reach the inner backend.
+        let dbl = FaultInjectingDirectory::new(std::sync::Arc::clone(&inner));
+        dbl.insert_known_wire_hash("Community", &hash, Some("peer-1"), now)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({label}) #785: insert_known_wire_hash through an UN-FAULTED \
+                     double failed with {e}. The double must be transparent when \
+                     nothing is declared — a defaulted trait method that is not \
+                     delegated answers `Unsupported` here while a bare backend \
+                     answers correctly"
+                )
+            });
+        assert!(
+            dbl.known_wire_hash_contains("Community", &hash)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) contains through double: {e}")),
+            "({label}) #785: the hash inserted through the double is not visible \
+             through it"
+        );
+        let rows = dbl
+            .list_known_wire_hashes_since("Community", None, u32::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) list through double: {e}"));
+        assert!(
+            rows.iter().any(|r| r.content_hash == hash),
+            "({label}) #785: paging through the double does not return what was \
+             written through it"
+        );
+        dbl.evict_known_wire_hashes(now - chrono::Duration::hours(1), u64::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) evict through double: {e}"));
+
+        // …and the fault still fires when it IS declared, so the delegation did
+        // not simply bypass the wrapper.
+        let faulted = FaultInjectingDirectory::new(inner).unsupported("insert_known_wire_hash");
+        assert!(
+            faulted
+                .insert_known_wire_hash("Community", &hash, None, now)
+                .await
+                .is_err(),
+            "({label}) #785: a DECLARED fault on a delegated method must still \
+             fire — a delegation that forgot the fault check would make the \
+             double untestable in the other direction"
+        );
+    }
+
     /// CIRISPersist#785 — the ageing column moves FORWARDS ONLY, and the
     /// insert door refuses a non-canonical hash.
     ///
@@ -5287,15 +5363,24 @@ pub mod test_support {
 
         // Non-canonical hashes are REFUSED at the door, not normalised.
         for bad in ["", "ABC", &hash.to_uppercase(), &hash[..63]] {
-            let refused = dir
-                .insert_known_wire_hash("Family", bad, None, newer)
-                .await
-                .is_err();
-            assert!(
-                refused,
-                "({label}) #785: {bad:?} was accepted as a content hash. An empty \
-                 value stores but can never be paged, and a case variant splits \
-                 one digest into two entries with separate ageing clocks"
+            let Err(why) = dir.insert_known_wire_hash("Family", bad, None, newer).await else {
+                panic!(
+                    "({label}) #785: {bad:?} was accepted as a content hash. An \
+                     empty value stores but can never be paged, and a case \
+                     variant splits one digest into two entries with separate \
+                     ageing clocks"
+                );
+            };
+            // The KIND matters as much as the refusal. This is caller input,
+            // not a substrate failure, and consumers split the two to decide
+            // what to RETRY — filed as `federation_backend`, a permanently
+            // invalid advertisement would be retried forever, because no
+            // number of attempts makes an empty hash canonical.
+            assert_eq!(
+                why.kind(),
+                "federation_invalid_argument",
+                "({label}) #785: refusing {bad:?} must be an INPUT refusal, not \
+                 a backend failure — got {why}"
             );
         }
     }

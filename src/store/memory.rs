@@ -15302,6 +15302,16 @@ mod tests {
         .expect("561 family-root transit eligibility exercise");
     }
 
+    /// CIRISPersist#785 — reachable through the public double, memory.
+    #[tokio::test]
+    async fn known_hashes_reachable_through_the_double_memory_785() {
+        let backend = std::sync::Arc::new(MemoryBackend::new());
+        crate::federation::operational::test_support::exercise_known_hashes_reachable_through_the_double_785(
+            backend, "mem785",
+        )
+        .await;
+    }
+
     /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, memory.
     #[tokio::test]
     async fn known_hash_monotonic_and_canonical_memory_785() {

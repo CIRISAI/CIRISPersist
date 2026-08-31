@@ -21196,6 +21196,17 @@ mod accord_tests {
         .expect("561 family-root transit eligibility exercise");
     }
 
+    /// CIRISPersist#785 — reachable through the public double, sqlite.
+    #[tokio::test]
+    async fn known_hashes_reachable_through_the_double_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hashes_reachable_through_the_double_785(
+            std::sync::Arc::new(backend), "sq785",
+        )
+        .await;
+    }
+
     /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, sqlite.
     #[tokio::test]
     async fn known_hash_monotonic_and_canonical_sqlite_785() {
