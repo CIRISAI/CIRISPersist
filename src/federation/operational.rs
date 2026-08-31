@@ -5314,8 +5314,24 @@ pub mod test_support {
     ) {
         let hash =
             crate::federation::wire_index::content_hash_of_bytes(format!("mono{label}").as_bytes());
-        let newer = chrono::Utc::now();
-        let older = newer - chrono::Duration::hours(3);
+
+        // Chosen so the two instants render at DIFFERENT fractional widths:
+        // `…:00.100Z` (earlier) and `…:00.100001Z` (later). Under chrono's
+        // variable-width `to_rfc3339()` a TEXT comparison puts the LATER one
+        // first — '0' < 'Z' at the fourth fractional character — so a sqlite
+        // backend storing this column as TEXT would treat the newer sighting
+        // as older, silently keep the stale value, and let eviction delete
+        // rows it should keep.
+        //
+        // An earlier draft of this witness used `Utc::now()` for both, which
+        // renders both at the same width and cannot see the defect at all
+        // (found in review on PR #786).
+        let base = chrono::DateTime::parse_from_rfc3339("2027-03-04T05:06:00Z")
+            .expect("literal is valid RFC-3339")
+            .with_timezone(&chrono::Utc);
+        let older = base + chrono::Duration::milliseconds(100);
+        let newer = base + chrono::Duration::microseconds(100_001);
+        assert!(older < newer, "fixture instants are ordered");
 
         dir.insert_known_wire_hash("Family", &hash, Some("peer-new"), newer)
             .await
@@ -5359,6 +5375,22 @@ pub mod test_support {
             "({label}) the advertiser must follow the same monotonic rule as the \
              timestamp it is recorded with, or the holder map names a peer from \
              an older sighting than the one the clock reports"
+        );
+
+        // The TEXT-ordering hazard again, on the EVICTION predicate: a cutoff
+        // between the two must delete neither, since both are newer than a
+        // cutoff below them. Spelled with the same awkward widths so a
+        // regression in the cutoff's serialization is caught here too.
+        let below_both = base - chrono::Duration::seconds(1);
+        dir.evict_known_wire_hashes(below_both, u64::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("({label}) evict below both: {e}"));
+        assert!(
+            dir.known_wire_hash_contains("Family", &hash)
+                .await
+                .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
+            "({label}) #785: a cutoff BELOW every entry evicted one anyway — the \
+             range predicate is not comparing chronologically"
         );
 
         // Non-canonical hashes are REFUSED at the door, not normalised.

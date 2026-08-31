@@ -6523,7 +6523,7 @@ mod tests {
 /// it returns `Ok(None)` on an unresolvable entry BY DESIGN, as a
 /// self-healing posture toward index drift. So "we would notice" is not
 /// available as a mitigation, and the separation has to be structural.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownWireHash {
     /// The `EnvelopeKind::as_str()` token — same vocabulary as the wire index.
     pub kind: String,
@@ -6563,7 +6563,7 @@ pub struct KnownWireHash {
 /// forgets a record exists, and only re-learns it when edge's re-sweep wraps
 /// back around to it, which on a large corpus is hours. So **the floor
 /// wins**, and the overage is reported rather than silently resolved.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct KnownHashEviction {
     /// Entries removed by this pass.
     pub evicted: u64,

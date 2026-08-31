@@ -893,6 +893,67 @@ pub enum DirectoryOp {
         /// The bundle to re-tally and admit.
         evidence: crate::federation::accord_carriage::AccordQuorumEvidence,
     },
+    /// [`FederationDirectory::list_wire_hashes_since`] (v38.7.0,
+    /// CIRISPersist#780) — the complete HELD hash set for one wire kind,
+    /// index-only. Result rides [`DirectoryOpResult::WireHashes`].
+    ///
+    /// Added in CIRISPersist#785, not #780: the trait method shipped in
+    /// v38.7.0 with a DEFAULT body and no op, so a capsule consumer got
+    /// `Unsupported` for the very read #780 exists to provide, while its two
+    /// neighbours routed fine. APPEND-ONLY.
+    ListWireHashesSince {
+        /// The `EnvelopeKind::as_str()` token.
+        kind: String,
+        /// Exclusive cursor; `None` starts at the first hash.
+        after_content_hash: Option<String>,
+        /// Page size.
+        limit: u32,
+    },
+    /// [`FederationDirectory::insert_known_wire_hash`] (CIRISPersist#785) —
+    /// record that a hash EXISTS without holding its body. Result rides
+    /// [`DirectoryOpResult::Unit`]. APPEND-ONLY.
+    InsertKnownWireHash {
+        /// The `EnvelopeKind::as_str()` token.
+        kind: String,
+        /// Canonical lowercase 64-hex sha256; refused otherwise.
+        content_hash: String,
+        /// LOCAL-ONLY observation of who advertised it — never replicated.
+        advertised_by: Option<String>,
+        /// The observation instant. Applied MONOTONICALLY: an older sighting
+        /// arriving late does not move the stored value backwards.
+        now: chrono::DateTime<chrono::Utc>,
+    },
+    /// [`FederationDirectory::known_wire_hash_contains`] (CIRISPersist#785).
+    /// Result rides [`DirectoryOpResult::Bool`]. APPEND-ONLY.
+    KnownWireHashContains {
+        /// The `EnvelopeKind::as_str()` token.
+        kind: String,
+        /// The hash to look for.
+        content_hash: String,
+    },
+    /// [`FederationDirectory::list_known_wire_hashes_since`]
+    /// (CIRISPersist#785) — page the KNOWN set, cursored on the hash. Result
+    /// rides [`DirectoryOpResult::KnownWireHashes`]. APPEND-ONLY.
+    ListKnownWireHashesSince {
+        /// The `EnvelopeKind::as_str()` token.
+        kind: String,
+        /// Exclusive cursor; `None` starts at the first hash.
+        after_content_hash: Option<String>,
+        /// Page size.
+        limit: u32,
+    },
+    /// [`FederationDirectory::evict_known_wire_hashes`] (CIRISPersist#785) —
+    /// evict on a CALLER-SUPPLIED cutoff. Result rides
+    /// [`DirectoryOpResult::KnownHashEviction`]. APPEND-ONLY.
+    EvictKnownWireHashes {
+        /// Entries not advertised since this instant are evicted. The caller
+        /// owns this number — persist never derives it, because the safe
+        /// floor is one wrap period of the caller's own re-sweep.
+        cutoff: chrono::DateTime<chrono::Utc>,
+        /// Soft cap. The floor WINS: an overage is reported, not resolved by
+        /// evicting below the cutoff.
+        bound: u64,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1106,6 +1167,20 @@ pub enum DirectoryOpResult {
         /// Which structural rule the bundle broke.
         reason: String,
     },
+    /// [`DirectoryOp::ListWireHashesSince`] (CIRISPersist#785) — the HELD
+    /// hash set page. APPEND-ONLY.
+    WireHashes(Vec<String>),
+    /// [`DirectoryOp::KnownWireHashContains`] (CIRISPersist#785).
+    /// APPEND-ONLY.
+    Bool(bool),
+    /// [`DirectoryOp::ListKnownWireHashesSince`] (CIRISPersist#785) — the
+    /// KNOWN-set page. A DISTINCT variant from [`Self::WireHashes`] on
+    /// purpose: the two sets must never be unioned, and giving them one wire
+    /// shape would make a swapped dispatch arm type-check. APPEND-ONLY.
+    KnownWireHashes(Vec<crate::federation::KnownWireHash>),
+    /// [`DirectoryOp::EvictKnownWireHashes`] (CIRISPersist#785) — evicted,
+    /// remaining, and how far over bound the floor left it. APPEND-ONLY.
+    KnownHashEviction(crate::federation::KnownHashEviction),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1708,6 +1783,57 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::U64(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        // CIRISPersist#785 — the wire-hash reads and the known-but-not-held
+        // set. The two `list_*` arms return DIFFERENT result variants for the
+        // same underlying shape (`Vec<String>` vs `Vec<KnownWireHash>`), which
+        // is deliberate: these sets must never be unioned, and a shared wire
+        // shape would let a swapped arm here type-check.
+        DirectoryOp::ListWireHashesSince {
+            kind,
+            after_content_hash,
+            limit,
+        } => match dir
+            .list_wire_hashes_since(&kind, after_content_hash.as_deref(), limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::WireHashes(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::InsertKnownWireHash {
+            kind,
+            content_hash,
+            advertised_by,
+            now,
+        } => match dir
+            .insert_known_wire_hash(&kind, &content_hash, advertised_by.as_deref(), now)
+            .await
+        {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::KnownWireHashContains { kind, content_hash } => {
+            match dir.known_wire_hash_contains(&kind, &content_hash).await {
+                Ok(v) => DirectoryOpResult::Bool(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListKnownWireHashesSince {
+            kind,
+            after_content_hash,
+            limit,
+        } => match dir
+            .list_known_wire_hashes_since(&kind, after_content_hash.as_deref(), limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::KnownWireHashes(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::EvictKnownWireHashes { cutoff, bound } => {
+            match dir.evict_known_wire_hashes(cutoff, bound).await {
+                Ok(v) => DirectoryOpResult::KnownHashEviction(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -3445,6 +3571,118 @@ impl FederationDirectory for OpsDirectory {
 
     /// v21.1.0 (CIRISPersist#507b) — the full-rebuild backfill via the
     /// capsule.
+    /// CIRISPersist#785 — #780's held-hash read, routed. It shipped in
+    /// v38.7.0 with a default body and no op, so a capsule consumer reached
+    /// the default and got `Unsupported`.
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListWireHashesSince {
+                kind: kind.to_owned(),
+                after_content_hash: after_content_hash.map(str::to_owned),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::WireHashes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// CIRISPersist#785 — record that a hash exists, unheld.
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::InsertKnownWireHash {
+                kind: kind.to_owned(),
+                content_hash: content_hash.to_owned(),
+                advertised_by: advertised_by.map(str::to_owned),
+                now,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// CIRISPersist#785 — is this hash known to exist?
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, Error> {
+        match self
+            .run_op(&DirectoryOp::KnownWireHashContains {
+                kind: kind.to_owned(),
+                content_hash: content_hash.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Bool(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// CIRISPersist#785 — page the KNOWN set, cursored on the hash.
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::KnownWireHash>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListKnownWireHashesSince {
+                kind: kind.to_owned(),
+                after_content_hash: after_content_hash.map(str::to_owned),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::KnownWireHashes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// CIRISPersist#785 — evict on a caller-supplied cutoff.
+    async fn evict_known_wire_hashes(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<crate::federation::KnownHashEviction, Error> {
+        match self
+            .run_op(&DirectoryOp::EvictKnownWireHashes { cutoff, bound })
+            .await?
+        {
+            DirectoryOpResult::KnownHashEviction(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn rebuild_signed_wire_index(&self) -> Result<u64, Error> {
         match self.run_op(&DirectoryOp::RebuildSignedWireIndex).await? {
             DirectoryOpResult::U64(v) => Ok(v),
@@ -4237,7 +4475,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "8298961b160172d8a865a1bd2a836a08869c5ddf3f86e800f4bdc773795dcefe",
+            "f1bf4892e9a8986b2a6a9ab0d4438aea402dab05c97b1b4f8d468274dc720ff1",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4249,6 +4487,13 @@ mod tests {
     /// Companion to [`directory_op_wire_contract_is_pinned_682`] for the result
     /// half. Pinned separately so a red names which side of the call moved —
     /// a consumer can be forward-compatible on ops and not on results.
+    ///
+    /// Re-pinned again in CIRISPersist#785 — GROWTH on both halves: five ops
+    /// and four result variants APPENDED, nothing existing renamed, reordered
+    /// or retyped. So both digests move and [`DIRECTORY_ABI_VERSION`] stays
+    /// put, which is the fork this gate's doc prescribes. A consumer built
+    /// against the older shape keeps working: it never sends the new ops and
+    /// never receives the new results.
     ///
     /// Re-pinned in v36.0.0 for two changes riding one release: GROWTH
     /// (`AccordEvidenceCarrierRefused` appended, CIRISPersist#674) and the
@@ -4263,7 +4508,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "6ef59d4f1da1ca8346961496a5aad4a4488ce4ff80ac87e917c4d2b3fd5e1d24",
+            "783094ff32226392c6719a93188bbedd6b2f41ab350c683139e9cce4f78aa34c",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -4277,6 +4522,128 @@ mod tests {
         let base = v as *const _ as usize;
         let version_field = &v.abi_version as *const _ as usize;
         assert_eq!(version_field, base, "abi_version must be at offset 0");
+    }
+
+    /// CIRISPersist#785 — the known-hash surface ROUND-TRIPS ACROSS THE
+    /// CAPSULE, and the two hash sets keep distinct wire shapes doing it.
+    ///
+    /// Without this, the ops are five appended enum variants nothing proves
+    /// are wired: the dispatch arm could return the wrong result variant and
+    /// only a consumer on the far side of the ABI would ever find out. That is
+    /// the same gap the trait-default methods had — reachable-looking code
+    /// that answers `Unsupported` in the one configuration that matters.
+    ///
+    /// `list_wire_hashes_since` is exercised here too. It shipped in #780
+    /// (v38.7.0) with a default body and NO op, so a capsule consumer got
+    /// `Unsupported` for the very read that release existed to provide, while
+    /// its two neighbours routed fine.
+    #[test]
+    fn known_hash_ops_round_trip_through_the_capsule_785() {
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        let hash = crate::federation::wire_index::content_hash_of_bytes(b"capsule-785");
+        let now = chrono::DateTime::parse_from_rfc3339("2027-05-06T07:08:09Z")
+            .expect("literal is valid RFC-3339")
+            .with_timezone(&chrono::Utc);
+
+        // Insert → Unit.
+        assert!(
+            matches!(
+                run_op(
+                    &rt,
+                    &directory,
+                    &DirectoryOp::InsertKnownWireHash {
+                        kind: "Key".into(),
+                        content_hash: hash.clone(),
+                        advertised_by: Some("peer-1".into()),
+                        now,
+                    },
+                ),
+                DirectoryOpResult::Unit
+            ),
+            "#785: InsertKnownWireHash must route across the capsule"
+        );
+
+        // Contains → Bool(true).
+        assert!(
+            matches!(
+                run_op(
+                    &rt,
+                    &directory,
+                    &DirectoryOp::KnownWireHashContains {
+                        kind: "Key".into(),
+                        content_hash: hash.clone(),
+                    },
+                ),
+                DirectoryOpResult::Bool(true)
+            ),
+            "#785: KnownWireHashContains must route and answer for what was \
+             written through the capsule"
+        );
+
+        // The KNOWN page carries the record, with its local-only advertiser.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListKnownWireHashesSince {
+                kind: "Key".into(),
+                after_content_hash: None,
+                limit: u32::MAX,
+            },
+        ) {
+            DirectoryOpResult::KnownWireHashes(rows) => {
+                let got = rows
+                    .iter()
+                    .find(|r| r.content_hash == hash)
+                    .expect("#785: the inserted hash must page back");
+                assert_eq!(got.advertised_by.as_deref(), Some("peer-1"));
+                assert_eq!(got.last_advertised_at, now);
+            }
+            other => panic!("#785: expected KnownWireHashes, got {other:?}"),
+        }
+
+        // …and the HELD read is a DIFFERENT wire variant that does not carry
+        // it. One shared shape here would let a swapped dispatch arm
+        // type-check, which is the union this plane exists to prevent —
+        // expressed at the ABI rather than only in the backend.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListWireHashesSince {
+                kind: "Key".into(),
+                after_content_hash: None,
+                limit: u32::MAX,
+            },
+        ) {
+            DirectoryOpResult::WireHashes(held) => assert!(
+                !held.contains(&hash),
+                "#785: a KNOWN-only hash reached the HELD read across the \
+                 capsule — `want = remote ∖ holdings` would drop it and the \
+                 node would stop fetching, silently"
+            ),
+            other => panic!("#785: expected WireHashes, got {other:?}"),
+        }
+
+        // Evict with a cutoff BELOW the entry keeps it, and reports the bound.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::EvictKnownWireHashes {
+                cutoff: now - chrono::Duration::hours(1),
+                bound: 0,
+            },
+        ) {
+            DirectoryOpResult::KnownHashEviction(rep) => {
+                assert_eq!(rep.evicted, 0, "#785: nothing is older than the cutoff");
+                assert!(
+                    rep.over_bound_by >= 1,
+                    "#785: the floor wins over the bound, and the overage is \
+                     REPORTED rather than resolved by evicting below it"
+                );
+            }
+            other => panic!("#785: expected KnownHashEviction, got {other:?}"),
+        }
+        drop(dir);
     }
 
     #[test]

@@ -99,6 +99,34 @@ threat-model citations because this crate's audit story is the point.
     Harmless because `want` reads holdings, not this set. The witness had
     passed only because it never persisted a body matching the hash it
     inserted; it now exercises that transition directly.
+- **The capsule routes it, and #780's read now routes too.** `list_wire_hashes_since`
+  shipped in v38.7.0 with a default body and no `DirectoryOp`, so a consumer
+  reaching persist across the ABI got `Unsupported` for the very read #780
+  exists to provide — while its two neighbours routed fine. Five ops and four
+  result variants appended, covering that gap and the four new methods.
+
+  **GROWTH, not a break**: appended only, nothing renamed, reordered or
+  retyped, so both wire digests are re-pinned and `DIRECTORY_ABI_VERSION`
+  stays at 3 — a consumer built against the older shape never sends the new
+  ops and never receives the new results. The two hash sets get DISTINCT
+  result variants (`WireHashes` vs `KnownWireHashes`) on purpose: one shared
+  shape would let a swapped dispatch arm type-check, so the never-union
+  invariant is expressed at the ABI as well as in the backend.
+
+  Same `shipped means host-reachable` class as the directory double above.
+  Green on three backends with a live database says nothing about whether a
+  consumer on the far side of the ABI can call the method at all.
+- **Timestamps stored at FIXED width, with the crate's `+00:00` spelling.**
+  This column is compared as TEXT, so its rendering has to be
+  order-preserving. Measured, because a review finding here turned on a
+  premise worth checking: plain `to_rfc3339()` is in fact correct despite a
+  variable fractional width, since `+` sorts below every digit and a short
+  fraction behaves exactly like zero-padding. It is `Z` that inverts
+  (`…00.100Z` > `…00.100001Z`). Fixed width removes the dependency on the
+  terminator entirely; keeping `+00:00` avoids introducing a second timestamp
+  spelling into one column, which would be worse than either, since a row
+  written by the other path would sort after every row regardless of its
+  instant.
 - **`advertised_by` is local-only by construction.** An observation ("this
   peer advertised H to me"), never a claim ("this peer holds H"). Absent from
   every replication policy kind and from the wire index; no type carrying it

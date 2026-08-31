@@ -4819,7 +4819,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let kind = kind.to_owned();
         let hash = content_hash.to_owned();
         let by = advertised_by.map(str::to_owned);
-        let now_s = now.to_rfc3339();
+        // FIXED WIDTH, and the repo's usual `+00:00` suffix rather than `Z`.
+        //
+        // This column is compared as TEXT — by the monotonic guard below and
+        // by the eviction predicate — so its rendering has to be
+        // order-preserving. Measured, because a review finding here turned on
+        // a premise worth checking:
+        //
+        //   to_rfc3339()          "…00.100+00:00" < "…00.100001+00:00"  ✓
+        //   AutoSi with use_z     "…00.100Z"      > "…00.100001Z"       ✗
+        //   Micros (fixed width)  correct under either suffix
+        //
+        // Plain `to_rfc3339()` is in fact correct despite its VARIABLE
+        // fractional width, because `+` (0x2B) sorts below every digit, so a
+        // short fraction behaves exactly like zero-padding. That is a real
+        // property and a fragile one to rely on: it silently inverts the
+        // moment anyone switches the suffix to `Z`, which is a change that
+        // looks purely cosmetic.
+        //
+        // Fixed width removes the dependency on the terminator entirely.
+        // `false` keeps the `+00:00` spelling every other timestamp in this
+        // crate uses — mixing spellings in ONE column would be far worse than
+        // either, since `Z` (0x5A) outranks `+` and a row written by the other
+        // path would sort after every row regardless of its instant. Micros
+        // also matches postgres TIMESTAMPTZ's own resolution, so the two
+        // dialects keep the same instant to the same precision.
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let guard = conn.lock();
@@ -4944,7 +4969,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         cutoff: chrono::DateTime<chrono::Utc>,
         bound: u64,
     ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
-        let cutoff_s = cutoff.to_rfc3339();
+        // Same fixed width as the insert path, or the range delete compares a
+        // 6-digit stored value against a 9-digit cutoff and stops being
+        // chronological at exactly the boundary it exists to enforce.
+        let cutoff_s = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         let conn = self.conn.clone();
         let out = (move || -> Result<(u64, u64), rusqlite::Error> {
             let guard = conn.lock();
