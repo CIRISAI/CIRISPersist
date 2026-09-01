@@ -8722,6 +8722,20 @@ mod tests {
         let conn = sq.conn_handle();
         let agent_pk_b64 = B64.encode(agent_sk.verifying_key().to_bytes());
         let key_id_owned = agent_key_id.to_owned();
+        // CIRISPersist#789 — the producer's ML-DSA-65 pubkey, resolved from
+        // the directory at admission rather than trusted off the payload.
+        let pqc_pk_b64 = {
+            use ciris_keyring::PqcSigner as _;
+            // Seed 0x77, matching the signer above — NOT 0x89, which the key
+            // NAME suggests and which produced a valid-looking registration
+            // whose pubkey simply did not verify the signature.
+            let m = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &[0x77; 32],
+                "engine-89-mldsa",
+            )
+            .expect("ml-dsa seed");
+            B64.encode(m.public_key().await.expect("ml-dsa pk"))
+        };
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             conn.execute(
@@ -8736,6 +8750,23 @@ mod tests {
                 rusqlite::params![key_id_owned, agent_pk_b64, "2026-04-30T00:00:00+00:00"],
             )
             .expect("seed federation key");
+            // #789 — and the producer's PQC key. A fixture registering only
+            // the classical half models a world that does not exist: the
+            // fleet is 100% PQC, and admission resolves the ML-DSA pubkey
+            // from `federation_keys` by `pqc_key_id`.
+            conn.execute(
+                "INSERT INTO federation_keys (\
+                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, \
+                    algorithm, identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES ('engine-89-mldsa', '', ?1, 'hybrid', 'agent', \
+                          'engine-89-mldsa', ?2, '{}', x'00', '', \
+                          'engine-89-mldsa', ?2, '0')",
+                rusqlite::params![pqc_pk_b64, "2026-04-30T00:00:00+00:00"],
+            )
+            .expect("seed producer PQC key");
         })
         .await
         .expect("spawn_blocking join");

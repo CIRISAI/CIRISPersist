@@ -574,6 +574,7 @@ pub fn verify_trace_hybrid<C>(
     trace: &CompleteTrace,
     canonicalizer: &C,
     ed25519_pubkey_b64: &str,
+    pqc_pubkey_b64: Option<&str>,
     policy: crate::verify::hybrid::HybridPolicy,
 ) -> Result<crate::verify::hybrid::VerifyOutcome, crate::verify::hybrid::VerifyError>
 where
@@ -587,7 +588,21 @@ where
         &trace.signature,
         trace.signature_ml_dsa_65.as_deref(),
         ed25519_pubkey_b64,
-        trace.pubkey_ml_dsa_65.as_deref(),
+        // CIRISPersist#789 — a PARAMETER, no longer read off the trace.
+        //
+        // Both pubkeys are verification INPUTS, not signed content: neither
+        // appears in any of the three canonical payload shapes above, so where
+        // the verifier obtains them cannot change what the signature covers.
+        // That is what makes the caller free to source the PQC half from the
+        // directory instead of from a copy carried on every stored row —
+        // 264 MB of one key repeated across 106,258 rows on the live
+        // canonical, 99.7% of it redundant.
+        //
+        // Taking it as a parameter rather than defaulting to
+        // `trace.pubkey_ml_dsa_65` is deliberate: a default would let a caller
+        // silently fall back to the inline copy and keep the duplication
+        // alive, and the compiler would never mention it.
+        pqc_pubkey_b64,
         policy,
         None,
     )

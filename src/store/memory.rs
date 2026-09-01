@@ -1367,6 +1367,41 @@ impl MemoryBackend {
         Ok(attestation_id)
     }
 
+    /// CIRISPersist#789 — register a key WITH its ML-DSA-65 pubkey.
+    ///
+    /// The fleet is 100% PQC, and since #789 admission resolves a producer's
+    /// PQC pubkey from `federation_keys` by `pqc_key_id` rather than trusting
+    /// the copy carried on the payload. A fixture that registers only an
+    /// Ed25519 half is therefore modelling a world that does not exist, and
+    /// its traces are refused — correctly.
+    pub fn add_pqc_public_key(&self, key_id: &str, pqc_pubkey_b64: &str) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let now = chrono::Utc::now();
+        let rec = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: String::new(),
+            pubkey_ml_dsa_65_base64: Some(pqc_pubkey_b64.to_owned()),
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "key_id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2ln".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        state.federation_keys.insert(key_id.to_owned(), rec);
+    }
+
     /// Register a public key. For test fixtures. v0.4.0 — writes to
     /// federation_keys (the canonical pubkey directory post-lens#8
     /// ASK 2). Pre-v0.4.0 wrote to a separate `keys` map; the legacy

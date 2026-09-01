@@ -1315,10 +1315,106 @@ where
         // (dedup-first would be a suppression/probe oracle). The
         // throughput lever is the per-batch verify loop, NOT dedup-first.
         let ed25519_pubkey_b64 = BASE64.encode(key.to_bytes());
+        // CIRISPersist#789 — the PQC pubkey comes from the DIRECTORY, by
+        // `pqc_key_id`. It is no longer read off the payload, and there is no
+        // fallback to the payload's copy.
+        //
+        // THE ASYMMETRY THIS FIXES. The Ed25519 half above is resolved through
+        // `lookup_public_key` — a key this node already knows. The PQC half
+        // was taken from the trace itself. So one half proved "a key the
+        // directory vouches for signed this" and the other proved only "the
+        // keypair named in this payload signed this payload", which any
+        // submitter can satisfy by generating a keypair. A hybrid verify is
+        // only as strong as its weakest identity binding, so the PQC half was
+        // contributing confidentiality-era future-proofing and no present
+        // identity assurance at all. Sourcing both halves from the directory
+        // makes the two legs say the same thing about WHO.
+        //
+        // FAIL-CLOSED, deliberately. A missing `pqc_key_id`, an unresolvable
+        // one, or a directory row without a PQC pubkey is a REFUSAL, never a
+        // fallback to `trace.pubkey_ml_dsa_65`. A fallback would leave the
+        // whole gate bypassable by omitting a field — the caller would choose
+        // which key verifies them, which is the property just removed.
+        // #789's measurement is what makes this safe to switch on: `pqc_key_id`
+        // resolves for 100% of live rows and the directory's key is
+        // byte-identical to the inline copy on every one, so no trace that
+        // verifies today stops verifying.
+        //
+        // ORDERING PRESERVED. This is a READ, placed before the verify it
+        // feeds, so step 2 remains verify-before-mutation; nothing is
+        // reordered behind dedup and no suppression/probe oracle is created.
+        // CIRISPersist#789 — the PQC pubkey comes from the DIRECTORY, by
+        // `pqc_key_id`. It is not read off the payload, and there is no
+        // fallback to the payload's copy.
+        //
+        // THE ASYMMETRY THIS CLOSES. The Ed25519 half above is resolved
+        // through `lookup_public_key` — a key this node already vouches for.
+        // The PQC half was taken from the trace itself, so one leg proved "a
+        // key the directory vouches for signed this" and the other proved only
+        // "the keypair named in this payload signed this payload", which any
+        // submitter can satisfy by generating one. A hybrid verify is only as
+        // strong as its weakest identity binding, so the PQC leg was carrying
+        // post-quantum durability and no present identity assurance at all.
+        //
+        // FAIL-CLOSED, with no warn-then-enforce step. A missing `pqc_key_id`,
+        // an unresolvable one, or a directory row without a PQC pubkey is a
+        // REFUSAL. A fallback would leave the gate bypassable by omitting a
+        // field — the caller would choose which key verifies them, which is
+        // the property being removed. The usual argument for a soft landing
+        // (an unregistered producer goes dark on deploy) does not apply here:
+        // the fleet is 100% PQC, so there is no unregistered-producer
+        // population to migrate, and a warn period would only preserve the
+        // bypass for whoever wanted it.
+        //
+        // ORDERING PRESERVED. This is a READ placed before the verify it
+        // feeds, so step 2 remains verify-before-mutation; nothing is
+        // reordered behind dedup and no suppression/probe oracle is created.
+        // ONLY for a trace that actually carries a PQC half.
+        //
+        // A classical-only trace must still be refused by the #225 hard cut
+        // with `HybridRequired` — that refusal is a documented contract with
+        // its own tests and its own operator meaning ("this producer sent
+        // classical-only; it must not"). Resolving the key first made a
+        // classical-only trace fail as `UnknownKey` instead, which is a true
+        // statement about a missing key and the WRONG answer to the question
+        // the operator is actually asking. A refusal's identity is part of its
+        // contract, so the hard cut keeps its own error and this lookup runs
+        // only where a PQC signature exists to verify.
+        let pqc_pubkey_b64 = if trace.signature_ml_dsa_65.is_some() {
+            let Some(pqc_key_id) = trace.pqc_key_id.as_deref() else {
+                return Err(IngestError::Verify(VerifyError::UnknownKey(
+                    "trace carries a PQC signature but no pqc_key_id — the \
+                     pubkey is resolved from the directory and is never taken \
+                     from the payload (#789)"
+                        .to_owned(),
+                )));
+            };
+            let pqc_record =
+                crate::federation::FederationDirectory::lookup_public_key(self.backend, pqc_key_id)
+                    .await
+                    .map_err(|e| {
+                        IngestError::Verify(VerifyError::HybridVerify(format!(
+                            "pqc pubkey directory read failed for {pqc_key_id}: {e}"
+                        )))
+                    })?;
+            let Some(found) = pqc_record.and_then(|r| r.pubkey_ml_dsa_65_base64) else {
+                return Err(IngestError::Verify(VerifyError::UnknownKey(format!(
+                    "pqc_key_id {pqc_key_id} has no ML-DSA-65 pubkey in the \
+                     federation directory — refusing rather than falling back \
+                     to the pubkey the payload nominates (#789)"
+                ))));
+            };
+            Some(found)
+        } else {
+            // No PQC half: fall through so `verify_trace_hybrid` produces the
+            // #225 hard cut under `HybridPolicy::Strict`.
+            None
+        };
         match crate::verify::ed25519::verify_trace_hybrid(
             trace,
             canon,
             &ed25519_pubkey_b64,
+            pqc_pubkey_b64.as_deref(),
             crate::verify::HybridPolicy::Strict,
         ) {
             Ok(_outcome) => Ok(()),
@@ -1417,6 +1513,25 @@ mod tests {
         trace.signature_ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
         trace.pubkey_ml_dsa_65 = Some(BASE64.encode(&pqc_pk));
         trace.pqc_key_id = Some("test-mldsa".to_owned());
+    }
+
+    /// CIRISPersist#789 — put the producer's ML-DSA-65 key in the directory.
+    ///
+    /// Since #789, admission resolves the PQC pubkey from `federation_keys` by
+    /// `pqc_key_id` and refuses when it is absent — the payload's own copy is
+    /// no longer trusted, because a key the submitter nominates proves nothing
+    /// about who they are. The fleet is 100% PQC, so a registered PQC key is
+    /// the normal state of the world and a fixture without one was modelling a
+    /// world that does not exist.
+    ///
+    /// Deterministic seed, matching the signer the trace fixtures use.
+    async fn seed_test_pqc_key(backend: &MemoryBackend) {
+        use ciris_keyring::PqcSigner;
+        let mldsa =
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "test-mldsa")
+                .expect("ml-dsa seed");
+        let pk = mldsa.public_key().await.expect("ml-dsa pk");
+        backend.add_pqc_public_key("test-mldsa", &BASE64.encode(&pk));
     }
 
     async fn make_signed_batch_bytes() -> (Vec<u8>, String, ed25519_dalek::VerifyingKey) {
@@ -1572,6 +1687,7 @@ mod tests {
                 .await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         // FSD §4.6 — make the verified WRITER (the signer; unbound, so
@@ -1612,6 +1728,7 @@ mod tests {
             make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         // The writer (signer) is a member of a DIFFERENT community —
@@ -1652,6 +1769,7 @@ mod tests {
             make_signed_batch_bytes_with_cohort("community", Some("community-key:mine")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
@@ -1690,6 +1808,7 @@ mod tests {
             make_signed_batch_bytes_with_cohort("self", Some("victim-identity-forged")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -1742,6 +1861,7 @@ mod tests {
 
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -1775,6 +1895,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -1988,6 +2109,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -2042,6 +2164,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -2069,6 +2192,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         // NOTE: memory's `add_public_key` seeds BOTH the legacy verify
         // store AND a minimal federation_keys row — the mint's FK holds.
@@ -2152,6 +2276,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let node_a = MemoryBackend::new();
         node_a.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&node_a).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &node_a,
@@ -2374,6 +2499,7 @@ mod tests {
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, other_sk.verifying_key());
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -2481,6 +2607,7 @@ mod tests {
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, other_sk.verifying_key());
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -2591,6 +2718,7 @@ mod tests {
 
         let backend = MemoryBackend::new();
         backend.add_public_key(key_id, sk.verifying_key());
+        seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -2713,6 +2841,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
 
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -2808,6 +2937,7 @@ mod tests {
 
         let backend = MemoryBackend::new();
         backend.add_public_key(key_id, sk.verifying_key());
+        seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -2932,6 +3062,7 @@ mod tests {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,

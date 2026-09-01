@@ -1277,7 +1277,7 @@ impl Backend for PostgresBackend {
                             agent_role, agent_template, deployment_domain, \
                             deployment_type, deployment_region, deployment_trust_mode, \
                             verification_source, cohort_scope, cohort_target_id, \
-                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
+                            pqc_key_id, \
                             shard_key, \
                             scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
                             admitted_at";
@@ -1402,8 +1402,11 @@ impl Backend for PostgresBackend {
             // v7.2.0 per-trace ML-DSA-65 hybrid columns (V083, #225).
             // The producer's PQC half of the per-trace envelope sig; the
             // ingest gate rejected Full-mode classical-only before this.
-            params.push(Box::new(row.signature_ml_dsa_65.clone()));
-            params.push(Box::new(row.pubkey_ml_dsa_65.clone()));
+            // CIRISPersist#789 — neither is written per-event any more. The
+            // signature is thought-scoped and lives once in
+            // `trace_thought_signatures`; the pubkey is key-scoped and is
+            // resolved from the directory by `pqc_key_id`, the column that
+            // stays. 679 MB of an 898 MB table was these two copies.
             params.push(Box::new(row.pqc_key_id.clone()));
             // #226 — app-level dedup shard (V094). Deterministic FNV over
             // a subset of the dedup key; a true duplicate computes the same
@@ -1445,6 +1448,39 @@ impl Backend for PostgresBackend {
             .execute(sql.as_str(), &params_refs)
             .await
             .map_err(|e| Error::Backend(format!("insert trace_events: {e}")))?;
+
+        // CIRISPersist#789 — the thought-scoped signature, written ONCE per
+        // thought, in the SAME transaction as the events it covers.
+        //
+        // Same transaction is the point: a crash between the two writes would
+        // leave events whose signature was never stored, and that signature is
+        // recoverable from nowhere else.
+        //
+        // `DO NOTHING` on conflict because the signature is a total function
+        // of `thought_id` — every event of a thought carries the same one, so
+        // the first write wins and the rest are identical bytes. A DIFFERING
+        // signature for one thought would be a producer bug, and it is refused
+        // loudly by the V135 backfill's PRIMARY KEY rather than silently
+        // overwritten here.
+        for row in rows {
+            // Bound before the call: `as_deref` refuses nothing, so it does not
+            // belong inside a `?`-propagated expression — the parity gate asks
+            // what each call on that path refuses, and "nothing" is the wrong
+            // answer to have to give.
+            let key = row.pqc_key_id.clone();
+            let sig = row.signature_ml_dsa_65.clone();
+            if let Some(sig) = sig {
+                tx.execute(
+                    "INSERT INTO cirislens.trace_thought_signatures \
+                         (thought_id, signature_ml_dsa_65, pqc_key_id) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (thought_id) DO NOTHING",
+                    &[&row.thought_id, &sig, &key],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("insert trace_thought_signatures: {e}")))?;
+            }
+        }
 
         tx.commit()
             .await
@@ -2139,7 +2175,16 @@ impl Backend for PostgresBackend {
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                             cohort_scope, cohort_target_id, \
-                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
+                            (SELECT s.signature_ml_dsa_65 \
+                               FROM cirislens.trace_thought_signatures s \
+                              WHERE s.thought_id = cirislens.trace_events.thought_id \
+                                AND cirislens.trace_events.pqc_key_id IS NOT NULL) \
+                              AS signature_ml_dsa_65, \
+                            (SELECT k.pubkey_ml_dsa_65_base64 \
+                               FROM cirislens.federation_keys k \
+                              WHERE k.key_id = cirislens.trace_events.pqc_key_id) \
+                              AS pubkey_ml_dsa_65, \
+                            pqc_key_id \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 AND agent_id_hash = $2 \
                      ORDER BY event_id ASC LIMIT $3",
@@ -2162,7 +2207,16 @@ impl Backend for PostgresBackend {
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                             cohort_scope, cohort_target_id, \
-                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
+                            (SELECT s.signature_ml_dsa_65 \
+                               FROM cirislens.trace_thought_signatures s \
+                              WHERE s.thought_id = cirislens.trace_events.thought_id \
+                                AND cirislens.trace_events.pqc_key_id IS NOT NULL) \
+                              AS signature_ml_dsa_65, \
+                            (SELECT k.pubkey_ml_dsa_65_base64 \
+                               FROM cirislens.federation_keys k \
+                              WHERE k.key_id = cirislens.trace_events.pqc_key_id) \
+                              AS pubkey_ml_dsa_65, \
+                            pqc_key_id \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 \
                      ORDER BY event_id ASC LIMIT $2",
@@ -18195,7 +18249,16 @@ impl crate::read::ReadEngine for PostgresBackend {
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
-                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
+                        (SELECT s.signature_ml_dsa_65 \
+                           FROM cirislens.trace_thought_signatures s \
+                          WHERE s.thought_id = cirislens.trace_events.thought_id \
+                            AND cirislens.trace_events.pqc_key_id IS NOT NULL) \
+                          AS signature_ml_dsa_65, \
+                        (SELECT k.pubkey_ml_dsa_65_base64 \
+                           FROM cirislens.federation_keys k \
+                          WHERE k.key_id = cirislens.trace_events.pqc_key_id) \
+                          AS pubkey_ml_dsa_65, \
+                        pqc_key_id \
                  FROM cirislens.trace_events \
                  WHERE trace_id = $1 \
                  ORDER BY ts ASC",

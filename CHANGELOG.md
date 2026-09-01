@@ -9,6 +9,69 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added
 
+- **#789 — `trace_events` stored crypto material at the wrong cardinality.**
+  A key-scoped pubkey and a thought-scoped signature, both written once per
+  EVENT row: **679 MB of an 898 MB table** wrapped around 80 MB of actual
+  trace payload (99.7% and 93.2% redundant). It surfaced three releases later
+  as a read API going deaf after ~22h with a thread parked in `D` on
+  `wait_on_page_bit_common` — the working set stopped fitting page cache.
+
+  The class is **not** "crypto stored inline": `federation_attestations`
+  carries 16,010 distinct signatures over 16,471 rows, genuinely per-row. It
+  is *material whose natural key differs from the row's, with nothing that
+  notices*.
+
+  V135 moves the signature to `trace_thought_signatures` (keyed by the thought
+  it actually covers), drops both per-event columns, and resolves the pubkey
+  from the directory. Reads rebuild both fields, so `TraceEventRow` keeps its
+  shape and no consumer API moves.
+
+- **The backfill asserts itself, and the ordering is the safety argument.**
+  `thought_id` is the PRIMARY KEY and the backfill selects DISTINCT, so a
+  thought carrying two signatures violates the PK and ABORTS the migration
+  *before* either column is dropped. Refinery wraps each migration in one
+  transaction, so there is no state where the columns are gone and the
+  signatures were not saved — on a corpus that is durable, replicated and kept
+  for posterity, a drop outrunning its backfill is unrecoverable. Witnessed
+  both ways, including that the source columns survive an aborted run.
+
+- **The dedup keeps the per-row FACT while removing the redundant BYTES.**
+  A thought can hold both a hybrid-signed trace and a classical-only
+  `2.7.legacy` import — they share a `thought_id` — so keying on the thought
+  alone handed the legacy row the hybrid signature and it read back as
+  PQC-signed when it never was. That is loss in the dangerous direction:
+  unsigned material looking signed, which is exactly what the #225 hard cut
+  audits. The measurement licensed "one signature per thought"; it did not
+  license "every event of a thought has one". Reads are gated on the row's own
+  `pqc_key_id`, which is retained and IS that bit.
+
+- **Admission resolves the PQC pubkey from the DIRECTORY, fail-closed.**
+  The Ed25519 half was always checked against a key the directory vouches for
+  while the PQC half came from the payload — provable by anyone who generates
+  a keypair, so the hybrid verify's second leg carried post-quantum durability
+  and no present identity assurance. Both legs now say the same thing about
+  WHO. No warn-then-enforce step: the fleet is 100% PQC, so there is no
+  unregistered-producer population to migrate and a warn period would only
+  preserve the bypass. The lookup runs only where a PQC signature exists, so
+  a classical-only trace still earns the #225 `HybridRequired` refusal rather
+  than a misleading `UnknownKey` — a refusal's identity is part of its
+  contract.
+
+- **A recurrence gate.** Every crypto-bearing column must declare what it is
+  keyed by; an undeclared one fails the build. A DECLARATION gate rather than
+  a cardinality measurement, because `COUNT(DISTINCT)/COUNT(*)` passes
+  vacuously on an empty CI database. It found 22 undeclared columns on first
+  run, each now declared with its natural key. Inherits #691's from-disk
+  weakness rather than inventing a new one.
+
+- **CIRISVerify v14.1.0 adopted** — all 7 Cargo pins flipped together
+  (splitting them forks `ciris_crypto` into two graph versions); `pyproject`'s
+  `>=14.0.0,<15` already covers a minor.
+
+## [Unreleased]
+
+### Added
+
 - **#785 — the KNOWN-but-not-held wire-hash set.** `signed_wire_index` (V111)
   answers *what do I hold*; every entry carries a NOT NULL `record_key`
   pointing at a row. The hash-first directory (CIRISEdge#552) needs a

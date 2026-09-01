@@ -50,11 +50,34 @@ fn producer_key(suffix: &str) -> (SigningKey, String, String) {
 /// reads). `put_public_key` is on `FederationDirectory`, implemented by
 /// all backends, so this stays dialect-agnostic.
 async fn register_producer<D: FederationDirectory>(dir: &D, key_id: &str, ed_pk_b64: &str) {
+    register_producer_with_pqc(dir, key_id, ed_pk_b64, None).await;
+}
+
+/// CIRISPersist#789 — register a key carrying its ML-DSA-65 pubkey.
+///
+/// The PQC pubkey is no longer stored per trace row and no longer read off the
+/// payload: admission resolves it from the DIRECTORY by `pqc_key_id`, and the
+/// read path rebuilds `TraceEventRow::pubkey_ml_dsa_65` the same way. So a
+/// producer's PQC key must exist in `federation_keys` for its traces to admit
+/// or to read back complete.
+///
+/// That is the contract, not a fixture inconvenience: verifying against the
+/// key the payload nominates proves only that whoever holds that key signed
+/// the payload, while the Ed25519 half was always checked against a key the
+/// directory vouches for. #789's measurement — `pqc_key_id` resolving for
+/// 100% of live rows, byte-identical to the directory's copy on every one —
+/// is what made closing that asymmetry safe.
+async fn register_producer_with_pqc<D: FederationDirectory>(
+    dir: &D,
+    key_id: &str,
+    ed_pk_b64: &str,
+    pqc_pk_b64: Option<String>,
+) {
     dir.put_public_key(SignedKeyRecord {
         record: KeyRecord {
             key_id: key_id.to_owned(),
             pubkey_ed25519_base64: ed_pk_b64.to_owned(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ml_dsa_65_base64: pqc_pk_b64,
             algorithm: ciris_persist::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: ciris_persist::federation::types::identity_type::AGENT.to_owned(),
             identity_ref: key_id.to_owned(),
@@ -313,6 +336,21 @@ async fn sqlite_trace_tier_hybrid_hard_cut() {
     // Register the producer Ed25519 key (inherent method, per backend).
     let (_sk, key_id, ed_pk_b64) = producer_key("sqlite");
     register_producer(&backend, &key_id, &ed_pk_b64).await;
+    // CIRISPersist#789 — the PQC key the traces name must be in the directory:
+    // admission resolves the ML-DSA pubkey from there rather than from the
+    // payload, and the read path rebuilds it from there too.
+    {
+        let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "hard-cut-mldsa")
+            .expect("pqc signer");
+        let pqc_pk = mldsa.public_key().await.expect("pqc pubkey");
+        register_producer_with_pqc(
+            &backend,
+            "hard-cut-mldsa",
+            &ed_pk_b64,
+            Some(BASE64.encode(&pqc_pk)),
+        )
+        .await;
+    }
     run_hard_cut_assertions(&backend, "sqlite").await;
 }
 
@@ -333,5 +371,20 @@ async fn postgres_trace_tier_hybrid_hard_cut() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let (_sk, key_id, ed_pk_b64) = producer_key(&suffix);
     register_producer(&backend, &key_id, &ed_pk_b64).await;
+    // CIRISPersist#789 — the PQC key the traces name must be in the directory:
+    // admission resolves the ML-DSA pubkey from there rather than from the
+    // payload, and the read path rebuilds it from there too.
+    {
+        let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "hard-cut-mldsa")
+            .expect("pqc signer");
+        let pqc_pk = mldsa.public_key().await.expect("pqc pubkey");
+        register_producer_with_pqc(
+            &backend,
+            "hard-cut-mldsa",
+            &ed_pk_b64,
+            Some(BASE64.encode(&pqc_pk)),
+        )
+        .await;
+    }
     run_hard_cut_assertions(&backend, &suffix).await;
 }
