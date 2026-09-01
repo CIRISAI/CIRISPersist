@@ -2539,6 +2539,28 @@ pub enum ServeTier {
 /// policy" is the same defect as "a failed read is indistinguishable from an
 /// absent grant". Absence must be a measurement, never a fallback.
 ///
+/// ## The one hole in that contract, stated rather than implied (#791)
+///
+/// Every read THIS function performs propagates. Leg A's does not, and it is
+/// not this function's to fix: `has_accord_conferred_role_over_roster` calls
+/// `verify_accord_family_coscrub`, which returns `Result<(), String>` and so
+/// flattens a transient directory read failure into the same shape as a failed
+/// verification — which leg A then maps to `Ok(false)`.
+///
+/// For leg A's four GATE callers that flattening is FAIL-SECURE and correct:
+/// a gate that cannot read should refuse. For a RESOLVER it is wrong, because
+/// refusing is indistinguishable from answering. The same function is right
+/// for one caller and wrong for the other, which is why the fix is to TYPE
+/// that error across all eight call sites without changing gate semantics —
+/// its own cut, tracked in #791.
+///
+/// Until then: a roster-read failure during canonical resolution can present
+/// as a LOWER tier rather than `Err`. Consumers gating retention on
+/// `>= MeshServer` should know that a canonical can transiently read as
+/// `MeshServer` or `None` under backend failure — never as a HIGHER tier than
+/// it holds, so the direction of the error is fail-secure even though the
+/// contract is not yet total.
+///
 /// # Precedence
 ///
 /// `Canonical` is checked FIRST and returns immediately. A key that is both
@@ -2590,6 +2612,41 @@ pub async fn resolve_serve_tier_over_roster<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // ── The subject must be a NODE before any rung is considered ──
+    //
+    // #788 review: `infra:serve` is server-class. Both rungs are defined over
+    // a node — the owner rung is an owner-binding whose dimension is literally
+    // `ownership:responsible_party:NODE:v1`, and the canonical rung is a
+    // `canonical,node` envelope. Nothing downstream re-checks this and role
+    // CLAIMS are intentionally free, so without it an owner-bound AGENT key
+    // that self-claims `infra:serve` would be handed `MeshServer`, and a
+    // consumer using this tier as the trace serve gate would authorize an
+    // agent key to serve.
+    //
+    // Read BEFORE either rung, and the read's failure PROPAGATES: a resolver
+    // that cannot read the subject's row must not answer "no serve standing".
+    let Some(subject_row) = directory.lookup_public_key(subject_key_id).await? else {
+        // Genuine absence — the lookup SUCCEEDED and reported nothing. A read
+        // failure propagated above instead.
+        return Ok(ServeTier::None);
+    };
+    if !super::types::identity_type::set_contains(
+        &subject_row.identity_type,
+        super::types::identity_type::NODE,
+    ) {
+        return Ok(ServeTier::None);
+    }
+
+    // ── Ambiguous ownership surfaces BEFORE any tier is returned ──
+    //
+    // #788 review: resolving Canonical first and returning early meant a
+    // canonical with two live owner bindings answered `Ok(Canonical)` and the
+    // operator never learned of the anomaly — contradicting this function's
+    // own promise that ambiguity propagates. Canonical standing does not
+    // DEPEND on an owner grant, but that is a reason to keep resolving, not a
+    // reason to suppress the error. Asked once, here, so both rungs inherit it.
+    let owner = super::admission::owner_of(directory, subject_key_id).await?;
+
     // ── Canonical: leg A ∧ leg B, both already spelled once elsewhere ──
     //
     // Composed rather than re-derived. Persist has spent several releases
@@ -2622,16 +2679,13 @@ where
     // VISIBILITY, never conferral", and AV-75's property that registering the
     // string is free. So the claim is a cheap precondition and the grant is
     // the actual gate.
-    let Some(row) = directory.lookup_public_key(subject_key_id).await? else {
-        // No row at all is genuine absence, not a failed read: the lookup
-        // succeeded and told us there is nothing here.
-        return Ok(ServeTier::None);
-    };
-    if !row.claims_role(INFRA_SERVE_SCOPE) {
+    // The row and the owner were both resolved above, before either rung —
+    // the node check needs the row and the ambiguity check needs the owner,
+    // and asking twice would be two reads that can disagree.
+    if !subject_row.claims_role(INFRA_SERVE_SCOPE) {
         return Ok(ServeTier::None);
     }
-
-    let Some(owner) = super::admission::owner_of(directory, subject_key_id).await? else {
+    let Some(owner) = owner else {
         // Claims the role, nobody owns it, and no accord conferral above.
         return Ok(ServeTier::None);
     };
@@ -2674,6 +2728,14 @@ where
             && a.attesting_key_id != subject_key_id
             && !dead.contains(&a.attestation_id)
             && !is_expired(a, now)
+            // #788 review — the ROW's `expires_at` is not the only temporal
+            // limit. The authoritative owner-binding fold also rejects a
+            // lapsed ENVELOPE-level `valid_until`, so checking `expires_at`
+            // alone let this resolver keep returning `MeshServer` after the
+            // serve grant had ended: two reads of "is this grant live"
+            // disagreeing, which is the two-lists class. The SAME predicate,
+            // not a second spelling of it.
+            && !super::admission::delegation_valid_until_lapsed(&a.attestation_envelope, now)
             && counts_in_capability_walk(a)
             && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
             && scope_contains(&a.attestation_envelope, scope)

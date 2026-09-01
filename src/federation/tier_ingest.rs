@@ -2035,6 +2035,119 @@ pub mod test_support {
              existence"
         );
 
+        // (3d) A grant whose ENVELOPE `valid_until` has lapsed confers nothing,
+        // even though the row's own `expires_at` is unset.
+        //
+        // #788 review: the authoritative owner-binding fold rejects a lapsed
+        // envelope `valid_until`; this resolver checked only the row column,
+        // so the two reads of "is this grant live" disagreed and the resolver
+        // kept reporting `MeshServer` after the serve grant had ended. Written
+        // with `expires_at` deliberately ABSENT so the envelope field is the
+        // only thing that can refuse it — a mutation removing the envelope
+        // check survives any fixture where the row column would also refuse.
+        // TWO bindings, which is what makes this reachable at all. A single
+        // lapsed binding is invisible to the defect: `owner_of` applies the
+        // same liveness rule, so the node would have NO owner and the resolver
+        // would return early without ever consulting the grant. The reviewer's
+        // scenario is an owner REFRESH — a live binding keeps ownership
+        // resolvable while an older serve grant has lapsed underneath it.
+        let lapsed_node = format!("lapsed-788-{suffix}");
+        register_identity_key(dir, &lapsed_node, "node,infra:serve").await;
+        for (scope, valid_until) in [
+            // The lapsed serve grant.
+            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00Z")),
+            // The refresh: live, and deliberately NOT bearing infra:serve, so
+            // ownership resolves while no live grant carries serve standing.
+            (ds::INFRA_NETWORK_PRESENCE, None),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [scope],
+            });
+            if let Some(vu) = valid_until {
+                env["valid_until"] = serde_json::Value::from(vu);
+            }
+            let mut binding = bare_attestation(&id, &owner, &lapsed_node, &env);
+            binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            binding.expires_at = None;
+            seal_row_in_place(&owner, &mut binding);
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) put binding: {e}"));
+        }
+
+        // Ownership still resolves — the refresh keeps it live. If this ever
+        // returns None the case below is vacuous, so it is asserted rather
+        // than assumed.
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &lapsed_node)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) owner_of lapsed_node: {e}"))
+                .as_deref(),
+            Some(owner.as_str()),
+            "({suffix}) the refresh binding must keep ownership resolvable, or \
+             this case cannot reach the grant check it exists to test"
+        );
+
+        assert_eq!(
+            resolve_serve_tier(dir, &lapsed_node, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve lapsed: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: a grant whose envelope `valid_until` has lapsed \
+             is not live — checking only the row's `expires_at` makes this \
+             resolver disagree with the authoritative owner-binding fold and \
+             keep serving standing that has ended"
+        );
+
+        // (3c) A NON-NODE subject gets no serve standing, however conferred.
+        //
+        // #788 review: `infra:serve` is server-class, both rungs are defined
+        // over a node, and nothing downstream re-checks it. Without this an
+        // owner-bound AGENT key that self-claims the role would be handed
+        // `MeshServer`, and a consumer using the tier as the trace serve gate
+        // would authorize an agent key to serve. Same owner, same binding,
+        // same claim as the passing case above — only the identity class
+        // differs, so this isolates exactly that.
+        let agent_claiming = format!("agent-serve-788-{suffix}");
+        register_identity_key(dir, &agent_claiming, "agent,infra:serve").await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut binding = bare_attestation(
+            &id,
+            &owner,
+            &agent_claiming,
+            &serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_SERVE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        seal_row_in_place(&owner, &mut binding);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) put agent binding: {e}"));
+
+        assert_eq!(
+            resolve_serve_tier(dir, &agent_claiming, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve agent: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: infra:serve is SERVER-CLASS — an agent key with \
+             a real owner conferral and a real claim still has no serve \
+             standing, or the tier authorizes an agent to serve traces"
+        );
+
         // (4) An unknown subject is absence, not an error: the lookup SUCCEEDED
         // and reported nothing. The distinction is the whole Exhibit-C contract
         // — see the ordering assertion below.

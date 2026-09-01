@@ -37,6 +37,24 @@ threat-model citations because this crate's audit story is the point.
   is present. That is #737's class ("an unconfigured gate is indistinguishable
   from a deliberate threshold-0 policy") on a second surface.
 
+  **Four review findings addressed** (PR #790). The node-class gate is the one
+  that mattered: nothing checked the subject was a node, so an owner-bound
+  AGENT key self-claiming `infra:serve` would have been handed `MeshServer`
+  and any consumer using the tier as the trace serve gate would authorize an
+  agent key to serve. Also: the resolver now applies the SAME liveness rule as
+  the authoritative owner-binding fold (row `expires_at` alone let it keep
+  reporting `MeshServer` after a grant's envelope `valid_until` had lapsed —
+  two reads of "is this live" disagreeing), and ambiguous ownership is
+  surfaced before the canonical early return rather than hidden by it.
+
+  One finding is **stated rather than fixed** (#791): leg A's
+  `verify_accord_family_coscrub` returns `Result<(), String>`, flattening a
+  transient read failure into the same shape as a failed verification, which
+  leg A maps to `Ok(false)`. That is fail-secure and correct for its four GATE
+  callers and wrong for a resolver — the same function, opposite requirements.
+  Direction is safe (a canonical can read LOWER, never higher), and the
+  resolver's doc says so precisely.
+
   Two facts worth recording because the obvious reading is wrong:
   - **The owner-binding row is itself the conferring edge.** It carries
     `scope: [infra:serve, …]` under the OWNERSHIP dimension, not
