@@ -34418,6 +34418,17 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#788 — the serve-tier ladder, sqlite arm.
+    #[tokio::test]
+    async fn resolve_serve_tier_sqlite_788() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_resolve_serve_tier_788(
+            &backend, "sq788",
+        )
+        .await;
+    }
+
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, sqlite arm.
     #[tokio::test]
     async fn node_speaks_for_owner_sqlite_765() {

@@ -11396,6 +11396,16 @@ mod tests {
         );
     }
 
+    /// CIRISPersist#788 — the serve-tier ladder, memory arm.
+    #[tokio::test]
+    async fn resolve_serve_tier_memory_788() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_resolve_serve_tier_788(
+            &backend, "mem788",
+        )
+        .await;
+    }
+
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, memory arm.
     #[tokio::test]
     async fn node_speaks_for_owner_memory_765() {

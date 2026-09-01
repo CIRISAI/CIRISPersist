@@ -30774,6 +30774,24 @@ mod tests {
         )
         .await;
     }
+    /// CIRISPersist#788 — the serve-tier ladder, POSTGRES arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn resolve_serve_tier_pg_788() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_resolve_serve_tier_788(
+            &backend, &suffix,
+        )
+        .await;
+    }
 
     /// v38.3.0 (CIRISPersist#765/#764) — node speaks for owner, postgres arm.
     #[tokio::test]

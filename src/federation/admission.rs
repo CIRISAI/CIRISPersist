@@ -5318,7 +5318,11 @@ fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> b
 /// NOT-lapsed (fail-open at read is wrong here — but a malformed binding is
 /// rejected at admission, so this branch is unreachable for admitted rows;
 /// we do not silently un-live a row on a parse quirk).
-fn delegation_valid_until_lapsed(
+/// Exposed `pub(crate)` for CIRISPersist#788's serve-tier resolver, so it
+/// applies the SAME liveness rule as the authoritative owner-binding fold.
+/// Two reads of "is this grant still live" that disagree is the two-lists
+/// class, and this one is the authority.
+pub(crate) fn delegation_valid_until_lapsed(
     envelope: &serde_json::Value,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {

@@ -1903,6 +1903,273 @@ pub mod test_support {
         );
     }
 
+    /// CIRISPersist#788 — the serve-tier ladder, on a real directory.
+    ///
+    /// The rung that had no resolver is `MeshServer`, and the thing worth
+    /// witnessing is that it takes BOTH halves: the owner's conferral AND the
+    /// subject's own claim. Either alone is `None`, which is what makes
+    /// `claims_role` visibility-not-conferral (v19.0.0) enforceable rather than
+    /// merely documented — registering the string buys nothing (AV-75).
+    pub(crate) async fn exercise_resolve_serve_tier_788(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::trust_root::{resolve_serve_tier, ServeTier};
+        use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+
+        let owner = format!("owner-788-{suffix}");
+        let served = format!("node-788-{suffix}");
+        let unclaimed = format!("quiet-788-{suffix}");
+        let orphan = format!("orphan-788-{suffix}");
+        let resolver = format!("resolver-788-{suffix}");
+        register_user_role_key(dir, &owner).await;
+        register_hybrid_key(dir, &resolver).await;
+        // The claim rides `identity_type` as a SET — `claims_role` reads either
+        // surface, and this is the one a node row actually carries.
+        register_identity_key(dir, &served, "node,infra:serve").await;
+        register_identity_key(dir, &unclaimed, "node").await;
+        register_identity_key(dir, &orphan, "node,infra:serve").await;
+
+        // Both nodes get the SAME owner-binding, bearing infra:serve. The only
+        // difference between them is whether the subject claims the role, so
+        // the assertions below isolate exactly that.
+        for node in [&served, &unclaimed] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut binding = bare_attestation(
+                &id,
+                &owner,
+                node,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": "delegates_to",
+                    "dimension": owner_binding::DIMENSION,
+                    "delegation_purpose": owner_binding::PURPOSE,
+                    "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                }),
+            );
+            binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            seal_row_in_place(&owner, &mut binding);
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) put owner-binding: {e}"));
+        }
+
+        // (1) Conferred AND claimed ⇒ MeshServer. This is the rung that had no
+        // resolver at all: before #788 an owner-conferred-only server could not
+        // be recognized as one, so a fleet's storage helpers were canonicals
+        // only rather than "any conferred server helps".
+        assert_eq!(
+            resolve_serve_tier(dir, &served, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve served: {e}")),
+            ServeTier::MeshServer,
+            "({suffix}) #788: an owner-conferred node that claims infra:serve is \
+             a mesh server"
+        );
+
+        // (2) Conferred but NOT claimed ⇒ None. The owner offering the
+        // capability is not the operator taking it up.
+        assert_eq!(
+            resolve_serve_tier(dir, &unclaimed, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve unclaimed: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: an owner may confer serve standing, but a node \
+             that does not claim it is not serving"
+        );
+
+        // (3) Claimed but NOT conferred ⇒ None. The AV-75 property: the string
+        // is free, so it must buy nothing on its own. `orphan` claims it and
+        // has no owner-binding at all.
+        assert_eq!(
+            resolve_serve_tier(dir, &orphan, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve orphan: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: a self-asserted infra:serve with no owner \
+             conferral confers nothing — claiming is VISIBILITY, never \
+             conferral (v19.0.0)"
+        );
+
+        // (3b) OWNED, and the owner granted something else — still None.
+        //
+        // This is the case (3) cannot reach: `orphan` has no owner at all, so
+        // it returns early at `owner_of` and never exercises the grant check.
+        // A mutation that dropped the grant requirement entirely SURVIVED the
+        // first draft of this witness for exactly that reason. The scope on
+        // the binding is what must carry serve standing, so a binding bearing
+        // only `infra:network_presence` must confer none of it.
+        let owned_no_serve = format!("owned-ns-788-{suffix}");
+        register_identity_key(dir, &owned_no_serve, "node,infra:serve").await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut binding = bare_attestation(
+            &id,
+            &owner,
+            &owned_no_serve,
+            &serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_NETWORK_PRESENCE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        seal_row_in_place(&owner, &mut binding);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) put presence-only binding: {e}"));
+
+        assert_eq!(
+            resolve_serve_tier(dir, &owned_no_serve, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve owned_no_serve: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: an owner-binding that does NOT bear infra:serve \
+             confers no serve standing, however loudly the node claims it — \
+             the SCOPE on the grant is the conferral, not the binding's \
+             existence"
+        );
+
+        // (3d) A grant whose ENVELOPE `valid_until` has lapsed confers nothing,
+        // even though the row's own `expires_at` is unset.
+        //
+        // #788 review: the authoritative owner-binding fold rejects a lapsed
+        // envelope `valid_until`; this resolver checked only the row column,
+        // so the two reads of "is this grant live" disagreed and the resolver
+        // kept reporting `MeshServer` after the serve grant had ended. Written
+        // with `expires_at` deliberately ABSENT so the envelope field is the
+        // only thing that can refuse it — a mutation removing the envelope
+        // check survives any fixture where the row column would also refuse.
+        // TWO bindings, which is what makes this reachable at all. A single
+        // lapsed binding is invisible to the defect: `owner_of` applies the
+        // same liveness rule, so the node would have NO owner and the resolver
+        // would return early without ever consulting the grant. The reviewer's
+        // scenario is an owner REFRESH — a live binding keeps ownership
+        // resolvable while an older serve grant has lapsed underneath it.
+        let lapsed_node = format!("lapsed-788-{suffix}");
+        register_identity_key(dir, &lapsed_node, "node,infra:serve").await;
+        for (scope, valid_until) in [
+            // The lapsed serve grant.
+            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00Z")),
+            // The refresh: live, and deliberately NOT bearing infra:serve, so
+            // ownership resolves while no live grant carries serve standing.
+            (ds::INFRA_NETWORK_PRESENCE, None),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [scope],
+            });
+            if let Some(vu) = valid_until {
+                env["valid_until"] = serde_json::Value::from(vu);
+            }
+            let mut binding = bare_attestation(&id, &owner, &lapsed_node, &env);
+            binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            binding.expires_at = None;
+            seal_row_in_place(&owner, &mut binding);
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) put binding: {e}"));
+        }
+
+        // Ownership still resolves — the refresh keeps it live. If this ever
+        // returns None the case below is vacuous, so it is asserted rather
+        // than assumed.
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &lapsed_node)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) owner_of lapsed_node: {e}"))
+                .as_deref(),
+            Some(owner.as_str()),
+            "({suffix}) the refresh binding must keep ownership resolvable, or \
+             this case cannot reach the grant check it exists to test"
+        );
+
+        assert_eq!(
+            resolve_serve_tier(dir, &lapsed_node, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve lapsed: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: a grant whose envelope `valid_until` has lapsed \
+             is not live — checking only the row's `expires_at` makes this \
+             resolver disagree with the authoritative owner-binding fold and \
+             keep serving standing that has ended"
+        );
+
+        // (3c) A NON-NODE subject gets no serve standing, however conferred.
+        //
+        // #788 review: `infra:serve` is server-class, both rungs are defined
+        // over a node, and nothing downstream re-checks it. Without this an
+        // owner-bound AGENT key that self-claims the role would be handed
+        // `MeshServer`, and a consumer using the tier as the trace serve gate
+        // would authorize an agent key to serve. Same owner, same binding,
+        // same claim as the passing case above — only the identity class
+        // differs, so this isolates exactly that.
+        let agent_claiming = format!("agent-serve-788-{suffix}");
+        register_identity_key(dir, &agent_claiming, "agent,infra:serve").await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut binding = bare_attestation(
+            &id,
+            &owner,
+            &agent_claiming,
+            &serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_SERVE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        seal_row_in_place(&owner, &mut binding);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) put agent binding: {e}"));
+
+        assert_eq!(
+            resolve_serve_tier(dir, &agent_claiming, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve agent: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: infra:serve is SERVER-CLASS — an agent key with \
+             a real owner conferral and a real claim still has no serve \
+             standing, or the tier authorizes an agent to serve traces"
+        );
+
+        // (4) An unknown subject is absence, not an error: the lookup SUCCEEDED
+        // and reported nothing. The distinction is the whole Exhibit-C contract
+        // — see the ordering assertion below.
+        assert_eq!(
+            resolve_serve_tier(dir, &format!("ghost-788-{suffix}"), &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve ghost: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: a key with no row has no serve standing"
+        );
+
+        // (5) The ladder is ORDERED, and consumers gate on `>=`. Spelled as a
+        // comparison rather than three equalities because that is how the
+        // consumer will use it, and an ordering that silently changed would
+        // otherwise only show up at their call site.
+        assert!(
+            ServeTier::Canonical > ServeTier::MeshServer && ServeTier::MeshServer > ServeTier::None,
+            "({suffix}) #788: the rungs must stay ordered least-to-most — \
+             `tier >= MeshServer` is the shape edge gates on"
+        );
+    }
+
     /// v38.3.0 (CIRISPersist#765 + #764) — **a node speaks for its owner**:
     /// the exact shape CIRISServer's two-node chat ladder refused forever at
     /// v38.2's community door.
