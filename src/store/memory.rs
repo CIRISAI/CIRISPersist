@@ -403,6 +403,16 @@ struct State {
     /// content-hash index: `(kind, content_hash) -> record_key`. Memory
     /// mirror of the `signed_wire_index` table.
     signed_wire_index: HashMap<(String, String), String>,
+    /// CIRISPersist#785 — mirror of the `known_wire_hashes` table:
+    /// records this node has HEARD EXIST and deliberately does not hold.
+    ///
+    /// A SEPARATE map from `signed_wire_index` above, for the same reason the
+    /// SQL backends use a separate table: if a known-but-not-held hash ever
+    /// reaches the holdings read, the node concludes it already has
+    /// everything it has merely heard of and silently stops fetching. Note
+    /// the value shapes differ too — the wire index stores a `record_key`
+    /// pointing at a held row, which these entries have no such thing as.
+    known_wire_hashes: HashMap<(String, String), (chrono::DateTime<chrono::Utc>, Option<String>)>,
 }
 
 /// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
@@ -768,6 +778,7 @@ impl Default for MemoryBackend {
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
                 federation_location_proof_authority_sigs: HashMap::new(),
                 signed_wire_index: HashMap::new(),
+                known_wire_hashes: HashMap::new(),
             }),
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
@@ -4047,6 +4058,96 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         hashes.sort();
         hashes.truncate(limit as usize);
         Ok(hashes)
+    }
+
+    /// CIRISPersist#785 — record that a hash EXISTS, unheld.
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Matches the SQL backends' upsert: the same hash arrives on every
+        // wrap of edge's re-sweep, and `last_advertised_at` must MOVE on each
+        // sighting or the eviction floor is measured against a frozen value
+        // (#776) — but it must move FORWARDS ONLY. Execution order is not
+        // observation order, so a delayed write carrying an older sighting
+        // would otherwise drag the column backwards and let the next sweep
+        // evict a hash that was recently advertised.
+        let entry = state
+            .known_wire_hashes
+            .entry((kind.to_owned(), content_hash.to_owned()))
+            .or_insert((now, advertised_by.map(str::to_owned)));
+        if now > entry.0 {
+            *entry = (now, advertised_by.map(str::to_owned));
+        }
+        Ok(())
+    }
+
+    /// CIRISPersist#785 — is this hash known to exist?
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .known_wire_hashes
+            .contains_key(&(kind.to_owned(), content_hash.to_owned())))
+    }
+
+    /// CIRISPersist#785 — page the known set, cursored on the HASH.
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::KnownWireHash>, crate::federation::Error> {
+        let after = after_content_hash.unwrap_or("");
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<crate::federation::KnownWireHash> = state
+            .known_wire_hashes
+            .iter()
+            .filter(|((k, h), _)| k == kind && h.as_str() > after)
+            .map(|((k, h), (ts, by))| crate::federation::KnownWireHash {
+                kind: k.clone(),
+                content_hash: h.clone(),
+                last_advertised_at: *ts,
+                advertised_by: by.clone(),
+            })
+            .collect();
+        // Ordered by HASH, like the SQL backends page over the primary key —
+        // a caller's cursor must not skip entries on one backend and not
+        // another. Deliberately NOT by `last_advertised_at`: that column moves
+        // on every re-advertisement, so a row bumped mid-iteration would jump
+        // the cursor and be skipped permanently.
+        out.sort_by(|a, b| a.content_hash.cmp(&b.content_hash));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    /// CIRISPersist#785 — evict on a CALLER-SUPPLIED cutoff; the
+    /// floor wins over the bound.
+    async fn evict_known_wire_hashes(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.known_wire_hashes.len() as u64;
+        state.known_wire_hashes.retain(|_, (ts, _)| *ts >= cutoff);
+        let remaining = state.known_wire_hashes.len() as u64;
+        Ok(crate::federation::KnownHashEviction {
+            evicted: before.saturating_sub(remaining),
+            remaining,
+            over_bound_by: remaining.saturating_sub(bound),
+        })
     }
 
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
@@ -15209,6 +15310,49 @@ mod tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — reachable through the public double, memory.
+    #[tokio::test]
+    async fn known_hashes_reachable_through_the_double_memory_785() {
+        let backend = std::sync::Arc::new(MemoryBackend::new());
+        crate::federation::operational::test_support::exercise_known_hashes_reachable_through_the_double_785(
+            backend, "mem785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, memory.
+    #[tokio::test]
+    async fn known_hash_monotonic_and_canonical_memory_785() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend, "mem785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — the known set never reaches the holdings
+    /// read. See the shared body for why this cannot be left to a review: the
+    /// failure is silent on both sides.
+    #[tokio::test]
+    async fn known_hashes_never_reach_holdings_memory_785() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_known_hashes_never_reach_holdings_785(
+            &backend, "mem785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — `last_advertised_at` moves on
+    /// re-advertisement (the #776 shape), and the floor wins over the bound.
+    #[tokio::test]
+    async fn known_hash_ageing_and_eviction_memory_785() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_known_hash_ageing_and_eviction_785(
+            &backend, "mem785",
+        )
+        .await;
     }
 
     /// **CIRISPersist#547 — a mutated row must be able to serve the Key ref it

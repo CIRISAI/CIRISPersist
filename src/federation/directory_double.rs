@@ -134,514 +134,14 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 81 delegations, generated. Every one: fault first, then delegate.
+// 87 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
-    async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_public_key") {
+    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("accord_nonce_issued") {
             return Err(e);
         }
-        self.inner.put_public_key(record).await
-    }
-    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error> {
-        if let Some(e) = self.faulted("lookup_public_key") {
-            return Err(e);
-        }
-        self.inner.lookup_public_key(key_id).await
-    }
-    async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error> {
-        if let Some(e) = self.faulted("lookup_keys_for_identity") {
-            return Err(e);
-        }
-        self.inner.lookup_keys_for_identity(identity_ref).await
-    }
-    async fn list_keys_by_identity_type(
-        &self,
-        identity_type: &str,
-    ) -> Result<Vec<KeyRecord>, Error> {
-        if let Some(e) = self.faulted("list_keys_by_identity_type") {
-            return Err(e);
-        }
-        self.inner.list_keys_by_identity_type(identity_type).await
-    }
-    async fn set_consent_role(
-        &self,
-        key_id: &str,
-        consent_role: Option<&str>,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("set_consent_role") {
-            return Err(e);
-        }
-        self.inner.set_consent_role(key_id, consent_role).await
-    }
-    async fn put_attestation(
-        &self,
-        attestation: SignedAttestation,
-    ) -> Result<AttestationOutcome, Error> {
-        if let Some(e) = self.faulted("put_attestation") {
-            return Err(e);
-        }
-        self.inner.put_attestation(attestation).await
-    }
-    async fn attestation_upsert_local(
-        &self,
-        input: crate::federation::types::LocalAttestationInput,
-    ) -> Result<String, Error> {
-        if let Some(e) = self.faulted("attestation_upsert_local") {
-            return Err(e);
-        }
-        self.inner.attestation_upsert_local(input).await
-    }
-    async fn attestation_insert_local(
-        &self,
-        input: crate::federation::types::LocalAttestationInput,
-    ) -> Result<String, Error> {
-        if let Some(e) = self.faulted("attestation_insert_local") {
-            return Err(e);
-        }
-        self.inner.attestation_insert_local(input).await
-    }
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_for") {
-            return Err(e);
-        }
-        self.inner.list_attestations_for(attested_key_id).await
-    }
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_by") {
-            return Err(e);
-        }
-        self.inner.list_attestations_by(attesting_key_id).await
-    }
-    async fn attestations_binding_content(
-        &self,
-        content_sha256: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("attestations_binding_content") {
-            return Err(e);
-        }
-        self.inner
-            .attestations_binding_content(content_sha256)
-            .await
-    }
-    async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_revocation") {
-            return Err(e);
-        }
-        self.inner.put_revocation(revocation).await
-    }
-    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
-        if let Some(e) = self.faulted("revocations_for") {
-            return Err(e);
-        }
-        self.inner.revocations_for(revoked_key_id).await
-    }
-    async fn put_identity_occurrence(
-        &self,
-        occurrence: SignedIdentityOccurrence,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence") {
-            return Err(e);
-        }
-        self.inner.put_identity_occurrence(occurrence).await
-    }
-    async fn list_identity_occurrences_for(
-        &self,
-        identity_key_id: &str,
-    ) -> Result<Vec<IdentityOccurrence>, Error> {
-        if let Some(e) = self.faulted("list_identity_occurrences_for") {
-            return Err(e);
-        }
-        self.inner
-            .list_identity_occurrences_for(identity_key_id)
-            .await
-    }
-    async fn lookup_identity_for_occurrence(
-        &self,
-        occurrence_key_id: &str,
-    ) -> Result<Option<IdentityOccurrence>, Error> {
-        if let Some(e) = self.faulted("lookup_identity_for_occurrence") {
-            return Err(e);
-        }
-        self.inner
-            .lookup_identity_for_occurrence(occurrence_key_id)
-            .await
-    }
-    async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_family") {
-            return Err(e);
-        }
-        self.inner.put_family(family).await
-    }
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: types::FamilyMember,
-        spec: &cohort::AdmitSpec,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("add_family_member") {
-            return Err(e);
-        }
-        self.inner
-            .add_family_member(family_key_id, member, spec)
-            .await
-    }
-    async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error> {
-        if let Some(e) = self.faulted("lookup_family") {
-            return Err(e);
-        }
-        self.inner.lookup_family(family_key_id).await
-    }
-    async fn list_families_for_member(
-        &self,
-        member_identity_key_id: &str,
-    ) -> Result<Vec<Family>, Error> {
-        if let Some(e) = self.faulted("list_families_for_member") {
-            return Err(e);
-        }
-        self.inner
-            .list_families_for_member(member_identity_key_id)
-            .await
-    }
-    async fn put_community(&self, community: SignedCommunity) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_community") {
-            return Err(e);
-        }
-        self.inner.put_community(community).await
-    }
-    async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
-        if let Some(e) = self.faulted("lookup_community") {
-            return Err(e);
-        }
-        self.inner.lookup_community(community_key_id).await
-    }
-    async fn list_communities_for_member(
-        &self,
-        member_identity_key_id: &str,
-    ) -> Result<Vec<Community>, Error> {
-        if let Some(e) = self.faulted("list_communities_for_member") {
-            return Err(e);
-        }
-        self.inner
-            .list_communities_for_member(member_identity_key_id)
-            .await
-    }
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence_revocation") {
-            return Err(e);
-        }
-        self.inner
-            .put_identity_occurrence_revocation(revocation)
-            .await
-    }
-    async fn put_family_membership_revocation(
-        &self,
-        revocation: SignedFamilyMembershipRevocation,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_family_membership_revocation") {
-            return Err(e);
-        }
-        self.inner
-            .put_family_membership_revocation(revocation)
-            .await
-    }
-    async fn put_community_membership_revocation(
-        &self,
-        revocation: SignedCommunityMembershipRevocation,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_community_membership_revocation") {
-            return Err(e);
-        }
-        self.inner
-            .put_community_membership_revocation(revocation)
-            .await
-    }
-    async fn list_identity_occurrence_revocations_for(
-        &self,
-        identity_key_id: &str,
-    ) -> Result<Vec<IdentityOccurrenceRevocation>, Error> {
-        if let Some(e) = self.faulted("list_identity_occurrence_revocations_for") {
-            return Err(e);
-        }
-        self.inner
-            .list_identity_occurrence_revocations_for(identity_key_id)
-            .await
-    }
-    async fn list_family_membership_revocations_for(
-        &self,
-        family_key_id: &str,
-    ) -> Result<Vec<FamilyMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_family_membership_revocations_for") {
-            return Err(e);
-        }
-        self.inner
-            .list_family_membership_revocations_for(family_key_id)
-            .await
-    }
-    async fn list_community_membership_revocations_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_community_membership_revocations_for") {
-            return Err(e);
-        }
-        self.inner
-            .list_community_membership_revocations_for(community_key_id)
-            .await
-    }
-    async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_location_proof") {
-            return Err(e);
-        }
-        self.inner.put_location_proof(proof).await
-    }
-    async fn list_location_proofs_for(
-        &self,
-        subject_key_id: &str,
-    ) -> Result<Vec<LocationProof>, Error> {
-        if let Some(e) = self.faulted("list_location_proofs_for") {
-            return Err(e);
-        }
-        self.inner.list_location_proofs_for(subject_key_id).await
-    }
-    async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
-        if let Some(e) = self.faulted("communities_containing") {
-            return Err(e);
-        }
-        self.inner.communities_containing(cell_id).await
-    }
-    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_organization") {
-            return Err(e);
-        }
-        self.inner.put_organization(signed).await
-    }
-    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_org_membership") {
-            return Err(e);
-        }
-        self.inner.put_org_membership(signed).await
-    }
-    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_partner_record") {
-            return Err(e);
-        }
-        self.inner.put_partner_record(signed).await
-    }
-    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
-        if let Some(e) = self.faulted("list_organizations_for") {
-            return Err(e);
-        }
-        self.inner.list_organizations_for(org_id).await
-    }
-    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
-        if let Some(e) = self.faulted("list_org_memberships_for") {
-            return Err(e);
-        }
-        self.inner.list_org_memberships_for(org_id).await
-    }
-    async fn list_partner_records_for(
-        &self,
-        license_id: &str,
-    ) -> Result<Vec<PartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_partner_records_for") {
-            return Err(e);
-        }
-        self.inner.list_partner_records_for(license_id).await
-    }
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrganization>, Error> {
-        if let Some(e) = self.faulted("list_organizations_since") {
-            return Err(e);
-        }
-        self.inner.list_organizations_since(since, limit).await
-    }
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrgMembership>, Error> {
-        if let Some(e) = self.faulted("list_org_memberships_since") {
-            return Err(e);
-        }
-        self.inner.list_org_memberships_since(since, limit).await
-    }
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedPartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_partner_records_since") {
-            return Err(e);
-        }
-        self.inner.list_partner_records_since(since, limit).await
-    }
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedSignedPartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_signed_partner_records_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_partner_records_since(since, limit)
-            .await
-    }
-    async fn list_signed_families_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedFamily>, Error> {
-        if let Some(e) = self.faulted("list_signed_families_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_families_since(since, limit).await
-    }
-    async fn list_signed_communities_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunity>, Error> {
-        if let Some(e) = self.faulted("list_signed_communities_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_communities_since(since, limit).await
-    }
-    async fn list_signed_location_proofs_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedLocationProof>, Error> {
-        if let Some(e) = self.faulted("list_signed_location_proofs_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_location_proofs_since(since, limit)
-            .await
-    }
-    async fn list_signed_family_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_family_membership_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_family_membership_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_community_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_community_membership_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_community_membership_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedKeyRecord>, Error> {
-        if let Some(e) = self.faulted("list_signed_key_records_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_key_records_since(since, limit).await
-    }
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrences_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrences_since(since, limit)
-            .await
-    }
-    async fn list_signed_transport_destinations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedTransportDestination>, Error> {
-        if let Some(e) = self.faulted("list_signed_transport_destinations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_transport_destinations_since(since, limit)
-            .await
-    }
-    async fn list_attestations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedAttestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_since") {
-            return Err(e);
-        }
-        self.inner.list_attestations_since(since, limit).await
-    }
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrence_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrence_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_revocations_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_revocations_since(since, limit).await
-    }
-    async fn list_signed_accord_quorum_evidence_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error> {
-        if let Some(e) = self.faulted("list_signed_accord_quorum_evidence_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_accord_quorum_evidence_since(since, limit)
-            .await
-    }
-    async fn apply_replicated_accord_evidence(
-        &self,
-        evidence: &accord_carriage::AccordQuorumEvidence,
-    ) -> Result<accord_carriage::AccordEvidenceAdmission, Error> {
-        if let Some(e) = self.faulted("apply_replicated_accord_evidence") {
-            return Err(e);
-        }
-        self.inner.apply_replicated_accord_evidence(evidence).await
+        self.inner.accord_nonce_issued(family_key_id, nonce).await
     }
     async fn add_community_member(
         &self,
@@ -656,28 +156,39 @@ impl FederationDirectory for FaultInjectingDirectory {
             .add_community_member(community_key_id, member, spec)
             .await
     }
-    async fn supersede_group_row(
+    async fn add_family_member(
         &self,
-        cohort: cohort::Cohort,
-        new_snapshot: serde_json::Value,
-        authorization: Option<serde_json::Value>,
-    ) -> Result<u32, Error> {
-        if let Some(e) = self.faulted("supersede_group_row") {
+        family_key_id: &str,
+        member: types::FamilyMember,
+        spec: &cohort::AdmitSpec,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("add_family_member") {
             return Err(e);
         }
         self.inner
-            .supersede_group_row(cohort, new_snapshot, authorization)
+            .add_family_member(family_key_id, member, spec)
             .await
     }
-    async fn list_group_versions(
+    async fn apply_replicated_accord_evidence(
         &self,
-        cohort: cohort::Cohort,
-        group_key_id: &str,
-    ) -> Result<Vec<cohort::GroupVersion>, Error> {
-        if let Some(e) = self.faulted("list_group_versions") {
+        evidence: &accord_carriage::AccordQuorumEvidence,
+    ) -> Result<accord_carriage::AccordEvidenceAdmission, Error> {
+        if let Some(e) = self.faulted("apply_replicated_accord_evidence") {
             return Err(e);
         }
-        self.inner.list_group_versions(cohort, group_key_id).await
+        self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    async fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("attach_attestation_pqc_signature") {
+            return Err(e);
+        }
+        self.inner
+            .attach_attestation_pqc_signature(attestation_id, scrub_signature_pqc)
+            .await
     }
     async fn attach_key_pqc_signature(
         &self,
@@ -692,18 +203,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)
             .await
     }
-    async fn attach_attestation_pqc_signature(
-        &self,
-        attestation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("attach_attestation_pqc_signature") {
-            return Err(e);
-        }
-        self.inner
-            .attach_attestation_pqc_signature(attestation_id, scrub_signature_pqc)
-            .await
-    }
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
@@ -716,58 +215,63 @@ impl FederationDirectory for FaultInjectingDirectory {
             .attach_revocation_pqc_signature(revocation_id, scrub_signature_pqc)
             .await
     }
-    async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
-        if let Some(e) = self.faulted("get_attestation") {
+    async fn attestation_insert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error> {
+        if let Some(e) = self.faulted("attestation_insert_local") {
             return Err(e);
         }
-        self.inner.get_attestation(attestation_id).await
+        self.inner.attestation_insert_local(input).await
     }
-    async fn promote_attestation(
+    async fn attestation_upsert_local(
         &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &AttestationReseal,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("promote_attestation") {
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error> {
+        if let Some(e) = self.faulted("attestation_upsert_local") {
+            return Err(e);
+        }
+        self.inner.attestation_upsert_local(input).await
+    }
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("attestations_binding_content") {
             return Err(e);
         }
         self.inner
-            .promote_attestation(attestation_id, cohort_scope, reseal)
+            .attestations_binding_content(content_sha256)
             .await
     }
-    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_keys") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_keys(limit).await
-    }
-    async fn list_hybrid_pending_attestations(
+    async fn clear_active_halt(
         &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_attestations") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_attestations(limit).await
-    }
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_revocations") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_revocations(limit).await
-    }
-    async fn list_held_fountain_content(
-        &self,
-        publisher_key_id: &str,
-    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
-        if let Some(e) = self.faulted("list_held_fountain_content") {
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("clear_active_halt") {
             return Err(e);
         }
         self.inner
-            .list_held_fountain_content(publisher_key_id)
+            .clear_active_halt(family_key_id, active_halt_id)
+            .await
+    }
+    async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
+        if let Some(e) = self.faulted("communities_containing") {
+            return Err(e);
+        }
+        self.inner.communities_containing(cell_id).await
+    }
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("evict_fountain_content_hard_delete") {
+            return Err(e);
+        }
+        self.inner
+            .evict_fountain_content_hard_delete(content_id, corpus_kind)
             .await
     }
     async fn evict_fountain_content_to_tier(
@@ -783,29 +287,24 @@ impl FederationDirectory for FaultInjectingDirectory {
             .evict_fountain_content_to_tier(content_id, corpus_kind, tier)
             .await
     }
-    async fn evict_fountain_content_hard_delete(
+    async fn evict_known_wire_hashes(
         &self,
-        content_id: &str,
-        corpus_kind: &str,
-    ) -> Result<u64, Error> {
-        if let Some(e) = self.faulted("evict_fountain_content_hard_delete") {
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<KnownHashEviction, Error> {
+        if let Some(e) = self.faulted("evict_known_wire_hashes") {
             return Err(e);
         }
-        self.inner
-            .evict_fountain_content_hard_delete(content_id, corpus_kind)
-            .await
+        self.inner.evict_known_wire_hashes(cutoff, bound).await
     }
-    async fn put_accord_proposal(
+    async fn get_accord_decision(
         &self,
-        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
-        authority_signature: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_accord_proposal") {
+        proposal_digest: &str,
+    ) -> Result<Option<accord_quorum::StoredDecision>, Error> {
+        if let Some(e) = self.faulted("get_accord_decision") {
             return Err(e);
         }
-        self.inner
-            .put_accord_proposal(proposal, authority_signature)
-            .await
+        self.inner.get_accord_decision(proposal_digest).await
     }
     async fn get_accord_proposal(
         &self,
@@ -815,6 +314,62 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.get_accord_proposal(proposal_digest).await
+    }
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<accord_quorum::ActiveHalt>, Error> {
+        if let Some(e) = self.faulted("get_active_halt") {
+            return Err(e);
+        }
+        self.inner.get_active_halt(family_key_id).await
+    }
+    async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
+        if let Some(e) = self.faulted("get_attestation") {
+            return Err(e);
+        }
+        self.inner.get_attestation(attestation_id).await
+    }
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("insert_known_wire_hash") {
+            return Err(e);
+        }
+        self.inner
+            .insert_known_wire_hash(kind, content_hash, advertised_by, now)
+            .await
+    }
+    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error> {
+        if let Some(e) = self.faulted("issue_accord_nonce") {
+            return Err(e);
+        }
+        self.inner.issue_accord_nonce(family_key_id, nonce).await
+    }
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("known_wire_hash_contains") {
+            return Err(e);
+        }
+        self.inner
+            .known_wire_hash_contains(kind, content_hash)
+            .await
+    }
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<accord_quorum::StoredParticipation>, Error> {
+        if let Some(e) = self.faulted("list_accord_participations") {
+            return Err(e);
+        }
+        self.inner.list_accord_participations(proposal_digest).await
     }
     async fn list_accord_proposals_by_anchor(
         &self,
@@ -826,6 +381,448 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_accord_proposals_by_anchor(action, prior_family_digest)
+            .await
+    }
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_by") {
+            return Err(e);
+        }
+        self.inner.list_attestations_by(attesting_key_id).await
+    }
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_for") {
+            return Err(e);
+        }
+        self.inner.list_attestations_for(attested_key_id).await
+    }
+    async fn list_attestations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedAttestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_since") {
+            return Err(e);
+        }
+        self.inner.list_attestations_since(since, limit).await
+    }
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error> {
+        if let Some(e) = self.faulted("list_communities_for_member") {
+            return Err(e);
+        }
+        self.inner
+            .list_communities_for_member(member_identity_key_id)
+            .await
+    }
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_community_membership_revocations_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_community_membership_revocations_for(community_key_id)
+            .await
+    }
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Family>, Error> {
+        if let Some(e) = self.faulted("list_families_for_member") {
+            return Err(e);
+        }
+        self.inner
+            .list_families_for_member(member_identity_key_id)
+            .await
+    }
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<FamilyMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_family_membership_revocations_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_family_membership_revocations_for(family_key_id)
+            .await
+    }
+    async fn list_group_versions(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupVersion>, Error> {
+        if let Some(e) = self.faulted("list_group_versions") {
+            return Err(e);
+        }
+        self.inner.list_group_versions(cohort, group_key_id).await
+    }
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
+        if let Some(e) = self.faulted("list_held_fountain_content") {
+            return Err(e);
+        }
+        self.inner
+            .list_held_fountain_content(publisher_key_id)
+            .await
+    }
+    async fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<HybridPendingRow>, Error> {
+        if let Some(e) = self.faulted("list_hybrid_pending_attestations") {
+            return Err(e);
+        }
+        self.inner.list_hybrid_pending_attestations(limit).await
+    }
+    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
+        if let Some(e) = self.faulted("list_hybrid_pending_keys") {
+            return Err(e);
+        }
+        self.inner.list_hybrid_pending_keys(limit).await
+    }
+    async fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<HybridPendingRow>, Error> {
+        if let Some(e) = self.faulted("list_hybrid_pending_revocations") {
+            return Err(e);
+        }
+        self.inner.list_hybrid_pending_revocations(limit).await
+    }
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrenceRevocation>, Error> {
+        if let Some(e) = self.faulted("list_identity_occurrence_revocations_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_identity_occurrence_revocations_for(identity_key_id)
+            .await
+    }
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        if let Some(e) = self.faulted("list_identity_occurrences_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_identity_occurrences_for(identity_key_id)
+            .await
+    }
+    async fn list_keys_by_identity_type(
+        &self,
+        identity_type: &str,
+    ) -> Result<Vec<KeyRecord>, Error> {
+        if let Some(e) = self.faulted("list_keys_by_identity_type") {
+            return Err(e);
+        }
+        self.inner.list_keys_by_identity_type(identity_type).await
+    }
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<KnownWireHash>, Error> {
+        if let Some(e) = self.faulted("list_known_wire_hashes_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_known_wire_hashes_since(kind, after_content_hash, limit)
+            .await
+    }
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<LocationProof>, Error> {
+        if let Some(e) = self.faulted("list_location_proofs_for") {
+            return Err(e);
+        }
+        self.inner.list_location_proofs_for(subject_key_id).await
+    }
+    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
+        if let Some(e) = self.faulted("list_org_memberships_for") {
+            return Err(e);
+        }
+        self.inner.list_org_memberships_for(org_id).await
+    }
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedOrgMembership>, Error> {
+        if let Some(e) = self.faulted("list_org_memberships_since") {
+            return Err(e);
+        }
+        self.inner.list_org_memberships_since(since, limit).await
+    }
+    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
+        if let Some(e) = self.faulted("list_organizations_for") {
+            return Err(e);
+        }
+        self.inner.list_organizations_for(org_id).await
+    }
+    async fn list_organizations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedOrganization>, Error> {
+        if let Some(e) = self.faulted("list_organizations_since") {
+            return Err(e);
+        }
+        self.inner.list_organizations_since(since, limit).await
+    }
+    async fn list_partner_records_for(
+        &self,
+        license_id: &str,
+    ) -> Result<Vec<PartnerRecord>, Error> {
+        if let Some(e) = self.faulted("list_partner_records_for") {
+            return Err(e);
+        }
+        self.inner.list_partner_records_for(license_id).await
+    }
+    async fn list_partner_records_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedPartnerRecord>, Error> {
+        if let Some(e) = self.faulted("list_partner_records_since") {
+            return Err(e);
+        }
+        self.inner.list_partner_records_since(since, limit).await
+    }
+    async fn list_signed_accord_quorum_evidence_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<accord_carriage::AccordQuorumEvidence>, Error> {
+        if let Some(e) = self.faulted("list_signed_accord_quorum_evidence_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_accord_quorum_evidence_since(since, limit)
+            .await
+    }
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunity>, Error> {
+        if let Some(e) = self.faulted("list_signed_communities_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_communities_since(since, limit).await
+    }
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_community_membership_revocations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_community_membership_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_families_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamily>, Error> {
+        if let Some(e) = self.faulted("list_signed_families_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_families_since(since, limit).await
+    }
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_family_membership_revocations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_family_membership_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_identity_occurrence_revocations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_identity_occurrence_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_identity_occurrences_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
+        if let Some(e) = self.faulted("list_signed_identity_occurrences_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_identity_occurrences_since(since, limit)
+            .await
+    }
+    async fn list_signed_key_records_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedKeyRecord>, Error> {
+        if let Some(e) = self.faulted("list_signed_key_records_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_key_records_since(since, limit).await
+    }
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedLocationProof>, Error> {
+        if let Some(e) = self.faulted("list_signed_location_proofs_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_location_proofs_since(since, limit)
+            .await
+    }
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedSignedPartnerRecord>, Error> {
+        if let Some(e) = self.faulted("list_signed_partner_records_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_partner_records_since(since, limit)
+            .await
+    }
+    async fn list_signed_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_revocations_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_revocations_since(since, limit).await
+    }
+    async fn list_signed_transport_destinations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedTransportDestination>, Error> {
+        if let Some(e) = self.faulted("list_signed_transport_destinations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_transport_destinations_since(since, limit)
+            .await
+    }
+    async fn list_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("list_wire_hashes_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_wire_hashes_since(kind, after_content_hash, limit)
+            .await
+    }
+    async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
+        if let Some(e) = self.faulted("lookup_community") {
+            return Err(e);
+        }
+        self.inner.lookup_community(community_key_id).await
+    }
+    async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error> {
+        if let Some(e) = self.faulted("lookup_family") {
+            return Err(e);
+        }
+        self.inner.lookup_family(family_key_id).await
+    }
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<IdentityOccurrence>, Error> {
+        if let Some(e) = self.faulted("lookup_identity_for_occurrence") {
+            return Err(e);
+        }
+        self.inner
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await
+    }
+    async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error> {
+        if let Some(e) = self.faulted("lookup_keys_for_identity") {
+            return Err(e);
+        }
+        self.inner.lookup_keys_for_identity(identity_ref).await
+    }
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error> {
+        if let Some(e) = self.faulted("lookup_public_key") {
+            return Err(e);
+        }
+        self.inner.lookup_public_key(key_id).await
+    }
+    async fn lookup_signed_record_by_content_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(e) = self.faulted("lookup_signed_record_by_content_hash") {
+            return Err(e);
+        }
+        self.inner
+            .lookup_signed_record_by_content_hash(kind, content_hash)
+            .await
+    }
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+        reseal: &AttestationReseal,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("promote_attestation") {
+            return Err(e);
+        }
+        self.inner
+            .promote_attestation(attestation_id, cohort_scope, reseal)
+            .await
+    }
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_accord_decision") {
+            return Err(e);
+        }
+        self.inner
+            .put_accord_decision(decision, steward_signatures)
             .await
     }
     async fn put_accord_participation(
@@ -840,35 +837,122 @@ impl FederationDirectory for FaultInjectingDirectory {
             .put_accord_participation(participation, standing_roster)
             .await
     }
-    async fn list_accord_participations(
+    async fn put_accord_proposal(
         &self,
-        proposal_digest: &str,
-    ) -> Result<Vec<accord_quorum::StoredParticipation>, Error> {
-        if let Some(e) = self.faulted("list_accord_participations") {
-            return Err(e);
-        }
-        self.inner.list_accord_participations(proposal_digest).await
-    }
-    async fn put_accord_decision(
-        &self,
-        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
     ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_accord_decision") {
+        if let Some(e) = self.faulted("put_accord_proposal") {
             return Err(e);
         }
         self.inner
-            .put_accord_decision(decision, steward_signatures)
+            .put_accord_proposal(proposal, authority_signature)
             .await
     }
-    async fn get_accord_decision(
+    async fn put_attestation(
         &self,
-        proposal_digest: &str,
-    ) -> Result<Option<accord_quorum::StoredDecision>, Error> {
-        if let Some(e) = self.faulted("get_accord_decision") {
+        attestation: SignedAttestation,
+    ) -> Result<AttestationOutcome, Error> {
+        if let Some(e) = self.faulted("put_attestation") {
             return Err(e);
         }
-        self.inner.get_accord_decision(proposal_digest).await
+        self.inner.put_attestation(attestation).await
+    }
+    async fn put_community(&self, community: SignedCommunity) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_community") {
+            return Err(e);
+        }
+        self.inner.put_community(community).await
+    }
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: SignedCommunityMembershipRevocation,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_community_membership_revocation") {
+            return Err(e);
+        }
+        self.inner
+            .put_community_membership_revocation(revocation)
+            .await
+    }
+    async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_family") {
+            return Err(e);
+        }
+        self.inner.put_family(family).await
+    }
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: SignedFamilyMembershipRevocation,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_family_membership_revocation") {
+            return Err(e);
+        }
+        self.inner
+            .put_family_membership_revocation(revocation)
+            .await
+    }
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: SignedIdentityOccurrence,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_identity_occurrence") {
+            return Err(e);
+        }
+        self.inner.put_identity_occurrence(occurrence).await
+    }
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_identity_occurrence_revocation") {
+            return Err(e);
+        }
+        self.inner
+            .put_identity_occurrence_revocation(revocation)
+            .await
+    }
+    async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_location_proof") {
+            return Err(e);
+        }
+        self.inner.put_location_proof(proof).await
+    }
+    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_org_membership") {
+            return Err(e);
+        }
+        self.inner.put_org_membership(signed).await
+    }
+    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_organization") {
+            return Err(e);
+        }
+        self.inner.put_organization(signed).await
+    }
+    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_partner_record") {
+            return Err(e);
+        }
+        self.inner.put_partner_record(signed).await
+    }
+    async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_public_key") {
+            return Err(e);
+        }
+        self.inner.put_public_key(record).await
+    }
+    async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_revocation") {
+            return Err(e);
+        }
+        self.inner.put_revocation(revocation).await
+    }
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
+        if let Some(e) = self.faulted("revocations_for") {
+            return Err(e);
+        }
+        self.inner.revocations_for(revoked_key_id).await
     }
     async fn set_active_halt(
         &self,
@@ -882,37 +966,27 @@ impl FederationDirectory for FaultInjectingDirectory {
             .set_active_halt(family_key_id, active_halt_id)
             .await
     }
-    async fn get_active_halt(
+    async fn set_consent_role(
         &self,
-        family_key_id: &str,
-    ) -> Result<Option<accord_quorum::ActiveHalt>, Error> {
-        if let Some(e) = self.faulted("get_active_halt") {
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("set_consent_role") {
             return Err(e);
         }
-        self.inner.get_active_halt(family_key_id).await
+        self.inner.set_consent_role(key_id, consent_role).await
     }
-    async fn clear_active_halt(
+    async fn supersede_group_row(
         &self,
-        family_key_id: &str,
-        active_halt_id: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("clear_active_halt") {
+        cohort: cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        if let Some(e) = self.faulted("supersede_group_row") {
             return Err(e);
         }
         self.inner
-            .clear_active_halt(family_key_id, active_halt_id)
+            .supersede_group_row(cohort, new_snapshot, authorization)
             .await
-    }
-    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error> {
-        if let Some(e) = self.faulted("issue_accord_nonce") {
-            return Err(e);
-        }
-        self.inner.issue_accord_nonce(family_key_id, nonce).await
-    }
-    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("accord_nonce_issued") {
-            return Err(e);
-        }
-        self.inner.accord_nonce_issued(family_key_id, nonce).await
     }
 }

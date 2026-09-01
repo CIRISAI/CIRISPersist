@@ -447,6 +447,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("try_from", Class::Plumbing),
     ("try_get", Class::Plumbing),
     ("try_into", Class::Plumbing),
+    // CIRISPersist#785 — a Gate by the table's own definition: it refuses
+    // something about the CALLER'S INPUT (a content hash that is not canonical
+    // lowercase 64-hex) before anything is stored. Not Plumbing — it cannot
+    // fail on the substrate's terms, only on the caller's — and the fail-open
+    // direction here would matter: an unvalidated empty hash stores, answers
+    // `contains`, and can never be paged, because every first page asks
+    // `content_hash > ''`.
+    ("validate_content_hash", Class::Gate),
     ("validate_envelope_against_schema", Class::Gate),
     ("validate_family_members", Class::Gate),
     ("validate_grant_admission", Class::Gate),

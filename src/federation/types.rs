@@ -6501,3 +6501,76 @@ mod tests {
         }
     }
 }
+
+/// CIRISPersist#785 — one entry in the **KNOWN-but-not-held**
+/// wire-hash set: a record this node has heard exists and deliberately does
+/// not hold.
+///
+/// # This is not a holdings type, and that is the whole point
+///
+/// [`FederationDirectory::list_wire_hashes_since`] answers *what do I hold*
+/// and returns bare `String` hashes, which is what the convergence
+/// computation `want = remote ∖ holdings` consumes. This type answers *what
+/// exists in the federation* and is deliberately NOT that shape: it cannot
+/// be handed to a `Vec<String>` consumer, so unioning the two sets requires
+/// writing an explicit projection rather than passing the wrong variable.
+///
+/// That matters more than it looks. If a known-but-not-held hash reaches
+/// `holdings`, the node concludes it already has everything it has merely
+/// HEARD OF and silently stops fetching — nothing errors, anti-entropy goes
+/// quiet, and the corpus freezes at whatever it had. Neither side reports a
+/// fault, and #780's `lookup_signed_record_by_content_hash` cannot help:
+/// it returns `Ok(None)` on an unresolvable entry BY DESIGN, as a
+/// self-healing posture toward index drift. So "we would notice" is not
+/// available as a mitigation, and the separation has to be structural.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownWireHash {
+    /// The `EnvelopeKind::as_str()` token — same vocabulary as the wire index.
+    pub kind: String,
+    /// Lowercase-hex sha256, derived identically to the wire index's, so the
+    /// two are COMPARABLE even though the rows are never joined.
+    pub content_hash: String,
+    /// When a peer most recently advertised this hash. **Moves**, once per
+    /// wrap of edge's re-sweep — which is what makes it a sound ageing
+    /// column and, for the same reason, an unsound cursor (see
+    /// [`FederationDirectory::list_known_wire_hashes_since`]).
+    pub last_advertised_at: DateTime<Utc>,
+    /// **LOCAL-ONLY.** The peer that advertised this hash to this node.
+    ///
+    /// An OBSERVATION ("this peer advertised H to me"), never a CLAIM ("this
+    /// peer holds H"). It is absent from every replication policy kind and
+    /// from the wire index, and no type carrying it reaches an envelope:
+    /// replicating it would build a who-holds-what index over the ENTIRE
+    /// corpus, a strictly larger disclosure than the one CIRISPersist#784
+    /// works to keep out of moderation records for a handful of subjects.
+    /// Keeping it local adds no disclosure, because it is derived from
+    /// Summaries that peer already sent us — the information is ours either
+    /// way; what matters is that it never becomes anyone else's.
+    pub advertised_by: Option<String>,
+}
+
+/// CIRISPersist#785 — the outcome of one eviction pass over the
+/// known-but-not-held set.
+///
+/// # Why this is a report and not a count
+///
+/// The bound and the floor can genuinely conflict: the set may exceed its
+/// bound while every entry is younger than the caller's cutoff. Something
+/// has to give, and the choice is not symmetric.
+///
+/// Exceeding a bound is VISIBLE — [`Self::over_bound_by`] says so, and an
+/// operator can act. Evicting below the floor is INVISIBLE: the node simply
+/// forgets a record exists, and only re-learns it when edge's re-sweep wraps
+/// back around to it, which on a large corpus is hours. So **the floor
+/// wins**, and the overage is reported rather than silently resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct KnownHashEviction {
+    /// Entries removed by this pass.
+    pub evicted: u64,
+    /// Entries still present afterwards.
+    pub remaining: u64,
+    /// How far over `bound` the set remains BECAUSE the floor forbade
+    /// evicting further. Non-zero means the caller's cutoff and bound are in
+    /// tension — not that the pass failed.
+    pub over_bound_by: u64,
+}

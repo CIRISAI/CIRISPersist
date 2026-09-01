@@ -4804,6 +4804,202 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(out)
     }
 
+    /// CIRISPersist#785 — record that a hash EXISTS, unheld.
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
+        let kind = kind.to_owned();
+        let hash = content_hash.to_owned();
+        let by = advertised_by.map(str::to_owned);
+        // FIXED WIDTH, and the repo's usual `+00:00` suffix rather than `Z`.
+        //
+        // This column is compared as TEXT — by the monotonic guard below and
+        // by the eviction predicate — so its rendering has to be
+        // order-preserving. Measured, because a review finding here turned on
+        // a premise worth checking:
+        //
+        //   to_rfc3339()          "…00.100+00:00" < "…00.100001+00:00"  ✓
+        //   AutoSi with use_z     "…00.100Z"      > "…00.100001Z"       ✗
+        //   Micros (fixed width)  correct under either suffix
+        //
+        // Plain `to_rfc3339()` is in fact correct despite its VARIABLE
+        // fractional width, because `+` (0x2B) sorts below every digit, so a
+        // short fraction behaves exactly like zero-padding. That is a real
+        // property and a fragile one to rely on: it silently inverts the
+        // moment anyone switches the suffix to `Z`, which is a change that
+        // looks purely cosmetic.
+        //
+        // Fixed width removes the dependency on the terminator entirely.
+        // `false` keeps the `+00:00` spelling every other timestamp in this
+        // crate uses — mixing spellings in ONE column would be far worse than
+        // either, since `Z` (0x5A) outranks `+` and a row written by the other
+        // path would sort after every row regardless of its instant. Micros
+        // also matches postgres TIMESTAMPTZ's own resolution, so the two
+        // dialects keep the same instant to the same precision.
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let guard = conn.lock();
+            // Upsert, because the same hash arrives on EVERY wrap of edge's
+            // re-sweep. `last_advertised_at` is bumped on each sighting —
+            // that movement is what makes the eviction floor meaningful, and
+            // a plain INSERT OR IGNORE would freeze it at first-seen and
+            // reproduce #776 precisely.
+            //
+            // The bump is MONOTONIC (`WHERE excluded... > stored...`) because
+            // execution order is not observation order: a caller that stamps
+            // `now` and then hands the write to a delayed task can apply an
+            // OLDER sighting after a newer one, moving the column BACKWARDS.
+            // The next sweep would then evict a hash that was in fact
+            // recently advertised — and that loss is invisible until edge's
+            // re-sweep wraps back around to it, which is the whole failure
+            // this column exists to prevent.
+            guard.execute(
+                "INSERT INTO known_wire_hashes \
+                     (kind, content_hash, last_advertised_at, advertised_by) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(kind, content_hash) DO UPDATE SET \
+                     last_advertised_at = excluded.last_advertised_at, \
+                     advertised_by = excluded.advertised_by \
+                 WHERE excluded.last_advertised_at > known_wire_hashes.last_advertised_at",
+                rusqlite::params![kind, hash, now_s, by],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}")))?;
+        Ok(())
+    }
+
+    /// CIRISPersist#785 — is this hash known to exist?
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let kind = kind.to_owned();
+        let hash = content_hash.to_owned();
+        let conn = self.conn.clone();
+        let found = (move || -> Result<bool, rusqlite::Error> {
+            let guard = conn.lock();
+            let mut stmt = guard
+                .prepare("SELECT 1 FROM known_wire_hashes WHERE kind = ?1 AND content_hash = ?2")?;
+            stmt.exists(rusqlite::params![kind, hash])
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("known_wire_hash_contains: {e}")))?;
+        Ok(found)
+    }
+
+    /// CIRISPersist#785 — page the known set, cursored on the HASH
+    /// (never on `last_advertised_at`, which moves on every re-advertisement).
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::KnownWireHash>, crate::federation::Error> {
+        let kind_q = kind.to_owned();
+        let after = after_content_hash.unwrap_or("").to_owned();
+        let lim = i64::from(limit);
+        let conn = self.conn.clone();
+        let rows =
+            (move || -> Result<Vec<(String, String, String, Option<String>)>, rusqlite::Error> {
+                let guard = conn.lock();
+                let mut stmt = guard.prepare(
+                    "SELECT kind, content_hash, last_advertised_at, advertised_by \
+                 FROM known_wire_hashes \
+                 WHERE kind = ?1 AND content_hash > ?2 \
+                 ORDER BY content_hash LIMIT ?3",
+                )?;
+                let it = stmt.query_map(rusqlite::params![kind_q, after, lim], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                it.collect()
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_known_wire_hashes_since: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(kind, content_hash, ts, advertised_by)| {
+                // Parsed STRICTLY, not through this module's `parse_rfc3339`
+                // helper: that one falls back to `Utc::now()` on a bad value,
+                // which is the single worst default for an ageing column — a
+                // corrupt timestamp would read as freshly advertised and the
+                // entry would be immune to every future eviction pass, with
+                // nothing to show for it. Refusing is loud; the alternative
+                // silently pins a row alive forever.
+                // The conversion is deliberately a separate statement from the
+                // fallible parse: folding it in as a `.map()` inside the
+                // propagated chain puts an infallible call on the `?` path,
+                // and the parity gate is right to ask what that call refuses.
+                // It refuses nothing — so it does not belong there.
+                let parsed = chrono::DateTime::parse_from_rfc3339(&ts).map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "list_known_wire_hashes_since: known_wire_hashes({kind}, \
+                         {content_hash}) has an unparseable last_advertised_at {ts:?}: {e}"
+                    ))
+                })?;
+                let last_advertised_at = parsed.with_timezone(&chrono::Utc);
+                Ok(crate::federation::KnownWireHash {
+                    kind,
+                    content_hash,
+                    last_advertised_at,
+                    advertised_by,
+                })
+            })
+            .collect()
+    }
+
+    /// CIRISPersist#785 — evict on a CALLER-SUPPLIED cutoff; the
+    /// floor wins over the bound.
+    async fn evict_known_wire_hashes(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
+        // Same fixed width as the insert path, or the range delete compares a
+        // 6-digit stored value against a 9-digit cutoff and stops being
+        // chronological at exactly the boundary it exists to enforce.
+        let cutoff_s = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        let conn = self.conn.clone();
+        let out = (move || -> Result<(u64, u64), rusqlite::Error> {
+            let guard = conn.lock();
+            // Only entries NOT advertised since the caller's cutoff. Persist
+            // never computes that instant — edge owns the wrap period and
+            // hands over the resulting timestamp, so there is exactly one
+            // owner of the number and nothing derived on this side.
+            let evicted = guard.execute(
+                "DELETE FROM known_wire_hashes WHERE last_advertised_at < ?1",
+                rusqlite::params![cutoff_s],
+            )?;
+            let remaining: i64 =
+                guard.query_row("SELECT COUNT(*) FROM known_wire_hashes", [], |r| r.get(0))?;
+            Ok((evicted as u64, remaining.max(0) as u64))
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("evict_known_wire_hashes: {e}")))?;
+        let (evicted, remaining) = out;
+        Ok(crate::federation::KnownHashEviction {
+            evicted,
+            remaining,
+            // Reported, never resolved by evicting further: everything left is
+            // younger than the floor, and forgetting one of those is invisible
+            // until edge's re-sweep wraps back to it.
+            over_bound_by: remaining.saturating_sub(bound),
+        })
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,
@@ -21026,6 +21222,53 @@ mod accord_tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — reachable through the public double, sqlite.
+    #[tokio::test]
+    async fn known_hashes_reachable_through_the_double_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hashes_reachable_through_the_double_785(
+            std::sync::Arc::new(backend), "sq785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, sqlite.
+    #[tokio::test]
+    async fn known_hash_monotonic_and_canonical_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend, "sq785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — the known set never reaches the holdings
+    /// read, sqlite leg.
+    #[tokio::test]
+    async fn known_hashes_never_reach_holdings_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hashes_never_reach_holdings_785(
+            &backend, "sq785",
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — ageing and eviction, sqlite leg. This is
+    /// the leg that would catch an `INSERT OR IGNORE` upsert, which is the
+    /// obvious way to write it and the #776 defect exactly.
+    #[tokio::test]
+    async fn known_hash_ageing_and_eviction_sqlite_785() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_known_hash_ageing_and_eviction_785(
+            &backend, "sq785",
+        )
+        .await;
     }
 
     /// **CIRISPersist#547 — a scrub-upgraded node must be able to serve the Key

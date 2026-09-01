@@ -817,6 +817,50 @@ pub async fn all_kind_hash_keys(
     Ok(out)
 }
 
+/// CIRISPersist#785 — refuse a `content_hash` that is not the canonical
+/// lowercase 64-hex SHA-256 the rest of this vocabulary assumes.
+///
+/// # Why this is a refusal and not a normalisation
+///
+/// Two concrete failures, both found by review before this shipped:
+///
+/// - **An empty hash becomes an INVISIBLE ROW.** It stores fine and
+///   `known_wire_hash_contains` answers `true` for it, but every first page
+///   asks `content_hash > ''`, so it can never be returned by
+///   `list_known_wire_hashes_since`. A row that exists, answers point-reads,
+///   and cannot be enumerated is worse than a rejected write: it makes the
+///   set's contents depend on which door you ask.
+/// - **Case variants split one digest into two entries**, each with its own
+///   `last_advertised_at`, so re-advertisement bumps one while the other ages
+///   out — the eviction floor silently stops meaning what it says.
+///
+/// Normalising (lowercasing) would fix the second and not the first, and it
+/// would quietly accept a caller whose hashes disagree with the wire
+/// vocabulary everywhere else. Refusing says so at the door.
+pub fn validate_content_hash(context: &str, content_hash: &str) -> Result<(), Error> {
+    if content_hash.len() == 64
+        && content_hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Ok(());
+    }
+    // `InvalidArgument`, NOT `Backend`. No storage operation has happened and
+    // the refusal is entirely about the CALLER'S INPUT, so the two must not
+    // share a `kind()`: consumers split retryable substrate failures
+    // (`federation_backend`) from input refusals
+    // (`federation_invalid_argument`), and misfiling this one sends a
+    // permanently invalid advertisement down backend-RETRY handling — retried
+    // forever, since no number of attempts makes an empty hash canonical.
+    Err(Error::InvalidArgument(format!(
+        "{context}: {content_hash:?} is not a canonical content hash (lowercase \
+         64-hex sha256). Uppercase and short values are refused rather than \
+         normalised: an empty hash stores but can never be paged \
+         (`content_hash > ''` skips it), and a case variant becomes a SECOND \
+         entry for one digest with its own ageing clock"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
