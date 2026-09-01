@@ -5736,6 +5736,163 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    /// CIRISPersist#785 — record that a hash EXISTS, unheld.
+    async fn insert_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::wire_index::validate_content_hash(
+            "insert_known_wire_hash",
+            content_hash,
+        )?;
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("insert_known_wire_hash pool: {e}"))
+        })?;
+        // Upsert, because the same hash arrives on EVERY wrap of edge's
+        // re-sweep. `last_advertised_at` is bumped on each sighting — that
+        // movement is what makes the eviction floor meaningful, and a plain
+        // DO NOTHING would freeze it at first-seen and reproduce #776.
+        //
+        // The bump is MONOTONIC because execution order is not observation
+        // order: a caller that stamps `now` and hands the write to a delayed
+        // task can apply an OLDER sighting after a newer one and move the
+        // column BACKWARDS, so the next sweep evicts a hash that was in fact
+        // recently advertised — invisibly, until the re-sweep wraps.
+        client
+            .execute(
+                "INSERT INTO cirislens.known_wire_hashes \
+                     (kind, content_hash, last_advertised_at, advertised_by) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, content_hash) DO UPDATE SET \
+                     last_advertised_at = EXCLUDED.last_advertised_at, \
+                     advertised_by = EXCLUDED.advertised_by \
+                 WHERE EXCLUDED.last_advertised_at \
+                       > cirislens.known_wire_hashes.last_advertised_at",
+                &[&kind, &content_hash, &now, &advertised_by],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// CIRISPersist#785 — is this hash known to exist?
+    async fn known_wire_hash_contains(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("known_wire_hash_contains pool: {e}"))
+        })?;
+        let row = client
+            .query_opt(
+                "SELECT 1 FROM cirislens.known_wire_hashes \
+                 WHERE kind = $1 AND content_hash = $2",
+                &[&kind, &content_hash],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("known_wire_hash_contains: {e}"))
+            })?;
+        Ok(row.is_some())
+    }
+
+    /// CIRISPersist#785 — page the known set, cursored on the HASH
+    /// (never on `last_advertised_at`, which moves on every re-advertisement).
+    async fn list_known_wire_hashes_since(
+        &self,
+        kind: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::KnownWireHash>, crate::federation::Error> {
+        let after = after_content_hash.unwrap_or("");
+        let lim = i64::from(limit);
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_known_wire_hashes_since pool: {e}"))
+        })?;
+        let rows = client
+            .query(
+                "SELECT kind, content_hash, last_advertised_at, advertised_by \
+                 FROM cirislens.known_wire_hashes \
+                 WHERE kind = $1 AND content_hash > $2 \
+                 ORDER BY content_hash LIMIT $3",
+                &[&kind, &after, &lim],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_known_wire_hashes_since: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::federation::KnownWireHash {
+                    kind: r.safe_get_with::<String, _, _, _>(
+                        "kind",
+                        crate::federation::Error::Backend,
+                    )?,
+                    content_hash: r.safe_get_with::<String, _, _, _>(
+                        "content_hash",
+                        crate::federation::Error::Backend,
+                    )?,
+                    last_advertised_at: r.safe_get_with::<chrono::DateTime<chrono::Utc>, _, _, _>(
+                        "last_advertised_at",
+                        crate::federation::Error::Backend,
+                    )?,
+                    advertised_by: r.safe_get_with::<Option<String>, _, _, _>(
+                        "advertised_by",
+                        crate::federation::Error::Backend,
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    /// CIRISPersist#785 — evict on a CALLER-SUPPLIED cutoff; the
+    /// floor wins over the bound.
+    async fn evict_known_wire_hashes(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        bound: u64,
+    ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
+        })?;
+        // Only entries NOT advertised since the caller's cutoff. Persist never
+        // computes that instant — edge owns the wrap period and hands over the
+        // resulting timestamp, so there is exactly one owner of the number and
+        // nothing derived on this side of the boundary to go stale.
+        let evicted = client
+            .execute(
+                "DELETE FROM cirislens.known_wire_hashes WHERE last_advertised_at < $1",
+                &[&cutoff],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("evict_known_wire_hashes: {e}"))
+            })?;
+        let row = client
+            .query_one("SELECT COUNT(*) FROM cirislens.known_wire_hashes", &[])
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("evict_known_wire_hashes count: {e}"))
+            })?;
+        let remaining: i64 =
+            row.safe_get_with::<i64, _, _, _>("count", crate::federation::Error::Backend)?;
+        let remaining = u64::try_from(remaining).unwrap_or(0);
+        Ok(crate::federation::KnownHashEviction {
+            evicted,
+            remaining,
+            // Reported, never resolved by evicting further: everything left is
+            // younger than the floor, and forgetting one of those is invisible
+            // until edge's re-sweep wraps back to it.
+            over_bound_by: remaining.saturating_sub(bound),
+        })
+    }
+
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
     async fn list_expired_attestation_ids(
         &self,
@@ -22413,6 +22570,60 @@ mod tests {
         )
         .await
         .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// CIRISPersist#785 — monotonic ageing + canonical-hash refusal, POSTGRES.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn known_hash_monotonic_and_canonical_postgres_785() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_known_hash_monotonic_and_canonical_785(
+            &backend,
+            &format!("pg785c{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — the known set never reaches the holdings
+    /// read, POSTGRES leg. The third backend is a separate claim: this plane's
+    /// whole purpose is a separation, and a separation that holds in two
+    /// dialects and not the third is not a separation.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn known_hashes_never_reach_holdings_postgres_785() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_known_hashes_never_reach_holdings_785(
+            &backend,
+            &format!("pg785a{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
+    /// CIRISPersist#785 — ageing and eviction, POSTGRES leg.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn known_hash_ageing_and_eviction_postgres_785() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_known_hash_ageing_and_eviction_785(
+            &backend,
+            &format!("pg785b{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
     }
 
     /// **CIRISPersist#547 — a scrub-upgraded node must be able to serve the Key

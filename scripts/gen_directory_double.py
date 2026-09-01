@@ -12,8 +12,25 @@ proc-macro crate is a heavier dependency than a script that emits committed code
 a reviewer can read. The generated file IS committed: `cargo` never runs this,
 so there is no build-time codegen and no surprise at compile time.
 
-The compiler is still the backstop. If the trait gains a method and nobody
-regenerates, the double fails to COMPILE — loud, and at the right moment.
+The compiler is still the backstop — but ONLY for required methods. If the
+trait gains a `;`-terminated method and nobody regenerates, the double fails to
+COMPILE, loud and at the right moment. A method added with a DEFAULT BODY is
+different: the double silently inherits the default, so a backend that
+overrides it is not reached even when no fault was requested, and nothing
+fails. Found on PR #786 (CIRISPersist#785); the trait currently declares ~200
+methods against 81 delegations here, so the silent set is large.
+
+Blanket-delegating every default would be WRONG, which is why this is an
+explicit list rather than a parser change. Some defaults are PROVIDED
+COMPOSITIONS — `active_family_key_ids_for` calls `list_families_for_member`
+through `self`. Delegated to the inner backend, that composition runs where
+this wrapper's fault table does not exist, so a fault injected on the inner
+call is silently not observed. That would break fault injection in the double
+whose entire purpose is fault injection.
+
+So a default belongs in DELEGATED_DEFAULTS when it is a LEAF backend operation
+(backends override it; it composes no other trait method through `self`), and
+stays out when it is a provided composition.
 
 Run:  python3 scripts/gen_directory_double.py
 Check: python3 scripts/gen_directory_double.py --check   (CI: fails if stale)
@@ -24,6 +41,29 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+
+# Defaulted trait methods that MUST be delegated anyway — see the module
+# docstring for the rule. Each is a leaf backend operation: backends override
+# it, it composes no other trait method through `self`, and a consumer wrapping
+# a backend in this double must reach the override rather than the default.
+#
+# The wire-hash family is listed as a family on purpose. #785's separation is a
+# statement about how `list_known_wire_hashes_since` and `list_wire_hashes_since`
+# relate; delegating one and not the other would make that relationship differ
+# through the double from what it is against a bare backend, which is exactly
+# the class of divergence a test double must not introduce.
+#
+# The remaining defaulted methods are NOT audited here — that is a standing gap
+# predating this list, tracked separately rather than resolved by a sweep that
+# cannot tell a leaf from a composition.
+DELEGATED_DEFAULTS = (
+    "insert_known_wire_hash",
+    "known_wire_hash_contains",
+    "list_known_wire_hashes_since",
+    "evict_known_wire_hashes",
+    "list_wire_hashes_since",
+    "lookup_signed_record_by_content_hash",
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "federation" / "mod.rs"
@@ -63,6 +103,43 @@ def split_args(arg_str: str) -> list[str]:
     if cur.strip():
         out.append(cur.strip())
     return out
+
+
+def parse_defaults(body: str):
+    """Yield (name, args_src, ret) for each DELEGATED_DEFAULTS method.
+
+    Signatures with a default body, so the terminator is `{` rather than `;`.
+    Only names in the allowlist are returned — see the module docstring for why
+    this is not "every default".
+    """
+    found = []
+    depth, buf = 0, ""
+    for line in body.split("\n"):
+        if depth == 0:
+            buf += line + "\n"
+            if re.search(r"\bfn\s+[a-z0-9_]+", buf) and "{" in line:
+                one = " ".join(buf.split())
+                m = re.match(
+                    r".*?\bfn\s+([a-z0-9_]+)\s*\((.*?)\)\s*(?:->\s*(.+?))?\s*\{", one
+                )
+                if m and m.group(1) in DELEGATED_DEFAULTS:
+                    found.append(
+                        (m.group(1), m.group(2), (m.group(3) or "()").strip())
+                    )
+                buf = ""
+            elif ";" in line:
+                buf = ""
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            depth = 0
+    missing = set(DELEGATED_DEFAULTS) - {n for n, _, _ in found}
+    if missing:
+        sys.exit(
+            f"DELEGATED_DEFAULTS names not found as defaulted trait methods: "
+            f"{sorted(missing)} — the trait changed, or one became required "
+            f"(in which case drop it from the list; it is generated anyway)"
+        )
+    return found
 
 
 def parse(body: str):
@@ -284,9 +361,13 @@ def rustfmt(text: str) -> str:
 
 
 def main() -> None:
-    methods = parse(trait_body(SRC.read_text()))
+    body = trait_body(SRC.read_text())
+    methods = parse(body)
     if not methods:
         sys.exit("parsed zero methods — the trait shape changed; fix the generator")
+    # Defaulted leaves are delegated too, or the double answers with the trait
+    # default while a bare backend answers with its override (PR #786).
+    methods = sorted(methods + parse_defaults(body))
     text = rustfmt(render(methods))
     if "--check" in sys.argv:
         cur = OUT.read_text() if OUT.exists() else ""

@@ -5,6 +5,155 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Added
+
+- **#785 — the KNOWN-but-not-held wire-hash set.** `signed_wire_index` (V111)
+  answers *what do I hold*; every entry carries a NOT NULL `record_key`
+  pointing at a row. The hash-first directory (CIRISEdge#552) needs a
+  different question answered — *what exists in the federation* — for records
+  whose bodies a node deliberately does not hold, and which therefore can
+  never appear in that index. V134 `known_wire_hashes` is that set, with
+  `insert_known_wire_hash` / `known_wire_hash_contains` /
+  `list_known_wire_hashes_since` / `evict_known_wire_hashes` on all three
+  backends.
+
+  **The two sets must never be unioned into the holdings read.**
+  `want = remote ∖ holdings`; a known-but-not-held hash reaching `holdings`
+  makes the node conclude it already has everything it has merely *heard of*,
+  so it stops fetching and its corpus freezes — CIRISEdge#416's
+  non-convergence with the sign flipped. Nothing errors, and
+  `lookup_signed_record_by_content_hash` cannot report it either: that
+  returns `Ok(None)` on an unresolvable entry BY DESIGN, as a self-healing
+  posture toward index drift. **"We would notice" is not available as a
+  mitigation**, which is why the separation is structural rather than
+  reviewed: a distinct table with no `record_key` column, distinct return
+  types (`Vec<String>` vs `Vec<KnownWireHash>`), and a witness on every
+  backend asserting the two sets are disjoint in both directions.
+
+  Worth recording that the union is *currently unrepresentable* and the
+  obvious design would have spent that: adding these as a flag on
+  `signed_wire_index` requires making `record_key` NULLABLE — retiring the
+  one constraint that makes the mistake impossible, in a migration that reads
+  like housekeeping.
+
+- **The ageing column moves; the cursor does not.** `last_advertised_at` is
+  bumped on every sighting, because edge's advertise axis is a watermark
+  sweep whose rolling re-sweep WRAPS and re-advertises every live hash once
+  per wrap. Built the obvious way — `INSERT OR IGNORE`, first-seen wins — it
+  would reproduce #776 exactly: that prune aged on `asserted_at`, a value the
+  writer freezes, so the cutoff never advanced, the prune never fired, and
+  both consumers independently refused to call it rather than reporting a
+  fault. For the same reason the column is unfit as a CURSOR — a row bumped
+  mid-iteration would jump the cursor and be skipped permanently (v31.1.0's
+  "a wall clock is not a cursor") — so paging is by content hash, as #780
+  does for a different reason.
+
+- **Eviction takes a caller-supplied CUTOFF, never a period.** Eviction is
+  safe only because the re-sweep wraps, so a forgotten hash comes back and
+  the cost is latency rather than correctness. But the safe floor is one wrap
+  period — `corpus ÷ page_budget × cadence` — and all three inputs live in
+  edge. Persist is handed the instant and compares timestamps; it never
+  learns what a wrap period is.
+
+  Deliberately NOT mesh config: mesh config's job is relief, and it SHRINKS
+  bounds. A relief lowering the page budget LENGTHENS the wrap period, which
+  must RAISE the floor — so a config-supplied floor and the config-supplied
+  budget determining it would have to move in opposite directions in
+  lockstep, forever. The first relief applied during an incident would
+  silently drop the floor below the wrap and the set would start forgetting
+  hashes the re-sweep has not returned to.
+
+  Where bound and floor conflict, **the floor wins and the overage is
+  reported** (`KnownHashEviction::over_bound_by`): an over-bound set is
+  visible and actionable, while evicting below the floor is invisible until
+  the sweep wraps back around.
+
+- **Four review findings from Codex on PR #786, all real, all taken.**
+  - *The ageing bump is now MONOTONIC.* Execution order is not observation
+    order: a caller that stamps `now` and hands the write to a delayed task
+    could apply an older sighting after a newer one, dragging
+    `last_advertised_at` backwards so the next sweep evicted a hash that had
+    just been advertised — invisibly, until the re-sweep wrapped.
+  - *The ageing index now LEADS on `last_advertised_at`.* It was
+    kind-leading, but eviction takes no kind and filters on the timestamp
+    alone, so the index could not serve its own range delete and every sweep
+    scanned the whole table — on a set that is larger than the held set by
+    design, which is the O(everything) shape #775 took off the health-poll
+    path. Paging is served by the primary key and never needed it.
+  - *Non-canonical hashes are REFUSED at the door.* An empty hash stored
+    fine and answered `contains`, but every first page asks
+    `content_hash > ''`, so it could never be enumerated — a row whose
+    existence depended on which door you asked. Case variants split one
+    digest into two entries with separate ageing clocks. Refused rather than
+    normalised, since normalising would fix only the second and would
+    silently accept a caller disagreeing with the wire vocabulary.
+  - *The disjointness claim was WRONG and is now stated correctly.* The
+    guarantee is one-directional: a known-only hash never reaches the
+    holdings read. The reverse cannot be maintained cheaply — the re-sweep
+    re-advertises what we hold, so removing an entry when its body arrives
+    would not achieve disjointness either; the next wrap puts it back. Real
+    disjointness would mean consulting holdings on every advertisement,
+    coupling the two sets on the write path to prevent a harmless overlap.
+    Harmless because `want` reads holdings, not this set. The witness had
+    passed only because it never persisted a body matching the hash it
+    inserted; it now exercises that transition directly.
+- **The capsule routes it, and #780's read now routes too.** `list_wire_hashes_since`
+  shipped in v38.7.0 with a default body and no `DirectoryOp`, so a consumer
+  reaching persist across the ABI got `Unsupported` for the very read #780
+  exists to provide — while its two neighbours routed fine. Five ops and four
+  result variants appended, covering that gap and the four new methods.
+
+  **GROWTH, not a break**: appended only, nothing renamed, reordered or
+  retyped, so both wire digests are re-pinned and `DIRECTORY_ABI_VERSION`
+  stays at 3 — a consumer built against the older shape never sends the new
+  ops and never receives the new results. The two hash sets get DISTINCT
+  result variants (`WireHashes` vs `KnownWireHashes`) on purpose: one shared
+  shape would let a swapped dispatch arm type-check, so the never-union
+  invariant is expressed at the ABI as well as in the backend.
+
+  Same `shipped means host-reachable` class as the directory double above.
+  Green on three backends with a live database says nothing about whether a
+  consumer on the far side of the ABI can call the method at all.
+- **The capsule routing is witnessed on the CONSUMER side, not just dispatch.**
+  `DirectoryOp` has two halves and only one is compiler-enforced: the dispatch
+  `match` must be exhaustive, so a missing arm fails to build — but
+  `OpsDirectory`'s proxy method has no backstop at all, because the trait
+  method has a default body. Omit one and it compiles clean and answers
+  `Unsupported` at runtime, in exactly the configuration a downstream consumer
+  runs.
+
+  The first witness here tested `run_op` — the dispatch side — and the routing
+  was reported verified when it was not. Deleting one proxy method separates
+  them: the consumer-side test FAILS and the dispatch round-trip PASSES. The
+  test that looked like it covered routing structurally could not.
+
+  The systemic version is filed as **#787**: nothing enumerates ops and asserts
+  each has a working proxy, and this class has now bitten twice — #780 shipped
+  unreachable across the ABI in v38.7.0, and this PR's own first witness missed
+  it the same way. Not bundled here, because a gate whose job is catching what
+  review misses should not ride the commit it would have caught.
+- **Timestamps stored at FIXED width, with the crate's `+00:00` spelling.**
+  This column is compared as TEXT, so its rendering has to be
+  order-preserving. Measured, because a review finding here turned on a
+  premise worth checking: plain `to_rfc3339()` is in fact correct despite a
+  variable fractional width, since `+` sorts below every digit and a short
+  fraction behaves exactly like zero-padding. It is `Z` that inverts
+  (`…00.100Z` > `…00.100001Z`). Fixed width removes the dependency on the
+  terminator entirely; keeping `+00:00` avoids introducing a second timestamp
+  spelling into one column, which would be worse than either, since a row
+  written by the other path would sort after every row regardless of its
+  instant.
+- **`advertised_by` is local-only by construction.** An observation ("this
+  peer advertised H to me"), never a claim ("this peer holds H"). Absent from
+  every replication policy kind and from the wire index; no type carrying it
+  reaches an envelope. Replicating it would build a who-holds-what index over
+  the entire corpus — strictly larger than the disclosure CIRISPersist#784
+  works to keep out of moderation records for a handful of subjects. Keeping
+  it local adds no disclosure, since it is derived from Summaries the peer
+  already sent.
+
 ## [38.7.0] - 2026-08-30
 
 The retention batch two consumers measured while adopting v38.4.0, plus the
