@@ -5,6 +5,47 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Added
+
+- **#788 — `resolve_serve_tier`: the owner-conferred `infra:serve` rung now has
+  a resolver.** The serve-tier axis has three rungs and only the accord-conferred
+  one was resolvable; an owner-conferred mesh server could not be recognized as
+  one, which is the difference between "the fleet's storage helpers are
+  canonicals only" and the intended "any conferred server helps".
+
+  `ServeTier { None, MeshServer, Canonical }` derives `Ord` and the declaration
+  order IS the ordering, so consumers gate with `tier >= MeshServer` rather
+  than matching every arm.
+
+  Lives in `trust_root.rs` because the four predicates the edge-enumeration
+  needs — `tombstoned_ids`, `is_expired`, `counts_in_capability_walk`,
+  `job_dimension_admits` — are private to that module. A caller reimplementing
+  "live conferring edge" over `list_attestations_for` is the two-lists class,
+  and persist has just spent a release paying for one parallel spelling (#750).
+
+  Ships a `_over_roster` variant mirroring both composed legs, for their stated
+  reason: the production roster's private halves live in the #268 hardware
+  ceremony, so without it the `Canonical` rung is reachable only on a node
+  holding ceremony keys — a rung that looks covered and is not.
+
+  **`Err` stays distinct from `Ok(ServeTier::None)`.** Every read propagates;
+  nothing is swallowed into a tier. This resolver sits under retention
+  decisions, where a transient read failure reported as "no serve standing"
+  silently demotes a server and sends an operator hunting for a conferral that
+  is present. That is #737's class ("an unconfigured gate is indistinguishable
+  from a deliberate threshold-0 policy") on a second surface.
+
+  Two facts worth recording because the obvious reading is wrong:
+  - **The owner-binding row is itself the conferring edge.** It carries
+    `scope: [infra:serve, …]` under the OWNERSHIP dimension, not
+    `trust:confers:v1`, and passes because `job_dimension_admits` refuses only
+    a *contradicting* trust-job label and infers when silent (v23.0.0 #551).
+  - **`MeshServer` requires BOTH halves** — the owner's grant AND the subject's
+    own claim. Either alone is `None`, which is what makes "claiming is
+    VISIBILITY, never conferral" (v19.0.0) enforced rather than documented.
+
 ## [38.7.0] - 2026-08-30
 
 The retention batch two consumers measured while adopting v38.4.0, plus the

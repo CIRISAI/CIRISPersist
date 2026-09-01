@@ -2487,6 +2487,199 @@ where
     }
 }
 
+/// CIRISPersist#788 — **which serve rung does this key stand on**, for this
+/// resolver.
+///
+/// Ordered least to most: absence, then the owner-conferred rung, then the
+/// accord-conferred one. `Ord` is derived and the declaration order IS the
+/// ordering, so a consumer can write `tier >= ServeTier::MeshServer` rather
+/// than matching every arm — and adding a rung in the middle later would be a
+/// deliberate edit to this order, not an accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ServeTier {
+    /// No serve standing. **Not** an error, and not "we could not tell" — see
+    /// [`resolve_serve_tier`]'s contract on why those must stay distinct.
+    None,
+    /// The OWNER's conferral: the subject claims `infra:serve` and its owner
+    /// granted it, via a live `delegates_to(owner → subject)` bearing that
+    /// scope. CC 4's first granter.
+    MeshServer,
+    /// The ACCORD's conferral: 2-of-3 co-scrub over a `canonical,node`
+    /// envelope bearing `roles: ["infra:serve"]`, with the granting root
+    /// walking to a trust root THIS resolver trusts. CC 4's second granter.
+    Canonical,
+}
+
+/// CIRISPersist#788 — resolve the serve tier for `subject_key_id`, as seen by
+/// `resolver_key_id`.
+///
+/// # Why the resolver is a parameter
+///
+/// `Canonical` is not a property of the subject alone: it is a `(subject,
+/// resolver)` pair, because leg B walks the granting root back to a trust root
+/// **the resolver's own records** accept. Two nodes can correctly disagree
+/// about whether the same key is canonical. Passing the resolver makes that
+/// visible in the signature rather than hiding a `self` somewhere.
+///
+/// `MeshServer` is resolver-independent — an owner's conferral over its own
+/// node is not relative to who is asking — so the same call answers it for
+/// everyone. The asymmetry is real and is why one function returns both.
+///
+/// # The contract that matters most: `Err` is not `Ok(None)`
+///
+/// A read failure MUST NOT be reported as "no serve standing". This resolver
+/// sits under retention decisions, where the two answers diverge in the worst
+/// direction: a transient directory failure read as `None` silently demotes a
+/// server and sends an operator hunting for a missing conferral that is
+/// present. Every read below propagates with `?`; nothing is swallowed into a
+/// tier.
+///
+/// This is CIRISPersist#737's class stated on a different surface — "an
+/// unconfigured gate is indistinguishable from a deliberate threshold-0
+/// policy" is the same defect as "a failed read is indistinguishable from an
+/// absent grant". Absence must be a measurement, never a fallback.
+///
+/// # Precedence
+///
+/// `Canonical` is checked FIRST and returns immediately. A key that is both
+/// accord-conferred and owner-conferred is `Canonical`: the tiers are a
+/// ladder, not a set, and reporting the lower rung for a key that holds the
+/// higher one would understate its standing at exactly the sites that gate on
+/// `>=`.
+///
+/// # Errors
+///
+/// Propagates any directory read failure, and
+/// [`Error::AmbiguousNodeOwner`](super::Error::AmbiguousNodeOwner) when the
+/// subject has more than one live owner binding — deliberately not collapsed
+/// to `None`, for the reason above: two owners is a fact an operator must
+/// see, not a reason to withhold serve standing.
+pub async fn resolve_serve_tier<F>(
+    directory: &F,
+    subject_key_id: &str,
+    resolver_key_id: &str,
+) -> Result<ServeTier, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    resolve_serve_tier_over_roster(
+        directory,
+        subject_key_id,
+        resolver_key_id,
+        &super::admission::accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// CIRISPersist#788 — the roster-parameterized core of
+/// [`resolve_serve_tier`], mirroring the split both composed legs already
+/// ship ([`capability_roots_to_trusted_root_over_roster`],
+/// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster))
+/// and for their stated reason: the production roster is the node's OWN
+/// genesis-derived accord holders, whose private halves live in the #268
+/// hardware ceremony. Without this variant the `Canonical` arm could not be
+/// driven by any test or downstream conformance run — it would be reachable
+/// only on a node holding ceremony keys, which is the shape of a rung that
+/// looks covered and is not.
+pub async fn resolve_serve_tier_over_roster<F>(
+    directory: &F,
+    subject_key_id: &str,
+    resolver_key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<ServeTier, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // ── Canonical: leg A ∧ leg B, both already spelled once elsewhere ──
+    //
+    // Composed rather than re-derived. Persist has spent several releases
+    // paying for parallel spellings of one projection (#750 most recently),
+    // and a second copy of "is this key canonical" would drift the first time
+    // either leg gained a condition.
+    if super::admission::has_accord_conferred_role_over_roster(
+        directory,
+        subject_key_id,
+        INFRA_SERVE_SCOPE,
+        roster_key_ids,
+    )
+    .await?
+        && capability_roots_to_trusted_root_over_roster(
+            directory,
+            resolver_key_id,
+            subject_key_id,
+            INFRA_SERVE_SCOPE,
+            roster_key_ids,
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(ServeTier::Canonical);
+    }
+
+    // ── MeshServer: the subject CLAIMS it, and its OWNER granted it ──
+    //
+    // The claim alone buys nothing — that is v19.0.0's rule, "lifting creates
+    // VISIBILITY, never conferral", and AV-75's property that registering the
+    // string is free. So the claim is a cheap precondition and the grant is
+    // the actual gate.
+    let Some(row) = directory.lookup_public_key(subject_key_id).await? else {
+        // No row at all is genuine absence, not a failed read: the lookup
+        // succeeded and told us there is nothing here.
+        return Ok(ServeTier::None);
+    };
+    if !row.claims_role(INFRA_SERVE_SCOPE) {
+        return Ok(ServeTier::None);
+    }
+
+    let Some(owner) = super::admission::owner_of(directory, subject_key_id).await? else {
+        // Claims the role, nobody owns it, and no accord conferral above.
+        return Ok(ServeTier::None);
+    };
+
+    if owner_granted_scope(directory, subject_key_id, &owner, INFRA_SERVE_SCOPE).await? {
+        return Ok(ServeTier::MeshServer);
+    }
+    Ok(ServeTier::None)
+}
+
+/// CIRISPersist#788 — is there a LIVE `delegates_to(granter → subject)` edge
+/// bearing `scope`?
+///
+/// Deliberately the same predicate the capability-root walk applies, in the
+/// same module, over the same one about-read and the same tombstone fold —
+/// only the granter differs (the owner, rather than a candidate root). Forking
+/// this into "roughly the same checks" is how one path starts honouring a
+/// tombstone the other ignores.
+async fn owner_granted_scope<F>(
+    directory: &F,
+    subject_key_id: &str,
+    granter_key_id: &str,
+    scope: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let about_subject = directory.list_attestations_for(subject_key_id).await?;
+    let about_refs: Vec<&Attestation> = about_subject.iter().collect();
+    let dead = tombstoned_ids(&about_refs);
+    let now = chrono::Utc::now();
+
+    Ok(about_subject.iter().any(|a| {
+        a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attested_key_id == subject_key_id
+            && a.attesting_key_id == granter_key_id
+            // A self-grant is skipped exactly as the root walk skips it: a key
+            // that grants itself serve standing has conferred nothing, and an
+            // owner that IS the subject is that same degenerate case.
+            && a.attesting_key_id != subject_key_id
+            && !dead.contains(&a.attestation_id)
+            && !is_expired(a, now)
+            && counts_in_capability_walk(a)
+            && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
+            && scope_contains(&a.attestation_envelope, scope)
+    }))
+}
+
 #[cfg(test)]
 mod accord_root_tests {
     use super::*;
