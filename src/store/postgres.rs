@@ -32575,7 +32575,17 @@ mod tests {
         let be = PostgresBackend::connect(&dsn).await.expect("connect");
         be.run_migrations().await.expect("migrations");
 
-        let base = chrono::Utc::now() - chrono::Duration::hours(5);
+        // v39.0.0 — the base instant must be AT the substrate resolution.
+        // Persist truncates every signed instant it mints (CC 2.6.2 renders
+        // `.sssZ`, so the resolution is milliseconds), and this window's lower
+        // bound is inclusive: an untruncated `Utc::now()` sits UP TO 1 ms
+        // ABOVE the row it stamps, which then falls outside its own window.
+        // That is a real consumer-visible consequence of the resolution, not a
+        // test artifact — a caller windowing on a sub-millisecond boundary must
+        // truncate the bound the same way the producer truncates the row.
+        let base = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::hours(5),
+        );
         let subj = format!("subj-{}", uuid_like());
         let dim = "trust:filteraxes:v1";
         let ka = format!("ka-{}", uuid_like());

@@ -129,6 +129,19 @@ human- and agent-authored row's crossing a node-authored row.
   proposed moving the one constant; the shipped form is two, for that reason.
   Parsing stays tolerant of both forms.
 
+  **Operator/consumer note — signed instants are now MILLISECOND resolution.**
+  `asserted_at` and `expires_at` were truncated to microseconds before this
+  cut and are truncated to milliseconds now, on the column as well as in the
+  envelope (the two must agree or `check_instant_binding` refuses the row).
+  A caller that windows on `[t, t + d)` with an untruncated `t` — an
+  `Utc::now()` straight from the clock — can now find that a row asserted
+  "at `t`" sits up to 1 ms BELOW its own lower bound and is excluded. Truncate
+  the bound the way the producer truncates the row
+  (`admission::truncate_to_substrate_resolution`). Caught by
+  `pg_list_attestations_honours_window_tier_and_attester_596`, which is the
+  only window assertion in the suite built on a clock instant rather than a
+  fixed one — the sqlite twin uses a whole second and could not see it.
+
 - **The consent sweep over both verbs.** `promote_consented_backlog` enters
   covered local rows over the same bytes and widens them to the grant's
   audience by a `supersedes`, then walks
