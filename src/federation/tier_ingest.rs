@@ -2106,6 +2106,58 @@ pub mod test_support {
              keep serving standing that has ended"
         );
 
+        // (3e) An EXPIRED KEY holds no rung, however live its grants.
+        //
+        // #788 review (post-merge): `lookup_public_key` still returns a row
+        // whose `valid_until` has passed, so a node whose KEY expired while
+        // its owner binding and serve grant stayed live kept resolving
+        // `MeshServer`. Built with a live conferral on purpose — the whole
+        // point is that the grant outlasting the identity must not keep the
+        // identity serving.
+        let expired_node = format!("expired-788-{suffix}");
+        dir.put_public_key(crate::federation::SignedKeyRecord {
+            record: expired_key_record(
+                &expired_node,
+                "node,infra:serve",
+                &expired_node,
+                "expired-788",
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) register expired key: {e}"));
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut binding = bare_attestation(
+            &id,
+            &owner,
+            &expired_node,
+            &serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_SERVE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        seal_row_in_place(&owner, &mut binding);
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) put binding for expired node: {e}"));
+
+        assert_eq!(
+            resolve_serve_tier(dir, &expired_node, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) resolve expired: {e}")),
+            ServeTier::None,
+            "({suffix}) #788: a key whose own `valid_until` has passed holds no \
+             serve rung, however live the conferral — a grant is authority \
+             ABOUT a key, not a reason to keep honouring one whose validity \
+             window has closed"
+        );
+
         // (3c) A NON-NODE subject gets no serve standing, however conferred.
         //
         // #788 review: `infra:serve` is server-class, both rungs are defined
@@ -2995,6 +3047,83 @@ pub mod test_support {
         dir.put_public_key(crate::federation::SignedKeyRecord { record })
             .await
             .expect("register identity key");
+    }
+    /// CIRISPersist#788 — a record whose key validity window has CLOSED.
+    ///
+    /// `valid_until` has been a BOUND subject member since #750, so it cannot
+    /// be set by mutating a minted record: the envelope binds it and the
+    /// subject-binding gate refuses the mismatch. It has to be bound at mint
+    /// time, and nothing in test-support could do that — which is why the
+    /// serve-tier resolver shipped without noticing it never checked the
+    /// subject key's own expiry.
+    pub fn expired_key_record(
+        key_id: &str,
+        identity_type: &str,
+        signer_key_id: &str,
+        nonce: &str,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::KeyRecord {
+        let mut rec = replicated_key_record_with_expiry(
+            key_id,
+            identity_type,
+            key_id,
+            signer_key_id,
+            nonce,
+            Some(valid_until),
+        );
+        rec.valid_until = Some(valid_until);
+        rec
+    }
+
+    /// The expiry-parameterised core of [`replicated_key_record`].
+    pub fn replicated_key_record_with_expiry(
+        key_id: &str,
+        identity_type: &str,
+        scrub_key_id: &str,
+        signer_key_id: &str,
+        nonce: &str,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::federation::KeyRecord {
+        let vu = valid_until.map(|t| t.to_rfc3339());
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let mut envelope = serde_json::json!({
+            "key_id": key_id,
+            "purpose": "federation-peering",
+            "nonce": nonce,
+        });
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut envelope,
+            key_id,
+            identity_type,
+            &ed_pk,
+            mldsa_pk.as_deref(),
+            vu.as_deref(),
+        )
+        .expect("bind the #659 subject into the registration envelope");
+        let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: ts,
+            valid_until,
+            registration_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: scrub_key_id.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: Some(ts),
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
     }
 
     /// #371 — build a fully-formed [`KeyRecord`](crate::federation::KeyRecord)
