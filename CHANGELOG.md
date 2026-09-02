@@ -9,6 +9,61 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added
 
+- **#788 — `resolve_serve_tier`: the owner-conferred `infra:serve` rung now has
+  a resolver.** The serve-tier axis has three rungs and only the accord-conferred
+  one was resolvable; an owner-conferred mesh server could not be recognized as
+  one, which is the difference between "the fleet's storage helpers are
+  canonicals only" and the intended "any conferred server helps".
+
+  `ServeTier { None, MeshServer, Canonical }` derives `Ord` and the declaration
+  order IS the ordering, so consumers gate with `tier >= MeshServer` rather
+  than matching every arm.
+
+  Lives in `trust_root.rs` because the four predicates the edge-enumeration
+  needs — `tombstoned_ids`, `is_expired`, `counts_in_capability_walk`,
+  `job_dimension_admits` — are private to that module. A caller reimplementing
+  "live conferring edge" over `list_attestations_for` is the two-lists class,
+  and persist has just spent a release paying for one parallel spelling (#750).
+
+  Ships a `_over_roster` variant mirroring both composed legs, for their stated
+  reason: the production roster's private halves live in the #268 hardware
+  ceremony, so without it the `Canonical` rung is reachable only on a node
+  holding ceremony keys — a rung that looks covered and is not.
+
+  **`Err` stays distinct from `Ok(ServeTier::None)`.** Every read propagates;
+  nothing is swallowed into a tier. This resolver sits under retention
+  decisions, where a transient read failure reported as "no serve standing"
+  silently demotes a server and sends an operator hunting for a conferral that
+  is present. That is #737's class ("an unconfigured gate is indistinguishable
+  from a deliberate threshold-0 policy") on a second surface.
+
+  **Four review findings addressed** (PR #790). The node-class gate is the one
+  that mattered: nothing checked the subject was a node, so an owner-bound
+  AGENT key self-claiming `infra:serve` would have been handed `MeshServer`
+  and any consumer using the tier as the trace serve gate would authorize an
+  agent key to serve. Also: the resolver now applies the SAME liveness rule as
+  the authoritative owner-binding fold (row `expires_at` alone let it keep
+  reporting `MeshServer` after a grant's envelope `valid_until` had lapsed —
+  two reads of "is this live" disagreeing), and ambiguous ownership is
+  surfaced before the canonical early return rather than hidden by it.
+
+  One finding is **stated rather than fixed** (#791): leg A's
+  `verify_accord_family_coscrub` returns `Result<(), String>`, flattening a
+  transient read failure into the same shape as a failed verification, which
+  leg A maps to `Ok(false)`. That is fail-secure and correct for its four GATE
+  callers and wrong for a resolver — the same function, opposite requirements.
+  Direction is safe (a canonical can read LOWER, never higher), and the
+  resolver's doc says so precisely.
+
+  Two facts worth recording because the obvious reading is wrong:
+  - **The owner-binding row is itself the conferring edge.** It carries
+    `scope: [infra:serve, …]` under the OWNERSHIP dimension, not
+    `trust:confers:v1`, and passes because `job_dimension_admits` refuses only
+    a *contradicting* trust-job label and infers when silent (v23.0.0 #551).
+  - **`MeshServer` requires BOTH halves** — the owner's grant AND the subject's
+    own claim. Either alone is `None`, which is what makes "claiming is
+    VISIBILITY, never conferral" (v19.0.0) enforced rather than documented.
+
 - **#789 — `trace_events` stored crypto material at the wrong cardinality.**
   A key-scoped pubkey and a thought-scoped signature, both written once per
   EVENT row: **679 MB of an 898 MB table** wrapped around 80 MB of actual
