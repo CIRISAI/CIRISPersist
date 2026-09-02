@@ -3835,14 +3835,14 @@ impl FederationDirectory for OpsDirectory {
             method: "get_attestation",
         })
     }
-    async fn promote_attestation(
+    async fn enter_mesh(
         &self,
         attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &crate::federation::AttestationReseal,
-    ) -> Result<bool, Error> {
+        ci: &crate::federation::ContextualIntegrity,
+        custody: &crate::federation::TierPromotionCustody,
+    ) -> Result<crate::federation::MeshCrossingOutcome, Error> {
         Err(Error::Unsupported {
-            method: "promote_attestation",
+            method: "enter_mesh",
         })
     }
     async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {

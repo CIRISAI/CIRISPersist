@@ -846,6 +846,25 @@ pub mod test_support {
         key_id: &str,
         pubkey_source_key_id: &str,
     ) {
+        register_hybrid_key_as(
+            dir,
+            key_id,
+            pubkey_source_key_id,
+            crate::federation::types::identity_type::AGENT,
+        )
+        .await
+    }
+
+    /// Register `key_id` with the deterministic test pubkeys of
+    /// `pubkey_source_key_id` and the given `identity_type` — for fixtures
+    /// whose doors care what KIND of key signs (a community member must be a
+    /// human or steward-bound; an agent is not).
+    pub async fn register_hybrid_key_as<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+        pubkey_source_key_id: &str,
+        identity_type: &str,
+    ) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
         // v30.12.0 (CIRISPersist#634) — TRUNCATED TO MICROSECONDS. Postgres
         // `TIMESTAMPTZ` is microsecond precision while `Utc::now()` carries
@@ -880,7 +899,7 @@ pub mod test_support {
             pubkey_ed25519_base64: ed_pk,
             pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+            identity_type: identity_type.to_owned(),
             identity_ref: key_id.to_owned(),
             valid_from: now,
             valid_until: None,
@@ -1040,7 +1059,7 @@ pub mod test_support {
             }
         }
         // THE MIRROR, from the row this input becomes
-        // (`LocalAttestationInput::into_transit_revocation_row`).
+        // (`LocalAttestationInput::into_caller_signed_row`).
         let mut as_stored = crate::federation::types::Attestation {
             attestation_id: attestation_id.to_owned(),
             attesting_key_id: subject.to_owned(),
@@ -1195,6 +1214,98 @@ pub mod test_support {
         row: &Attestation,
     ) -> crate::federation::AttestationReseal {
         reseal_over(signing_key_id, row.attestation_envelope.clone())
+    }
+
+    /// v39.0.0 — the ACTOR's custody for a tier crossing: the attester's own
+    /// hybrid signature over `JCS(envelope)` of the row as stored (canonical at
+    /// rest, so the bytes are the ones `crossing::plan_enter_mesh`
+    /// recomputes). Never re-stamps anything.
+    pub fn actor_reseal(row: &Attestation) -> crate::federation::TierPromotionCustody {
+        let mut envelope = row.attestation_envelope.clone();
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut envelope)
+            .expect("fixture envelope canonicalizes");
+        crate::federation::TierPromotionCustody::ActorSigned(reseal_over(
+            &row.attesting_key_id,
+            envelope,
+        ))
+    }
+
+    /// v39.0.0 — a NODE's custody for a tier crossing: `signing_key_id`'s
+    /// hybrid signature over the same bytes, offered as a co-scrub
+    /// (`cosigned_at` is stamped by the crossing, not here).
+    pub fn node_coscrub(
+        signing_key_id: &str,
+        row: &Attestation,
+    ) -> crate::federation::TierPromotionCustody {
+        let mut envelope = row.attestation_envelope.clone();
+        crate::federation::canonical_at_rest::canonicalize_in_place(&mut envelope)
+            .expect("fixture envelope canonicalizes");
+        let (_hash, classical, pqc) = sign_envelope(signing_key_id, &envelope);
+        crate::federation::TierPromotionCustody::NodeCoScrub(crate::federation::types::ScrubSig {
+            scrub_key_id: signing_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            // The co-signer stamps its own instant; the crossing writes it.
+            cosigned_at: Some(crate::federation::admission::render_signed_instant(
+                chrono::Utc::now(),
+            )),
+        })
+    }
+
+    /// v39.0.0 — widen `prior` to `scope` by a `supersedes` signed by the
+    /// prior's attester (its deterministic test key), through the ONE widening
+    /// path (`FederationDirectory::widen_audience`). `strip` names payload
+    /// members omitted on the way (listed in `differs_in`).
+    pub async fn widen<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        prior: &Attestation,
+        audience: crate::federation::Audience,
+        strip: &[String],
+    ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
+        use crate::federation::{attestation_emit, crossing, CrossingBasis, SignedAttestation};
+        let ci = describe_for(prior, audience, CrossingBasis::ProducerAuthority);
+        let mut input = crossing::build_widening(prior, &ci.recipient_see, strip)?;
+        let canonical = attestation_emit::stamp_and_canonicalize(
+            &mut input,
+            &prior.attesting_key_id,
+            chrono::Utc::now(),
+        )?;
+        let sig = local_signer(&prior.attesting_key_id)
+            .sign_hybrid(&canonical)
+            .await
+            .expect("test signer signs");
+        let (row, _) =
+            attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, sig, input)?;
+        dir.widen_audience(
+            &prior.attestation_id,
+            &ci,
+            SignedAttestation { attestation: row },
+        )
+        .await
+    }
+
+    /// v39.0.0 — the nine axes DERIVED from a row (the description a caller
+    /// would state), with `recipient_see` set to `scope` and the basis given.
+    /// Fixtures use it so every crossing states the checklist; a witness that
+    /// wants a mismatch edits one field.
+    pub fn describe_for(
+        row: &Attestation,
+        audience: crate::federation::Audience,
+        basis: crate::federation::CrossingBasis,
+    ) -> crate::federation::ContextualIntegrity {
+        crate::federation::crossing::describe(row, audience, basis)
+            .expect("fixture row is describable")
+    }
+
+    /// The nine axes of a row AT ITS OWN audience (`Audience::of_row`) — what a
+    /// tier crossing states.
+    pub fn describe_own(
+        row: &Attestation,
+        basis: crate::federation::CrossingBasis,
+    ) -> crate::federation::ContextualIntegrity {
+        let audience =
+            crate::federation::Audience::of_row(row).expect("fixture row has an audience");
+        describe_for(row, audience, basis)
     }
 
     fn reseal_over(
@@ -1580,28 +1691,33 @@ pub mod test_support {
         })
         .await
         .unwrap_or_else(|e| panic!("({suffix}) seed local self row: {e}"));
-        let reseal = reseal_for_scope(
-            &bob_observer,
-            &local_row,
-            crate::federation::types::cohort_scope::COMMUNITY,
-        );
-        let err = dir
-            .set_attestation_cohort_scope(
-                &local_id,
-                crate::federation::types::cohort_scope::COMMUNITY,
-                &reseal,
-            )
+        // v39.0.0 — a scope change is a `supersedes` through `widen_audience`,
+        // and a LOCAL prior is refused there: it must enter the mesh first.
+        let stored_local = dir
+            .get_attestation(&local_id)
             .await
-            .err()
-            .unwrap_or_else(|| {
-                panic!(
-                    "({suffix}) PR#761: re-scoping a LOCAL row into a community is an \
-                     unverified membership claim and must refuse"
-                )
-            });
+            .unwrap()
+            .expect("the local row exists");
+        let err = test_support::widen(
+            dir,
+            &stored_local,
+            crate::federation::Audience::Community {
+                community_key_id: cid2.clone(),
+            },
+            &[],
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "({suffix}) PR#761: widening a LOCAL row into a community is an \
+                 unverified membership claim and must refuse"
+            )
+        });
         assert!(
-            format!("{err}").contains("federation tier"),
-            "({suffix}) the re-scope refusal names the federation-tier requirement: {err}"
+            matches!(err, crate::federation::Error::WideningMalformed { .. })
+                && format!("{err}").contains("enter_mesh first"),
+            "({suffix}) the refusal names the crossing that must come first: {err}"
         );
 
         // (10) A REVOKED DEVICE LOSES ITS OWNER'S MEMBERSHIP (PR #761

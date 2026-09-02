@@ -3745,6 +3745,7 @@ pub(crate) mod test_support {
             .map(|k| {
                 let (_h, c, p) = sign_envelope(k, &sealed_row_.attestation_envelope);
                 crate::federation::types::ScrubSig {
+                    cosigned_at: None,
                     scrub_key_id: (*k).to_owned(),
                     scrub_signature_classical: c,
                     scrub_signature_pqc: p,

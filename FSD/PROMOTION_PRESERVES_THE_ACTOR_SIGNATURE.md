@@ -1,6 +1,6 @@
 # FSD: CIRISPersist — Promotion preserves the actor's signature (the fabric key never replaces the actor key)
 
-**Status:** **ACCEPTED — building** (2026-09-02). Edge reviewed end-to-end and answered OQ-1/OQ-2 with corrections folded below (CIRISEdge `docs/FSD_REPLICATION_DX.md` §6 items 4–6, `786815c`). Written against CIRISConstitution **1.0-rc4** and persist **v38.8.0**.
+**Status:** **SHIPPED in v39.0.0** (2026-09-02). The build followed this document with the deltas recorded in §11; read §11 before citing any earlier section as the shipped shape. Edge reviewed end-to-end and answered OQ-1/OQ-2 with corrections folded below (CIRISEdge `docs/FSD_REPLICATION_DX.md` §6 items 4–6, `786815c`). Written against CIRISConstitution **1.0-rc4** and persist **v38.8.0**.
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-02
 **Repo:** `~/CIRISPersist`
@@ -163,17 +163,17 @@ The input to the rule, `asserted_at`, is **signed** (§4.4), so it cannot be bac
 
 ## 5. Design — the split
 
-### 5.1 `enter_federation` — tier-only, same bytes (replaces `promote_attestation`)
+### 5.1 `enter_mesh` — tier-only, same bytes (replaces `promote_attestation`)
 
 ```rust
 /// CC 5.3.2.4.2 — flip `local → federation` over the SAME bytes.
 /// Never changes `cohort_scope`. Never replaces an existing scrub.
-async fn enter_federation(
+async fn enter_mesh(
     &self,
     attestation_id: &str,
     ci: ContextualIntegrity,          // §5.6 — all nine axes, no defaults
     custody: TierPromotionCustody,
-) -> Result<FederationCrossing, Error>;
+) -> Result<MeshCrossing, Error>;
 
 pub enum TierPromotionCustody {
     /// The actor's own hybrid signature over JCS(envelope), minted now or at
@@ -190,7 +190,7 @@ Refusals (all typed, none collapse to `Ok`):
 
 | Condition | Refusal |
 |---|---|
-| row is already `federation` | `Ok(AlreadyFederation)` (idempotent, CC 5.3.2.4.2) |
+| row is already `federation` | `Ok(AlreadyInMesh)` (idempotent, CC 5.3.2.4.2) |
 | `NodeCoScrub` and base scrub is the empty sentinel | `Error::NoActorSignature` — the fabric cannot be the only signer of an actor's claim |
 | `ActorSigned` and `reseal.scrub_key_id != row.attesting_key_id` | `Error::CustodyIsNotTheActor` |
 | the reseal's bytes ≠ `JCS(stored envelope)` | `Error::PromotionMovedThePreimage` — the #649 class, refused at the primitive |
@@ -211,7 +211,7 @@ async fn widen_audience(
                                  // references_attestation_id = prior,
                                  // differs_in = ["cohort_scope"],
                                  // attesting_key_id = prior.attesting_key_id
-) -> Result<FederationCrossing, Error>;
+) -> Result<MeshCrossing, Error>;
 ```
 
 Refused unless `signed.attesting_key_id == prior.attesting_key_id` (or a delegated signer per OQ-1), unless `new_cohort_scope` is strictly wider, and unless `references_attestation_id` resolves. The `content_sha256` / `evidence_refs` of the prior are reused (CC 8.1.5: "no body re-upload").
@@ -239,20 +239,20 @@ Additive and serde-default; a pre-cut `ScrubSig` round-trips unchanged. `KeyReco
 
 ```
 promote(row):
-  if row.tier == federation: return AlreadyFederation
+  if row.tier == federation: return AlreadyInMesh
   age = now - row.asserted_at                       # asserted_at is SIGNED
   has_actor_sig = row.scrub_signature_classical != ""
 
   if actor_signer_reachable(row.attesting_key_id):
       # the actor can sign; do so over the SAME bytes (re-stamp = same sig)
-      enter_federation(id, ci, ActorSigned(actor.sign(JCS(env))))
+      enter_mesh(id, ci, ActorSigned(actor.sign(JCS(env))))
   elif has_actor_sig:
       # actor gone; preserve their signature, add custody
-      enter_federation(id, ci, NodeCoScrub(node.coscrub(JCS(env), now)))
+      enter_mesh(id, ci, NodeCoScrub(node.coscrub(JCS(env), now)))
   else:
       # deferred row, no actor, no signature: it WAITS — a typed outcome,
       # never a silent stay-local. There is nothing to co-scrub (W4).
-      return FederationCrossing::AwaitingActor { attestation_id, age }
+      return MeshCrossing::AwaitingActor { attestation_id, age }
       emit hard_case: promotion_awaiting_actor        # see §7 — the CC 5.3.2.2
                                                       # overdue emission's sibling
 ```
@@ -276,7 +276,7 @@ Edge's practice already agrees: every edge producer signs at write; `share*` tak
 
 | Verb | Constitutional operation | What it changes | What edge sees afterwards |
 |---|---|---|---|
-| **`enter_federation`** | tier crossing, CC 5.3.2.4.2 | `tier: local → federation`. Nothing in the signed bytes. | the row appears on the wire index and replicates to whoever `cohort_scope` already admits |
+| **`enter_mesh`** | tier crossing, CC 5.3.2.4.2 | `tier: local → federation`. Nothing in the signed bytes. | the row appears on the wire index and replicates to whoever `cohort_scope` already admits |
 | **`widen_audience`** | scope widening, CC 4.4.3.3.1 | authors a new `supersedes` row with a wider `cohort_scope`; the prior row is untouched | a **new** row appears, addressed to the wider audience; the old one stays exactly where it was |
 
 `promote_attestation` is removed, not aliased (this repo's clean-break rule).
@@ -316,7 +316,7 @@ pub struct ContextualIntegrity {
     /// bound the caller asserts (`valid_until` / retention class).
     pub temporal_lifecycle: Lifecycle,
     /// `content` — the content hash the crossing commits to. Byte-identical
-    /// for `enter_federation`; reused (no re-upload, CC 8.1.5) for
+    /// for `enter_mesh`; reused (no re-upload, CC 8.1.5) for
     /// `widen_audience`.
     pub content: ContentRef,
 }
@@ -327,7 +327,7 @@ The verb **cross-checks every axis against the row** and refuses on any mismatch
 **Return shape says what edge will do:**
 
 ```rust
-pub struct FederationCrossing {
+pub struct MeshCrossing {
     pub attestation_id: String,        // the row now on the wire (new id for widen_audience)
     pub audience: Audience,            // recipient_see, as applied
     pub custody: Custody,              // ActorSigned | ActorSignedNodeCoScrubbed
@@ -337,14 +337,14 @@ pub struct FederationCrossing {
 
 /// The variant for a deferred row whose actor is absent. Typed, so "it did
 /// not cross" is something a caller reads rather than infers from silence.
-pub enum FederationCrossingOutcome { Crossed(FederationCrossing), AwaitingActor { attestation_id, age } }
+pub enum MeshCrossingOutcome { Crossed(MeshCrossing), AwaitingActor { attestation_id, age } }
 ```
 
 `replicates` states what persist can state and no more. **`self` and `family` rows DO replicate** — to the owner's own node set and to the family's nodes respectively, by consent fan-out over resolved recipients rather than by `holds_bytes` discovery. CC 5.2 makes them *undiscoverable*, not un-replicated. (An earlier draft labelled them `InvisibleByScope`; edge corrected it from its side of the wire, `src/edge.rs` `CohortScope::SelfOnly`.) So persist reports `discoverable: false` for those scopes and `true` otherwise; **where the bytes go** (`routes_to`) is edge's to state, on edge's `Crossing`.
 
-**One type, persist's.** `ContextualIntegrity` (nine axes, required, refused by axis name) subsumes edge's five-axis `Flow`. Edge deletes `Flow`, re-exports `ContextualIntegrity` + `FederationCrossing`, and keeps `With` (which maps onto `Audience`) and `Shared`.
+**One type, persist's.** `ContextualIntegrity` (nine axes, required, refused by axis name) subsumes edge's five-axis `Flow`. Edge deletes `Flow`, re-exports `ContextualIntegrity` + `MeshCrossing`, and keeps `With` (which maps onto `Audience`) and `Shared`.
 
-**Why this is not ceremony.** The nine-axis struct is the manifest's own rubric turned into a call signature. Persist already derives `ci_axis` per field at manifest generation and gates axis fusion (CC 4.5.1.1). What it never did was ask the *caller* to answer the axes at the one moment they become irrevocable. `enter_federation` is that moment, because edge picks the row up on the next round.
+**Why this is not ceremony.** The nine-axis struct is the manifest's own rubric turned into a call signature. Persist already derives `ci_axis` per field at manifest generation and gates axis fusion (CC 4.5.1.1). What it never did was ask the *caller* to answer the axes at the one moment they become irrevocable. `enter_mesh` is that moment, because edge picks the row up on the next round.
 
 ### 5.5 Timestamp conformance (CC 2.6.2)
 
@@ -358,7 +358,7 @@ Every entry names the mutation that must fail it. A witness whose mutation survi
 
 | # | Property | Mutation that must FAIL |
 |---|---|---|
-| W1 | `enter_federation` leaves `JCS(envelope)` byte-identical | make it call `restamp_for_scope` |
+| W1 | `enter_mesh` leaves `JCS(envelope)` byte-identical | make it call `restamp_for_scope` |
 | W2 | actor's base scrub survives tier promotion | overwrite `scrub_key_id` with the reseal's |
 | W3 | `additional_scrubs` survives tier promotion | reinstate `additional_scrubs.clear()` |
 | W4 | `NodeCoScrub` over an empty-sentinel base is refused | drop the `NoActorSignature` check |
@@ -390,9 +390,9 @@ All on three backends. The postgres leg must be confirmed **executing** (timing)
 
 Two behavioural breaks, one conformance fix:
 
-1. **`promote_attestation` is removed** — every caller that flips tier migrates to `enter_federation`; every caller that widens through it (`bootstrap_admission.rs` ×7, `engine.rs` ×4) migrates to `widen_audience`. This is a public-API break → **MAJOR (v39.0.0)** under this repo's clean-break rule (no aliases, rename + remove in one cut, flagged in CHANGELOG).
+1. **`promote_attestation` is removed** — every caller that flips tier migrates to `enter_mesh`; every caller that widens through it (`bootstrap_admission.rs` ×7, `engine.rs` ×4) migrates to `widen_audience`. This is a public-API break → **MAJOR (v39.0.0)** under this repo's clean-break rule (no aliases, rename + remove in one cut, flagged in CHANGELOG).
 2. **Timestamp form** changes signed bytes for new rows. Not a break for stored rows (tolerant parse), a break for any external party byte-comparing persist's `asserted_at` — which CC 2.6.2 says they should have been refusing anyway.
-3. Ship `ScrubSig.cosigned_at`, `ContextualIntegrity`, and `enter_federation` **first**, `widen_audience` **second**, in the same release: a tier-only crossing with no widening path would strand every caller that needs to widen.
+3. Ship `ScrubSig.cosigned_at`, `ContextualIntegrity`, and `enter_mesh` **first**, `widen_audience` **second**, in the same release: a tier-only crossing with no widening path would strand every caller that needs to widen.
 
 ---
 
@@ -411,3 +411,22 @@ Two behavioural breaks, one conformance fix:
 ## 10. What was checked, and how
 
 Every constitutional claim above was read from `CIRISConstitution/constitution/part_{2,3,4,5,8}*.md` at 1.0-rc4 on 2026-09-02, and every persist claim from `src/` at v38.8.0 — by grep and by reading the cited lines, not from memory. The two places the conversation preceding this FSD was wrong are corrected in-line (§4.1 on "inner envelope" precedent; §4.4 on `asserted_at` being unsigned). The CC 2.6.2 gap (§1.4) was not being looked for.
+
+---
+
+## 11. What shipped differently from this document (v39.0.0)
+
+Recorded here rather than rewritten into the sections above, so the reasoning
+that led to each choice stays readable.
+
+1. **Naming.** `enter_federation` shipped as **`enter_mesh`** (operator call: less confusing next to the `federation` tier). Types: `MeshCrossing`, `MeshCrossingOutcome` (`Crossed | AlreadyInMesh | AlreadyWidened | AwaitingActor`), `TierPromotionCustody`, `Custody`, `Replicates`.
+2. **`Audience` carries the cohort id** for `family`/`community` (`Audience::Family { family_key_id }`, `Audience::Community { community_key_id }`). A widening into a cohort plane goes through the put door's AV-45 write-scope gate, which proves membership against the cohort the row NAMES; a targeted audience without its id is not an audience. The consent sweep therefore widens to `family`/`community` only when the grant names the cohort (a cohort-target alias on its envelope) and otherwise counts the row `skipped` with a warning. `enter_mesh` is unaffected (the placement is the row's own).
+3. **CC 2.6.2 (§5.5) shipped as two constants, not one moved.** Minting renders `.sssZ` at millisecond resolution (`SIGNED_INSTANT_RESOLUTION_NANOS`); the ingest CHECK stays at microseconds (`CONSENT_INSTANT_RESOLUTION_NANOS`), because raising it would refuse every already-signed pre-v39 row. W10's "a `+00:00` form is refused on a new-epoch row" is not enforceable without an epoch marker and was not claimed; what is witnessed is that every minted instant renders `.sssZ`.
+4. **`(federation, self)` is admitted at the crossing** — the placement arm of `check_promotion_admission` no longer refuses `self` (it was #315's dead plane only while nothing consumed it). The "not strictly wider" refusal lives at `widen_audience` (`AudienceNotWider`).
+5. **`widen_audience` is a default trait method** over `get_attestation` + `put_attestation` (no per-backend body); it reports `AlreadyWidened` when the put door deduplicated the supersedes (CEG §6.1). To widen a claim twice, widen the LATEST row in its chain.
+6. **`temporal_lifecycle` and `content` are cross-checked against the CLAIM** — the row itself for `enter_mesh`, the PRIOR for `widen_audience` — because a widening describes the claim being widened, whose instants and content hash the actor already signed; the new row's own do not exist until it is stamped and signed. The `transmission_principle` grant check requires the grant to name the audience only at a widening; at `enter_mesh` it must cover the dimension.
+7. **`Engine::register_self`** emits the identity's `delegates_to` federation-tier directly, signed by `SelfAtLoginInput::identity_signer` (or by this node when the identity IS its composed signer); otherwise the delegation is staged local and waits. It is not widened, because a `supersedes` is not a `delegates_to` to a type-keyed reader — see §7 and the reader contract in the CHANGELOG.
+8. **The consent sweep** (§5.4's engine motion) is two passes over one predicate: local rows (enter, then widen) and `list_widening_candidates` (undiscoverable federation rows with no widening yet — the sealed-before-grant case). `repair_stranded_scope_backlog` and the in-place re-scope are gone; `ConsentSweepReport` is `{promoted, widened, awaiting_actor, skipped}`.
+9. **W14** reads `replicates.discoverable == false` for `self`/`family` and `true` otherwise (edge's correction, §5.6). **W12** rides W2's mechanism and is not fixtured separately.
+10. **`register_hybrid_key_as`** in test support: a community member must be a human or steward-bound, so the B9 witness registers its producer as a USER before proving membership and then STANDING.
+

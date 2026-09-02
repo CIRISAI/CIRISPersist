@@ -35,7 +35,7 @@
 //! | [`OpKind::InsertLocal`] | [`FederationDirectory::attestation_insert_local`] |
 //! | [`OpKind::UpsertLocal`] | [`FederationDirectory::attestation_upsert_local`] |
 //! | [`OpKind::Put`] | [`FederationDirectory::put_attestation`] at the op's `tier` |
-//! | [`OpKind::Promote`] | `set_attestation_cohort_scope` + [`FederationDirectory::promote_attestation`] |
+//! | [`OpKind::Promote`] | [`FederationDirectory::enter_mesh`] — same bytes, the attester's custody |
 //! | [`OpKind::Withdraw`] | `put_attestation` of a `withdraws` referencing a prior row |
 //! | [`OpKind::Supersede`] | `put_attestation` of a `supersedes` referencing a prior row |
 //! | [`OpKind::Recant`] | `put_attestation` of a `recants` referencing a prior row |
@@ -1146,13 +1146,26 @@ pub mod test_support {
             // Signing the pre-promotion envelope produced a row every peer
             // refused; the harness mirrors the primitive, so it mirrors that
             // fix too.
-            let mut reseal =
-                ts::reseal_for_scope(&row.attesting_key_id, &row, op.cohort_scope.as_str());
-            reseal.scrub_timestamp = at;
-            let res = self
-                .dir
-                .promote_attestation(&target, op.cohort_scope.as_str(), &reseal)
-                .await;
+            // v39.0.0 — a promotion is `enter_mesh`: same bytes, the attester
+            // signs, the placement is the row's own. `op.cohort_scope` no longer
+            // has a role here (a widening is a `supersedes`, i.e. an `OpKind::Supersede`).
+            let custody = match ts::actor_reseal(&row) {
+                crate::federation::TierPromotionCustody::ActorSigned(mut reseal) => {
+                    reseal.scrub_timestamp = at;
+                    crate::federation::TierPromotionCustody::ActorSigned(reseal)
+                }
+                other => other,
+            };
+            let res = match crate::federation::Audience::of_row(&row).and_then(|audience| {
+                crate::federation::crossing::describe(
+                    &row,
+                    audience,
+                    crate::federation::CrossingBasis::ProducerAuthority,
+                )
+            }) {
+                Ok(ci) => self.dir.enter_mesh(&target, &ci, &custody).await,
+                Err(e) => Err(e),
+            };
             match res {
                 Ok(_) => OpOutcome {
                     admitted: true,
@@ -1380,6 +1393,7 @@ pub mod test_support {
                     };
                     let (_, c, q) = signature_for_key(state, &self.kid(p), &envelope);
                     crate::federation::types::ScrubSig {
+                        cosigned_at: None,
                         scrub_key_id: self.kid(p),
                         scrub_signature_classical: c,
                         scrub_signature_pqc: q,

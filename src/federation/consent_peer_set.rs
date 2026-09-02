@@ -310,37 +310,9 @@ pub(crate) mod test_support {
         // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN: `cohort_scope`
         // is bound into the signed envelope, so the door takes the re-stamped
         // + re-signed bundle beside the new placement.
-        let local1_row = dir.get_attestation(&local1).await.unwrap().expect("row");
-        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
-            &local1_row.attesting_key_id,
-            &local1_row,
-            cohort_scope::FEDERATION,
-        );
-        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION, &reseal)
-            .await
-            .expect("cohort_scope write-back");
-        let after = dir.get_attestation(&local1).await.unwrap().expect("row");
-        assert_eq!(after.cohort_scope, cohort_scope::FEDERATION);
-
-        let invalid = dir
-            .set_attestation_cohort_scope(&local1, "not-a-real-scope", &reseal)
-            .await;
-        assert!(
-            matches!(invalid, Err(crate::federation::Error::InvalidArgument(_))),
-            "an out-of-closed-set cohort_scope is rejected: {invalid:?}"
-        );
-
-        let missing = dir
-            .set_attestation_cohort_scope(
-                "00000000-0000-0000-0000-000000000000",
-                cohort_scope::FEDERATION,
-                &reseal,
-            )
-            .await;
-        assert!(
-            matches!(missing, Err(crate::federation::Error::InvalidArgument(_))),
-            "a nonexistent attestation_id is rejected: {missing:?}"
-        );
+        // (v39.0.0 — the in-place re-scope primitive is gone; a scope change is a
+        // `supersedes` written through `widen_audience`, witnessed in
+        // `bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing`.)
 
         // ── list_live_consent_grants_by: grant → live, withdraw → gone ──
         let grant_id = uuid::Uuid::new_v4().to_string();

@@ -179,7 +179,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_peer_deadmission", Class::Gate),
     ("check_peer_record_admission", Class::Gate),
     ("check_privileged_identity_type_admission", Class::Gate),
-    ("check_promotion_admission", Class::Gate),
     // v38.2.0 PR #759 review — the standing comparison RESOLVES occurrence →
     // identity at every standing door, so the doors call the resolved form;
     // the pure `check_promotion_cohort_standing` survives only as the
@@ -274,6 +273,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the mappers' own decode helpers. Plumbing — they fail only on the
     // substrate's own stored bytes (a corrupt column), never on caller input.
     ("decode_witness_set", Class::Plumbing),
+    // v39.0.0 — the whole crossing decision: custody verification, every
+    // inherited co-scrub, `check_promotion_admission`, and the nine
+    // contextual-integrity axes. Delegates, not Gate: it is the door's helper
+    // that RUNS the gates, and every one of them refuses on its own terms.
+    ("plan_enter_mesh", Class::Delegates),
     ("pg_witness_set", Class::Plumbing),
     ("strict_ts", Class::Plumbing),
     ("mint_content_kem_keypair", Class::Plumbing),

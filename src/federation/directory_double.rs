@@ -262,6 +262,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.communities_containing(cell_id).await
     }
+    async fn enter_mesh(
+        &self,
+        attestation_id: &str,
+        ci: &crossing::ContextualIntegrity,
+        custody: &crossing::TierPromotionCustody,
+    ) -> Result<crossing::MeshCrossingOutcome, Error> {
+        if let Some(e) = self.faulted("enter_mesh") {
+            return Err(e);
+        }
+        self.inner.enter_mesh(attestation_id, ci, custody).await
+    }
     async fn evict_fountain_content_hard_delete(
         &self,
         content_id: &str,
@@ -798,19 +809,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
-            .await
-    }
-    async fn promote_attestation(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &AttestationReseal,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("promote_attestation") {
-            return Err(e);
-        }
-        self.inner
-            .promote_attestation(attestation_id, cohort_scope, reseal)
             .await
     }
     async fn put_accord_decision(

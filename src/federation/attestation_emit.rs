@@ -100,12 +100,14 @@ pub fn stamp_and_canonicalize(
     attesting_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<u8>, Error> {
-    use crate::federation::admission::truncate_to_substrate_resolution as trunc;
+    use crate::federation::admission::{
+        render_signed_instant, truncate_to_substrate_resolution as trunc,
+    };
     if input.attestation_envelope.asserted_at.is_none() {
-        input.attestation_envelope.asserted_at = Some(trunc(now).to_rfc3339());
+        input.attestation_envelope.asserted_at = Some(render_signed_instant(trunc(now)));
     }
     input.expires_at = input.expires_at.map(trunc);
-    input.attestation_envelope.expires_at = input.expires_at.map(|t| t.to_rfc3339());
+    input.attestation_envelope.expires_at = input.expires_at.map(render_signed_instant);
     input.attestation_envelope.row = Some(crate::federation::envelope::RowMirror {
         // v31.0.0 (#643) — THE ROW ID IS MINTED HERE, before the bytes exist,
         // and [`assemble`] reads it back out. It used to be a fresh

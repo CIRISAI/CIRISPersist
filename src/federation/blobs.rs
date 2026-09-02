@@ -3049,8 +3049,9 @@ mod tests {
         // accept, through a door that never asked what the peers ask.
         assert_eq!(
             env[crate::federation::envelope::paths::ASSERTED_AT],
-            serde_json::json!(at.to_rfc3339()),
-            "#598: the holder's assertion instant rides the SIGNED bytes"
+            serde_json::json!(crate::federation::admission::render_signed_instant(at)),
+            "#598: the holder's assertion instant rides the SIGNED bytes — and v39.0.0 renders \
+             every MINTED instant as CC 2.6.2 `.sssZ`"
         );
         assert!(
             env.get(crate::federation::envelope::paths::EXPIRES_AT)

@@ -2144,6 +2144,7 @@ mod tests {
             env("x:y:v1", Some("t")),
         );
         tomb.additional_scrubs = vec![ScrubSig {
+            cosigned_at: None,
             scrub_key_id: "a".into(),
             scrub_signature_classical: "s".into(),
             scrub_signature_pqc: None,
@@ -2248,11 +2249,13 @@ mod tests {
         );
         r.additional_scrubs = vec![
             crate::federation::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: "holder-b".into(),
                 scrub_signature_classical: "sig-b".into(),
                 scrub_signature_pqc: None,
             },
             crate::federation::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: "holder-c".into(),
                 scrub_signature_classical: "sig-c".into(),
                 scrub_signature_pqc: None,
@@ -2309,6 +2312,7 @@ mod tests {
         }
         let mut r = row("d1", "me", attestation_type::SCORES, env("x:y:v1", None));
         r.additional_scrubs = vec![crate::federation::types::ScrubSig {
+            cosigned_at: None,
             scrub_key_id: "holder-b".into(),
             scrub_signature_classical: "sig-b".into(),
             scrub_signature_pqc: None,
@@ -2630,6 +2634,7 @@ pub(crate) mod test_support {
         {
             let (_h, ed, pqc) = seal::sign_envelope(&other, &quorum.attestation_envelope);
             quorum.additional_scrubs = vec![crate::federation::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: other.clone(),
                 scrub_signature_classical: ed,
                 scrub_signature_pqc: pqc,

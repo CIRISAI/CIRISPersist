@@ -1205,6 +1205,7 @@ mod authorization_digest_tests {
         // B1 appends its scrub, and the primary scrub fields move with it.
         sn.additional_scrubs
             .push(crate::federation::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: "B1".to_owned(),
                 scrub_signature_classical: "B".repeat(88),
                 scrub_signature_pqc: Some("B".repeat(4412)),

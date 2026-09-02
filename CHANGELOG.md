@@ -5,6 +5,181 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [39.0.0] - 2026-09-02
+
+**Promotion preserves the actor's signature.** A MAJOR: the one promotion
+primitive is gone and two operations stand where it stood. Design record:
+`FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md` (reviewed end to end by
+CIRISEdge, `docs/FSD_REPLICATION_DX.md` §6 items 4–6, `786815c`).
+
+### The defect
+
+`promote_attestation` re-signed a local-tier row with THIS NODE's key,
+replaced the actor's base scrub, cleared every co-scrub, and rewrote
+`cohort_scope` inside the signed envelope. The fabric became the author of an
+actor's claim. It was also unreplicable whenever the attester was not the
+node: the wire verifier (`verify_row_hybrid_signature`) resolves the base
+signature against `attesting_key_id`, never `scrub_key_id`, so a row attested
+by an agent and signed by its node was refused at every peer's `put_attestation`
+— and promotion returned `Ok` throughout, which is what hid it (the #649 class
+wearing the key model). Under the three-key model (NodeID at bootstrap; NodeID
++ FedID after startup; FedID + NodeID + AgentID for agents) this made every
+human- and agent-authored row's crossing a node-authored row.
+
+### Removed (clean break, no aliases)
+
+- `FederationDirectory::promote_attestation`, `set_attestation_cohort_scope`,
+  `list_stranded_federation_attestations`; `Engine::attestation_promote`,
+  `promote_attestation_with_transforms`, `reseal_for_scope`,
+  `repair_stranded_scope_backlog`; PyEngine `attestation_promote`,
+  `repair_stranded_scope_backlog`. `ConsentSweepReport.rescoped` is gone
+  (`widened` and `awaiting_actor` replace it).
+
+### Added — two verbs, one module
+
+- **`src/federation/crossing.rs` is the map.** Everything that decides a
+  crossing — custody verification, every inherited co-scrub, the promotion
+  admission stack, the nine contextual-integrity axes, the widening shape rule,
+  the row as it will be stored — lives there. The backends execute a
+  `crossing::EnterPlan` in one statement; nothing is re-derived elsewhere.
+
+- **`enter_mesh`** (CC 5.3.2.4.2) — `local → federation` over the **same
+  bytes**. `cohort_scope` is one of those bytes, so a `(local, self)` row
+  crosses to `(federation, self)`: the CC 5.2 shape, replicated to the owner's
+  own nodes by consent fan-out and never advertised via `holds_bytes`. The
+  #315 refusal of that placement is retired — it was a dead plane only while
+  nothing consumed it; edge's own-device fan-out (`CohortScope::SelfOnly`) does.
+  Custody is the caller's typed answer to "who signs":
+  `TierPromotionCustody::ActorSigned` (the attester's own hybrid signature;
+  refused unless `scrub_key_id == attesting_key_id` — `CustodyIsNotTheActor` —
+  and unless the bytes canonicalize to the stored envelope —
+  `PromotionMovedThePreimage`) or `NodeCoScrub` (the node's signature over the
+  same bytes, **appended** to `additional_scrubs` with `cosigned_at`; refused
+  when there is no actor signature to co-scrub — `NoActorSignature`: the
+  fabric is never the only signer of an actor's claim). Every signature the
+  plan admits — actor, node, and each pre-existing co-scrub — is verified at
+  this door under `HybridPolicy::Strict` (100% PQC), which is the answer to
+  #556/#557's reason for clearing co-scrubs: the preserve set equals the
+  verified set because the door verifies it.
+
+- **`widen_audience`** (CC 4.4.3.3.1 / 8.1.5) — a `supersedes` row the ACTOR
+  signs at a strictly wider `cohort_scope`; the prior row is untouched.
+  `references_attestation_id` names the prior, `differs_in` lists
+  `cohort_scope` and only otherwise the payload members a consent
+  `StripField` restriction removed; the body is reused member by member
+  (`WideningReAuthors` otherwise); a non-actor signer is `CustodyIsNotTheActor`;
+  a target that is not strictly wider is `AudienceNotWider`; a local prior is
+  `WideningMalformed` (enter first). It is a **default trait method** over
+  `get_attestation` + `put_attestation`, so the ordinary put door runs every
+  gate and the ingest verification, and a second widening of the same prior
+  by the same attester is reported as `AlreadyWidened` (CEG §6.1 dedup) rather
+  than a phantom `Crossed`.
+
+- **`ContextualIntegrity`** — the nine CC 4.5.1.1 axes (`sender`,
+  `data_subject`, `recipient_see`, `recipient_revoke`, `recipient_receive`,
+  `information_type`, `transmission_principle`, `temporal_lifecycle`,
+  `content`), every field required, every field cross-checked against the row
+  and refused by the NAME of the axis (`ContextualIntegrityMismatch`). Edge
+  re-exports it; its `With` vocabulary maps onto `Audience`, which carries the
+  cohort id for `family`/`community` — a cohort placement is a membership
+  claim about ONE cohort (AV-45), so a targeted audience without its id is not
+  an audience. `crossing::describe` derives the truthful description from a
+  row; a caller edits an axis to change what a crossing means and is refused
+  if the edit is a lie.
+
+- **`MeshCrossingOutcome`** — `Crossed(MeshCrossing { attestation_id,
+  audience, custody, age_at_crossing_ms, replicates })`, `AlreadyInMesh`,
+  `AlreadyWidened`, and **`AwaitingActor`**: an unsigned row whose actor is
+  not in hand WAITS — typed, never a silent stay-local. `replicates.discoverable`
+  is `false` for `self`/`family` (replicated, not advertised) — an earlier
+  draft called them "invisible"; edge corrected it from its side of the wire.
+  `age_at_crossing_ms` is `now − asserted_at` (the signed `created`), so the
+  CC 2.6.7 window is observable.
+
+- **`Engine::custody_for` is the one place that decides who signs.** A row
+  signed at write by another key → the node co-scrubs; signed by this node →
+  the base scrub is re-offered; unsigned and attested by this node → the node
+  signs as the actor; unsigned by another key → the actor's signer, or
+  `AwaitingActor`; a signer that is in hand but is NOT the attester is refused,
+  not ignored. There is no delegated widening (subsidiarity, CC part 3 §308;
+  `check_node_agency_admission` makes it cryptographic).
+
+- **Sign at write** (FSD §5.4, answered by edge from this cut's own gates):
+  `LocalAttestationInput::bind_for_signing` mints the id, stamps the signed
+  instants and the typed-column mirror, and returns the JCS bytes for the
+  actor to sign; `admission::verify_caller_signed_local_row` (the generalized
+  transit-revocation verify) checks the signature at the local door and the
+  row is stored SIGNED at `tier = local`. A durable row without a signature is
+  still admitted deferred (CC 5.3.2.2) — and it is exactly the row a node can
+  never co-scrub, so software-held actor keys (AgentID, in-process) sign at
+  write; ceremony-bound keys (FedID on hardware) sign at the crossing, which
+  for chat is the send.
+
+- **`ScrubSig.cosigned_at`** — `modified` (CC 2.6.7), on the scrub, OUTSIDE
+  the signed preimage; `asserted_at` inside the envelope is `created`. Absent
+  and serialized away on every base scrub, key-plane scrub and pre-v39 record,
+  so those stay byte-identical on the wire.
+
+- **CC 2.6.2 instants.** Every instant persist MINTS into a signed envelope
+  (`asserted_at`, `expires_at`, `cosigned_at`) renders through
+  `admission::render_signed_instant` as `.sssZ` (`SIGNED_INSTANT_RESOLUTION_NANOS`
+  = 1 ms). The ingest CHECK deliberately stays at microseconds
+  (`CONSENT_INSTANT_RESOLUTION_NANOS`): raising it would refuse every
+  already-signed pre-v39 row, whose bytes cannot be re-rendered. The FSD
+  proposed moving the one constant; the shipped form is two, for that reason.
+  Parsing stays tolerant of both forms.
+
+- **The consent sweep over both verbs.** `promote_consented_backlog` enters
+  covered local rows over the same bytes and widens them to the grant's
+  audience by a `supersedes`, then walks
+  `FederationDirectory::list_widening_candidates` — federation-tier rows at an
+  undiscoverable scope that no `supersedes` by their attester references yet
+  (the NOT EXISTS arm on both SQL backends; the memory backend filters) — so a
+  row that entered before any grant covered it (#530's sealed-before-grant
+  case) is widened once one does. The node signs only what it authored;
+  everything else is `awaiting_actor` in the report. A grant whose audience is
+  `family`/`community` must name the cohort (a cohort-target alias on the grant
+  envelope) or the widening is refused at the put door and counted `skipped`
+  with a warning — persist no longer has any door that places a row in a
+  cohort plane without proving membership.
+
+- **`Engine::register_self` emits the delegation federation-tier, signed by
+  the identity.** The `delegates_to` from the identity to the agent is the
+  identity's claim; before this cut it was staged local and "promoted" by
+  re-signing with the node's key — a row attested by the identity but signed
+  by the node, which every peer refused. `SelfAtLoginInput::identity_signer`
+  carries the identity's signer; when the identity is this node's composed
+  signer it emits directly; otherwise the delegation is staged local and
+  waits, and `delegation_promoted` reports `false` rather than signing as
+  somebody else.
+
+- PyEngine: `enter_mesh(attestation_id, contextual_integrity_json) -> dict`,
+  `widen_audience(prior_attestation_id, contextual_integrity_json, strip) -> dict`,
+  `describe_crossing(attestation_id, scope, cohort_target, basis_json) -> str`.
+  Refusals raise; outcomes are the `MeshCrossingOutcome` object.
+
+### The reader contract this cut relies on, stated so it is not discovered later
+
+A `supersedes` row written by `widen_audience` IS the claim at the wider
+audience (CC 4.4.3.3.1). Readers that key on `attestation_type` — including
+persist's own type-keyed folds — see the prior at its own scope and must
+resolve through `references_attestation_id` to see the widening; the
+precedence fold already does, per-type folds do not. That is the FSD's §7
+projection work, deliberately not bundled into this cut. It is also why the
+`register_self` delegation is emitted at the federation tier directly rather
+than widened.
+
+### Witnesses
+
+W1–W14 of the FSD run at the directory primitive on all three backends
+(`bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing`);
+the engine's custody policy and the two-pass sweep have their own tests; the
+re-cut B8 / #649 / B9 witnesses cover the admission stack at the crossing, a
+crossed row and its widening admitting at a PEER (the assertion whose absence
+hid #649), and cohort standing at the widening door with membership proven
+first. W12 (a transit revocation's caller signature survives) rides the same
+mechanism as W2 and is not fixtured separately.
+
 ## [38.8.0] - 2026-09-02
 
 The mesh-launch cut: the two surfaces edge needs to promote identities and
