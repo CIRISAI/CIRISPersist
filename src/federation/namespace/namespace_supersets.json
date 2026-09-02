@@ -3613,7 +3613,7 @@
     "proposed: no CCC UI distinguishing implementation located (client-layer obligation)",
     "proposed: activity_tier emitter (unbuilt anywhere) must set cohort_scope explicitly rather than inherit persist federation default or the seed self assumption",
     "src/federation/types.rs#cohort_scope::crypto_tier",
-    "src/engine.rs#Engine::promote_consented_backlog (the CORRECT resolving primitive; defect is that the server endpoint promote flag calls non-resolving attestation_promote instead)",
+    "src/engine.rs#Engine::promote_consented_backlog (composes both crossing verbs). v39.0.0: `attestation_promote` no longer exists; a consumer that only crosses the tier must call `enter_mesh` and, if it wants a wider audience, `widen_audience` — the resolution is not something a tier crossing can do",
     "proposed:CIRISPersist/src/federation/admission.rs#check_write_cohort_scope (community-scoped emission currently passes unrejected)",
     "proposed: decide Global-vs-Cohort per Annex H/J transparency before building card/endpoint",
     "proposed:src/compose.rs#check_bond_scope_covers_backed_claim (speculative; no CC pin)",
@@ -3648,7 +3648,7 @@
     "proposed: no edge projection/serve default or guard exists for the canonical self-scope",
     "proposed: CIRISServer policy wiring for transport:* projection default - no symbol; needs-human-review to pin before compile/admission-checkable",
     "CIRISPersist/src/store/types.rs#cohort_scope; admission.rs#DimensionAdmissionPolicy::check_write_cohort_scope",
-    "src/safety/watchlist.rs#enable_watchlist (engine.attestation_promote - local SELF row promoted federation-tier so peers agree; implemented, wire shape not yet upstream-canonicalized per FSD sec.10 #1)",
+    "src/safety/watchlist.rs#enable_watchlist (engine.enter_mesh - local SELF row crosses to the federation tier so peers agree; v39.0.0 renamed the verb and the row keeps its own scope, so a watchlist row that must be broadly visible now also needs engine.widen_audience; wire shape not yet upstream-canonicalized per FSD sec.10 #1)",
     "proposed: edge routing/projection default table - witness_diversity:* -> federation (not community)",
     "proposed: src/federation/admission.rs#reject_non_federation_scoped_replication_grant (no existing admission check found; today enforced only by CIRISServer's producer-side src/peer.rs emission discipline)",
     "CIRISPersist/src/engine.rs#Engine::promote_consented_backlog",
@@ -10304,7 +10304,7 @@
     "primitive_constraint": "no cap import; no family conflation"
    },
    {
-    "rule": "cohort_scope/restrictions must be resolved AT PROMOTION, not assumed from initial write: Engine::attestation_promote (reachable via POST /v1/auth/attestation promote:true) performs NO cohort_scope resolution and NO restriction application - only promote_consented_backlog resolves scope from covering consent:replication grants and applies StripField.",
+    "rule": "cohort_scope/restrictions are resolved when the row is PUBLISHED, not at the initial write. v39.0.0: the tier crossing (`Engine::enter_mesh`) deliberately resolves neither — it is byte-identical (CC 5.3.2.4.2) — and `Engine::widen_audience` is where the covering consent:replication grant's audience and its StripField restrictions are applied, as a `supersedes` the actor signs. `promote_consented_backlog` composes both. A restriction that strips a member the dimension REQUIRES is refused at the put door rather than published.",
     "cc_ref": "CIRISPersist#509/#510 design intent (impl-level)",
     "quote": "",
     "primitive_constraint": "bare tier-flip ships a federation row whose visibility/restrictions were never validated - the named exemplar defect"
@@ -13708,7 +13708,7 @@
   "persist_reality": "CIRISPersist v21.4.0",
   "edge_reality": "CIRISEdge v14.4.0",
   "headline_gaps": [
-   "attestation_promote: flips tier WITHOUT uplifting cohort_scope/audience/restrictions (incomplete-primitive bug; CIRISPersist#315 fix = persist must uplift EVERY placement field at promotion), demanded by attestation:* promotion consumers across the reserved ladder",
+   "v39.0.0: RESOLVED, and the framing was wrong. `attestation_promote` is gone. A tier crossing (`enter_mesh`) is byte-identical by construction (CC 5.3.2.4.2), so it CANNOT uplift a placement field — `cohort_scope` is one of the signed bytes. Widening the audience is a separate operation (`widen_audience`, CC 4.4.3.3.1): a `supersedes` row the actor signs, carrying the covering grant's audience and its StripField restrictions as `differs_in`. Two operations, not one incomplete one",
    "delivery_mode: NOT typed in EnvelopeCore, NO processor in any component - carried as untyped extra; recipient_receive axis references it across families with zero enforcement",
    "deletion_window: NOT typed in EnvelopeCore, NO processor - GDPR/erasure temporal window is cargo-only; no lifecycle processor uplifts or enforces it",
    "deletion_window: no processor in any component, demanded by 9 families ['attestation:self_verify', 'audit_chain:hash_continuity', 'capacity:composite', 'identity_continuity:relational_anchor', 'integrity:{aspect}']...",
@@ -13983,12 +13983,12 @@
    "witness_relation: partial processor in component [persist/server], demanded by ['consent:*'] -- proposed: no composer reads witness_relation when weighting this family (CC 2.1 anti-gaming guard unimplemented)"
   ],
   "mandated_known_gaps": [
-   "attestation_promote: flips tier WITHOUT uplifting cohort_scope/audience/restrictions (incomplete-primitive bug; CIRISPersist#315 fix = persist must uplift EVERY placement field at promotion), demanded by attestation:* promotion consumers across the reserved ladder",
+   "v39.0.0: RESOLVED, and the framing was wrong. `attestation_promote` is gone. A tier crossing (`enter_mesh`) is byte-identical by construction (CC 5.3.2.4.2), so it CANNOT uplift a placement field — `cohort_scope` is one of the signed bytes. Widening the audience is a separate operation (`widen_audience`, CC 4.4.3.3.1): a `supersedes` row the actor signs, carrying the covering grant's audience and its StripField restrictions as `differs_in`. Two operations, not one incomplete one",
    "delivery_mode: NOT typed in EnvelopeCore, NO processor in any component - carried as untyped extra; recipient_receive axis references it across families with zero enforcement",
    "deletion_window: NOT typed in EnvelopeCore, NO processor - GDPR/erasure temporal window is cargo-only; no lifecycle processor uplifts or enforces it"
   ],
   "complete_baselines": [
-   "promote_consented_backlog: COMPLETE over tier+cohort_scope (uplifts both placement fields at promotion) - the correct template attestation_promote should follow per #315",
+   "promote_consented_backlog (v39.0.0): two passes over one predicate — `enter_mesh` over the same bytes, then `widen_audience` to the covering grant's audience with its StripField restrictions. It is not a template for a single uplifting primitive; there is no such primitive, because a crossing that changed the placement would be re-signing somebody else's claim",
    "cohort_scope: PROCESSED in edge via projection_for (serve-time projection) AND admission-validated in persist via DimensionAdmissionPolicy::check_write_cohort_scope - not a gap",
    "recipient_capability: PROCESSED in edge via the #396 capability gates at serve - not a gap",
    "CIRISPersist v21.4.0 check_adult_incapacity_binding: COMPLETE over attester-independence + valid_until bounds + domain-scope subset + apophatic floor + reversible-companion linkage + legitimacy source - the most complete admission predicate found in the addendum, and the template a promote-with-full-placement primitive should follow",
@@ -16361,7 +16361,7 @@
      "manifests/namespace_registry.json",
      "evidence/cc_impl.tsv row 4.4.3.6 (stale)",
      "CIRISPersist admission.rs (ladder mechanisms + T3 carve-out)",
-     "CIRISPersist engine.rs#attestation_promote + #promote_consented_backlog",
+     "CIRISPersist engine.rs#enter_mesh + #widen_audience + #promote_consented_backlog",
      "CIRISPersist consent_grammar.rs (StripField/RecipientCapability)",
      "CIRISServer src/auth/attestation.rs (cohort_scope hardcode L128, promote L148)"
     ],
@@ -16444,7 +16444,7 @@
       "primitive_constraint": "no cap import; no family conflation"
      },
      {
-      "rule": "cohort_scope/restrictions must be resolved AT PROMOTION, not assumed from initial write: Engine::attestation_promote (reachable via POST /v1/auth/attestation promote:true) performs NO cohort_scope resolution and NO restriction application - only promote_consented_backlog resolves scope from covering consent:replication grants and applies StripField.",
+      "rule": "cohort_scope/restrictions are resolved when the row is PUBLISHED, not at the initial write. v39.0.0: the tier crossing (`Engine::enter_mesh`) deliberately resolves neither — it is byte-identical (CC 5.3.2.4.2) — and `Engine::widen_audience` is where the covering consent:replication grant's audience and its StripField restrictions are applied, as a `supersedes` the actor signs. `promote_consented_backlog` composes both. A restriction that strips a member the dimension REQUIRES is refused at the put door rather than published.",
       "cc_ref": "CIRISPersist#509/#510 design intent (impl-level)",
       "primitive_constraint": "bare tier-flip ships a federation row whose visibility/restrictions were never validated - the named exemplar defect"
      }
@@ -16459,7 +16459,7 @@
      {
       "field": "cohort_scope",
       "owner_component": "persist",
-      "processor": "src/engine.rs#Engine::promote_consented_backlog (the CORRECT resolving primitive; defect is that the server endpoint promote flag calls non-resolving attestation_promote instead)",
+      "processor": "src/engine.rs#Engine::promote_consented_backlog (composes both crossing verbs). v39.0.0: `attestation_promote` no longer exists; a consumer that only crosses the tier must call `enter_mesh` and, if it wants a wider audience, `widen_audience` — the resolution is not something a tier crossing can do",
       "enforcement_point": "promotion"
      },
      {
@@ -16504,7 +16504,7 @@
      "seed missed the biggest gap: strip/scope not enforced end-to-end because promote:true bypasses the resolving primitive"
     ],
     "flags": [
-     "needs-human-review: confirm server_endpoint wires promotion through promote_consented_backlog, not bare attestation_promote",
+     "needs-human-review: confirm server_endpoint wires publication through promote_consented_backlog (or enter_mesh + widen_audience) — `attestation_promote` was removed in v39.0.0 and no CIRISAI repo search finds a remaining caller",
      "needs-human-review: build:registered precondition unenforced in persist v21.4.0",
      "constitution-silent: cohort_scope/visibility default",
      "evidence-registry-stale: cc_impl.tsv row for CC 4.4.3.6 marks open while persist implements the gate"
@@ -37871,7 +37871,7 @@
      {
       "field": "cohort_scope (federation visibility of the enable)",
       "owner_component": "edge",
-      "processor": "src/safety/watchlist.rs#enable_watchlist (engine.attestation_promote - local SELF row promoted federation-tier so peers agree; implemented, wire shape not yet upstream-canonicalized per FSD sec.10 #1)",
+      "processor": "src/safety/watchlist.rs#enable_watchlist (engine.enter_mesh - local SELF row crosses to the federation tier so peers agree; v39.0.0 renamed the verb and the row keeps its own scope, so a watchlist row that must be broadly visible now also needs engine.widen_audience; wire shape not yet upstream-canonicalized per FSD sec.10 #1)",
       "enforcement_point": "promotion"
      }
     ],
@@ -37880,7 +37880,7 @@
       "attestation_upsert_local (config-attestation enable row)",
       "withdraws (disable/revocation)",
       "delegates_to enforced-admission chain-walk (moderate; +takedown for Csam)",
-      "attestation_promote (federation-tier cross-fabric agreement)",
+      "enter_mesh + widen_audience (federation-tier cross-fabric agreement)",
       "hard_case:{kind} emission (watchlist_enabled/watchlist_match - unimplemented, required by CC 4.5.7)",
       "is_named_moderator resolution (validate route_to_moderator + gate CSAM/OtherContent dispatch)",
       "takedown_notice{PerceptualHashCsam} fast-path composition (CSAM auto-fire only)"
@@ -39129,7 +39129,7 @@
      },
      "recipient_see": {
       "usage": "default",
-      "note": "cohort_scope defaults to (and at local tier MUST be) self - private to the producing occurrence. Widening happens only through the generic attestation_promote path when consent is separately granted ('consent promotes self -> community via attestation_promote; replication is pure CEG state').",
+      "note": "cohort_scope defaults to (and at local tier MUST be) self - private to the producing occurrence. Widening happens only through the generic widen_audience path when consent is separately granted (v39.0.0: consent widens self -> community via a `supersedes` the actor signs; the tier crossing itself never widens; replication is pure CEG state).",
       "wire_fields": [
        "cohort_scope"
       ]
@@ -39226,7 +39226,7 @@
       "enforcement_point": "admission"
      },
      {
-      "field": "cohort_scope == self at local-tier write (widening only via explicit consent-driven attestation_promote)",
+      "field": "cohort_scope == self at local-tier write (widening only via explicit consent-driven widen_audience)",
       "owner_component": "persist",
       "processor": "src/federation/types.rs#LocalAttestationInput (default_self_cohort_scope) + the local-tier write-path self-cohort gate",
       "enforcement_point": "admission"
@@ -39249,7 +39249,7 @@
       "self-emission-only mint (attesting_key_id in subject_key_ids), admission-enforced",
       "exactly-one-of inline/manifest shape gate, admission-enforced",
       "size-cap oversize fallback to manifest when canonical bytes exceed MAX_ATTESTATION_ENVELOPE_BYTES",
-      "promote-with-full-placement: cohort_scope widening only through the generic consent-gated attestation_promote path, never a default"
+      "promote-with-full-placement: cohort_scope widening only through the generic consent-gated widen_audience path, never a default"
      ],
      "forbidden": [
       "third-party / non-self emission (structurally refused at admission)",

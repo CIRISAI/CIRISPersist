@@ -629,9 +629,6 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
-    def attestation_promote(self, attestation_id: str, cohort_scope: str) -> bool:
-        """(derived) deontic — v4.9.0 (CIRISPersist#171 phase 2, CEG §10.1.5) — promote a local-tier self-attestation to federation tier: the local→public transition the agent's..."""
-
     def bake_assembled_genesis(self, bundle_json: str) -> str:
         """(derived) deontic — v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root bundle (the ceremony artifact JSON, the operator-saved genesis_v2.json). Verifies... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
 
@@ -748,6 +745,9 @@ class Engine:
 
     def emit_attestation_self(self, input_json: str) -> str:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
+
+    def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
+        """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""
 
     def escrow_create(self, row_json: str) -> bool:
         """(derived) deontic — CC 4.4.3.2.8 — create (or idempotently re-create) an escrow record (JSON KeyEscrowRow, status must be "active" — an escrow is born live and its lif... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
@@ -1389,7 +1389,7 @@ class Engine:
         """(derived) deontic — v3.4.0 (CIRISPersist#123) — set the trust-score admission threshold consulted by every write path. Range [0.0, 1.0]; out-of-range values are clampe..."""
 
     def steward_bind(self, node_or_agent_key_id: str, infra_scopes: list[str], delegation_purpose: str | None = None) -> str:
-        """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-only ke..."""
+        """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-role ke..."""
 
     def steward_bind_incapacity(self, ward_key_id: str, domains: list[str], legitimacy_source: str, valid_until: str, binding_tier: str | None = None, petitioner_key_id: str | None = None) -> str:
         """(derived) deontic — v16.0.0 (#433, CC 3.4.12) — the adult-incapacity guardianship emit aperture: a delegates_to(S → ward) carrying the CC 3.4.12 binding fields (bindin..."""
@@ -1536,6 +1536,9 @@ class Engine:
         ``parent_wa_id`` referencing a missing parent raises
         ``Conflict``.
         """
+
+    def widen_audience(self, prior_attestation_id: str, contextual_integrity: str, strip: list[str]) -> dict[str, Any]:
+        """(derived) deontic — v39.0.0 — widen the audience of a row in the mesh by a supersedes this node signs as the row's author (CC 4.4.3.3.1 / 8.1.5). The prior row is unto..."""
 
     def withdraw_canonical_role(self, key_id: str, proposal_digest: str) -> None:
         """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — withdraw the canonical role from key_id (the DESTRUCTIVE Trust Root op). proposal_digest..."""
@@ -2064,6 +2067,9 @@ class Engine:
 
     def cross_agent_divergence(self, deployment_domain: str, window_json: str, metric: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Cross-agent divergence z-scores. metric is one of "csdma_plausibility", "dsdma_domain_alignment", "idma_k_eff", "idma_correlation_risk", "conscienc..."""
+
+    def describe_crossing(self, attestation_id: str, scope: str, cohort_target: str | None, basis: str) -> str:
+        """(derived) epistemic — v39.0.0 — the nine-axis description a truthful caller would state for attestation_id at scope, as JSON: the starting point for enter_mesh / widen_a..."""
 
     def disk_pressure_state(self) -> dict[str, Any]:
         """(derived) epistemic — v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot for monitoring. Re-polls the (injectable) free-bytes source, returns a dict: {free_bytes, t..."""
@@ -2854,8 +2860,8 @@ class Engine:
         condition. Reading and attesting are two different acts and they now
         have two method names.
 
-        ``attestation_id`` is the :meth:`attestation_promote` handle that
-        clears each row. ``sla_seconds`` defaults to 86400, the 24 h
+        ``attestation_id`` is the :meth:`enter_mesh` handle that clears each
+        row. ``sla_seconds`` defaults to 86400, the 24 h
         never-rest-local tripwire.
 
         **The return is JSON text**, so ``'[]'`` is a non-empty ``str`` --
@@ -3573,9 +3579,6 @@ class Engine:
 
     def promote_consented_backlog(self) -> dict[str, Any]:
         """(derived) procedural — v21.2.0 (CIRISPersist#509 FLOOR) — run the promote-on-consent sweep ON DEMAND: the same idempotent Engine::promote_consented_backlog primitive the... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
-
-    def repair_stranded_scope_backlog(self) -> dict[str, Any]:
-        """(derived) procedural — v21.12.0 (CIRISPersist#530) — the REPAIR sweep: correct stranded (self|family, federation) rows to their covering grant's federation-visible audien..."""
 
     def replay_abandoned(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Operator-driven replay. Resets attempt_count=0 and requeues an abandoned row."""

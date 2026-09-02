@@ -1147,6 +1147,18 @@ impl PyEngine {
         Ok(())
     }
 
+    /// The crate-level engine dispatch over the shared backend (the same
+    /// shape `federation_directory()` produces) — for the wrappers that
+    /// reconstruct a hybrid-capable `Engine` (the cohabitation path).
+    fn engine_backend(&self) -> crate::engine::BackendDispatch {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        }
+    }
+
     /// v4.4.0 (CIRISPersist#171) — shared dispatch for the local-tier
     /// attestation write PyO3 methods (`replace` = upsert vs insert).
     fn local_attestation_write(
@@ -5186,49 +5198,8 @@ impl PyEngine {
                 .map_err(federation_err_to_py)?;
             let dict = PyDict::new(py);
             dict.set_item("promoted", report.promoted)?;
-            dict.set_item("rescoped", report.rescoped)?;
-            dict.set_item("skipped", report.skipped)?;
-            Ok(dict)
-        })
-    }
-
-    /// v21.12.0 (CIRISPersist#530) — the REPAIR sweep: correct stranded
-    /// `(self|family, federation)` rows to their covering grant's
-    /// federation-visible audience. Returns
-    /// `{"promoted": 0, "rescoped": N, "skipped": M}` — the second motion
-    /// `promote_consented_backlog` structurally cannot perform (its
-    /// `WHERE tier = 'local'` page source excludes already-promoted rows).
-    fn repair_stranded_scope_backlog<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let local_signer = self.local_signer.clone().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "repair_stranded_scope_backlog requires a local software signing identity",
-                )
-            })?;
-            let runtime = self.runtime.clone();
-            let backend = self.backend.clone();
-            let signer = self.signer.clone();
-            let report = py
-                .detach(move || {
-                    let backend = match &backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(b) => {
-                            crate::engine::BackendDispatch::Postgres(b.clone())
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(b) => {
-                            crate::engine::BackendDispatch::Sqlite(b.clone())
-                        }
-                    };
-                    let engine =
-                        crate::Engine::from_shared_with_local(backend, signer, Some(local_signer));
-                    runtime.block_on(async move { engine.repair_stranded_scope_backlog().await })
-                })
-                .map_err(federation_err_to_py)?;
-            let dict = PyDict::new(py);
-            dict.set_item("promoted", report.promoted)?;
-            dict.set_item("rescoped", report.rescoped)?;
+            dict.set_item("widened", report.widened)?;
+            dict.set_item("awaiting_actor", report.awaiting_actor)?;
             dict.set_item("skipped", report.skipped)?;
             Ok(dict)
         })
@@ -6520,7 +6491,7 @@ impl PyEngine {
             // against when the composed signer and the local seed are
             // distinct identities, so `put_blob_signing` FK-failed on every
             // persist ≥ 9.3.0. Reconstruct the hybrid-capable engine over
-            // the shared backend + signer (the `attestation_promote` /
+            // the shared backend + signer (the `enter_mesh` /
             // `emit_attestation` cohabitation pattern) and call it.
             let backend = match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -6904,59 +6875,127 @@ impl PyEngine {
         self.local_attestation_write_many(py, inputs_json, false)
     }
 
-    /// v4.9.0 (CIRISPersist#171 phase 2, CEG §10.1.5) — promote a
-    /// **local**-tier self-attestation to **federation** tier: the
-    /// local→public transition the agent's community-server opt-in
-    /// performs at federation-emit time. Canonicalizes the row's envelope
-    /// (§0.9 produce gate), hybrid-signs the canonical bytes
-    /// (Ed25519 + ML-DSA-65) **synchronously**, writes the scrub envelope,
-    /// and flips `tier=federation`. The signing bytes are the §0.9
-    /// canonical envelope, so a promoted row is byte-identical on the wire
-    /// to a natively-federation attestation (Registry must #1).
+    /// v39.0.0 — **enter the mesh**: flip a local-tier row to the federation
+    /// tier over the SAME bytes (CC 5.3.2.4.2). Replaces `attestation_promote`,
+    /// which re-signed the row with this node's key and replaced the actor's.
     ///
-    /// Returns `True` on promotion, `False` if the row is already
-    /// `federation` (idempotent — re-emitting an already-announced opt-in
-    /// is a no-op, not an error).
-    ///
-    /// Requires the Engine to carry a PQC-configured local signer
-    /// (constructed with `local_pqc_key_id` + `local_pqc_key_path`) — the
-    /// agent runs this in PROXY/SERVER mode where that signer is present.
-    /// Raises if PQC is not configured (the synchronous hybrid sign can't
-    /// complete).
-    fn attestation_promote(
+    /// `contextual_integrity` is the nine-axis description of the crossing as
+    /// JSON (the `ContextualIntegrity` shape; every axis required, each
+    /// cross-checked against the row and refused by name). This node signs
+    /// what it authored and co-scrubs what another key signed at write; a row
+    /// by another key that is unsigned WAITS — the outcome says so. Returns the
+    /// `MeshCrossingOutcome` as a dict: `{"outcome": "crossed", ...}` |
+    /// `{"outcome": "already_in_mesh", ...}` | `{"outcome": "awaiting_actor", ...}`.
+    fn enter_mesh<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         attestation_id: &str,
-        cohort_scope: &str,
-    ) -> PyResult<bool> {
+        contextual_integrity: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
-        catch_panic(|| {
+        let ci: crate::federation::ContextualIntegrity = serde_json::from_str(contextual_integrity)
+            .map_err(|e| PyValueError::new_err(format!("contextual_integrity: {e}")))?;
+        let outcome = catch_panic(|| {
             let runtime = self.runtime.clone();
-            // Convert the PyO3 dispatch to the crate-level engine dispatch
-            // (same shape `federation_directory()` produces).
-            let backend = match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-            };
+            let backend = self.engine_backend();
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = attestation_id.to_owned();
-            // v21.5.0 (CIRISPersist#519) — the placement the promotion carries.
-            // A promotion cannot flip tier without a coherent federation-visible
-            // cohort_scope; `self`/invalid is rejected inside the engine.
-            let scope = cohort_scope.to_owned();
             py.detach(move || {
-                // Reconstruct a hybrid-capable Engine over the shared
-                // backend + signer (the cohabitation path, same as the
-                // sweeper) so `sign_hybrid` can reach the LocalSigner.
                 let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
-                        .attestation_promote(&id, &scope)
+                        .enter_mesh(&id, &ci, None)
                         .await
                         .map_err(federation_err_to_py)
+                })
+            })
+        })?;
+        outcome_to_py(py, &outcome)
+    }
+
+    /// v39.0.0 — **widen the audience** of a row in the mesh by a `supersedes`
+    /// this node signs as the row's author (CC 4.4.3.3.1 / 8.1.5). The prior
+    /// row is untouched; a NEW row appears at `contextual_integrity.recipient_see`.
+    /// `strip` names payload members the widening omits (listed in
+    /// `differs_in`). A row authored by another key WAITS — there is no
+    /// delegated widening. Returns the `MeshCrossingOutcome` as a dict.
+    fn widen_audience<'py>(
+        &self,
+        py: Python<'py>,
+        prior_attestation_id: &str,
+        contextual_integrity: &str,
+        strip: Vec<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        let ci: crate::federation::ContextualIntegrity = serde_json::from_str(contextual_integrity)
+            .map_err(|e| PyValueError::new_err(format!("contextual_integrity: {e}")))?;
+        let outcome = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let id = prior_attestation_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .widen_audience(&id, &ci, None, &strip)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })?;
+        outcome_to_py(py, &outcome)
+    }
+
+    /// v39.0.0 — the nine-axis description a truthful caller would state for
+    /// `attestation_id` at `scope`, as JSON: the starting point for
+    /// `enter_mesh` / `widen_audience`. Edit an axis to change what the
+    /// crossing means; the verbs refuse a description that does not match.
+    /// `cohort_target` names the family/community for a `family`/`community`
+    /// scope (a cohort placement is a membership claim about ONE cohort);
+    /// `basis` is `{"kind": "producer_authority"}` or
+    /// `{"kind": "consent_grant", "attestation_id": ...}`.
+    fn describe_crossing(
+        &self,
+        py: Python<'_>,
+        attestation_id: &str,
+        scope: &str,
+        cohort_target: Option<String>,
+        basis: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let basis: crate::federation::CrossingBasis = serde_json::from_str(basis)
+            .map_err(|e| PyValueError::new_err(format!("basis: {e}")))?;
+        let scope = scope.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let id = attestation_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    // The singleton's directory, through the ONE accessor —
+                    // hand-matching the dispatch here would be a second
+                    // spelling, and it collapses to an infallible pattern in
+                    // any single-backend build (the shipped wheel is both).
+                    let dir = crate::Engine::from_shared_with_local(backend, signer, local_signer)
+                        .federation_directory();
+                    let row = dir
+                        .get_attestation(&id)
+                        .await
+                        .map_err(federation_err_to_py)?
+                        .ok_or_else(|| PyValueError::new_err(format!("row {id} does not exist")))?;
+                    let audience = crate::federation::Audience::from_cohort_scope(
+                        &scope,
+                        cohort_target.as_deref(),
+                    )
+                    .map_err(federation_err_to_py)?;
+                    let ci = crate::federation::crossing::describe(&row, audience, basis)
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&ci).map_err(|e| PyRuntimeError::new_err(e.to_string()))
                 })
             })
         })
@@ -6998,7 +7037,7 @@ impl PyEngine {
             })?;
             let runtime = self.runtime.clone();
             // Convert the PyO3 dispatch to the crate-level engine dispatch
-            // (same shape `attestation_promote` reconstructs).
+            // (same shape `enter_mesh` reconstructs).
             let backend = match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
@@ -7008,7 +7047,7 @@ impl PyEngine {
             let signer = self.signer.clone();
             // `emit_attestation` derives the key_id from the LocalSigner it
             // is handed — the engine's configured local signer (mirrors how
-            // `attestation_promote` reaches `sign_hybrid`). Absent ⇒ no
+            // `enter_mesh` reaches `sign_hybrid`). Absent ⇒ no
             // hybrid-capable identity, surface honestly.
             let local_signer = self.local_signer.clone().ok_or_else(|| {
                 PyValueError::new_err(
@@ -10449,8 +10488,8 @@ impl PyEngine {
     /// the SLA (`sla_seconds`, default 86400 = the 24 h never-rest-local
     /// tripwire). Returns a JSON array of `{attestation_id,
     /// target_key_id, subject_key_id, asserted_at, age_seconds, tier}` —
-    /// `attestation_id` is the [`attestation_promote`](Self::attestation_promote)
-    /// handle that clears the condition.
+    /// `attestation_id` is the [`enter_mesh`](Self::enter_mesh) handle that
+    /// clears the condition.
     ///
     /// Each overdue row is also flagged as
     /// `hard_case:consent_revocation_promotion_overdue`, idempotently
@@ -30113,6 +30152,20 @@ fn parse_pair_cursor(
     }
 }
 
+/// A `MeshCrossingOutcome` as a Python dict, via `json.loads` of its serde
+/// form — one shape on both sides of the FFI.
+fn outcome_to_py<'py>(
+    py: Python<'py>,
+    outcome: &crate::federation::MeshCrossingOutcome,
+) -> PyResult<Bound<'py, PyDict>> {
+    let text =
+        serde_json::to_string(outcome).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = PyModule::import(py, "json")?;
+    json.call_method1("loads", (text,))?
+        .cast_into::<PyDict>()
+        .map_err(|e| PyRuntimeError::new_err(format!("outcome is not an object: {e}")))
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -30460,6 +30513,65 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // `kind`, for the reason `AdminActionUnattributed` and
         // `CohortStandingRefused` do: a Python consumer must be able to see WHICH
         // door went dark and why without holding a second copy of the taxonomy.
+        // ── v39.0.0 — the crossing's refusals (FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE) ──
+        //
+        // All caller-fault except `NoActorSignature`, which is not a fault at
+        // all: the row is well-formed and the actor is simply not here yet.
+        // A consumer's remedy differs — fix the call vs. come back with the
+        // signer — so they do not share an exception.
+        //
+        // The fabric is not the actor, the bytes moved, or an axis of the
+        // crossing disagrees with the row it describes: the CALLER must fix
+        // the call (4xx). Each carries the detail that names what to fix —
+        // the axis, the diverging hashes, the key that was offered.
+        crate::federation::Error::CustodyIsNotTheActor {
+            attestation_id,
+            attesting_key_id,
+            scrub_key_id,
+        } => PyValueError::new_err(format!(
+            "{kind}: {attestation_id} is attested by {attesting_key_id} but the signature \
+             offered is by {scrub_key_id}"
+        )),
+        crate::federation::Error::PromotionMovedThePreimage {
+            attestation_id,
+            stored_hash,
+            offered_hash,
+        } => PyValueError::new_err(format!(
+            "{kind}: {attestation_id} stored bytes hash to {stored_hash}, the offer to \
+             {offered_hash} — a tier crossing is byte-identical"
+        )),
+        crate::federation::Error::ContextualIntegrityMismatch { axis, stated, row, .. } => {
+            PyValueError::new_err(format!(
+                "{kind}: axis `{axis}` — the crossing states {stated} but the row carries {row}"
+            ))
+        }
+        crate::federation::Error::AudienceNotWider { prior, requested, .. } => {
+            PyValueError::new_err(format!(
+                "{kind}: {requested} is not strictly wider than {prior} — a supersedes widens; \
+                 to narrow, withdraw"
+            ))
+        }
+        crate::federation::Error::WideningReAuthors { member, .. } => PyValueError::new_err(
+            format!("{kind}: `{member}` — a widening reuses the prior's body"),
+        ),
+        crate::federation::Error::WideningMalformed { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
+        // NOT a caller fault and NOT retryable by re-calling: the row defers
+        // its signature (CC 5.3.2.2) and its actor is absent, so there is
+        // nothing to co-scrub — the fabric will not sign in the actor's place.
+        // RuntimeError rather than ValueError because the call was correct and
+        // the remedy is to come back with the actor, which is the same posture
+        // as an unset node identity below. Callers that can act on this should
+        // read the `awaiting_actor` outcome from `enter_mesh` instead of
+        // driving the directory primitive directly.
+        crate::federation::Error::NoActorSignature {
+            attestation_id,
+            attesting_key_id,
+        } => PyRuntimeError::new_err(format!(
+            "{kind}: {attestation_id} by {attesting_key_id} has no actor signature to co-scrub \
+             — it waits for its actor"
+        )),
         crate::federation::Error::NodeIdentityUnset {
             method,
             needed_for,
@@ -32635,18 +32747,15 @@ mod tests {
         (cell, sq)
     }
 
-    /// v4.9.0 (CIRISPersist#171 phase 2) — the substantive path the PyO3
-    /// `attestation_promote` binding delegates to: a backend + a
-    /// **PQC-configured** local signer, reconstructed into an Engine via
-    /// `from_shared_with_local` (exactly what the binding does), then
-    /// `attestation_promote` runs the synchronous hybrid sign. Exercised
-    /// at the Engine surface per the module's PyO3-wrapper test convention
-    /// (the `py`-taking method body is thin glue; `cargo test --lib` has
-    /// no interpreter to drive the dispatch boundary).
+    /// v39.0.0 — the cohabitation path (a PyEngine reconstructing a
+    /// hybrid-capable Engine over the shared backend) crosses a row this node
+    /// authored: the node signs AS THE ACTOR, over the same bytes.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn attestation_promote_via_cohab_reconstruction_hybrid_signs() {
-        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+    fn enter_mesh_via_cohab_reconstruction_hybrid_signs() {
+        use crate::federation::{
+            crossing, CrossingBasis, FederationDirectory, MeshCrossingOutcome,
+        };
         use ciris_keyring::MlDsa65SoftwareSigner;
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -32656,8 +32765,6 @@ mod tests {
                 sq.run_migrations().await.unwrap();
                 Arc::new(sq)
             };
-            // PQC-configured local signer (alias == the producing occurrence
-            // so attesting_key_id and scrub_key_id share one seeded key).
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
             let pqc = MlDsa65SoftwareSigner::from_seed_bytes(&[0x42 ^ 0x55; 32], "promote-pqc")
                 .expect("pqc seed");
@@ -32667,43 +32774,23 @@ mod tests {
                 Some(Arc::new(pqc)),
                 Some("promote-pqc".to_string()),
             ));
-            // v9.3.0 (#247) — the real-node shape: keystore alias ("occ") ≠
-            // registered derived federation key_id. Seed the row + the local
-            // attestation under the DERIVED id; promote scrubs as the derived
-            // id (FK holds — this FK-violated before the #247 fix).
             let derived = local.derived_key_id();
             assert_ne!(derived, "occ", "derived id differs from the alias");
             let signer: Arc<dyn HardwareSigner> = Arc::new(
                 crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
             );
-
-            // Seed the federation key + a local-tier self-attestation.
-            sq.put_public_key(SignedKeyRecord {
-                record: KeyRecord {
-                    key_id: derived.clone(),
-                    pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-                    pubkey_ml_dsa_65_base64: None,
-                    algorithm: crate::federation::types::algorithm::HYBRID.into(),
-                    identity_type: crate::federation::types::identity_type::STEWARD.into(),
-                    identity_ref: derived.clone(),
-                    valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    valid_until: None,
-                    registration_envelope: serde_json::json!({ "id": derived.clone() }),
-                    original_content_hash: "deadbeef".into(),
-                    scrub_signature_classical: "c2ln".into(),
-                    scrub_signature_pqc: None,
-                    scrub_key_id: derived.clone(),
-                    scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    pqc_completed_at: None,
-                    persist_row_hash: String::new(),
-                    capability_roles: Vec::new(),
-                    attestation_evidence: None,
-                    consent_role: None,
-                    additional_scrubs: Vec::new(),
-                },
-            })
-            .await
-            .unwrap();
+            let engine = crate::Engine::from_shared_with_local(
+                crate::engine::BackendDispatch::Sqlite(sq.clone()),
+                signer,
+                Some(local),
+            );
+            // The node's REAL pubkeys: the crossing verifies the actor's
+            // signature against the registered record.
+            let registered = engine
+                .register_self_federation_key("steward", "ref", None, serde_json::json!({}), vec![])
+                .await
+                .expect("register self");
+            assert_eq!(registered, derived);
             let att_id = sq
                 .attestation_upsert_local(crate::federation::types::LocalAttestationInput {
                     attestation_id: None,
@@ -32726,32 +32813,26 @@ mod tests {
                 })
                 .await
                 .unwrap();
-
-            // Reconstruct the Engine exactly as the PyO3 binding does.
-            let engine = crate::Engine::from_shared_with_local(
-                crate::engine::BackendDispatch::Sqlite(sq.clone()),
-                signer,
-                Some(local),
+            let before = sq.get_attestation(&att_id).await.unwrap().expect("row");
+            let ci = crossing::describe(
+                &before,
+                crate::federation::Audience::SelfOnly,
+                CrossingBasis::ProducerAuthority,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    engine.enter_mesh(&att_id, &ci, None).await.unwrap(),
+                    MeshCrossingOutcome::Crossed(_)
+                ),
+                "first crossing flips local→federation"
             );
             assert!(
-                engine
-                    .attestation_promote(
-                        &att_id,
-                        crate::federation::types::cohort_scope::FEDERATION
-                    )
-                    .await
-                    .unwrap(),
-                "first promote flips local→federation"
-            );
-            assert!(
-                !engine
-                    .attestation_promote(
-                        &att_id,
-                        crate::federation::types::cohort_scope::FEDERATION
-                    )
-                    .await
-                    .unwrap(),
-                "re-promote is idempotent (already federation)"
+                matches!(
+                    engine.enter_mesh(&att_id, &ci, None).await.unwrap(),
+                    MeshCrossingOutcome::AlreadyInMesh { .. }
+                ),
+                "re-crossing is idempotent (already in the mesh)"
             );
 
             let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
@@ -32759,6 +32840,7 @@ mod tests {
                 row.tier,
                 crate::federation::types::attestation_tier::FEDERATION
             );
+            assert_eq!(row.scrub_key_id, derived, "the node signed AS THE ACTOR");
             assert!(!row.scrub_signature_classical.is_empty(), "Ed25519 signed");
             assert!(
                 row.scrub_signature_pqc

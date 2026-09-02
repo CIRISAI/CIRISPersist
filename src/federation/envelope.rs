@@ -35,6 +35,10 @@ pub mod paths {
     /// The composer target: which attestation a `withdraws` / `supersedes`
     /// / `recants` / `delegates_to` row references.
     pub const REFERENCES_ATTESTATION_ID: &str = "references_attestation_id";
+    /// v39.0.0 — on a `supersedes`, the members that differ from the prior
+    /// (CC 4.4.3.3.1). A `widen_audience` supersedes lists `cohort_scope` and
+    /// only otherwise the members it strips; see `crossing::check_widening`.
+    pub const DIFFERS_IN: &str = "differs_in";
     /// Delegation scope: bare string OR array of tokens (both wire shapes
     /// are established — see `trust_root::scope_contains`).
     pub const SCOPE: &str = "scope";
@@ -775,8 +779,10 @@ pub fn stamp_signed_instants(row: &mut super::Attestation) -> Result<(), super::
     use crate::federation::admission::truncate_to_substrate_resolution as trunc;
     row.asserted_at = trunc(row.asserted_at);
     row.expires_at = row.expires_at.map(trunc);
-    let asserted = row.asserted_at.to_rfc3339();
-    let expires = row.expires_at.map(|t| t.to_rfc3339());
+    let asserted = crate::federation::admission::render_signed_instant(row.asserted_at);
+    let expires = row
+        .expires_at
+        .map(crate::federation::admission::render_signed_instant);
     let obj = row.attestation_envelope.as_object_mut().ok_or_else(|| {
         super::Error::InvalidArgument(format!(
             "attestation {}: attestation_envelope must be a JSON object to carry the signed \

@@ -508,23 +508,25 @@ mod tests {
         // v31.0.0 (CIRISPersist#649) — a promotion RE-STAMPS the mirror it
         // re-signs (`cohort_scope` is inside the signed bytes), so the door
         // takes the resealed bundle, not a bare signature triple.
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::{CrossingBasis, MeshCrossingOutcome};
         let row = dir
             .get_attestation(id)
             .await?
             .expect("the local row exists");
-        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
-            attester,
-            &row,
-            cohort_scope::FEDERATION,
-        );
-        dir.promote_attestation(id, cohort_scope::FEDERATION, &reseal)
-            .await?;
+        assert_eq!(row.attesting_key_id, attester);
+        // v39.0.0 — the crossing is two operations: enter the mesh over the
+        // same bytes, then widen by a `supersedes` the attester signs.
+        let ci = ts::describe_own(&row, CrossingBasis::ProducerAuthority);
+        dir.enter_mesh(id, &ci, &ts::actor_reseal(&row)).await?;
         let stored = dir
             .get_attestation(id)
             .await?
-            .expect("the promoted row exists");
+            .expect("the crossed row exists");
         assert_eq!(stored.tier, attestation_tier::FEDERATION);
-        assert_eq!(stored.cohort_scope, cohort_scope::FEDERATION);
+        assert_eq!(stored.cohort_scope, cohort_scope::SELF);
+        let widened = ts::widen(dir, &stored, crate::federation::Audience::Federation, &[]).await?;
+        assert!(matches!(widened, MeshCrossingOutcome::Crossed(_)));
         Ok(())
     }
 
@@ -883,10 +885,25 @@ mod tests {
             attestation_tier::FEDERATION,
             "a grant naming `regime:` federates the regime row — there is no allowlist to add to"
         );
+        // v39.0.0 — the crossing keeps the row's own scope; the grant's
+        // audience is reached by a `supersedes` (clause 3, two rows).
+        assert_eq!(after.cohort_scope, cohort_scope::SELF);
+        let widened = dir
+            .list_attestations_by(&after.attesting_key_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| {
+                a.attestation_type == crate::federation::types::attestation_type::SUPERSEDES
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &a.attestation_envelope,
+                    ) == Some(first.as_str())
+            })
+            .count();
         assert_eq!(
-            after.cohort_scope,
-            cohort_scope::FEDERATION,
-            "clause 3: the placement is carried from the covering grant's audience, never `self`"
+            widened, 1,
+            "clause 3: the placement is carried from the covering grant's audience by a supersedes, \
+             never by moving the row"
         );
         // The second row rides the same grant — the coverage is the FAMILY, not
         // the row (clause 1: one prefix covers all four leaves).

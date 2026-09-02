@@ -1211,12 +1211,9 @@ impl MemoryBackend {
         // signature verifies (accept on VALID crypto only; the operator gate).
         // Runs BEFORE the state lock (verify resolves pubkeys via the directory,
         // which locks itself). `None` for a durable producer-authority row.
-        let transit = crate::federation::admission::verify_local_transit_revocation(
-            self,
-            disposition,
-            &input,
-        )
-        .await?;
+        let transit =
+            crate::federation::admission::verify_caller_signed_local_row(self, disposition, &input)
+                .await?;
 
         // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with
         // sqlite + postgres and with the federation write path. BEFORE the state
@@ -1263,9 +1260,9 @@ impl MemoryBackend {
         // the instant binding at the promote door.
         let now =
             crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
-        let is_transit = transit.is_some();
+        let caller_signed = transit.is_some();
         let mut row = match transit {
-            Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
+            Some((hash, sig_classical, sig_pqc)) => input.into_caller_signed_row(
                 attestation_id.clone(),
                 now,
                 hash,
@@ -1299,7 +1296,7 @@ impl MemoryBackend {
         // See `crate::federation::envelope::RowMirror::stamp_local_row` for
         // the decision and the transit exclusion. One helper, all three
         // backends.
-        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, is_transit)?;
+        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, caller_signed)?;
         // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
         // measured the PRODUCER's envelope; this one measures the bytes that
         // actually land, which the #643 mirror and the #598 instants just grew
@@ -3888,7 +3885,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// predicate uses [`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
     /// (`self`/`family`) directly rather than a literal set so the memory
     /// backend can never drift from the taxonomy the SQL backends spell out.
-    async fn list_stranded_federation_attestations(
+    async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
         limit: u32,
@@ -3905,6 +3902,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         Some(after) => a.attestation_id.as_str() > after,
                         None => true,
                     }
+                    // not yet widened: no `supersedes` by the same attester
+                    // references it (the sqlite/postgres NOT EXISTS arm)
+                    && !state.federation_attestations.iter().any(|s| {
+                        s.attestation_type == crate::federation::types::attestation_type::SUPERSEDES
+                            && s.attesting_key_id == a.attesting_key_id
+                            && crate::federation::precedence::references_attestation_id_from_envelope(
+                                &s.attestation_envelope,
+                            ) == Some(a.attestation_id.as_str())
+                    })
             })
             .cloned()
             .collect();
@@ -4281,132 +4287,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         state.subject_index.retain(|_, ids| !ids.is_empty());
         Ok(true)
-    }
-
-    /// v21.2.0 (CIRISPersist#509 FLOOR) — the #530 repair write-back:
-    /// validate against the closed cohort_scope set, stamp it alongside the
-    /// re-signed envelope, and recompute `persist_row_hash`.
-    async fn set_attestation_cohort_scope(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &crate::federation::AttestationReseal,
-    ) -> Result<(), crate::federation::Error> {
-        if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
-            )));
-        }
-        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
-        // `repair_stranded_scope_backlog` re-scopes an already-federation row
-        // to a covering grant's audience through here, which can be
-        // `community` — so without this the standing gate on
-        // `promote_attestation` would have a door beside it, this repo's own
-        // recurring class.
-        //
-        // Gated on a CANDIDATE clone, before the stored row is touched. Since
-        // v38.2.0 (PR #759 review) the standing check RESOLVES occurrences
-        // through the directory — i.e. it re-enters `self`, which takes the
-        // state lock — so it cannot run under the guard (self-deadlock). The
-        // candidate is cloned under a short first lock, gated LOCK-FREE, and
-        // the mutating lock below re-verifies the row is byte-identical to
-        // what was gated (the #719 re-read shape); a concurrent mutation is a
-        // typed Conflict, never a gate bypass.
-        let gated = {
-            let state = self.state.lock().expect("memory backend lock");
-            state
-                .federation_attestations
-                .iter()
-                .find(|a| a.attestation_id == attestation_id)
-                .cloned()
-                .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "federation_attestations row {attestation_id} does not exist"
-                    ))
-                })?
-        };
-        let mut candidate = gated.clone();
-        candidate.cohort_scope = cohort_scope.to_owned();
-        candidate.attestation_envelope = reseal.attestation_envelope.clone();
-        crate::federation::admission::check_targeted_cohort_requires_federation_tier(
-            &candidate.tier,
-            &candidate.cohort_scope,
-        )?;
-        crate::federation::admission::envelope_cohort_target(&candidate.attestation_envelope)?;
-        crate::federation::admission::check_cohort_standing_resolved(self, &candidate).await?;
-
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v36.0.0 (#668/#707-class) — a re-scope rewrites the served
-            // bytes; the serve position moves with them.
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_ATTESTATION,
-                attestation_rows(&state).into_iter(),
-            );
-            let row = state
-                .federation_attestations
-                .iter_mut()
-                .find(|a| a.attestation_id == attestation_id)
-                .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "federation_attestations row {attestation_id} does not exist"
-                    ))
-                })?;
-            if row.persist_row_hash != gated.persist_row_hash {
-                return Err(crate::federation::Error::Conflict(format!(
-                    "set_attestation_cohort_scope: row {attestation_id} changed while its \
-                     re-scope was being gated — retry against the current row"
-                )));
-            }
-            // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING at the
-            // SECOND placement door. `cohort_scope` is one of the seven columns
-            // #643 bound into the signed envelope, so re-scoping in place made
-            // the row's own mirror diverge from its column and every peer's
-            // `put_attestation` refused it. The caller re-stamps and re-signs;
-            // this refuses a caller that did not.
-            crate::federation::admission::check_row_column_binding(&candidate)?;
-
-            row.cohort_scope = cohort_scope.to_owned();
-            row.attestation_envelope = reseal.attestation_envelope.clone();
-            row.original_content_hash = reseal.original_content_hash.clone();
-            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
-            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
-            row.scrub_key_id = reseal.scrub_key_id.clone();
-            row.scrub_timestamp = reseal.scrub_timestamp;
-            row.pqc_completed_at = reseal
-                .scrub_signature_pqc
-                .as_ref()
-                .map(|_| reseal.scrub_timestamp);
-            let mut for_hash = row.clone();
-            for_hash.persist_row_hash = String::new();
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-            // v30.1.0 (CIRISPersist#610) — the wire index moves WITH the row.
-            // Same defect as the two SQL backends: this mutator recomputes
-            // `persist_row_hash`, so without re-indexing the row advertises a hash
-            // the index does not hold and the pack path cannot serve what the offer
-            // path offered. Federation-tier only, per the E5 invariant that governs
-            // the put path's own indexing.
-            let wik =
-                (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
-                    crate::federation::wire_index::record_key(&[(
-                        "attestation_id",
-                        &row.attestation_id,
-                    )])
-                });
-            stamp_plane_position(
-                &mut state,
-                PLANE_ATTESTATION,
-                attestation_id.to_owned(),
-                admitted_at,
-            );
-            wik
-        };
-        if let Some(wire_index_key) = wire_index_key {
-            self.index_stored_record("Attestation", &wire_index_key)
-                .await?;
-        }
-        Ok(())
     }
 
     async fn attestations_binding_content(
@@ -7995,98 +7875,59 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned())
     }
 
-    async fn promote_attestation(
+    /// v39.0.0 — the tier crossing. Everything that decides lives in
+    /// `crossing::plan_enter_mesh` (read that module's doc). It runs
+    /// BEFORE `self.state.lock()` — every gate in it reads the directory through
+    /// that same lock — and writes nothing, so a refused crossing never touches
+    /// the row (verify-before-mutation, AV-9). The critical section then swaps
+    /// the planned row in, re-stamps the plane position (v36.0.0 #668) and
+    /// re-indexes it under its stored bytes.
+    async fn enter_mesh(
         &self,
         attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &crate::federation::AttestationReseal,
-    ) -> Result<bool, crate::federation::Error> {
+        ci: &crate::federation::ContextualIntegrity,
+        custody: &crate::federation::TierPromotionCustody,
+    ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
-        // v26.0.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
-        // See `src/store/sqlite.rs` promote_attestation for the rationale.
-        // It MUST run before `self.state.lock()`: every gate in the stack
-        // reads the directory through that same lock, so gating inside the
-        // critical section would deadlock this backend. Running it first is
-        // also verify-before-mutation (AV-9) — a refused promotion never
-        // touches the row.
-        //
-        // v31.0.0 (CIRISPersist#649) — gated on the RE-STAMPED envelope, the
-        // same discipline the transformed path always had: the gate must read
-        // the bytes this row will federate as, and `check_row_column_binding`
-        // inside it compares the mirror in THOSE bytes against the
-        // post-promotion columns.
-        {
-            let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-            if current.tier != attestation_tier::FEDERATION {
-                let mut as_promoted = current;
-                as_promoted.attestation_envelope = reseal.attestation_envelope.clone();
-                as_promoted.tier = attestation_tier::FEDERATION.to_string();
-                as_promoted.cohort_scope = cohort_scope.to_owned();
-                crate::federation::admission::check_promotion_admission(
-                    self,
-                    &as_promoted,
-                    self.self_key_id().as_deref(),
-                )
-                .await?;
-            }
-        }
+        use crate::federation::{crossing, Error, MeshCrossingOutcome};
+        let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        let Some(crossing::EnterPlan { row, crossing }) =
+            crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
+                .await?
+        else {
+            return Ok(MeshCrossingOutcome::AlreadyInMesh {
+                attestation_id: attestation_id.to_owned(),
+            });
+        };
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            // v36.0.0 (#668) — promotion IS this plane's admission into the
-            // federation stream; re-stamp the serve position through the
-            // allocator (superseding `promoted_at` as the cursor key).
             let admitted_at = next_plane_position(
                 &state,
                 PLANE_ATTESTATION,
                 attestation_rows(&state).into_iter(),
             );
-            let row = state
+            let slot = state
                 .federation_attestations
                 .iter_mut()
                 .find(|a| a.attestation_id == attestation_id)
                 .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
+                    Error::InvalidArgument(format!(
                         "federation_attestations row {attestation_id} does not exist"
                     ))
                 })?;
-            if row.tier == attestation_tier::FEDERATION {
-                return Ok(false);
+            if slot.tier == attestation_tier::FEDERATION {
+                return Err(Error::Conflict(format!(
+                    "federation_attestations row {attestation_id} was concurrently promoted"
+                )));
             }
-            let now = reseal.scrub_timestamp;
-            row.cohort_scope = cohort_scope.to_owned();
-            row.attestation_envelope = reseal.attestation_envelope.clone();
-            row.original_content_hash = reseal.original_content_hash.clone();
-            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
-            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
-            row.scrub_key_id = reseal.scrub_key_id.clone();
-            row.scrub_timestamp = now;
-            row.pqc_completed_at = reseal.scrub_signature_pqc.as_ref().map(|_| now);
-            row.tier = attestation_tier::FEDERATION.to_string();
-            row.promoted_at = Some(now);
-            // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
-            // A local-tier row defers its signature, so any `additional_scrubs` it
-            // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
-            // the row with this node's key and moves it into the federation plane,
-            // where the ingest verifier DOES check every scrub — so carrying the
-            // unverified set across would either launder it into the signed plane or
-            // (once corrupt) make the promoted row unverifiable at every peer with
-            // no error at the promote site. That is the #541 shape: the preserve set
-            // must equal the verified set. Co-signatures are earned at the ceremony
-            // that mints a federation-tier row, never inherited by a promotion.
-            row.additional_scrubs.clear();
-            let mut for_hash = row.clone();
-            for_hash.persist_row_hash = String::new();
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-            // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
-            // tier and therefore wire-servable; index it under its final
-            // post-promotion shape (matches `list_attestations_since`).
+            *slot = row;
             let wik = crate::federation::wire_index::record_key(&[(
                 "attestation_id",
-                &row.attestation_id,
+                &slot.attestation_id,
             )]);
             stamp_plane_position(
                 &mut state,
@@ -8098,7 +7939,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         };
         self.index_stored_record("Attestation", &wire_index_key)
             .await?;
-        Ok(true)
+        Ok(MeshCrossingOutcome::Crossed(crossing))
     }
 
     async fn attach_revocation_pqc_signature(
@@ -10121,6 +9962,15 @@ mod accord_tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn actor_signature_survives_the_crossing_memory_v39() {
+        let dir = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing(
+            &dir, "mem39",
+        )
+        .await;
+    }
+
     /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
     /// the STORED envelope: strip the #598 instants and the #643 mirror, exactly
     /// as a v30 writer would have left it.
@@ -10737,7 +10587,7 @@ mod tests {
     /// bypassed the placement machinery, so the read path must be provable
     /// against an arbitrary stored shape.
     #[tokio::test]
-    async fn list_stranded_federation_attestations_filters_suppressed_scopes_530() {
+    async fn list_widening_candidates_filters_suppressed_scopes_530() {
         use crate::federation::types::{attestation_tier, cohort_scope};
         let be = MemoryBackend::new();
         for (id, tier, scope) in [
@@ -10758,6 +10608,10 @@ mod tests {
                 cohort_scope::COMMUNITY,
             ),
             ("l-self", attestation_tier::LOCAL, cohort_scope::SELF),
+            // v39.0.0 — already widened: a `supersedes` by k530 references it
+            // (pushed below), so it is NOT a candidate — the NOT EXISTS arm on
+            // the SQL backends.
+            ("w-self", attestation_tier::FEDERATION, cohort_scope::SELF),
         ] {
             let mut a = fix_attestation(id, "k530", "k530", "k530");
             a.tier = tier.to_string();
@@ -10770,8 +10624,20 @@ mod tests {
                 .push(a);
         }
 
+        {
+            let mut sup = fix_attestation("w-self-widened", "k530", "k530", "k530");
+            sup.attestation_type = crate::federation::types::attestation_type::SUPERSEDES.into();
+            sup.attestation_envelope["references_attestation_id"] = serde_json::json!("w-self");
+            sup.cohort_scope = cohort_scope::COMMUNITY.to_string();
+            resign_fix(&mut sup);
+            be.state
+                .lock()
+                .expect("memory backend lock")
+                .federation_attestations
+                .push(sup);
+        }
         let ids: Vec<String> = be
-            .list_stranded_federation_attestations(None, 100)
+            .list_widening_candidates(None, 100)
             .await
             .expect("page")
             .into_iter()
@@ -10785,7 +10651,7 @@ mod tests {
 
         // keyset cursor resumes strictly after the given id.
         let after: Vec<String> = be
-            .list_stranded_federation_attestations(Some("s-family"), 100)
+            .list_widening_candidates(Some("s-family"), 100)
             .await
             .expect("page 2")
             .into_iter()

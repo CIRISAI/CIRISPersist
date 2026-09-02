@@ -1434,6 +1434,17 @@ pub struct ScrubSig {
     /// Base64 `ML-DSA-65.sign(JCS(registration_envelope) ‖ ed25519_sig)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v39.0.0 — **`modified`**: when this co-scrub was applied (CC 2.6.7
+    /// `cosigned_at`, rendered per CC 2.6.2 as `.sssZ`). Stamped by
+    /// `crossing::plan_enter_mesh` on a node co-scrub at the tier
+    /// crossing. It rides OUTSIDE the signed preimage — every scrub is over
+    /// the same `JCS(envelope)`, so stamping it never touches the bytes the
+    /// actor signed. Absent (and serialized away) on the base scrub, on
+    /// key-plane scrubs, and on every pre-v39 record, so those stay
+    /// byte-identical on the wire. `asserted_at` inside the envelope is
+    /// `created`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosigned_at: Option<String>,
 }
 
 /// A single **transport reachability hint** carried INSIDE a
@@ -1489,6 +1500,7 @@ impl KeyRecord {
             scrub_key_id: self.scrub_key_id.clone(),
             scrub_signature_classical: self.scrub_signature_classical.clone(),
             scrub_signature_pqc: self.scrub_signature_pqc.clone(),
+            cosigned_at: None,
         });
         out.extend(self.additional_scrubs.iter().cloned());
         out
@@ -1697,6 +1709,7 @@ impl Attestation {
             scrub_key_id: self.scrub_key_id.clone(),
             scrub_signature_classical: self.scrub_signature_classical.clone(),
             scrub_signature_pqc: self.scrub_signature_pqc.clone(),
+            cosigned_at: None,
         });
         out.extend(self.additional_scrubs.iter().cloned());
         out
@@ -1829,6 +1842,33 @@ impl LocalAttestationInput {
         self.attestation_envelope.dimension.as_deref()
     }
 
+    /// v39.0.0 — **sign at write.** Mint the row id, stamp the signed
+    /// instants and the typed-column mirror INTO the envelope, and return the
+    /// JCS bytes the actor signs. Sets `self.attestation_id` so the row the
+    /// local door builds is the row the mirror names. The caller signs the
+    /// bytes, sets `scrub_signature_classical` / `scrub_signature_pqc`, and
+    /// writes; [`crate::federation::admission::verify_caller_signed_local_row`]
+    /// verifies the signature at the door and the row is stored signed at
+    /// `tier = local`. This is the same stamp
+    /// `attestation_emit::stamp_and_canonicalize` applies to a federation
+    /// emit, so a row signed here and one emitted there are one shape.
+    pub fn bind_for_signing(&mut self, now: DateTime<Utc>) -> Result<Vec<u8>, super::Error> {
+        use crate::federation::admission::{
+            render_signed_instant, truncate_to_substrate_resolution as trunc,
+        };
+        let attestation_id = self
+            .attestation_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let asserted_at = trunc(now);
+        self.attestation_envelope.asserted_at = Some(render_signed_instant(asserted_at));
+        self.expires_at = self.expires_at.map(trunc);
+        self.attestation_envelope.expires_at = self.expires_at.map(render_signed_instant);
+        let row = self.clone().into_local_row(attestation_id, asserted_at);
+        self.attestation_envelope.row = Some(crate::federation::envelope::RowMirror::of(&row)?);
+        crate::federation::attestation_emit::canonicalize(&self.attestation_envelope.to_value())
+    }
+
     /// Build the `local`-tier [`Attestation`] row: caller fields + the
     /// deferred empty-sentinel scrub envelope (`scrub_signature_classical
     /// = ""` — admitted at local tier by the V066 CHECK; `scrub_key_id =
@@ -1866,17 +1906,23 @@ impl LocalAttestationInput {
         }
     }
 
-    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — build the
-    /// `local`-tier row for a **subject-side revocation transiting** the
-    /// local write path. Unlike [`Self::into_local_row`] (deferred
-    /// empty-sentinel scrub envelope), this carries the caller's REAL
-    /// bound-hybrid signature + the persist-computed `original_content_hash`
-    /// (hex `SHA-256(JCS(envelope))`, returned by the verify step) so the
-    /// row is a fully-signed federation-classified revocation staged at
-    /// `tier = local`, `promoted_at = None`. It is NOT a durable local row:
-    /// the consent-SLA watcher drives it to promotion or overdue-flag.
+    /// Build the `local`-tier row for a **caller-signed** local write: the
+    /// row carries the caller's REAL bound-hybrid signature and the
+    /// persist-computed `original_content_hash` (hex `SHA-256(JCS(envelope))`,
+    /// returned by [`crate::federation::admission::verify_caller_signed_local_row`]),
+    /// staged at `tier = local`, `promoted_at = None`. Two producers use it:
+    ///
+    /// * v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a
+    ///   **subject-side revocation transiting** the local tier; the
+    ///   consent-SLA watcher drives it to the crossing.
+    /// * v39.0.0 — an actor **signing at write** (an AgentID in-process, per
+    ///   `FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE` §5.4), so a deferred row
+    ///   has an actor signature for the node to co-scrub at the crossing and
+    ///   survives the actor's absence or key rotation. Build the bytes to sign
+    ///   with [`Self::bind_for_signing`].
+    ///
     /// `persist_row_hash` is filled by the caller after construction.
-    pub fn into_transit_revocation_row(
+    pub fn into_caller_signed_row(
         self,
         attestation_id: String,
         asserted_at: DateTime<Utc>,
@@ -5930,6 +5976,7 @@ mod tests {
         // now non-empty → included in the hash → a DISTINCT value.
         let mut two = base.clone();
         two.additional_scrubs = vec![ScrubSig {
+            cosigned_at: None,
             scrub_key_id: "B1".into(),
             scrub_signature_classical: "sig2".into(),
             scrub_signature_pqc: Some("pqc2".into()),

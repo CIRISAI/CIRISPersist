@@ -1506,6 +1506,7 @@ pub(crate) mod test_support {
             .map(|c| {
                 let (_h, cl, pq) = ts::sign_envelope(c, &sealed_row_.attestation_envelope);
                 crate::federation::types::ScrubSig {
+                    cosigned_at: None,
                     scrub_key_id: (*c).to_owned(),
                     scrub_signature_classical: cl,
                     scrub_signature_pqc: pq,
@@ -2033,6 +2034,7 @@ pub(crate) mod test_support {
         let mut rebind = ts::owner_binding_attestation(&rebind_id, &claimant, &node);
         let (_h, cl, pq) = ts::sign_envelope(&node, &rebind.attestation_envelope);
         rebind.additional_scrubs = vec![crate::federation::types::ScrubSig {
+            cosigned_at: None,
             scrub_key_id: node.clone(),
             scrub_signature_classical: cl,
             scrub_signature_pqc: pq,

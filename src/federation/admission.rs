@@ -1889,7 +1889,27 @@ where
 /// MUST run BEFORE the backend acquires its write lock (it resolves pubkeys
 /// via the directory, which locks itself).
 #[allow(clippy::type_complexity)]
-pub async fn verify_local_transit_revocation<F>(
+/// **The caller-signed local write** — the ONE place a signature offered on a
+/// local-tier row is verified, for both producers that offer one:
+///
+/// * [`LocalTierDisposition::TransitRevocation`] (v12.6.0, §10.1.3 / AV-61):
+///   a subject-side revocation transiting the local tier MUST carry a
+///   bound-hybrid signature; refused without one.
+/// * [`LocalTierDisposition::Durable`] with a signature present (v39.0.0,
+///   `FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE` §5.4 — **sign at write**):
+///   an actor whose key is in-process signs its local row so the row has an
+///   actor signature for the node to co-scrub at the crossing, and survives
+///   the actor's absence or key rotation. A durable row WITHOUT a signature
+///   is still admitted deferred (CC 5.3.2.2) — `Ok(None)`.
+///
+/// Either way the signature is verified against the attester's REGISTERED
+/// pubkeys under `HybridPolicy::Strict` over `JCS(envelope)` — the bytes the
+/// caller built with `LocalAttestationInput::bind_for_signing` — and the
+/// returned triple is `(original_content_hash, classical, pqc)` for
+/// `LocalAttestationInput::into_caller_signed_row`. The local door then CHECKS
+/// (never re-stamps) the mirror those bytes carry (`RowMirror::stamp_local_row`
+/// with `caller_signed = true`, CIRISPersist#656).
+pub async fn verify_caller_signed_local_row<F>(
     directory: &F,
     disposition: LocalTierDisposition,
     input: &crate::federation::types::LocalAttestationInput,
@@ -1897,33 +1917,32 @@ pub async fn verify_local_transit_revocation<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
-    match disposition {
-        LocalTierDisposition::Durable => Ok(None),
-        LocalTierDisposition::TransitRevocation => {
-            let sig_classical = input.scrub_signature_classical.as_deref().ok_or_else(|| {
-                Error::InvalidArgument(
-                    "a subject-side revocation transiting the local tier requires a bound-hybrid \
-                     signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
-                     must be present and verify against the attester's registered pubkeys"
-                        .to_string(),
-                )
-            })?;
-            let sig_pqc = input.scrub_signature_pqc.as_deref();
-            let hash = crate::federation::verify_envelope_hybrid_signature(
-                directory,
-                &input.attesting_key_id,
-                &input.attestation_envelope.to_value(),
-                sig_classical,
-                sig_pqc,
-            )
-            .await?;
-            Ok(Some((
-                hash,
-                sig_classical.to_string(),
-                sig_pqc.map(str::to_string),
-            )))
+    let sig_classical = match (disposition, input.scrub_signature_classical.as_deref()) {
+        (LocalTierDisposition::Durable, None) => return Ok(None),
+        (LocalTierDisposition::Durable | LocalTierDisposition::TransitRevocation, Some(s)) => s,
+        (LocalTierDisposition::TransitRevocation, None) => {
+            return Err(Error::InvalidArgument(
+                "a subject-side revocation transiting the local tier requires a bound-hybrid \
+                 signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
+                 must be present and verify against the attester's registered pubkeys"
+                    .to_string(),
+            ))
         }
-    }
+    };
+    let sig_pqc = input.scrub_signature_pqc.as_deref();
+    let hash = crate::federation::verify_envelope_hybrid_signature(
+        directory,
+        &input.attesting_key_id,
+        &input.attestation_envelope.to_value(),
+        sig_classical,
+        sig_pqc,
+    )
+    .await?;
+    Ok(Some((
+        hash,
+        sig_classical.to_string(),
+        sig_pqc.map(str::to_string),
+    )))
 }
 
 /// v12.6.0 (CIRISPersist#171, CEG §10.1.3 transit-not-rest) — how a
@@ -2516,20 +2535,19 @@ pub async fn check_promotion_admission(
     row: &super::Attestation,
     self_key_id: Option<&str>,
 ) -> Result<(), Error> {
-    // The placement itself must be a legal, federation-visible value. Pure,
-    // free, and a REFUSAL — so it leads. `(federation, self)` is the #315
-    // incoherent state (substrate-local-only scope on a replicate-me tier; the
-    // offer filter drops it), refused here so every caller of the primitive
-    // inherits the rule, not just `Engine::attestation_promote`.
-    if !crate::federation::types::cohort_scope::is_valid(&row.cohort_scope)
-        || row.cohort_scope == crate::federation::types::cohort_scope::SELF
-    {
-        return Err(Error::InvalidArgument(format!(
-            "promotion placement {:?} is not a valid federation-visible cohort_scope \
-             (self / invalid rejected — CIRISPersist#519/#315)",
-            row.cohort_scope
-        )));
-    }
+    // The placement must be a legal value. Pure, free, and a REFUSAL — so it
+    // leads.
+    //
+    // v39.0.0 — `(federation, self)` is NO LONGER refused here. A tier
+    // crossing is over the same bytes (CC 5.3.2.4.2) and `cohort_scope` is
+    // one of those bytes, so a `(local, self)` row crosses to
+    // `(federation, self)`: the CC 5.2 shape — replicated to the owner's own
+    // nodes by consent fan-out, never advertised via `holds_bytes`. #315
+    // called this a dead plane because nothing consumed it; edge's own-device
+    // fan-out (`CohortScope::SelfOnly`) now does. Widening is a separate
+    // `supersedes` row (`FederationDirectory::widen_audience`), and THAT door
+    // refuses a target that is not strictly wider — `self` can never be one.
+    check_cohort_scope(&row.cohort_scope)?;
 
     // v31.0.0 (CIRISPersist#649) — THE TYPED-COLUMN BINDING, at the promote
     // door. #643 could not put it here: promotion re-signed the PRE-promotion
@@ -4114,6 +4132,13 @@ pub fn verify_touch_claim_admission(
 /// index.
 pub const CONSENT_INSTANT_RESOLUTION_NANOS: u32 = 1_000;
 
+/// v39.0.0 — the resolution persist MINTS signed instants at: milliseconds
+/// (CC 2.6.2 `.sssZ`). A multiple of [`CONSENT_INSTANT_RESOLUTION_NANOS`], so
+/// every minted instant passes the microsecond CHECK that pre-v39 rows are
+/// held to; the check is deliberately NOT raised to milliseconds, because that
+/// would refuse every already-signed microsecond row at ingest.
+pub const SIGNED_INSTANT_RESOLUTION_NANOS: u32 = 1_000_000;
+
 /// v31.0.0 (CIRISPersist#598) — truncate an instant to the substrate's
 /// [`CONSENT_INSTANT_RESOLUTION_NANOS`] floor, i.e. to what postgres
 /// `TIMESTAMPTZ` can actually hold. Every persist-minted instant that will be
@@ -4127,8 +4152,20 @@ pub fn truncate_to_substrate_resolution(
     // `nanosecond()` reports ≥ 1_000_000_000 inside a leap second; `with_nanosecond`
     // then refuses the truncated value, so fall back to the input unchanged
     // rather than silently mangling it (the caller's binding check still runs).
-    t.with_nanosecond(nanos / CONSENT_INSTANT_RESOLUTION_NANOS * CONSENT_INSTANT_RESOLUTION_NANOS)
+    t.with_nanosecond(nanos / SIGNED_INSTANT_RESOLUTION_NANOS * SIGNED_INSTANT_RESOLUTION_NANOS)
         .unwrap_or(t)
+}
+
+/// v39.0.0 — **the one rendering of a signed instant** (CC 2.6.2): RFC 3339,
+/// UTC, millisecond precision, `Z` suffix — `2026-09-02T12:34:56.789Z`.
+/// Every instant persist MINTS into a signed envelope (`asserted_at`,
+/// `expires_at`, `ScrubSig::cosigned_at`) goes through here. Parsing stays
+/// tolerant (`check_instant_binding` accepts any RFC 3339 form) because
+/// pre-v39 rows carry `+00:00` microsecond instants inside bytes that are
+/// already signed and cannot be re-rendered.
+#[must_use]
+pub fn render_signed_instant(t: chrono::DateTime<chrono::Utc>) -> String {
+    truncate_to_substrate_resolution(t).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// v31.0.0 (CIRISPersist#598) — the instant a LOCAL-tier write stamps on
@@ -15642,11 +15679,11 @@ mod tests {
             .await
             .expect("(6) the local door stages producer-authority rows; it is not the gate");
         let staged = dir.get_attestation(&staged_id).await.unwrap().unwrap();
-        let reseal = ts::reseal_for_scope(&stranger, &staged, cohort_scope::FEDERATION);
+        let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
         let err = dir
-            .promote_attestation(&staged_id, cohort_scope::FEDERATION, &reseal)
+            .enter_mesh(&staged_id, &ci, &ts::actor_reseal(&staged))
             .await
-            .expect_err("(6) promoting a third-party config:* row must be REFUSED");
+            .expect_err("(6) crossing a third-party config:* row must be REFUSED");
         assert!(
             err.to_string().contains("SELF-REPORT"),
             "(6) the promote door must refuse for the CONFIG rule, not a neighbour's: {err}"
@@ -16000,6 +16037,7 @@ mod canonical_gate_tests {
                 .await
                 .unwrap();
             scrubs.push(super::super::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: (*kid).to_string(),
                 scrub_signature_classical: sig.ed25519_signature_base64,
                 scrub_signature_pqc: sig.mldsa65_signature_base64,
@@ -16110,6 +16148,7 @@ mod canonical_gate_tests {
                 .await
                 .unwrap();
             scrubs.push(super::super::types::ScrubSig {
+                cosigned_at: None,
                 scrub_key_id: (*kid).to_string(),
                 scrub_signature_classical: sig.ed25519_signature_base64,
                 scrub_signature_pqc: sig.mldsa65_signature_base64,
@@ -16492,6 +16531,7 @@ mod canonical_gate_tests {
             &[&founders[0]],
         );
         forged.additional_scrubs = vec![ScrubSig {
+            cosigned_at: None,
             scrub_key_id: founders[1].key_id.clone(),
             scrub_signature_classical: B64.encode([0u8; 64]),
             scrub_signature_pqc: Some(B64.encode([0u8; 64])),
@@ -16992,6 +17032,7 @@ mod canonical_gate_tests {
             &[&founders[0]],
         ));
         forged.additional_scrubs = vec![ScrubSig {
+            cosigned_at: None,
             scrub_key_id: founders[1].key_id.clone(),
             scrub_signature_classical: B64.encode([0u8; 64]),
             scrub_signature_pqc: Some(B64.encode([0u8; 64])),
@@ -20024,14 +20065,38 @@ pub(crate) mod r2_test_support {
         // v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN: `cohort_scope`
         // is bound into the signed envelope, so the mirror is re-stamped and
         // the row re-signed before the door is asked.
-        let reseal = crate::federation::tier_ingest::test_support::reseal_for_scope(
-            &author,
-            &before,
-            cohort_scope::COMMUNITY,
-        );
-        dir.set_attestation_cohort_scope(&id, cohort_scope::COMMUNITY, &reseal)
+        // v39.0.0 — the served bytes move at the crossing (canonical at rest,
+        // the actor's scrub, `promoted_at`), so `enter_mesh` is the motion the
+        // wire index must follow. The row was put at the federation tier above;
+        // stage a LOCAL twin and cross it.
+        let mut local_twin = before.clone();
+        local_twin.attestation_id = uuid::Uuid::new_v4().to_string();
+        local_twin.tier = crate::federation::types::attestation_tier::LOCAL.to_owned();
+        local_twin.cohort_scope = cohort_scope::SELF.to_owned();
+        crate::federation::tier_ingest::test_support::reseal(&mut local_twin);
+        let id = local_twin.attestation_id.clone();
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: local_twin,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the local twin admits: {e}"));
+        let before = dir
+            .get_attestation(&id)
             .await
-            .unwrap_or_else(|e| panic!("[{tag}] re-scope must succeed: {e}"));
+            .expect("get")
+            .expect("row exists");
+        let before_wire = crate::federation::wire_index::content_hash_of(&before).expect("hash");
+        let ci = crate::federation::tier_ingest::test_support::describe_own(
+            &before,
+            crate::federation::CrossingBasis::ProducerAuthority,
+        );
+        dir.enter_mesh(
+            &id,
+            &ci,
+            &crate::federation::tier_ingest::test_support::actor_reseal(&before),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the crossing must succeed: {e}"));
 
         let after = dir
             .get_attestation(&id)

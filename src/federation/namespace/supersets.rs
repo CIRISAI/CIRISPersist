@@ -1262,9 +1262,9 @@ pub const PERSIST_AUTHORED_ABSENCE_FALSIFIERS: &[(&str, &str, &[&str], &str)] = 
             "check_promoted_scope_narrowing",
             "revoke_promoted_cohort_scope",
         ],
-        "Still true, and the nearest shipping symbol says why: CIRISPersist#530's \
-         `repair_stranded_scope_backlog` is BROADEN-ONLY by construction, so it cannot be the \
-         cessation dual however close it looks. WEAK TRIPWIRE — the names here are persist's guess \
+        "Still true, and the nearest shipping symbol says why: v39.0.0's `widen_audience` is \
+         WIDEN-ONLY by construction (`crossing::check_strictly_wider`; a narrowing is a withdraw), \
+         so it cannot be the cessation dual however close it looks. WEAK TRIPWIRE — the names here are persist's guess \
          at what the narrowing counterpart would be called, and an implementer who spells it \
          differently walks past this line.",
     ),

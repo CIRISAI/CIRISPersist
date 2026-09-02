@@ -56,6 +56,7 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+pub mod crossing;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -159,30 +160,25 @@ pub struct TraceBackfillReport {
     pub skipped: Vec<(String, String)>,
 }
 
-/// v21.2.0 (CIRISPersist#509 FLOOR) — one
-/// [`crate::Engine::promote_consented_backlog`] sweep's tally: local-tier
-/// attestations promoted to federation tier (their dimension was covered
-/// by a LIVE self-authored `consent:replication:v1` grant) vs. skipped
-/// (an `attestation_promote` error on that ONE row — logged via
-/// `tracing::warn!` and counted, never wedging the rest of the sweep;
-/// the same honest-accounting posture [`TraceBackfillReport`]
-/// established for the #478 backfill).
+/// One [`crate::Engine::promote_consented_backlog`] sweep's tally — the
+/// "payload follows the consent edge" motion (v21.2.0, CIRISPersist#509),
+/// re-cut in v39.0.0 over the two crossing verbs. Every count is a row;
+/// nothing here wedges the sweep — a per-row error is logged and counted.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConsentSweepReport {
-    /// Local-tier attestations promoted to federation tier this sweep
-    /// (the [`crate::Engine::promote_consented_backlog`] motion).
+    /// Local-tier rows that crossed to the federation tier this sweep
+    /// (`enter_mesh`, same bytes, actor-signed or node-co-scrubbed).
     pub promoted: u64,
-    /// Federation-tier rows whose suppressed (`self`/`family`) placement
-    /// was corrected to the covering grant's federation-visible audience
-    /// (the [`crate::Engine::repair_stranded_scope_backlog`] motion —
-    /// CIRISPersist#530). `0` for the promote sweep, which never touches
-    /// federation-tier rows.
-    pub rescoped: u64,
-    /// Rows that matched a live grant's prefix set but failed the sweep's
-    /// write (promote or re-scope) on that ONE row — logged via
-    /// `tracing::warn!` and counted, never wedging the rest of the sweep;
-    /// the same honest-accounting posture [`TraceBackfillReport`]
-    /// established for the #478 backfill.
+    /// `supersedes` rows written to widen a crossed row to its covering
+    /// grant's audience (`widen_audience`, signed by the actor).
+    pub widened: u64,
+    /// Rows the sweep could NOT act on because the actor's signer was not in
+    /// hand — an unsigned local row by another key, or a widening of another
+    /// key's claim (no delegated widening; subsidiarity, CC part 3 §308). They
+    /// wait; they are not skipped errors.
+    pub awaiting_actor: u64,
+    /// Rows on which a crossing returned an error (logged via
+    /// `tracing::warn!`).
     pub skipped: u64,
 }
 
@@ -306,6 +302,11 @@ pub use blobs::{
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
+pub use crossing::{
+    Audience, ContentRef, ContextualIntegrity, CrossingBasis, Custody, DataSubject, DeliveryMode,
+    EnterPlan, Lifecycle, MeshCrossing, MeshCrossingOutcome, Replicates, RevocationAuthority,
+    TierPromotionCustody,
+};
 pub use freshness::{coalesce_touch_ts, TouchApplyOutcome};
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
@@ -1141,37 +1142,22 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// v21.12.0 (CIRISPersist#530) — the REPAIR sweep's page source: a
-    /// keyset cursor (identical shape to [`Self::list_local_tier_attestations`])
-    /// over the **stranded** rows — `tier = 'federation'` yet
-    /// `cohort_scope ∈ {self, family}` (the
-    /// [`types::cohort_scope::suppresses_holds_bytes`] scopes that project
-    /// `SelfOwn` and are structurally invisible to the offer filter).
-    ///
-    /// This is the second motion #530 identifies as missing.
-    /// [`Self::list_local_tier_attestations`] pages `WHERE tier = 'local'`,
-    /// so its self-limiting property (a promoted row leaves the `local`
-    /// tier and is never revisited) — the very property that makes
-    /// [`crate::Engine::promote_consented_backlog`] safe to call
-    /// unconditionally — is *exactly* what makes it unable to repair a row
-    /// that already reached `(federation, self)` (sealed-before-grant, or a
-    /// pre-#519 tier-only promotion that flipped tier without carrying the
-    /// placement). A stranded row is past the tier gate, covered by the
-    /// grant, and still never offered; only a page source that selects on
-    /// `tier = 'federation'` can see it.
-    ///
-    /// `after_attestation_id = None` starts from the beginning; `Some(id)`
-    /// resumes strictly after it (`attestation_id > after`, lexical
-    /// ordering). Backends order + page `ORDER BY attestation_id ASC LIMIT
-    /// limit`. Default `Unsupported`; sqlite/postgres/memory override.
-    async fn list_stranded_federation_attestations(
+    /// v39.0.0 — the consent sweep's **widening candidates**: federation-tier
+    /// rows at an undiscoverable scope (`self` / `family`, CC 5.2) that no
+    /// `supersedes` by their own attester references yet. Keyset cursor on
+    /// `attestation_id` (`after = None` starts; `Some(id)` resumes strictly
+    /// after it), `ORDER BY attestation_id ASC LIMIT limit`. Replaces
+    /// `list_stranded_federation_attestations` (#530): those rows are not
+    /// stranded, they are the CC 5.2 shape — this page is what
+    /// `Engine::promote_consented_backlog` widens when a grant covers them.
+    async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<Attestation>, Error> {
         let _ = (after_attestation_id, limit);
         Err(Error::Unsupported {
-            method: "list_stranded_federation_attestations",
+            method: "list_widening_candidates",
         })
     }
 
@@ -1731,47 +1717,6 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (attestation_id, expected_persist_row_hash, authority);
         Err(Error::Unsupported {
             method: "purge_genesis_delegation_row_v31",
-        })
-    }
-
-    /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
-    /// an EXISTING attestation row: the second placement door, driven by
-    /// [`crate::Engine::repair_stranded_scope_backlog`] (CIRISPersist#530),
-    /// which re-scopes an ALREADY-federation row to a covering grant's
-    /// audience. `cohort_scope` MUST be one of the closed-set values
-    /// ([`types::cohort_scope::is_valid`]) — implementations validate
-    /// before writing and reject an out-of-set value with
-    /// `InvalidArgument`. Also `InvalidArgument` if `attestation_id`
-    /// does not exist. Default `Unsupported`; sqlite/postgres/memory
-    /// override.
-    ///
-    /// # v31.0.0 (CIRISPersist#649) — a re-scope is a RE-SIGN
-    ///
-    /// This method's own doc used to end *"`cohort_scope` is a row attribute
-    /// outside the signed envelope, so the scrub signature stays valid"*.
-    /// CIRISPersist#643 made that sentence false: `cohort_scope` is one of the
-    /// seven columns bound into `envelope.row`, and
-    /// [`admission::check_row_column_binding`] refuses any row whose column
-    /// diverges from that mirror. Rewriting the column in place therefore
-    /// produced a row asserting its OLD scope — refused by every peer's
-    /// `put_attestation`, and by this node's own.
-    ///
-    /// So the caller re-stamps the mirror
-    /// ([`envelope::RowMirror::restamp_for_scope`]), re-signs the result, and
-    /// hands both over as `reseal`; the envelope, its digest, its signature
-    /// and the new placement land in ONE statement. Implementations re-run
-    /// [`admission::check_row_column_binding`] over the row as it will be
-    /// stored, so a caller that skips the re-stamp is REFUSED rather than
-    /// silently minting an unreplicable row.
-    async fn set_attestation_cohort_scope(
-        &self,
-        attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &AttestationReseal,
-    ) -> Result<(), Error> {
-        let _ = (attestation_id, cohort_scope, reseal);
-        Err(Error::Unsupported {
-            method: "set_attestation_cohort_scope",
         })
     }
 
@@ -4477,68 +4422,98 @@ pub trait FederationDirectory: Send + Sync {
     /// promote` to load the `local` row's envelope before signing.
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error>;
 
-    /// v4.6 (CIRISPersist#171 phase 2, CEG §10.1.3/§10.1.5) — the
-    /// local→federation **promotion** write-back: stamp the hybrid scrub
-    /// envelope computed by [`crate::Engine::attestation_promote`] and
-    /// flip `tier` to `federation` (+ `promoted_at`), iff the row is
-    /// currently `local`. Returns `Ok(true)` on promotion, `Ok(false)` if
-    /// the row is already `federation` (idempotent), `Err` if absent. The
-    /// signing bytes are the §0.9-canonical envelope (gated produce
-    /// canonicalizer), so a promoted row is byte-identical on the wire to
-    /// a natively-federation one (Registry must #1).
+    /// v39.0.0 — **the tier crossing** (CC 5.3.2.4.2): flip `local →
+    /// federation` over the SAME bytes. Replaces `promote_attestation`, which
+    /// re-signed the row with the node's key, replaced the actor's base scrub,
+    /// cleared every co-scrub and rewrote `cohort_scope` inside the signed
+    /// envelope — so the fabric became the author of an actor's claim, and
+    /// every peer refused the result whenever the attester was not the node
+    /// (the wire verifier resolves the base signature against
+    /// `attesting_key_id`, never `scrub_key_id`).
     ///
-    /// # v26.0.0 (CIRISPersist#589 / AV-83) — the primitive carries its placement
+    /// **Everything that decides is in [`crossing`]** — read that module's doc
+    /// first. Implementations call [`crossing::plan_enter_mesh`] (which
+    /// verifies custody, every co-scrub, the promotion admission stack and all
+    /// nine contextual-integrity axes, then hashes the row as it will be
+    /// stored) and execute the returned [`crossing::EnterPlan`] as ONE statement
+    /// guarded by `tier = 'local'`, re-stamping the plane position
+    /// (`admitted_at`) and refreshing the `attestation_subjects` projection and
+    /// the wire index. Nothing in the signed bytes changes; `cohort_scope` is
+    /// untouched, so a `(local, self)` row crosses to `(federation, self)` —
+    /// the CC 5.2 shape (replicated by consent fan-out, not discoverable).
+    /// Widening is [`Self::widen_audience`].
     ///
-    /// `cohort_scope` is the placement the promoted row lands at, written in
-    /// the SAME statement as the tier flip. Before this it was a separate
-    /// [`Self::set_attestation_cohort_scope`] call the caller made first
-    /// ("placement before tier"), which was safe only while promotion could
-    /// not refuse on authority grounds. Now that
-    /// [`admission::check_promotion_admission`] runs here, that two-step left a
-    /// REFUSED promotion having already mutated the row's `cohort_scope` and
-    /// `persist_row_hash` — a verify-before-mutation (AV-9) violation, and
-    /// exactly what the substrate state machine's I2a caught. Carrying the
-    /// placement is #519's own "a promotion is placement-touching, so the
-    /// primitive must carry it" argument applied one layer further down: an
-    /// incomplete OR a partially-applied promotion is no longer expressible.
-    ///
-    /// # v31.0.0 (CIRISPersist#649) — the primitive carries its ENVELOPE
-    ///
-    /// The same argument, one layer further still. CIRISPersist#643 bound
-    /// `cohort_scope` into `envelope.row`; promotion CHANGES `cohort_scope`
-    /// and RE-SIGNS the row, and it was re-signing the PRE-promotion envelope
-    /// — so the promoted row's signed mirror asserted its old scope while its
-    /// column said otherwise, and every peer's `put_attestation` refused it.
-    /// The promoting node's own output was unreplicable, and promotion
-    /// returned `Ok` throughout, which is what hid it.
-    ///
-    /// [`AttestationReseal`] now carries the RE-STAMPED envelope
-    /// ([`envelope::RowMirror::restamp_for_scope`]) alongside the digest and
-    /// signature computed over exactly those bytes, and the implementation
-    /// writes the envelope in the SAME statement as the placement and the tier
-    /// flip. Implementations re-run [`admission::check_row_column_binding`]
-    /// over the row as it will be stored (via
-    /// [`admission::check_promotion_admission`]), so a caller that skips the
-    /// re-stamp is REFUSED at the primitive.
-    ///
-    /// # This absorbed `promote_attestation_transformed`
-    ///
-    /// v21.3.0's #510 strip-then-promote variant existed for exactly one
-    /// reason: it additionally wrote back `attestation_envelope`. Once THIS
-    /// method must write the envelope back too, the two were the same method
-    /// under two names with two copies of one gate stack — the "door beside
-    /// the door" this repo keeps re-discovering. There is one promotion
-    /// primitive; a #510 restriction pipeline is just a different `base` handed
-    /// to [`envelope::RowMirror::restamp_for_scope`]
-    /// (see [`crate::Engine::promote_consented_backlog`]). The row's full
-    /// PRE-transform form remains queryable via the `trace_events` projection,
-    /// exactly as before.
-    async fn promote_attestation(
+    /// Returns [`crossing::MeshCrossingOutcome::AlreadyInMesh`] for an
+    /// already-crossed row (idempotent; nothing touched), else `Crossed`.
+    /// Never returns `AwaitingActor` — that is the engine's outcome when it has
+    /// no custody to offer. `Err(Conflict)` if the row was crossed
+    /// concurrently.
+    async fn enter_mesh(
         &self,
         attestation_id: &str,
-        cohort_scope: &str,
-        reseal: &AttestationReseal,
-    ) -> Result<bool, Error>;
+        ci: &crossing::ContextualIntegrity,
+        custody: &crossing::TierPromotionCustody,
+    ) -> Result<crossing::MeshCrossingOutcome, Error>;
+
+    /// v39.0.0 — **widen the audience** (CC 4.4.3.3.1 / 8.1.5): write a
+    /// `supersedes` row the ACTOR signed at a strictly wider `cohort_scope`.
+    /// The prior row is untouched — byte-identical, still served at its own
+    /// scope. Readers resolve the current scope of a claim by walking
+    /// `supersedes` (the precedence fold already does).
+    ///
+    /// A default over [`Self::get_attestation`] + [`Self::put_attestation`]:
+    /// [`crossing::check_widening`] is the pure shape rule (by the prior's
+    /// attester, `references_attestation_id = prior`, `differs_in` names
+    /// `cohort_scope`, body reused member-by-member, audience strictly wider),
+    /// [`crossing::check_contextual_integrity`] cross-checks the nine axes
+    /// against the NEW row, and then the ordinary put door runs every gate and
+    /// the ingest hybrid verification. Build `signed` with
+    /// [`crossing::build_widening`] → `attestation_emit::stamp_and_canonicalize`
+    /// → sign → `attestation_emit::assemble`, exactly like any other emit. No
+    /// backend overrides this; there is one widening path.
+    async fn widen_audience(
+        &self,
+        prior_attestation_id: &str,
+        ci: &crossing::ContextualIntegrity,
+        signed: SignedAttestation,
+    ) -> Result<crossing::MeshCrossingOutcome, Error> {
+        let prior = self
+            .get_attestation(prior_attestation_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "widen_audience: prior row {prior_attestation_id} does not exist"
+                ))
+            })?;
+        crossing::check_widening(&prior, &signed.attestation)?;
+        let now = chrono::Utc::now();
+        crossing::check_contextual_integrity(
+            self,
+            &signed.attestation,
+            &prior,
+            ci,
+            &signed.attestation.cohort_scope,
+            true,
+            now,
+        )
+        .await?;
+        let row = signed.attestation.clone();
+        self.put_attestation(signed).await?;
+        // CEG §6.1: a structural-composer replay is a silent `Ok` with NO row
+        // written. Ask the store what it did, so `Crossed` keeps meaning
+        // "a new row is on the wire" (the same question
+        // `apply_replicated_attestation` asks).
+        if self.get_attestation(&row.attestation_id).await?.is_none() {
+            return Ok(crossing::MeshCrossingOutcome::AlreadyWidened {
+                prior_attestation_id: prior.attestation_id,
+            });
+        }
+        Ok(crossing::MeshCrossingOutcome::Crossed(crossing::report(
+            &row,
+            crossing::Custody::ActorSigned,
+            now,
+        )))
+    }
 
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
@@ -7613,6 +7588,107 @@ pub enum Error {
         reason: admission::CohortStandingRefusal,
     },
 
+    /// v39.0.0 — `TierPromotionCustody::NodeCoScrub` over a row that carries
+    /// no actor signature. The fabric is never the only signer of an actor's
+    /// claim; a deferred row with no actor present WAITS
+    /// (`MeshCrossingOutcome::AwaitingActor`). See `crossing`.
+    #[error(
+        "attestation {attestation_id}: no actor signature to co-scrub — the local row by \
+         {attesting_key_id} defers its signature, and the node's co-scrub cannot stand in for \
+         it (FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE §5.1 W4); the row waits for the actor"
+    )]
+    NoActorSignature {
+        /// The row that has no actor signature.
+        attestation_id: String,
+        /// The actor whose signature is absent.
+        attesting_key_id: String,
+    },
+    /// v39.0.0 — the signer offered as the actor's is not the attester.
+    #[error(
+        "attestation {attestation_id}: custody is not the actor — the row is attested by \
+         {attesting_key_id} but the signature offered is by {scrub_key_id}; the fabric never \
+         replaces the actor's key (FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE §5.1 W5)"
+    )]
+    CustodyIsNotTheActor {
+        /// The row.
+        attestation_id: String,
+        /// The row's attester — the only key that may sign as the actor.
+        attesting_key_id: String,
+        /// The key that was offered instead.
+        scrub_key_id: String,
+    },
+    /// v39.0.0 — a tier crossing must be over the SAME bytes (CC 5.3.2.4.2);
+    /// the bytes offered (or the stored hash) do not canonicalize to the
+    /// stored envelope. The #649 class, refused at the primitive.
+    #[error(
+        "attestation {attestation_id}: the promotion moved the preimage — stored bytes hash to \
+         {stored_hash}, the offer hashes to {offered_hash}; a tier crossing is byte-identical \
+         (CC 5.3.2.4.2), a different body is a new row"
+    )]
+    PromotionMovedThePreimage {
+        /// The row.
+        attestation_id: String,
+        /// Hex SHA-256 of `JCS` of the stored envelope.
+        stored_hash: String,
+        /// Hex SHA-256 of `JCS` of the bytes offered (or the stored hash column).
+        offered_hash: String,
+    },
+    /// v39.0.0 — a `ContextualIntegrity` axis disagrees with the row it
+    /// describes. Named by axis so the caller fixes the answer, not the row.
+    #[error(
+        "attestation {attestation_id}: contextual-integrity axis `{axis}` mismatch — the \
+         crossing states {stated:?} but the row carries {row:?} (CC 4.5.1.1; a row never \
+         crosses while misdescribed)"
+    )]
+    ContextualIntegrityMismatch {
+        /// The row being described.
+        attestation_id: String,
+        /// The CC 4.5.1.1 axis that disagrees.
+        axis: &'static str,
+        /// What the crossing stated for that axis.
+        stated: String,
+        /// What the row actually carries.
+        row: String,
+    },
+    /// v39.0.0 — `widen_audience` asked for a scope that is not strictly
+    /// wider than the prior row's.
+    #[error(
+        "widening of {prior_attestation_id}: requested audience {requested:?} is not strictly \
+         wider than the prior's {prior:?} (CC 4.4.3.3.1 — a supersedes widens; to narrow, \
+         withdraw)"
+    )]
+    AudienceNotWider {
+        /// The row being widened.
+        prior_attestation_id: String,
+        /// Its current `cohort_scope`.
+        prior: String,
+        /// The `cohort_scope` requested.
+        requested: String,
+    },
+    /// v39.0.0 — the `supersedes` row offered to `widen_audience` changes a
+    /// member a widening may not touch. A widening reuses the body (CC 8.1.5)
+    /// and may only STRIP members it declares in `differs_in`.
+    #[error(
+        "widening of {prior_attestation_id} re-authors `{member}` — a supersedes that widens \
+         the audience carries the prior's body unchanged except for members it declares \
+         stripped in `differs_in`; anything else is a new claim, not a widening"
+    )]
+    WideningReAuthors {
+        /// The row being widened.
+        prior_attestation_id: String,
+        /// The envelope member (or bound column) the offered row changes.
+        member: String,
+    },
+    /// v39.0.0 — the `supersedes` row offered to `widen_audience` is not the
+    /// right shape (type, tier, reference, `differs_in`, or a local prior).
+    #[error("widening of {prior_attestation_id} is malformed: {reason}")]
+    WideningMalformed {
+        /// The row being widened.
+        prior_attestation_id: String,
+        /// What is wrong with the offered `supersedes`.
+        reason: String,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -7777,6 +7853,13 @@ impl Error {
             }
             Error::CommunityHasNoModerator { .. } => "federation_community_no_moderator",
             Error::CohortStandingRefused { .. } => "federation_cohort_standing_refused",
+            Error::NoActorSignature { .. } => "federation_no_actor_signature",
+            Error::CustodyIsNotTheActor { .. } => "federation_custody_is_not_the_actor",
+            Error::PromotionMovedThePreimage { .. } => "federation_promotion_moved_the_preimage",
+            Error::ContextualIntegrityMismatch { .. } => "federation_contextual_integrity_mismatch",
+            Error::AudienceNotWider { .. } => "federation_audience_not_wider",
+            Error::WideningReAuthors { .. } => "federation_widening_re_authors",
+            Error::WideningMalformed { .. } => "federation_widening_malformed",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

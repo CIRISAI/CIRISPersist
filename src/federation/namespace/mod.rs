@@ -722,7 +722,8 @@ const SYSTEM_AUDIT_CHAIN_HASH_CONTINUITY: &str = "system:audit_chain:hash_contin
 /// release), and a new decided family is additive policy, not a contract
 /// change — it must not break a consumer's build. Consumers match the
 /// variants they gate on and let the rest fall through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AttestationFamily {
     /// `consent:*` — the routing editor (Global ceiling).

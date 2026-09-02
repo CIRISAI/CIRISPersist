@@ -128,7 +128,9 @@ Engine	attach_key_pqc_signature	ontological
 Engine	attach_revocation_pqc_signature	ontological	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
-Engine	attestation_promote	deontic	
+Engine	enter_mesh	deontic	
+Engine	widen_audience	deontic	
+Engine	describe_crossing	epistemic	
 Engine	attestation_upsert_local	empirical	
 Engine	attestation_upsert_local_many	empirical	
 Engine	audit_canonicalize_for_hash	nomological	
@@ -482,7 +484,6 @@ Engine	register_public_key	deontic
 Engine	register_self_federation_key	ontological	
 Engine	remove_moderator	deontic	
 Engine	remove_peer_record	deontic	
-Engine	repair_stranded_scope_backlog	procedural	
 Engine	replay_abandoned	procedural	
 Engine	resolve_key_statement_standing_json	deontic	
 Engine	resolve_mesh_config_json	deontic	

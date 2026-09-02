@@ -1727,6 +1727,7 @@ pub mod test_support {
             .map(|s| {
                 let (ed, pqc) = s.sign_bytes(&bytes);
                 ScrubSig {
+                    cosigned_at: None,
                     scrub_key_id: s.key_id.clone(),
                     scrub_signature_classical: ed,
                     scrub_signature_pqc: Some(pqc),
@@ -2068,6 +2069,7 @@ pub mod test_support {
             .map(|s| {
                 let (ed, pqc) = s.sign_bytes(&bytes);
                 ScrubSig {
+                    cosigned_at: None,
                     scrub_key_id: s.key_id.clone(),
                     scrub_signature_classical: ed,
                     scrub_signature_pqc: Some(pqc),
@@ -2535,6 +2537,7 @@ pub mod test_support {
                 .map(|s| {
                     let (ed, pqc) = s.sign_bytes(&bytes);
                     ScrubSig {
+                        cosigned_at: None,
                         scrub_key_id: s.key_id.clone(),
                         scrub_signature_classical: ed,
                         scrub_signature_pqc: Some(pqc),
@@ -3320,6 +3323,7 @@ pub mod test_support {
                 let (_, classical, pqc) =
                     crate::federation::tier_ingest::test_support::sign_envelope(k, &envelope);
                 crate::federation::types::ScrubSig {
+                    cosigned_at: None,
                     scrub_key_id: (*k).to_owned(),
                     scrub_signature_classical: classical,
                     scrub_signature_pqc: pqc,
