@@ -9,6 +9,7 @@
 //! Sweep is 1 / 6 / 16 / 64 components — covers single-step traces,
 //! typical thoughts, full thoughts with all H3ERE steps, and stress.
 
+use base64::Engine as _;
 use ciris_keyring::HardwareSigner;
 use ciris_persist::ingest::IngestPipeline;
 use ciris_persist::scrub::NullScrubber;
@@ -64,6 +65,25 @@ fn ingest_pipeline_sweep(c: &mut Criterion) {
                         // constructor is cheap (one Mutex per Vec).
                         let backend = MemoryBackend::new();
                         backend.add_public_key("agent-bench", sk.verifying_key());
+                        // CIRISPersist#789 — admission resolves the producer's
+                        // ML-DSA-65 pubkey from `federation_keys` by
+                        // `pqc_key_id` and refuses when it is absent. The
+                        // bench signs with `bench-mldsa` (common.rs), so that
+                        // key has to be in the directory or every iteration
+                        // measures a rejection instead of the pipeline.
+                        runtime.block_on(async {
+                            use ciris_keyring::PqcSigner as _;
+                            let m = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                                &[0x77; 32],
+                                "bench-mldsa",
+                            )
+                            .expect("ml-dsa seed");
+                            let pk = m.public_key().await.expect("ml-dsa pk");
+                            backend.add_pqc_public_key(
+                                "bench-mldsa",
+                                &base64::engine::general_purpose::STANDARD.encode(&pk),
+                            );
+                        });
                         backend
                     },
                     |backend| {
