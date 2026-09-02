@@ -40,9 +40,24 @@ fn test_signer() -> Box<dyn HardwareSigner> {
 
 /// Mint an agent keypair + register in the backend's accord_public_keys
 /// directory so verify_trace passes. Returns (signing_key, key_id).
-fn agent_with_registered_key(backend: &MemoryBackend, key_id: &str, seed: u8) -> SigningKey {
+async fn agent_with_registered_key(backend: &MemoryBackend, key_id: &str, seed: u8) -> SigningKey {
     let sk = SigningKey::from_bytes(&[seed; 32]);
     backend.add_public_key(key_id, sk.verifying_key());
+    // CIRISPersist#789 — the producer's ML-DSA-65 key must be IN THE
+    // DIRECTORY. Admission resolves it by `pqc_key_id` and refuses when it is
+    // absent; the payload's own copy is no longer trusted, because a key the
+    // submitter nominates proves nothing about who they are. The fleet is
+    // 100% PQC, so a registered PQC key is the normal state of the world.
+    {
+        use ciris_keyring::PqcSigner as _;
+        let mldsa = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "qa-mldsa")
+            .expect("ml-dsa seed");
+        let pk = mldsa.public_key().await.expect("ml-dsa pk");
+        backend.add_pqc_public_key(
+            "qa-mldsa",
+            &base64::engine::general_purpose::STANDARD.encode(&pk),
+        );
+    }
     sk
 }
 
@@ -143,7 +158,7 @@ async fn high_volume_concurrent_agents() {
     for i in 0..N_AGENTS {
         let key_id = format!("agent-{i:02}");
         let agent_id_hash = format!("hash-{i:02}");
-        let sk = agent_with_registered_key(&backend, &key_id, (i + 1) as u8);
+        let sk = agent_with_registered_key(&backend, &key_id, (i + 1) as u8).await;
         agents.push((key_id, agent_id_hash, sk));
     }
 
@@ -306,8 +321,8 @@ async fn av6_json_bomb_depth() {
 async fn av9_cross_agent_dedup() {
     let backend = MemoryBackend::new();
     let signer = test_signer();
-    let sk_a = agent_with_registered_key(&backend, "agent-A", 0xAA);
-    let sk_b = agent_with_registered_key(&backend, "agent-B", 0xBB);
+    let sk_a = agent_with_registered_key(&backend, "agent-A", 0xAA).await;
+    let sk_b = agent_with_registered_key(&backend, "agent-B", 0xBB).await;
 
     let bytes_a =
         build_signed_batch(&sk_a, "agent-A", "hash-A", "trace-collide", "th-collide", 1).await;
@@ -351,7 +366,7 @@ async fn av24_sign_verify_round_trip_all_rows() {
     let backend = Arc::new(MemoryBackend::new());
     let signer = Arc::<dyn HardwareSigner>::from(test_signer());
     let signer_key_id = "qa-harness-signer".to_owned();
-    let sk = agent_with_registered_key(&backend, "agent-qa", 0x42);
+    let sk = agent_with_registered_key(&backend, "agent-qa", 0x42).await;
 
     let mut tasks = Vec::new();
     for b in 0..N_BATCHES {
@@ -452,7 +467,7 @@ async fn av19_graceful_shutdown_under_load() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(dir.path().join("j.redb")).unwrap());
     let backend = Arc::new(MemoryBackend::new());
-    let sk = agent_with_registered_key(&backend, "agent-shutdown", 0xC0);
+    let sk = agent_with_registered_key(&backend, "agent-shutdown", 0xC0).await;
     let signer = Arc::<dyn HardwareSigner>::from(test_signer());
 
     let (handle, persister) = spawn_persister(
@@ -509,7 +524,7 @@ async fn av19_graceful_shutdown_under_load() {
 async fn av17_attempt_index_out_of_range() {
     let backend = MemoryBackend::new();
     let signer = test_signer();
-    let sk = agent_with_registered_key(&backend, "agent-av17", 0x17);
+    let sk = agent_with_registered_key(&backend, "agent-av17", 0x17).await;
 
     // Build a trace with attempt_index = 4_294_967_296 (u32::MAX + 1).
     // Pre-v0.1.3 this would have wrapped to 0 via `as u32`.

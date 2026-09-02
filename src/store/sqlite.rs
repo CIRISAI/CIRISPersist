@@ -563,15 +563,15 @@ impl Backend for SqliteBackend {
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
                 verification_source, cohort_scope, cohort_target_id, \
-                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
+                pqc_key_id, \
                 shard_key, \
                 scrub_ner_ran, scrub_applied_trace_level, scrub_model_digest, \
                 admitted_at\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-                ?41, ?42, ?43, ?44\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, \
+                ?39, ?40, ?41, ?42\
                 ) ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
                 event_type, attempt_index, ts) DO NOTHING";
 
@@ -616,7 +616,7 @@ impl Backend for SqliteBackend {
                     // shard and still collides on the sharded UNIQUE index.
                     let shard_key = i64::from(super::decompose::trace_dedup_shard_key(row));
 
-                    let params: [SqlValue; 44] = [
+                    let params: [SqlValue; 42] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -664,11 +664,18 @@ impl Backend for SqliteBackend {
                         // pipeline resolved the self-target already).
                         SqlValue::Text(row.cohort_scope.clone()),
                         opt_text(row.cohort_target_id.as_deref()),
-                        // v7.2.0 per-trace ML-DSA-65 hybrid columns
-                        // (V083, #225). Producer PQC half; the ingest
-                        // gate rejected Full-mode classical-only first.
-                        opt_text(row.signature_ml_dsa_65.as_deref()),
-                        opt_text(row.pubkey_ml_dsa_65.as_deref()),
+                        // CIRISPersist#789 — `signature_ml_dsa_65` and
+                        // `pubkey_ml_dsa_65` are NO LONGER written here.
+                        //
+                        // Both were stored at the wrong cardinality: the
+                        // signature is thought-scoped (7,264 distinct across
+                        // 106,258 rows) and the pubkey is key-scoped (321),
+                        // so the per-event copies were 679 MB of an 898 MB
+                        // table. The signature now lives once per thought in
+                        // `trace_thought_signatures`, written by
+                        // `put_thought_signature`; the pubkey is resolved
+                        // from the directory by `pqc_key_id`, which is the
+                        // column that stays.
                         opt_text(row.pqc_key_id.as_deref()),
                         // #226 — shard_key (V094).
                         SqlValue::Integer(shard_key),
@@ -696,6 +703,39 @@ impl Backend for SqliteBackend {
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
                     inserted += n;
+                }
+            }
+
+            // CIRISPersist#789 — the thought-scoped signature, written ONCE
+            // per thought, in the SAME transaction as the events it covers.
+            //
+            // Same transaction is the point: a crash between the two writes
+            // would leave events whose signature was never stored, and that
+            // signature is recoverable from nowhere else.
+            //
+            // `DO NOTHING` on conflict because the signature is a total
+            // function of `thought_id` — every event of a thought carries the
+            // same one, so the first write wins and the rest are identical
+            // bytes. A DIFFERING signature for one thought would be a
+            // producer bug, and it is refused loudly by the V135 backfill's
+            // PRIMARY KEY rather than silently overwritten here.
+            {
+                let mut sig_stmt = tx.prepare(
+                    "INSERT INTO trace_thought_signatures \
+                         (thought_id, signature_ml_dsa_65, pqc_key_id) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (thought_id) DO NOTHING",
+                )?;
+                for row in &owned {
+                    // Bound before the call: `as_deref` refuses nothing, so it
+                    // does not belong inside a `?`-propagated expression — the
+                    // parity gate asks what each call on that path refuses,
+                    // and "nothing" is the wrong answer to have to give.
+                    let key = row.pqc_key_id.as_deref();
+                    let sig = row.signature_ml_dsa_65.as_deref();
+                    if let Some(sig) = sig {
+                        sig_stmt.execute(rusqlite::params![row.thought_id, sig, key])?;
+                    }
                 }
             }
 
@@ -1137,7 +1177,16 @@ impl Backend for SqliteBackend {
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
-                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
+                        (SELECT s.signature_ml_dsa_65 \
+                           FROM trace_thought_signatures s \
+                          WHERE s.thought_id = trace_events.thought_id \
+                            AND trace_events.pqc_key_id IS NOT NULL) \
+                          AS signature_ml_dsa_65, \
+                        (SELECT k.pubkey_ml_dsa_65_base64 \
+                           FROM federation_keys k \
+                          WHERE k.key_id = trace_events.pqc_key_id) \
+                          AS pubkey_ml_dsa_65, \
+                        pqc_key_id";
             let (sql, rows) = match agent {
                 Some(h) => {
                     let sql = format!(
@@ -17641,7 +17690,16 @@ impl crate::read::ReadEngine for SqliteBackend {
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
                         cohort_scope, cohort_target_id, \
-                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
+                        (SELECT s.signature_ml_dsa_65 \
+                           FROM trace_thought_signatures s \
+                          WHERE s.thought_id = trace_events.thought_id \
+                            AND trace_events.pqc_key_id IS NOT NULL) \
+                          AS signature_ml_dsa_65, \
+                        (SELECT k.pubkey_ml_dsa_65_base64 \
+                           FROM federation_keys k \
+                          WHERE k.key_id = trace_events.pqc_key_id) \
+                          AS pubkey_ml_dsa_65, \
+                        pqc_key_id";
             let event_rows: Vec<(i64, TraceEventRow)> = {
                 let sql = format!(
                     "SELECT {cols} FROM trace_events \

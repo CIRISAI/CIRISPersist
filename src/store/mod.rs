@@ -15,6 +15,13 @@ pub mod memory;
 // diagnostic. Sibling to the `debug-tools`-gated panic hook in
 // `crate::debug`. Gated on `postgres` OR `sqlite` since the type
 // references `refinery::Report`.
+/// v31.2.0 (CIRISPersist#670) — **the schema-parity gate.** The sibling of
+/// [`parity`], for the half a Rust scan cannot see: it replays
+/// `migrations/{postgres,sqlite}/lens/V*.sql` and compares the table, column,
+/// type, nullability and write-column shape the two dialects end up with.
+#[cfg(test)]
+/// CIRISPersist#789 — the crypto-cardinality declaration gate.
+pub(crate) mod crypto_cardinality;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod migration_timing;
 /// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**
@@ -28,11 +35,6 @@ pub mod migration_timing;
 mod parity;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-/// v31.2.0 (CIRISPersist#670) — **the schema-parity gate.** The sibling of
-/// [`parity`], for the half a Rust scan cannot see: it replays
-/// `migrations/{postgres,sqlite}/lens/V*.sql` and compares the table, column,
-/// type, nullability and write-column shape the two dialects end up with.
-#[cfg(test)]
 mod schema_parity;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod scope_bind;

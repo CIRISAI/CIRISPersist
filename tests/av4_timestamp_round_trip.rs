@@ -126,6 +126,21 @@ async fn build_signed_trace_with_wire_timestamps(
 async fn run(bytes: &[u8], key_id: &str, sk: &SigningKey) -> Result<usize, String> {
     let backend = MemoryBackend::new();
     backend.add_public_key(key_id, sk.verifying_key());
+    // CIRISPersist#789 — the producer's ML-DSA-65 key must be IN THE
+    // DIRECTORY. Admission resolves it by `pqc_key_id` and refuses when it is
+    // absent; the payload's own copy is no longer trusted, because a key the
+    // submitter nominates proves nothing about who they are. The fleet is
+    // 100% PQC, so a registered PQC key is the normal state of the world.
+    {
+        use ciris_keyring::PqcSigner as _;
+        let mldsa = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "av4-mldsa")
+            .expect("ml-dsa seed");
+        let pk = mldsa.public_key().await.expect("ml-dsa pk");
+        backend.add_pqc_public_key(
+            "av4-mldsa",
+            &base64::engine::general_purpose::STANDARD.encode(&pk),
+        );
+    }
     let signer = test_signer();
     let pipeline = IngestPipeline {
         backend: &backend,
