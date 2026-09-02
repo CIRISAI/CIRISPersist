@@ -9,6 +9,30 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added
 
+- **#788 follow-up — an EXPIRED key holds no serve rung.** `lookup_public_key`
+  returns a row whose `valid_until` has passed, so a node whose KEY expired
+  while its owner binding and `infra:serve` grant stayed live kept resolving
+  `MeshServer` — and an accord-conferred one kept resolving `Canonical`. That
+  authorizes an expired serving identity.
+
+  The rule already existed in the same module and this resolver was not
+  following it: `resolve_transit_eligibility` folds the peer's own
+  `valid_until` into its bound and denies once elapsed, because *"reporting
+  `eligible: true` beside an elapsed TTL would be a fail-OPEN dressed as a
+  fresh answer."* The same sentence applies verbatim to a serve tier, so this
+  is the same check rather than a new one. Applied before BOTH rungs: neither
+  the owner's conferral nor the accord's outlives the identity it was
+  conferred on — a grant is authority ABOUT a key, not a reason to keep
+  honouring one whose window has closed.
+
+  The witness needed new machinery, and its absence is why this shipped:
+  `valid_until` has been a BOUND subject member since #750, so it cannot be
+  set by mutating a minted record — the envelope binds it and the
+  subject-binding gate refuses the mismatch. Nothing in test-support could
+  mint a key with an expiry, so the case was literally unwritable.
+  `expired_key_record` / `replicated_key_record_with_expiry` make it writable;
+  the gate is mutation-killed.
+
 - **#788 — `resolve_serve_tier`: the owner-conferred `infra:serve` rung now has
   a resolver.** The serve-tier axis has three rungs and only the accord-conferred
   one was resolvable; an owner-conferred mesh server could not be recognized as

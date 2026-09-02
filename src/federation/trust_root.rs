@@ -2637,6 +2637,32 @@ where
         return Ok(ServeTier::None);
     }
 
+    // ── An EXPIRED key holds no rung ──────────────────────────────────
+    //
+    // #788 review (post-merge). `lookup_public_key` returns a row whose
+    // `valid_until` has passed, so a node whose KEY expired while its owner
+    // binding and serve grant stayed live kept resolving `MeshServer` — and an
+    // accord-conferred one kept resolving `Canonical`. That authorizes an
+    // expired serving identity.
+    //
+    // The rule already exists in this module and this resolver was not
+    // following it: `resolve_transit_eligibility` folds the peer's own
+    // `valid_until` into its bound and denies when it has elapsed, because
+    // "reporting `eligible: true` beside an elapsed TTL would be a fail-OPEN
+    // dressed as a fresh answer". The same sentence applies verbatim to a
+    // serve tier, which is why this is the same check rather than a new one.
+    //
+    // Checked BEFORE both rungs: neither the owner's conferral nor the
+    // accord's outlives the identity it was conferred on. A grant is authority
+    // ABOUT a key; it is not a reason to keep honouring a key whose own
+    // validity window has closed.
+    if subject_row
+        .valid_until
+        .is_some_and(|until| until <= chrono::Utc::now())
+    {
+        return Ok(ServeTier::None);
+    }
+
     // ── Ambiguous ownership surfaces BEFORE any tier is returned ──
     //
     // #788 review: resolving Canonical first and returning early meant a
