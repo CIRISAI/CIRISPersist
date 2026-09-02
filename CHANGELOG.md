@@ -5,151 +5,28 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased]
+## [38.8.0] - 2026-09-02
+
+The mesh-launch cut: the two surfaces edge needs to promote identities and
+converge a hash-first directory, plus the storage defect that was taking a
+production node's read API offline.
+
+Four issues, three of them raised by downstream measurement rather than found
+here. Each shipped with a defect only a witness caught, and each is recorded
+with its own entry — the pattern is the point. A green suite said nothing
+about a feature set never compiled, a bench target never run, a refusal whose
+identity moved, or a case that had become UNWRITABLE once its field became a
+bound member.
+
+**Operator note — this release carries an IRREVERSIBLE migration.** V135 drops
+two columns from `trace_events` (106,258 rows on the canonical). The backfill
+is self-asserting and the migration is one transaction, so it cannot
+half-apply — but the drop cannot be undone, and the ~679 MB only returns on
+**VACUUM**, a deliberate operator action. Deploy this on purpose, not as part
+of a routine upgrade.
 
 ### Added
 
-- **#788 follow-up — an EXPIRED key holds no serve rung.** `lookup_public_key`
-  returns a row whose `valid_until` has passed, so a node whose KEY expired
-  while its owner binding and `infra:serve` grant stayed live kept resolving
-  `MeshServer` — and an accord-conferred one kept resolving `Canonical`. That
-  authorizes an expired serving identity.
-
-  The rule already existed in the same module and this resolver was not
-  following it: `resolve_transit_eligibility` folds the peer's own
-  `valid_until` into its bound and denies once elapsed, because *"reporting
-  `eligible: true` beside an elapsed TTL would be a fail-OPEN dressed as a
-  fresh answer."* The same sentence applies verbatim to a serve tier, so this
-  is the same check rather than a new one. Applied before BOTH rungs: neither
-  the owner's conferral nor the accord's outlives the identity it was
-  conferred on — a grant is authority ABOUT a key, not a reason to keep
-  honouring one whose window has closed.
-
-  The witness needed new machinery, and its absence is why this shipped:
-  `valid_until` has been a BOUND subject member since #750, so it cannot be
-  set by mutating a minted record — the envelope binds it and the
-  subject-binding gate refuses the mismatch. Nothing in test-support could
-  mint a key with an expiry, so the case was literally unwritable.
-  `expired_key_record` / `replicated_key_record_with_expiry` make it writable;
-  the gate is mutation-killed.
-
-- **#788 — `resolve_serve_tier`: the owner-conferred `infra:serve` rung now has
-  a resolver.** The serve-tier axis has three rungs and only the accord-conferred
-  one was resolvable; an owner-conferred mesh server could not be recognized as
-  one, which is the difference between "the fleet's storage helpers are
-  canonicals only" and the intended "any conferred server helps".
-
-  `ServeTier { None, MeshServer, Canonical }` derives `Ord` and the declaration
-  order IS the ordering, so consumers gate with `tier >= MeshServer` rather
-  than matching every arm.
-
-  Lives in `trust_root.rs` because the four predicates the edge-enumeration
-  needs — `tombstoned_ids`, `is_expired`, `counts_in_capability_walk`,
-  `job_dimension_admits` — are private to that module. A caller reimplementing
-  "live conferring edge" over `list_attestations_for` is the two-lists class,
-  and persist has just spent a release paying for one parallel spelling (#750).
-
-  Ships a `_over_roster` variant mirroring both composed legs, for their stated
-  reason: the production roster's private halves live in the #268 hardware
-  ceremony, so without it the `Canonical` rung is reachable only on a node
-  holding ceremony keys — a rung that looks covered and is not.
-
-  **`Err` stays distinct from `Ok(ServeTier::None)`.** Every read propagates;
-  nothing is swallowed into a tier. This resolver sits under retention
-  decisions, where a transient read failure reported as "no serve standing"
-  silently demotes a server and sends an operator hunting for a conferral that
-  is present. That is #737's class ("an unconfigured gate is indistinguishable
-  from a deliberate threshold-0 policy") on a second surface.
-
-  **Four review findings addressed** (PR #790). The node-class gate is the one
-  that mattered: nothing checked the subject was a node, so an owner-bound
-  AGENT key self-claiming `infra:serve` would have been handed `MeshServer`
-  and any consumer using the tier as the trace serve gate would authorize an
-  agent key to serve. Also: the resolver now applies the SAME liveness rule as
-  the authoritative owner-binding fold (row `expires_at` alone let it keep
-  reporting `MeshServer` after a grant's envelope `valid_until` had lapsed —
-  two reads of "is this live" disagreeing), and ambiguous ownership is
-  surfaced before the canonical early return rather than hidden by it.
-
-  One finding is **stated rather than fixed** (#791): leg A's
-  `verify_accord_family_coscrub` returns `Result<(), String>`, flattening a
-  transient read failure into the same shape as a failed verification, which
-  leg A maps to `Ok(false)`. That is fail-secure and correct for its four GATE
-  callers and wrong for a resolver — the same function, opposite requirements.
-  Direction is safe (a canonical can read LOWER, never higher), and the
-  resolver's doc says so precisely.
-
-  Two facts worth recording because the obvious reading is wrong:
-  - **The owner-binding row is itself the conferring edge.** It carries
-    `scope: [infra:serve, …]` under the OWNERSHIP dimension, not
-    `trust:confers:v1`, and passes because `job_dimension_admits` refuses only
-    a *contradicting* trust-job label and infers when silent (v23.0.0 #551).
-  - **`MeshServer` requires BOTH halves** — the owner's grant AND the subject's
-    own claim. Either alone is `None`, which is what makes "claiming is
-    VISIBILITY, never conferral" (v19.0.0) enforced rather than documented.
-
-- **#789 — `trace_events` stored crypto material at the wrong cardinality.**
-  A key-scoped pubkey and a thought-scoped signature, both written once per
-  EVENT row: **679 MB of an 898 MB table** wrapped around 80 MB of actual
-  trace payload (99.7% and 93.2% redundant). It surfaced three releases later
-  as a read API going deaf after ~22h with a thread parked in `D` on
-  `wait_on_page_bit_common` — the working set stopped fitting page cache.
-
-  The class is **not** "crypto stored inline": `federation_attestations`
-  carries 16,010 distinct signatures over 16,471 rows, genuinely per-row. It
-  is *material whose natural key differs from the row's, with nothing that
-  notices*.
-
-  V135 moves the signature to `trace_thought_signatures` (keyed by the thought
-  it actually covers), drops both per-event columns, and resolves the pubkey
-  from the directory. Reads rebuild both fields, so `TraceEventRow` keeps its
-  shape and no consumer API moves.
-
-- **The backfill asserts itself, and the ordering is the safety argument.**
-  `thought_id` is the PRIMARY KEY and the backfill selects DISTINCT, so a
-  thought carrying two signatures violates the PK and ABORTS the migration
-  *before* either column is dropped. Refinery wraps each migration in one
-  transaction, so there is no state where the columns are gone and the
-  signatures were not saved — on a corpus that is durable, replicated and kept
-  for posterity, a drop outrunning its backfill is unrecoverable. Witnessed
-  both ways, including that the source columns survive an aborted run.
-
-- **The dedup keeps the per-row FACT while removing the redundant BYTES.**
-  A thought can hold both a hybrid-signed trace and a classical-only
-  `2.7.legacy` import — they share a `thought_id` — so keying on the thought
-  alone handed the legacy row the hybrid signature and it read back as
-  PQC-signed when it never was. That is loss in the dangerous direction:
-  unsigned material looking signed, which is exactly what the #225 hard cut
-  audits. The measurement licensed "one signature per thought"; it did not
-  license "every event of a thought has one". Reads are gated on the row's own
-  `pqc_key_id`, which is retained and IS that bit.
-
-- **Admission resolves the PQC pubkey from the DIRECTORY, fail-closed.**
-  The Ed25519 half was always checked against a key the directory vouches for
-  while the PQC half came from the payload — provable by anyone who generates
-  a keypair, so the hybrid verify's second leg carried post-quantum durability
-  and no present identity assurance. Both legs now say the same thing about
-  WHO. No warn-then-enforce step: the fleet is 100% PQC, so there is no
-  unregistered-producer population to migrate and a warn period would only
-  preserve the bypass. The lookup runs only where a PQC signature exists, so
-  a classical-only trace still earns the #225 `HybridRequired` refusal rather
-  than a misleading `UnknownKey` — a refusal's identity is part of its
-  contract.
-
-- **A recurrence gate.** Every crypto-bearing column must declare what it is
-  keyed by; an undeclared one fails the build. A DECLARATION gate rather than
-  a cardinality measurement, because `COUNT(DISTINCT)/COUNT(*)` passes
-  vacuously on an empty CI database. It found 22 undeclared columns on first
-  run, each now declared with its natural key. Inherits #691's from-disk
-  weakness rather than inventing a new one.
-
-- **CIRISVerify v14.1.0 adopted** — all 7 Cargo pins flipped together
-  (splitting them forks `ciris_crypto` into two graph versions); `pyproject`'s
-  `>=14.0.0,<15` already covers a minor.
-
-## [Unreleased]
-
-### Added
 
 - **#785 — the KNOWN-but-not-held wire-hash set.** `signed_wire_index` (V111)
   answers *what do I hold*; every entry carries a NOT NULL `record_key`
@@ -295,6 +172,146 @@ threat-model citations because this crate's audit story is the point.
   works to keep out of moderation records for a handful of subjects. Keeping
   it local adds no disclosure, since it is derived from Summaries the peer
   already sent.
+
+
+
+- **#788 follow-up — an EXPIRED key holds no serve rung.** `lookup_public_key`
+  returns a row whose `valid_until` has passed, so a node whose KEY expired
+  while its owner binding and `infra:serve` grant stayed live kept resolving
+  `MeshServer` — and an accord-conferred one kept resolving `Canonical`. That
+  authorizes an expired serving identity.
+
+  The rule already existed in the same module and this resolver was not
+  following it: `resolve_transit_eligibility` folds the peer's own
+  `valid_until` into its bound and denies once elapsed, because *"reporting
+  `eligible: true` beside an elapsed TTL would be a fail-OPEN dressed as a
+  fresh answer."* The same sentence applies verbatim to a serve tier, so this
+  is the same check rather than a new one. Applied before BOTH rungs: neither
+  the owner's conferral nor the accord's outlives the identity it was
+  conferred on — a grant is authority ABOUT a key, not a reason to keep
+  honouring one whose window has closed.
+
+  The witness needed new machinery, and its absence is why this shipped:
+  `valid_until` has been a BOUND subject member since #750, so it cannot be
+  set by mutating a minted record — the envelope binds it and the
+  subject-binding gate refuses the mismatch. Nothing in test-support could
+  mint a key with an expiry, so the case was literally unwritable.
+  `expired_key_record` / `replicated_key_record_with_expiry` make it writable;
+  the gate is mutation-killed.
+
+- **#788 — `resolve_serve_tier`: the owner-conferred `infra:serve` rung now has
+  a resolver.** The serve-tier axis has three rungs and only the accord-conferred
+  one was resolvable; an owner-conferred mesh server could not be recognized as
+  one, which is the difference between "the fleet's storage helpers are
+  canonicals only" and the intended "any conferred server helps".
+
+  `ServeTier { None, MeshServer, Canonical }` derives `Ord` and the declaration
+  order IS the ordering, so consumers gate with `tier >= MeshServer` rather
+  than matching every arm.
+
+  Lives in `trust_root.rs` because the four predicates the edge-enumeration
+  needs — `tombstoned_ids`, `is_expired`, `counts_in_capability_walk`,
+  `job_dimension_admits` — are private to that module. A caller reimplementing
+  "live conferring edge" over `list_attestations_for` is the two-lists class,
+  and persist has just spent a release paying for one parallel spelling (#750).
+
+  Ships a `_over_roster` variant mirroring both composed legs, for their stated
+  reason: the production roster's private halves live in the #268 hardware
+  ceremony, so without it the `Canonical` rung is reachable only on a node
+  holding ceremony keys — a rung that looks covered and is not.
+
+  **`Err` stays distinct from `Ok(ServeTier::None)`.** Every read propagates;
+  nothing is swallowed into a tier. This resolver sits under retention
+  decisions, where a transient read failure reported as "no serve standing"
+  silently demotes a server and sends an operator hunting for a conferral that
+  is present. That is #737's class ("an unconfigured gate is indistinguishable
+  from a deliberate threshold-0 policy") on a second surface.
+
+  **Four review findings addressed** (PR #790). The node-class gate is the one
+  that mattered: nothing checked the subject was a node, so an owner-bound
+  AGENT key self-claiming `infra:serve` would have been handed `MeshServer`
+  and any consumer using the tier as the trace serve gate would authorize an
+  agent key to serve. Also: the resolver now applies the SAME liveness rule as
+  the authoritative owner-binding fold (row `expires_at` alone let it keep
+  reporting `MeshServer` after a grant's envelope `valid_until` had lapsed —
+  two reads of "is this live" disagreeing), and ambiguous ownership is
+  surfaced before the canonical early return rather than hidden by it.
+
+  One finding is **stated rather than fixed** (#791): leg A's
+  `verify_accord_family_coscrub` returns `Result<(), String>`, flattening a
+  transient read failure into the same shape as a failed verification, which
+  leg A maps to `Ok(false)`. That is fail-secure and correct for its four GATE
+  callers and wrong for a resolver — the same function, opposite requirements.
+  Direction is safe (a canonical can read LOWER, never higher), and the
+  resolver's doc says so precisely.
+
+  Two facts worth recording because the obvious reading is wrong:
+  - **The owner-binding row is itself the conferring edge.** It carries
+    `scope: [infra:serve, …]` under the OWNERSHIP dimension, not
+    `trust:confers:v1`, and passes because `job_dimension_admits` refuses only
+    a *contradicting* trust-job label and infers when silent (v23.0.0 #551).
+  - **`MeshServer` requires BOTH halves** — the owner's grant AND the subject's
+    own claim. Either alone is `None`, which is what makes "claiming is
+    VISIBILITY, never conferral" (v19.0.0) enforced rather than documented.
+
+- **#789 — `trace_events` stored crypto material at the wrong cardinality.**
+  A key-scoped pubkey and a thought-scoped signature, both written once per
+  EVENT row: **679 MB of an 898 MB table** wrapped around 80 MB of actual
+  trace payload (99.7% and 93.2% redundant). It surfaced three releases later
+  as a read API going deaf after ~22h with a thread parked in `D` on
+  `wait_on_page_bit_common` — the working set stopped fitting page cache.
+
+  The class is **not** "crypto stored inline": `federation_attestations`
+  carries 16,010 distinct signatures over 16,471 rows, genuinely per-row. It
+  is *material whose natural key differs from the row's, with nothing that
+  notices*.
+
+  V135 moves the signature to `trace_thought_signatures` (keyed by the thought
+  it actually covers), drops both per-event columns, and resolves the pubkey
+  from the directory. Reads rebuild both fields, so `TraceEventRow` keeps its
+  shape and no consumer API moves.
+
+- **The backfill asserts itself, and the ordering is the safety argument.**
+  `thought_id` is the PRIMARY KEY and the backfill selects DISTINCT, so a
+  thought carrying two signatures violates the PK and ABORTS the migration
+  *before* either column is dropped. Refinery wraps each migration in one
+  transaction, so there is no state where the columns are gone and the
+  signatures were not saved — on a corpus that is durable, replicated and kept
+  for posterity, a drop outrunning its backfill is unrecoverable. Witnessed
+  both ways, including that the source columns survive an aborted run.
+
+- **The dedup keeps the per-row FACT while removing the redundant BYTES.**
+  A thought can hold both a hybrid-signed trace and a classical-only
+  `2.7.legacy` import — they share a `thought_id` — so keying on the thought
+  alone handed the legacy row the hybrid signature and it read back as
+  PQC-signed when it never was. That is loss in the dangerous direction:
+  unsigned material looking signed, which is exactly what the #225 hard cut
+  audits. The measurement licensed "one signature per thought"; it did not
+  license "every event of a thought has one". Reads are gated on the row's own
+  `pqc_key_id`, which is retained and IS that bit.
+
+- **Admission resolves the PQC pubkey from the DIRECTORY, fail-closed.**
+  The Ed25519 half was always checked against a key the directory vouches for
+  while the PQC half came from the payload — provable by anyone who generates
+  a keypair, so the hybrid verify's second leg carried post-quantum durability
+  and no present identity assurance. Both legs now say the same thing about
+  WHO. No warn-then-enforce step: the fleet is 100% PQC, so there is no
+  unregistered-producer population to migrate and a warn period would only
+  preserve the bypass. The lookup runs only where a PQC signature exists, so
+  a classical-only trace still earns the #225 `HybridRequired` refusal rather
+  than a misleading `UnknownKey` — a refusal's identity is part of its
+  contract.
+
+- **A recurrence gate.** Every crypto-bearing column must declare what it is
+  keyed by; an undeclared one fails the build. A DECLARATION gate rather than
+  a cardinality measurement, because `COUNT(DISTINCT)/COUNT(*)` passes
+  vacuously on an empty CI database. It found 22 undeclared columns on first
+  run, each now declared with its natural key. Inherits #691's from-disk
+  weakness rather than inventing a new one.
+
+- **CIRISVerify v14.1.0 adopted** — all 7 Cargo pins flipped together
+  (splitting them forks `ciris_crypto` into two graph versions); `pyproject`'s
+  `>=14.0.0,<15` already covers a minor.
 
 ## [38.7.0] - 2026-08-30
 
