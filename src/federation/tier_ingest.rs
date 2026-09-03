@@ -1264,12 +1264,10 @@ pub mod test_support {
     ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
         use crate::federation::{attestation_emit, crossing, CrossingBasis, SignedAttestation};
         let ci = describe_for(prior, audience, CrossingBasis::ProducerAuthority);
-        let mut input = crossing::build_widening(prior, &ci.recipient_see, strip)?;
-        let canonical = attestation_emit::stamp_and_canonicalize(
-            &mut input,
-            &prior.attesting_key_id,
-            chrono::Utc::now(),
-        )?;
+        let now = chrono::Utc::now();
+        let mut input = crossing::build_widening(prior, &ci.recipient_see, strip, now)?;
+        let canonical =
+            attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
         let sig = local_signer(&prior.attesting_key_id)
             .sign_hybrid(&canonical)
             .await

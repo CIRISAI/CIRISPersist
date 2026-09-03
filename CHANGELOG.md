@@ -5,6 +5,101 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [40.0.0] - 2026-09-03
+
+**A widening carries the claim's instant; the placement gets its own.**
+CIRISPersist#801, reported by CIRISServer while adopting v39.0.0. A MAJOR
+because it re-pins `ENVELOPE_VOCABULARY_SHA256`.
+
+### The defect
+
+v39.0.0's `crossing::build_widening` treated `asserted_at` as placement
+bookkeeping and dropped it; `attestation_emit::stamp_and_canonicalize` then
+minted a fresh one. So a widening's signed instant was **when it was placed**,
+not when the claim was asserted.
+
+That would be survivable if widening were optional. It is not. A local-tier row
+MUST be `cohort_scope = self` (`check_local_tier_eligibility`), and `enter_mesh`
+crosses over the same bytes — so reaching any wider audience MUST go through
+`widen_audience`. A `self` row is structurally undiscoverable (CC 5.2) and never
+replicates. **The widening is therefore the only row any peer ever sees, and the
+claim's own instant was unrecoverable off-node.**
+
+Nothing errored. CIRISServer's equivocation detector — which defines a
+contradiction as two claims at one signed instant that neither supersedes the
+other — silently began comparing placement times. On a fixture seeding two
+contradictory claims at one instant and widening both, the rows differed by
+259 ms purely from being widened in sequence, and `classify_pair` returned
+`Superseded`: *a legitimate later revision*. Zero contradictions reported where
+there was one, and an attacker got the same result for free. A detection
+capability that went to zero on adoption.
+
+### The fix
+
+- **`asserted_at` on a widening is the CLAIM's instant**, carried **verbatim**
+  from the prior's signed envelope — not re-rendered, because a pre-v39 prior
+  carries microseconds and re-minting at the substrate resolution would move the
+  instant this row exists to preserve.
+- **`widened_at` (NEW, signed) is the placement's own instant.** The
+  `cosigned_at` analogue for this plane (CC 2.6.7): a second act on an existing
+  claim records when it happened without overwriting when the claim was made.
+  Unlike `cosigned_at` it lives INSIDE the envelope — a widening is a fresh
+  signature over fresh bytes, so there is no preimage to protect and the act's
+  time can be signed rather than left in a column a relay could rewrite.
+- **`attestation_emit::assemble` reads `scrub_timestamp` / `pqc_completed_at`
+  from `widened_at` when present**, else from `asserted_at`. Both come OUT of
+  the signed envelope, so #598's rule — assemble never samples its own clock —
+  is unchanged. This is precisely why `widened_at` had to be a signed member:
+  simply preserving `asserted_at` would have made `scrub_timestamp` the old
+  instant too, erasing the act's time entirely.
+
+### Why this is a MAJOR
+
+`paths::WIDENED_AT` joins `universal_paths`, re-pinning
+`ENVELOPE_VOCABULARY_SHA256` to
+`e7135559a3d843ecff3ad34ee3b1a10acf92b33f199a327758139969e19f5699`
+(was `e019ecb8…`). Same posture as the v36.0.0 and v37.0.0 re-pins: **consumers
+asserting the old hash BREAK, deliberately.** An unadopted reader is one that
+believes a widening's `asserted_at` is the placement time — it should learn that
+loudly rather than keep a detector it believes is working. Splitting "when
+claimed" from "when placed" only works if BOTH are agreed vocabulary; a reader
+with one of them cannot tell a contradiction from an honest revision.
+
+### The gate, because this class hid once already
+
+`check_widening` now refuses a re-dated widening by name, and `asserted_at` was
+removed from `is_placement_member` so the generic member-by-member comparison
+covers it too. That exemption is what let v39.0.0 ship the defect: **the
+comparison exempted exactly the field that then silently changed** — a check
+that could not fail. Two independent enforcers now, and removing either turns a
+witness red (both mutations verified).
+
+Removing the exemption surfaced a second bug in the same breath: with
+`asserted_at` no longer exempt, `build_widening`'s copy loop began stashing the
+prior's instant in `extra` alongside the typed field — two spellings of one
+member. The loop now skips it explicitly, and the comment says why.
+
+### Witnesses
+
+- **W15** — the widening asserts the CLAIM's instant verbatim; the column
+  agrees; `widened_at` is present, not before the claim, and is what
+  `scrub_timestamp` follows. Mutation: restore v39.0.0's drop.
+- **W16** — a re-dated widening is REFUSED by name. Mutation: delete the arm.
+- **`exercise_promoted_row_crosses_to_a_peer` (c3)** — a PEER reads the claim's
+  instant and can tell it from the placement time, using only what replicates.
+  That is the capability #801 lost, asserted where it actually lives.
+
+Both W15 and W16 mint their own prior: §6.1 deduplicates a second widening of
+one row, so sharing a prior with another arm would collide with it.
+
+### Note for adopters
+
+A widening minted by v39.0.0 carries the placement time in `asserted_at` and no
+`widened_at`. There is no migration — those bytes are signed and cannot be
+re-rendered. Readers should treat a `supersedes` with `differs_in:
+["cohort_scope"]` and **no** `widened_at` as v39.0.0-era, where the two instants
+are not distinguishable.
+
 ## [39.0.0] - 2026-09-02
 
 **Promotion preserves the actor's signature.** A MAJOR: the one promotion

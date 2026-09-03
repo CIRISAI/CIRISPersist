@@ -35,6 +35,19 @@ pub mod paths {
     /// The composer target: which attestation a `withdraws` / `supersedes`
     /// / `recants` / `delegates_to` row references.
     pub const REFERENCES_ATTESTATION_ID: &str = "references_attestation_id";
+    /// v40.0.0 (CIRISPersist#801) — on a widening `supersedes`, the instant
+    /// the WIDENING ITSELF was placed. The claim's own instant stays in
+    /// [`ASSERTED_AT`], carried verbatim from the prior, because a widening
+    /// republishes the same claim at a wider audience rather than making a new
+    /// one — so `asserted_at` means the same thing on a widening as on every
+    /// other row, and the act that placed it gets its own name.
+    ///
+    /// The `cosigned_at` analogue for the widening plane (CC 2.6.7): a second
+    /// act on an existing claim records WHEN it happened without overwriting
+    /// when the claim was made. Unlike `cosigned_at` this one is INSIDE the
+    /// signed envelope — a widening is a fresh signature over fresh bytes, so
+    /// there is no preimage to protect and the act's own time can be signed.
+    pub const WIDENED_AT: &str = "widened_at";
     /// v39.0.0 — on a `supersedes`, the members that differ from the prior
     /// (CC 4.4.3.3.1). A `widen_audience` supersedes lists `cohort_scope` and
     /// only otherwise the members it strips; see `crossing::check_widening`.
@@ -424,6 +437,11 @@ pub struct EnvelopeCore {
     /// binding gate refuses any other pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// v40.0.0 (CIRISPersist#801) — see [`paths::WIDENED_AT`]. Present only on
+    /// a widening `supersedes`; absent (and serialized away) everywhere else,
+    /// so every other envelope stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widened_at: Option<String>,
     /// [`paths::ROW`] — v31.0.0 (#643). The signed twin of the seven typed
     /// columns (see [`RowMirror`]). `None` on an envelope that has not been
     /// through
@@ -857,6 +875,7 @@ fn fully_populated_core() -> EnvelopeCore {
         deletion_window: Some("2027-01-01T00:00:00Z".into()),
         asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
         expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
+        widened_at: Some("2026-08-12T00:00:01.000Z".into()),
         row: Some(RowMirror {
             attestation_id: "att-1".into(),
             attesting_key_id: "k-auth".into(),
@@ -899,6 +918,7 @@ mod tests {
             (paths::DELETION_WINDOW, true),
             (paths::ASSERTED_AT, true),
             (paths::EXPIRES_AT, true),
+            (paths::WIDENED_AT, true),
             (paths::ROW, true),
             (paths::ACCORD_ROOT, true),
         ] {
@@ -1048,6 +1068,17 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // choose.
             paths::ASSERTED_AT,
             paths::EXPIRES_AT,
+            // v40.0.0 (CIRISPersist#801) — WHEN A WIDENING WAS PLACED, as
+            // distinct from when the claim it widens was made. Added
+            // DELIBERATELY, re-pinning `ENVELOPE_VOCABULARY_SHA256`, on
+            // #642's reasoning one plane over: a local row must be
+            // `self`-scoped and `self` never replicates, so a widening is the
+            // ONLY row a peer sees — which made `asserted_at` the placement
+            // time and put the claim's own instant beyond every off-node
+            // reader's reach. Splitting them needs BOTH to be agreed
+            // vocabulary: a reader that cannot tell "when claimed" from "when
+            // placed" cannot tell a contradiction from an honest revision.
+            paths::WIDENED_AT,
             // v31.0.0 (CIRISPersist#643) — the typed-column mirror. Added
             // DELIBERATELY (re-pinning `ENVELOPE_VOCABULARY_SHA256` a second
             // time in this cut): the VERB of an attestation, and the field
@@ -1136,8 +1167,19 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// the agreed vocabulary rather than a column no signature covers. Consumers
 /// asserting the old hash BREAK, deliberately: an unadopted producer is
 /// minting rows that no enforcing relay will carry.
+/// v40.0.0 (CIRISPersist#801) — **RE-PINNED**, #642's reasoning transposed to
+/// the widening plane. [`paths::WIDENED_AT`] joined `universal_paths`: v39.0.0
+/// let `stamp_and_canonicalize` mint a fresh `asserted_at` for a widening, so
+/// the only instant any peer could read was the placement time — and because a
+/// local row must be `self`-scoped and `self` never replicates, the claim's own
+/// instant was unrecoverable off-node. Splitting "when claimed" from "when
+/// placed" requires BOTH to be agreed vocabulary; a reader with only one cannot
+/// tell a contradiction from an honest revision, which is a detection
+/// capability, not a nicety. Consumers asserting the old hash BREAK,
+/// deliberately: an unadopted reader is one that believes a widening's
+/// `asserted_at` is the placement time, and it should learn that loudly.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "e019ecb873f662399c13515414849a8d055d5ec2f0893e21f74cdccf6f60a111";
+    "e7135559a3d843ecff3ad34ee3b1a10acf92b33f199a327758139969e19f5699";
 
 #[cfg(test)]
 mod vocab_tests {
