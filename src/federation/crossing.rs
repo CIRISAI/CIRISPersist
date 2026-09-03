@@ -985,8 +985,9 @@ pub fn describe(
 fn is_placement_member(member: &str) -> bool {
     matches!(
         member,
-        paths::ROW | paths::ASSERTED_AT | paths::EXPIRES_AT | paths::REFERENCES_ATTESTATION_ID
+        paths::ROW | paths::EXPIRES_AT | paths::REFERENCES_ATTESTATION_ID
     ) || member == paths::DIFFERS_IN
+        || member == paths::WIDENED_AT
         || admission::COHORT_TARGET_ENVELOPE_FIELDS.contains(&member)
 }
 
@@ -1120,6 +1121,61 @@ pub fn check_widening(prior: &Attestation, signed: &Attestation) -> Result<(), E
         )));
     }
     check_strictly_wider(prior, &signed.cohort_scope)?;
+
+    // v40.0.0 (CIRISPersist#801) — THE CLAIM'S INSTANT IS PART OF THE CLAIM.
+    //
+    // `differs_in` says `cohort_scope` is the only difference; a re-dated
+    // widening makes that false, and because the prior is `self`-scoped and
+    // never replicates, the re-dated instant is the ONLY one any peer can
+    // read. So this is enforced rather than merely produced correctly:
+    // v39.0.0 dropped the instant in `build_widening` and no gate could see
+    // it, because `asserted_at` was exempted from the member comparison
+    // below — the exemption hid exactly the field that then changed.
+    fn instant_of(row: &Attestation) -> Option<&str> {
+        row.attestation_envelope
+            .get(paths::ASSERTED_AT)
+            .and_then(serde_json::Value::as_str)
+    }
+    if instant_of(signed) != instant_of(prior) {
+        return Err(malformed(format!(
+            "`{}` was re-dated: the prior asserts {:?} and the widening {:?}. A widening \
+             republishes the SAME claim at a wider audience — its body, subjects, weight and \
+             expiry are all reused and `differs_in` names only `{}` — so the claim's instant \
+             crosses with it. The act of widening has its own instant in `{}`",
+            paths::ASSERTED_AT,
+            instant_of(prior),
+            instant_of(signed),
+            row_paths::COHORT_SCOPE,
+            paths::WIDENED_AT,
+        )));
+    }
+    // …and the act must say when it happened, or the two instants are
+    // indistinguishable to a reader.
+    let Some(widened_at) = signed
+        .attestation_envelope
+        .get(paths::WIDENED_AT)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(malformed(format!(
+            "no `{}`: a widening carries the claim's instant in `{}` and its OWN in `{}`, so a \
+             reader can tell when the claim was made from when it was placed",
+            paths::WIDENED_AT,
+            paths::ASSERTED_AT,
+            paths::WIDENED_AT,
+        )));
+    };
+    let widened_at = DateTime::parse_from_rfc3339(widened_at)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| malformed(format!("`{}` is not RFC-3339: {e}", paths::WIDENED_AT)))?;
+    if widened_at < prior.asserted_at {
+        return Err(malformed(format!(
+            "`{}` {} precedes the claim it widens ({}) — a placement cannot happen before the \
+             claim it places",
+            paths::WIDENED_AT,
+            admission::render_signed_instant(widened_at),
+            admission::render_signed_instant(prior.asserted_at),
+        )));
+    }
     let reauthors = |member: &str| Error::WideningReAuthors {
         prior_attestation_id: prior.attestation_id.clone(),
         member: member.to_owned(),
@@ -1180,6 +1236,7 @@ pub fn build_widening(
     prior: &Attestation,
     new_scope: &Audience,
     strip: &[String],
+    now: DateTime<Utc>,
 ) -> Result<super::EmitAttestationInput, Error> {
     let pipeline = super::transform::TransformPipeline(
         strip
@@ -1194,7 +1251,13 @@ pub fn build_widening(
     let mut envelope = super::envelope::EnvelopeCore::default();
     if let Some(obj) = stripped.as_object() {
         for (k, v) in obj {
-            if is_placement_member(k) {
+            // `asserted_at` is NOT a placement member — `check_widening`
+            // compares it like any other body member, which is what makes the
+            // "carry the claim's instant" rule enforceable rather than merely
+            // implemented. But it is set EXPLICITLY below, so the copy loop
+            // must skip it or the typed field and `extra` both carry it and
+            // the envelope grows two spellings of one member.
+            if is_placement_member(k) || k == paths::ASSERTED_AT {
                 continue;
             }
             if k == paths::DIMENSION {
@@ -1211,6 +1274,33 @@ pub fn build_widening(
             .extra
             .insert(member.to_owned(), serde_json::json!(target));
     }
+    // v40.0.0 (CIRISPersist#801) — THE CLAIM'S INSTANT CROSSES WITH THE CLAIM.
+    //
+    // Carried VERBATIM from the prior's signed envelope, not re-rendered: a
+    // pre-v39 prior carries microseconds, and re-minting it at the substrate
+    // resolution would move the instant this row exists to preserve.
+    //
+    // It is carried at all because a widening is not a new claim — the body,
+    // the subjects, the weight and the expiry are all reused, and `differs_in`
+    // says `cohort_scope` is the ONLY difference. Letting
+    // `stamp_and_canonicalize` mint a fresh `asserted_at` (v39.0.0 did) made
+    // that statement false and, worse, made the claim's instant UNRECOVERABLE
+    // off-node: a local row must be `self`-scoped, `self` is undiscoverable
+    // (CC 5.2), so the widening is the only row a peer ever sees. Every
+    // cross-node reader — CIRISServer's equivocation detector among them — was
+    // then comparing placement times while believing it compared claim times,
+    // and two contradictory claims widened a moment apart became
+    // indistinguishable from an honest revision. Nothing errored; the
+    // detection just went to zero (CIRISPersist#801).
+    envelope.asserted_at = prior
+        .attestation_envelope
+        .get(paths::ASSERTED_AT)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    // …and the ACT gets its own instant, so nothing is lost in the other
+    // direction: `widened_at` is when this placement happened, and
+    // `attestation_emit::assemble` reads `scrub_timestamp` from it.
+    envelope.widened_at = Some(admission::render_signed_instant(now));
     envelope.references_attestation_id = Some(prior.attestation_id.clone());
     let mut differs_in: Vec<String> = vec![row_paths::COHORT_SCOPE.to_owned()];
     differs_in.extend(strip.iter().cloned());

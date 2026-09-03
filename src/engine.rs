@@ -3490,12 +3490,12 @@ impl Engine {
                 }
             }
         };
-        let mut input = crossing::build_widening(&prior, &ci.recipient_see, strip)?;
-        let canonical = attestation_emit::stamp_and_canonicalize(
-            &mut input,
-            &prior.attesting_key_id,
-            chrono::Utc::now(),
-        )?;
+        // ONE instant for both: `widened_at` (the act) and whatever
+        // `stamp_and_canonicalize` still needs to fill.
+        let now = chrono::Utc::now();
+        let mut input = crossing::build_widening(&prior, &ci.recipient_see, strip, now)?;
+        let canonical =
+            attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
         let sig = match actor {
             Some(a) => a.sign_hybrid(&canonical).await.map_err(|e| {
                 Error::Backend(format!("widen_audience: the actor's signer failed: {e}"))

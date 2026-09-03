@@ -215,6 +215,26 @@ pub fn assemble(
     // `check_instant_binding` satisfiable at all — see
     // [`stamp_and_canonicalize`], which every emit entry point goes through.
     let envelope_value = input.attestation_envelope.to_value();
+    // v40.0.0 (CIRISPersist#801) — `asserted_at` is WHEN THE CLAIM WAS MADE;
+    // `scrub_timestamp` / `pqc_completed_at` are WHEN IT WAS SIGNED. They
+    // coincide for an ordinary emit and DIVERGE for a widening, which
+    // republishes an older claim at a wider audience: there `widened_at`
+    // carries the signing moment. Both are read OUT of the signed envelope, so
+    // #598's rule — assemble never samples its own clock — is unchanged, and
+    // that is precisely why `widened_at` is a signed member and not a column.
+    let signed_at = match input.attestation_envelope.widened_at.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "emit_attestation: envelope `widened_at` is not RFC-3339: {e} \
+                         (CIRISPersist#801)"
+                    ))
+                })?,
+        ),
+    };
     let now = {
         let raw = input
             .attestation_envelope
@@ -297,8 +317,8 @@ pub fn assemble(
         scrub_signature_classical: B64.encode(&sig.classical.signature),
         scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
         scrub_key_id: key_id.clone(),
-        scrub_timestamp: now,
-        pqc_completed_at: Some(now),
+        scrub_timestamp: signed_at.unwrap_or(now),
+        pqc_completed_at: Some(signed_at.unwrap_or(now)),
         persist_row_hash: String::new(),
         subject_key_ids: input.subject_key_ids,
         withdraws_admission_rule: None,

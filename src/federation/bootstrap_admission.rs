@@ -1384,6 +1384,49 @@ pub mod test_support {
             "({tag}) W6: the peer stored the widening"
         );
 
+        // (c3) — CIRISPersist#801: THE PEER READS THE CLAIM'S INSTANT, not the
+        // placement time. This is the capability the v39.0.0 shape silently
+        // set to zero: the prior is `self`-scoped and never replicates, so if
+        // the widening does not carry the claim's instant, no other node can
+        // ever learn it. A reader comparing placement times cannot tell two
+        // contradictory claims made at one instant from an honest revision.
+        {
+            let claim_instant = promoted
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::ASSERTED_AT)
+                .and_then(|v| v.as_str())
+                .expect("the crossed row carries its signed instant");
+            let at_peer = peer
+                .get_attestation(&report.attestation_id)
+                .await
+                .expect("read at peer")
+                .expect("the peer stored the widening");
+            assert_eq!(
+                at_peer
+                    .attestation_envelope
+                    .get(crate::federation::envelope::paths::ASSERTED_AT)
+                    .and_then(|v| v.as_str()),
+                Some(claim_instant),
+                "({tag}) #801: the widening a peer receives asserts the CLAIM's instant"
+            );
+            assert!(
+                at_peer
+                    .attestation_envelope
+                    .get(crate::federation::envelope::paths::WIDENED_AT)
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "({tag}) #801: …and says when it was placed, so the two are distinguishable"
+            );
+            assert!(
+                peer.get_attestation(&id)
+                    .await
+                    .expect("read at peer")
+                    .is_some(),
+                "({tag}) #801: precondition — this fixture's prior DID cross to the peer; the \
+                 hazard is the `self`-scoped case, where it does not"
+            );
+        }
+
         // (d)
         let stale_id = origin
             .attestation_insert_local(local_input("trust:demo:v1"))
@@ -1913,6 +1956,154 @@ pub mod test_support {
             "({tag}) W3: the refusal names the co-scrub: {err}"
         );
 
+        // ── W15 (CIRISPersist#801) — THE CLAIM'S INSTANT CROSSES WITH THE CLAIM,
+        // and the ACT gets its own. Mutation: drop `envelope.asserted_at` in
+        // `build_widening` (v39.0.0's behaviour) and this goes red.
+        //
+        // This is the off-node capability, so it is asserted the way a peer
+        // experiences it: the widening is the ONLY row that replicates (the
+        // prior is `self`-scoped, CC 5.2), so if the claim's instant does not
+        // ride the widening it does not exist anywhere a peer can read.
+        {
+            // Its OWN prior: §6.1 dedups a second widening of one row, so
+            // reusing another arm's row would collide with it.
+            let own = put(signed_local()).await;
+            dir.enter_mesh(
+                &own.attestation_id,
+                &ci_self(&own),
+                &ts::node_coscrub(&node, &own),
+            )
+            .await
+            .expect("({tag}) W15: the row crosses");
+            let own = dir
+                .get_attestation(&own.attestation_id)
+                .await
+                .expect("read")
+                .expect("row");
+            let claim_instant = own
+                .attestation_envelope
+                .get(paths::ASSERTED_AT)
+                .and_then(|v| v.as_str())
+                .expect("the crossed row carries its signed instant")
+                .to_owned();
+            let out = ts::widen(dir, &own, crate::federation::Audience::Species, &[])
+                .await
+                .expect("({tag}) W15: the actor widens");
+            let MeshCrossingOutcome::Crossed(report) = out else {
+                panic!("({tag}) W15: expected Crossed, got {out:?}");
+            };
+            let widening = dir
+                .get_attestation(&report.attestation_id)
+                .await
+                .expect("read")
+                .expect("the widening row");
+            assert_eq!(
+                widening
+                    .attestation_envelope
+                    .get(paths::ASSERTED_AT)
+                    .and_then(|v| v.as_str()),
+                Some(claim_instant.as_str()),
+                "({tag}) W15: the widening asserts the CLAIM's instant, verbatim — not the \
+                 moment it was placed. The prior never replicates, so this is the only copy \
+                 any peer can read"
+            );
+            assert_eq!(
+                widening.asserted_at, own.asserted_at,
+                "({tag}) W15: and the COLUMN agrees, so folds and windows see the claim time"
+            );
+            let widened_at = widening
+                .attestation_envelope
+                .get(paths::WIDENED_AT)
+                .and_then(|v| v.as_str())
+                .expect("({tag}) W15: the act records its own instant");
+            let widened_at: chrono::DateTime<chrono::Utc> =
+                chrono::DateTime::parse_from_rfc3339(widened_at)
+                    .expect("RFC-3339")
+                    .into();
+            assert!(
+                widened_at >= widening.asserted_at,
+                "({tag}) W15: a placement cannot precede the claim it places"
+            );
+            assert_eq!(
+                widening.scrub_timestamp, widened_at,
+                "({tag}) W15: `scrub_timestamp` follows the ACT — when it was signed — while \
+                 `asserted_at` stays the claim's. Read out of the signed envelope, so #598's \
+                 no-second-clock rule still holds"
+            );
+            // The off-node half — that a PEER reads this same instant with only
+            // what replicates — is asserted in
+            // `exercise_promoted_row_crosses_to_a_peer`, which has a peer.
+        }
+
+        // ── W16 (CIRISPersist#801) — a re-dated widening is REFUSED, so this
+        // cannot silently regress. Mutation: delete the `asserted_at` arm in
+        // `check_widening`.
+        {
+            // Also its own prior, for the same dedup reason.
+            let prior = put(signed_local()).await;
+            dir.enter_mesh(
+                &prior.attestation_id,
+                &ci_self(&prior),
+                &ts::node_coscrub(&node, &prior),
+            )
+            .await
+            .expect("({tag}) W16: the row crosses");
+            let prior = dir
+                .get_attestation(&prior.attestation_id)
+                .await
+                .expect("read")
+                .expect("row");
+            let forged = {
+                let mut input = crossing::build_widening(
+                    &prior,
+                    &crossing::Audience::Biosphere,
+                    &[],
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                // Re-date the claim — exactly what v39.0.0 did by omission —
+                // then re-sign, so the row is internally consistent and only
+                // `check_widening` can object to it.
+                input.attestation_envelope.asserted_at =
+                    Some(crate::federation::admission::render_signed_instant(
+                        chrono::Utc::now() + chrono::Duration::seconds(1),
+                    ));
+                let canonical = attestation_emit::stamp_and_canonicalize(
+                    &mut input,
+                    &actor,
+                    chrono::Utc::now() + chrono::Duration::seconds(1),
+                )
+                .unwrap();
+                let sig = ts::local_signer(&actor)
+                    .sign_hybrid(&canonical)
+                    .await
+                    .unwrap();
+                attestation_emit::assemble(actor.clone(), &canonical, sig, input)
+                    .unwrap()
+                    .0
+            };
+            let ci = ts::describe_for(
+                &prior,
+                crossing::Audience::Biosphere,
+                CrossingBasis::ProducerAuthority,
+            );
+            let err = dir
+                .widen_audience(
+                    &prior.attestation_id,
+                    &ci,
+                    SignedAttestation {
+                        attestation: forged,
+                    },
+                )
+                .await
+                .expect_err("({tag}) W16: a re-dated widening must be refused");
+            assert!(
+                matches!(&err, Error::WideningMalformed { .. })
+                    && format!("{err}").contains(paths::ASSERTED_AT),
+                "({tag}) W16: refused by name of the member that moved: {err}"
+            );
+        }
+
         // W7 / W8 — widening is a supersedes by the actor; the prior is untouched.
         let out = ts::widen(dir, &after, crate::federation::Audience::Affiliations, &[])
             .await
@@ -1949,8 +2140,13 @@ pub mod test_support {
         );
         // W8 negative — a widening signed by a NON-actor.
         let forged = {
-            let mut input =
-                crossing::build_widening(&sup, &crossing::Audience::Federation, &[]).unwrap();
+            let mut input = crossing::build_widening(
+                &sup,
+                &crossing::Audience::Federation,
+                &[],
+                chrono::Utc::now(),
+            )
+            .unwrap();
             let canonical =
                 attestation_emit::stamp_and_canonicalize(&mut input, &stranger, chrono::Utc::now())
                     .unwrap();
@@ -1983,8 +2179,13 @@ pub mod test_support {
         );
         // Re-authoring under the guise of widening.
         let reauthored = {
-            let mut input =
-                crossing::build_widening(&sup, &crossing::Audience::Federation, &[]).unwrap();
+            let mut input = crossing::build_widening(
+                &sup,
+                &crossing::Audience::Federation,
+                &[],
+                chrono::Utc::now(),
+            )
+            .unwrap();
             input
                 .attestation_envelope
                 .extra
