@@ -954,6 +954,35 @@ pub enum DirectoryOp {
         /// evicting below the cutoff.
         bound: u64,
     },
+    /// v41.0.0 (CIRISPersist#804) — publish a row THIS NODE AUTHORED, as
+    /// distinct from [`Self::PutAttestation`], which admits a row from
+    /// elsewhere. APPEND-ONLY (Growth): a new variant at the end, so an older
+    /// consumer's dispatch is unaffected and `DIRECTORY_ABI_VERSION` does not
+    /// move.
+    ///
+    /// It is a separate OP rather than a flag on `PutAttestation` because the
+    /// two are different acts with different budgets, and a bool on the wire
+    /// is a thing a caller can get wrong silently. Answers with
+    /// [`DirectoryOpResult::AttestationOutcome`], exactly as its sibling does.
+    PutAttestationAuthored {
+        /// The signed row this node just authored.
+        attestation: SignedAttestation,
+    },
+    /// v41.0.0 (CIRISPersist#804) — the privileged SYNC door across the ABI:
+    /// a row delivered over a session the transport authenticated as
+    /// `authenticated_peer_key_id`. APPEND-ONLY (Growth).
+    ///
+    /// The identity travels because it is the whole basis of the privilege —
+    /// a proxy that dropped it would silently demote every synced row to
+    /// stranger metering, which is the defect this door exists to fix. The
+    /// far side still decides whether that identity is a cohort-mate, from
+    /// its own rosters.
+    PutAttestationSynced {
+        /// The signed row.
+        attestation: SignedAttestation,
+        /// The identity the TRANSPORT authenticated — never the row's claim.
+        authenticated_peer_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1526,6 +1555,22 @@ pub async fn dispatch_directory_op(
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PutAttestation { attestation } => match dir.put_attestation(attestation).await
+        {
+            Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::PutAttestationAuthored { attestation } => {
+            match dir.put_attestation_authored(attestation).await {
+                Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PutAttestationSynced {
+            attestation,
+            authenticated_peer_key_id,
+        } => match dir
+            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2355,14 +2400,25 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    async fn put_attestation(
+    async fn put_attestation_with_origin(
         &self,
         attestation: SignedAttestation,
+        origin: crate::federation::replication::admission::WriteOrigin,
     ) -> Result<crate::federation::AttestationOutcome, Error> {
-        match self
-            .run_op(&DirectoryOp::PutAttestation { attestation })
-            .await?
-        {
+        // v41.0.0 (#804) — the origin must SURVIVE the capsule boundary. A
+        // proxy that dropped it would meter the far side's local authorship as
+        // a peer again, which is the whole defect, reappearing wherever the
+        // directory is reached through the ABI rather than directly.
+        use crate::federation::replication::admission::WriteOrigin;
+        let op = match origin {
+            WriteOrigin::Authored => DirectoryOp::PutAttestationAuthored { attestation },
+            WriteOrigin::Sync { peer_key_id } => DirectoryOp::PutAttestationSynced {
+                attestation,
+                authenticated_peer_key_id: peer_key_id,
+            },
+            WriteOrigin::Wire => DirectoryOp::PutAttestation { attestation },
+        };
+        match self.run_op(&op).await? {
             DirectoryOpResult::AttestationOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
@@ -4475,7 +4531,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "f1bf4892e9a8986b2a6a9ab0d4438aea402dab05c97b1b4f8d468274dc720ff1",
+            "90db5c0448cca437c3f3045dd43e4cbcc2340ec655549d8ad942151bb86cd033",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \

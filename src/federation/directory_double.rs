@@ -847,14 +847,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             .put_accord_proposal(proposal, authority_signature)
             .await
     }
-    async fn put_attestation(
+    async fn put_attestation_with_origin(
         &self,
         attestation: SignedAttestation,
+        origin: replication::admission::WriteOrigin,
     ) -> Result<AttestationOutcome, Error> {
-        if let Some(e) = self.faulted("put_attestation") {
+        if let Some(e) = self.faulted("put_attestation_with_origin") {
             return Err(e);
         }
-        self.inner.put_attestation(attestation).await
+        self.inner
+            .put_attestation_with_origin(attestation, origin)
+            .await
     }
     async fn put_community(&self, community: SignedCommunity) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_community") {

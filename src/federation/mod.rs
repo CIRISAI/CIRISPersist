@@ -925,10 +925,99 @@ pub trait FederationDirectory: Send + Sync {
     // ── Attestations ───────────────────────────────────────────────
 
     /// Insert a new attestation row.
+    /// v41.0.0 (CIRISPersist#804) — the ONE stored-write door, carrying the
+    /// one fact the row cannot carry: **did this node author it, or did it
+    /// arrive over a wire?**
+    ///
+    /// The AV-76 per-peer write quota runs here at tier 0, ahead of any
+    /// signature check, and it is keyed on the row's `attesting_key_id` — a
+    /// value the row merely CLAIMS at that point. So the quota cannot tell an
+    /// owner writing locally from a stranger claiming the owner's key, and
+    /// since v39.0.0 routed local publication through this door
+    /// (`widen_audience` → here), it metered the former as the latter.
+    /// Measured downstream: 652 of 900 chat sends refused (CIRISPersist#804).
+    ///
+    /// Origin is not a property of the row; it is a property of the CALL. So
+    /// it is a parameter, and the two named doors below are the vocabulary:
+    /// [`Self::put_attestation`] for anything arriving from elsewhere, and
+    /// [`Self::put_attestation_authored`] for a row this node just signed.
+    /// Implementors write this one; both doors are defaults over it, which is
+    /// why no existing caller had to change.
+    async fn put_attestation_with_origin(
+        &self,
+        attestation: SignedAttestation,
+        origin: replication::admission::WriteOrigin,
+    ) -> Result<AttestationOutcome, Error>;
+
+    /// Admit a row from ELSEWHERE — a peer, a relay, an operator import.
+    /// Metered by the per-peer quota exactly as it always has been (AV-76
+    /// untouched): the writer is a stranger until proven otherwise, and at
+    /// tier 0 nothing is proven.
     async fn put_attestation(
         &self,
         attestation: SignedAttestation,
-    ) -> Result<AttestationOutcome, Error>;
+    ) -> Result<AttestationOutcome, Error> {
+        self.put_attestation_with_origin(attestation, replication::admission::WriteOrigin::Wire)
+            .await
+    }
+
+    /// v41.0.0 (CIRISPersist#804) — publish a row THIS NODE AUTHORED.
+    ///
+    /// Charged against the node's own ingest ceiling and nothing else: no peer
+    /// bucket (which would report `tracked_peers > 0` and lift `node_state`'s
+    /// peer-quota band on the strength of the owner talking to itself — #665's
+    /// signal corruption, one identity over) and no untracked tail (a
+    /// stranger's shared budget; the owner's writing must not exhaust it, nor
+    /// be throttled by it).
+    ///
+    /// Calling this is an assertion the caller must be entitled to make. It is
+    /// safe because reaching it already means code running in-process on this
+    /// node — the same trust boundary that lets that code write to the storage
+    /// layer directly. It is NOT safe to expose across a wire.
+    async fn put_attestation_authored(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<AttestationOutcome, Error> {
+        self.put_attestation_with_origin(attestation, replication::admission::WriteOrigin::Authored)
+            .await
+    }
+
+    /// v41.0.0 (CIRISPersist#804) — **the privileged SYNC door**: admit a row
+    /// delivered over a session the transport authenticated as
+    /// `authenticated_peer_key_id`.
+    ///
+    /// A sync carries rows authored by MANY parties, so
+    /// [`Self::put_attestation_authored`] is the wrong door for it — it would
+    /// claim this node wrote them. The party being metered is the one on the
+    /// other end of the session, and the caller is the only layer that knows
+    /// who that is.
+    ///
+    /// What the caller vouches for is narrow: **which identity its transport
+    /// authenticated.** Whether that identity is a cohort-mate is persist's
+    /// own question, answered from its own family and community rosters
+    /// ([`replication::admission::shares_cohort_with`]) and memoized for
+    /// [`replication::admission::COHORT_AFFINITY_TTL`]. A peer with no shared
+    /// cohort is metered exactly as if it had come through
+    /// [`Self::put_attestation`] — so a caller cannot widen a stranger's
+    /// budget by routing them here, and the privilege it can hand out is
+    /// bounded by a fact persist checks for itself.
+    ///
+    /// Not safe to expose across a wire: reaching this means in-process code
+    /// on this node, the same boundary that lets that code write to storage
+    /// directly.
+    async fn put_attestation_synced(
+        &self,
+        attestation: SignedAttestation,
+        authenticated_peer_key_id: &str,
+    ) -> Result<AttestationOutcome, Error> {
+        self.put_attestation_with_origin(
+            attestation,
+            replication::admission::WriteOrigin::Sync {
+                peer_key_id: authenticated_peer_key_id.to_owned(),
+            },
+        )
+        .await
+    }
 
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
     /// Attestation-plane apply**: the Key plane's #565 twin
@@ -4498,7 +4587,10 @@ pub trait FederationDirectory: Send + Sync {
         )
         .await?;
         let row = signed.attestation.clone();
-        self.put_attestation(signed).await?;
+        // v41.0.0 (#804) — this node just signed this row; it is not a peer of
+        // itself. Before this, every widening charged the OWNER's peer bucket,
+        // which is what cut chat off at ~250 messages.
+        self.put_attestation_authored(signed).await?;
         // CEG §6.1: a structural-composer replay is a silent `Ok` with NO row
         // written. Ask the store what it did, so `Crossed` keeps meaning
         // "a new row is on the wire" (the same question

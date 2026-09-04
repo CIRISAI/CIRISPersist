@@ -278,6 +278,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper
     // that RUNS the gates, and every one of them refuses on its own terms.
     ("plan_enter_mesh", Class::Delegates),
+    // v41.0.0 (#804) — the two budget doors. Gates: each refuses on a fact
+    // about the write itself (which budget it is entitled to spend, and
+    // whether that budget is spent).
+    ("check_write_authored", Class::Gate),
+    ("check_write_synced", Class::Gate),
+    // The cohort resolver. Plumbing, and the fail-open caveat does NOT apply:
+    // it ANSWERS a question rather than refusing one, and its `Err` propagates
+    // out of the door with `?`, so a directory read that fails REFUSES the
+    // write rather than admitting it unmetered. The privilege it gates is
+    // granted only on `Ok(true)`.
+    ("shares_cohort_with", Class::Plumbing),
     ("pg_witness_set", Class::Plumbing),
     ("strict_ts", Class::Plumbing),
     ("mint_content_kem_keypair", Class::Plumbing),
@@ -1462,9 +1473,12 @@ mod tests {
                 .doors
                 .get(&(
                     "FederationDirectory".to_owned(),
-                    ["put", "attestation"].join("_"),
+                    // v41.0.0 (#804) — the stored-write door carries its origin
+                    // now; `put_attestation` is a thin default over it, so the
+                    // gate SEQUENCE lives here.
+                    ["put", "attestation", "with", "origin"].join("_"),
                 ))
-                .expect("put_attestation is scanned")[backend]
+                .expect("put_attestation_with_origin is scanned")[backend]
                 .0;
             let mut it = seq.iter();
             for needle in &must_contain {

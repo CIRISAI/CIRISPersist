@@ -3709,9 +3709,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_role_withdrawal: {e}")))
     }
 
-    async fn put_attestation(
+    async fn put_attestation_with_origin(
         &self,
         attestation: crate::federation::SignedAttestation,
+        origin: crate::federation::replication::admission::WriteOrigin,
     ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error> {
         let mut row = attestation.attestation;
 
@@ -3742,7 +3743,46 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // the row (see `PeerWriteQuota::classify`), and that predicate
             // lives in the quota so the three backends cannot hold three
             // opinions of it.
-            self.peer_write_quota.check_write(&row)?;
+            match &origin {
+                // v41.0.0 (#804) — this node authored the row; a node is not a
+                // peer of itself. The node ceiling only: no peer bucket (which
+                // would corrupt `tracked_peers`) and no stranger's tail.
+                crate::federation::replication::admission::WriteOrigin::Authored => {
+                    self.peer_write_quota.check_write_authored(&row)?;
+                }
+                // v41.0.0 (#804) — a bulk sync from an AUTHENTICATED peer. The
+                // caller vouches for WHICH identity it authenticated; whether
+                // that identity is a cohort-mate is persist's own question,
+                // answered from its own rosters and memoized. No shared cohort
+                // ⇒ metered exactly as if it had arrived through the wire door.
+                crate::federation::replication::admission::WriteOrigin::Sync { peer_key_id } => {
+                    let shares = match self.peer_write_quota.cohort_affinity(peer_key_id) {
+                        Some(known) => known,
+                        None => {
+                            let us = self.self_key_id().unwrap_or_default();
+                            let resolved =
+                                crate::federation::replication::admission::shares_cohort_with(
+                                    self,
+                                    &us,
+                                    peer_key_id,
+                                )
+                                .await?;
+                            self.peer_write_quota
+                                .remember_cohort_affinity(peer_key_id, resolved);
+                            resolved
+                        }
+                    };
+                    if shares {
+                        self.peer_write_quota
+                            .check_write_synced(&row, peer_key_id)?;
+                    } else {
+                        self.peer_write_quota.check_write(&row)?;
+                    }
+                }
+                crate::federation::replication::admission::WriteOrigin::Wire => {
+                    self.peer_write_quota.check_write(&row)?;
+                }
+            }
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. Trust is
             // the cheapest reject that consults state AND the one that
@@ -43326,6 +43366,18 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn privileged_sync_door_sqlite_804() {
+        let dir = SqliteBackend::open_in_memory().await.unwrap();
+        dir.run_migrations().await.unwrap();
+        dir.set_self_key_id(Some("sq804-self".to_owned()));
+        crate::federation::bootstrap_admission::test_support::exercise_privileged_sync_door_804(
+            &dir,
+            "sq804-self",
+            "sq804",
+        )
+        .await;
+    }
     #[tokio::test]
     async fn actor_signature_survives_the_crossing_sqlite_v39() {
         let dir = SqliteBackend::open_in_memory().await.unwrap();

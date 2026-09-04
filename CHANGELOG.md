@@ -5,6 +5,120 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [41.0.0] - 2026-09-04
+
+**A node is not a peer of itself, and a cohort-mate is not a stranger.**
+CIRISPersist#804, reported by CIRISServer. MAJOR: the `FederationDirectory`
+trait gains a required method.
+
+### The defect
+
+The AV-76 per-peer write quota is keyed on `row.attesting_key_id` with no
+origin axis. v39.0.0 routed local publication through the same door a hostile
+remote peer's row arrives at (`widen_audience` → `put_attestation`), so the
+control written to stop a stranger flooding this node began metering **the
+node's own owner typing into it**. Measured downstream: **652 of 900 chat
+sends refused** at `peer_burst`, with a warm p50 of 35 ms — not a throughput
+limit, a budget aimed at the wrong party.
+
+It also corrupted a signal. `Ordinary` promotes a writer to a tracked peer
+bucket, so a node whose owner had sent chat reported `tracked_peers > 0`,
+which lifts `node_state`'s peer-quota band out of `unknown` into `green`. That
+is CIRISPersist#665's signal corruption — a node reporting a TESTED quota on
+the strength of talking to itself — one identity over.
+
+### Why the row cannot answer this
+
+The quota runs at **tier 0, ahead of any signature check**, so
+`attesting_key_id` is only what the row SAYS. Deriving "this is my owner" from
+it would hand the larger budget to anyone willing to claim the owner's key —
+the trap `WriteAdmissionClass::GenesisClaim` already documents. Origin is not a
+property of the row; it is a property of the CALL.
+
+### Three doors
+
+`WriteOrigin` is now a parameter, and each variant names a different act:
+
+| door | class | budget | peer bucket |
+|---|---|---|---|
+| `put_attestation` | unchanged | per-peer / tail — **AV-76 untouched** | opens one |
+| `put_attestation_authored` | `LocalAuthorship` | the node ceiling, alone | never |
+| `put_attestation_synced(row, authenticated_peer)` | `CohortSync` | shared sync budget, `SYNC_BUDGET_MULTIPLE` (5×) | never |
+
+`put_attestation_with_origin` is the one required method; both named doors are
+defaults over it, **so none of the 662 existing call sites changed**.
+`widen_audience` and `attestation_emit::assemble_and_put` now use the authored
+door — that is the whole of the 652/900.
+
+`LocalAuthorship` is charged the node ceiling and nothing else: not a peer
+bucket (which corrupts `tracked_peers`), and not the untracked tail — the tail
+is what a STRANGER pays, so charging local authorship there would let a flood
+of strangers throttle the owner's own writing, and the owner's writing exhaust
+what strangers share.
+
+### The privileged sync door, and what bounds it
+
+A sync carries rows authored by MANY parties, so the authored door is wrong for
+it — it would claim this node wrote them. The party metered is the one on the
+other end of the session, and only the caller knows who that is.
+
+What the caller vouches for is deliberately narrow: **which identity its
+transport authenticated.** Whether that identity is a cohort-mate is *persist's*
+question, answered from persist's own family and community rosters
+(`shares_cohort_with`) and memoized for `COHORT_AFFINITY_TTL`. **An
+authenticated stranger falls back to ordinary peer metering**, so routing
+someone through the sync door cannot widen their budget — the privilege a
+caller can hand out is bounded by a fact persist checks for itself.
+
+`affiliations` is deliberately not consulted: it has no per-member roster to
+intersect, so there would be nothing to check rather than believe.
+
+Both new constants state what they bound and why that value, because the quota
+refuses undeclared magic numbers: `SYNC_BUDGET_MULTIPLE` is half the node
+ceiling (a sync at full tilt still leaves as much again for serving);
+`COHORT_AFFINITY_TTL` is one burst window (a revoked member cannot outlive one
+window's worth of over-budget writes).
+
+### ABI
+
+`PutAttestationAuthored` and `PutAttestationSynced` appended — **Growth** both
+times: digest re-pinned, `DIRECTORY_ABI_VERSION` stays 5. The authenticated
+identity travels with the sync op because it is the whole basis of the
+privilege; a proxy that dropped it would silently demote every synced row to
+stranger metering, which is the defect this door exists to fix.
+
+### Witnesses, and one that had to be rebuilt
+
+Budget sizes are witnessed against a **simulated clock** in
+`admission::local_authorship_804`; door routing is witnessed on all three
+backends in `exercise_privileged_sync_door_804`. Mutations: routing authored
+back through the peer path refuses at write 600 with `peer_burst` (the report's
+symptom, reproduced); opening a bucket trips `tracked_peers`; sizing the sync
+budget per-peer refuses at 600; making the door trust the caller turns the
+stranger arm red on every backend.
+
+Two of this cut's own witnesses were wrong first, and the rebuild is the
+interesting part:
+
+- `the_sync_budget_is_shared_and_finite` originally asserted only that the
+  write loop *ends*. It survived deleting the sync budget entirely — because
+  the node ceiling is checked first and ends it anyway. It proved "something
+  bounds a sync", not "the sync budget does". It now asserts the refusal **by
+  budget name**.
+- The door-level witness first tried to drive a real backend to a rate-limit
+  refusal. The burst window refills over 60 s and a few hundred storage writes
+  take tens of seconds, so **both arms passed on refill** and the test measured
+  nothing. Budget sizes moved to the simulated clock, and the door now asserts
+  the exact thing only it can: which budget it SELECTED, observed through the
+  peer-bucket table.
+
+### Also
+
+CIRISVerify pinned to **v14.2.0** (all seven pins flip together; additive —
+`fedcode` gains `verify_pulled_ml_dsa_65_pubkey`, and `derive_key_id`, which
+persist calls, is untouched). The Python `ciris-verify>=14.0.0,<15` range
+already covers it.
+
 ## [40.0.0] - 2026-09-03
 
 **A widening carries the claim's instant; the placement gets its own.**
