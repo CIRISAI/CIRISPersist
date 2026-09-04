@@ -536,6 +536,119 @@ pub const PER_PEER_QUOTA_TRACKED_PEERS_CAP: usize = 8192;
 /// property that matters when identity is free.
 pub const UNTRACKED_TAIL_BUDGET_MULTIPLE: u32 = 1;
 
+/// v41.0.0 (CIRISPersist#804) — the bulk-sync allowance, in units of one
+/// peer's ordinary budget.
+///
+/// A cohort sync is legitimately BURSTY — a family or community node handing
+/// over a backlog — and the ordinary per-peer burst
+/// ([`PER_PEER_ATTESTATION_WRITES_PER_WINDOW`], 600/min) is sized for steady
+/// conversation, not for catching up. Metering a sync there is the same
+/// category error #804 reported for local authorship: a control aimed at
+/// strangers, applied to a party that is not one.
+///
+/// **Bounds:** the total rate at which authenticated cohort peers may hand
+/// this node a backlog — SHARED across all of them, so no single syncing peer
+/// can take the node, and the node budget remains the ceiling above it.
+///
+/// **Derived:** [`NODE_INGEST_BUDGET_MULTIPLE`] / 2. Half the node's ordinary
+/// ceiling, so a sync running flat out still leaves at least as much again for
+/// everything else the node must admit — ordinary peer writes, reserved-class
+/// rows, its own publication. Larger would let catching up starve serving;
+/// smaller would not clear the ordinary per-peer burst
+/// ([`PER_PEER_ATTESTATION_WRITES_PER_WINDOW`]) by enough to be worth a
+/// separate budget, which is the whole point of the class. A cohort member is
+/// trusted more than a stranger, not trusted with the whole node.
+pub const SYNC_BUDGET_MULTIPLE: u32 = NODE_INGEST_BUDGET_MULTIPLE / 2;
+
+/// v41.0.0 (CIRISPersist#804) — **where a stored write came from**, which is
+/// the one thing the row cannot say about itself.
+///
+/// The AV-76 quota runs at tier 0, before any signature check, so
+/// `attesting_key_id` is a claim rather than a fact (see
+/// [`WriteAdmissionClass::GenesisClaim`]). Origin is a property of the CALL,
+/// so it is a parameter — and each variant names a different act with a
+/// different budget, rather than a bool a caller can get subtly wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOrigin {
+    /// The row arrived from elsewhere and nothing about the sender is
+    /// established. Today's behaviour, unchanged: metered per claimed
+    /// identity, AV-76 exactly as it was.
+    Wire,
+    /// This node authored and signed the row in-process.
+    /// [`WriteAdmissionClass::LocalAuthorship`].
+    Authored,
+    /// A bulk sync delivered over a session the transport AUTHENTICATED as
+    /// `peer_key_id`. Earns [`WriteAdmissionClass::CohortSync`] only if
+    /// persist confirms a shared cohort from its own rosters; otherwise it is
+    /// metered exactly like [`Self::Wire`].
+    Sync {
+        /// The identity the TRANSPORT authenticated — never the row's claim.
+        peer_key_id: String,
+    },
+}
+
+/// v41.0.0 (CIRISPersist#804) — does this node share a family or community
+/// with `peer`, according to persist's OWN rosters?
+///
+/// The un-forgeable half of the privileged-sync door. The caller vouches only
+/// for WHICH identity its transport authenticated; whether that identity is a
+/// cohort-mate is persist's own question, answered from state it already
+/// holds. A caller cannot widen its own budget by asserting a relationship.
+///
+/// `affiliations` is deliberately not consulted: it has no per-member roster
+/// to intersect, so there is nothing here that could be checked rather than
+/// believed.
+pub async fn shares_cohort_with<D>(
+    dir: &D,
+    us: &str,
+    peer: &str,
+) -> Result<bool, crate::federation::Error>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
+    if us.is_empty() || peer.is_empty() || us == peer {
+        return Ok(false);
+    }
+    let ours: std::collections::BTreeSet<String> = dir
+        .list_families_for_member_active(us)
+        .await?
+        .into_iter()
+        .map(|f| f.family_key_id)
+        .collect();
+    if !ours.is_empty() {
+        let theirs = dir.list_families_for_member_active(peer).await?;
+        if theirs.iter().any(|f| ours.contains(&f.family_key_id)) {
+            return Ok(true);
+        }
+    }
+    let ours: std::collections::BTreeSet<String> = dir
+        .list_communities_for_member_active(us)
+        .await?
+        .into_iter()
+        .map(|c| c.community_key_id)
+        .collect();
+    if ours.is_empty() {
+        return Ok(false);
+    }
+    let theirs = dir.list_communities_for_member_active(peer).await?;
+    Ok(theirs.iter().any(|c| ours.contains(&c.community_key_id)))
+}
+
+/// v41.0.0 (CIRISPersist#804) — how long a resolved cohort answer is reused
+/// before persist asks its own state again.
+///
+/// **Bounds:** how long a REVOKED cohort membership can still buy the
+/// bulk-sync budget. Membership is revocable; this is the honest cost of not
+/// doing four directory reads per synced row, stated rather than discovered.
+///
+/// **Derived:** one [`PER_PEER_ATTESTATION_WRITE_WINDOW`]. The burst budgets
+/// refill over that window, so a stale answer cannot buy more than a single
+/// window's worth of over-budget writes before it is re-asked — the error is
+/// bounded by the same period the thing it affects is bounded by. Longer would
+/// let a removed member keep syncing across several windows; shorter would
+/// re-read the rosters more often than the budget it guards can even refill.
+pub const COHORT_AFFINITY_TTL: Duration = Duration::from_secs(60);
+
 /// v24.3.0 (CIRISPersist#575) — the node-wide federation-ingest ceiling, as
 /// a multiple of one peer's budget: **ten peers writing at their individual
 /// ceiling, simultaneously, forever** (6 000 writes/min and 144 000
@@ -748,16 +861,26 @@ pub enum QuotaBudget {
     Node,
     /// The reserved admission class ([`RESERVED_CLASS_BUDGET_MULTIPLE`]).
     Reserved,
+    /// v41.0.0 (CIRISPersist#804) — the shared bulk COHORT SYNC allowance
+    /// ([`SYNC_BUDGET_MULTIPLE`], [`WriteAdmissionClass::CohortSync`]).
+    CohortSync,
 }
 
 impl QuotaBudget {
     /// Every budget, in declaration order.
-    pub const ALL: &'static [Self] = &[Self::Peer, Self::UntrackedTail, Self::Node, Self::Reserved];
+    pub const ALL: &'static [Self] = &[
+        Self::Peer,
+        Self::UntrackedTail,
+        Self::Node,
+        Self::Reserved,
+        Self::CohortSync,
+    ];
 
     /// The stable token — the same spelling serde emits.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::CohortSync => "cohort_sync",
             Self::Peer => "peer",
             Self::UntrackedTail => "untracked_tail",
             Self::Node => "node",
@@ -772,6 +895,7 @@ impl QuotaBudget {
             Self::UntrackedTail => 1,
             Self::Node => 2,
             Self::Reserved => 3,
+            Self::CohortSync => 4,
         }
     }
 }
@@ -857,6 +981,13 @@ pub enum PeerQuotaRefusal {
     /// The **reserved class**'s sustained ROW budget is spent. As
     /// [`Self::ReservedBurst`], on the day horizon.
     ReservedSustained,
+    /// v41.0.0 (#804) — the shared bulk-sync row budget
+    /// ([`SYNC_BUDGET_MULTIPLE`]) is spent. Cohort members are catching up
+    /// faster than this node has agreed to absorb; the node ceiling is still
+    /// above it.
+    CohortSyncBurst,
+    /// [`Self::CohortSyncBurst`], on the day horizon.
+    CohortSyncSustained,
     /// v25.1.0 (CIRISPersist#583) — this peer's own **burst** BYTE budget is
     /// spent: more than [`PER_PEER_ATTESTATION_BYTES_PER_WINDOW`] of payload
     /// inside [`PER_PEER_ATTESTATION_WRITE_WINDOW`]. A **storage** flood,
@@ -892,6 +1023,11 @@ pub enum PeerQuotaRefusal {
     /// v25.1.0 (CIRISPersist#583) — the **reserved class**'s sustained BYTE
     /// budget is spent. As [`Self::ReservedBytesBurst`], on the day horizon.
     ReservedBytesSustained,
+    /// v41.0.0 (#804) — the shared bulk-sync BYTE budget is spent: a sync is
+    /// moving more storage than agreed, at the same row count.
+    CohortSyncBytesBurst,
+    /// [`Self::CohortSyncBytesBurst`], on the day horizon.
+    CohortSyncBytesSustained,
 }
 
 impl PeerQuotaRefusal {
@@ -909,6 +1045,8 @@ impl PeerQuotaRefusal {
             Self::NodeSustained => "node_sustained",
             Self::ReservedBurst => "reserved_burst",
             Self::ReservedSustained => "reserved_sustained",
+            Self::CohortSyncBurst => "cohort_sync_burst",
+            Self::CohortSyncSustained => "cohort_sync_sustained",
             Self::PeerBytesBurst => "peer_bytes_burst",
             Self::PeerBytesSustained => "peer_bytes_sustained",
             Self::UntrackedTailBytesBurst => "untracked_tail_bytes_burst",
@@ -917,6 +1055,8 @@ impl PeerQuotaRefusal {
             Self::NodeBytesSustained => "node_bytes_sustained",
             Self::ReservedBytesBurst => "reserved_bytes_burst",
             Self::ReservedBytesSustained => "reserved_bytes_sustained",
+            Self::CohortSyncBytesBurst => "cohort_sync_bytes_burst",
+            Self::CohortSyncBytesSustained => "cohort_sync_bytes_sustained",
         }
     }
 
@@ -969,6 +1109,18 @@ impl PeerQuotaRefusal {
             (QuotaBudget::Reserved, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
                 Self::ReservedBytesSustained
             }
+            (QuotaBudget::CohortSync, QuotaDimension::Rows, QuotaHorizon::Burst) => {
+                Self::CohortSyncBurst
+            }
+            (QuotaBudget::CohortSync, QuotaDimension::Rows, QuotaHorizon::Sustained) => {
+                Self::CohortSyncSustained
+            }
+            (QuotaBudget::CohortSync, QuotaDimension::Bytes, QuotaHorizon::Burst) => {
+                Self::CohortSyncBytesBurst
+            }
+            (QuotaBudget::CohortSync, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
+                Self::CohortSyncBytesSustained
+            }
         }
     }
 
@@ -985,7 +1137,9 @@ impl PeerQuotaRefusal {
             | Self::NodeBurst
             | Self::NodeSustained
             | Self::ReservedBurst
-            | Self::ReservedSustained => QuotaDimension::Rows,
+            | Self::ReservedSustained
+            | Self::CohortSyncBurst
+            | Self::CohortSyncSustained => QuotaDimension::Rows,
             Self::PeerBytesBurst
             | Self::PeerBytesSustained
             | Self::UntrackedTailBytesBurst
@@ -993,7 +1147,9 @@ impl PeerQuotaRefusal {
             | Self::NodeBytesBurst
             | Self::NodeBytesSustained
             | Self::ReservedBytesBurst
-            | Self::ReservedBytesSustained => QuotaDimension::Bytes,
+            | Self::ReservedBytesSustained
+            | Self::CohortSyncBytesBurst
+            | Self::CohortSyncBytesSustained => QuotaDimension::Bytes,
         }
     }
 
@@ -1017,6 +1173,10 @@ impl PeerQuotaRefusal {
             | Self::ReservedSustained
             | Self::ReservedBytesBurst
             | Self::ReservedBytesSustained => QuotaBudget::Reserved,
+            Self::CohortSyncBurst
+            | Self::CohortSyncSustained
+            | Self::CohortSyncBytesBurst
+            | Self::CohortSyncBytesSustained => QuotaBudget::CohortSync,
         }
     }
 
@@ -1031,7 +1191,9 @@ impl PeerQuotaRefusal {
             | Self::PeerBytesBurst
             | Self::UntrackedTailBytesBurst
             | Self::NodeBytesBurst
-            | Self::ReservedBytesBurst => QuotaHorizon::Burst,
+            | Self::ReservedBytesBurst
+            | Self::CohortSyncBurst
+            | Self::CohortSyncBytesBurst => QuotaHorizon::Burst,
             Self::PeerSustained
             | Self::UntrackedTailSustained
             | Self::NodeSustained
@@ -1039,7 +1201,9 @@ impl PeerQuotaRefusal {
             | Self::PeerBytesSustained
             | Self::UntrackedTailBytesSustained
             | Self::NodeBytesSustained
-            | Self::ReservedBytesSustained => QuotaHorizon::Sustained,
+            | Self::ReservedBytesSustained
+            | Self::CohortSyncSustained
+            | Self::CohortSyncBytesSustained => QuotaHorizon::Sustained,
         }
     }
 
@@ -1062,6 +1226,10 @@ impl PeerQuotaRefusal {
         Self::NodeBytesSustained,
         Self::ReservedBytesBurst,
         Self::ReservedBytesSustained,
+        Self::CohortSyncBurst,
+        Self::CohortSyncSustained,
+        Self::CohortSyncBytesBurst,
+        Self::CohortSyncBytesSustained,
     ];
 }
 
@@ -1150,6 +1318,68 @@ pub enum WriteAdmissionClass {
     /// exhausted at boot fails the seed to `Absent`, which boots. Protecting
     /// them with a budget an unauthenticated claim can drain protects nothing.
     GenesisClaim,
+    /// v41.0.0 (CIRISPersist#804) — **THIS NODE AUTHORED THE ROW, AND A NODE
+    /// IS NOT A PEER OF ITSELF.**
+    ///
+    /// `GenesisClaim`'s argument, one identity over. That class exists because
+    /// the node's own boot seed is not a peer; this one exists because the
+    /// node's own OWNER is not a peer either. Since v39.0.0 a locally authored
+    /// row reaches the federation through `widen_audience` → `put_attestation`
+    /// — the same door a hostile remote peer's row arrives at — so the control
+    /// written to stop a stranger flooding this node began metering the owner
+    /// typing into it. Measured downstream: **652 of 900 chat sends refused**
+    /// at `peer_burst`, with a warm p50 of 35 ms. Not a throughput limit; a
+    /// budget aimed at the wrong party.
+    ///
+    /// # Why the row cannot answer this
+    ///
+    /// [`PeerWriteQuota::classify`] runs at TIER 0, ahead of any signature
+    /// check, so the only thing establishing `attesting_key_id` is the row
+    /// SAYING SO — the trap spelled out on [`Self::GenesisClaim`]. Deriving
+    /// "this is my owner" from the claimed attester would hand the larger
+    /// budget to anyone willing to claim the owner's key. The distinguishing
+    /// fact is ORIGIN — did this node author the row, or did it arrive over a
+    /// wire — and origin is not a property of the row at all. It is known only
+    /// at the CALL SITE, which is why this class is supplied by the door
+    /// ([`FederationDirectory::put_attestation_authored`]) and never inferred.
+    ///
+    /// # What it is charged
+    ///
+    /// The NODE budget, and nothing else. Not a peer bucket — opening one
+    /// would report `tracked_peers > 0` and lift `node_state`'s peer-quota
+    /// band out of `unknown` into `green` on the strength of the owner talking
+    /// to itself, which is precisely the signal corruption CIRISPersist#665
+    /// fixed for genesis. And not the untracked tail either: the tail is what
+    /// a STRANGER pays, so charging local authorship there would let a flood
+    /// of strangers throttle the owner's own writing, and the owner's writing
+    /// exhaust what strangers share. The node budget is the honest ceiling —
+    /// it is this node's own capacity, and a runaway local loop is bounded by
+    /// it exactly as ingest is.
+    LocalAuthorship,
+    /// v41.0.0 (CIRISPersist#804) — **a bulk sync from an AUTHENTICATED peer
+    /// this node shares a cohort with**: the privileged-sync door
+    /// ([`crate::federation::FederationDirectory::put_attestation_synced`]).
+    ///
+    /// Two facts must hold, and neither comes from the row:
+    ///
+    /// 1. **The caller names the peer the TRANSPORT authenticated** — not the
+    ///    row's `attesting_key_id`, which at tier 0 is only a claim (see
+    ///    [`Self::GenesisClaim`] for what trusting that claim costs). A sync
+    ///    carries rows authored by many parties; the party metered is the one
+    ///    on the other end of the session.
+    /// 2. **Persist confirms the cohort from its OWN verified state** — the
+    ///    family and community rosters it already holds — never from anything
+    ///    the caller or the row asserts. An authenticated stranger falls back
+    ///    to ordinary peer metering, so the privilege a caller can hand out is
+    ///    bounded by a fact persist checks for itself.
+    ///
+    /// Charged against [`QuotaBudget::CohortSync`] and the node ceiling. Not
+    /// the untracked tail (a stranger's shared budget), and not a per-peer
+    /// bucket, whose 600/min burst is what makes a backlog refuse halfway. So
+    /// it does NOT count toward `tracked_peers`: that signal means "peers have
+    /// written through the METERED path and none were denied", and a
+    /// privileged sync is not evidence about that path.
+    CohortSync,
 }
 
 /// One horizon of one dimension of one budget: a capacity and a continuous
@@ -1604,6 +1834,14 @@ struct QuotaState {
     tail: PeerBucket,
     /// The reserved class's own budget ([`RESERVED_CLASS_BUDGET_MULTIPLE`]).
     reserved: PeerBucket,
+    /// v41.0.0 (CIRISPersist#804) — the shared bulk COHORT SYNC allowance
+    /// ([`SYNC_BUDGET_MULTIPLE`]). Shared across syncing peers on purpose:
+    /// one cohort member catching up must not be able to take the node.
+    sync: PeerBucket,
+    /// v41.0.0 (#804) — memoized "does this authenticated peer share a cohort
+    /// with us", with the instant it was resolved. See
+    /// [`PeerWriteQuota::cohort_affinity`].
+    cohort_affinity: HashMap<String, (bool, Instant)>,
     /// v25.1.0 (CIRISPersist#583) — how many admitted writes were denied an
     /// individual bucket because the table was saturated with non-full
     /// peers: the **tail-squeeze counter**.
@@ -1619,7 +1857,7 @@ struct QuotaState {
     /// v38.0.0 (#609) — refusals since process start, indexed by
     /// [`QuotaBudget::idx`]. Counted at the ONE chokepoint (`charge`), so
     /// the counter and the refusal cannot disagree.
-    refusals_by_budget: [u64; 4],
+    refusals_by_budget: [u64; 5],
     /// v38.0.0 (#609) — last refusal instant per key, pruned to the burst
     /// window on every write and hard-bounded at
     /// [`REFUSED_KEYS_WINDOW_CAP`] (see the const for why the bound is the
@@ -1706,8 +1944,10 @@ impl PeerWriteQuota {
                     &BudgetSpec::for_multiple(RESERVED_CLASS_BUDGET_MULTIPLE),
                     now,
                 ),
+                cohort_affinity: HashMap::new(),
+                sync: PeerBucket::full(&BudgetSpec::for_multiple(SYNC_BUDGET_MULTIPLE), now),
                 slot_denials: 0,
-                refusals_by_budget: [0; 4],
+                refusals_by_budget: [0; 5],
                 refused_keys: HashMap::new(),
             }),
         }
@@ -1782,6 +2022,81 @@ impl PeerWriteQuota {
         row: &crate::federation::types::Attestation,
     ) -> Result<(), crate::federation::Error> {
         self.check_write_typed(row).map_err(Into::into)
+    }
+
+    /// v41.0.0 (CIRISPersist#804) — charge a row delivered by an
+    /// AUTHENTICATED cohort peer during a sync.
+    ///
+    /// `peer_key_id` is the identity the TRANSPORT authenticated, not
+    /// anything the row claims — see [`WriteAdmissionClass::CohortSync`]. The
+    /// caller must already have confirmed the shared cohort against persist's
+    /// own state ([`PeerWriteQuota::cohort_affinity`] /
+    /// [`PeerWriteQuota::remember_cohort_affinity`]); this function only
+    /// spends the budget that decision earned.
+    pub fn check_write_synced(
+        &self,
+        row: &crate::federation::types::Attestation,
+        peer_key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        self.charge(
+            peer_key_id,
+            WriteAdmissionClass::CohortSync,
+            &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
+            Instant::now(),
+        )
+        .map_err(Into::into)
+    }
+
+    /// v41.0.0 (CIRISPersist#804) — the memoized answer to *"do we share a
+    /// cohort with this authenticated peer?"*, or `None` if it has not been
+    /// resolved recently.
+    ///
+    /// The lookup itself is two directory reads per side and the sync path
+    /// asks it per ROW, so the answer is remembered for
+    /// [`COHORT_AFFINITY_TTL`]. A short TTL rather than a permanent cache
+    /// because membership is revocable: a peer removed from a family should
+    /// stop enjoying the bulk budget within a bounded time, and that bound
+    /// should be readable here rather than inferred.
+    #[must_use]
+    pub fn cohort_affinity(&self, peer_key_id: &str) -> Option<bool> {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (shares, at) = st.cohort_affinity.get(peer_key_id).copied()?;
+        (at.elapsed() < COHORT_AFFINITY_TTL).then_some(shares)
+    }
+
+    /// Record a freshly resolved answer for [`Self::cohort_affinity`].
+    pub fn remember_cohort_affinity(&self, peer_key_id: &str, shares: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // Bounded like every other map here: a sync partner set that grows
+        // without limit would be a memory hole reachable from the wire.
+        if st.cohort_affinity.len() >= PER_PEER_QUOTA_TRACKED_PEERS_CAP {
+            st.cohort_affinity
+                .retain(|_, (_, at)| at.elapsed() < COHORT_AFFINITY_TTL);
+        }
+        if st.cohort_affinity.len() < PER_PEER_QUOTA_TRACKED_PEERS_CAP {
+            st.cohort_affinity
+                .insert(peer_key_id.to_owned(), (shares, Instant::now()));
+        }
+    }
+
+    /// v41.0.0 (CIRISPersist#804) — charge a row THIS NODE AUTHORED.
+    ///
+    /// The class is supplied, not derived: origin is not a property of the row
+    /// (see [`WriteAdmissionClass::LocalAuthorship`]), so only the door can
+    /// know it. Reaching this function already means code running in-process
+    /// on this node, which is the same trust boundary that lets that code call
+    /// the storage layer directly.
+    pub fn check_write_authored(
+        &self,
+        row: &crate::federation::types::Attestation,
+    ) -> Result<(), crate::federation::Error> {
+        self.charge(
+            &row.attesting_key_id,
+            WriteAdmissionClass::LocalAuthorship,
+            &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
+            Instant::now(),
+        )
+        .map_err(Into::into)
     }
 
     /// [`Self::check_write`] keeping the typed [`PeerQuotaRefused`] instead
@@ -1914,6 +2229,26 @@ impl PeerWriteQuota {
         // able to drain the reserve) nor `Ordinary` (the node's own boot seed is
         // not a peer). Placed after the node charge and before the bucket
         // lookup, so it pays what everyone pays and skips only the promotion.
+        // v41.0.0 (#804) — local authorship: the node ceiling and nothing
+        // else. No tail (that is a stranger's shared budget) and no bucket
+        // (that would corrupt `tracked_peers`). See
+        // `WriteAdmissionClass::LocalAuthorship`.
+        if class == WriteAdmissionClass::CohortSync {
+            let sync_spec = BudgetSpec::for_multiple(SYNC_BUDGET_MULTIPLE);
+            st.sync.refill(&sync_spec, now);
+            if let Some(refused) = st.sync.refusal(&sync_spec, QuotaBudget::CohortSync, cost) {
+                return Err(refused);
+            }
+            st.sync.spend(cost);
+            st.node.spend(cost);
+            return Ok(());
+        }
+
+        if class == WriteAdmissionClass::LocalAuthorship {
+            st.node.spend(cost);
+            return Ok(());
+        }
+
         if class == WriteAdmissionClass::GenesisClaim {
             st.tail.refill(&tail_spec, now);
             if let Some(refused) = st
@@ -2534,6 +2869,201 @@ pub mod gate_order_test_support {
             "the byte budget bound only after {admitted} of \
              {} rows at 900 KiB — that is not a storage bound",
             super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW,
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_authorship_804 {
+    use super::*;
+    use crate::federation::types::Attestation;
+
+    fn row(attester: &str) -> Attestation {
+        Attestation {
+            attestation_id: "r".into(),
+            attesting_key_id: attester.into(),
+            attested_key_id: attester.into(),
+            attestation_type: "scores".into(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({ "dimension": "chat:message:v1" }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: attester.into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "community".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// CIRISPersist#804 — **a node is not a peer of itself.**
+    ///
+    /// The measured symptom was 652 of 900 chat sends refused at `peer_burst`,
+    /// because every `widen_audience` charged the OWNER's peer bucket. The
+    /// per-peer burst is `PER_PEER_ATTESTATION_WRITES_PER_WINDOW` (600) and the
+    /// node ceiling is `NODE_INGEST_BUDGET_MULTIPLE` times that, so a run of
+    /// 900 separates the two budgets unambiguously: it cannot fit in a peer
+    /// bucket and comfortably fits under the node ceiling.
+    ///
+    /// Mutation: route `check_write_authored` back through `check_write` and
+    /// this goes red at write 601.
+    #[test]
+    fn local_authorship_is_not_metered_as_a_peer() {
+        let q = PeerWriteQuota::new();
+        let owner = "owner-key";
+        for i in 0..900u32 {
+            q.check_write_authored(&row(owner)).unwrap_or_else(|e| {
+                panic!(
+                    "#804: local authorship must not be metered as a peer — refused at write {i} \
+                     of 900 with {e}. The per-peer burst is {} and the node ceiling is {}×that; \
+                     a refusal here means the owner is being charged a stranger's budget",
+                    PER_PEER_ATTESTATION_WRITES_PER_WINDOW, NODE_INGEST_BUDGET_MULTIPLE,
+                )
+            });
+        }
+        assert_eq!(
+            q.tracked_peers(),
+            0,
+            "#804: local authorship must NOT open a peer bucket — `tracked_peers > 0` lifts \
+             node_state's peer-quota band out of `unknown` into `green`, so a node whose owner \
+             has merely talked to itself would report a TESTED quota. That is CIRISPersist#665's \
+             signal corruption, one identity over"
+        );
+    }
+
+    /// The other half, and the one that keeps this from being a hole: the WIRE
+    /// path is untouched. A stranger claiming the same key still meets the peer
+    /// budget, so AV-76 is exactly where it was.
+    ///
+    /// Mutation: make `check_write` delegate to `check_write_authored` and this
+    /// goes red — a stranger would then never be refused.
+    #[test]
+    fn the_wire_path_still_meters_a_stranger() {
+        let q = PeerWriteQuota::new();
+        let stranger = "stranger-key";
+        let mut refused_at = None;
+        for i in 0..900u32 {
+            if q.check_write(&row(stranger)).is_err() {
+                refused_at = Some(i);
+                break;
+            }
+        }
+        assert!(
+            refused_at.is_some(),
+            "#804: a row arriving over the wire must still be metered — AV-76 is untouched by \
+             the local-authorship class"
+        );
+    }
+
+    /// CIRISPersist#804 — **a cohort sync bursts; a stranger does not.**
+    ///
+    /// The report's second case: sync between peers in a community/family is
+    /// legitimately bursty, and the ordinary per-peer burst (600/min) refuses
+    /// it halfway. The sync budget is `SYNC_BUDGET_MULTIPLE` times that, so a
+    /// run of 900 separates them unambiguously.
+    ///
+    /// Mutation: charge `CohortSync` against the peer bucket and this goes red
+    /// at 601.
+    #[test]
+    fn a_cohort_sync_may_burst_past_the_per_peer_budget() {
+        let q = PeerWriteQuota::new();
+        let mate = "family-node";
+        for i in 0..900u32 {
+            q.check_write_synced(&row("someone-else"), mate)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "#804: a cohort sync must burst past the per-peer budget — refused at \
+                         {i} of 900 with {e}. Per-peer burst is {}; the sync budget is {}×that",
+                        PER_PEER_ATTESTATION_WRITES_PER_WINDOW, SYNC_BUDGET_MULTIPLE,
+                    )
+                });
+        }
+        assert_eq!(
+            q.tracked_peers(),
+            0,
+            "#804: a privileged sync must not open a peer bucket — `tracked_peers` means peers \
+             have written through the METERED path and none were denied, which a sync is not \
+             evidence about"
+        );
+    }
+
+    /// The sync budget is SHARED and FINITE: it is a wider door, not an open
+    /// one. Without this, "privileged" would mean "unmetered", and the only
+    /// remaining bound would be the node ceiling.
+    #[test]
+    fn the_sync_budget_is_shared_and_finite() {
+        let q = PeerWriteQuota::new();
+        let mut admitted = 0u64;
+        // The refusal must come from the SYNC budget BY NAME. Asserting only
+        // that the loop ends proves nothing: the node ceiling is checked first
+        // and would end it even with the sync budget deleted entirely — which
+        // is exactly what an earlier version of this witness failed to catch
+        // when that mutation was applied.
+        let refusal = loop {
+            match q.check_write_synced(&row("a"), "mate-a") {
+                Ok(()) => {
+                    admitted += 1;
+                    assert!(admitted < 1_000_000, "the sync budget must be FINITE");
+                }
+                Err(e) => break e.to_string(),
+            }
+        };
+        assert!(
+            refusal.contains(QuotaBudget::CohortSync.as_str()),
+            "#804: a sync must be bounded by its OWN budget, not merely by the node ceiling \
+             above it — refused with {refusal:?}, which names a different budget"
+        );
+        assert!(
+            admitted > u64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW),
+            "#804: …and that budget must be WIDER than one peer's, or the class buys nothing"
+        );
+        // A SECOND cohort mate now meets a budget the first has spent: the
+        // allowance is shared, so one peer catching up cannot take the node.
+        let second = q.check_write_synced(&row("b"), "mate-b");
+        assert!(
+            second.is_err_and(|e| e.to_string().contains(QuotaBudget::CohortSync.as_str())),
+            "#804: the sync budget is SHARED — a second cohort peer must meet the same spent \
+             allowance, by name, or one syncing peer could exhaust the node on its own"
+        );
+    }
+
+    /// The un-forgeable half, asserted where it can actually be checked: the
+    /// AUTHENTICATED identity is what gets metered, not the row's claim. A
+    /// sync carries rows authored by many parties, and metering the claimed
+    /// author would let a hostile row inside a sync spend somebody else's
+    /// budget.
+    #[test]
+    fn the_sync_meters_the_authenticated_peer_not_the_rows_claim() {
+        let q = PeerWriteQuota::new();
+        // Drain the ordinary bucket of the identity the ROWS claim.
+        while q.check_write(&row("claimed-author")).is_ok() {}
+        // The sync still proceeds: it is metered against the session peer.
+        q.check_write_synced(&row("claimed-author"), "authenticated-mate")
+            .expect(
+                "#804: a sync is metered against the AUTHENTICATED peer; a drained bucket for \
+                 the identity its rows happen to claim must not stop it",
+            );
+    }
+
+    /// And the two do not share a bucket: exhausting the wire budget for a key
+    /// must not stop this node publishing its own rows, which is the failure
+    /// the report actually experienced (a busy node silencing its owner).
+    #[test]
+    fn a_flooded_wire_budget_does_not_silence_the_owner() {
+        let q = PeerWriteQuota::new();
+        let owner = "owner-key";
+        while q.check_write(&row(owner)).is_ok() {}
+        q.check_write_authored(&row(owner)).expect(
+            "#804: the owner's own publication must survive a peer budget that a stranger \
+             claiming the owner's key has just drained",
         );
     }
 }
@@ -3665,6 +4195,10 @@ mod tests {
 
         let class = match budget {
             QuotaBudget::Reserved => WriteAdmissionClass::Reserved,
+            // v41.0.0 (#804) — the sync budget is driven through the SAME
+            // completeness gate as every other, so its four refusal variants
+            // are witnessed rather than exempted.
+            QuotaBudget::CohortSync => WriteAdmissionClass::CohortSync,
             _ => WriteAdmissionClass::Ordinary,
         };
         // Peer: one identity spends its own. Node: enough identities that no
@@ -3678,6 +4212,9 @@ mod tests {
                 .map(|i| format!("node-peer-{i}"))
                 .collect(),
             QuotaBudget::UntrackedTail => Vec::new(),
+            // One cohort-mate: the sync budget is SHARED, so a single syncing
+            // peer must be able to exhaust it — that sharing is the property.
+            QuotaBudget::CohortSync => vec!["cohort-mate".into()],
         };
 
         let mut rotation = 0u64;
@@ -4136,6 +4673,8 @@ mod tests {
             "PER_PEER_SUSTAINED_BYTES_PER_WINDOW",
             "PER_PEER_QUOTA_TRACKED_PEERS_CAP",
             "UNTRACKED_TAIL_BUDGET_MULTIPLE",
+            "SYNC_BUDGET_MULTIPLE",
+            "COHORT_AFFINITY_TTL",
             "NODE_INGEST_BUDGET_MULTIPLE",
             "RESERVED_CLASS_BUDGET_MULTIPLE",
             "RESERVED_CLASS_DIMENSION_PREFIXES",

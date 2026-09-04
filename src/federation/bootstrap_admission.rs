@@ -1685,6 +1685,158 @@ pub mod test_support {
         }
     }
 
+    /// **CIRISPersist#804 — the privileged sync door, at the DOOR.**
+    ///
+    /// The quota's own unit tests prove the budgets differ. This proves the
+    /// thing that actually protects the node: **who gets the privileged
+    /// budget is decided by persist, from persist's own rosters — not by the
+    /// caller.** A caller vouches for WHICH identity its transport
+    /// authenticated and nothing more, so an authenticated STRANGER routed
+    /// through the sync door must be metered exactly as if it had come through
+    /// the wire door.
+    ///
+    /// Both arms drive `put_attestation_synced` past the per-peer burst
+    /// (`PER_PEER_ATTESTATION_WRITES_PER_WINDOW`, 600) with real rows through a
+    /// real backend, so the difference is the cohort and nothing else.
+    /// `us` MUST equal what the caller installed via `set_self_key_id` — the
+    /// node's own identity is the one side of the cohort intersection persist
+    /// resolves, so a mismatch would silently make every peer a stranger and
+    /// the witness would pass for the wrong reason.
+    pub async fn exercise_privileged_sync_door_804(
+        dir: &dyn FederationDirectory,
+        us: &str,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let us = us.to_owned();
+        let mate = format!("{tag}-mate-{run}");
+        let stranger = format!("{tag}-stranger-{run}");
+        let comm = format!("{tag}-comm-{run}");
+        // The community's own key must exist too — a cohort is addressed by a
+        // registered key, not a bare string.
+        for k in [&us, &mate, &stranger, &comm] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+        let now = chrono::Utc::now();
+        // A community this node and `mate` both belong to — and `stranger`
+        // does not. This is the ONLY difference between the two arms.
+        dir.put_community(ts::sign_community(
+            &us,
+            crate::federation::types::Community {
+                community_key_id: comm.clone(),
+                community_name: format!("{tag}-c-{run}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: us.clone(),
+                        joined_at: now,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: mate.clone(),
+                        joined_at: now,
+                        role: None,
+                    },
+                ],
+                founded_at: now,
+                consensus_protocol: "founder_only".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #804: the community admits: {e}"));
+
+        // ── the resolver first, so a failure below names the right thing ──
+        let mate_shares =
+            crate::federation::replication::admission::shares_cohort_with(dir, &us, &mate)
+                .await
+                .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
+        let stranger_shares =
+            crate::federation::replication::admission::shares_cohort_with(dir, &us, &stranger)
+                .await
+                .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
+        assert!(
+            mate_shares,
+            "({tag}) #804: persist must resolve the community it holds — `{us}` and `{mate}` are \
+             both members of `{comm}`"
+        );
+        assert!(
+            !stranger_shares,
+            "({tag}) #804: `{stranger}` is in no community with `{us}`, and persist must say so \
+             from its OWN rosters. If this is true, the privileged budget is handed to anyone a \
+             caller names"
+        );
+
+        // Rows authored by whoever — a sync carries other people's claims.
+        let sync_row = |i: u32| {
+            let mut row = scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &stranger,
+                &stranger,
+                "trust:demo:v1",
+            );
+            row.tier = attestation_tier::FEDERATION.to_owned();
+            row.cohort_scope = cohort_scope::FEDERATION.to_owned();
+            row.attestation_envelope["nonce"] = serde_json::json!(i);
+            ts::reseal(&mut row);
+            row
+        };
+
+        // ── WHICH BUDGET the door selected, observed without racing a clock ──
+        //
+        // This deliberately does NOT try to exhaust a budget. The burst window
+        // refills over 60s and a few hundred real storage writes take tens of
+        // seconds, so a door-level test that drives a rate limit to refusal
+        // measures the refill, not the budget — an earlier version of this
+        // witness passed both arms for exactly that reason, proving nothing.
+        // Budget SIZES are witnessed in `local_authorship_804` against a
+        // simulated clock; what only the DOOR can show is which budget it
+        // picked, and the peer-bucket table is an exact, immediate discriminator:
+        // the ordinary path opens a bucket for the writer, the privileged sync
+        // path never does.
+        let before = dir.peer_quota_observation().map_or(0, |o| o.tracked_peers);
+
+        for i in 0..3u32 {
+            dir.put_attestation_synced(
+                SignedAttestation {
+                    attestation: sync_row(i),
+                },
+                &mate,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #804: a cohort mate's sync admits: {e}"));
+        }
+        assert_eq!(
+            dir.peer_quota_observation().map_or(0, |o| o.tracked_peers),
+            before,
+            "({tag}) #804: a sync from a COHORT MATE must take the privileged budget, which \
+             opens no peer bucket. A new bucket here means the door fell back to stranger \
+             metering — the 600/min burst that refuses a backlog halfway"
+        );
+
+        for i in 0..3u32 {
+            dir.put_attestation_synced(
+                SignedAttestation {
+                    attestation: sync_row(1_000_000 + i),
+                },
+                &stranger,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #804: a stranger's write still admits: {e}"));
+        }
+        assert!(
+            dir.peer_quota_observation().map_or(0, |o| o.tracked_peers) > before,
+            "({tag}) #804: an AUTHENTICATED STRANGER routed through the privileged sync door \
+             must be metered as a stranger — it must get its own peer bucket, exactly as if it \
+             had come through the wire door. persist decides who is a cohort-mate from its OWN \
+             rosters; if a caller could buy the bulk budget just by naming a peer, the privilege \
+             would be unbounded and AV-76 would be optional"
+        );
+    }
+
     /// **W1–W14 — the actor's signature survives the crossing**
     /// (`FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md` §6), at the directory
     /// primitive, on every backend. Each arm names the mutation that must fail

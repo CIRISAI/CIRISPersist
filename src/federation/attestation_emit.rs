@@ -163,7 +163,10 @@ where
     D: FederationDirectory + Sync + ?Sized,
 {
     let (row, emitted) = assemble(key_id, canonical, sig, input)?;
-    dir.put_attestation(SignedAttestation { attestation: row })
+    // v41.0.0 (#804) — the emit recipe publishes a row this node authored and
+    // signed a few lines above; charging it as a peer write metered the node
+    // against a budget written to stop strangers flooding it.
+    dir.put_attestation_authored(SignedAttestation { attestation: row })
         .await?;
     Ok(emitted)
 }
