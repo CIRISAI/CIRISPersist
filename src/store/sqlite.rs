@@ -4709,6 +4709,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                      AND json_extract(s.attestation_envelope, \
                                                       '$.references_attestation_id') \
                                          = a.attestation_id) \
+                   AND NOT EXISTS (SELECT 1 FROM federation_attestations e \
+                                   WHERE e.tier = 'federation' \
+                                     AND e.cohort_scope NOT IN ('self', 'family') \
+                                     AND e.attestation_type = ?4 \
+                                     AND a.attestation_type = ?4 \
+                                     AND e.attesting_key_id = a.attesting_key_id \
+                                     AND e.attested_key_id = a.attested_key_id \
+                                     AND json_extract(e.attestation_envelope, '$.dimension') \
+                                         = json_extract(a.attestation_envelope, '$.dimension')) \
                  ORDER BY a.attestation_id ASC LIMIT ?2",
             )?;
             // The pointer read names its DISCRIMINATOR in the same breath: the
@@ -4716,8 +4725,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // literal (CC 4.5.1.1 op-separation —
             // `supersets::tests::every_pointer_read_is_discriminator_guarded`).
             let composer = crate::federation::types::attestation_type::SUPERSEDES;
+            // v41.1.0 (#807) — the equivalence arm is restricted to
+            // `delegates_to`, where `(attester, attested, dimension)` IDENTIFIES
+            // the edge and persist already keeps ownership single-valued
+            // (`check_single_node_owner_admission`). It must NOT be generalized:
+            // two `scores` or `chat:` rows share all four and are different
+            // claims, so a wider one settles nothing about the others.
+            let edge = crate::federation::types::attestation_type::DELEGATES_TO;
             let rows = stmt.query_map(
-                rusqlite::params![after, limit, composer],
+                rusqlite::params![after, limit, composer, edge],
                 sqlite_row_to_attestation,
             )?;
             rows.collect()
@@ -43366,6 +43382,15 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn owner_binding_widening_is_not_visible_to_a_peer_807() {
+        let peer = SqliteBackend::open_in_memory().await.unwrap();
+        peer.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_owner_binding_widening_not_visible_to_a_peer_807(
+            &peer, "sq807",
+        )
+        .await;
+    }
     #[tokio::test]
     async fn privileged_sync_door_sqlite_804() {
         let dir = SqliteBackend::open_in_memory().await.unwrap();

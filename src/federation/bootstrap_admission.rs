@@ -1685,6 +1685,87 @@ pub mod test_support {
         }
     }
 
+    /// **CIRISPersist#807 — a widening of the owner-binding is NOT visible to
+    /// a peer, and this pins that as a known limitation rather than leaving it
+    /// to be rediscovered.**
+    ///
+    /// `owner_of` folds `attestation_type == delegates_to` only
+    /// (`live_delegation_granters`). A `supersedes` widening carries the
+    /// binding's whole body — `is_owner_binding_envelope` is true of it — so
+    /// the ONLY thing excluding it is the type check. A peer never holds the
+    /// `self` prior (CC 5.2), so if the announce were a widening, every peer
+    /// would resolve the node to NO OWNER and the audience walk would withhold
+    /// every community row for it.
+    ///
+    /// **This asserts the limitation, deliberately.** Relaxing the type check
+    /// is CIRISPersist#798's work, not a one-line change, because of something
+    /// the read side does that is easy to miss: `precedence::retired_ids`
+    /// DROPS a retraction whose target it cannot resolve (fail-secure toward
+    /// retention). A peer holds the widening and not the prior, so a
+    /// `withdraws` naming the PRIOR is discarded there — the owner would
+    /// revoke the binding on their own node and leave it live at every peer.
+    /// Folding widenings into this resolver therefore requires the retraction
+    /// fold to chain too, and that is a design, not a relaxation.
+    ///
+    /// The consequence for callers, which CIRISServer already does: the
+    /// announce is a FRESH `delegates_to` at federation scope, not a widening.
+    pub async fn exercise_owner_binding_widening_not_visible_to_a_peer_807(
+        peer: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("{tag}-owner-{run}");
+        let node = format!("{tag}-node-{run}");
+        for k in [&owner, &node] {
+            ts::register_hybrid_key_as(peer, k, k, identity_type::USER).await;
+        }
+
+        // The peer's view: it holds ONLY the widening. The `self` prior is
+        // structurally undiscoverable and never replicated to it.
+        let mut widening = scores_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &owner,
+            &node,
+            crate::federation::types::owner_binding::DIMENSION,
+        );
+        widening.attestation_type =
+            crate::federation::types::attestation_type::SUPERSEDES.to_owned();
+        widening.tier = attestation_tier::FEDERATION.to_owned();
+        widening.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        widening.attestation_envelope
+            [crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
+            serde_json::json!(uuid::Uuid::new_v4().to_string());
+        widening.attestation_envelope[crate::federation::envelope::paths::DIFFERS_IN] =
+            serde_json::json!([crate::federation::envelope::row_paths::COHORT_SCOPE]);
+        ts::reseal(&mut widening);
+        assert!(
+            crate::federation::admission::is_owner_binding_envelope(&widening.attestation_envelope),
+            "({tag}) #807: precondition — the widening carries the binding's own body, so the \
+             ONLY thing that can exclude it from the fold is its TYPE"
+        );
+        peer.put_attestation(SignedAttestation {
+            attestation: widening,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #807: the widening admits at the peer: {e}"));
+
+        let resolved = crate::federation::admission::owner_of(peer, &node)
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #807: owner_of must not error: {e}"));
+        assert_eq!(
+            resolved, None,
+            "({tag}) #807: KNOWN LIMITATION, pinned — `owner_of` folds `delegates_to` only, so a \
+             peer holding just the widening resolves NO OWNER. If this flips to Some, the fold \
+             learned to read widenings and CIRISPersist#798's retraction-chaining must have \
+             landed with it: `retired_ids` drops a retraction whose target it cannot resolve, and \
+             a peer cannot resolve the `self` prior, so a withdraw of the prior would leave the \
+             binding live here"
+        );
+    }
+
     /// **CIRISPersist#804 — the privileged sync door, at the DOOR.**
     ///
     /// The quota's own unit tests prove the budgets differ. This proves the
