@@ -5,6 +5,115 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [41.2.0] - 2026-09-05
+
+**A vocabulary persist mirrors must be a SUPERSET of the one it serves.**
+CIRISPersist#810, from CIRISAgent#1077. MINOR: `TaskStatus` gains a member and
+the `status` CHECK widens on both backends. Nothing is removed; every stored
+row is untouched.
+
+*This cut was written while v41.1.0 (CIRISPersist#808) was still open, blocked
+on a CI pre-flight that had not caught up with CIRISRegistry v3.0.0
+(CIRISPersist#809). That landed first; this follows it.*
+
+### The defect
+
+`TaskStatus` (`src/tasks/types.rs`) declared a closed six-member set and its
+doc comment claimed the vocabulary "mirrors the CIRISAgent 2.8.13 task state
+machine". It mirrors something else. Side by side:
+
+| | persist | `ciris_engine.schemas.runtime.enums.TaskStatus` |
+|---|---|---|
+| `pending` `active` `completed` `failed` `deferred` | yes | yes |
+| `rejected` | **no** | yes |
+| `cancelled` | yes | **no** |
+
+The direction of the mismatch is the whole defect. A value persist HAS that
+the consumer does not (`cancelled`) is inert. A value persist LACKS is a
+wedge, because a refused status write is not a refusal the caller can route
+around:
+
+```
+task_update_status('…', 'rejected', None)      -> ValueError: unknown TaskStatus: rejected
+task_update_status('…', 'bogus_status', None)  -> ValueError: unknown TaskStatus: bogus_status
+```
+
+`rejected` is refused **exactly like a typo**. The agent logs the error and
+continues; the write never lands; the task stays `active` forever and nothing
+retries or surfaces it. CIRISAgent#1077 observed three wakeup step tasks stuck
+that way in a single boot on a freshly recreated `datum`, and argues it
+plausibly explains CIRISAgent#1069 (WAKEUP spinning 15,938 rounds over 22h
+producing 0 thoughts) and CIRISAgent#1070 (children-first delete failing,
+because a stuck `active` task keeps thoughts holding the FK).
+
+### Three doors, not one
+
+The report named `task_update_status`. Two more carry the same closed set:
+`upsert_task` deserializes `status` through serde (`unknown variant`), and
+`list_tasks` cannot express the filter. `every_agent_status_survives_all_three_doors_810`
+drives all three on both backends.
+
+### The neighbours are clean
+
+Checked, because the class matters more than the instance: `ThoughtStatus`
+matches CIRISAgent exactly (5/5), and `CorrelationStatus` is a strict superset.
+`TaskStatus` was the only vocabulary that was not a superset of its consumer's.
+
+### The SQLite migration is the hard rebuild case
+
+Postgres widens the CHECK by discovery-then-`DROP CONSTRAINT`/`ADD CONSTRAINT`
+— the V115 shape, four lines. SQLite has no `DROP CONSTRAINT`, so
+`cirislens_tasks` is rebuilt, and two things about that were **measured, not
+reasoned about**:
+
+* `cirislens_thoughts.source_task_id` is `ON DELETE CASCADE` (V035). Emptying
+  `cirislens_tasks` — by `DELETE`, or by the implicit `DELETE FROM` inside
+  `DROP TABLE` — fires it and wipes the agent's entire reasoning record, and
+  the migration reports success. `PRAGMA defer_foreign_keys` defers violation
+  CHECKING, not cascade ACTIONS.
+* Even with the cascade staged and restored, and every referrer emptied first,
+  **COMMIT still fails**: `PRAGMA foreign_key_check` reports zero violations
+  and `COMMIT` raises `FOREIGN KEY constraint failed`. Bisecting statement by
+  statement pins it to `DROP TABLE cirislens_tasks`, where the only remaining
+  referrer is the rebuild itself — `cirislens_tasks_new` holds rows whose
+  `parent_task_id` self-FK names the table being dropped. SQLite's deferred-FK
+  ledger is a counter, not a re-check: it takes a `+1` there that the rename
+  never gives back.
+
+So V136 stages `cirislens_tasks` too, empties everything leaf-first so the
+drop is inert, and re-creates the table **under its final name** — no `_new`,
+no rename, no window in which a live row references a dropped table. (V035 and
+V061 carry the same latent window; it only fires when a row's self-FK column
+is non-NULL, and no deployment has met it yet. Noted, not fixed: an
+already-applied migration cannot be edited.)
+
+### Witnesses
+
+* `every_status_the_agent_can_write_round_trips` — the consumer set as
+  **literals**. The pre-existing `status_sql_round_trip` iterates persist's own
+  enum and is structurally incapable of failing when a member is MISSING:
+  deleting `Rejected` leaves it green on five values. Mutation-tested — with
+  the variant removed, exactly one test in the suite goes red, and it is this
+  one.
+* `v136_rebuild_preserves_thoughts_and_admits_rejected_810` — the rebuild
+  against a POPULATED database, with `PRAGMA foreign_keys = ON` set as
+  `SqliteBackend` sets it. `migrations_run_clean_in_memory` drives the same
+  chain against EMPTY tables and cannot see any of this. Mutation-tested two
+  ways: with the staging removed and a deferral report present, V136 fails to
+  apply; with the report absent — the shape of most databases — it applies
+  cleanly and leaves thoughts at **0 of 2**. Removing the pragma from the
+  witness makes every survival assertion pass on the broken migration, which is
+  why the trailing orphan check is there.
+* `every_agent_status_survives_all_three_doors_810` on SQLite and Postgres.
+  Mutation-tested on Postgres by dropping `'rejected'` from the `ADD
+  CONSTRAINT` list: red with a 23514 on the upsert door.
+
+### Changed
+
+* `TaskStatus::Rejected`, with `as_sql_str` / `parse_str` arms and corrected
+  docstring prose stating the superset rule and what breaks without it.
+* `migrations/postgres/lens/V136__tasks_status_rejected.sql`,
+  `migrations/sqlite/lens/V136__tasks_status_rejected.sql`.
 ## [41.1.0] - 2026-09-04
 
 **A settled owner-binding is not "awaiting its author".** CIRISPersist#807,

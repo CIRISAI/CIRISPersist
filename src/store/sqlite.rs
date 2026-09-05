@@ -41524,6 +41524,283 @@ mod tests {
         assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
     }
 
+    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — the V136 rebuild of
+    /// `cirislens_tasks` must admit `rejected` WITHOUT destroying the
+    /// agent's reasoning record.
+    ///
+    /// `migrations_run_clean_in_memory` drives the same chain and cannot
+    /// see this: it runs every migration against EMPTY tables, so the
+    /// implicit `DELETE FROM` inside V136's `DROP TABLE` deletes nothing
+    /// and the `ON DELETE CASCADE` on `cirislens_thoughts.source_task_id`
+    /// (V035) never fires. The hazard only exists on an UPGRADE of a
+    /// database that has rows — which is every deployment.
+    ///
+    /// Two details here are load-bearing, and this witness is worthless
+    /// without either:
+    ///
+    /// 1. `PRAGMA foreign_keys = ON`. `Connection::open_in_memory()`
+    ///    defaults it OFF; `SqliteBackend` sets it at every connection
+    ///    open. With it off, `DROP TABLE` fires no cascade at all and the
+    ///    unstaged migration passes.
+    /// 2. Rows in `cirislens_thoughts` BEFORE the target-135 boundary, and
+    ///    a `source_task_id` that actually points at a task being rebuilt.
+    ///    An orphan thought would survive a cascade it was never subject
+    ///    to.
+    ///
+    /// Both mutations were run, not assumed. Removing the
+    /// `cirislens_thoughts` staging from
+    /// `migrations/sqlite/lens/V136__tasks_status_rejected.sql` turns this
+    /// red two different ways depending on the fixture, and the pair is the
+    /// point:
+    ///
+    /// * with the deferral report present, V136 fails to APPLY — COMMIT is
+    ///   refused because the report's `thought_id` no longer resolves;
+    /// * with it absent — the shape of most databases — V136 APPLIES
+    ///   CLEANLY, reports success, and leaves `cirislens_thoughts` at 0 of
+    ///   2 rows. That is the production failure mode, and the count below
+    ///   is the only thing in the suite that sees it.
+    ///
+    /// Removing the pragma above (while leaving the migration broken) makes
+    /// every survival assertion pass: the cascade never fires, so there is
+    /// nothing to detect. Only the trailing orphan check notices, which is
+    /// why it is here.
+    #[test]
+    fn v136_rebuild_preserves_thoughts_and_admits_rejected_810() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Production parity — and the whole hazard. See (1) above.
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Pass 1: everything up to and including V135 (the pre-V136 HEAD).
+        embedded::migrations::runner()
+            .set_target(refinery::Target::Version(135))
+            .run(&mut conn)
+            .expect("migrate to V135");
+
+        const T0: &str = "2026-09-05T00:00:00+00:00";
+
+        // A parent task carrying a correlation_id (so V036's partial unique
+        // expression index has something to index), and a child task, so the
+        // self-FK is exercised across the swap.
+        conn.execute(
+            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
+                priority, created_at, updated_at, parent_task_id, context_json, \
+                outcome_json, retry_count, signed_by, signature, signed_at, \
+                updated_info_available, updated_info_content, agent_occurrence_id, \
+                images_json) \
+             VALUES ('t-parent', 'chan-1', 'the parent', 'active', 3, ?1, ?1, NULL, \
+                '{\"correlation_id\":\"corr-1\"}', '{\"note\":\"o\"}', 2, 'signer-a', \
+                'sig-a', ?1, 1, 'more info', 'occ-a', '[\"img\"]')",
+            rusqlite::params![T0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
+                created_at, updated_at, parent_task_id, agent_occurrence_id) \
+             VALUES ('t-child', 'chan-1', 'the child', 'pending', ?1, ?1, 't-parent', \
+                'occ-a')",
+            rusqlite::params![T0],
+        )
+        .unwrap();
+
+        // Two thoughts under the parent task. These are what the cascade
+        // would take.
+        for (tid, parent) in [("th-1", None), ("th-2", Some("th-1"))] {
+            conn.execute(
+                "INSERT INTO cirislens_thoughts (thought_id, source_task_id, channel_id, \
+                    thought_type, status, created_at, updated_at, round_number, content, \
+                    thought_depth, parent_thought_id, agent_occurrence_id) \
+                 VALUES (?1, 't-parent', 'chan-1', 'standard', 'completed', ?2, ?2, 1, \
+                    'reasoning', 0, ?3, 'occ-a')",
+                rusqlite::params![tid, T0, parent],
+            )
+            .unwrap();
+        }
+
+        // A deferral report pointing at BOTH — the NO ACTION referrer whose
+        // violation V136 leaves to COMMIT rather than staging.
+        conn.execute(
+            "INSERT INTO cirislens_deferral_reports (message_id, task_id, thought_id, \
+                package, created_at) \
+             VALUES ('msg-1', 't-parent', 'th-1', 'pkg', ?1)",
+            rusqlite::params![T0],
+        )
+        .unwrap();
+
+        // Before V136 the CHECK refuses the agent's `rejected` — the
+        // CIRISAgent#1077 wedge, reproduced at the schema layer.
+        let refused = conn.execute(
+            "UPDATE cirislens_tasks SET status = 'rejected' WHERE task_id = 't-parent'",
+            [],
+        );
+        assert!(
+            refused.is_err(),
+            "V024's CHECK must still refuse 'rejected' at V135 — otherwise this \
+             witness proves nothing about V136"
+        );
+
+        // Pass 2: V136.
+        embedded::migrations::runner()
+            .run(&mut conn)
+            .expect("migrate to HEAD (V136)");
+
+        // THE POINT: the reasoning record survived the cascade.
+        let thoughts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cirislens_thoughts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            thoughts, 2,
+            "V136 CASCADE-WIPED cirislens_thoughts. Emptying cirislens_tasks — by \
+             DELETE, or by the implicit DELETE FROM inside DROP TABLE — fires the \
+             ON DELETE CASCADE on source_task_id; PRAGMA defer_foreign_keys defers \
+             violation CHECKING, not cascade ACTIONS. The staged copy must be \
+             restored before COMMIT."
+        );
+        let (src, parent_th): (String, Option<String>) = conn
+            .query_row(
+                "SELECT source_task_id, parent_thought_id FROM cirislens_thoughts \
+                 WHERE thought_id = 'th-2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src, "t-parent");
+        assert_eq!(parent_th.as_deref(), Some("th-1"));
+
+        // The deferral report survived too.
+        let reports: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cirislens_deferral_reports", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(reports, 1, "the NO ACTION referrer must be untouched");
+
+        // Every task column round-tripped through the rebuild.
+        let row: (
+            String,
+            String,
+            i64,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT channel_id, description, priority, outcome_json, retry_count, \
+                    signed_by, signature, signed_at, updated_info_available, \
+                    updated_info_content, images_json \
+                 FROM cirislens_tasks WHERE task_id = 't-parent'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                    ))
+                },
+            )
+            .expect("the parent task survives the rebuild");
+        assert_eq!(
+            row,
+            (
+                "chan-1".into(),
+                "the parent".into(),
+                3,
+                "{\"note\":\"o\"}".into(),
+                2,
+                "signer-a".into(),
+                "sig-a".into(),
+                T0.into(),
+                1,
+                "more info".into(),
+                "[\"img\"]".into(),
+            )
+        );
+        let child_parent: String = conn
+            .query_row(
+                "SELECT parent_task_id FROM cirislens_tasks WHERE task_id = 't-child'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parent, "t-parent", "the self-FK column survives");
+
+        // All four indexes came back — V024's three and V036's partial unique.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                    AND tbl_name = 'cirislens_tasks' AND name IN \
+                    ('tasks_status_occurrence', 'tasks_channel', 'tasks_parent', \
+                     'tasks_correlation_id_unique')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 4, "all four indexes must survive the rebuild");
+
+        // V036's unique index still BITES (a rebuild that recreated it as a
+        // plain index would still count 4 above).
+        let dup = conn.execute(
+            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
+                created_at, updated_at, context_json, agent_occurrence_id) \
+             VALUES ('t-dup', 'chan-1', 'dup', 'pending', ?1, ?1, \
+                '{\"correlation_id\":\"corr-1\"}', 'occ-a')",
+            rusqlite::params![T0],
+        );
+        assert!(
+            dup.is_err(),
+            "tasks_correlation_id_unique must still be UNIQUE after the rebuild"
+        );
+
+        // And the reason for the whole migration.
+        conn.execute(
+            "UPDATE cirislens_tasks SET status = 'rejected' WHERE task_id = 't-parent'",
+            [],
+        )
+        .expect("V136 must admit the agent's `rejected`");
+        let st: String = conn
+            .query_row(
+                "SELECT status FROM cirislens_tasks WHERE task_id = 't-parent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "rejected");
+
+        // The set is still CLOSED — a widened CHECK, not a dropped one.
+        let typo = conn.execute(
+            "UPDATE cirislens_tasks SET status = 'rejcted' WHERE task_id = 't-child'",
+            [],
+        );
+        assert!(
+            typo.is_err(),
+            "V136 widens the CHECK; it must not remove it. A typo is still a refusal."
+        );
+
+        // The FK still binds after the swap: an orphan thought is refused.
+        let orphan = conn.execute(
+            "INSERT INTO cirislens_thoughts (thought_id, source_task_id, status, \
+                created_at, updated_at, content) \
+             VALUES ('th-orphan', 'no-such-task', 'pending', ?1, ?1, 'x')",
+            rusqlite::params![T0],
+        );
+        assert!(
+            orphan.is_err(),
+            "cirislens_thoughts.source_task_id must still resolve to the rebuilt table"
+        );
+    }
+
     /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table
     /// rebuild MUST preserve existing federation_blobs rows (incl. the
     /// V053 access-tracking columns), keep every index, and admit

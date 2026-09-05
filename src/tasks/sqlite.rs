@@ -901,6 +901,77 @@ mod tests {
         assert_eq!(seen, expected);
     }
 
+    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — every status the agent
+    /// can write survives all three doors, on SQLite.
+    ///
+    /// The reported symptom was one door (`task_update_status`). Two more
+    /// carry the same closed set — `upsert_task` deserializes `status`
+    /// through serde, and `list_tasks` filters on it — so the fix is only
+    /// real if all three admit `rejected`. The wire strings are spelled as
+    /// literals for the same reason as
+    /// `every_status_the_agent_can_write_round_trips`: a loop over
+    /// persist's own enum cannot fail when persist's enum is the defect.
+    #[tokio::test]
+    async fn every_agent_status_survives_all_three_doors_810() {
+        let (_b, svc) = fresh_backend().await;
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+
+        for wire in [
+            "pending",
+            "active",
+            "completed",
+            "failed",
+            "deferred",
+            "rejected",
+        ] {
+            let status = TaskStatus::parse_str(wire)
+                .unwrap_or_else(|| panic!("persist refuses the agent's `{wire}`"));
+
+            // Door 1 — upsert (serde + the SQL CHECK).
+            let id = format!("t-{wire}-{}", Uuid::new_v4().simple());
+            svc.upsert_task(mk_task(&id, status, &occ))
+                .await
+                .unwrap_or_else(|e| panic!("upsert `{wire}`: {e}"));
+            let got = svc.get_task(&id).await.unwrap().expect("present");
+            assert_eq!(got.status, status, "`{wire}` round-trips through upsert");
+
+            // Door 2 — the focused status update, the CIRISAgent#1077 site.
+            let moved = format!("m-{wire}-{}", Uuid::new_v4().simple());
+            svc.upsert_task(mk_task(&moved, TaskStatus::Active, &occ))
+                .await
+                .unwrap();
+            assert!(
+                svc.update_task_status(&moved, status, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("update_task_status `{wire}`: {e}")),
+                "a live row must report updated"
+            );
+            assert_eq!(
+                svc.get_task(&moved).await.unwrap().expect("present").status,
+                status
+            );
+
+            // Door 3 — the list filter.
+            let page = svc
+                .list_tasks(
+                    TaskFilter {
+                        agent_occurrence_id: Some(occ.clone()),
+                        status: Some(status),
+                        ..Default::default()
+                    },
+                    None,
+                    50,
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = page.items.iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                ids.contains(&id.as_str()) && ids.contains(&moved.as_str()),
+                "`{wire}` must be expressible as a list filter; got {ids:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn update_task_status_success_missing_outcome_merge() {
         let (_b, svc) = fresh_backend().await;

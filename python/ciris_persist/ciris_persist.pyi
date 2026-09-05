@@ -3101,7 +3101,13 @@ class Engine:
         """v1.5.9 — Focused status update + optional outcome merge.
 
         ``new_status`` is one of ``pending`` / ``active`` /
-        ``completed`` / ``failed`` / ``cancelled`` / ``deferred``.
+        ``completed`` / ``failed`` / ``deferred`` / ``rejected`` /
+        ``cancelled``. The first six are exactly CIRISAgent's
+        ``TaskStatus``; ``cancelled`` is persist-only. As of v41.2.0
+        (CIRISPersist#810) this set is a SUPERSET of the agent's and
+        stays one — before that, ``rejected`` was refused like a typo
+        and the caller's task stayed ``active`` forever
+        (CIRISAgent#1077).
         ``outcome_json`` (when not None) is decoded and stored into the
         ``outcome_json`` column; ``None`` preserves the existing value.
 
