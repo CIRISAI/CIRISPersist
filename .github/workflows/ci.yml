@@ -2042,19 +2042,49 @@ jobs:
           ls -la dist/manifest-*.json
           # Stash the list for the register step.
           printf '%s\n' "${SIGNED_BINARY_TARGETS[@]}" > dist/signed-binary-targets.txt
-      - name: pre-flight registry steward-key check
-        # CIRISRegistry exposes GET /v1/steward-key with the active
-        # signing key + key_id. We log it for human-visible
-        # confirmation that the registry isn't running in ephemeral
-        # mode. Per persist issue #2 / registry's own AV-28: an
-        # ephemeral-key registry signs every manifest with a key
-        # that disappears on registry restart, invalidating
-        # downstream verify caches.
+      - name: pre-flight registry trust-root check
+        # CIRISPersist#809 — this guard used to require
+        # `stewards[].deployed` from GET /v1/steward-key. CIRISRegistry
+        # v3.0.0 (live 2026-09-04 ~19:41Z) moved that endpoint from the
+        # registry's self-published steward key to the PORTABLE TRUST
+        # ROOT — the accord `GenesisBundle`. There is no `stewards` key
+        # in the new body in any form, so the old parse read `[]` and
+        # exited 1 against a registry that was healthy and carrying a
+        # full 2-of-3 quorum. It fired on CIRISPersist#808 at 23:47Z,
+        # six minutes after #809 was filed predicting it.
         #
-        # We don't fail the build on ephemeral mode (registry might
-        # be staging / dev intentionally); we surface it loudly so
-        # the human running CI sees the posture before downstream
-        # peers do.
+        # Both shapes are accepted, deliberately — a pre-flight that
+        # only understands the shape shipped yesterday turns every
+        # registry rollback into a red tag run. CIRISEdge#571 is the
+        # reference implementation; this is that pattern.
+        #
+        # WHAT THIS GATES, AND WHAT IT DOES NOT
+        # -------------------------------------
+        # * OLD shape  -> still GATED on a deployed steward, unchanged.
+        # * NEW shape  -> REPORT ONLY. Edge's version also asserts the
+        #   bundle's own declared quorum is met (`authorizations` >= M
+        #   parsed from `consensus_protocol`). That assertion is
+        #   deliberately NOT lifted here while the trust root is in
+        #   transition: holders and authorizations move during the
+        #   migration, and a tag run blocked on a mid-migration count is
+        #   a release blocked on somebody else's deploy window.
+        #
+        #   Say plainly what that costs, because a check that cannot
+        #   fail is a report (and this repo has shipped that mistake):
+        #   for the length of the transition this leg CANNOT catch a
+        #   registry serving a bundle whose quorum has collapsed. The
+        #   registration step that follows is what actually fails if the
+        #   registry cannot accept a build; this leg is early warning,
+        #   and right now the new-shape half of it is warning only.
+        #   Restore the quorum assertion when the root settles —
+        #   CIRISPersist#809 tracks it.
+        # * UNRECOGNISED shape -> FAILS CLOSED. An unreachable registry,
+        #   a truncated body, or a third shape nobody has seen is still
+        #   a red, which is what keeps this from being pure decoration.
+        #
+        # `served_by.accepts_this_root` is false for the registry node
+        # and is INFORMATIONAL (the outer envelope is unsigned by
+        # design; this is an unauthenticated read). Warn, never gate.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
@@ -2062,23 +2092,68 @@ jobs:
             REGISTRY_URL="https://api.registry.ciris-services-1.ai"
             echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
           fi
-          echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
+          echo "Registry trust-root snapshot for ${REGISTRY_URL}:"
           curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          # v3.6.6 — registry shipped M-of-N steward shape (per
-          # CIRISVerify#31). Old shape was `{classical: {key_id}}`;
-          # new shape is `{stewards: [{region, key_id, deployed}, ...],
-          # verification_policy: {threshold, of_total, scheme}}`. Surface
-          # the first deployed steward's key_id and the policy line.
           python3 <<'PYEOF' >> "$GITHUB_STEP_SUMMARY"
           import json, sys
-          d = json.load(open("dist/steward-key.json"))
-          deployed = [s for s in d.get("stewards", []) if s.get("deployed")]
-          if not deployed:
-              print("::error::registry has no deployed stewards", file=sys.stderr)
+
+          def err(msg):
+              print(f"::error::{msg}", file=sys.stderr)
               sys.exit(1)
-          p = d.get("verification_policy", {})
-          print(f"registry steward key_id={deployed[0]['key_id']}")
-          print(f"registry verification policy={p.get('threshold','?')}-of-{p.get('of_total','?')} {p.get('scheme','')}")
+
+          try:
+              with open("dist/steward-key.json") as fh:
+                  d = json.load(fh)
+          except Exception as exc:
+              err(f"registry /v1/steward-key unreadable or not JSON: {exc}")
+          if not isinstance(d, dict):
+              err(f"registry /v1/steward-key is {type(d).__name__}, expected object")
+
+          # ── NEW: the accord GenesisBundle (CIRISRegistry v3.0.0+) ──
+          if isinstance(d.get("bundle"), dict):
+              b = d["bundle"]
+              holders = b.get("holders") or []
+              auths = b.get("authorizations") or []
+              proto = b.get("consensus_protocol", "?")
+              print("registry trust root: accord GenesisBundle (CIRISRegistry v3.0.0 shape)")
+              print(f"  charter_root_key_id={d.get('charter_root_key_id', '?')}")
+              print(f"  bundle_fingerprint={d.get('bundle_fingerprint', '?')}")
+              print(f"  bundle_version={b.get('version', '?')} family_key_id={b.get('family_key_id', '?')}")
+              print(f"  consensus_protocol={proto}  holders={len(holders)}  authorizations={len(auths)}")
+              print(f"  serve_nodes={len(b.get('serve_nodes') or [])}  attestations={len(b.get('attestations') or [])}")
+              # NOT a gate while the root is in transition — see the step
+              # comment. Loud when it looks wrong, red for nobody.
+              print("  quorum NOT asserted here (transition; CIRISPersist#809)")
+              served = d.get("served_by") or {}
+              if not served.get("accepts_this_root", False):
+                  print(
+                      "::warning::registry node "
+                      f"{served.get('node_key_id', '?')} reports accepts_this_root=false "
+                      "(informational: the outer envelope is unsigned by design)",
+                      file=sys.stderr,
+                  )
+              sys.exit(0)
+
+          # ── OLD: M-of-N steward list (registry <= v2.x, CIRISVerify#31) ──
+          if "stewards" in d:
+              deployed = [s for s in (d.get("stewards") or []) if s.get("deployed")]
+              if not deployed:
+                  err("registry has no deployed stewards")
+              p = d.get("verification_policy", {})
+              print("registry trust root: M-of-N steward list (pre-v3.0.0 shape)")
+              print(f"  steward key_id={deployed[0]['key_id']}")
+              print(
+                  f"  verification policy={p.get('threshold', '?')}-of-{p.get('of_total', '?')} "
+                  f"{p.get('scheme', '')}"
+              )
+              sys.exit(0)
+
+          # ── Neither. Fail closed rather than guess. ──
+          err(
+              "registry /v1/steward-key matched no known shape "
+              f"(top-level keys: {sorted(d)}). Expected either a v3.0.0 "
+              "`bundle` or a pre-v3.0.0 `stewards` list."
+          )
           PYEOF
       - name: register multi-target build with CIRISRegistry
         # v0.9.2 (CIRISPersist#42) — replaces the prior custom

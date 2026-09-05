@@ -3951,6 +3951,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                                 &s.attestation_envelope,
                             ) == Some(a.attestation_id.as_str())
                     })
+                    // v41.1.0 (CIRISPersist#807) — …and not already published
+                    // WIDER by an equivalent row. A candidate exists to make an
+                    // undiscoverable row discoverable; if the same attester has
+                    // already put the same claim on a discoverable scope by
+                    // other means, there is nothing here awaiting anybody.
+                    && !state.federation_attestations.iter().any(|e| {
+                        e.tier == attestation_tier::FEDERATION
+                            && !cohort_scope::suppresses_holds_bytes(&e.cohort_scope)
+                            // `delegates_to` ONLY: there `(attester, attested,
+                            // dimension)` identifies the edge. Two `scores` or
+                            // `chat:` rows share all four and are DIFFERENT
+                            // claims, so a wider one settles nothing.
+                            && e.attestation_type
+                                == crate::federation::types::attestation_type::DELEGATES_TO
+                            && a.attestation_type == e.attestation_type
+                            && e.attesting_key_id == a.attesting_key_id
+                            && e.attested_key_id == a.attested_key_id
+                            && crate::federation::admission::envelope_dimension(
+                                &e.attestation_envelope,
+                            ) == crate::federation::admission::envelope_dimension(
+                                &a.attestation_envelope,
+                            )
+                    })
             })
             .cloned()
             .collect();
@@ -10003,6 +10026,14 @@ mod accord_tests {
     }
 
     #[tokio::test]
+    async fn owner_binding_widening_is_not_visible_to_a_peer_807() {
+        let peer = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_owner_binding_widening_not_visible_to_a_peer_807(
+            &peer, "mem807",
+        )
+        .await;
+    }
+    #[tokio::test]
     async fn privileged_sync_door_memory_804() {
         let dir = MemoryBackend::new();
         dir.set_self_key_id(Some("mem804-self".to_owned()));
@@ -10709,6 +10740,96 @@ mod tests {
             .map(|a| a.attestation_id)
             .collect();
         assert_eq!(after, vec!["s-self".to_string()]);
+    }
+
+    /// CIRISPersist#807 — **a row already published WIDER by other means is
+    /// not awaiting anybody.**
+    ///
+    /// The owner-binding case CIRISServer measured: setup writes
+    /// `delegates_to(owner → node)` at `self`, and the announce publishes a
+    /// FRESH `delegates_to` at federation scope rather than a `supersedes`
+    /// (which is correct — see `owner_binding_widening_is_not_visible_to_a_peer_807`
+    /// for why a `supersedes` announce would be invisible to every peer). The
+    /// `self` row therefore never acquires a referencing `supersedes`, and the
+    /// sweep reported `awaiting_actor` on every announced node, every tick,
+    /// forever: "1 row(s) are stuck awaiting their author's signer" — false on
+    /// an announced node, and misleading on an un-announced one.
+    ///
+    /// Mutation: drop the equivalent-wider arm and this goes red.
+    #[tokio::test]
+    async fn an_equivalently_wider_row_retires_the_candidate_807() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        let be = MemoryBackend::new();
+        let push = |id: &str, scope: &str| {
+            let mut a = fix_attestation(id, "owner", "node-a", "owner");
+            a.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            a.tier = attestation_tier::FEDERATION.to_string();
+            a.cohort_scope = scope.to_string();
+            resign_fix(&mut a);
+            be.state
+                .lock()
+                .expect("memory backend lock")
+                .federation_attestations
+                .push(a);
+        };
+        // The `self` binding alone IS a candidate — nothing publishes it yet.
+        push("binding-self", cohort_scope::SELF);
+        let ids: Vec<String> = be
+            .list_widening_candidates(None, 100)
+            .await
+            .expect("page")
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["binding-self".to_string()],
+            "#807: an undiscoverable row with no wider publication IS awaiting one"
+        );
+
+        // The announce: a fresh equivalent row at a discoverable scope.
+        push("binding-announced", cohort_scope::FEDERATION);
+        let ids: Vec<String> = be
+            .list_widening_candidates(None, 100)
+            .await
+            .expect("page")
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert!(
+            ids.is_empty(),
+            "#807: the same attester has published the same claim (type, attested key and \
+             dimension) at a DISCOVERABLE scope, so the `self` row is settled, not stuck. \
+             Reporting it as a candidate makes `promote_consented_backlog` say \
+             `awaiting_actor` on every announced node forever: {ids:?}"
+        );
+
+        // …and a DIFFERENT claim by the same attester does not retire it —
+        // otherwise one announce would silence every candidate that node has.
+        push("other-self", cohort_scope::SELF);
+        {
+            let mut st = be.state.lock().expect("memory backend lock");
+            let row = st
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == "other-self")
+                .expect("row");
+            row.attested_key_id = "node-b".into();
+            crate::federation::tier_ingest::test_support::reseal(row);
+        }
+        let ids: Vec<String> = be
+            .list_widening_candidates(None, 100)
+            .await
+            .expect("page")
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["other-self".to_string()],
+            "#807: the exclusion must match the CLAIM (attester, type, attested key, dimension) \
+             — a wider row about a different subject settles nothing"
+        );
     }
 
     // ── v17.4.0 (FSD-005 Appendix C) — scores read surface parity ──

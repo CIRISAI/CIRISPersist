@@ -5623,6 +5623,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                                      AND s.attesting_key_id = a.attesting_key_id \
                                      AND (s.attestation_envelope::jsonb ->> \
                                           'references_attestation_id') = a.attestation_id::text) \
+                   AND NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations e \
+                                   WHERE e.tier = 'federation' \
+                                     AND e.cohort_scope NOT IN ('self', 'family') \
+                                     AND e.attestation_type = $4 \
+                                     AND a.attestation_type = $4 \
+                                     AND e.attesting_key_id = a.attesting_key_id \
+                                     AND e.attested_key_id = a.attested_key_id \
+                                     AND (e.attestation_envelope::jsonb ->> 'dimension') \
+                                         IS NOT DISTINCT FROM \
+                                         (a.attestation_envelope::jsonb ->> 'dimension')) \
                  ORDER BY a.attestation_id ASC LIMIT $2",
                 // The pointer read names its DISCRIMINATOR in the same breath:
                 // bound from the closed constant, never a hand-typed literal.
@@ -5630,6 +5640,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &after_attestation_id,
                     &limit,
                     &crate::federation::types::attestation_type::SUPERSEDES,
+                    // v41.1.0 (#807) — see the sqlite twin: the equivalence arm
+                    // is `delegates_to`-only on purpose.
+                    &crate::federation::types::attestation_type::DELEGATES_TO,
                 ],
             )
             .await

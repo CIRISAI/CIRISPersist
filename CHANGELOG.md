@@ -5,6 +5,73 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [41.1.0] - 2026-09-04
+
+**A settled owner-binding is not "awaiting its author".** CIRISPersist#807,
+reported by CIRISServer while getting the two-node chat ladder green.
+
+### The defect
+
+Two readers disagreed about what a widening of the owner-binding is.
+`list_widening_candidates` (v39, the consent sweep's page source) offered the
+`self`-scoped `delegates_to(owner → node)` binding as a widening candidate —
+and kept offering it after the owner had announced, because the announce mints
+a FRESH federation-scope `delegates_to`, not a `supersedes` referencing the
+`self` row. So `promote_consented_backlog` reported `awaiting_actor = 1` on
+every announced node, every tick, forever. CIRISServer's reconcile logged it as
+*"1 row(s) are stuck awaiting their author's signer and will NOT move on their
+own"* — false on an announced node, and misleading on an un-announced one
+(which is P2P-only by the owner's choice).
+
+### Fixed
+
+A row is no longer a widening candidate when the same attester has already
+published the **same claim at a discoverable scope**. A candidate exists to
+make an undiscoverable row discoverable; if that has happened by other means,
+nothing is awaiting anybody.
+
+Restricted to `delegates_to`, deliberately: there `(attester, attested key,
+dimension)` identifies the edge, and persist already keeps ownership
+single-valued (`check_single_node_owner_admission`). The first draft of this
+predicate was type-agnostic and retired `scores` rows too — two `scores` or
+`chat:` rows share all four fields and are DIFFERENT claims, so a wider one
+settles nothing about the others. The existing #530 witness caught that
+immediately.
+
+### What was NOT done, and why
+
+The report offered a second option: fold widenings into
+`live_delegation_granters`, so `widen_audience` could become the announce. That
+is the better DX and it is what v39 says readers do — but it is
+CIRISPersist#798's work, not a relaxation of one type check, because of
+something on the read side:
+
+**`precedence::retired_ids` DROPS a retraction whose target it cannot resolve**
+(fail-secure toward retention). A peer holds the widening and never the `self`
+prior (CC 5.2), so a `withdraws` naming the prior is discarded there. Folding
+widenings into the owner-binding resolver without chaining the retraction fold
+would let an owner revoke the binding on their own node and leave it live at
+every peer. That is a revocation split-brain, and it has to be designed rather
+than switched on.
+
+So the announce stays a fresh federation-scope `delegates_to`, which is what
+CIRISServer and edge's bench-mesh runner already do.
+
+### The limitation is pinned, not just described
+
+`exercise_owner_binding_widening_not_visible_to_a_peer_807` builds the peer's
+view — a directory holding ONLY the widening — and asserts `owner_of` resolves
+**None**. That is the case the report identified as uncovered, and it is the one
+that decides discovery.
+
+It asserts a limitation on purpose, and it is a tripwire rather than a
+tombstone: relaxing the `attestation_type` check in `live_delegation_granters`
+turns it red (verified by mutation), and the failure message hands the reader
+the retraction-chaining requirement. The witness also asserts up front that the
+widening satisfies `is_owner_binding_envelope` — so the record shows the TYPE
+check is the only thing excluding it, which is what makes #798 a small change
+once the revocation half is designed.
+
 ## [41.0.0] - 2026-09-04
 
 **A node is not a peer of itself, and a cohort-mate is not a stranger.**
