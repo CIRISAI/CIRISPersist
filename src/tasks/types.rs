@@ -11,13 +11,29 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Task lifecycle status. Vocabulary mirrors the CIRISAgent 2.8.13
-/// task state machine: `pending → active → (completed | failed |
-/// cancelled | deferred)`. Persist does not enforce transition
-/// monotonicity at the trait surface — the agent owns the state
-/// machine and persist accepts whatever the agent asserts. The
+/// Task lifecycle status: `pending → active → (completed | failed |
+/// rejected | cancelled | deferred)`. Persist does not enforce
+/// transition monotonicity at the trait surface — the agent owns the
+/// state machine and persist accepts whatever the agent asserts. The
 /// CHECK constraint at the schema layer keeps the vocabulary
 /// closed-set so a bad caller can't write an unknown status.
+///
+/// **This set is a SUPERSET of the consumer enum it serves**, and that
+/// direction is load-bearing. The consumer is
+/// `ciris_engine.schemas.runtime.enums.TaskStatus` in CIRISAgent, which
+/// declares `pending / active / completed / failed / deferred /
+/// rejected`. A value persist is missing is not a refusal the caller can
+/// route around: the agent logs the `ValueError` and continues, the write
+/// never lands, and the task stays `active` forever with nothing to
+/// retry it — the CIRISAgent#1077 wedge, which persist shipped for the
+/// whole life of the six-member set. A value persist has that the agent
+/// does not (`cancelled`, here) is inert.
+///
+/// So: when the consumer enum grows, this one grows with it, in a MINOR,
+/// with a CHECK-widening migration on both backends. It never shrinks.
+/// `every_status_the_agent_can_write_round_trips` pins the consumer set
+/// as literals so an addition here that misses the migration — or a
+/// migration that misses this — is a red, not a production wedge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -27,6 +43,12 @@ pub enum TaskStatus {
     Failed,
     Cancelled,
     Deferred,
+    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — the agent's
+    /// `TaskStatus.REJECTED`. Distinct from `Failed` (the task ran and
+    /// did not succeed) and from `Deferred` (the task is waiting on a
+    /// wise authority): the work was declined, and the agent's
+    /// `reject` handler is the only writer of it.
+    Rejected,
 }
 
 impl TaskStatus {
@@ -39,6 +61,7 @@ impl TaskStatus {
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
             TaskStatus::Deferred => "deferred",
+            TaskStatus::Rejected => "rejected",
         }
     }
 
@@ -51,6 +74,7 @@ impl TaskStatus {
             "failed" => Some(TaskStatus::Failed),
             "cancelled" => Some(TaskStatus::Cancelled),
             "deferred" => Some(TaskStatus::Deferred),
+            "rejected" => Some(TaskStatus::Rejected),
             _ => None,
         }
     }
@@ -201,10 +225,44 @@ mod tests {
             TaskStatus::Failed,
             TaskStatus::Cancelled,
             TaskStatus::Deferred,
+            TaskStatus::Rejected,
         ] {
             assert_eq!(TaskStatus::parse_str(s.as_sql_str()), Some(s));
         }
         assert_eq!(TaskStatus::parse_str("UNKNOWN"), None);
+    }
+
+    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — the consumer set,
+    /// spelled as LITERALS.
+    ///
+    /// `status_sql_round_trip` above iterates `TaskStatus`'s own members,
+    /// so it is structurally incapable of failing when the defect is a
+    /// MISSING member: delete `Rejected` and that test still passes on
+    /// five values. This one asserts against the six strings CIRISAgent's
+    /// `ciris_engine.schemas.runtime.enums.TaskStatus` can hand us, copied
+    /// by hand and deliberately not derived from anything in this crate.
+    /// It is the only test here that goes red when persist's vocabulary
+    /// falls behind its consumer's again.
+    #[test]
+    fn every_status_the_agent_can_write_round_trips() {
+        for wire in [
+            "pending",
+            "active",
+            "completed",
+            "failed",
+            "deferred",
+            "rejected",
+        ] {
+            let parsed = TaskStatus::parse_str(wire).unwrap_or_else(|| {
+                panic!(
+                    "persist refuses `{wire}`, which CIRISAgent's TaskStatus can write. \
+                     A refused status write is not a refusal the agent can route around \
+                     (CIRISAgent#1077): it logs and continues, and the task stays active \
+                     forever. Add the member here AND widen the CHECK on both backends."
+                )
+            });
+            assert_eq!(parsed.as_sql_str(), wire);
+        }
     }
 
     #[test]

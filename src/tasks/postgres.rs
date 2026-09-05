@@ -598,6 +598,88 @@ mod tests {
         assert_eq!(got.parent_task_id, Some(parent_id));
     }
 
+    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — the SQLite twin of
+    /// `every_agent_status_survives_all_three_doors_810`, on the backend
+    /// production actually runs. V136 widens the CHECK by DROP/ADD
+    /// CONSTRAINT here rather than by rebuild, so this is a genuinely
+    /// different mechanism reaching the same admission, not the same code
+    /// exercised twice.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn tasks_pg_every_agent_status_survives_all_three_doors_810() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let occ = format!("occ-{}", Uuid::new_v4().simple());
+
+        for wire in [
+            "pending",
+            "active",
+            "completed",
+            "failed",
+            "deferred",
+            "rejected",
+        ] {
+            let status = TaskStatus::parse_str(wire)
+                .unwrap_or_else(|| panic!("persist refuses the agent's `{wire}`"));
+
+            let id = format!("t-{}", Uuid::new_v4().simple());
+            TaskService::upsert_task(&backend, mk_task(&id, status, &occ))
+                .await
+                .unwrap_or_else(|e| panic!("upsert `{wire}`: {e}"));
+            assert_eq!(
+                backend
+                    .get_task(&id)
+                    .await
+                    .unwrap()
+                    .expect("present")
+                    .status,
+                status
+            );
+
+            let moved = format!("m-{}", Uuid::new_v4().simple());
+            TaskService::upsert_task(&backend, mk_task(&moved, TaskStatus::Active, &occ))
+                .await
+                .unwrap();
+            assert!(
+                TaskService::update_task_status(&backend, &moved, status, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("update_task_status `{wire}`: {e}"))
+            );
+            assert_eq!(
+                backend
+                    .get_task(&moved)
+                    .await
+                    .unwrap()
+                    .expect("present")
+                    .status,
+                status
+            );
+
+            let page = TaskService::list_tasks(
+                &backend,
+                TaskFilter {
+                    agent_occurrence_id: Some(occ.clone()),
+                    status: Some(status),
+                    ..Default::default()
+                },
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+            let ids: Vec<&str> = page.items.iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                ids.contains(&id.as_str()) && ids.contains(&moved.as_str()),
+                "`{wire}` must be expressible as a list filter; got {ids:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn tasks_pg_upsert_idempotent_then_overwrites_mutable_cols() {
