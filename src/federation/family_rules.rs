@@ -24,7 +24,8 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
-//! of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1).
+//! of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1; the
+//! 22nd is `duty:`, CIRISPersist#814 part 1).
 //!
 //! # What is derived and what is pinned
 //!
@@ -225,6 +226,30 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     // on — not by a quorum, not by the lowest id, and not by a single-node
     // self. Being the only occurrence is not authority to act; it means
     // there is one place where nobody is home.
+    // v42.0.0 (CIRISPersist#814 part 1) — CC 3.1.1 ratified the duty family in
+    // rc5; the persist-side evidence row (`CLM-duty` @ 3.1.1) publishes on
+    // CIRISPersist#803, so until that lands the rule is enforced here and NOT
+    // resolvable from the registry row. Recorded rather than assumed.
+    PersistFamilyRule {
+        prefix: "duty:",
+        rule: "ISSUER-BOUND emitter + INHERITED reach: a duty MUST name the permission it \
+               attaches to (references_attestation_id), its attester MUST be that \
+               permission's issuer, and it may never project wider than the permission \
+               does — a duty visible where its permission is not leaks the permission's \
+               existence",
+        enforced_at: &[
+            "federation::admission::check_duty_admission",
+            "federation::namespace::attestation_family",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#100 (rc5 CC 3.1.1) states the duty rule; the \
+                 machine-readable row (`CLM-duty` @ 3.1.1) is owed on CIRISPersist#803. The reach half is the \
+                 one that cannot live on the row alone: `projection_for` is pure over four \
+                 inputs and cannot read the referenced permission, so persist enforces \
+                 inheritance at admission and the registry row should say so rather than \
+                 implying the resolver does it (CIRISPersist#814 part 1).",
+    },
     PersistFamilyRule {
         prefix: "session:",
         rule: "SELF-REPORT emitter (attesting == attested == the occurrence) + \
@@ -739,6 +764,14 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // computes identically. Read at the const so the classifier
                 // arm and this table cannot drift.
                 crate::federation::session_claim::SESSION_DIMENSION_PREFIX,
+                // v42.0.0 (CIRISPersist#814 part 1) — persist rules on
+                // `duty:`: `check_duty_admission` refuses a duty that names no
+                // permission, names one this node does not hold, was not
+                // issued by its attester, or would out-reach it. Read at the
+                // const the gate itself branches on, never re-spelled — the
+                // #590 lesson, which is why this scan reads MINT SITES rather
+                // than the module that holds the inventory.
+                admission::DUTY_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1030,9 +1063,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            21,
+            22,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

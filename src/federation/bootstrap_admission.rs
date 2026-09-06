@@ -1685,6 +1685,153 @@ pub mod test_support {
         }
     }
 
+    /// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — a duty rides only a
+    /// permission its attester issued, and never out-reaches it. Driven through
+    /// the REAL `put_attestation` door on every backend.
+    ///
+    /// Four arms, and the fourth is the one the ask is actually about:
+    ///  1. a duty naming no permission is refused (an obligation attached to
+    ///     nothing is unfalsifiable, not merely weak);
+    ///  2. a duty naming a permission this node does not hold is refused —
+    ///     admitting it would let a peer establish an obligation against a
+    ///     grant it invented;
+    ///  3. a duty attached to SOMEONE ELSE'S grant is refused;
+    ///  4. a duty that would out-reach its permission is refused — the leak
+    ///     direction, since a duty visible where its permission is not
+    ///     discloses the permission's existence.
+    ///
+    /// Every refusal also asserts NOTHING WAS STORED: a gate that refuses and
+    /// writes anyway is the verify-before-mutation defect (AV-9).
+    pub async fn exercise_duty_rides_only_its_own_permission_814(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{cohort_scope, identity_type};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let licensor = format!("{tag}-licensor-{run}");
+        let stranger = format!("{tag}-stranger-{run}");
+        for k in [&licensor, &stranger] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+
+        // A permission the licensor issued, at `community`.
+        let permission_id = uuid::Uuid::new_v4().to_string();
+        let mut permission = scores_row(&permission_id, &licensor, &licensor, "licensure:acme:v1");
+        permission.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        ts::reseal(&mut permission);
+        dir.put_attestation(SignedAttestation {
+            attestation: permission,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: the permission admits: {e}"));
+
+        let duty = |id: &str, attester: &str, refs: Option<&str>, scope: &str| {
+            let mut d = scores_row(id, attester, attester, "duty:attribute:v1");
+            d.cohort_scope = scope.to_owned();
+            if let Some(r) = refs {
+                d.attestation_envelope["references_attestation_id"] = serde_json::json!(r);
+            }
+            ts::reseal(&mut d);
+            SignedAttestation { attestation: d }
+        };
+
+        // (1) names no permission.
+        let id1 = uuid::Uuid::new_v4().to_string();
+        let e1 = dir
+            .put_attestation(duty(&id1, &licensor, None, cohort_scope::SELF))
+            .await
+            .expect_err("a duty naming no permission must be refused");
+        assert!(
+            format!("{e1}").contains("references_attestation_id"),
+            "({tag}) #814 (1): refusal should name the missing field; got {e1}"
+        );
+        assert!(
+            dir.get_attestation(&id1).await.expect("read").is_none(),
+            "({tag}) #814 (1): a REFUSED duty must not be stored (AV-9)"
+        );
+
+        // (2) names a permission this node does not hold.
+        let id2 = uuid::Uuid::new_v4().to_string();
+        let ghost = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(duty(&id2, &licensor, Some(&ghost), cohort_scope::SELF))
+            .await
+            .expect_err("a duty against an unheld permission must be refused");
+        assert!(
+            dir.get_attestation(&id2).await.expect("read").is_none(),
+            "({tag}) #814 (2): a REFUSED duty must not be stored (AV-9)"
+        );
+
+        // (3) attached to someone else's grant.
+        let id3 = uuid::Uuid::new_v4().to_string();
+        let e3 = dir
+            .put_attestation(duty(
+                &id3,
+                &stranger,
+                Some(&permission_id),
+                cohort_scope::SELF,
+            ))
+            .await
+            .expect_err("a duty on someone else's grant must be refused");
+        assert!(
+            format!("{e3}").contains("someone else"),
+            "({tag}) #814 (3): got {e3}"
+        );
+        assert!(
+            dir.get_attestation(&id3).await.expect("read").is_none(),
+            "({tag}) #814 (3): a REFUSED duty must not be stored (AV-9)"
+        );
+
+        // (4) THE LEAK DIRECTION — the duty out-reaches its permission.
+        // Permission is `self`-scoped here, duty at `community`.
+        let narrow_id = uuid::Uuid::new_v4().to_string();
+        let mut narrow = scores_row(&narrow_id, &licensor, &licensor, "licensure:acme:v1");
+        narrow.cohort_scope = cohort_scope::SELF.to_owned();
+        ts::reseal(&mut narrow);
+        dir.put_attestation(SignedAttestation {
+            attestation: narrow,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: the narrow permission admits: {e}"));
+
+        let id4 = uuid::Uuid::new_v4().to_string();
+        let e4 = dir
+            .put_attestation(duty(
+                &id4,
+                &licensor,
+                Some(&narrow_id),
+                cohort_scope::FEDERATION,
+            ))
+            .await
+            .expect_err("a duty may never project wider than its permission");
+        assert!(
+            format!("{e4}").contains("NEVER wider"),
+            "({tag}) #814 (4): got {e4}"
+        );
+        assert!(
+            dir.get_attestation(&id4).await.expect("read").is_none(),
+            "({tag}) #814 (4): a REFUSED duty must not be stored (AV-9)"
+        );
+
+        // The honest path still works: same attester, same-or-narrower reach.
+        let ok_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(duty(
+            &ok_id,
+            &licensor,
+            Some(&permission_id),
+            cohort_scope::FEDERATION,
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            panic!("({tag}) #814: a duty on its OWN permission at equal reach must ADMIT: {e}")
+        });
+        assert!(
+            dir.get_attestation(&ok_id).await.expect("read").is_some(),
+            "({tag}) #814: the admitted duty is stored"
+        );
+    }
+
     /// **CIRISPersist#807 — a widening of the owner-binding is NOT visible to
     /// a peer, and this pins that as a known limitation rather than leaving it
     /// to be rediscovered.**

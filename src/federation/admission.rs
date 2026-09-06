@@ -2611,6 +2611,10 @@ pub async fn check_promotion_admission(
     // never asked (the B8 shape #598 closed for the instant binding).
     check_config_self_or_owner_admission(directory, row).await?;
 
+    // CC 3.1.1 — a duty may only be attached to a permission its attester
+    // issued, and may never out-reach it (v42.0.0, CIRISPersist#814 part 1).
+    check_duty_admission(directory, row).await?;
+
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
 
@@ -2841,6 +2845,149 @@ pub fn check_capacity_not_self_attested(
 /// [`mesh_config::record_mesh_config_row`](crate::federation::mesh_config::record_mesh_config_row)
 /// and its stem is [`MESH_CONFIG_DIMENSION_PREFIX`].
 pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
+
+/// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — the `duty:*` dimension
+/// prefix. An obligation attached to a permission.
+pub const DUTY_DIMENSION_PREFIX: &str = "duty:";
+
+/// v42.0.0 (CIRISPersist#814 part 1) — **may a duty projecting `duty_p` ride
+/// a permission projecting `perm_p`?**
+///
+/// Deliberately an explicit partial match and NOT a rank function.
+/// [`Projection`](crate::federation::namespace::Projection) is not linearly
+/// ordered: `Capability(_)` and `Subject` are audience KINDS, not points on a
+/// reach scale, and that non-comparability is exactly what made #713's
+/// Attestation row a deferred cell. A `fn rank(p) -> u8` would impose a total
+/// order the type does not have, and the first consumer to compare a
+/// `Capability` against a `Cohort` would get an answer that means nothing.
+///
+/// So the comparison is enumerated, and anything not enumerated fails CLOSED:
+///
+/// | duty | permission | verdict |
+/// |---|---|---|
+/// | `SelfOwn` | anything | ride — the narrowest projection cannot out-reach |
+/// | `Cohort` | `Cohort` / `Global` | ride |
+/// | `Cohort` | `SelfOwn` | REFUSE — the duty would out-reach its permission |
+/// | anything | `Capability(_)` / `Subject` | REFUSE — not comparable |
+/// | `Global` / `Capability(_)` / `Subject` | anything | REFUSE — unreachable today (the
+///   `Duty` curve caps at `Cohort`), and a refusal is the right answer if that cap ever moves |
+fn duty_may_ride(
+    duty_p: crate::federation::namespace::Projection,
+    perm_p: crate::federation::namespace::Projection,
+) -> bool {
+    use crate::federation::namespace::Projection as P;
+    matches!(
+        (duty_p, perm_p),
+        (P::SelfOwn, _) | (P::Cohort, P::Cohort | P::Global)
+    )
+}
+
+/// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — **a duty may only be attached
+/// to a permission its attester issued, and may never out-reach it.**
+///
+/// Three refusals, in order:
+///
+/// 1. **It must name a permission.** A `duty:*` row with no
+///    `references_attestation_id` is an obligation attached to nothing. Refused
+///    — a free-floating duty is not a weaker claim, it is an unfalsifiable one.
+/// 2. **The attester must have ISSUED that permission.** You cannot attach an
+///    obligation to someone else's grant. This is
+///    [`check_config_self_or_owner_admission`]'s shape generalized, and the
+///    generalization is the rule CC states: *the attester's relation to the
+///    subject is what decides*.
+/// 3. **The duty may not project wider than its permission.** CC's rule is that
+///    a duty projects exactly as far as its permission and never wider, because
+///    a duty visible where its permission is not LEAKS THE PERMISSION'S
+///    EXISTENCE.
+///
+/// # Why (3) is checked here rather than in the projection resolver
+///
+/// `projection_for` is pure and O(1) over `(plane, cohort_scope, authority,
+/// is_tombstone)` and deliberately does not read the referenced row, so
+/// "inherit from parent" is not expressible there — the same constraint that
+/// deferred #713's Attestation cell for a whole release. Admission is the one
+/// place the permission row is legible, so the invariant is enforced here and
+/// the resolver keeps an ordinary curve over the duty's own `cohort_scope`. An
+/// unexpressible projection rule became an enforceable admission rule, which is
+/// the move CIRISPersist#814 part 3 makes for `config:*` in this same cut.
+///
+/// A referenced permission that cannot be resolved is a REFUSAL, not a pass:
+/// admitting a duty whose parent this node has never seen would let a peer
+/// establish an obligation against a permission it invented.
+pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(DUTY_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+
+    // (1) it must name the permission it attaches to.
+    let Some(permission_id) = row
+        .attestation_envelope
+        .get("references_attestation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} is a DUTY (CC 3.1.1) and MUST name the permission it attaches to via \
+             references_attestation_id. An obligation attached to nothing is not a weaker claim, \
+             it is an unfalsifiable one."
+        )));
+    };
+
+    // The permission must be resolvable — a duty against a permission this node
+    // has never seen would let a peer establish an obligation against a grant
+    // it invented.
+    let Some(permission) = directory.get_attestation(permission_id).await? else {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} names permission {permission_id:?}, which this node does not hold. A \
+             duty is refused rather than admitted-pending: admitting it would let a peer \
+             establish an obligation against a permission it invented."
+        )));
+    };
+
+    // (2) the attester must have ISSUED that permission.
+    if row.attesting_key_id != permission.attesting_key_id {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} is attested by {:?} but the permission it names ({permission_id:?}) was \
+             issued by {:?}. You cannot attach an obligation to someone else's grant (CC 3.1.1) — \
+             the licensor for a licence, the consenting subject for a consent grant, the \
+             asset-holder for a key_grant.",
+            row.attesting_key_id, permission.attesting_key_id
+        )));
+    }
+
+    // (3) the duty may not out-reach its permission.
+    let perm_dimension = envelope_dimension(&permission.attestation_envelope).unwrap_or("");
+    let duty_projection = crate::federation::namespace::projection_for(
+        crate::federation::namespace::Plane::Attestation { dimension },
+        &row.cohort_scope,
+        crate::federation::namespace::registry::authority_for(dimension).class,
+        false,
+    );
+    let permission_projection = crate::federation::namespace::projection_for(
+        crate::federation::namespace::Plane::Attestation {
+            dimension: perm_dimension,
+        },
+        &permission.cohort_scope,
+        crate::federation::namespace::registry::authority_for(perm_dimension).class,
+        false,
+    );
+    if !duty_may_ride(duty_projection, permission_projection) {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} would project {duty_projection:?} while the permission it names \
+             ({perm_dimension:?} @ {:?}) projects {permission_projection:?}. A duty projects \
+             exactly as far as its permission and NEVER wider (CC 3.1.1): a duty visible where \
+             its permission is not leaks the permission's existence.",
+            permission.cohort_scope
+        )));
+    }
+    Ok(())
+}
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
 /// floor** on `config:*`: which leaves may not travel past the node itself.
@@ -12742,6 +12889,78 @@ pub async fn check_reserved_prefix_admission(
 
 #[cfg(test)]
 mod tests {
+
+    /// v42.0.0 (CIRISPersist#814 part 1) — the duty/permission reach table.
+    ///
+    /// Enumerated rather than ranked. `Projection` is NOT linearly ordered —
+    /// `Capability(_)` and `Subject` are audience KINDS — so a `rank(p) -> u8`
+    /// would impose a total order the type does not have, and the first
+    /// consumer comparing a `Capability` against a `Cohort` would get an answer
+    /// that means nothing. Everything not enumerated fails CLOSED, and the
+    /// non-comparable rows below are what pin that.
+    #[test]
+    fn duty_may_ride_is_partial_and_fails_closed_814() {
+        use crate::federation::namespace::{CapabilityToken, Projection as P};
+        let cap = P::Capability(CapabilityToken::InfraServe);
+        for (duty, perm, expect, why) in [
+            (
+                P::SelfOwn,
+                P::SelfOwn,
+                true,
+                "the narrowest cannot out-reach",
+            ),
+            (
+                P::SelfOwn,
+                P::Cohort,
+                true,
+                "narrower than its permission is fine",
+            ),
+            (P::SelfOwn, P::Global, true, "narrower again"),
+            (
+                P::SelfOwn,
+                cap,
+                true,
+                "SelfOwn reaches nobody the permission missed",
+            ),
+            (P::SelfOwn, P::Subject, true, "same"),
+            (P::Cohort, P::Cohort, true, "equal reach"),
+            (P::Cohort, P::Global, true, "narrower than its permission"),
+            (
+                P::Cohort,
+                P::SelfOwn,
+                false,
+                "THE LEAK: a duty visible where its permission is not discloses \
+                 the permission's existence",
+            ),
+            (
+                P::Cohort,
+                cap,
+                false,
+                "not comparable — a capability audience is a KIND, not a reach; \
+                 fail closed rather than guess",
+            ),
+            (P::Cohort, P::Subject, false, "not comparable — fail closed"),
+            (
+                P::Global,
+                P::Global,
+                false,
+                "unreachable today (the Duty curve caps at Cohort) and a refusal \
+                 is the right answer if that cap ever moves",
+            ),
+            (
+                cap,
+                P::Global,
+                false,
+                "a duty never carries a capability audience",
+            ),
+        ] {
+            assert_eq!(
+                duty_may_ride(duty, perm),
+                expect,
+                "duty {duty:?} on permission {perm:?} should be {expect} — {why}"
+            );
+        }
+    }
 
     /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the sensitive-leaf
     /// floor, as a table.

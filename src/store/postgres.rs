@@ -5158,6 +5158,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // 3.4.5 gates sit together and a reader finds both at one line.
         // Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+        // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
+        // permission its attester issued, and never out-reaches it.
+        crate::federation::admission::check_duty_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap

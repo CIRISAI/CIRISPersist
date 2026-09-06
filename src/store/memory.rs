@@ -3291,6 +3291,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // 3.4.5 gates sit together and a reader finds both at one line.
         // Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+        // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
+        // permission its attester issued, and never out-reaches it.
+        crate::federation::admission::check_duty_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
@@ -10030,6 +10033,16 @@ mod accord_tests {
         let peer = MemoryBackend::new();
         crate::federation::bootstrap_admission::test_support::exercise_owner_binding_widening_not_visible_to_a_peer_807(
             &peer, "mem807",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 1) — the memory leg of the duty gate.
+    #[tokio::test]
+    async fn duty_rides_only_its_own_permission_814_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_duty_rides_only_its_own_permission_814(
+            &backend, "memory",
         )
         .await;
     }

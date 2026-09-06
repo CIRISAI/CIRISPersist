@@ -563,8 +563,10 @@ mod tests {
         );
         assert_eq!(
             delegation_scope::MODERATION.len(),
-            5,
-            "the ladder is still the five §11.10 rungs; #612 added a CAPABILITY scope"
+            7,
+            "the ladder is the §11.10 rungs plus the v42.0.0 issuance axis (license, grant — \
+             CIRISPersist#814 part 4); #612 added a CAPABILITY scope, which is a different \
+             axis and still must NOT appear here"
         );
         assert!(
             delegation_scope::INFRA_CLASSIFY_CONTENT.starts_with(delegation_scope::INFRA_PREFIX),

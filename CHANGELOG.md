@@ -148,6 +148,71 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Also in this cut — CIRISPersist#814 part 1: `duty:{kind}`
+
+A new family (CC 3.1.1): an **obligation attached to a permission** — the ODRL
+*Duty* leg a permission/prohibition grammar cannot express, and what every
+widely used content licence actually rests on. Rides `scores`; no new
+primitive. The WHOLE `duty:` prefix classifies, because the kind vocabulary is
+open per CC 4.5.1.1 and matching a closed list would default every unlisted
+kind to `Unknown` — the "one leaf decided, its siblings defaulted" shape #713
+spent a cut removing.
+
+**Its projection is inherited, and that is not expressible in the resolver.**
+CC's rule is that a duty projects exactly as far as the permission it attaches
+to and never wider, because a duty visible where its permission is not **leaks
+the permission's existence**. `projection_for` is pure and O(1) over
+`(plane, cohort_scope, authority, is_tombstone)` and deliberately does not read
+the referenced row — the same constraint that made #713's Attestation cell a
+deferred row for a whole release.
+
+So the invariant is enforced where it *can* be: `check_duty_admission` resolves
+the named permission at the write door and refuses three ways —
+
+1. a duty naming **no** permission (an obligation attached to nothing is not a
+   weaker claim, it is an unfalsifiable one);
+2. a duty naming a permission **this node does not hold** — refused rather than
+   admitted-pending, because admitting it would let a peer establish an
+   obligation against a grant it invented;
+3. a duty whose attester **did not issue** that permission — you cannot attach
+   an obligation to someone else's grant;
+
+and then a fourth, the reach check itself: a duty that would out-reach its
+permission is refused. An unexpressible projection rule became an enforceable
+admission rule — the same move part 3 makes for `config:*` in this cut.
+
+**The reach comparison is a partial match, not a rank.** `Projection` is not
+linearly ordered: `Capability(_)` and `Subject` are audience KINDS, not points
+on a scale, and that non-comparability is exactly what deferred #713's cell. A
+`rank(p) -> u8` would impose a total order the type does not have, and the
+first consumer comparing a `Capability` against a `Cohort` would get an answer
+that means nothing. `duty_may_ride` enumerates what rides and fails closed on
+everything else, including both non-comparable audiences.
+
+The `Duty` curve caps at `Cohort`, and the cap is what makes the invariant
+cheap: a duty can never out-reach a permission that itself reaches `Cohort`, so
+the gate only has to compare. The cost is recorded rather than hidden — a duty
+on a Global-projecting public licence propagates narrower than that licence.
+That **under-propagates an obligation rather than leaking a permission**, which
+is the safe direction of the two.
+
+Witnessed end-to-end through the real `put_attestation` door on memory and
+sqlite: all four refusals, each also asserting **nothing was stored** (a gate
+that refuses and writes anyway is the AV-9 verify-before-mutation defect), plus
+the honest path admitting. Mutation-tested three ways — deleting the issuer
+check, the reach check, or the unheld-permission refusal each reds the
+corresponding arm on both backends.
+
+**Five registration gates caught the landing before CI did**, and each one is
+a mechanism this repo built after paying for its absence: a SECOND five-rung
+ladder pin in `content_class.rs` (the first was in `types.rs`); the `duty:`
+prefix literal unclassified in `family_rules`; the same const not wired into
+`persist_ruled_prefixes()`'s derivation — which reads MINT SITES rather than
+the module holding the inventory, the #590 lesson exactly; the new door call
+unclassified in `parity::CALL_CLASSES`; and the module doc's hand-maintained
+"4 of 21" claim, checked rather than trusted. None of these would have been
+found by reading the diff.
+
 ### Also in this cut — CIRISPersist#814 part 3: the sensitive-leaf floor
 
 CC rc5 (#97) is explicit that `config:*` is **not** scope-pinned as a family,
