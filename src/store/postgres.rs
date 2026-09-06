@@ -31543,7 +31543,7 @@ mod tests {
     /// v8.7.1 (CIRISPersist#233) — a `delegates_to` edge `granter →
     /// grantee` bearing `scope` (+ optional `sub_delegation`) on the PG
     /// backend.
-    /// v41.3.0 (CIRISPersist#811) — the CC 2.4.1.2 custody-marked twin of
+    /// v42.0.0 (CIRISPersist#811) — the CC 2.4.1.2 custody-marked twin of
     /// [`pg_delegates_to`]. Since #811 that marker decides steward-binding for
     /// any target that can accept for itself (a person, an agent): a plain
     /// conferral is a job, only a marked edge is ownership.
@@ -31985,7 +31985,7 @@ mod tests {
         let owner = format!("ob-owner-{suffix}");
         let node = format!("ob-node-{suffix}");
         let agent = format!("ob-agent-{suffix}");
-        // v41.3.0 (CIRISPersist#811) — a second agent, stewarded by a PLAIN
+        // v42.0.0 (CIRISPersist#811) — a second agent, stewarded by a PLAIN
         // conferral only, for the blast-radius arm.
         let agent_plain = format!("ob-agentp-{suffix}");
         let node_wd = format!("ob-node-wd-{suffix}");
@@ -32042,7 +32042,7 @@ mod tests {
         let comm_unstewarded_agent = format!("ob-c2-{suffix}");
         let comm_node_ok = format!("ob-c3-{suffix}");
         let comm_agent_ok = format!("ob-c4-{suffix}");
-        // v41.3.0 (CIRISPersist#811) — the conferral-only roster's community.
+        // v42.0.0 (CIRISPersist#811) — the conferral-only roster's community.
         let comm_agent_plain = format!("ob-c4b-{suffix}");
         let comm_infra = format!("ob-cinfra-{suffix}");
         let comm_fakeinfra = format!("ob-cfakeinfra-{suffix}");
@@ -32143,7 +32143,7 @@ mod tests {
         // STEWARD-BOUND agent (live CUSTODY delegates_to(user → agent)) →
         // ADMITTED.
         //
-        // v41.3.0 (CIRISPersist#811): this arm used to pass a PLAIN
+        // v42.0.0 (CIRISPersist#811): this arm used to pass a PLAIN
         // `delegates_to` and assert admission. That is a capability conferral —
         // a job — and under CC 3.2 rc4 it never steward-bound an agent; the
         // predicate merely said it did. It now passes a custody-marked edge,
@@ -32169,7 +32169,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        // v41.3.0 (CIRISPersist#811) — THE BLAST RADIUS, on the Postgres leg
+        // v42.0.0 (CIRISPersist#811) — THE BLAST RADIUS, on the Postgres leg
         // too. A SECOND agent whose only incoming edge is a PLAIN conferral is
         // NOT steward-bound, so its community is refused and not stored.
         backend

@@ -968,11 +968,11 @@ pub mod delegation_scope {
     /// [`crate::federation::admission::DELEGATION_SCOPE_REVIEW`] by value.
     pub const SCOPE_REVIEW: &str = crate::federation::admission::DELEGATION_SCOPE_REVIEW;
 
-    /// v41.3.0 (CIRISPersist#814 part 4) —
+    /// v42.0.0 (CIRISPersist#814 part 4) —
     /// [`crate::federation::admission::DELEGATION_SCOPE_LICENSE`] by value.
     pub const SCOPE_LICENSE: &str = crate::federation::admission::DELEGATION_SCOPE_LICENSE;
 
-    /// v41.3.0 (CIRISPersist#814 part 4) —
+    /// v42.0.0 (CIRISPersist#814 part 4) —
     /// [`crate::federation::admission::DELEGATION_SCOPE_GRANT`] by value.
     pub const SCOPE_GRANT: &str = crate::federation::admission::DELEGATION_SCOPE_GRANT;
     /// v25.1.0 (CIRISPersist#570 ask 2) — `slash`, the tier-3/4 REMOVAL duty
@@ -1043,7 +1043,7 @@ pub mod delegation_scope {
         SCOPE_TAKEDOWN,
         SCOPE_REVIEW,
         SCOPE_SLASH,
-        // issuance axis (v41.3.0, CIRISPersist#814 part 4).
+        // issuance axis (v42.0.0, CIRISPersist#814 part 4).
         SCOPE_LICENSE,
         SCOPE_GRANT,
         // recovery / succession standing, re-exported from `ownership_reclaim`.
@@ -6539,7 +6539,7 @@ mod tests {
         // The ladder is SEVEN rungs. Pinned by count AND by membership so that
         // dropping one and adding another cannot pass.
         //
-        // v41.3.0 (CIRISPersist#814 part 4) — five became seven when the
+        // v42.0.0 (CIRISPersist#814 part 4) — five became seven when the
         // ISSUANCE axis landed (`license`, `grant`). The count is deliberately
         // a hand-written literal rather than `DELEGATED_DUTY_SCOPES.len()`: a
         // count derived from the array under test cannot fail when the array is

@@ -14091,7 +14091,7 @@ mod tests {
     }
 
     /// Build a memory-backend `delegates_to` carrying `scope`.
-    /// v41.3.0 (CIRISPersist#811) — a `delegates_to` carrying the CC 2.4.1.2
+    /// v42.0.0 (CIRISPersist#811) — a `delegates_to` carrying the CC 2.4.1.2
     /// **custody marker**, which [`fix_delegates_to`] deliberately does not.
     /// Since #811 that distinction decides steward-binding for any target that
     /// can accept for itself (a person, an agent): a plain conferral is a job,
@@ -16778,7 +16778,7 @@ mod tests {
     /// → ADMITTED. The agent carries no `node` role, so the delegation needs no
     /// infra scope to store.
     ///
-    /// **v41.3.0 (CIRISPersist#811) — this fixture changed shape, and the
+    /// **v42.0.0 (CIRISPersist#811) — this fixture changed shape, and the
     /// change is the point.** It used to pass a PLAIN `delegates_to` with scope
     /// `["share"]` and assert admission. That is a capability conferral — a job
     /// — and under CC 3.2 rc4 it never steward-bound an agent; the predicate
@@ -16810,7 +16810,7 @@ mod tests {
             .is_some());
     }
 
-    /// v41.3.0 (CIRISPersist#811) — **the blast radius, on the record.** An
+    /// v42.0.0 (CIRISPersist#811) — **the blast radius, on the record.** An
     /// agent member whose only incoming edge is a PLAIN conferral is NOT
     /// steward-bound, so its community is refused and not stored.
     ///

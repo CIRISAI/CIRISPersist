@@ -5,11 +5,31 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [41.3.0] - 2026-09-06
+## [42.0.0] - 2026-09-06
 
-**A conferral is not custody, and the predicate now agrees with the fold.**
-CIRISPersist#811, from CIRISConformance#87. Behaviour change with a blast
-radius — read the last section before adopting.
+**A conferral is not custody, a caveat is not its parent, and a secret is not
+a routing input.** MAJOR: this cut refuses input that previously succeeded, on
+two independent axes, and re-pins the whole CIRISVerify graph.
+
+### Why MAJOR
+
+Numbered MINOR while it was CIRISPersist#811 alone, and raised once
+CIRISPersist#814 part 3 landed a second refusal. Three reasons, any one of
+which a consumer must act on:
+
+1. **#811** — an agent member rostered under a plain (unmarked) conferral is no
+   longer steward-bound, so its community is refused at the write gate. Rows
+   that federated yesterday do not today.
+2. **#814 part 3** — a `config:admission` or `config:transport` row above
+   `self` is refused. Same shape: previously-admitted input, now rejected.
+3. **CIRISVerify v15.0.0** — seven pins move together and the wheel's
+   `Requires-Dist` firewall becomes `ciris-verify>=15.0.0,<16`, so
+   `pip install ciris-persist` will refuse a v14 verify. That is the
+   dep-ABI-break-as-firewall precedent (v6.0.1) rather than a quiet re-pin.
+
+CIRISPersist#814 part 4 also changes what authority matching MEANS (a held
+parent now satisfies a check for its child), though it breaks nothing today —
+no caveat tokens exist in deployed data yet.
 
 ### The defect
 

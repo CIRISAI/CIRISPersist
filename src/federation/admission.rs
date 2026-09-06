@@ -2842,7 +2842,7 @@ pub fn check_capacity_not_self_attested(
 /// and its stem is [`MESH_CONFIG_DIMENSION_PREFIX`].
 pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
 
-/// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
 /// floor** on `config:*`: which leaves may not travel past the node itself.
 ///
 /// # Why a floor at admission, and NOT a family pinned to `SelfOwn`
@@ -2867,7 +2867,7 @@ pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
 /// door.
 pub const CONFIG_SENSITIVE_LEAVES: &[&str] = &["config:admission", "config:transport"];
 
-/// v41.3.0 (CIRISPersist#814 part 3) — is `dimension` one of the
+/// v42.0.0 (CIRISPersist#814 part 3) — is `dimension` one of the
 /// [`CONFIG_SENSITIVE_LEAVES`], allowing a `:v{n}` version suffix?
 ///
 /// Matched on the leaf STEM through the CC 4.5.5 sub-scope relation
@@ -2882,7 +2882,7 @@ pub fn is_sensitive_config_leaf(dimension: &str) -> bool {
         .any(|leaf| scope_covers(leaf, dimension))
 }
 
-/// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — refuse a sensitive
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — refuse a sensitive
 /// `config:*` leaf published above `self`.
 ///
 /// Runs BEFORE [`check_config_self_or_owner_admission`]'s authority arms: a
@@ -3035,7 +3035,7 @@ pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory 
     if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
         return Ok(());
     }
-    // v41.3.0 (CIRISPersist#814 part 3) — the sensitive-leaf floor runs FIRST:
+    // v42.0.0 (CIRISPersist#814 part 3) — the sensitive-leaf floor runs FIRST:
     // a row that may not travel at this scope is refused whoever wrote it.
     check_config_sensitive_leaf_floor(row)?;
     // Arm 1 — the subject speaking about itself. The overwhelmingly common
@@ -5288,7 +5288,7 @@ pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 /// without re-walking the graph on every page.
 pub const DELEGATION_SCOPE_SLASH: &str = "slash";
 
-/// v41.3.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `license` — authorize
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `license` — authorize
 /// emitting `licensure:{authority_id}` / `attestation:license_validity` **on
 /// behalf of a delegator that itself holds licence authority for that
 /// `authority_id`** (by quorum, CC 3.3.9).
@@ -5303,7 +5303,7 @@ pub const DELEGATION_SCOPE_SLASH: &str = "slash";
 /// not a state this plane may enter.
 pub const DELEGATION_SCOPE_LICENSE: &str = "license";
 
-/// v41.3.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `grant` — authorize
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `grant` — authorize
 /// emitting `key_grant` / `consent:scope:*` grants **over assets the
 /// delegator holds**.
 ///
@@ -5360,7 +5360,7 @@ pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
     DELEGATION_SCOPE_TAKEDOWN,
     DELEGATION_SCOPE_REVIEW,
     DELEGATION_SCOPE_SLASH,
-    // v41.3.0 (CIRISPersist#814 part 4) — the issuance axis. Same walk, same
+    // v42.0.0 (CIRISPersist#814 part 4) — the issuance axis. Same walk, same
     // enforced admission; a consumer importing the ladder gets these two
     // without hand-picking, which is the whole reason this array exists.
     DELEGATION_SCOPE_LICENSE,
@@ -5434,7 +5434,7 @@ pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
 /// (`consent_revocation` / `moderate` / `takedown` / `review`); the
 /// scope token is the only thing that varies — the bare-string-OR-set
 /// acceptance is identical for all four (§11.10 mirrors §3.2.3 rule-3).
-/// v41.3.0 (CIRISPersist#814 part 4, CC 4.5.5) — **does a HELD scope token
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.5.5) — **does a HELD scope token
 /// cover a WANTED one?** The single sub-scope relation, used in both
 /// directions it is needed and spelled once.
 ///
@@ -5483,7 +5483,7 @@ pub(crate) fn scope_covers(held: &str, wanted: &str) -> bool {
 }
 
 fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> bool {
-    // v41.3.0 (CIRISPersist#814) — a held PARENT covers a check for its CHILD;
+    // v42.0.0 (CIRISPersist#814) — a held PARENT covers a check for its CHILD;
     // a held child never widens to its parent. See [`scope_covers`].
     match envelope.get("scope") {
         Some(serde_json::Value::String(s)) => scope_covers(s, scope_token),
@@ -6034,7 +6034,7 @@ async fn scoped_delegation_reach(
             if policy.enforce_attenuation_and_sub_delegation {
                 if let Some(parent_scope) = &node.parent_scope {
                     let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    // v41.3.0 (CIRISPersist#814 part 4) — "⊆-parent" is now
+                    // v42.0.0 (CIRISPersist#814 part 4) — "⊆-parent" is now
                     // read modulo sub-scopes: every child token must be equal
                     // to, or a CAVEAT ON, some parent token. Exact set-subset
                     // would refuse `infra:attest:licensure:acme` under a parent
@@ -7473,7 +7473,7 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
     Ok(out)
 }
 
-/// v41.3.0 (CIRISPersist#811) — **THE clause-(3) edge filter.** One
+/// v42.0.0 (CIRISPersist#811) — **THE clause-(3) edge filter.** One
 /// definition, three callers: [`is_steward_bound`], [`steward_bindings_of`]
 /// and [`steward_binding_chain`] all resolve their delegation clause through
 /// this, so the biconditional they each document cannot drift on the axis
@@ -12743,7 +12743,7 @@ pub async fn check_reserved_prefix_admission(
 #[cfg(test)]
 mod tests {
 
-    /// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the sensitive-leaf
+    /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the sensitive-leaf
     /// floor, as a table.
     ///
     /// The two REFUSAL rows are the ask. The `config:load` rows are what keeps
@@ -12839,7 +12839,7 @@ mod tests {
         }
     }
 
-    /// v41.3.0 (CIRISPersist#814 part 4, CC 4.5.5) — **the directional
+    /// v42.0.0 (CIRISPersist#814 part 4, CC 4.5.5) — **the directional
     /// sub-scope table, spelled as LITERALS.**
     ///
     /// Deliberately not derived from `delegation_scope::*`: a table generated
@@ -12920,7 +12920,7 @@ mod tests {
         }
     }
 
-    /// v41.3.0 (CIRISPersist#814 part 4) — the relation is ANTISYMMETRIC on
+    /// v42.0.0 (CIRISPersist#814 part 4) — the relation is ANTISYMMETRIC on
     /// distinct tokens: if `a` covers `b` and they differ, `b` must not cover
     /// `a`. Stated as a property because the failure mode is a symmetric
     /// implementation (`starts_with` in either argument order), which no
@@ -21026,7 +21026,7 @@ pub(crate) mod steward_liveness_test_support {
         row
     }
 
-    /// v41.3.0 (CIRISPersist#811) — a `delegates_to` carrying the **CC 2.4.1.2
+    /// v42.0.0 (CIRISPersist#811) — a `delegates_to` carrying the **CC 2.4.1.2
     /// custody marker**, as distinct from [`delegates_to`]'s plain capability
     /// conferral. This is the shape `is_owner_binding_envelope` recognizes via
     /// `delegation_purpose` — the raw `emit_attestation_self` path, and what
