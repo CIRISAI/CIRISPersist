@@ -4283,6 +4283,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
         // permission its attester issued, and never out-reaches it.
         crate::federation::admission::check_duty_admission(self, &row).await?;
+        // CC 3.4.5.1 — a config renewal must supersede the row it replaces
+        // (v42.0.0, CIRISPersist#814 part 3).
+        crate::federation::admission::check_config_renewal_supersedes(self, &row).await?;
+        // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
+        // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
+        crate::federation::admission::check_session_self_report_admission(&row)?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
@@ -43762,6 +43768,28 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_licensure_fold_is_set_valued_and_revoked_absorbs_814(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 3) — the sqlite leg of the config renewal gate.
+    #[tokio::test]
+    async fn config_renewal_must_supersede_814_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_config_renewal_must_supersede_814(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 5) — the sqlite leg of the session self-report door.
+    #[tokio::test]
+    async fn session_is_a_self_report_at_the_door_814_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_session_is_a_self_report_at_the_door_814(
             &backend, "sqlite",
         )
         .await;

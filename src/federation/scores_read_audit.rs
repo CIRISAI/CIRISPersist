@@ -1710,8 +1710,11 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 107 of the registry's 114
-    /// families; withholding it pins 3. That two-number contrast is the whole
+    /// Retaining the contradiction count pins 109 of the registry's 116
+    /// families; withholding it pins 3. (107 of 114 before the v42.0.0 rc3 →
+    /// rc5 re-vendor; both new families — `duty:` and `session:` — are signed,
+    /// so both land in the retained set and the contrast is unchanged in
+    /// shape.) That two-number contrast is the whole
     /// argument for what the reserved token's retained set must be, and a
     /// paragraph asserting it would rot — so it is measured.
     #[test]
@@ -1720,11 +1723,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (107, 3),
+            (109, 3),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 114);
+        assert_eq!(vendored_family_polarities().len(), 116);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

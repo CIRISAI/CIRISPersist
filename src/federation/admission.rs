@@ -2615,6 +2615,14 @@ pub async fn check_promotion_admission(
     // issued, and may never out-reach it (v42.0.0, CIRISPersist#814 part 1).
     check_duty_admission(directory, row).await?;
 
+    // CC 3.4.5.1 — a config renewal must supersede the row it replaces
+    // (v42.0.0, CIRISPersist#814 part 3).
+    check_config_renewal_supersedes(directory, row).await?;
+
+    // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
+    // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
+    check_session_self_report_admission(row)?;
+
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
 
@@ -2987,6 +2995,132 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
         )));
     }
     Ok(())
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **a renewal must supersede
+/// the row it replaces.**
+///
+/// The live set for a `(subject, cohort_scope, leaf)` must be ONE row. A node
+/// that re-publishes `config:load` without a `supersedes` naming its prior row
+/// leaves two live rows saying different things, and a composer weighting
+/// self-attestations by live count then reads one node as two — so **a node
+/// that renews correctly halves its own signal** relative to one that does not.
+/// The incentive points the wrong way, which is why this is a refusal and not
+/// a lint.
+///
+/// A `supersedes` row is itself exempt: it IS the renewal.
+///
+/// # What this does NOT do
+///
+/// It does not deduplicate on read, and it does not make the fold count
+/// distinct subjects. CC rc5 (#97) asks for both halves; this is the write-door
+/// half. A composer that weights by live ROW count is still wrong after this
+/// gate — the gate only guarantees it will not be handed two rows by a
+/// well-behaved renewer. The read-side half is a consumer rule persist cannot
+/// enforce from here, and it is recorded in CIRISPersist#814 rather than
+/// implied to be done.
+pub async fn check_config_renewal_supersedes<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    // A supersedes/withdraws IS the renewal act; it cannot require one of
+    // itself.
+    if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+        return Ok(());
+    }
+    let existing = directory
+        .list_attestations_for(&row.attested_key_id)
+        .await?;
+    let refs: Vec<&super::Attestation> = existing.iter().collect();
+    let retired = crate::federation::precedence::retired_ids(&refs);
+    for prior in &existing {
+        // An idempotent re-put of the SAME row is not a renewal.
+        if prior.attestation_id == row.attestation_id {
+            continue;
+        }
+        if retired.contains(&prior.attestation_id) {
+            continue;
+        }
+        if prior.attesting_key_id != row.attesting_key_id {
+            continue;
+        }
+        if prior.cohort_scope != row.cohort_scope {
+            continue;
+        }
+        if envelope_dimension(&prior.attestation_envelope) != Some(dimension) {
+            continue;
+        }
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} from {:?} at cohort_scope {:?} already has a live row \
+             ({}, itself at cohort_scope {:?}). A renewal MUST carry a `supersedes` naming \
+             the row it replaces (CC 3.4.5.1): two live rows for one (subject, scope, leaf) \
+             make a composer that weights by live count read one node as two, so a node \
+             that renews correctly would halve its own signal against one that does not.",
+            row.attesting_key_id, row.cohort_scope, prior.attestation_id, prior.cohort_scope
+        )));
+    }
+    Ok(())
+}
+
+/// v42.0.0 (CIRISPersist#814 part 5, CC 3.4.3) — **`session:*` is a substrate
+/// SELF-REPORT: attester and subject must be the same occurrence.**
+///
+/// # The rc3 → rc5 re-vendor exposed this, it did not create it
+///
+/// Persist has always enforced the self-report rule — in the FOLD.
+/// `session_claim::resolve_claim` skips any row whose `attesting_key_id` or
+/// `attested_key_id` is not the occurrence, so a third party's claim was never
+/// *acted on*. It was, however, **stored**, and a stored row replicates and is
+/// visible to any consumer reading rows directly rather than through the fold.
+///
+/// While CC said nothing about the family, fold-only enforcement was a
+/// defensible place to draw the line. rc5 reserves the prefix with
+/// `{CC 3.4.3, substrate-self-report}`, and
+/// `authority_lists_agree_on_every_manifest_family` immediately reported the
+/// gap: *"CC reserves it; persist has no gate and no declared reason"*. That
+/// gate is the CIRISPersist#590 split-truth mechanism, and this is the first
+/// time it has caught a real under-enforcement rather than a bookkeeping
+/// mismatch.
+///
+/// # Why not a `ReservedPrefixRule`
+///
+/// [`ReservedPrefixRule`] gates on `required_identity_types` /
+/// `required_delegation_scope` — it asks *what kind of key is this*. A
+/// self-report rule asks *is the attester the subject*, which no identity type
+/// can express. `config:` sits in the same position for the same reason
+/// (`check_config_self_or_owner_admission`), which is why both families are
+/// recorded in `RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` rather than gated by
+/// one.
+///
+/// Stricter than `config:`, deliberately: `config:` admits the subject's live
+/// OWNER speaking for its instrument, because a node's operator has a real
+/// claim to state what their node is running. A session is a claim about which
+/// occurrence is *handling an exchange right now*; an owner is not in a
+/// position to know that, and CC 3.4.3 says self-report rather than
+/// self-or-owner.
+pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(crate::federation::session_claim::SESSION_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{dimension} is a substrate SELF-REPORT (CC 3.4.3): attesting_key_id {:?} must be the \
+         attested occurrence {:?}. A third party cannot say which occurrence of someone else's \
+         self is handling an exchange — and a row that is merely ignored by the fold is still a \
+         row that replicates and is visible to any consumer reading rows directly.",
+        row.attesting_key_id, row.attested_key_id
+    )))
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
@@ -15160,6 +15294,10 @@ mod tests {
         "licensure:",
         "ownership:",
         "peer_reachability:",
+        // v42.0.0 (CIRISPersist#814 part 5) — gated by
+        // `check_session_self_report_admission`, not by a prefix rule: CC 3.4.3
+        // asks "is the attester the subject", which no identity type expresses.
+        "session:",
         "trace:",
         "trace_summary:",
         "transport:",

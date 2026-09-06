@@ -1685,6 +1685,156 @@ pub mod test_support {
         }
     }
 
+    /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — a config renewal must
+    /// supersede the row it replaces.
+    ///
+    /// Four arms, and the last two are what keep the gate from being a blunt
+    /// "one config row ever" rule:
+    ///  1. the FIRST row for a `(subject, scope, leaf)` admits;
+    ///  2. a SECOND plain row for the same triple is REFUSED, and not stored;
+    ///  3. a `supersedes` row IS the renewal and admits — the gate must not
+    ///     demand a supersedes of a supersedes;
+    ///  4. a different LEAF, a different SCOPE, and a different ATTESTER each
+    ///     admit freely — the live-set rule is per `(subject, scope, leaf)`,
+    ///     and a gate that refused any of these would stop a node publishing
+    ///     `config:load` and `config:replication` at the same time.
+    pub async fn exercise_config_renewal_must_supersede_814(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, cohort_scope, identity_type};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-cfgnode-{run}");
+        let other = format!("{tag}-cfgother-{run}");
+        for k in [&node, &other] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+
+        let row = |id: &str, attester: &str, dim: &str, scope: &str| {
+            let mut r = scores_row(id, attester, &node, dim);
+            r.cohort_scope = scope.to_owned();
+            ts::reseal(&mut r);
+            SignedAttestation { attestation: r }
+        };
+
+        // (1) the first row admits.
+        let first = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(&first, &node, "config:load:v1", cohort_scope::SELF))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #814: the first config row admits: {e}"));
+
+        // (2) a second PLAIN row for the same triple is refused, and not stored.
+        let second = uuid::Uuid::new_v4().to_string();
+        let err = dir
+            .put_attestation(row(&second, &node, "config:load:v1", cohort_scope::SELF))
+            .await
+            .expect_err("a renewal without supersedes must be refused");
+        assert!(
+            format!("{err}").contains("supersedes"),
+            "({tag}) #814: the refusal must name what is missing; got {err}"
+        );
+        assert!(
+            dir.get_attestation(&second).await.expect("read").is_none(),
+            "({tag}) #814: a refused renewal must not be stored (AV-9)"
+        );
+
+        // (3) a supersedes IS the renewal — it must not require one of itself.
+        let renewal = uuid::Uuid::new_v4().to_string();
+        let mut sup = scores_row(&renewal, &node, &node, "config:load:v1");
+        // The renewal must sit at the SAME (subject, scope, leaf) as the row it
+        // replaces — a supersedes at a different scope renews nothing and
+        // silently occupies another slot.
+        sup.cohort_scope = cohort_scope::SELF.to_owned();
+        sup.attestation_type = attestation_type::SUPERSEDES.to_owned();
+        sup.attestation_envelope[crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
+            serde_json::json!(first.clone());
+        ts::reseal(&mut sup);
+        dir.put_attestation(SignedAttestation { attestation: sup })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("({tag}) #814: a supersedes IS the renewal and must admit: {e}")
+            });
+
+        // (4) a different LEAF admits — the rule is per (subject, scope, leaf),
+        // not "one config row per node".
+        let leaf2 = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(
+            &leaf2,
+            &node,
+            "config:replication:v1",
+            cohort_scope::SELF,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: a DIFFERENT leaf must admit: {e}"));
+
+        // a different SCOPE admits (config:load may travel).
+        let scope2 = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(
+            &scope2,
+            &node,
+            "config:load:v1",
+            cohort_scope::FEDERATION,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: a DIFFERENT scope must admit: {e}"));
+
+        // a different ATTESTER admits — two parties may each say what they see.
+        let other_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(row(&other_id, &other, "config:load:v1", cohort_scope::SELF))
+            .await
+            .expect_err("a third party's config self-report is refused by the #778 gate");
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 5, CC 3.4.3) — a `session:*` row from a
+    /// third party is REFUSED at the write door, not merely ignored by the fold.
+    ///
+    /// Before the rc3 → rc5 re-vendor persist enforced this only in
+    /// `resolve_claim`, so such a row STORED and replicated while being inert.
+    /// rc5 reserves the prefix `substrate-self-report` and the #590 split-truth
+    /// gate reported the gap. This pins the door.
+    pub async fn exercise_session_is_a_self_report_at_the_door_814(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let occurrence = format!("{tag}-occ-{run}");
+        let stranger = format!("{tag}-stranger-{run}");
+        for k in [&occurrence, &stranger] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+
+        // The occurrence speaking for ITSELF admits.
+        let mine = uuid::Uuid::new_v4().to_string();
+        let mut r = scores_row(&mine, &occurrence, &occurrence, "session:claim:v1");
+        ts::reseal(&mut r);
+        dir.put_attestation(SignedAttestation { attestation: r })
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #814: a self-report session claim admits: {e}"));
+
+        // A stranger claiming about that occurrence is REFUSED and NOT STORED.
+        let theirs = uuid::Uuid::new_v4().to_string();
+        let mut bad = scores_row(&theirs, &stranger, &occurrence, "session:claim:v1");
+        ts::reseal(&mut bad);
+        let err = dir
+            .put_attestation(SignedAttestation { attestation: bad })
+            .await
+            .expect_err("a third party's session claim must be refused at the door");
+        assert!(
+            format!("{err}").contains("SELF-REPORT"),
+            "({tag}) #814: got {err}"
+        );
+        assert!(
+            dir.get_attestation(&theirs).await.expect("read").is_none(),
+            "({tag}) #814: a row that is merely ignored by the fold is still a row \
+             that replicates — it must not be STORED (AV-9)"
+        );
+    }
+
     /// v42.0.0 (CIRISPersist#814 part 2) — the licensure fold: set-valued, with
     /// `revoked` ABSORBING.
     ///

@@ -148,6 +148,58 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Also in this cut — the rc5 vendor exposed a real under-enforcement
+
+`authority_lists_agree_on_every_manifest_family` — CIRISPersist#590's
+split-truth gate — reported it the moment the vendor landed:
+
+> **SPLIT TRUTH — persist UNDER-ENFORCES**: `session:{kind}` (CC reserves it:
+> `substrate-self-report`; persist has no gate and no declared reason)
+
+Persist *had* always enforced the rule — in the **fold**.
+`session_claim::resolve_claim` skips any row whose attester is not the
+occurrence, so a third party's claim was never acted on. It was, however,
+**stored**, and a stored row replicates and is visible to any consumer reading
+rows directly rather than through the fold. While CC said nothing about the
+family that was a defensible line; rc5 states the rule, and the line moved.
+
+`check_session_self_report_admission` now refuses it at the door.
+Deliberately stricter than `config:`, which admits the subject's live *owner*
+speaking for its instrument: an owner has a real claim to say what their node is
+running, but a session says which occurrence is handling an exchange **right
+now**, and an owner is not in a position to know that. CC 3.4.3 says
+self-report, not self-or-owner.
+
+Not a `ReservedPrefixRule`, because that mechanism asks *what kind of key is
+this* and a self-report rule asks *is the attester the subject* — which no
+identity type can express. `session:` joins `config:` in
+`RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` with that reason recorded.
+
+This is the first time that gate has caught a real under-enforcement rather
+than a bookkeeping mismatch, and it only fired because the re-vendor changed
+what CC claimed. A vendor bump is not a bookkeeping exercise.
+
+### Also in this cut — CIRISPersist#814 part 3: the renewal must supersede
+
+The live set for a `(subject, cohort_scope, leaf)` must be ONE row. A node
+re-publishing `config:load` without a `supersedes` leaves two live rows saying
+different things, and a composer weighting self-attestations by live count then
+reads one node as two — so **a node that renews correctly halves its own signal
+against one that does not**. The incentive points the wrong way, which is why
+this is a refusal rather than a lint.
+
+Scoped precisely, and the witness pins all of it: a `supersedes` row is exempt
+(it *is* the renewal), and a different leaf, a different scope, or a different
+attester each admit freely. A gate that refused any of those would have become
+"one config row per node", which is not the rule — and the refusal arm alone
+would not have caught that.
+
+**What this does not do**, recorded rather than implied: it is the write-door
+half. CC rc5 (#97) also asks that a composer count **distinct subjects, never
+rows**. A composer weighting by live row count is still wrong after this gate;
+the gate only guarantees a well-behaved renewer will not hand it two. That
+read-side half is a consumer rule persist cannot enforce from here.
+
 ### Also in this cut — the CC registry re-vendored rc3 → rc5, and #814 parts 2 + 5
 
 **The re-vendor.** `namespace_registry.json` moves from CC `1.0-rc3` to
