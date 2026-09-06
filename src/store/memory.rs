@@ -10046,6 +10046,17 @@ mod accord_tests {
         )
         .await;
     }
+
+    /// v42.0.0 (CIRISPersist#814 part 2) — the memory leg of the licensure fold.
+    #[tokio::test]
+    async fn licensure_fold_is_set_valued_and_revoked_absorbs_814_memory() {
+        let backend = MemoryBackend::new();
+
+        crate::federation::bootstrap_admission::test_support::exercise_licensure_fold_is_set_valued_and_revoked_absorbs_814(
+            &backend, "memory",
+        )
+        .await;
+    }
     #[tokio::test]
     async fn privileged_sync_door_memory_804() {
         let dir = MemoryBackend::new();

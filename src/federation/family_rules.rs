@@ -24,8 +24,11 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
-//! of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1; the
-//! 22nd is `duty:`, CIRISPersist#814 part 1).
+//! of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1). The
+//! inventory gained `duty:` and lost `session:` in the same cut (v42.0.0): CC
+//! rc5 registered `session:{kind}` WITH its `substrate-self-report` rule, so
+//! the gap it recorded is closed and the pin is retired; `duty:{kind}` landed
+//! registered but `reserved: false`, so persist still rules where CC does not.
 //!
 //! # What is derived and what is pinned
 //!
@@ -250,24 +253,7 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  inheritance at admission and the registry row should say so rather than \
                  implying the resolver does it (CIRISPersist#814 part 1).",
     },
-    PersistFamilyRule {
-        prefix: "session:",
-        rule: "SELF-REPORT emitter (attesting == attested == the occurrence) + \
-               convergent claim merge: earliest claimed_at wins, ties on the lowest \
-               occurrence key_id; an unclaimed session has NO handler",
-        enforced_at: &[
-            "federation::session_claim::resolve_claim",
-            "federation::session_claim::handler_for",
-            "federation::namespace::attestation_family",
-        ],
-        gap: RowRuleGap::NoRuleOnTheRow,
-        minted_by_persist: false,
-        cc_ask: "CIRISConstitution#98 — CC has not stated a rule for `session:`; the ask is \
-                 a row carrying the self-report emitter rule and the convergent merge, so the \
-                 two validators agree. Until it lands persist enforces both and this entry \
-                 records that it does (CIRISPersist#782).",
-    },
-    // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
+     // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
     // CIRISConstitution#92. Two rules ride the one prefix: the staging latch
     // (R2(b) refuses the whole family at federation tier until the CC row
     // lands and the re-vendor opens the door by itself), and the L1 binding
@@ -1063,9 +1049,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            22,
+            21,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

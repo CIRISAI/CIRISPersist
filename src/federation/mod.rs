@@ -82,13 +82,16 @@ pub mod identity_aggregate;
 // (one gap: `health:liveness:*` self-emission) vs. already-covered vs.
 // consumer-owned.
 pub mod invariant;
+/// v38.7.0 (CIRISPersist#782) — the session-claim plane: which occurrence of a
+/// self handles a given `(community, session)`.
+/// v42.0.0 (CIRISPersist#814 part 2) — the `licensure:{authority_id}` status
+/// fold: set-valued, with `revoked` absorbing.
+pub mod licensure;
 pub mod location;
 /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
 /// folded CEG state from the owner root, then purge what is provably dead.
 pub mod migration;
 pub mod namespace;
-/// v38.7.0 (CIRISPersist#782) — the session-claim plane: which occurrence of a
-/// self handles a given `(community, session)`.
 pub mod session_claim;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /

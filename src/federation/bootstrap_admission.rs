@@ -1685,6 +1685,91 @@ pub mod test_support {
         }
     }
 
+    /// v42.0.0 (CIRISPersist#814 part 2) — the licensure fold: set-valued, with
+    /// `revoked` ABSORBING.
+    ///
+    /// Four properties, and the third is the one a "latest wins" fold gets
+    /// wrong:
+    ///  1. concurrent statuses are BOTH live — `issued` + `probation` is two
+    ///     facts, not a blended state;
+    ///  2. a suspension is REVERSIBLE — superseding it lifts it;
+    ///  3. a revocation ABSORBS — a later `issued` cannot dilute it, whatever
+    ///     the arrival order, because arrival order across a mesh is not a fact
+    ///     about the licence;
+    ///  4. authorities do not bleed — a status from `other` is not folded into
+    ///     `acme`.
+    pub async fn exercise_licensure_fold_is_set_valued_and_revoked_absorbs_814(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::licensure::{status_set_for, LicensureStatus as L};
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let board = format!("{tag}-board-{run}");
+        let holder = format!("{tag}-holder-{run}");
+        for k in [&board, &holder] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+
+        let put = |id: &str, dim: &str, status: &str| {
+            let mut r = scores_row(id, &board, &holder, dim);
+            r.attestation_envelope["status"] = serde_json::json!(status);
+            ts::reseal(&mut r);
+            SignedAttestation { attestation: r }
+        };
+
+        // (1) concurrent statuses are both live.
+        let issued = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&issued, "licensure:acme:v1", "issued"))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) issued admits: {e}"));
+        let probation = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&probation, "licensure:acme:v1", "probation"))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) probation admits: {e}"));
+        assert_eq!(
+            status_set_for(dir, &holder, "acme").await.expect("fold"),
+            std::collections::BTreeSet::from([L::Issued, L::Probation]),
+            "({tag}) #814: issued + probation is TWO FACTS — a scalar fold would \
+             have to discard one, and every rule for picking is a policy this \
+             substrate does not own"
+        );
+
+        // (4) another authority does not bleed in.
+        let other = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&other, "licensure:other:v1", "revoked"))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) other-authority row admits: {e}"));
+        assert!(
+            !status_set_for(dir, &holder, "acme")
+                .await
+                .expect("fold")
+                .contains(&L::Revoked),
+            "({tag}) #814: a revocation by a DIFFERENT authority must not fold \
+             into acme's set"
+        );
+
+        // (3) THE ABSORPTION. Revoke, then issue again afterwards.
+        let revoked = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&revoked, "licensure:acme:v1", "revoked"))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) revoked admits: {e}"));
+        let later = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&later, "licensure:acme:v1", "issued"))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) later issued admits: {e}"));
+        assert_eq!(
+            status_set_for(dir, &holder, "acme").await.expect("fold"),
+            std::collections::BTreeSet::from([L::Revoked]),
+            "({tag}) #814: `revoked` is ABSORBING — nothing lifts a revocation, \
+             and a re-licence is a NEW licence under a new authority \
+             attestation, never a status transition. A later `issued` arriving \
+             after it must not dilute the set."
+        );
+    }
+
     /// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — a duty rides only a
     /// permission its attester issued, and never out-reaches it. Driven through
     /// the REAL `put_attestation` door on every backend.

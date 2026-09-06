@@ -148,6 +148,62 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Also in this cut — the CC registry re-vendored rc3 → rc5, and #814 parts 2 + 5
+
+**The re-vendor.** `namespace_registry.json` moves from CC `1.0-rc3` to
+`1.0-rc5`, with all three drift pins bumped in lockstep (`VENDORED_CC_VERSION`,
+`VENDORED_SOURCE_SHA256`, `VENDORED_N_FAMILIES` 114 → 116) and the two new
+families added to `VENDORED_FAMILY_PREFIXES` so the removal gate keeps covering
+them.
+
+Verified before vendoring rather than after: the rc5 artifact's own
+`_meta.source_sha256` was checked against a freshly fetched
+`constitution/part_3_the_namespace.md` from the same ref. A generated file that
+does not match its own source is the one thing a re-vendor must never carry, and
+"CC generated it" is not evidence of that.
+
+The diff is exactly the #814 surface and nothing else — **2 added, 0 removed, 1
+changed**:
+
+| | |
+|---|---|
+| `+ duty:{kind}` | `reserved: false` — registered, no machine-readable rule |
+| `+ session:{kind}` | `reserved: true`, `{CC 3.4.3, substrate-self-report}` |
+| `~ licensure:{authority_id}` | description only — now states that authority is conferred by quorum, **never** by `delegates_to` |
+
+**Part 5 falls out of it.** `session:`'s `RULES_NOT_ON_THE_ROW` pin recorded a
+gap — persist ruling where CC did not. rc5 registers the rule persist already
+enforced, so the gap is closed and the pin is retired. This was **measured, not
+assumed**: before the vendor, `authority_for("session:claim:v1").reserved` was
+`None`, so retiring the pin would have been a false claim and would have broken
+the classifier gate. `duty:`'s pin stays, because rc5 registered that family
+with `reserved: false` — persist still rules where CC does not, and the entry
+now says so with rc5 as its citation.
+
+**Part 2 — the licensure fold.** New `federation::licensure`: a set-valued fold
+over `licensure:{authority_id}` carrying two normative semantics the registry
+row could already express and this crate could not read.
+
+`revoked` is **absorbing**; `suspended` is reversible. Nothing lifts a
+revocation — a re-licence is a *new* licence under a new authority attestation,
+never a status transition — so a live `revoked` collapses the set to exactly
+`{Revoked}` whatever the arrival order.
+
+More than one status may be live at once, so the fold returns a **set**.
+`issued` + `probation` is two facts, not a blended state. Latest-wins is the
+shape that looks obviously right and quietly discards one: it would report
+either an unlimited licence or none at all depending on arrival order, and
+arrival order across a mesh is not a fact about the licence.
+
+Retirement runs through `precedence::retired_ids` — the one retirement fold,
+not a copy. An unrecognized status is ignored rather than guessed at, because a
+status nobody has defined cannot be composed against the absorption rule.
+
+Mutation-tested three ways on both backends: deleting the absorption rule,
+collapsing the set to latest-wins, and matching the authority by prefix instead
+of exactly. Each is killed by its own assertion — the third by a revocation
+from a *different* authority failing to bleed in.
+
 ### Also in this cut — CIRISPersist#814 part 1: `duty:{kind}`
 
 A new family (CC 3.1.1): an **obligation attached to a permission** — the ODRL

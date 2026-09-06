@@ -43755,6 +43755,17 @@ mod tests {
         )
         .await;
     }
+
+    /// v42.0.0 (CIRISPersist#814 part 2) — the sqlite leg of the licensure fold.
+    #[tokio::test]
+    async fn licensure_fold_is_set_valued_and_revoked_absorbs_814_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_licensure_fold_is_set_valued_and_revoked_absorbs_814(
+            &backend, "sqlite",
+        )
+        .await;
+    }
     #[tokio::test]
     async fn privileged_sync_door_sqlite_804() {
         let dir = SqliteBackend::open_in_memory().await.unwrap();

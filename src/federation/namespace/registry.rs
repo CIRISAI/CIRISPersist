@@ -38,14 +38,14 @@ const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc3";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "ec3cca6cdfea62a51905867d380a3f7b07d90cd2bcdb4fa2c5080e8b405516b6";
+    "1b1a248a4e863130d9ad6ec6cc6c8b3e57e9311b0b710ffb735b04d4c926afa3";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 114;
+pub const VENDORED_N_FAMILIES: usize = 116;
 
 /// One resolved namespace family — a CC 3.1 prefix, its owning component, and
 /// the [`Authority`] its reserved-prefix rule (CC 3.4) demands.
@@ -414,9 +414,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
     "consent:{kind}",
-    // rc3 / CIRISConstitution#77 — the three CEG-0.3 media-plane families
-    // persist had gated since v3.0.0 with no CC row. Their arrival is what
-    // retires `UNREGISTERED_GATED_FAMILIES`.
     "content_class:{class}",
     "content_rating:{scheme}:{rating}",
     "corpus_health:n_eff_measurable",
@@ -436,6 +433,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "dma:dsdma:{domain}:*",
     "dma:idma:*",
     "dma:pdma:*",
+    "duty:{kind}",
     "expertise:{domain}:{language}",
     "federation_directory:replication_lag",
     "fidelity:explainability_sla:{tier}",
@@ -478,11 +476,11 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ratchet:flag:harassment_pattern",
     "ratchet:flag:out_of_distribution_voting",
     "reconsideration:{grounds}",
-    // rc3 / CIRISConstitution#81 — the family CIRISPersist#571 was blocked on.
     "regime:{artifact}:{version}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
     "seed_holder_voting_alignment:{cell}",
+    "session:{kind}",
     "slashing:{outcome}",
     "system:*",
     "testimonial_witness:{kind}",
