@@ -84,6 +84,25 @@ edges with the CC 2.4.1.2 marker (`delegation_purpose: "owner_binding"`, the
 members are unaffected — a node cannot accept for itself, so any delegation
 naming it is still custody.
 
+### Also in this cut — CIRISVerify v15.0.0 adopted
+
+All **seven** Cargo pins moved `v14.2.0` → `v15.0.0` together (the pins must
+flip as a set; bumping one splits `ciris_crypto` into two graph versions), and
+`pyproject.toml`'s `Requires-Dist` firewall moved to
+`ciris-verify>=15.0.0,<16`.
+
+v15.0.0 is a verify MAJOR — `FedCode` became `non_exhaustive` and admission is
+unconstructible unless verified (CIRISVerify#274), plus CC decimal assignments
+(#275). **Neither breaking change reaches persist**: `FedCode` has no use site
+in this crate, and the shipped-shape check passes across all targets with no
+source change. Adopted verified rather than assumed — the CIRISVerify v15.0.0
+tag run was green at job level (CI, Release, Bench and Post-Release Live Verify
+all success) and the release published before the pins moved, and `Cargo.lock`
+resolves to the tag's exact SHA `3531334`.
+
+Bundled here rather than cut alone, per the standing rule that a dep re-pin
+rides the next feature cut instead of burning a release on its own.
+
 ## [41.2.0] - 2026-09-05
 
 **A vocabulary persist mirrors must be a SUPERSET of the one it serves.**
