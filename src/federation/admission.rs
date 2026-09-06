@@ -5217,6 +5217,33 @@ pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 /// without re-walking the graph on every page.
 pub const DELEGATION_SCOPE_SLASH: &str = "slash";
 
+/// v41.3.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `license` — authorize
+/// emitting `licensure:{authority_id}` / `attestation:license_validity` **on
+/// behalf of a delegator that itself holds licence authority for that
+/// `authority_id`** (by quorum, CC 3.3.9).
+///
+/// # It is an enforced refusal, not an unweighted opinion
+///
+/// An issuance whose delegator does NOT hold licence authority for the
+/// `authority_id` it names is **refused at admission and never stored** — the
+/// same treatment [`DELEGATION_SCOPE_SLASH`] gets, and for the same reason:
+/// a conferral nothing gates on is a stored label (#333). A licence is a
+/// claim other parties act on; "admitted but you should not believe it" is
+/// not a state this plane may enter.
+pub const DELEGATION_SCOPE_LICENSE: &str = "license";
+
+/// v41.3.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `grant` — authorize
+/// emitting `key_grant` / `consent:scope:*` grants **over assets the
+/// delegator holds**.
+///
+/// # A `key_grant` stays non-transferable
+///
+/// This scope does not make one forwardable. An onward grant is a NEW grant
+/// minted by a DEK holder, never a relayed copy of someone else's — which is
+/// already true structurally, because only a DEK holder can wrap. This
+/// constant names the rule that the shape was silently enforcing.
+pub const DELEGATION_SCOPE_GRANT: &str = "grant";
+
 /// v30.11.0 (CIRISPersist#637) — **the delegated-duty ladder, as an array.**
 /// Import this; do not hand-pick the `DELEGATION_SCOPE_*` constants above.
 ///
@@ -5262,6 +5289,11 @@ pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
     DELEGATION_SCOPE_TAKEDOWN,
     DELEGATION_SCOPE_REVIEW,
     DELEGATION_SCOPE_SLASH,
+    // v41.3.0 (CIRISPersist#814 part 4) — the issuance axis. Same walk, same
+    // enforced admission; a consumer importing the ladder gets these two
+    // without hand-picking, which is the whole reason this array exists.
+    DELEGATION_SCOPE_LICENSE,
+    DELEGATION_SCOPE_GRANT,
 ];
 
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
@@ -5331,10 +5363,63 @@ pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
 /// (`consent_revocation` / `moderate` / `takedown` / `review`); the
 /// scope token is the only thing that varies — the bare-string-OR-set
 /// acceptance is identical for all four (§11.10 mirrors §3.2.3 rule-3).
+/// v41.3.0 (CIRISPersist#814 part 4, CC 4.5.5) — **does a HELD scope token
+/// cover a WANTED one?** The single sub-scope relation, used in both
+/// directions it is needed and spelled once.
+///
+/// True iff they are equal, or `wanted` is a **sub-scope** of `held` — a
+/// caveat NARROWING it, as in `infra:attest:licensure:{authority_id}` under
+/// `infra:attest` (CC 4.5.5 attenuation, which adds no member to the closed
+/// `infra:*` set).
+///
+/// # The direction is the whole point, and it is normative
+///
+/// A parent token satisfies a check for its child. **A child MUST NOT satisfy
+/// a check for its parent.** The obvious implementation —
+/// `held.starts_with(wanted)` — inverts exactly this: a holder of
+/// `infra:attest:licensure:acme` would satisfy a check for bare
+/// `infra:attest` and walk away with the FULL attest capability, repealing
+/// the attenuation that was the entire reason for issuing the narrowed token.
+/// CC 3.4.7.3 Clause B's purity-vs-membership defect in a second dress.
+///
+/// # Why the colon boundary is load-bearing beyond that
+///
+/// `wanted.strip_prefix(held)` alone would let `infra:attest` cover
+/// **`infra:attest_assurance`** — and v30.2.0 (CIRISPersist#607) split those
+/// two deliberately, because `infra:attest` already governs the build-manifest
+/// plane and reusing it "would let an attest-scoped key silently gain the
+/// power to declare a third party's age band". A naive prefix test does not
+/// merely widen a caveat; it re-merges two authorities this repo already paid
+/// to separate. The `:` is what keeps a sub-scope a sub-scope rather than a
+/// string prefix.
+///
+/// An unrecognized caveat therefore fails **closed** by construction: an
+/// unknown child is covered only by a genuine ancestor, and never widens to
+/// one. A trailing-colon token (`infra:attest:`) has an empty caveat and is
+/// covered by nothing but itself.
+#[must_use]
+pub(crate) fn scope_covers(held: &str, wanted: &str) -> bool {
+    if held.is_empty() || wanted.is_empty() {
+        return false;
+    }
+    if held == wanted {
+        return true;
+    }
+    // `wanted` is a sub-scope of `held` iff it continues PAST a `:` boundary.
+    wanted
+        .strip_prefix(held)
+        .is_some_and(|rest| rest.len() > 1 && rest.starts_with(':'))
+}
+
 fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> bool {
+    // v41.3.0 (CIRISPersist#814) — a held PARENT covers a check for its CHILD;
+    // a held child never widens to its parent. See [`scope_covers`].
     match envelope.get("scope") {
-        Some(serde_json::Value::String(s)) => s == scope_token,
-        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(scope_token)),
+        Some(serde_json::Value::String(s)) => scope_covers(s, scope_token),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|held| scope_covers(held, scope_token)),
         _ => false,
     }
 }
@@ -5878,7 +5963,17 @@ async fn scoped_delegation_reach(
             if policy.enforce_attenuation_and_sub_delegation {
                 if let Some(parent_scope) = &node.parent_scope {
                     let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    if !child_scope.is_subset(parent_scope) {
+                    // v41.3.0 (CIRISPersist#814 part 4) — "⊆-parent" is now
+                    // read modulo sub-scopes: every child token must be equal
+                    // to, or a CAVEAT ON, some parent token. Exact set-subset
+                    // would refuse `infra:attest:licensure:acme` under a parent
+                    // holding `infra:attest` — i.e. refuse the attenuation this
+                    // cut exists to allow. Still never EXPANDS: a child token
+                    // no parent token covers prunes the edge exactly as before.
+                    if !child_scope
+                        .iter()
+                        .all(|c| parent_scope.iter().any(|p| scope_covers(p, c)))
+                    {
                         continue;
                     }
                 }
@@ -12576,6 +12671,115 @@ pub async fn check_reserved_prefix_admission(
 
 #[cfg(test)]
 mod tests {
+
+    /// v41.3.0 (CIRISPersist#814 part 4, CC 4.5.5) — **the directional
+    /// sub-scope table, spelled as LITERALS.**
+    ///
+    /// Deliberately not derived from `delegation_scope::*`: a table generated
+    /// from the constants under test cannot fail when the constants are the
+    /// thing that is wrong, and the vector this exists to pin
+    /// (`infra:attest:licensure:acme` must NOT satisfy `infra:attest`) is a
+    /// relation between two strings, not a property of either.
+    #[test]
+    fn scope_covers_is_directional_and_boundary_exact_814() {
+        for (held, wanted, expect, why) in [
+            ("infra:attest", "infra:attest", true, "exact"),
+            (
+                "infra:attest",
+                "infra:attest:licensure:acme",
+                true,
+                "a parent covers its child — this is what attenuation MEANS",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest",
+                false,
+                "THE HAZARD: a child must never widen to its parent. \
+                 `held.starts_with(wanted)` returns true here and hands a \
+                 deliberately narrowed holder the full attest capability",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest:licensure:other",
+                false,
+                "siblings cover nothing",
+            ),
+            (
+                "infra:attest",
+                "infra:attest_assurance",
+                false,
+                "the COLON BOUNDARY: v30.2.0 split these two authorities on \
+                 purpose; a bare prefix test silently re-merges them",
+            ),
+            (
+                "infra:attest",
+                "infra:attestation",
+                false,
+                "colon boundary again — a string prefix is not a sub-scope",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest:licensure:acme",
+                true,
+                "an exact caveat is still exact",
+            ),
+            (
+                "moderate",
+                "moderate",
+                true,
+                "the unprefixed duty ladder is unaffected by this cut",
+            ),
+            (
+                "moderate",
+                "moderate:something",
+                true,
+                "the relation is not infra-specific; it is about the token shape",
+            ),
+            ("infra:attest", "", false, "empty is covered by nothing"),
+            ("", "infra:attest", false, "empty covers nothing"),
+            (
+                "infra:attest",
+                "infra:attest:",
+                false,
+                "a trailing-colon caveat is EMPTY — fail closed rather than \
+                 treat it as the parent",
+            ),
+        ] {
+            assert_eq!(
+                scope_covers(held, wanted),
+                expect,
+                "scope_covers({held:?}, {wanted:?}) should be {expect} — {why}"
+            );
+        }
+    }
+
+    /// v41.3.0 (CIRISPersist#814 part 4) — the relation is ANTISYMMETRIC on
+    /// distinct tokens: if `a` covers `b` and they differ, `b` must not cover
+    /// `a`. Stated as a property because the failure mode is a symmetric
+    /// implementation (`starts_with` in either argument order), which no
+    /// single row of the table above catches on its own.
+    #[test]
+    fn scope_covers_is_antisymmetric_814() {
+        let tokens = [
+            "infra:attest",
+            "infra:attest:licensure:acme",
+            "infra:attest:licensure:other",
+            "infra:attest_assurance",
+            "infra:serve",
+            "moderate",
+        ];
+        for a in tokens {
+            for b in tokens {
+                if a != b && scope_covers(a, b) {
+                    assert!(
+                        !scope_covers(b, a),
+                        "{a:?} covers {b:?} AND {b:?} covers {a:?} — the relation \
+                         is symmetric, which means a child can widen to its parent"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     fn default_policy() -> DimensionAdmissionPolicy {

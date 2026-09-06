@@ -84,6 +84,64 @@ edges with the CC 2.4.1.2 marker (`delegation_purpose: "owner_binding"`, the
 members are unaffected — a node cannot accept for itself, so any delegation
 naming it is still custody.
 
+### Also in this cut — CIRISPersist#814 part 4: directional sub-scope matching
+
+CIRISConstitution rc5 (#100 ask 2) allows `infra:attest` to be attenuated to a
+dimension family — `infra:attest:licensure:{authority_id}` — as a **caveat on
+an existing capability**, adding no member to the closed `infra:*` set.
+
+**The matcher is directional, and the direction is normative.** A parent token
+satisfies a check for its child; a child MUST NOT satisfy a check for its
+parent. One primitive, `scope_covers(held, wanted)`, spelled once:
+
+```rust
+held == wanted || wanted.strip_prefix(held).is_some_and(|r| r.len() > 1 && r.starts_with(':'))
+```
+
+The obvious implementation — `held.starts_with(wanted)` — inverts exactly this
+and hands a deliberately narrowed holder the FULL attest capability, repealing
+the attenuation that was the reason for issuing the narrow token. That is
+CC 3.4.7.3 Clause B's purity-vs-membership defect in a second dress, and it is
+pinned as a literal vector rather than a code comment.
+
+**Two sites, not the one the ask names.** The check
+(`delegation_scope_grants`) is the obvious one. The `⊆`-parent attenuation
+check is the other: it compared scope sets with exact `HashSet::is_subset`, so
+a legitimately NARROWED child (`infra:attest:licensure:acme` under a parent
+holding `infra:attest`) would have been **refused** — that is, the feature
+would have been unusable through the very rule that is supposed to permit it.
+Both now resolve through `scope_covers`. Site 2 only ever RELAXES: a child
+token no parent token covers still prunes the edge exactly as before.
+
+**The colon boundary is load-bearing beyond the stated hazard.** Without it,
+`infra:attest` would cover `infra:attest_assurance` — and v30.2.0
+(CIRISPersist#607) split those two deliberately, because `infra:attest` already
+governs the build-manifest plane and reusing it "would let an attest-scoped key
+silently gain the power to declare a third party's age band". A naive prefix
+test does not merely widen a caveat; it re-merges two authorities this repo
+already paid to separate. An unrecognized caveat therefore fails **closed**: an
+unknown child is covered only by a genuine ancestor and never widens to one.
+
+Twelve vectors, hand-written as literals rather than derived from the constants
+under test, plus an antisymmetry property (a symmetric implementation is a
+failure no single row catches alone). Mutation-tested three ways, each killed
+by a different assertion: the naive `starts_with` inversion, the missing colon
+boundary, and a symmetric relation.
+
+### Also in this cut — the issuance axis joins the duty ladder
+
+`license` and `grant` join `DELEGATED_DUTY_SCOPES` (five rungs → seven) and
+`delegation_scope::ALL`, under the same walk and the same enforced admission as
+`moderate` / `takedown` / `review`. The #637 inventory gate did its job on the
+way in: it refused the commit until both constants were placed in the ladder,
+and the seven-rung count is a hand-written literal for the same reason it was a
+hand-written five — a count derived from the array under test cannot notice
+that the array changed.
+
+*Remaining on #814: the `license` issuance quorum refusal (CC 3.3.9), parts 1
+and 3 (the `duty:{kind}` family and the `config:load` self-report route), part
+2 (the widened licensure status fold), and part 5's `session:` pin retirement.*
+
 ### Also in this cut — CIRISVerify v15.0.0 adopted
 
 All **seven** Cargo pins moved `v14.2.0` → `v15.0.0` together (the pins must

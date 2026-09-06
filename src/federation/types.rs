@@ -967,6 +967,14 @@ pub mod delegation_scope {
     /// `review` — the §11.10 reconsideration/review duty. Aliases
     /// [`crate::federation::admission::DELEGATION_SCOPE_REVIEW`] by value.
     pub const SCOPE_REVIEW: &str = crate::federation::admission::DELEGATION_SCOPE_REVIEW;
+
+    /// v41.3.0 (CIRISPersist#814 part 4) —
+    /// [`crate::federation::admission::DELEGATION_SCOPE_LICENSE`] by value.
+    pub const SCOPE_LICENSE: &str = crate::federation::admission::DELEGATION_SCOPE_LICENSE;
+
+    /// v41.3.0 (CIRISPersist#814 part 4) —
+    /// [`crate::federation::admission::DELEGATION_SCOPE_GRANT`] by value.
+    pub const SCOPE_GRANT: &str = crate::federation::admission::DELEGATION_SCOPE_GRANT;
     /// v25.1.0 (CIRISPersist#570 ask 2) — `slash`, the tier-3/4 REMOVAL duty
     /// (CC 6.1.2). Aliases
     /// [`crate::federation::admission::DELEGATION_SCOPE_SLASH`] by value.
@@ -1035,6 +1043,9 @@ pub mod delegation_scope {
         SCOPE_TAKEDOWN,
         SCOPE_REVIEW,
         SCOPE_SLASH,
+        // issuance axis (v41.3.0, CIRISPersist#814 part 4).
+        SCOPE_LICENSE,
+        SCOPE_GRANT,
         // recovery / succession standing, re-exported from `ownership_reclaim`.
         SCOPE_OWNER_BINDING_RECOVERY,
     ];
@@ -6525,13 +6536,21 @@ mod tests {
              same array — one vocabulary, one definition (#637)"
         );
 
-        // The ladder is FIVE rungs. Pinned by count AND by membership so that
+        // The ladder is SEVEN rungs. Pinned by count AND by membership so that
         // dropping one and adding another cannot pass.
+        //
+        // v41.3.0 (CIRISPersist#814 part 4) — five became seven when the
+        // ISSUANCE axis landed (`license`, `grant`). The count is deliberately
+        // a hand-written literal rather than `DELEGATED_DUTY_SCOPES.len()`: a
+        // count derived from the array under test cannot fail when the array is
+        // what changed, and this assertion exists precisely to make a consumer
+        // notice that the vocabulary GREW (#637 — a duty-conferral card shipped
+        // able to confer three of five because nothing announced the growth).
         assert_eq!(
             ds::MODERATION.len(),
-            5,
-            "the moderation ladder is five rungs (consent_revocation, moderate, takedown, \
-             review, slash); MODERATION has {}",
+            7,
+            "the delegated-duty ladder is seven rungs (consent_revocation, moderate, \
+             takedown, review, slash, license, grant); MODERATION has {}",
             ds::MODERATION.len()
         );
         for expected in [
@@ -6540,6 +6559,8 @@ mod tests {
             crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
             crate::federation::admission::DELEGATION_SCOPE_REVIEW,
             crate::federation::admission::DELEGATION_SCOPE_SLASH,
+            crate::federation::admission::DELEGATION_SCOPE_LICENSE,
+            crate::federation::admission::DELEGATION_SCOPE_GRANT,
         ] {
             assert!(
                 ds::MODERATION.contains(&expected),
