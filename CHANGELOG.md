@@ -128,6 +128,39 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Also in this cut — CIRISPersist#814 part 3: the sensitive-leaf floor
+
+CC rc5 (#97) is explicit that `config:*` is **not** scope-pinned as a family,
+and that distinction is load-bearing rather than pedantic. CIRISServer#324
+correctly forced *sensitive* rows to `SelfOwn`; generalizing that to the whole
+family would invent an invariant CC never stated **and break the operational
+leaves** — `config:load` MAY take the smallest scope that reaches the peers who
+route on it, which is the entire point of publishing load at all. A family-wide
+pin cannot express "these two leaves are secrets, that one is a routing input".
+
+So projection keeps following the envelope's own `cohort_scope`, and the leaves
+that must not travel are stopped at the **write door**:
+`check_config_sensitive_leaf_floor` refuses a `config:admission` or
+`config:transport` row carried above `self`. It runs BEFORE the existing
+self-or-owner authority arms — a row that may not travel at this scope is
+refused whoever wrote it, and answering "who are you" first would leak that
+ordering to a prober.
+
+`CONFIG_SENSITIVE_LEAVES` is a CLOSED literal set. An unrecognized leaf is NOT
+presumed sensitive, because presuming it would re-introduce the family-wide pin
+by the back door. Leaf matching goes through part 4's `scope_covers`, so
+`config:admission:v1` is the same leaf as `config:admission` while
+`config:admission_policy_notes` is a different one — a bare `starts_with` would
+refuse a leaf nobody decided was sensitive.
+
+Eight-row table, mutation-tested twice. Generalizing the floor to the whole
+family is killed by the `config:load @ community` row — the operational leaf CC
+declined to pin. Swapping `scope_covers` for `starts_with` is killed by
+`config:admission_policy_notes`.
+
+*Still open on part 3: the renewal-`supersedes` rule and the distinct-subject
+count.*
+
 ### Also in this cut — the issuance axis joins the duty ladder
 
 `license` and `grant` join `DELEGATED_DUTY_SCOPES` (five rungs → seven) and

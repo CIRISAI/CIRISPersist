@@ -2842,6 +2842,74 @@ pub fn check_capacity_not_self_attested(
 /// and its stem is [`MESH_CONFIG_DIMENSION_PREFIX`].
 pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
 
+/// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
+/// floor** on `config:*`: which leaves may not travel past the node itself.
+///
+/// # Why a floor at admission, and NOT a family pinned to `SelfOwn`
+///
+/// CC rc5 (#97) is explicit that `config:*` is **not** scope-pinned as a
+/// family, and the distinction is load-bearing rather than pedantic.
+/// CIRISServer#324 correctly forced *sensitive* rows to `SelfOwn`; generalizing
+/// that to the whole family would invent an invariant CC never stated, and it
+/// would break the operational leaves — `config:load` MAY take the smallest
+/// scope that reaches the peers who route to it, which is the entire point of
+/// publishing load at all. A family-wide pin cannot express "these two leaves
+/// are secrets, that one is a routing input".
+///
+/// So projection keeps following the envelope's own `cohort_scope`, and the
+/// leaves that must not travel are stopped at the WRITE door instead — where
+/// the leaf name is legible and a refusal is a refusal, rather than a silently
+/// narrower read.
+///
+/// The set is CLOSED and spelled as literals. A third sensitive leaf must be
+/// added here deliberately; an unrecognized leaf is NOT presumed sensitive,
+/// because presuming it would re-introduce the family-wide pin by the back
+/// door.
+pub const CONFIG_SENSITIVE_LEAVES: &[&str] = &["config:admission", "config:transport"];
+
+/// v41.3.0 (CIRISPersist#814 part 3) — is `dimension` one of the
+/// [`CONFIG_SENSITIVE_LEAVES`], allowing a `:v{n}` version suffix?
+///
+/// Matched on the leaf STEM through the CC 4.5.5 sub-scope relation
+/// ([`scope_covers`]) rather than a bare `starts_with`, for the reason that
+/// function documents: a prefix test would also catch
+/// `config:admission_policy_notes`, a different leaf nobody decided was
+/// sensitive.
+#[must_use]
+pub fn is_sensitive_config_leaf(dimension: &str) -> bool {
+    CONFIG_SENSITIVE_LEAVES
+        .iter()
+        .any(|leaf| scope_covers(leaf, dimension))
+}
+
+/// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — refuse a sensitive
+/// `config:*` leaf published above `self`.
+///
+/// Runs BEFORE [`check_config_self_or_owner_admission`]'s authority arms: a
+/// row that may not travel at this scope is refused whoever wrote it, and
+/// answering "who are you" first would leak that ordering to a prober.
+pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !is_sensitive_config_leaf(dimension) {
+        return Ok(());
+    }
+    if row.cohort_scope == crate::federation::types::cohort_scope::SELF {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{dimension} is a SENSITIVE config leaf (CC 3.4.5.1) and may only be published at \
+         cohort_scope {:?}; this row carries {:?}. An admission policy says what this node will \
+         accept and a transport config says how to reach it — either published past the node \
+         itself is a map for whoever is deciding how to approach it. An operational leaf such \
+         as config:load is unaffected and may take the smallest scope reaching the peers that \
+         route to it.",
+        crate::federation::types::cohort_scope::SELF,
+        row.cohort_scope
+    )))
+}
+
 /// v38.7.0 (CIRISPersist#778, **CC 3.4.5**) — **`config:{scope}` is a
 /// SELF-REPORT.** The author is the subject, or the subject's single live
 /// owner, or the row is refused:
@@ -2967,6 +3035,9 @@ pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory 
     if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
         return Ok(());
     }
+    // v41.3.0 (CIRISPersist#814 part 3) — the sensitive-leaf floor runs FIRST:
+    // a row that may not travel at this scope is refused whoever wrote it.
+    check_config_sensitive_leaf_floor(row)?;
     // Arm 1 — the subject speaking about itself. The overwhelmingly common
     // shape, the only one persist's own producer emits, and free: it settles
     // before any directory read, so the honest path buys no walk.
@@ -12671,6 +12742,102 @@ pub async fn check_reserved_prefix_admission(
 
 #[cfg(test)]
 mod tests {
+
+    /// v41.3.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the sensitive-leaf
+    /// floor, as a table.
+    ///
+    /// The two REFUSAL rows are the ask. The `config:load` rows are what keeps
+    /// this from being the family-wide `SelfOwn` pin CC explicitly declined: if
+    /// an operational leaf stops travelling, the floor has been generalized
+    /// into the invariant CC never stated, and load is no longer publishable to
+    /// the peers that route on it.
+    #[test]
+    fn config_sensitive_leaf_floor_814() {
+        for (dimension, scope, refused, why) in [
+            (
+                "config:admission:v1",
+                "self",
+                false,
+                "the sensitive leaf at its floor",
+            ),
+            (
+                "config:admission:v1",
+                "community",
+                true,
+                "an admission policy says what this node will accept",
+            ),
+            (
+                "config:transport:v1",
+                "federation",
+                true,
+                "a transport config says how to reach it",
+            ),
+            (
+                "config:transport",
+                "self",
+                false,
+                "unversioned stem, at the floor",
+            ),
+            (
+                "config:load:v1",
+                "community",
+                false,
+                "OPERATIONAL leaf — must still travel, or the floor has become \
+                 the family-wide pin CC declined",
+            ),
+            (
+                "config:load:v1",
+                "federation",
+                false,
+                "load at the widest scope is a routing input, not a secret",
+            ),
+            (
+                "config:admission_policy_notes:v1",
+                "community",
+                false,
+                "NOT a sensitive leaf — a bare prefix test would catch this and \
+                 refuse a leaf nobody decided was sensitive",
+            ),
+            (
+                "config:replication:v1",
+                "community",
+                false,
+                "an undecided leaf is not presumed sensitive",
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let row = crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "k".to_owned(),
+                attested_key_id: "k".to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({ "dimension": dimension }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: scope.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            let got = check_config_sensitive_leaf_floor(&row);
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "{dimension} @ cohort_scope={scope} should be {} — {why}. got {got:?}",
+                if refused { "REFUSED" } else { "admitted" }
+            );
+        }
+    }
 
     /// v41.3.0 (CIRISPersist#814 part 4, CC 4.5.5) — **the directional
     /// sub-scope table, spelled as LITERALS.**
