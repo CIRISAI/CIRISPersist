@@ -31543,6 +31543,30 @@ mod tests {
     /// v8.7.1 (CIRISPersist#233) — a `delegates_to` edge `granter →
     /// grantee` bearing `scope` (+ optional `sub_delegation`) on the PG
     /// backend.
+    /// v41.3.0 (CIRISPersist#811) — the CC 2.4.1.2 custody-marked twin of
+    /// [`pg_delegates_to`]. Since #811 that marker decides steward-binding for
+    /// any target that can accept for itself (a person, an agent): a plain
+    /// conferral is a job, only a marked edge is ownership.
+    fn pg_delegates_to_custody(
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        sub_delegation: bool,
+    ) -> crate::federation::Attestation {
+        let mut a = pg_scores_attestation(granter, grantee, granter, "x");
+        a.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
+        a.attestation_envelope = serde_json::json!({
+            "references_attestation_id": a.attestation_id,
+            "scope": scope,
+            "sub_delegation": sub_delegation,
+            "delegation_purpose":
+                crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+        });
+        pg_resign(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        a
+    }
+
     fn pg_delegates_to(
         granter: &str,
         grantee: &str,
@@ -31961,6 +31985,9 @@ mod tests {
         let owner = format!("ob-owner-{suffix}");
         let node = format!("ob-node-{suffix}");
         let agent = format!("ob-agent-{suffix}");
+        // v41.3.0 (CIRISPersist#811) — a second agent, stewarded by a PLAIN
+        // conferral only, for the blast-radius arm.
+        let agent_plain = format!("ob-agentp-{suffix}");
         let node_wd = format!("ob-node-wd-{suffix}");
         let node_exp = format!("ob-node-exp-{suffix}");
         let node_unstewarded = format!("ob-node-unstewarded-{suffix}");
@@ -31968,6 +31995,7 @@ mod tests {
             (&owner, crate::federation::types::identity_type::USER),
             (&node, crate::federation::types::identity_type::NODE),
             (&agent, crate::federation::types::identity_type::AGENT),
+            (&agent_plain, crate::federation::types::identity_type::AGENT),
             (&node_wd, crate::federation::types::identity_type::NODE),
             (&node_exp, crate::federation::types::identity_type::NODE),
             (
@@ -32014,6 +32042,8 @@ mod tests {
         let comm_unstewarded_agent = format!("ob-c2-{suffix}");
         let comm_node_ok = format!("ob-c3-{suffix}");
         let comm_agent_ok = format!("ob-c4-{suffix}");
+        // v41.3.0 (CIRISPersist#811) — the conferral-only roster's community.
+        let comm_agent_plain = format!("ob-c4b-{suffix}");
         let comm_infra = format!("ob-cinfra-{suffix}");
         let comm_fakeinfra = format!("ob-cfakeinfra-{suffix}");
         let comm_user = format!("ob-cuser-{suffix}");
@@ -32025,6 +32055,7 @@ mod tests {
             &comm_unstewarded_agent,
             &comm_node_ok,
             &comm_agent_ok,
+            &comm_agent_plain,
             &comm_infra,
             &comm_fakeinfra,
             &comm_user,
@@ -32109,10 +32140,22 @@ mod tests {
             .unwrap()
             .is_some());
 
-        // STEWARD-BOUND agent (live delegates_to(user → agent)) → ADMITTED.
+        // STEWARD-BOUND agent (live CUSTODY delegates_to(user → agent)) →
+        // ADMITTED.
+        //
+        // v41.3.0 (CIRISPersist#811): this arm used to pass a PLAIN
+        // `delegates_to` and assert admission. That is a capability conferral —
+        // a job — and under CC 3.2 rc4 it never steward-bound an agent; the
+        // predicate merely said it did. It now passes a custody-marked edge,
+        // and the conferral-only case is asserted as a REFUSAL below.
         backend
             .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(&owner, &agent, serde_json::json!(["share"]), false),
+                attestation: pg_delegates_to_custody(
+                    &owner,
+                    &agent,
+                    serde_json::json!(["share"]),
+                    false,
+                ),
             })
             .await
             .unwrap();
@@ -32125,6 +32168,40 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+
+        // v41.3.0 (CIRISPersist#811) — THE BLAST RADIUS, on the Postgres leg
+        // too. A SECOND agent whose only incoming edge is a PLAIN conferral is
+        // NOT steward-bound, so its community is refused and not stored.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &owner,
+                    &agent_plain,
+                    serde_json::json!(["share"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_community(put_comm(&comm_agent_plain, vec![&agent_plain], None))
+            .await
+            .expect_err("a conferral is not custody — the roster must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::UnstewardedCommunityMember { .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            backend
+                .lookup_community(&comm_agent_plain)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is stored on a refused roster"
+        );
 
         // `infrastructure` carve-out → unstewarded node admitted (AUTHORIZED:
         // comm_infra's key is substrate_persist).
