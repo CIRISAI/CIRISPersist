@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [41.3.0] - 2026-09-06
+
+**A conferral is not custody, and the predicate now agrees with the fold.**
+CIRISPersist#811, from CIRISConformance#87. Behaviour change with a blast
+radius — read the last section before adopting.
+
+### The defect
+
+CC 3.2 rc4 states it normatively: *"The steward-binding predicate, its
+admission gate, and the `steward_bindings_of` fold key on owner-binding edges
+alone."* v30.8.0 narrowed the **fold** to that discriminator and left the
+**predicate** and the **chain** hardcoding `DelegationEdgeFilter::AnyDelegation`.
+
+With an `agent` key `N`, an adult `user` `S` holding custody and a second adult
+`S2` holding only a plain conferral:
+
+| state | `is_steward_bound(N)` | `steward_bindings_of(N)` |
+|---|---|---|
+| both edges live | `true` | `[S]` |
+| `S`'s custody edge withdrawn | **`true`** | `[]` |
+
+After the only custody edge is gone, `N` read as steward-bound **to nobody** —
+a steward-less state the substrate could create but not describe, which is the
+exact class CC 3.2's fail-secure predicate exists to prevent. Every consumer
+gating on the predicate rather than the fold (edge, server) inherited it.
+
+### Why it survived review
+
+All three functions documented the biconditional as holding "by construction"
+because clause (3) was "literally the same call". That sentence is **true of
+the callee and false of the argument** — `live_delegation_granters` was indeed
+shared; the filter passed to it was not. A comment asserting agreement is not
+agreement.
+
+The report named two functions. There were **three**: `steward_binding_chain`
+was also hardcoding `AnyDelegation` against a fold that had already narrowed,
+and carries the same "by construction" claim.
+
+### The fix
+
+One `steward_edge_filter()`, called by all three. The filter is now shared on
+the axis that actually drifted, and the docstrings say what is and is not
+guaranteed rather than repeating the claim that failed.
+
+### Witnesses
+
+`exercise_steward_binding_liveness` gained the arrangement it never built. Every
+prior case used a NODE target with one edge shape, and that is why the harness
+was green through the whole life of the defect: a node cannot accept for itself,
+so every clause gets `AnyDelegation` and the predicate's hardcoded value was
+accidentally correct. The drift needs a target that CAN accept for itself AND
+two edge shapes at once — CIRISConformance#87's vector exactly.
+
+Mutation-tested, both backends, both sites independently: reverting
+`is_steward_bound` reds the fold arm (`bound=true anchors=[]`); reverting
+`steward_binding_chain` reds the chain arm (`bound=false
+chain=["conferrer","agent"]`). Each names the function that disagreed.
+
+### BLAST RADIUS — read this
+
+**An agent member whose only incoming edge is a plain conferral is no longer
+steward-bound, so its community is refused at the write gate**
+(`UnstewardedCommunityMember`) and nothing is stored. Before this cut the
+unmarked edge kept such a roster federating.
+
+This is asserted, on both backends, by
+`community_agent_member_with_only_a_conferral_is_refused_811` — a decision on
+the record rather than a surprise in a deployment, the same treatment
+`exercise_objection_plane_blast_radius` gives the node case. The pre-existing
+`community_steward_bound_agent_member_admitted` fixture was passing a plain
+`delegates_to` and asserting admission; it now passes a custody-marked edge,
+because what it was really asserting was the defect.
+
+Deployments rostering agents under unmarked delegations must re-issue those
+edges with the CC 2.4.1.2 marker (`delegation_purpose: "owner_binding"`, the
+`emit_attestation_self` path CIRISConformance probes) before adopting. Node
+members are unaffected — a node cannot accept for itself, so any delegation
+naming it is still custody.
+
 ## [41.2.0] - 2026-09-05
 
 **A vocabulary persist mirrors must be a SUPERSET of the one it serves.**

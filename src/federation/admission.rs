@@ -7307,6 +7307,42 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
     Ok(out)
 }
 
+/// v41.3.0 (CIRISPersist#811) — **THE clause-(3) edge filter.** One
+/// definition, three callers: [`is_steward_bound`], [`steward_bindings_of`]
+/// and [`steward_binding_chain`] all resolve their delegation clause through
+/// this, so the biconditional they each document cannot drift on the axis
+/// that actually drifted.
+///
+/// The discriminator is CC 3.2 rc3's, unchanged: **can this target accept for
+/// itself?** A node (no agency) is stewarded by ANY delegation naming it — a
+/// person's delegation to it IS custody. A target that can accept for itself
+/// is stewarded only where the envelope declares custody (the CC 2.4.1.2
+/// marker); an unmarked delegation to it is a capability conferral, a job
+/// rather than ownership.
+///
+/// # Why this is a function and not three literals
+///
+/// It was three literals, and two of them were the wrong one. v30.8.0
+/// narrowed `steward_bindings_of`'s clause (3) to this discriminator and left
+/// `is_steward_bound` and `steward_binding_chain` hardcoding
+/// [`DelegationEdgeFilter::AnyDelegation`]. All three docstrings claimed the
+/// biconditional held "by construction" because clause (3) was "literally the
+/// same call" — true of the callee, false of the argument, which is exactly
+/// why it survived review. CIRISConformance#87 found it: after the sole
+/// custody edge over an `agent` key is withdrawn with a plain conferral still
+/// live, the fold correctly returned `[]` while the predicate still answered
+/// `true` — a key steward-bound to nobody.
+async fn steward_edge_filter(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<DelegationEdgeFilter, Error> {
+    Ok(if can_accept_for_itself(directory, k).await? {
+        DelegationEdgeFilter::OwnerBindingOnly
+    } else {
+        DelegationEdgeFilter::AnyDelegation
+    })
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
 /// **steward-bound**? A moderation chain ROOT must terminate in a real human
 /// (a `user`-role identity), never a free-floating agent/service key — the
@@ -7318,7 +7354,10 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
 ///      resolves `k` to an identity whose key is `user`-role (k is a
 ///      device/occurrence of a human identity); OR
 ///   3. ∃ a **live** `delegates_to(U → k)` with `U` a `user`-role key (a
-///      human delegated to k) — [`live_delegation_granters`], the ONE walk
+///      human delegated to k), **of the shape [`steward_edge_filter`] admits
+///      for this target** — custody-only where `k` can accept for itself, any
+///      delegation where it cannot (CIRISPersist#811) —
+///      [`live_delegation_granters`], the ONE walk
 ///      that owns what "live" means: not retracted by the granter (the §11.10
 ///      edge-retraction model), not retracted by ANY admitted
 ///      `withdraws`/`recants` naming the edge (CEG §3.2.3 rules 1-4 /
@@ -7366,11 +7405,10 @@ pub async fn is_steward_bound(
     //     live-delegation walk ([`live_delegation_granters`]), which owns every
     //     liveness clause (retraction by the granter OR by any admitted
     //     `withdraws` naming the edge, expiry, adult-incapacity lapse).
-    Ok(
-        !live_delegation_granters(directory, k, DelegationEdgeFilter::AnyDelegation)
-            .await?
-            .is_empty(),
-    )
+    let filter = steward_edge_filter(directory, k).await?;
+    Ok(!live_delegation_granters(directory, k, filter)
+        .await?
+        .is_empty())
 }
 
 /// #249 Cut B — the **enumeration** of [`is_steward_bound`]: the `user`-role
@@ -7388,9 +7426,20 @@ pub async fn is_steward_bound(
 /// Consistency: `is_steward_bound(k)` ⟺ `!steward_bindings_of(k).is_empty()` —
 /// the predicate returns true iff ANY clause holds, and this returns the
 /// union of all satisfying anchors (deduped, sorted). An unbound `k` yields
-/// the empty set. Clause (3) is now literally the same call in both, so the
-/// biconditional cannot drift; the memory / sqlite / postgres legs of
-/// `steward_liveness_test_support` assert it at every state transition.
+/// the empty set.
+///
+/// Clause (3) resolves through [`steward_edge_filter`] in both, so the
+/// **filter** cannot drift (CIRISPersist#811). That is a narrower claim than
+/// this comment used to make: it said the biconditional could not drift
+/// because clause (3) was "literally the same call", which was true of the
+/// callee and false of the argument — the predicate passed
+/// `AnyDelegation` while this passed the agency-discriminated filter, and the
+/// two disagreed for the whole life of that sentence. What holds the
+/// biconditional now is the shared filter PLUS
+/// `exercise_steward_binding_liveness`, which asserts it at every state
+/// transition on all three backends — and, since #811, with a plain conferral
+/// surviving alongside the custody edge, the arrangement the old harness never
+/// built and therefore could not fail on.
 pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
@@ -7447,11 +7496,7 @@ pub async fn steward_bindings_of(
     // A target that cannot accept for itself (a node, or a minor) is stewarded by
     // ANY delegation naming it; one that can is stewarded only where the envelope
     // declares custody.
-    let filter = if can_accept_for_itself(directory, k).await? {
-        DelegationEdgeFilter::OwnerBindingOnly
-    } else {
-        DelegationEdgeFilter::AnyDelegation
-    };
+    let filter = steward_edge_filter(directory, k).await?;
     out.extend(live_delegation_granters(directory, k, filter).await?);
     let mut out: Vec<String> = out.into_iter().collect();
     out.sort();
@@ -10403,10 +10448,13 @@ pub async fn is_canonical_effective(
 ///   1. `k` is itself `user`-role → `[k]` (the key IS the human anchor).
 ///   2. `k` is an occurrence of a `user`-role identity → `[identity, k]`.
 ///   3. a **live** `delegates_to(U → k)` with `U` `user`-role →
-///      `[U, k]`, liveness decided by [`live_delegation_granters`] — the same
-///      call [`is_steward_bound`] and [`steward_bindings_of`] make, so
-///      `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds by
-///      construction (CIRISPersist#584). The §11.10 steward-binding clause (3)
+///      `[U, k]`, liveness decided by [`live_delegation_granters`] and edge
+///      SHAPE by [`steward_edge_filter`] — the same call AND the same argument
+///      [`is_steward_bound`] and [`steward_bindings_of`] make, so
+///      `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds
+///      (CIRISPersist#584, argument fixed in #811 — this function was the
+///      third site hardcoding `AnyDelegation` against a fold that had already
+///      narrowed). The §11.10 steward-binding clause (3)
 ///      is a DIRECT incoming edge (same as the predicate), so the delegated
 ///      path is one hop; a multi-hop human→…→k steward-binding is not part of
 ///      the predicate and is not synthesized here.
@@ -10445,8 +10493,8 @@ pub async fn steward_binding_chain(
     //     the ONE live-delegation walk returns a BTreeSet, so `.first()` IS
     //     that minimum. Liveness is NOT re-derived here — that is the whole
     //     point of CIRISPersist#584.
-    let anchors =
-        live_delegation_granters(directory, key_id, DelegationEdgeFilter::AnyDelegation).await?;
+    let filter = steward_edge_filter(directory, key_id).await?;
+    let anchors = live_delegation_granters(directory, key_id, filter).await?;
     if let Some(anchor) = anchors.into_iter().next() {
         return Ok(vec![anchor, key_id.to_owned()]);
     }
@@ -20607,6 +20655,37 @@ pub(crate) mod steward_liveness_test_support {
         row
     }
 
+    /// v41.3.0 (CIRISPersist#811) — a `delegates_to` carrying the **CC 2.4.1.2
+    /// custody marker**, as distinct from [`delegates_to`]'s plain capability
+    /// conferral. This is the shape `is_owner_binding_envelope` recognizes via
+    /// `delegation_purpose` — the raw `emit_attestation_self` path, and what
+    /// CIRISConformance probes.
+    ///
+    /// The harness needs BOTH shapes over one target, because the #811 drift
+    /// is invisible with only one: the predicate and the fold disagree only
+    /// where a plain conferral SURVIVES a withdrawn custody edge.
+    fn delegates_to_custody(
+        granter: &str,
+        recipient: &str,
+        scope: &[&str],
+        subjects: &[&str],
+    ) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = signed_row(
+            granter,
+            recipient,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            }),
+        );
+        row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
+        row
+    }
+
     pub(crate) fn withdraws_of(
         issuer: &str,
         attested: &str,
@@ -20792,6 +20871,70 @@ pub(crate) mod steward_liveness_test_support {
             steward_bindings_of(dir, &node3).await.expect("anchors"),
             vec![granter.clone()],
             "a withdraws that references some OTHER attestation must not fold this edge away"
+        );
+
+        // ── #811: a SURVIVING conferral must not answer for withdrawn custody ──
+        //
+        // Everything above uses a NODE target with exactly one edge shape, and
+        // that is why this harness was green through the whole life of the
+        // defect. A node cannot accept for itself, so `steward_edge_filter`
+        // hands every clause `AnyDelegation` and the predicate's old hardcoded
+        // `AnyDelegation` was accidentally the right answer. The drift needs a
+        // target that CAN accept for itself AND two edge shapes over it at once.
+        //
+        // An `agent` key is that target (not a node, not a minor user), and
+        // this is CIRISConformance#87's vector: custody from one adult, a plain
+        // capability conferral from another, then the custody edge withdrawn.
+        // Before #811 the fold correctly returned `[]` while the predicate
+        // still answered `true` on the strength of the conferral — a key
+        // steward-bound to nobody, which is precisely the state CC 3.2 says the
+        // substrate must be able to describe.
+        let custodian = format!("sb-custodian-{suffix}");
+        let conferrer = format!("sb-conferrer-{suffix}");
+        let agent = format!("sb-agent-{suffix}");
+        register(dir, &custodian, &[identity_type::USER]).await;
+        register(dir, &conferrer, &[identity_type::USER]).await;
+        register(dir, &agent, &[identity_type::AGENT]).await;
+
+        assert_biconditional(dir, &agent, false, "agent, no edges").await;
+
+        // The plain conferral ALONE must not steward-bind an agent: it is a
+        // job, not custody. (If this arm passes `true`, the filter is not
+        // being applied at all and every assertion below is vacuous.)
+        let conferral = delegates_to(&conferrer, &agent, &[ds::INFRA_SERVE], &[&agent]);
+        store(dir, &conferral).await.expect("conferral admitted");
+        assert_biconditional(dir, &agent, false, "plain conferral only").await;
+
+        // Custody arrives — now, and only now, the agent is steward-bound, and
+        // to the CUSTODIAN alone.
+        let custody = delegates_to_custody(
+            &custodian,
+            &agent,
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            &[&agent],
+        );
+        store(dir, &custody).await.expect("custody edge admitted");
+        assert_biconditional(dir, &agent, true, "custody + conferral").await;
+        assert_eq!(
+            steward_bindings_of(dir, &agent).await.expect("anchors"),
+            vec![custodian.clone()],
+            "only the CUSTODIAN anchors an agent; the conferrer gave it a job, not ownership"
+        );
+
+        // THE #811 STATE: the sole custody edge is withdrawn by its granter
+        // while the conferral stays live.
+        let custody_gone = bare_edge_retraction(&custodian, &agent);
+        store(dir, &custody_gone)
+            .await
+            .expect("the custodian's edge retraction must be admitted");
+        assert_biconditional(dir, &agent, false, "custody withdrawn, conferral survives").await;
+        assert!(
+            steward_bindings_of(dir, &agent)
+                .await
+                .expect("anchors")
+                .is_empty(),
+            "with custody withdrawn the agent is steward-bound to NOBODY — a live capability \
+             conferral is not a custody claim and must not answer for one (CIRISPersist#811)"
         );
     }
 
