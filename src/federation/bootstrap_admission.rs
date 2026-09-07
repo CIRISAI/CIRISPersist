@@ -1685,6 +1685,68 @@ pub mod test_support {
         }
     }
 
+    /// v42.0.0 (CIRISPersist#814 part 3) — the DISTINCT-SUBJECT count.
+    ///
+    /// The arm that matters is the third: a node with a live row AND a
+    /// superseded predecessor counts ONCE. A composer counting rows reads it as
+    /// two and a node that renews correctly halves its own signal against one
+    /// that does not — the incentive CC rc5 asks consumers to stop rewarding.
+    pub async fn exercise_distinct_self_reporting_subjects_814(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::distinct_self_reporting_subjects;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, cohort_scope, identity_type};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let a = format!("{tag}-dsa-{run}");
+        let b = format!("{tag}-dsb-{run}");
+        let quiet = format!("{tag}-dsq-{run}");
+        let third = format!("{tag}-dst-{run}");
+        for k in [&a, &b, &quiet, &third] {
+            ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
+        }
+        let subjects = vec![a.clone(), b.clone(), quiet.clone()];
+
+        let put = |id: &str, attester: &str, subject: &str| {
+            let mut r = scores_row(id, attester, subject, "config:load:v1");
+            r.cohort_scope = cohort_scope::SELF.to_owned();
+            ts::reseal(&mut r);
+            SignedAttestation { attestation: r }
+        };
+
+        // `a` reports once.
+        let a1 = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&a1, &a, &a)).await.expect("a1");
+
+        // `b` reports, then RENEWS correctly with a supersedes — two rows, one
+        // subject.
+        let b1 = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&b1, &b, &b)).await.expect("b1");
+        let b2 = uuid::Uuid::new_v4().to_string();
+        let mut sup = scores_row(&b2, &b, &b, "config:load:v1");
+        sup.cohort_scope = cohort_scope::SELF.to_owned();
+        sup.attestation_type = attestation_type::SUPERSEDES.to_owned();
+        sup.attestation_envelope[crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
+            serde_json::json!(b1.clone());
+        ts::reseal(&mut sup);
+        dir.put_attestation(SignedAttestation { attestation: sup })
+            .await
+            .expect("b renews");
+
+        let got = distinct_self_reporting_subjects(dir, &subjects, "config:load")
+            .await
+            .expect("fold");
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([a.clone(), b.clone()]),
+            "({tag}) #814: a renewing node counts ONCE — counting rows would read \
+             `b` as two and penalise it for renewing correctly; `quiet` has no \
+             live row and must not appear"
+        );
+    }
+
     /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — a config renewal must
     /// supersede the row it replaces.
     ///

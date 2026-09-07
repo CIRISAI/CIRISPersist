@@ -148,6 +148,46 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Closing the named residue
+
+Three things were carried as "not done" and are now either shipped or asked.
+
+**The dimension-casing bypass, partly closed.** Every family gate in
+`admission.rs` tests membership with a byte-exact `starts_with`, so
+`Config:Admission:v1` matched none of them — not the `config:` family gate, not
+CC 3.4.5's self-report rule, not the sensitive-leaf floor. Any key could write
+one about a victim node. `check_dimension_stem_is_lowercase` refuses a
+non-lowercase family STEM: CC 3.1 catalogues 116 families and not one carries an
+uppercase character, so this constrains nothing a conformant emitter does.
+VALUE segments are deliberately untouched — `{authority_id}`, `{target}` and
+`{H}` are caller data and may carry case, and the table pins that with admission
+rows as well as the refusal.
+
+It does **not** close the whole class: `config:Admission:v1` still reaches the
+family gate while evading the leaf floor. Closing that needs a decision about
+whether dimensions are case-sensitive identifiers at all — a vocabulary question
+for CC, not a gate persist may add unilaterally.
+
+**The distinct-subject count, shipped rather than described.** CC rc5 states it
+as a consumer obligation; persist now provides
+`distinct_self_reporting_subjects` so consumers do not each hand-roll it. A rule
+stated in prose and left to every consumer is the shape CIRISPersist#637 cost a
+release to remove — the ones that get it wrong get it wrong silently, reading
+one node as two and penalising the node that renewed correctly.
+
+One honest note is recorded in that function rather than papered over: its
+supersedes pass is **defensive, not decisive**. A live `supersedes` is itself a
+live row on the same leaf, so mutating the exclusion away does not red the
+witness. It is kept because the contract is "live rows", not "rows that happen
+to dominate".
+
+**The CC 3.3.9 issuance quorum remains open, and is blocked on a definition.**
+`authority_id` appears nowhere in persist outside the licensure module: there is
+no primitive for *which key holds licence authority for a named authority*. The
+rc5 registry says authority "is conferred by quorum, never by `delegates_to`",
+which rules out the delegation plane but does not say what the quorum is over.
+This is an ask, not an omission — see CIRISPersist#814.
+
 ### Adversarial review found five defects in this cut — all fixed
 
 An independent reviewer was run against the branch. Every finding was

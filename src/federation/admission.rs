@@ -2651,6 +2651,10 @@ pub async fn check_promotion_admission(
     // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
     check_session_self_report_admission(row)?;
 
+    // CC 3.1 — a dimension's family stem is lowercase, or it evades every
+    // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
+    check_dimension_stem_is_lowercase(row)?;
+
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
 
@@ -3244,6 +3248,119 @@ pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(
          row that replicates and is visible to any consumer reading rows directly.",
         row.attesting_key_id, row.attested_key_id
     )))
+}
+
+/// v42.0.0 (CIRISPersist#814, found by review) — **a dimension's FAMILY STEM
+/// must be lowercase.**
+///
+/// Every family gate in this file tests membership with a byte-exact
+/// `starts_with`, so `Config:Admission:v1` matches none of them: not the
+/// `config:` family gate, not the CIRISPersist#778 self-report rule, not the
+/// sensitive-leaf floor. Any key could write one about a victim node, and it
+/// would sit in the corpus looking like config.
+///
+/// The stem is governed vocabulary — CC 3.1 catalogues 116 families and not one
+/// carries an uppercase character — so requiring it lowercase constrains
+/// nothing a conformant emitter does, and turns a silent bypass into a
+/// refusal. The VALUE segments are deliberately untouched: `{authority_id}`,
+/// `{target}` and `{H}` are caller data and may legitimately carry case.
+///
+/// # This does not close the whole class
+///
+/// `config:Admission:v1` still reaches the `config:` family gate (its stem is
+/// lowercase) while evading the sensitive-leaf floor, which compares leaf
+/// stems byte-exactly. Closing that needs a decision about whether dimensions
+/// are case-sensitive identifiers at all — a vocabulary question for CC, not a
+/// gate persist can add unilaterally. Tracked separately; this gate closes the
+/// reported vector and narrows the rest.
+pub fn check_dimension_stem_is_lowercase(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let stem = crate::federation::namespace::registry::family_stem(dimension);
+    if !stem.chars().any(|c| c.is_ascii_uppercase()) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "dimension {dimension:?} has a non-lowercase family stem {stem:?}. CC 3.1's family \
+         vocabulary is lowercase throughout, and every family gate matches byte-exactly — so a \
+         capitalised stem silently evades ALL of them (the family gate, the CC 3.4.5 \
+         self-report rule, the sensitive-leaf floor) and lands a row that looks like the family \
+         it is imitating. Value segments may carry case; the stem may not."
+    )))
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **live self-reports for a
+/// `config:{leaf}`, counted by DISTINCT SUBJECT.**
+///
+/// CC rc5 (#97) states the rule as a consumer obligation: *a composer weighting
+/// self-attestations by live count MUST count distinct subjects, never rows.*
+/// [`check_config_renewal_supersedes`] is the write-door half — it stops a
+/// well-behaved renewer handing anyone two rows — but a composer that counts
+/// ROWS is still wrong after it, because rows legitimately multiply across
+/// scopes and versions.
+///
+/// So persist ships the count instead of only describing it. A rule stated in
+/// prose and left to each consumer is the shape CIRISPersist#637 cost a release
+/// to remove: every consumer hand-rolls the fold, and the ones that get it
+/// wrong get it wrong silently, reading one node as two.
+///
+/// Returns the distinct `attested_key_id`s with at least one live (not
+/// withdrawn, not recanted, not superseded) row on `leaf`. Retirement runs
+/// through [`crate::federation::precedence::retired_ids`] plus a separate
+/// supersedes pass, for the reason `federation::licensure` documents: that fold
+/// is a RETRACTION fold and by its own docs does not filter `supersedes`.
+///
+/// # Honest note on the supersedes pass here
+///
+/// Unlike in `federation::licensure`, where it is load-bearing, the supersedes
+/// exclusion is **defensive rather than decisive for this boolean**: a live
+/// `supersedes` is itself a live row on the same leaf, so a subject that
+/// superseded its own report still counts through the replacement. Mutating
+/// the exclusion away does NOT red the witness, and that is recorded rather
+/// than papered over — it only changes the answer in the cross-dimension case
+/// (a `supersedes` whose own dimension differs from its target's), which no
+/// conformant emitter produces. It is kept because the fold's contract is
+/// "live rows", not "rows that happen to dominate".
+pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    subject_key_ids: &[String],
+    leaf: &str,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut out = std::collections::BTreeSet::new();
+    for subject in subject_key_ids {
+        let rows = directory.list_attestations_for(subject).await?;
+        let refs: Vec<&super::Attestation> = rows.iter().collect();
+        let retired = crate::federation::precedence::retired_ids(&refs);
+        let superseded: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::SUPERSEDES
+                    && !retired.contains(&r.attestation_id)
+            })
+            .filter_map(|r| {
+                r.attestation_envelope
+                    .get("references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect();
+        let live = rows.iter().any(|r| {
+            !retired.contains(&r.attestation_id)
+                && !superseded.contains(r.attestation_id.as_str())
+                && r.attestation_type != attestation_type::WITHDRAWS
+                && r.attestation_type != attestation_type::RECANTS
+                && envelope_dimension(&r.attestation_envelope)
+                    .is_some_and(|d| scope_covers(leaf, d) || d == leaf)
+                // A self-report: the subject speaking about itself. A third
+                // party's row is not this subject's signal and must not make it
+                // count (CC 3.4.5).
+                && r.attesting_key_id == r.attested_key_id
+        });
+        if live {
+            out.insert(subject.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
@@ -13146,6 +13263,76 @@ pub async fn check_reserved_prefix_admission(
 
 #[cfg(test)]
 mod tests {
+
+    /// v42.0.0 (CIRISPersist#814, found by review) — the family-stem casing
+    /// table. The refusal row is the reported vector; the admission rows are
+    /// what stop this becoming "dimensions must be lowercase", which would
+    /// refuse legitimate caller data in a `{authority_id}` or `{target}`.
+    #[test]
+    fn dimension_family_stem_must_be_lowercase_814() {
+        let mk = |dim: &str| {
+            let now = chrono::Utc::now();
+            crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "k".to_owned(),
+                attested_key_id: "k".to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({ "dimension": dim }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            }
+        };
+        for (dim, refused, why) in [
+            (
+                "Config:Admission:v1",
+                true,
+                "THE REPORTED VECTOR: a capitalised stem evades the config family \
+                 gate, the #778 self-report rule AND the sensitive-leaf floor",
+            ),
+            (
+                "CONFIG:admission:v1",
+                true,
+                "shouting evades it just as well",
+            ),
+            ("Licensure:acme:v1", true, "and so would a forged licence"),
+            ("config:admission:v1", false, "the conformant spelling"),
+            ("duty:attribute:v1", false, "unaffected"),
+            (
+                "licensure:ACME-Board:v1",
+                false,
+                "VALUE segments may carry case — {authority_id} is caller data, and \
+                 refusing it would be a vocabulary change persist cannot make \
+                 unilaterally",
+            ),
+            (
+                "provenance:build_manifest:Darwin-ARM64",
+                false,
+                "a {target} likewise",
+            ),
+        ] {
+            let got = check_dimension_stem_is_lowercase(&mk(dim));
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "{dim:?} should be {} — {why}. got {got:?}",
+                if refused { "REFUSED" } else { "admitted" }
+            );
+        }
+    }
 
     /// v42.0.0 (CIRISPersist#814 part 1) — the duty/permission reach table.
     ///

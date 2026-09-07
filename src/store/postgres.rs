@@ -5167,6 +5167,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
         // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
         crate::federation::admission::check_session_self_report_admission(&row)?;
+        // CC 3.1 — a lowercase family stem, or the row evades every family gate
+        // (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_dimension_stem_is_lowercase(&row)?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
