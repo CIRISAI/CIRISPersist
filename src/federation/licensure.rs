@@ -148,7 +148,31 @@ pub async fn status_set_for(
     authority_id: &str,
 ) -> Result<BTreeSet<LicensureStatus>, Error> {
     let rows = directory.list_attestations_for(subject_key_id).await?;
-    Ok(fold_status_set(&rows, authority_id))
+    // v42.0.0 (CIRISPersist#814, CC ruling) — **fold by emitter-resolves-to-A.**
+    //
+    // A `licensure:{A}` row signed by a key that is neither `A` nor `A`'s
+    // `license`-scoped delegate is admissible and stays stored: it is TESTIMONY
+    // ABOUT `A`'s licensure, reaching a reader only along a flow that reader's
+    // trust or consent admits (CC 4.4.3.8). It is not `A`'s licensure, so it is
+    // not in this fold, and it composes at consumer confidence instead.
+    //
+    // This — not a write-door refusal — is what makes a stranger's absorbing
+    // `revoked` bind nobody. An earlier cut of this work reserved the family to
+    // `registry`/`verify` identity types; CC ruled that a misreading of
+    // CC 3.4.9 and the reservation was removed.
+    let mut mine = Vec::with_capacity(rows.len());
+    for row in rows {
+        if super::admission::emitter_resolves_to_authority(
+            directory,
+            &row.attesting_key_id,
+            authority_id,
+        )
+        .await?
+        {
+            mine.push(row);
+        }
+    }
+    Ok(fold_status_set(&mine, authority_id))
 }
 
 /// The fold itself, over rows already read — **pure**, so it is testable

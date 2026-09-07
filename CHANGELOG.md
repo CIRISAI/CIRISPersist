@@ -148,6 +148,81 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Both open questions were ruled on, and one ruling corrected this cut
+
+CC answered both asks on `rc5` at CIRISConstitution@71e7b2d. The registry was
+re-vendored at that ref — same 116 families, nothing added or removed, two
+descriptions lowercased, plus `_meta.case_rule` and `families[].segments[]`.
+
+**#815 — dimensions are case-sensitive, and the rule is PER SEGMENT (CC 3.1.7
+R3).** Nothing case-folds anywhere; a segment breaking its class's rule is
+*malformed*, never a sibling. The five classes ship as DATA — `literal`,
+`vocab`, `external`, `value`, `hex` — so the gate keys on the manifest rather
+than on `{...}` parsed out of prose.
+
+`check_dimension_case_rule` replaces the stem-only check, which CC confirmed was
+"the `literal` half of R3" and which **stays** — and it has to run BEFORE the
+family lookup, for a structural reason worth recording: a dimension whose stem
+is capitalised matches no catalogued family at all, so it has no `segments[]` to
+judge and would sail past a segment-only pass. `Config:admission:v1` is exactly
+that shape; `config:Admission:v1` is the one only the segment pass catches
+(`{scope}` is `vocab`). Both halves are needed and each is mutation-killed by
+its own row, as is the over-strict direction — applying the vocab rule to
+`value` segments reds on CC's own worked example, `licensure:CA_medical_board`.
+
+The manifest's `vocab_pattern` is checked by hand rather than by pulling in a
+regex engine, so `the_vocab_pattern_is_the_one_this_gate_implements_815` pins
+the two together: if CC widens the pattern, that reds instead of the gate
+silently enforcing a stale shape.
+
+Clippy then caught an unread `RawSegment.segment` field, which turned out to
+matter: the gate zips a dimension's `:`-split segments against `segments[]` **by
+position**, so a manifest whose list did not correspond to its own `prefix`
+would silently mis-class — judging a `value` segment by the `vocab` rule, or
+letting a `vocab` segment through as `value`. Invisible, because the gate would
+still pass its own table. `manifest_segments_align_with_their_prefix_815` now
+proves the alignment across all 116 families.
+
+The #724 gate — *"an unread manifest column is a claim the substrate silently
+ignores"* — refused the vendor until `segments[]` had a reader, which is how the
+ruling's own ask got enforced rather than merely intended.
+
+**#814 — there is no authority object, because there is no roster.** Anyone may
+be a licensing authority; `authority_id` names a KEY. "X holds licence authority
+for A" means X's key IS `A`, or X holds a `license`-scoped delegation chain from
+`A`. "By quorum" describes an authority's own governance, never an admission
+gate a substrate applies to somebody else's authority.
+
+**This corrected a fix made earlier in this same cut.** The `ReservedPrefixRule`
+reserving `licensure:` to `registry`/`verify` was a misreading of CC 3.4.9 —
+which is co-stewardship of the CIRIS-*issued* licence, not a reservation of the
+family. It is removed; the open-emitter posture is the design.
+
+The security property is unchanged and the mechanism is different, which is
+what the replacement witness pins: a stranger's forged, absorbing `revoked`
+**admits and is stored** — it is testimony about an authority, reaching a reader
+only along a flow that reader's trust or consent admits — and it **binds
+nobody**, because `status_set_for` now folds only rows whose emitter resolves to
+the authority. Exclusion, not refusal. Mutation-tested both ways: removing the
+resolution lets the stranger bind again; restoring the door refusal reds the
+"testimony admits" arm.
+
+The one refusal CC does specify is on the `license` scope:
+`licensure_delegator_not_authority`, when a row **claims** delegated authority
+(carrying `delegation_id`) whose chain does not resolve to the authority it
+names. Getting that trigger wrong once is recorded in the gate — firing on any
+attester-differs row would refuse the testimony CC ruled must admit.
+
+`registry` / `verify` **stay** in `AUTHORITY_CONFERRING_IDENTITY_TYPES`. That
+finding was independent of the reservation: `AccordCoScrubbed`'s own docstring
+already named the `CO_STEWARD_ROLES`, and registering such a key already failed
+through `check_accord_role_admission_over_roster`. Only the declaration was
+missing, and it still is worth having.
+
+One item from the #815 ruling needed no action: it flags
+`src/federation/migration.rs` as carrying a `slashing:PROVEN_ROGUE` literal now
+malformed under R3. **That string does not appear anywhere in this tree.**
+
 ### Closing the named residue
 
 Three things were carried as "not done" and are now either shipped or asked.

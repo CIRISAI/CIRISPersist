@@ -375,34 +375,6 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     // (`lookup_trusted_publisher_chain`), which is where CC puts it.
     let lenscore_detector = identity_type::LENSCORE_DETECTOR.to_owned();
     vec![
-        // v42.0.0 (CIRISPersist#814, found by review) — CC 3.4.9 reserves
-        // `licensure:` as **co-stewarded (Registry + Verify)**, and until this
-        // cut persist did not gate it: the family sat in
-        // `RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` with no purpose-built gate
-        // either, so ANY registered key could write a licensure row.
-        //
-        // That was inert while nothing folded those rows. `federation::licensure`
-        // (part 2) made them load-bearing, and `revoked` is ABSORBING — so a
-        // stranger could mint a permanent revocation for any holder, and neither
-        // the real authority nor the holder could lift it
-        // (`precedence::retraction_entitled` admits only the forged row's own
-        // attester or a subject named in it). Landing the fold without this gate
-        // turned a dormant hole into a live one; the fold is what made the gate
-        // urgent, not what created the hole.
-        //
-        // ANY-semantics: the attester's identity_type SET must contain
-        // `registry` or `verify`. This is the emitter half of CC 3.4.9; the
-        // CC 3.3.9 issuance QUORUM (which authority holds `{authority_id}`)
-        // remains outstanding on CIRISPersist#814 part 4 and is a narrower
-        // question than "may this key speak on this plane at all".
-        ReservedPrefixRule {
-            pattern_prefix: "licensure:".into(),
-            required_identity_types: vec![
-                identity_type::REGISTRY.to_owned(),
-                identity_type::VERIFY.to_owned(),
-            ],
-            required_delegation_scope: None,
-        },
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
             required_identity_types: vec![substrate_persist.clone()],
@@ -2653,7 +2625,11 @@ pub async fn check_promotion_admission(
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
-    check_dimension_stem_is_lowercase(row)?;
+    check_dimension_case_rule(row)?;
+
+    // CC 3.3.9 / CC 4.4.3.4.3 — a `license`-scoped issuance must resolve to the
+    // authority it names (v42.0.0, CIRISPersist#814).
+    check_licensure_delegator_is_authority(directory, row).await?;
 
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
@@ -3250,44 +3226,100 @@ pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(
     )))
 }
 
-/// v42.0.0 (CIRISPersist#814, found by review) — **a dimension's FAMILY STEM
-/// must be lowercase.**
+/// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — **the per-segment dimension case
+/// rule, driven from the manifest.**
 ///
-/// Every family gate in this file tests membership with a byte-exact
-/// `starts_with`, so `Config:Admission:v1` matches none of them: not the
-/// `config:` family gate, not the CIRISPersist#778 self-report rule, not the
-/// sensitive-leaf floor. Any key could write one about a victim node, and it
-/// would sit in the corpus looking like config.
+/// A dimension is a **case-sensitive byte string**, compared byte-exactly
+/// everywhere — admission, every family gate, `authority_for`, the
+/// sensitive-leaf floor. **Nothing case-folds.** Two strings differing only in
+/// case are two different strings, and the one that breaks its segment's rule
+/// is *malformed*, never a sibling.
 ///
-/// The stem is governed vocabulary — CC 3.1 catalogues 116 families and not one
-/// carries an uppercase character — so requiring it lowercase constrains
-/// nothing a conformant emitter does, and turns a silent bypass into a
-/// refusal. The VALUE segments are deliberately untouched: `{authority_id}`,
-/// `{target}` and `{H}` are caller data and may legitimately carry case.
+/// Which rule applies is decided PER SEGMENT, and the classes come from
+/// `_meta.case_rule` + `families[].segments[]` in the vendored manifest rather
+/// than from `{...}` parsed out of prose:
 ///
-/// # This does not close the whole class
+/// | class | rule |
+/// |---|---|
+/// | `literal` | CC-fixed stem, lowercase by construction |
+/// | `vocab` | must match `_meta.case_rule.vocab_pattern` |
+/// | `external` | an outside standard's canonical form (`USD`, `en-US`, `PG-13`) — untouched |
+/// | `value` | caller identity (`{authority_id}`, `{target}`) — case PRESERVED |
+/// | `hex` | CC 2.6.3 digest — lowercase |
 ///
-/// `config:Admission:v1` still reaches the `config:` family gate (its stem is
-/// lowercase) while evading the sensitive-leaf floor, which compares leaf
-/// stems byte-exactly. Closing that needs a decision about whether dimensions
-/// are case-sensitive identifiers at all — a vocabulary question for CC, not a
-/// gate persist can add unilaterally. Tracked separately; this gate closes the
-/// reported vector and narrows the rest.
-pub fn check_dimension_stem_is_lowercase(row: &super::Attestation) -> Result<(), Error> {
+/// # Why this replaced a stem-only check
+///
+/// The first cut of this gate refused a non-lowercase family STEM, which closed
+/// `Config:Admission:v1` but left `config:Admission:v1` reaching the family gate
+/// while evading the sensitive-leaf floor. CC ruled reading 2 (CC 3.1.7 R3) and
+/// carried the classes as DATA precisely so the gate stops guessing: the
+/// `{scope}` segment of `config:{scope}` is `vocab`, so `Admission` is malformed
+/// and never reaches the floor. The floor stays byte-exact because nothing
+/// malformed survives to it.
+///
+/// An UNCATALOGUED dimension is not judged here — it has no segment classes,
+/// and inventing them would be the section-walk heuristic CC 3.1.7 R2 forbids.
+/// Such rows are governed by the family gates that already cover them.
+pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> {
     let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
         return Ok(());
     };
-    let stem = crate::federation::namespace::registry::family_stem(dimension);
-    if !stem.chars().any(|c| c.is_ascii_uppercase()) {
+    let Some((vocab_pattern, refusal_token)) = crate::federation::namespace::registry::case_rule()
+    else {
         return Ok(());
+    };
+    // The `literal` half of R3, and it must run BEFORE the lookup — CC's ruling
+    // says this check "stays as is", and the reason is structural: a dimension
+    // whose STEM is capitalised matches no catalogued family at all, so it has
+    // no `segments[]` to judge and would sail through the per-segment pass
+    // below. `Config:admission:v1` is exactly that shape. The generator
+    // guarantees every catalogued stem is lowercase, so any uppercase here is a
+    // family nobody catalogued, imitating one somebody did.
+    let stem = crate::federation::namespace::registry::family_stem(dimension);
+    if stem.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(Error::InvalidArgument(format!(
+            "{refusal_token}: dimension {dimension:?} has a non-lowercase family stem \
+             {stem:?}. CC 3.1.7 R3 classes a stem `literal` and the CC generator refuses to \
+             build if any catalogued stem is not lowercase — so this matches no family, and \
+             would evade every family gate while looking like the family it imitates."
+        )));
     }
-    Err(Error::InvalidArgument(format!(
-        "dimension {dimension:?} has a non-lowercase family stem {stem:?}. CC 3.1's family \
-         vocabulary is lowercase throughout, and every family gate matches byte-exactly — so a \
-         capitalised stem silently evades ALL of them (the family gate, the CC 3.4.5 \
-         self-report rule, the sensitive-leaf floor) and lands a row that looks like the family \
-         it is imitating. Value segments may carry case; the stem may not."
-    )))
+    let Some(entry) = crate::federation::namespace::registry::lookup(dimension) else {
+        return Ok(());
+    };
+    use crate::federation::namespace::registry::SegmentClass as SC;
+    for (seg, (_, class)) in dimension.split(':').zip(entry.segments.iter()) {
+        let bad = match *class {
+            // Lowercase alphanumerics plus `_ . -`, per the manifest's own
+            // pattern. Checked structurally rather than by pulling in a regex
+            // engine for one expression; `vocab_pattern` is asserted to BE this
+            // shape by `the_vocab_pattern_is_the_one_this_gate_implements_815`,
+            // so the manifest and this check cannot drift apart silently.
+            SC::Vocab | SC::Literal => {
+                seg.is_empty()
+                    || !seg
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    || !seg.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')
+                    })
+            }
+            SC::Hex => seg.chars().any(|c| c.is_ascii_uppercase()),
+            // Caller data and outside standards keep their case.
+            SC::Value | SC::External | SC::Wildcard => false,
+        };
+        if bad {
+            return Err(Error::InvalidArgument(format!(
+                "{refusal_token}: dimension {dimension:?} segment {seg:?} is classed \
+                 {class:?} by CC 3.1.7 R3 and must match {vocab_pattern:?}. A dimension is a \
+                 case-sensitive byte string and NOTHING case-folds, so a segment breaking its \
+                 rule is malformed rather than a sibling — it would otherwise reach the family \
+                 gate while evading the leaf checks that key on the exact spelling."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **live self-reports for a
@@ -3305,22 +3337,15 @@ pub fn check_dimension_stem_is_lowercase(row: &super::Attestation) -> Result<(),
 /// to remove: every consumer hand-rolls the fold, and the ones that get it
 /// wrong get it wrong silently, reading one node as two.
 ///
-/// Returns the distinct `attested_key_id`s with at least one live (not
-/// withdrawn, not recanted, not superseded) row on `leaf`. Retirement runs
-/// through [`crate::federation::precedence::retired_ids`] plus a separate
-/// supersedes pass, for the reason `federation::licensure` documents: that fold
-/// is a RETRACTION fold and by its own docs does not filter `supersedes`.
-///
-/// # Honest note on the supersedes pass here
+/// # Honest note on the supersedes pass
 ///
 /// Unlike in `federation::licensure`, where it is load-bearing, the supersedes
 /// exclusion is **defensive rather than decisive for this boolean**: a live
 /// `supersedes` is itself a live row on the same leaf, so a subject that
-/// superseded its own report still counts through the replacement. Mutating
-/// the exclusion away does NOT red the witness, and that is recorded rather
-/// than papered over — it only changes the answer in the cross-dimension case
-/// (a `supersedes` whose own dimension differs from its target's), which no
-/// conformant emitter produces. It is kept because the fold's contract is
+/// superseded its own report still counts through the replacement. Mutating the
+/// exclusion away does NOT red the witness, and that is recorded rather than
+/// papered over — it only changes the answer in the cross-dimension case, which
+/// no conformant emitter produces. It is kept because the fold's contract is
 /// "live rows", not "rows that happen to dominate".
 pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?Sized>(
     directory: &F,
@@ -3351,9 +3376,6 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
                 && r.attestation_type != attestation_type::RECANTS
                 && envelope_dimension(&r.attestation_envelope)
                     .is_some_and(|d| scope_covers(leaf, d) || d == leaf)
-                // A self-report: the subject speaking about itself. A third
-                // party's row is not this subject's signal and must not make it
-                // count (CC 3.4.5).
                 && r.attesting_key_id == r.attested_key_id
         });
         if live {
@@ -3361,6 +3383,133 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
         }
     }
     Ok(out)
+}
+
+/// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`
+/// resolve to licence authority `authority_id`?**
+///
+/// CC ruled there is no authority object and no roster: *anyone may be a
+/// licensing authority.* `authority_id` names a KEY — a
+/// `federation_keys.key_id`, or an organisation whose keys resolve through
+/// `org_membership`. So "X holds licence authority for A" means exactly:
+///
+///  * X's key **is** `A`; or
+///  * X holds a [`DELEGATION_SCOPE_LICENSE`]-scoped delegation chain from `A`
+///    (CC 4.4.3.4.3).
+///
+/// That is the whole predicate. There is no quorum for persist to check — "by
+/// quorum" in CC 2.4.1.2.1 describes an authority's OWN governance where it is
+/// a collective, never an admission gate a substrate applies to somebody else's
+/// authority.
+///
+/// # This is a FOLD key, not an admission gate
+///
+/// A `licensure:{A}` row from a key that does not resolve to `A` is perfectly
+/// admissible — it is *testimony about* `A`'s licensure, and it reaches a reader
+/// only along a flow that reader's trust or consent already admits (CC 4.4.3.8).
+/// It simply is not `A`'s licensure, so it stays out of the `(subject, A)` fold
+/// and composes at consumer confidence instead. **That is how a stranger's
+/// absorbing `revoked` binds nobody — not by refusing the row.**
+pub async fn emitter_resolves_to_authority(
+    directory: &dyn super::FederationDirectory,
+    attester: &str,
+    authority_id: &str,
+) -> Result<bool, Error> {
+    if attester == authority_id {
+        return Ok(true);
+    }
+    let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
+    issuer_reaches_target_via_scoped_delegation(
+        directory,
+        authority_id,
+        &targets,
+        DELEGATION_SCOPE_LICENSE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await
+}
+
+/// v42.0.0 (CIRISPersist#814, CC 3.3.9 / CC 4.4.3.4.3) — **the one refusal on
+/// the `license` scope**: an issuance whose delegator chain does not resolve to
+/// the authority it names.
+///
+/// A key emitting `licensure:{A}` under a delegated
+/// [`DELEGATION_SCOPE_LICENSE`] must have that delegation chain resolve to `A`
+/// itself. Emitting `licensure:{A}` under a `license` scope delegated by `B` is
+/// `B` lending authority it does not hold, and it is refused
+/// (`licensure_delegator_not_authority`).
+///
+/// # What this is NOT
+///
+/// It is **not** a check that `A` is a known or trusted authority. CC ruled
+/// there is no roster: an unknown authority is simply an authority nobody
+/// trusts yet, and there is no `licensure_authority_unknown`. A key signing
+/// `licensure:{itself}` is always its own authority and passes trivially — the
+/// bootstrap has no circle because there is no prior row to gate on.
+///
+/// So this fires only on the delegated path: someone claiming to speak FOR an
+/// authority, whose chain does not reach it.
+pub async fn check_licensure_delegator_is_authority(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
+        return Ok(());
+    };
+    // Its own authority — the bootstrap case, and the overwhelmingly common one.
+    if row.attesting_key_id == authority_id {
+        return Ok(());
+    }
+    // v42.0.0 — the trigger is an EXPLICIT delegated-issuance claim, and getting
+    // this wrong once is why it is spelled out. CC's refusal is on "the `license`
+    // scope itself: an issuance whose delegator chain does not resolve to A" —
+    // NOT on any row whose attester differs from the authority. A stranger
+    // writing `licensure:{A}` with no delegation claim is TESTIMONY about A, and
+    // CC ruled it must admit; it binds nobody because the fold excludes it, not
+    // because the door refuses it.
+    //
+    // So the gate fires only where the row carries the authorizing
+    // `delegates_to` id — the `delegation_id` convention
+    // ([`crate::federation::hard_case`]'s field, whose entire job is to name the
+    // edge an act was taken under). A row that claims delegated authority must
+    // make that claim resolve; a row that claims none is not lying about one.
+    let Some(delegation_id) = row
+        .attestation_envelope
+        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let _ = delegation_id;
+    let targets: std::collections::HashSet<String> =
+        std::iter::once(row.attesting_key_id.clone()).collect();
+    let reaches = issuer_reaches_target_via_scoped_delegation(
+        directory,
+        authority_id,
+        &targets,
+        DELEGATION_SCOPE_LICENSE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await?;
+    if reaches {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "licensure_delegator_not_authority: {:?} emitted {dimension:?} but no \
+         `license`-scoped delegation chain from {authority_id:?} reaches it (CC 3.3.9 / \
+         CC 4.4.3.4.3). A `license` scope authorises emitting on behalf of a delegator that \
+         itself holds authority for THAT authority_id; lending authority one does not hold is \
+         the refusal. Note this says nothing about whether {authority_id:?} is known or \
+         trusted — an unknown authority is simply one nobody trusts yet, and a key signing \
+         `licensure:` for ITSELF is always its own authority.",
+        row.attesting_key_id
+    )))
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
@@ -13264,12 +13413,19 @@ pub async fn check_reserved_prefix_admission(
 #[cfg(test)]
 mod tests {
 
-    /// v42.0.0 (CIRISPersist#814, found by review) — the family-stem casing
-    /// table. The refusal row is the reported vector; the admission rows are
-    /// what stop this becoming "dimensions must be lowercase", which would
-    /// refuse legitimate caller data in a `{authority_id}` or `{target}`.
+    /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case table.
+    ///
+    /// The two REFUSAL rows are what CC's ruling closed that the first cut of
+    /// this gate did not: `config:Admission:v1` has a lowercase stem, so a
+    /// stem-only check let it reach the family gate while evading the
+    /// sensitive-leaf floor. Its `{scope}` segment is classed `vocab`, so it is
+    /// malformed and never gets there.
+    ///
+    /// The ADMISSION rows are what stops this becoming "dimensions must be
+    /// lowercase" — a `value` segment is caller identity and CC's own worked
+    /// example (`licensure:CA_medical_board`) must stay legal.
     #[test]
-    fn dimension_family_stem_must_be_lowercase_814() {
+    fn dimension_case_rule_is_per_segment_815() {
         let mk = |dim: &str| {
             let now = chrono::Utc::now();
             crate::federation::Attestation {
@@ -13298,33 +13454,32 @@ mod tests {
         };
         for (dim, refused, why) in [
             (
-                "Config:Admission:v1",
+                "config:Admission:v1",
                 true,
-                "THE REPORTED VECTOR: a capitalised stem evades the config family \
-                 gate, the #778 self-report rule AND the sensitive-leaf floor",
+                "THE ONE THE STEM CHECK MISSED: `{scope}` is a `vocab` segment, so \
+                 this is malformed and never reaches the sensitive-leaf floor",
             ),
             (
-                "CONFIG:admission:v1",
+                "Config:admission:v1",
                 true,
-                "shouting evades it just as well",
+                "a `literal` stem is lowercase by construction",
             ),
-            ("Licensure:acme:v1", true, "and so would a forged licence"),
             ("config:admission:v1", false, "the conformant spelling"),
-            ("duty:attribute:v1", false, "unaffected"),
             (
-                "licensure:ACME-Board:v1",
+                "config:load:v1",
                 false,
-                "VALUE segments may carry case — {authority_id} is caller data, and \
-                 refusing it would be a vocabulary change persist cannot make \
-                 unilaterally",
+                "the operational leaf still travels",
             ),
             (
-                "provenance:build_manifest:Darwin-ARM64",
+                "licensure:CA_medical_board",
                 false,
-                "a {target} likewise",
+                "CC's OWN worked example — `{authority_id}` is a `value` segment \
+                 and its case is preserved; refusing it would be the vocabulary \
+                 change persist must not make",
             ),
+            ("duty:attribute:v1", false, "the v42.0.0 family, conformant"),
         ] {
-            let got = check_dimension_stem_is_lowercase(&mk(dim));
+            let got = check_dimension_case_rule(&mk(dim));
             assert_eq!(
                 got.is_err(),
                 refused,
@@ -13332,6 +13487,25 @@ mod tests {
                 if refused { "REFUSED" } else { "admitted" }
             );
         }
+    }
+
+    /// v42.0.0 (CIRISPersist#815) — the manifest's `vocab_pattern` IS the shape
+    /// `check_dimension_case_rule` implements structurally.
+    ///
+    /// The gate checks the pattern by hand rather than pulling in a regex
+    /// engine for one expression, so this pins the two together: if CC ever
+    /// widens or narrows the pattern, this reds instead of the gate silently
+    /// enforcing the old shape against a manifest that says something else.
+    #[test]
+    fn the_vocab_pattern_is_the_one_this_gate_implements_815() {
+        let (pattern, token) = crate::federation::namespace::registry::case_rule()
+            .expect("the rc5 manifest carries _meta.case_rule");
+        assert_eq!(
+            pattern, "^[a-z0-9][a-z0-9_.-]*$",
+            "the gate implements this pattern structurally; if CC changed it, the \
+             gate must change with it rather than enforce a stale shape"
+        );
+        assert_eq!(token, "namespace_dimension_case_malformed");
     }
 
     /// v42.0.0 (CIRISPersist#814 part 1) — the duty/permission reach table.
@@ -15606,6 +15780,14 @@ mod tests {
         "delivery:",
         "delivery_receipt:",
         "key_boundary:",
+        // v42.0.0 (CIRISPersist#814) — CC ruled that CC 3.4.9 is co-stewardship
+        // of the CIRIS-ISSUED licence, NOT a reservation of the family, and
+        // that "a substrate reserving it to those identity types has misread
+        // it". The open-emitter posture is the design: anyone may be a
+        // licensing authority, and a stranger's row binds nobody because it
+        // falls OUTSIDE the (subject, authority) fold — not because it is
+        // refused. See `federation::licensure`.
+        "licensure:",
         "ownership:",
         "peer_reachability:",
         // v42.0.0 (CIRISPersist#814 part 5) — gated by

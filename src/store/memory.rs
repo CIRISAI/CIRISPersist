@@ -3302,7 +3302,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_session_self_report_admission(&row)?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
-        crate::federation::admission::check_dimension_stem_is_lowercase(&row)?;
+        crate::federation::admission::check_dimension_case_rule(&row)?;
+        // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
+        // names (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_licensure_delegator_is_authority(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
@@ -10058,10 +10061,10 @@ mod accord_tests {
 
     /// v42.0.0 (CIRISPersist#814 part 2) — the memory leg of the licensure fold.
     #[tokio::test]
-    async fn licensure_is_co_stewarded_at_the_door_814_memory() {
+    async fn stranger_licensure_admits_but_does_not_bind_814_memory() {
         let backend = MemoryBackend::new();
 
-        crate::federation::bootstrap_admission::test_support::exercise_licensure_is_co_stewarded_at_the_door_814(
+        crate::federation::bootstrap_admission::test_support::exercise_stranger_licensure_admits_but_does_not_bind_814(
             &backend, "memory",
         )
         .await;

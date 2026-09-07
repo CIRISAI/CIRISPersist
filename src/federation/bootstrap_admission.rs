@@ -1897,57 +1897,77 @@ pub mod test_support {
         );
     }
 
-    /// v42.0.0 (CIRISPersist#814, found by review) — **`licensure:` is
-    /// co-stewarded (CC 3.4.9): an ordinary key cannot write one.**
+    /// v42.0.0 (CIRISPersist#814, CC ruling on the licence-authority object) —
+    /// **a stranger's licensure row is ADMITTED and stays OUT of the fold.**
     ///
-    /// This replaced an end-to-end fold witness. The fold's ALGEBRA
-    /// (absorption, set-valuedness, supersedes lifting a suspension, authority
-    /// isolation) is now witnessed exhaustively against
-    /// `licensure::fold_status_set` as a pure function, because standing up a
-    /// `registry`-role attester needs accord-roster admission — and an
-    /// expensive fixture is how the supersedes arm came to be documented and
-    /// never asserted in the first place.
+    /// This replaced a witness asserting the opposite. An earlier cut of this
+    /// work reserved `licensure:` to `registry`/`verify` identity types; CC
+    /// ruled that a misreading of CC 3.4.9 — "the open-emitter posture is the
+    /// design, not a gap". Anyone may be a licensing authority; a stranger's
+    /// row is testimony ABOUT an authority, reaching a reader only along a flow
+    /// that reader's trust or consent admits, and it binds nobody because it is
+    /// not in the `(subject, authority)` fold.
     ///
-    /// What is left here is the part that genuinely needs the door: **who may
-    /// write at all.** Nothing gated the family before this cut, which was
-    /// inert while nothing folded those rows — and part 2's fold made a forged
-    /// `revoked` load-bearing, absorbing, and unliftable by the real authority
-    /// or the holder.
-    pub async fn exercise_licensure_is_co_stewarded_at_the_door_814(
+    /// So the security property is the SAME and the mechanism is different, and
+    /// that is exactly what this pins: the forged absorbing `revoked` still
+    /// cannot bar the holder — by exclusion, not by refusal.
+    pub async fn exercise_stranger_licensure_admits_but_does_not_bind_814(
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::licensure::{status_set_for, LicensureStatus as L};
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type;
 
         let run = uuid::Uuid::new_v4().simple().to_string();
+        let authority = format!("{tag}-auth-{run}");
         let stranger = format!("{tag}-stranger-{run}");
         let holder = format!("{tag}-holder-{run}");
-        for k in [&stranger, &holder] {
+        for k in [&authority, &stranger, &holder] {
             ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
         }
 
-        let forged = uuid::Uuid::new_v4().to_string();
-        let mut r = scores_row(&forged, &stranger, &holder, "licensure:acme:v1");
-        r.attestation_envelope["status"] = serde_json::json!("revoked");
-        ts::reseal(&mut r);
-        let err = dir
-            .put_attestation(SignedAttestation { attestation: r })
+        let put = |id: &str, attester: &str, status: &str| {
+            let mut r = scores_row(id, attester, &holder, &format!("licensure:{authority}:v1"));
+            r.attestation_envelope["status"] = serde_json::json!(status);
+            ts::reseal(&mut r);
+            SignedAttestation { attestation: r }
+        };
+
+        // The authority licenses the holder. An ordinary `user` key — CC ruled
+        // anyone may be a licensing authority, so no identity type is required.
+        let issued = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&issued, &authority, "issued"))
             .await
-            .expect_err(
-                "an ordinary key must not mint a licensure revocation — `revoked` is \
-                 ABSORBING and unliftable by the real authority or the holder",
-            );
+            .unwrap_or_else(|e| {
+                panic!("({tag}) #814: an ordinary key IS a licensing authority for its own id: {e}")
+            });
+
+        // A stranger forges an absorbing revocation. It ADMITS — refusing it
+        // would be the misreading CC corrected.
+        let forged = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(put(&forged, &stranger, "revoked"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("({tag}) #814: a stranger's licensure row is TESTIMONY and admits: {e}")
+            });
         assert!(
-            matches!(
-                err,
-                crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
-            ),
-            "({tag}) #814: expected the CC 3.4.9 co-steward refusal, got {err:?}"
+            dir.get_attestation(&forged).await.expect("read").is_some(),
+            "({tag}) #814: and it is stored — it is a real claim, just not the \
+             authority's"
         );
-        assert!(
-            dir.get_attestation(&forged).await.expect("read").is_none(),
-            "({tag}) #814: a refused licensure row must not be stored (AV-9)"
+
+        // THE POINT: it binds nobody, because it is not in the fold.
+        let set = status_set_for(dir, &holder, &authority)
+            .await
+            .expect("fold");
+        assert_eq!(
+            set,
+            std::collections::BTreeSet::from([L::Issued]),
+            "({tag}) #814: the stranger's `revoked` must NOT appear — the fold keys \
+             on emitter-resolves-to-authority, so a forged absorbing revocation \
+             cannot bar the holder. That is the mechanism CC ruled for, replacing \
+             a write-door refusal that misread CC 3.4.9."
         );
     }
 
