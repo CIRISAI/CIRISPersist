@@ -199,6 +199,33 @@ above: a `withdraws` whose envelope still named the dimension was folded as a
 live status. Retractions carry no replacement body and no longer contribute one;
 `supersedes` does, which is how a lift becomes `issued`.
 
+**The certification found the hole in the security fix itself.**
+`authority_conferring_set_covers_every_reserved_prefix_rule` (CIRISPersist#543's
+gate) reported that `registry` and `verify` reserved a family in
+`default_reserved_prefix_rules` but were **not** in
+`AUTHORITY_CONFERRING_IDENTITY_TYPES` — *"so a peer can self-assert them at
+registration and emit under the family they reserve"*.
+
+The `licensure:` gate above was therefore keyed on identity types a peer can
+simply declare about itself: a Sybil registers as `registry` and mints the same
+forged, absorbing revocation. **A reserved-prefix rule and a conferral
+requirement only work as a pair**, and shipping one without the other is a gate
+that reads as protection and is decoration.
+
+The fix records what persist already enforced rather than deciding anything new.
+`CO_STEWARD_ROLES` is already `[REGISTRY, VERIFY]`; `ConferralMode::AccordCoScrubbed`'s
+own docstring already names "the `CO_STEWARD_ROLES`" among its members; and
+registering a `registry` key already failed through
+`check_accord_role_admission_over_roster`. Only the **declaration** was missing,
+so `conferral_mode` returned `None` and the claim read as self-assertable. Nine
+authority-conferring types became eleven.
+
+Unlike `trusted_publisher` / `lenscore_detector` — moved OFF `AccordCoScrubbed`
+because requiring 2-of-3 hardware humans to stand up a routine detector is an
+outage rather than a gate — the co-stewards are two named services, and a
+self-asserted one gains standing over THIRD PARTIES: it could revoke a licence.
+The ceremony is proportionate here where it was not there.
+
 **A sixth finding, and a correction to my own correction.** I initially reverted
 the reviewer's `is_tombstone` fix, reasoning that `tombstone_ceiling` governs how
 far a *retraction signal* travels rather than whether a body may be seen. That is

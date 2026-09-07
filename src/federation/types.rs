@@ -280,7 +280,7 @@ pub mod identity_type {
     /// costs nothing. [`STEWARD`], [`PARTNER`] and [`WISE_AUTHORITY`] ARE
     /// present: each is read as authority (steward-binding, partner licensure,
     /// WA adjudication) somewhere in the write path.
-    pub const AUTHORITY_CONFERRING_IDENTITY_TYPES: [&str; 9] = [
+    pub const AUTHORITY_CONFERRING_IDENTITY_TYPES: [&str; 11] = [
         ACCORD_HOLDER,
         CANONICAL,
         SUBSTRATE_PERSIST,
@@ -290,6 +290,15 @@ pub mod identity_type {
         STEWARD,
         PARTNER,
         WISE_AUTHORITY,
+        // v42.0.0 (CIRISPersist#814) — `registry` and `verify` join the closed
+        // set because CC 3.4.9's co-stewarded rule now GATES a family on them
+        // (`licensure:`), and `authority_conferring_set_covers_every_reserved_prefix_rule`
+        // is right that a reserved-prefix rule keyed on a SELF-ASSERTABLE type
+        // is not a gate at all: a peer would declare `registry` at registration
+        // and emit under the family it reserves. Nine became eleven the moment
+        // those two types started carrying authority.
+        REGISTRY,
+        VERIFY,
     ];
 
     /// v22.0.0 (CIRISPersist#543 finding 3) — HOW each member of
@@ -435,6 +444,31 @@ pub mod identity_type {
             // decision, and until it lands this mode row is a claim about
             // the BINDING axis only.
             STEWARD | PARTNER | WISE_AUTHORITY => ConferralMode::DerivedFromVerifiedState,
+
+            // v42.0.0 (CIRISPersist#814) — the CO_STEWARD_ROLES. This records
+            // what persist ALREADY enforces rather than deciding anything new:
+            // `ConferralMode::AccordCoScrubbed`'s own docstring names "the
+            // CO_STEWARD_ROLES" among its members, and registering a `registry`
+            // key already fails through `check_accord_role_admission_over_roster`
+            // (`NoConstitutionalRootYet` with no roster to tally against). Only
+            // the DECLARATION was missing, so `conferral_mode` returned None and
+            // the claim read as self-assertable.
+            //
+            // That mattered the moment CC 3.4.9's co-stewarded rule started
+            // GATING a family on these two types (`licensure:`, this cut): a
+            // reserved-prefix rule keyed on a self-assertable type is not a gate
+            // — a peer declares the type at registration and emits under the
+            // family it reserves. `authority_conferring_set_covers_every_reserved_prefix_rule`
+            // caught exactly that.
+            //
+            // Unlike `trusted_publisher` / `lenscore_detector` — which were
+            // moved OFF AccordCoScrubbed because requiring 2-of-3 hardware
+            // humans to stand up a routine detector is an outage, not a gate —
+            // the co-stewards are two named services, not a routine operational
+            // role, and a self-asserted one gains standing over THIRD PARTIES:
+            // it could revoke a licence. That is the #543 attack, so the
+            // ceremony is proportionate here where it was not there.
+            REGISTRY | VERIFY => ConferralMode::AccordCoScrubbed,
             _ => return None,
         })
     }

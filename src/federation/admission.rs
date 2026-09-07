@@ -13810,6 +13810,11 @@ mod tests {
             identity_type::NODE,
             identity_type::LENSCORE_DETECTOR,
             identity_type::CANONICAL,
+            // v42.0.0 (CIRISPersist#814) — the CO_STEWARD_ROLES became
+            // authority-conferring when CC 3.4.9's rule started gating
+            // `licensure:` on them.
+            identity_type::REGISTRY,
+            identity_type::VERIFY,
         ];
         for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
             assert!(
