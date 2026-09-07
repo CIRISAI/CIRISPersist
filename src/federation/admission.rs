@@ -375,6 +375,34 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     // (`lookup_trusted_publisher_chain`), which is where CC puts it.
     let lenscore_detector = identity_type::LENSCORE_DETECTOR.to_owned();
     vec![
+        // v42.0.0 (CIRISPersist#814, found by review) — CC 3.4.9 reserves
+        // `licensure:` as **co-stewarded (Registry + Verify)**, and until this
+        // cut persist did not gate it: the family sat in
+        // `RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` with no purpose-built gate
+        // either, so ANY registered key could write a licensure row.
+        //
+        // That was inert while nothing folded those rows. `federation::licensure`
+        // (part 2) made them load-bearing, and `revoked` is ABSORBING — so a
+        // stranger could mint a permanent revocation for any holder, and neither
+        // the real authority nor the holder could lift it
+        // (`precedence::retraction_entitled` admits only the forged row's own
+        // attester or a subject named in it). Landing the fold without this gate
+        // turned a dormant hole into a live one; the fold is what made the gate
+        // urgent, not what created the hole.
+        //
+        // ANY-semantics: the attester's identity_type SET must contain
+        // `registry` or `verify`. This is the emitter half of CC 3.4.9; the
+        // CC 3.3.9 issuance QUORUM (which authority holds `{authority_id}`)
+        // remains outstanding on CIRISPersist#814 part 4 and is a narrower
+        // question than "may this key speak on this plane at all".
+        ReservedPrefixRule {
+            pattern_prefix: "licensure:".into(),
+            required_identity_types: vec![
+                identity_type::REGISTRY.to_owned(),
+                identity_type::VERIFY.to_owned(),
+            ],
+            required_delegation_scope: None,
+        },
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
             required_identity_types: vec![substrate_persist.clone()],
@@ -2933,19 +2961,68 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
         return Ok(());
     }
 
-    // (1) it must name the permission it attaches to.
-    let Some(permission_id) = row
-        .attestation_envelope
-        .get("references_attestation_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Err(Error::InvalidArgument(format!(
+    // v42.0.0 — a STRUCTURAL COMPOSER's `references_attestation_id` names its
+    // TARGET, not a permission, so this gate's premises do not hold for it as
+    // written. Found by review: without this, a subject-side `withdraws` of a
+    // duty (CEG §3.2.3 rule 2, which `precedence::retraction_entitled` admits)
+    // was REFUSED as "attaching an obligation to someone else's grant" — a
+    // message describing something the retractor had not done. A `duty:` row
+    // was retractable only by its own author.
+    //
+    //   * `withdraws` / `recants` carry no new duty body, so there is nothing
+    //     left to check: entitlement is `retraction_entitled`'s job.
+    //   * `supersedes` DOES carry a new body, so it IS checked — against the
+    //     permission of the duty it REPLACES, inherited by following the
+    //     target. Exempting it outright would have let a renewal widen a duty
+    //     past the permission the original was pinned to.
+    let inherited: Option<String>;
+    let permission_id =
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            if row.attestation_type != attestation_type::SUPERSEDES {
+                return Ok(());
+            }
+            let Some(target_id) = row
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(());
+            };
+            let Some(target) = directory.get_attestation(target_id).await? else {
+                return Ok(());
+            };
+            if !envelope_dimension(&target.attestation_envelope)
+                .is_some_and(|d| d.starts_with(DUTY_DIMENSION_PREFIX))
+            {
+                return Ok(());
+            }
+            inherited = target
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let Some(ref p) = inherited else {
+                return Ok(());
+            };
+            p.as_str()
+        } else {
+            // (1) it must name the permission it attaches to.
+            let Some(p) = row
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(Error::InvalidArgument(format!(
             "{dimension} is a DUTY (CC 3.1.1) and MUST name the permission it attaches to via \
              references_attestation_id. An obligation attached to nothing is not a weaker claim, \
              it is an unfalsifiable one."
         )));
-    };
+            };
+            p
+        };
 
     // The permission must be resolvable — a duty against a permission this node
     // has never seen would let a peer establish an obligation against a grant
@@ -2975,6 +3052,17 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
         crate::federation::namespace::Plane::Attestation { dimension },
         &row.cohort_scope,
         crate::federation::namespace::registry::authority_for(dimension).class,
+        // `is_tombstone = false` DELIBERATELY, and this was re-examined under
+        // review. The reviewer flagged the hardcoded `false` after seeing a
+        // `withdraws` refused as an "out-reach" — but that refusal's real cause
+        // was the missing structural-composer exemption above, and it is fixed
+        // there. Passing `true` here would be wrong for the one composer that
+        // still reaches this line: a `supersedes` carries a NEW DUTY BODY, and
+        // it is that body's reach which could leak the permission. The
+        // `tombstone_ceiling` governs how far a RETRACTION SIGNAL travels —
+        // deliberately wide, to reach holders who by construction already have
+        // the row — which is a different question from "may these bytes be
+        // seen by someone who cannot see the permission".
         false,
     );
     let permission_projection = crate::federation::namespace::projection_for(
@@ -2985,13 +3073,39 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
         crate::federation::namespace::registry::authority_for(perm_dimension).class,
         false,
     );
-    if !duty_may_ride(duty_projection, permission_projection) {
+    // v42.0.0 (found by review) — the PROJECTION comparison alone is not
+    // enough, and the hole is subtle. `Projection::Cohort` collapses
+    // `community | affiliations | species | biosphere | federation` into one
+    // value whose real audience is THE ROW'S OWN roster, so two `Cohort` rows
+    // at different `cohort_scope` have strictly different reach. A duty at
+    // `federation` on a permission at `affiliations` compared "equal" and was
+    // admitted — plaintext-gossiped federation-wide while the permission it
+    // names is DEK-encrypted to one affiliation roster, which is exactly the
+    // leak the refusal below describes.
+    //
+    // I avoided a false total order ACROSS `Projection` variants (see
+    // `duty_may_ride`) and then walked into one WITHIN a variant. So the reach
+    // test is now two questions, and both must pass: the audience KIND must be
+    // ridable, and the tier must not be wider on the closed CC 4.4.3.3.1
+    // ladder — `crossing::scope_rank`, the same ordering `check_strictly_wider`
+    // uses, not a second one derived here.
+    let duty_rank = crate::federation::crossing::scope_rank(&row.cohort_scope);
+    let perm_rank = crate::federation::crossing::scope_rank(&permission.cohort_scope);
+    let tier_ok = match (duty_rank, perm_rank) {
+        (Some(d), Some(p)) => d <= p,
+        // An unrecognized scope fails CLOSED: it has no place on the ladder, so
+        // "not wider" cannot be established.
+        _ => false,
+    };
+    if !tier_ok || !duty_may_ride(duty_projection, permission_projection) {
         return Err(Error::InvalidArgument(format!(
-            "{dimension} would project {duty_projection:?} while the permission it names \
-             ({perm_dimension:?} @ {:?}) projects {permission_projection:?}. A duty projects \
-             exactly as far as its permission and NEVER wider (CC 3.1.1): a duty visible where \
-             its permission is not leaks the permission's existence.",
-            permission.cohort_scope
+            "{dimension} @ {:?} would project {duty_projection:?} while the permission it \
+             names ({perm_dimension:?} @ {:?}) projects {permission_projection:?}. A duty \
+             projects exactly as far as its permission and NEVER wider (CC 3.1.1): a duty \
+             visible where its permission is not leaks the permission's existence. Note that \
+             two `Cohort` projections at different cohort_scope are NOT equal reach — the \
+             audience is the row's own roster.",
+            row.cohort_scope, permission.cohort_scope
         )));
     }
     Ok(())
@@ -15291,7 +15405,6 @@ mod tests {
         "delivery:",
         "delivery_receipt:",
         "key_boundary:",
-        "licensure:",
         "ownership:",
         "peer_reachability:",
         // v42.0.0 (CIRISPersist#814 part 5) — gated by

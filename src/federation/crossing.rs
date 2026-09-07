@@ -1015,7 +1015,14 @@ pub const WIDENING_PROTECTED_MEMBERS: [&str; 7] = [
     paths::DIFFERS_IN,
 ];
 
-fn scope_rank(s: &str) -> Option<usize> {
+/// Position in the closed widening order [`cohort_scope::ALL`] — THE ordering
+/// over cohort scopes, ratified by CC 4.4.3.3.1 and used by
+/// [`check_strictly_wider`].
+///
+/// `pub(crate)` since v42.0.0 so `admission::check_duty_admission` compares
+/// reach against the SAME ladder rather than deriving a second one. Two
+/// orderings over one vocabulary is the two-lists class.
+pub(crate) fn scope_rank(s: &str) -> Option<usize> {
     cohort_scope::ALL.iter().position(|v| *v == s)
 }
 

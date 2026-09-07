@@ -1835,88 +1835,57 @@ pub mod test_support {
         );
     }
 
-    /// v42.0.0 (CIRISPersist#814 part 2) — the licensure fold: set-valued, with
-    /// `revoked` ABSORBING.
+    /// v42.0.0 (CIRISPersist#814, found by review) — **`licensure:` is
+    /// co-stewarded (CC 3.4.9): an ordinary key cannot write one.**
     ///
-    /// Four properties, and the third is the one a "latest wins" fold gets
-    /// wrong:
-    ///  1. concurrent statuses are BOTH live — `issued` + `probation` is two
-    ///     facts, not a blended state;
-    ///  2. a suspension is REVERSIBLE — superseding it lifts it;
-    ///  3. a revocation ABSORBS — a later `issued` cannot dilute it, whatever
-    ///     the arrival order, because arrival order across a mesh is not a fact
-    ///     about the licence;
-    ///  4. authorities do not bleed — a status from `other` is not folded into
-    ///     `acme`.
-    pub async fn exercise_licensure_fold_is_set_valued_and_revoked_absorbs_814(
+    /// This replaced an end-to-end fold witness. The fold's ALGEBRA
+    /// (absorption, set-valuedness, supersedes lifting a suspension, authority
+    /// isolation) is now witnessed exhaustively against
+    /// `licensure::fold_status_set` as a pure function, because standing up a
+    /// `registry`-role attester needs accord-roster admission — and an
+    /// expensive fixture is how the supersedes arm came to be documented and
+    /// never asserted in the first place.
+    ///
+    /// What is left here is the part that genuinely needs the door: **who may
+    /// write at all.** Nothing gated the family before this cut, which was
+    /// inert while nothing folded those rows — and part 2's fold made a forged
+    /// `revoked` load-bearing, absorbing, and unliftable by the real authority
+    /// or the holder.
+    pub async fn exercise_licensure_is_co_stewarded_at_the_door_814(
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::licensure::{status_set_for, LicensureStatus as L};
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type;
 
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let board = format!("{tag}-board-{run}");
+        let stranger = format!("{tag}-stranger-{run}");
         let holder = format!("{tag}-holder-{run}");
-        for k in [&board, &holder] {
+        for k in [&stranger, &holder] {
             ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
         }
 
-        let put = |id: &str, dim: &str, status: &str| {
-            let mut r = scores_row(id, &board, &holder, dim);
-            r.attestation_envelope["status"] = serde_json::json!(status);
-            ts::reseal(&mut r);
-            SignedAttestation { attestation: r }
-        };
-
-        // (1) concurrent statuses are both live.
-        let issued = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(put(&issued, "licensure:acme:v1", "issued"))
+        let forged = uuid::Uuid::new_v4().to_string();
+        let mut r = scores_row(&forged, &stranger, &holder, "licensure:acme:v1");
+        r.attestation_envelope["status"] = serde_json::json!("revoked");
+        ts::reseal(&mut r);
+        let err = dir
+            .put_attestation(SignedAttestation { attestation: r })
             .await
-            .unwrap_or_else(|e| panic!("({tag}) issued admits: {e}"));
-        let probation = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(put(&probation, "licensure:acme:v1", "probation"))
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) probation admits: {e}"));
-        assert_eq!(
-            status_set_for(dir, &holder, "acme").await.expect("fold"),
-            std::collections::BTreeSet::from([L::Issued, L::Probation]),
-            "({tag}) #814: issued + probation is TWO FACTS — a scalar fold would \
-             have to discard one, and every rule for picking is a policy this \
-             substrate does not own"
-        );
-
-        // (4) another authority does not bleed in.
-        let other = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(put(&other, "licensure:other:v1", "revoked"))
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) other-authority row admits: {e}"));
+            .expect_err(
+                "an ordinary key must not mint a licensure revocation — `revoked` is \
+                 ABSORBING and unliftable by the real authority or the holder",
+            );
         assert!(
-            !status_set_for(dir, &holder, "acme")
-                .await
-                .expect("fold")
-                .contains(&L::Revoked),
-            "({tag}) #814: a revocation by a DIFFERENT authority must not fold \
-             into acme's set"
+            matches!(
+                err,
+                crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+            ),
+            "({tag}) #814: expected the CC 3.4.9 co-steward refusal, got {err:?}"
         );
-
-        // (3) THE ABSORPTION. Revoke, then issue again afterwards.
-        let revoked = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(put(&revoked, "licensure:acme:v1", "revoked"))
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) revoked admits: {e}"));
-        let later = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(put(&later, "licensure:acme:v1", "issued"))
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) later issued admits: {e}"));
-        assert_eq!(
-            status_set_for(dir, &holder, "acme").await.expect("fold"),
-            std::collections::BTreeSet::from([L::Revoked]),
-            "({tag}) #814: `revoked` is ABSORBING — nothing lifts a revocation, \
-             and a re-licence is a NEW licence under a new authority \
-             attestation, never a status transition. A later `issued` arriving \
-             after it must not dilute the set."
+        assert!(
+            dir.get_attestation(&forged).await.expect("read").is_none(),
+            "({tag}) #814: a refused licensure row must not be stored (AV-9)"
         );
     }
 
@@ -1951,9 +1920,19 @@ pub mod test_support {
             ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
         }
 
-        // A permission the licensor issued, at `community`.
+        // A permission the licensor issued. A CONSENT GRANT rather than a
+        // licence: CC 3.1.1 names both ("the licensor for a licence, the
+        // consenting subject for a consent grant"), and since v42.0.0
+        // `licensure:` is co-stewarded (CC 3.4.9) so an ordinary key cannot
+        // issue one — which is the point of that gate, not an obstacle to work
+        // around.
         let permission_id = uuid::Uuid::new_v4().to_string();
-        let mut permission = scores_row(&permission_id, &licensor, &licensor, "licensure:acme:v1");
+        let mut permission = scores_row(
+            &permission_id,
+            &licensor,
+            &licensor,
+            "consent:scope:share:v1",
+        );
         permission.cohort_scope = cohort_scope::FEDERATION.to_owned();
         ts::reseal(&mut permission);
         dir.put_attestation(SignedAttestation {
@@ -2021,7 +2000,7 @@ pub mod test_support {
         // (4) THE LEAK DIRECTION — the duty out-reaches its permission.
         // Permission is `self`-scoped here, duty at `community`.
         let narrow_id = uuid::Uuid::new_v4().to_string();
-        let mut narrow = scores_row(&narrow_id, &licensor, &licensor, "licensure:acme:v1");
+        let mut narrow = scores_row(&narrow_id, &licensor, &licensor, "consent:scope:share:v1");
         narrow.cohort_scope = cohort_scope::SELF.to_owned();
         ts::reseal(&mut narrow);
         dir.put_attestation(SignedAttestation {
@@ -2049,6 +2028,81 @@ pub mod test_support {
             "({tag}) #814 (4): a REFUSED duty must not be stored (AV-9)"
         );
 
+        // (5) THE BUCKET-COLLAPSE VECTOR (found by review). Both rows land in
+        // `Projection::Cohort`, so a projection-only comparison calls them
+        // equal reach — but `Cohort`'s audience is the ROW'S OWN roster, so a
+        // duty at `federation` on a permission at `affiliations` is
+        // plaintext-gossiped federation-wide while the permission is
+        // DEK-encrypted to one affiliation. Arm 4 above only crosses the
+        // SelfOwn/Cohort boundary and passes on the broken code; this one does
+        // not.
+        let mid_id = uuid::Uuid::new_v4().to_string();
+        let mut mid = scores_row(&mid_id, &licensor, &licensor, "consent:scope:share:v1");
+        mid.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
+        ts::reseal(&mut mid);
+        dir.put_attestation(SignedAttestation { attestation: mid })
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #814: the affiliations permission admits: {e}"));
+        let id5 = uuid::Uuid::new_v4().to_string();
+        let e5 = dir
+            .put_attestation(duty(
+                &id5,
+                &licensor,
+                Some(&mid_id),
+                cohort_scope::FEDERATION,
+            ))
+            .await
+            .expect_err(
+                "a duty at `federation` must not ride a permission at `affiliations` — \
+                 both are Projection::Cohort but Cohort is the ROW'S OWN roster",
+            );
+        assert!(
+            format!("{e5}").contains("NEVER wider"),
+            "({tag}) #814 (5): got {e5}"
+        );
+        assert!(
+            dir.get_attestation(&id5).await.expect("read").is_none(),
+            "({tag}) #814 (5): a refused duty must not be stored (AV-9)"
+        );
+
+        // (6) A DUTY MUST BE RETRACTABLE BY AN ENTITLED PARTY (found by review;
+        // the fix for it initially survived mutation because no arm covered
+        // it). A structural composer's `references_attestation_id` names its
+        // TARGET, not a permission — so without the exemption this gate read a
+        // subject-side `withdraws` as "a duty naming a permission issued by
+        // someone else" and refused it, with a message describing something the
+        // retractor had not done. A `duty:` row was retractable only by its own
+        // author, while `precedence::retraction_entitled` says the subject named
+        // in it may retract too (CEG §3.2.3 rule 2).
+        let subject = format!("{tag}-subject-{run}");
+        ts::register_hybrid_key_as(dir, &subject, &subject, identity_type::USER).await;
+        let owned_id = uuid::Uuid::new_v4().to_string();
+        let mut owned = scores_row(&owned_id, &licensor, &licensor, "duty:attribute:v1");
+        owned.cohort_scope = cohort_scope::SELF.to_owned();
+        owned.subject_key_ids = vec![subject.clone()];
+        owned.attestation_envelope["references_attestation_id"] =
+            serde_json::json!(permission_id.clone());
+        ts::reseal(&mut owned);
+        dir.put_attestation(SignedAttestation { attestation: owned })
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) #814 (6): the subject-bearing duty admits: {e}"));
+
+        let retraction = uuid::Uuid::new_v4().to_string();
+        let mut w = scores_row(&retraction, &subject, &subject, "duty:attribute:v1");
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+        w.cohort_scope = cohort_scope::SELF.to_owned();
+        w.attestation_envelope["references_attestation_id"] = serde_json::json!(owned_id.clone());
+        ts::reseal(&mut w);
+        dir.put_attestation(SignedAttestation { attestation: w })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({tag}) #814 (6): the SUBJECT named in a duty may retract it \
+                     (CEG §3.2.3 rule 2) — a duty retractable only by its author is a \
+                     duty nobody can get out from under: {e}"
+                )
+            });
+
         // The honest path still works: same attester, same-or-narrower reach.
         let ok_id = uuid::Uuid::new_v4().to_string();
         dir.put_attestation(duty(
@@ -2064,6 +2118,40 @@ pub mod test_support {
         assert!(
             dir.get_attestation(&ok_id).await.expect("read").is_some(),
             "({tag}) #814: the admitted duty is stored"
+        );
+
+        // (7) A SUPERSEDES of a duty inherits the permission of the duty it
+        // replaces, and is checked against it — so a renewal cannot widen a
+        // duty past the grant the original was pinned to. Exempting structural
+        // composers outright (the obvious fix for arm 6) would have opened
+        // exactly that hole.
+        // Its own base: a duty at `self` on the `self`-scoped permission.
+        let base_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(duty(
+            &base_id,
+            &licensor,
+            Some(&narrow_id),
+            cohort_scope::SELF,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814 (7): the narrow base duty admits: {e}"));
+
+        let widen = uuid::Uuid::new_v4().to_string();
+        let mut w2 = scores_row(&widen, &licensor, &licensor, "duty:attribute:v1");
+        w2.attestation_type = crate::federation::types::attestation_type::SUPERSEDES.to_owned();
+        w2.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        w2.attestation_envelope["references_attestation_id"] = serde_json::json!(base_id.clone());
+        ts::reseal(&mut w2);
+        let e7 = dir
+            .put_attestation(SignedAttestation { attestation: w2 })
+            .await
+            .expect_err(
+                "a supersedes must not widen a duty past the permission its target \
+                 was pinned to",
+            );
+        assert!(
+            format!("{e7}").contains("NEVER wider"),
+            "({tag}) #814 (7): got {e7}"
         );
     }
 

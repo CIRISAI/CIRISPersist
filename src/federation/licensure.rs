@@ -129,9 +129,13 @@ fn status_of(row: &Attestation) -> Option<LicensureStatus> {
 
 /// **The fold**: every live status for `(subject_key_id, authority_id)`.
 ///
-/// * Retired rows (superseded / withdrawn / recanted) are dropped through
+/// * Withdrawn / recanted rows are dropped through
 ///   [`precedence::retired_ids`](super::precedence::retired_ids) — the ONE
-///   retirement fold, not a copy of it.
+///   retraction fold, not a copy of it. **Superseded rows are dropped
+///   separately**, because `retired_ids` is a retraction fold and by its own
+///   documentation does not filter `supersedes` (they rank below both
+///   retraction forms in §6.1). Conflating the two is what left a lifted
+///   suspension live.
 /// * A live `Revoked` **absorbs**: the result is exactly `{Revoked}`.
 /// * Otherwise every live, recognized status is returned.
 /// * An unrecognized status value is ignored rather than guessed at.
@@ -144,12 +148,57 @@ pub async fn status_set_for(
     authority_id: &str,
 ) -> Result<BTreeSet<LicensureStatus>, Error> {
     let rows = directory.list_attestations_for(subject_key_id).await?;
+    Ok(fold_status_set(&rows, authority_id))
+}
+
+/// The fold itself, over rows already read — **pure**, so it is testable
+/// without standing up an authority.
+///
+/// Split out from [`status_set_for`] deliberately (v42.0.0): the write door
+/// now requires a `registry`/`verify` attester for `licensure:` (CC 3.4.9), and
+/// such a key needs accord-roster admission. An end-to-end witness for the
+/// fold's ALGEBRA would therefore have to stand up a quorum to assert something
+/// that is a pure function of rows. Separating I/O from the fold lets the
+/// algebra be witnessed exhaustively here and the door be witnessed where it
+/// belongs — rather than the algebra going untested because its fixture is
+/// expensive, which is how `supersedes` lifting a suspension came to be
+/// documented and never asserted.
+#[must_use]
+pub fn fold_status_set(rows: &[Attestation], authority_id: &str) -> BTreeSet<LicensureStatus> {
     let refs: Vec<&Attestation> = rows.iter().collect();
     let retired = super::precedence::retired_ids(&refs);
 
+    // v42.0.0 (found by review) — `retired_ids` is a RETRACTION fold: it drops
+    // a row only when the §6.1 precedence winner is `withdraws` or `recants`,
+    // and its own docs say `supersedes` rows are deliberately not filtered
+    // because they rank BELOW both retraction forms. So it does not answer
+    // "was this replaced".
+    //
+    // That gap is load-bearing HERE specifically: `supersedes` is the CEG
+    // replace-in-place primitive and therefore the natural way an authority
+    // lifts a suspension. Without this pass a lifted suspension stays live
+    // forever — `{Issued, Suspended}` — and any consumer testing
+    // `contains(Suspended)` keeps the holder out of practice after the
+    // authority formally reinstated them. This is the CIRISPersist#798 class
+    // (type-keyed folds must resolve through the supersedes chain), handled
+    // locally rather than left for the caller.
+    let superseded: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.attestation_type == super::types::attestation_type::SUPERSEDES
+                && !retired.contains(&r.attestation_id)
+        })
+        .filter_map(|r| {
+            r.attestation_envelope
+                .get(super::envelope::paths::REFERENCES_ATTESTATION_ID)
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+
     let mut out = BTreeSet::new();
-    for row in &rows {
-        if retired.contains(&row.attestation_id) {
+    for row in rows {
+        if retired.contains(&row.attestation_id) || superseded.contains(row.attestation_id.as_str())
+        {
             continue;
         }
         let Some(dimension) = super::admission::envelope_dimension(&row.attestation_envelope)
@@ -159,6 +208,18 @@ pub async fn status_set_for(
         if authority_of(dimension) != Some(authority_id) {
             continue;
         }
+        // v42.0.0 — a RETRACTION carries no replacement body, so it must not
+        // contribute a status even when its envelope still names the dimension.
+        // A `supersedes` DOES carry one (that is what replace-in-place means),
+        // so its status counts — which is how a lifted suspension becomes
+        // `issued` rather than nothing. Found by the `withdraws` control test:
+        // without this, a withdraws whose envelope carried `status` was folded
+        // as a live status of its own.
+        if row.attestation_type == super::types::attestation_type::WITHDRAWS
+            || row.attestation_type == super::types::attestation_type::RECANTS
+        {
+            continue;
+        }
         if let Some(status) = status_of(row) {
             out.insert(status);
         }
@@ -166,9 +227,9 @@ pub async fn status_set_for(
     // `revoked` is absorbing — see the module docs. Applied AFTER collection so
     // a revocation anywhere in the live set wins regardless of arrival order.
     if out.contains(&LicensureStatus::Revoked) {
-        return Ok(BTreeSet::from([LicensureStatus::Revoked]));
+        return BTreeSet::from([LicensureStatus::Revoked]);
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -209,6 +270,135 @@ mod tests {
                 "CC 3.1.1 names {wire:?} as a licensure status and persist does not parse it"
             );
         }
+    }
+
+    /// Build a bare `licensure:` row for the pure fold. Not a wire-valid
+    /// attestation — the fold reads only type, envelope and ids, and that is
+    /// exactly why it can be tested without an authority.
+    fn lic_row(id: &str, authority: &str, status: &str) -> Attestation {
+        let now = chrono::Utc::now();
+        Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: "board".to_owned(),
+            attested_key_id: "holder".to_owned(),
+            attestation_type: super::super::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": format!("licensure:{authority}:v1"),
+                "status": status,
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "board".to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: super::super::types::cohort_scope::SELF.to_owned(),
+            tier: super::super::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    fn composer(id: &str, kind: &str, target: &str) -> Attestation {
+        let mut r = lic_row(id, "acme", "issued");
+        r.attestation_type = kind.to_owned();
+        r.attestation_envelope["references_attestation_id"] = serde_json::json!(target);
+        r
+    }
+
+    /// v42.0.0 — **`supersedes` lifts a suspension.** THE arm the original
+    /// witness documented as property (2) and never asserted, which is how
+    /// `retired_ids`-only retirement shipped: that fold drops withdrawn and
+    /// recanted rows and, by its own docs, deliberately does NOT filter
+    /// `supersedes`. A suspension lifted by the CEG replace-in-place primitive
+    /// stayed live forever, and a consumer testing `contains(Suspended)` would
+    /// keep a reinstated holder out of practice.
+    #[test]
+    fn supersedes_lifts_a_suspension_814() {
+        let rows = vec![
+            lic_row("a", "acme", "suspended"),
+            composer("b", super::super::types::attestation_type::SUPERSEDES, "a"),
+        ];
+        let got = fold_status_set(&rows, "acme");
+        assert!(
+            !got.contains(&LicensureStatus::Suspended),
+            "a superseded suspension must not stay live — `suspended` is REVERSIBLE \
+             (CC 3.1.1) and supersedes is how an authority lifts it; got {got:?}"
+        );
+        assert_eq!(got, BTreeSet::from([LicensureStatus::Issued]));
+    }
+
+    /// A `withdraws` retires its target — the control that proves the arm above
+    /// is testing supersedes specifically and not retirement in general.
+    #[test]
+    fn withdraws_retires_its_target_814() {
+        let rows = vec![
+            lic_row("a", "acme", "suspended"),
+            composer("b", super::super::types::attestation_type::WITHDRAWS, "a"),
+        ];
+        assert!(fold_status_set(&rows, "acme").is_empty());
+    }
+
+    #[test]
+    fn revoked_absorbs_whatever_the_order_814() {
+        for order in [vec!["revoked", "issued"], vec!["issued", "revoked"]] {
+            let rows: Vec<Attestation> = order
+                .iter()
+                .enumerate()
+                .map(|(i, st)| lic_row(&format!("r{i}"), "acme", st))
+                .collect();
+            assert_eq!(
+                fold_status_set(&rows, "acme"),
+                BTreeSet::from([LicensureStatus::Revoked]),
+                "`revoked` is ABSORBING — arrival order across a mesh is not a fact \
+                 about the licence"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_statuses_are_a_set_814() {
+        let rows = vec![
+            lic_row("a", "acme", "issued"),
+            lic_row("b", "acme", "probation"),
+        ];
+        assert_eq!(
+            fold_status_set(&rows, "acme"),
+            BTreeSet::from([LicensureStatus::Issued, LicensureStatus::Probation])
+        );
+    }
+
+    #[test]
+    fn authorities_do_not_bleed_814() {
+        let rows = vec![
+            lic_row("a", "acme", "issued"),
+            lic_row("b", "other", "revoked"),
+        ];
+        assert_eq!(
+            fold_status_set(&rows, "acme"),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "a revocation by a DIFFERENT authority must not absorb acme's set"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_status_is_ignored_not_guessed_814() {
+        let rows = vec![
+            lic_row("a", "acme", "issued"),
+            lic_row("b", "acme", "probationary"),
+        ];
+        assert_eq!(
+            fold_status_set(&rows, "acme"),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "a status nobody has defined cannot be composed against the absorption \
+             rule, so it is ignored rather than guessed at"
+        );
     }
 
     #[test]

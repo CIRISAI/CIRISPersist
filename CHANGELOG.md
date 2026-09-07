@@ -148,6 +148,73 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### Adversarial review found five defects in this cut — all fixed
+
+An independent reviewer was run against the branch. Every finding was
+reproduced here before being acted on; every fix is mutation-tested.
+
+**A forged licensure revocation was load-bearing, absorbing and unliftable.**
+CC 3.4.9 reserves `licensure:` as co-stewarded (Registry + Verify) and persist
+gated it nowhere — no prefix rule, no purpose-built gate. That was inert while
+nothing folded those rows. **Part 2's fold made it live**: any registered key
+could mint `status = revoked` for any holder, `revoked` ABSORBS, and neither the
+real authority nor the holder could lift it — `precedence::retraction_entitled`
+admits only the forged row's own attester. Landing a fold ahead of its emitter
+gate turned a dormant hole into a live one. `licensure:` now carries a
+`ReservedPrefixRule` requiring a `registry` or `verify` attester, which is
+accord-roster admitted.
+
+**A duty could out-reach its permission inside the `Cohort` bucket.**
+`Projection::Cohort` collapses `community | affiliations | species | biosphere
+| federation` into one value whose audience is *the row's own roster*, so a duty
+at `federation` on a permission at `affiliations` compared equal and admitted —
+plaintext-gossiped federation-wide while the permission is DEK-encrypted to one
+affiliation. The reach test now asks two questions: the audience KIND must be
+ridable, **and** the tier must not be wider on the closed CC 4.4.3.3.1 ladder —
+`crossing::scope_rank`, the ordering `check_strictly_wider` already uses, not a
+second one. The irony is on the record: `duty_may_ride`'s own docstring warns
+against imposing a total order `Projection` does not have, and the defect was
+assuming one *within* a variant.
+
+**A `duty:` row was retractable only by its author.** A structural composer's
+`references_attestation_id` names its TARGET, not a permission, so a
+subject-side `withdraws` — which `retraction_entitled` explicitly admits under
+CEG §3.2.3 rule 2 — was refused as "attaching an obligation to someone else's
+grant", describing something the retractor had not done. The obvious fix
+(exempt all composers) would have opened a hole, since a `supersedes` carries a
+new duty body and could widen past the permission its target was pinned to. So
+`withdraws`/`recants` are exempt and `supersedes` inherits its target's
+permission. Both directions are mutation-pinned.
+
+**A lifted suspension stayed live.** `precedence::retired_ids` is a RETRACTION
+fold — by its own documentation it does not filter `supersedes` — and the fold
+called it "the ONE retirement fold". `supersedes` is the CEG replace-in-place
+primitive and therefore how an authority lifts a suspension, so
+`{Issued, Suspended}` persisted and any consumer testing `contains(Suspended)`
+would keep a reinstated holder out of practice. Superseded rows are now dropped
+separately, with the distinction documented.
+
+**A retraction contributed a status.** Found by a control test written for the
+above: a `withdraws` whose envelope still named the dimension was folded as a
+live status. Retractions carry no replacement body and no longer contribute one;
+`supersedes` does, which is how a lift becomes `issued`.
+
+Two review findings were **not** adopted as proposed. The reviewer flagged
+`is_tombstone` hardcoded `false`; the refusal it produced was really the
+composer-exemption defect, and passing `true` would be wrong for the one
+composer that still reaches that line — a `supersedes` carries a new body, and
+it is the body's reach that could leak, whereas `tombstone_ceiling` governs how
+far a retraction signal travels to holders who already have the row. Reverted
+with the reasoning recorded in-line. The reviewer also confirmed **no defect**
+in `scope_covers` or either of its call sites, including the specific question
+of whether the relaxed attenuation can admit a chain that is not legitimately
+narrower — it cannot, by transitivity of `covers`.
+
+`status_set_for` was split into a pure `fold_status_set` plus a thin async
+wrapper, because standing up a `registry`-role attester needs accord-roster
+admission — and an expensive fixture is precisely how the supersedes arm came to
+be documented and never asserted.
+
 ### Also in this cut — the rc5 vendor exposed a real under-enforcement
 
 `authority_lists_agree_on_every_manifest_family` — CIRISPersist#590's
