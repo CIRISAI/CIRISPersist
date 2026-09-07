@@ -146,6 +146,7 @@ pub async fn status_set_for(
     directory: &dyn FederationDirectory,
     subject_key_id: &str,
     authority_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<BTreeSet<LicensureStatus>, Error> {
     let rows = directory.list_attestations_for(subject_key_id).await?;
     // v42.0.0 (CIRISPersist#814, CC ruling) — **fold by emitter-resolves-to-A.**
@@ -160,19 +161,32 @@ pub async fn status_set_for(
     // `revoked` bind nobody. An earlier cut of this work reserved the family to
     // `registry`/`verify` identity types; CC ruled that a misreading of
     // CC 3.4.9 and the reservation was removed.
+    // v42.0.0 (review, P1) — **authority is bound at ISSUANCE, not resolved from
+    // the current graph.**
+    //
+    // Resolving every stored row against today's delegation graph reclassifies
+    // HISTORY in both directions, and both are bad:
+    //
+    //   * a stranger pre-publishes `licensure:{A}` with `status: revoked`; `A`
+    //     later grants that key a `license` delegation for any reason, and the
+    //     old row retroactively enters `A`'s fold — where `revoked` ABSORBS and
+    //     immediately bars the holder;
+    //   * `A` withdraws a delegation, and issuances that were valid when made
+    //     silently vanish from the fold.
+    //
+    // So a row enters the fold only if its emitter IS the authority, or the row
+    // itself NAMES the delegation it was issued under (`delegation_id`) and
+    // that delegation resolved to `A` **at the row's own `asserted_at`**. A row
+    // claiming no delegation is testimony forever; no later grant promotes it.
+    // This is the same rule `check_licensure_delegator_is_authority` applies at
+    // the door — one predicate, both sides.
     let mut mine = Vec::with_capacity(rows.len());
     for row in rows {
-        if super::admission::emitter_resolves_to_authority(
-            directory,
-            &row.attesting_key_id,
-            authority_id,
-        )
-        .await?
-        {
+        if super::admission::row_was_issued_under_authority(directory, &row, authority_id).await? {
             mine.push(row);
         }
     }
-    Ok(fold_status_set(&mine, authority_id))
+    Ok(fold_status_set(&mine, authority_id, now))
 }
 
 /// The fold itself, over rows already read — **pure**, so it is testable
@@ -188,8 +202,17 @@ pub async fn status_set_for(
 /// expensive, which is how `supersedes` lifting a suspension came to be
 /// documented and never asserted.
 #[must_use]
-pub fn fold_status_set(rows: &[Attestation], authority_id: &str) -> BTreeSet<LicensureStatus> {
-    let refs: Vec<&Attestation> = rows.iter().collect();
+pub fn fold_status_set(
+    rows: &[Attestation],
+    authority_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BTreeSet<LicensureStatus> {
+    // v42.0.0 (review) — an EXPIRED row is not live, and this API says "live
+    // statuses". Applied to composers too: an expired `supersedes` must not go
+    // on hiding its target, or expiry becomes a way to freeze a replacement in
+    // place forever.
+    let unexpired = |r: &Attestation| r.expires_at.is_none_or(|e| e > now);
+    let refs: Vec<&Attestation> = rows.iter().filter(|r| unexpired(r)).collect();
     let retired = super::precedence::retired_ids(&refs);
 
     // v42.0.0 (found by review) — `retired_ids` is a RETRACTION fold: it drops
@@ -206,10 +229,30 @@ pub fn fold_status_set(rows: &[Attestation], authority_id: &str) -> BTreeSet<Lic
     // authority formally reinstated them. This is the CIRISPersist#798 class
     // (type-keyed folds must resolve through the supersedes chain), handled
     // locally rather than left for the caller.
+    // v42.0.0 (review, P1) — **`revoked` survives supersession.**
+    //
+    // The absorption check runs at the END of this fold, so a target hidden
+    // here never reaches it: a `supersedes` carrying `issued` and pointing at a
+    // live `revoked` row returned `{Issued}` and LIFTED THE REVOCATION —
+    // exactly what this module's contract says is impossible ("nothing lifts a
+    // revocation; a re-licence is a NEW licence under a new authority
+    // attestation, never a status transition").
+    //
+    // Retraction still removes one: a `withdraws`/`recants` by an entitled
+    // party is the authority saying the row was wrong, which is not a status
+    // transition and must stay possible or an erroneous revocation would be
+    // permanent. Supersession is the status-transition path, and that is the
+    // one CC closed.
+    let revoked_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| unexpired(r) && status_of(r) == Some(LicensureStatus::Revoked))
+        .map(|r| r.attestation_id.as_str())
+        .collect();
     let superseded: std::collections::HashSet<&str> = rows
         .iter()
         .filter(|r| {
             r.attestation_type == super::types::attestation_type::SUPERSEDES
+                && unexpired(r)
                 && !retired.contains(&r.attestation_id)
         })
         .filter_map(|r| {
@@ -217,10 +260,11 @@ pub fn fold_status_set(rows: &[Attestation], authority_id: &str) -> BTreeSet<Lic
                 .get(super::envelope::paths::REFERENCES_ATTESTATION_ID)
                 .and_then(serde_json::Value::as_str)
         })
+        .filter(|target| !revoked_ids.contains(target))
         .collect();
 
     let mut out = BTreeSet::new();
-    for row in rows {
+    for row in rows.iter().filter(|r| unexpired(r)) {
         if retired.contains(&row.attestation_id) || superseded.contains(row.attestation_id.as_str())
         {
             continue;
@@ -349,7 +393,7 @@ mod tests {
             lic_row("a", "acme", "suspended"),
             composer("b", super::super::types::attestation_type::SUPERSEDES, "a"),
         ];
-        let got = fold_status_set(&rows, "acme");
+        let got = fold_status_set(&rows, "acme", chrono::Utc::now());
         assert!(
             !got.contains(&LicensureStatus::Suspended),
             "a superseded suspension must not stay live — `suspended` is REVERSIBLE \
@@ -360,13 +404,72 @@ mod tests {
 
     /// A `withdraws` retires its target — the control that proves the arm above
     /// is testing supersedes specifically and not retirement in general.
+    /// v42.0.0 (Codex review, P1) — **a `supersedes` cannot lift a revocation.**
+    ///
+    /// The absorption check runs at the end of the fold, so a target hidden by
+    /// supersession never reached it: `supersedes(revoked) -> issued` returned
+    /// `{Issued}` and lifted the revocation, contradicting this module's own
+    /// contract. Reproduced before fixing.
+    #[test]
+    fn supersedes_cannot_lift_a_revocation_816() {
+        let rows = vec![lic_row("a", "acme", "revoked"), {
+            let mut r = lic_row("b", "acme", "issued");
+            r.attestation_type = super::super::types::attestation_type::SUPERSEDES.to_owned();
+            r.attestation_envelope["references_attestation_id"] = serde_json::json!("a");
+            r
+        }];
+        assert_eq!(
+            fold_status_set(&rows, "acme", chrono::Utc::now()),
+            BTreeSet::from([LicensureStatus::Revoked]),
+            "`revoked` is TERMINAL — a re-licence is a NEW licence under a new \
+             authority attestation, never a status transition. A supersedes \
+             carrying `issued` must not lift it."
+        );
+    }
+
+    /// A `withdraws` of a revocation still works — the authority saying the row
+    /// was wrong is not a status transition, and an erroneous revocation must
+    /// stay retractable or it would be permanent.
+    #[test]
+    fn a_withdraws_still_retracts_a_revocation_816() {
+        let rows = vec![
+            lic_row("a", "acme", "revoked"),
+            composer("b", super::super::types::attestation_type::WITHDRAWS, "a"),
+        ];
+        assert!(fold_status_set(&rows, "acme", chrono::Utc::now()).is_empty());
+    }
+
+    /// v42.0.0 (Codex review, P2) — an EXPIRED row is not live, and an expired
+    /// `supersedes` stops hiding its target.
+    #[test]
+    fn expired_rows_leave_the_fold_816() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::hours(1);
+        let mut expired = lic_row("a", "acme", "issued");
+        expired.expires_at = Some(past);
+        assert!(
+            fold_status_set(&[expired], "acme", now).is_empty(),
+            "an expired `issued` is not a live status"
+        );
+
+        // An expired supersedes must not go on hiding a live target.
+        let live = lic_row("t", "acme", "suspended");
+        let mut dead_sup = composer("s", super::super::types::attestation_type::SUPERSEDES, "t");
+        dead_sup.expires_at = Some(past);
+        assert_eq!(
+            fold_status_set(&[live, dead_sup], "acme", now),
+            BTreeSet::from([LicensureStatus::Suspended]),
+            "expiry must not become a way to freeze a replacement in place forever"
+        );
+    }
+
     #[test]
     fn withdraws_retires_its_target_814() {
         let rows = vec![
             lic_row("a", "acme", "suspended"),
             composer("b", super::super::types::attestation_type::WITHDRAWS, "a"),
         ];
-        assert!(fold_status_set(&rows, "acme").is_empty());
+        assert!(fold_status_set(&rows, "acme", chrono::Utc::now()).is_empty());
     }
 
     #[test]
@@ -378,7 +481,7 @@ mod tests {
                 .map(|(i, st)| lic_row(&format!("r{i}"), "acme", st))
                 .collect();
             assert_eq!(
-                fold_status_set(&rows, "acme"),
+                fold_status_set(&rows, "acme", chrono::Utc::now()),
                 BTreeSet::from([LicensureStatus::Revoked]),
                 "`revoked` is ABSORBING — arrival order across a mesh is not a fact \
                  about the licence"
@@ -393,7 +496,7 @@ mod tests {
             lic_row("b", "acme", "probation"),
         ];
         assert_eq!(
-            fold_status_set(&rows, "acme"),
+            fold_status_set(&rows, "acme", chrono::Utc::now()),
             BTreeSet::from([LicensureStatus::Issued, LicensureStatus::Probation])
         );
     }
@@ -405,7 +508,7 @@ mod tests {
             lic_row("b", "other", "revoked"),
         ];
         assert_eq!(
-            fold_status_set(&rows, "acme"),
+            fold_status_set(&rows, "acme", chrono::Utc::now()),
             BTreeSet::from([LicensureStatus::Issued]),
             "a revocation by a DIFFERENT authority must not absorb acme's set"
         );
@@ -418,7 +521,7 @@ mod tests {
             lic_row("b", "acme", "probationary"),
         ];
         assert_eq!(
-            fold_status_set(&rows, "acme"),
+            fold_status_set(&rows, "acme", chrono::Utc::now()),
             BTreeSet::from([LicensureStatus::Issued]),
             "a status nobody has defined cannot be composed against the absorption \
              rule, so it is ignored rather than guessed at"

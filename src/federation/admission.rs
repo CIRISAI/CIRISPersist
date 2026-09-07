@@ -2967,7 +2967,11 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
             else {
-                return Ok(());
+                return Err(Error::InvalidArgument(format!(
+                    "{dimension} is a duty-bodied `supersedes` naming no target. A replacement \
+                     must say what it replaces — otherwise it carries a new duty body past the \
+                     permission, issuer and reach checks entirely."
+                )));
             };
             let Some(target) = directory.get_attestation(target_id).await? else {
                 return Ok(());
@@ -3132,9 +3136,54 @@ pub async fn check_config_renewal_supersedes<F: super::FederationDirectory + ?Si
     if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
         return Ok(());
     }
-    // A supersedes/withdraws IS the renewal act; it cannot require one of
-    // itself.
+    // A `withdraws`/`recants` carries no replacement body, so there is nothing
+    // to duplicate — exempt.
+    //
+    // v42.0.0 (review, P1) — a `supersedes` is NOT exempt on its own say-so. It
+    // carries a new config body, so exempting it unconditionally let a second
+    // body in as a `supersedes` pointing at an unrelated or nonexistent row:
+    // the original was never superseded, the new body was admitted, and the
+    // multiple-live-row state this gate exists to prevent was recreated by
+    // saying the magic word. A renewal must actually replace its own
+    // (subject, attester, scope, leaf).
     if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+        if row.attestation_type != attestation_type::SUPERSEDES {
+            return Ok(());
+        }
+        let target_id = row
+            .attestation_envelope
+            .get("references_attestation_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        let target = match target_id {
+            Some(id) => directory.get_attestation(id).await?,
+            None => None,
+        };
+        let Some(target) = target else {
+            return Err(Error::InvalidArgument(format!(
+                "{dimension} is a `supersedes` naming no resolvable target. A renewal must \
+                 replace the row it claims to (CC 3.4.5.1) — a supersedes pointing nowhere \
+                 leaves the original live and adds a second body beside it."
+            )));
+        };
+        let same_leaf = envelope_dimension(&target.attestation_envelope) == Some(dimension);
+        if target.attested_key_id != row.attested_key_id
+            || target.attesting_key_id != row.attesting_key_id
+            || target.cohort_scope != row.cohort_scope
+            || !same_leaf
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{dimension} is a `supersedes` whose target {:?} is a different \
+                 (subject, attester, scope, leaf) — target is {:?}/{:?} @ {:?} on {:?}. A \
+                 renewal replaces its OWN live row; pointing at someone else's leaves the \
+                 original live and adds a second body beside it.",
+                target.attestation_id,
+                target.attested_key_id,
+                target.attesting_key_id,
+                target.cohort_scope,
+                envelope_dimension(&target.attestation_envelope).unwrap_or("<none>")
+            )));
+        }
         return Ok(());
     }
     let existing = directory
@@ -3284,8 +3333,26 @@ pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> 
              would evade every family gate while looking like the family it imitates."
         )));
     }
-    let Some(entry) = crate::federation::namespace::registry::lookup(dimension) else {
-        return Ok(());
+    // v42.0.0 (review, P2) — identify the family CASE-INSENSITIVELY before
+    // judging it. A byte-exact lookup fails on `audit_chain:Hash_continuity`
+    // precisely BECAUSE a later literal segment is miscased, so returning Ok on
+    // a lookup miss let every such imitation through — the exact family-imitation
+    // gap this gate exists to close, one segment further in than the stem check
+    // catches. Matching folds case only to FIND the candidate family; the
+    // enforcement below is still byte-exact against its declared classes, and
+    // nothing else in the substrate case-folds.
+    let entry = match crate::federation::namespace::registry::lookup(dimension) {
+        Some(e) => e,
+        None => {
+            let lowered = dimension.to_ascii_lowercase();
+            match crate::federation::namespace::registry::lookup(&lowered) {
+                // Not a catalogued family in any casing — not this gate's to
+                // judge; inventing classes would be the section-walk heuristic
+                // CC 3.1.7 R2 forbids.
+                None => return Ok(()),
+                Some(e) => e,
+            }
+        }
     };
     use crate::federation::namespace::registry::SegmentClass as SC;
     for (seg, (_, class)) in dimension.split(':').zip(entry.segments.iter()) {
@@ -3351,16 +3418,19 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
     directory: &F,
     subject_key_ids: &[String],
     leaf: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
+    let unexpired_outer = |r: &super::Attestation| r.expires_at.is_none_or(|e| e > now);
     let mut out = std::collections::BTreeSet::new();
     for subject in subject_key_ids {
         let rows = directory.list_attestations_for(subject).await?;
-        let refs: Vec<&super::Attestation> = rows.iter().collect();
+        let refs: Vec<&super::Attestation> = rows.iter().filter(|r| unexpired_outer(r)).collect();
         let retired = crate::federation::precedence::retired_ids(&refs);
         let superseded: std::collections::HashSet<&str> = rows
             .iter()
             .filter(|r| {
                 r.attestation_type == attestation_type::SUPERSEDES
+                    && unexpired_outer(r)
                     && !retired.contains(&r.attestation_id)
             })
             .filter_map(|r| {
@@ -3369,7 +3439,10 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
                     .and_then(serde_json::Value::as_str)
             })
             .collect();
-        let live = rows.iter().any(|r| {
+        // v42.0.0 (review, P2) — an EXPIRED report is not a live self-report,
+        // and an expired `supersedes` must not go on hiding its target
+        // (`unexpired_outer` is applied to both, above and here).
+        let live = rows.iter().filter(|r| unexpired_outer(r)).any(|r| {
             !retired.contains(&r.attestation_id)
                 && !superseded.contains(r.attestation_id.as_str())
                 && r.attestation_type != attestation_type::WITHDRAWS
@@ -3383,6 +3456,53 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
         }
     }
     Ok(out)
+}
+
+/// v42.0.0 (review, P1) — **was this ROW issued under `authority_id`'s
+/// authority, as of its own `asserted_at`?**
+///
+/// The fold key. Distinct from [`emitter_resolves_to_authority`], which asks
+/// only about a key *now*: this asks about a row *then*, and the difference is
+/// the whole point. Resolving stored rows against the current graph
+/// reclassifies history — a stranger's pre-published `revoked` would enter the
+/// fold the moment the authority granted that key a delegation for any reason,
+/// and an absorbing revocation would bar the holder retroactively.
+///
+/// A row qualifies iff its attester IS the authority, or it NAMES the
+/// delegation it was issued under (`delegation_id`) and that delegation was a
+/// live `license` chain to the authority at the row's `asserted_at`. A row that
+/// claims no delegation is testimony permanently; no later grant promotes it.
+pub async fn row_was_issued_under_authority(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    authority_id: &str,
+) -> Result<bool, Error> {
+    if row.attesting_key_id == authority_id {
+        return Ok(true);
+    }
+    let Some(delegation_id) = row
+        .attestation_envelope
+        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        // No delegation claimed — testimony, and it stays testimony.
+        return Ok(false);
+    };
+    let Some(delegation) = directory.get_attestation(delegation_id).await? else {
+        return Ok(false);
+    };
+    // The named edge must be the authority's own `license` grant, and it must
+    // have been live when the row was asserted — an edge issued afterwards
+    // cannot have authorised it.
+    if delegation.attesting_key_id != authority_id
+        || delegation.attestation_type != attestation_type::DELEGATES_TO
+        || !delegation_scope_grants(&delegation.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+        || delegation.asserted_at > row.asserted_at
+    {
+        return Ok(false);
+    }
+    emitter_resolves_to_authority(directory, &row.attesting_key_id, authority_id).await
 }
 
 /// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`

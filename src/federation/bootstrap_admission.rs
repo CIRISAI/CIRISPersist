@@ -1735,9 +1735,10 @@ pub mod test_support {
             .await
             .expect("b renews");
 
-        let got = distinct_self_reporting_subjects(dir, &subjects, "config:load")
-            .await
-            .expect("fold");
+        let got =
+            distinct_self_reporting_subjects(dir, &subjects, "config:load", chrono::Utc::now())
+                .await
+                .expect("fold");
         assert_eq!(
             got,
             std::collections::BTreeSet::from([a.clone(), b.clone()]),
@@ -1958,7 +1959,7 @@ pub mod test_support {
         );
 
         // THE POINT: it binds nobody, because it is not in the fold.
-        let set = status_set_for(dir, &holder, &authority)
+        let set = status_set_for(dir, &holder, &authority, chrono::Utc::now())
             .await
             .expect("fold");
         assert_eq!(

@@ -1743,7 +1743,7 @@ mod tests {
     /// One representative dimension per decided Attestation family, plus one
     /// resolving the conservative default — LITERALS, never derived from the
     /// classifier under test.
-    const FAMILY_DIMS: [&str; 13] = [
+    const FAMILY_DIMS: [&str; 14] = [
         "consent:replication:v1",
         "trace:complete:v1",
         "scores:medical",
@@ -1778,6 +1778,11 @@ mod tests {
         "chat:message:v1",
         // v38.7.0 (CIRISPersist#782) — the session-claim plane.
         "session:claim:v1",
+        // v42.0.0 (review, P2) — `duty:` is the FOURTH family added without a
+        // representative here; the comment above records the first three.
+        // Without this row every property sweep built on `all_planes()` looked
+        // straight past the family this cut introduced.
+        "duty:attribute:v1",
         "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
     ];
 
@@ -1849,6 +1854,11 @@ mod tests {
         }
 
         for family in [
+            // v42.0.0 (review, P2) — `Duty` joins the sweep corpus. The
+            // exhaustive representative helper mapped it, but this array did
+            // not, so the assertion never called it: a cell added and never
+            // swept is a check that cannot fail.
+            AttestationFamily::Duty,
             AttestationFamily::Consent,
             AttestationFamily::Trace,
             AttestationFamily::Scores,
