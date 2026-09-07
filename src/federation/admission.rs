@@ -3052,18 +3052,27 @@ pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
         crate::federation::namespace::Plane::Attestation { dimension },
         &row.cohort_scope,
         crate::federation::namespace::registry::authority_for(dimension).class,
-        // `is_tombstone = false` DELIBERATELY, and this was re-examined under
-        // review. The reviewer flagged the hardcoded `false` after seeing a
-        // `withdraws` refused as an "out-reach" — but that refusal's real cause
-        // was the missing structural-composer exemption above, and it is fixed
-        // there. Passing `true` here would be wrong for the one composer that
-        // still reaches this line: a `supersedes` carries a NEW DUTY BODY, and
-        // it is that body's reach which could leak the permission. The
-        // `tombstone_ceiling` governs how far a RETRACTION SIGNAL travels —
-        // deliberately wide, to reach holders who by construction already have
-        // the row — which is a different question from "may these bytes be
-        // seen by someone who cannot see the permission".
-        false,
+        // A `supersedes` is measured at the TOMBSTONE CEILING, not at its own
+        // `cohort_scope` curve.
+        //
+        // I got this wrong twice, and the second reason is the real one. My
+        // first reading was that `tombstone_ceiling` governs how far a
+        // RETRACTION SIGNAL travels — a different question from whether a body
+        // may be seen. That is false for the one composer which reaches this
+        // line: `lifetime_class(supersedes) = MonotonicSupersede`, whose own
+        // documentation says it *gossips at the plane's `tombstone_ceiling`*,
+        // and `projection_for` routes ANY `is_tombstone` row to that ceiling
+        // before it looks at `cohort_scope` at all. So a `supersedes` of a duty
+        // replicates at `Cohort` whatever its own scope says, and its NEW BODY
+        // is exactly what gossips there. Measuring it at `false` computed a
+        // reach the row does not have, and admitted a leak.
+        //
+        // Consequence, stated here rather than discovered later: a duty whose
+        // permission projects `SelfOwn` cannot be renewed by `supersedes` — the
+        // renewal would gossip past the permission. Such a duty is retracted
+        // and re-issued instead. That is the honest reading of anti-rollback
+        // replication, not a limitation of this gate.
+        crate::federation::precedence::is_structural_composer(&row.attestation_type),
     );
     let permission_projection = crate::federation::namespace::projection_for(
         crate::federation::namespace::Plane::Attestation {

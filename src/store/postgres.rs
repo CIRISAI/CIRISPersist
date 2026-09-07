@@ -23132,6 +23132,98 @@ mod tests {
     /// write-back, its TEXT round-trip (V122), and the re-stamped mirror
     /// surviving both. The receiving stack is backend-symmetric by construction
     /// and has its own parity witnesses.
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn duty_rides_only_its_own_permission_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgduty{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_duty_rides_only_its_own_permission_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn licensure_is_co_stewarded_at_the_door_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pglic{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_licensure_is_co_stewarded_at_the_door_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn config_renewal_must_supersede_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgcfg{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_config_renewal_must_supersede_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn session_is_a_self_report_at_the_door_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgsess{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_session_is_a_self_report_at_the_door_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn promoted_row_crosses_to_a_peer_postgres_649() {

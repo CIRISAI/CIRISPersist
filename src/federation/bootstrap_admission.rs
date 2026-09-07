@@ -2153,6 +2153,45 @@ pub mod test_support {
             format!("{e7}").contains("NEVER wider"),
             "({tag}) #814 (7): got {e7}"
         );
+
+        // (8) THE TOMBSTONE-CEILING ARM. A `supersedes` at `self` of a `self`
+        // duty on a `self` permission is ALSO refused — because
+        // `lifetime_class(supersedes) = MonotonicSupersede` gossips at the
+        // plane's `tombstone_ceiling` (Cohort for Duty) regardless of its own
+        // cohort_scope, and its new BODY is what travels there.
+        //
+        // This arm is the one that distinguishes the two readings of
+        // `is_tombstone`: measured at `false` the row computes `SelfOwn` and is
+        // admitted — a leak, since the bytes actually gossip at Cohort while the
+        // permission stays SelfOwn. It follows that a duty on a SelfOwn
+        // permission cannot be renewed by supersedes at all; it is retracted and
+        // re-issued.
+        let base2 = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(duty(
+            &base2,
+            &licensor,
+            Some(&narrow_id),
+            cohort_scope::SELF,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814 (8): the self base duty admits: {e}"));
+        let same_scope = uuid::Uuid::new_v4().to_string();
+        let mut w3 = scores_row(&same_scope, &licensor, &licensor, "duty:attribute:v1");
+        w3.attestation_type = crate::federation::types::attestation_type::SUPERSEDES.to_owned();
+        w3.cohort_scope = cohort_scope::SELF.to_owned();
+        w3.attestation_envelope["references_attestation_id"] = serde_json::json!(base2.clone());
+        ts::reseal(&mut w3);
+        let e8 = dir
+            .put_attestation(SignedAttestation { attestation: w3 })
+            .await
+            .expect_err(
+                "a supersedes gossips at the tombstone ceiling, so it out-reaches a \
+                 SelfOwn permission even at cohort_scope=self",
+            );
+        assert!(
+            format!("{e8}").contains("NEVER wider"),
+            "({tag}) #814 (8): got {e8}"
+        );
     }
 
     /// **CIRISPersist#807 — a widening of the owner-binding is NOT visible to

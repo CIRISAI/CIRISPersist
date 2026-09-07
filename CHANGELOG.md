@@ -199,16 +199,38 @@ above: a `withdraws` whose envelope still named the dimension was folded as a
 live status. Retractions carry no replacement body and no longer contribute one;
 `supersedes` does, which is how a lift becomes `issued`.
 
-Two review findings were **not** adopted as proposed. The reviewer flagged
-`is_tombstone` hardcoded `false`; the refusal it produced was really the
-composer-exemption defect, and passing `true` would be wrong for the one
-composer that still reaches that line — a `supersedes` carries a new body, and
-it is the body's reach that could leak, whereas `tombstone_ceiling` governs how
-far a retraction signal travels to holders who already have the row. Reverted
-with the reasoning recorded in-line. The reviewer also confirmed **no defect**
-in `scope_covers` or either of its call sites, including the specific question
+**A sixth finding, and a correction to my own correction.** I initially reverted
+the reviewer's `is_tombstone` fix, reasoning that `tombstone_ceiling` governs how
+far a *retraction signal* travels rather than whether a body may be seen. That is
+false for the only composer which reaches that line:
+`lifetime_class(supersedes) = MonotonicSupersede`, whose own documentation says
+it **gossips at the plane's `tombstone_ceiling`**, and `projection_for` routes any
+`is_tombstone` row to that ceiling before it looks at `cohort_scope` at all. A
+`supersedes` of a duty therefore replicates at `Cohort` whatever its own scope
+says, and its new body is exactly what travels there. Measuring it at `false`
+computed a reach the row does not have and admitted a leak. Corrected, with the
+consequence stated rather than left to be discovered: **a duty whose permission
+projects `SelfOwn` cannot be renewed by `supersedes`** — it is retracted and
+re-issued.
+
+**Four missing postgres legs.** `exercise_duty_rides_only_its_own_permission_814`,
+`exercise_licensure_is_co_stewarded_at_the_door_814`,
+`exercise_config_renewal_must_supersede_814` and
+`exercise_session_is_a_self_report_at_the_door_814` shipped with memory + sqlite
+and no third leg, while every other exercise in that module has three. Not
+ceremony: each crosses a backend boundary — the duty gate calls
+`get_attestation` from inside postgres's own `put_attestation`, the licensure
+door runs the reserved-prefix rule against postgres's key read. `store/parity.rs`
+pins the gate SEQUENCE and so structurally cannot notice a missing witness. This
+is the "test every backend" class this repo has hit repeatedly, and it recurred
+here inside the same cut that fixed an instance of it (#811's postgres leg).
+
+One review finding was **not** adopted as proposed. The reviewer also confirmed **no defect**
+in `scope_covers` or either of its call sites — including the specific question
 of whether the relaxed attenuation can admit a chain that is not legitimately
-narrower — it cannot, by transitivity of `covers`.
+narrower, which it cannot, by transitivity of `covers` — nor in the config
+sensitive-leaf floor, nor in the steward biconditional across all three
+functions.
 
 `status_set_for` was split into a pure `fold_status_set` plus a thin async
 wrapper, because standing up a `registry`-role attester needs accord-roster
