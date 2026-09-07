@@ -38,14 +38,56 @@ const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc3";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "ec3cca6cdfea62a51905867d380a3f7b07d90cd2bcdb4fa2c5080e8b405516b6";
+    "87aede5012064288fd5ce8770d3e77a8c5131cd61d27799c4c06558507b9a9f5";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 114;
+pub const VENDORED_N_FAMILIES: usize = 116;
+
+/// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
+/// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
+///
+/// A dimension is a **case-sensitive byte string** compared byte-exactly
+/// everywhere; nothing case-folds. Which rule a segment obeys is decided per
+/// segment, and only [`Vocab`](SegmentClass::Vocab), [`Literal`] and
+/// [`Hex`](SegmentClass::Hex) constrain case at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentClass {
+    /// A CC-fixed stem. Lowercase by construction — the CC generator refuses to
+    /// build if a catalogued stem is not.
+    Literal,
+    /// CC-defined vocabulary. MUST match `_meta.case_rule.vocab_pattern`; any
+    /// other byte is malformed, never folded.
+    Vocab,
+    /// Spelling fixed by an outside standard (ISO 4217 `USD`, BCP 47 `en-US`,
+    /// `PG-13`) — verbatim canonical form, case untouched.
+    External,
+    /// Caller-supplied identity (`{authority_id}`, `{target}`) — verbatim,
+    /// case PRESERVED. Constraining these would be a vocabulary change persist
+    /// may not make.
+    Value,
+    /// A CC 2.6.3 digest — lowercase; uppercase is malformed.
+    Hex,
+    /// A `*` tail.
+    Wildcard,
+}
+
+impl SegmentClass {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "literal" => SegmentClass::Literal,
+            "vocab" => SegmentClass::Vocab,
+            "external" => SegmentClass::External,
+            "value" => SegmentClass::Value,
+            "hex" => SegmentClass::Hex,
+            "wildcard" => SegmentClass::Wildcard,
+            _ => return None,
+        })
+    }
+}
 
 /// One resolved namespace family — a CC 3.1 prefix, its owning component, and
 /// the [`Authority`] its reserved-prefix rule (CC 3.4) demands.
@@ -81,6 +123,12 @@ pub struct NamespaceEntry {
     pub description: String,
     /// The resolved emit authority (class + any CC 3.4 reserved rule).
     pub authority: Authority,
+    /// v42.0.0 (CC 3.1.7 R3) — the family's per-segment case classes, in
+    /// order. Read by
+    /// [`check_dimension_case_rule`](crate::federation::admission::check_dimension_case_rule);
+    /// an unclassified segment fails the CC build, so this is never partial for
+    /// a catalogued family.
+    pub segments: Vec<(String, SegmentClass)>,
 }
 
 // ── raw serde shapes matching the generated manifest ────────────────────
@@ -97,6 +145,10 @@ struct RawMeta {
     cc_version: String,
     source_sha256: String,
     n_families: usize,
+    /// v42.0.0 (CC 3.1.7 R3) — the case policy, carried as DATA so the gates
+    /// key on the manifest rather than on a convention nobody wrote down.
+    #[serde(default)]
+    case_rule: Option<RawCaseRule>,
     /// **The `_meta` key the R2 Private Use ask asked for, and the rc3
     /// re-vendor delivered.** `x_private:` on this cut.
     ///
@@ -125,6 +177,12 @@ struct RawMeta {
 }
 
 #[derive(serde::Deserialize)]
+struct RawCaseRule {
+    vocab_pattern: String,
+    refusal_token: String,
+}
+
+#[derive(serde::Deserialize)]
 struct RawFamily {
     prefix: String,
     owning_component: String,
@@ -137,6 +195,15 @@ struct RawFamily {
     // presence (which carries the CC 3.4 specifics) — serde ignores it.
     #[serde(default)]
     reserved_rule: Option<RawReservedRule>,
+    /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case classes.
+    #[serde(default)]
+    segments: Vec<RawSegment>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawSegment {
+    segment: String,
+    class: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -242,6 +309,13 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
                 cc_section: f.cc_section,
                 description: f.description,
                 authority: Authority { class, reserved },
+                segments: f
+                    .segments
+                    .iter()
+                    .filter_map(|sg| {
+                        SegmentClass::parse(&sg.class).map(|c| (sg.segment.clone(), c))
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -294,6 +368,24 @@ pub fn lookup(dimension: &str) -> Option<&'static NamespaceEntry> {
     registry()
         .iter()
         .find(|e| dimension.starts_with(&e.match_prefix))
+}
+
+/// v42.0.0 (CC 3.1.7 R3) — the `_meta.case_rule.vocab_pattern` a `vocab`
+/// segment must match, and the refusal token CC names for a violation.
+///
+/// Read from the manifest rather than transcribed: a pattern hand-copied here
+/// is a claim about CC prose that nothing can contradict.
+#[must_use]
+pub fn case_rule() -> Option<(&'static str, &'static str)> {
+    static RULE: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    RULE.get_or_init(|| {
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).ok()?;
+        raw.meta
+            .case_rule
+            .map(|c| (c.vocab_pattern, c.refusal_token))
+    })
+    .as_ref()
+    .map(|(a, b)| (a.as_str(), b.as_str()))
 }
 
 /// **`authority_for(dimension)`** — the emit authority the `dimension`'s
@@ -414,9 +506,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
     "consent:{kind}",
-    // rc3 / CIRISConstitution#77 — the three CEG-0.3 media-plane families
-    // persist had gated since v3.0.0 with no CC row. Their arrival is what
-    // retires `UNREGISTERED_GATED_FAMILIES`.
     "content_class:{class}",
     "content_rating:{scheme}:{rating}",
     "corpus_health:n_eff_measurable",
@@ -436,6 +525,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "dma:dsdma:{domain}:*",
     "dma:idma:*",
     "dma:pdma:*",
+    "duty:{kind}",
     "expertise:{domain}:{language}",
     "federation_directory:replication_lag",
     "fidelity:explainability_sla:{tier}",
@@ -478,11 +568,11 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ratchet:flag:harassment_pattern",
     "ratchet:flag:out_of_distribution_voting",
     "reconsideration:{grounds}",
-    // rc3 / CIRISConstitution#81 — the family CIRISPersist#571 was blocked on.
     "regime:{artifact}:{version}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
     "seed_holder_voting_alignment:{cell}",
+    "session:{kind}",
     "slashing:{outcome}",
     "system:*",
     "testimonial_witness:{kind}",
@@ -512,6 +602,39 @@ pub const RETIRED_FAMILIES: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {
+
+    /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the manifest's `segments[]`
+    /// ALIGN POSITIONALLY with their family's `prefix`.
+    ///
+    /// `check_dimension_case_rule` zips a concrete dimension's `:`-split
+    /// segments against this list by POSITION, so a manifest whose segment list
+    /// did not correspond to the prefix's own structure would silently mis-class
+    /// — judging a `value` segment by the `vocab` rule, or worse, letting a
+    /// `vocab` segment through under `value`. That would be invisible: the gate
+    /// would still pass its own table.
+    #[test]
+    fn manifest_segments_align_with_their_prefix_815() {
+        for e in entries() {
+            let parts: Vec<&str> = e.prefix.split(':').collect();
+            assert_eq!(
+                e.segments.len(),
+                parts.len(),
+                "{:?} has {} prefix segments but {} classified — a positional zip \
+                 would mis-class",
+                e.prefix,
+                parts.len(),
+                e.segments.len()
+            );
+            for (i, (name, _)) in e.segments.iter().enumerate() {
+                assert_eq!(
+                    name, parts[i],
+                    "{:?} segment {i} is {:?} in the prefix but {name:?} in \
+                     segments[] — the lists have drifted apart",
+                    e.prefix, parts[i]
+                );
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -911,6 +1034,10 @@ mod tests {
             "cc_section",
             "description",
             "reserved_rule",
+            // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case
+            // classes, deserialized into `NamespaceEntry::segments` and read by
+            // `admission::check_dimension_case_rule`.
+            "segments",
         ];
         // Columns read OUTSIDE the shared type, each naming its reader.
         const READ_ELSEWHERE: &[(&str, &str)] = &[(

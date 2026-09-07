@@ -2611,6 +2611,26 @@ pub async fn check_promotion_admission(
     // never asked (the B8 shape #598 closed for the instant binding).
     check_config_self_or_owner_admission(directory, row).await?;
 
+    // CC 3.1.1 — a duty may only be attached to a permission its attester
+    // issued, and may never out-reach it (v42.0.0, CIRISPersist#814 part 1).
+    check_duty_admission(directory, row).await?;
+
+    // CC 3.4.5.1 — a config renewal must supersede the row it replaces
+    // (v42.0.0, CIRISPersist#814 part 3).
+    check_config_renewal_supersedes(directory, row).await?;
+
+    // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
+    // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
+    check_session_self_report_admission(row)?;
+
+    // CC 3.1 — a dimension's family stem is lowercase, or it evades every
+    // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
+    check_dimension_case_rule(row)?;
+
+    // CC 3.3.9 / CC 4.4.3.4.3 — a `license`-scoped issuance must resolve to the
+    // authority it names (v42.0.0, CIRISPersist#814).
+    check_licensure_delegator_is_authority(directory, row).await?;
+
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
 
@@ -2842,6 +2862,844 @@ pub fn check_capacity_not_self_attested(
 /// and its stem is [`MESH_CONFIG_DIMENSION_PREFIX`].
 pub const CONFIG_DIMENSION_PREFIX: &str = "config:";
 
+/// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — the `duty:*` dimension
+/// prefix. An obligation attached to a permission.
+pub const DUTY_DIMENSION_PREFIX: &str = "duty:";
+
+/// v42.0.0 (CIRISPersist#814 part 1) — **may a duty projecting `duty_p` ride
+/// a permission projecting `perm_p`?**
+///
+/// Deliberately an explicit partial match and NOT a rank function.
+/// [`Projection`](crate::federation::namespace::Projection) is not linearly
+/// ordered: `Capability(_)` and `Subject` are audience KINDS, not points on a
+/// reach scale, and that non-comparability is exactly what made #713's
+/// Attestation row a deferred cell. A `fn rank(p) -> u8` would impose a total
+/// order the type does not have, and the first consumer to compare a
+/// `Capability` against a `Cohort` would get an answer that means nothing.
+///
+/// So the comparison is enumerated, and anything not enumerated fails CLOSED:
+///
+/// | duty | permission | verdict |
+/// |---|---|---|
+/// | `SelfOwn` | anything | ride — the narrowest projection cannot out-reach |
+/// | `Cohort` | `Cohort` / `Global` | ride |
+/// | `Cohort` | `SelfOwn` | REFUSE — the duty would out-reach its permission |
+/// | anything | `Capability(_)` / `Subject` | REFUSE — not comparable |
+/// | `Global` / `Capability(_)` / `Subject` | anything | REFUSE — unreachable today (the
+///   `Duty` curve caps at `Cohort`), and a refusal is the right answer if that cap ever moves |
+fn duty_may_ride(
+    duty_p: crate::federation::namespace::Projection,
+    perm_p: crate::federation::namespace::Projection,
+) -> bool {
+    use crate::federation::namespace::Projection as P;
+    matches!(
+        (duty_p, perm_p),
+        (P::SelfOwn, _) | (P::Cohort, P::Cohort | P::Global)
+    )
+}
+
+/// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — **a duty may only be attached
+/// to a permission its attester issued, and may never out-reach it.**
+///
+/// Three refusals, in order:
+///
+/// 1. **It must name a permission.** A `duty:*` row with no
+///    `references_attestation_id` is an obligation attached to nothing. Refused
+///    — a free-floating duty is not a weaker claim, it is an unfalsifiable one.
+/// 2. **The attester must have ISSUED that permission.** You cannot attach an
+///    obligation to someone else's grant. This is
+///    [`check_config_self_or_owner_admission`]'s shape generalized, and the
+///    generalization is the rule CC states: *the attester's relation to the
+///    subject is what decides*.
+/// 3. **The duty may not project wider than its permission.** CC's rule is that
+///    a duty projects exactly as far as its permission and never wider, because
+///    a duty visible where its permission is not LEAKS THE PERMISSION'S
+///    EXISTENCE.
+///
+/// # Why (3) is checked here rather than in the projection resolver
+///
+/// `projection_for` is pure and O(1) over `(plane, cohort_scope, authority,
+/// is_tombstone)` and deliberately does not read the referenced row, so
+/// "inherit from parent" is not expressible there — the same constraint that
+/// deferred #713's Attestation cell for a whole release. Admission is the one
+/// place the permission row is legible, so the invariant is enforced here and
+/// the resolver keeps an ordinary curve over the duty's own `cohort_scope`. An
+/// unexpressible projection rule became an enforceable admission rule, which is
+/// the move CIRISPersist#814 part 3 makes for `config:*` in this same cut.
+///
+/// A referenced permission that cannot be resolved is a REFUSAL, not a pass:
+/// admitting a duty whose parent this node has never seen would let a peer
+/// establish an obligation against a permission it invented.
+pub async fn check_duty_admission<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(DUTY_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+
+    // v42.0.0 — a STRUCTURAL COMPOSER's `references_attestation_id` names its
+    // TARGET, not a permission, so this gate's premises do not hold for it as
+    // written. Found by review: without this, a subject-side `withdraws` of a
+    // duty (CEG §3.2.3 rule 2, which `precedence::retraction_entitled` admits)
+    // was REFUSED as "attaching an obligation to someone else's grant" — a
+    // message describing something the retractor had not done. A `duty:` row
+    // was retractable only by its own author.
+    //
+    //   * `withdraws` / `recants` carry no new duty body, so there is nothing
+    //     left to check: entitlement is `retraction_entitled`'s job.
+    //   * `supersedes` DOES carry a new body, so it IS checked — against the
+    //     permission of the duty it REPLACES, inherited by following the
+    //     target. Exempting it outright would have let a renewal widen a duty
+    //     past the permission the original was pinned to.
+    let inherited: Option<String>;
+    let permission_id =
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            if row.attestation_type != attestation_type::SUPERSEDES {
+                return Ok(());
+            }
+            let Some(target_id) = row
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(Error::InvalidArgument(format!(
+                    "{dimension} is a duty-bodied `supersedes` naming no target. A replacement \
+                     must say what it replaces — otherwise it carries a new duty body past the \
+                     permission, issuer and reach checks entirely."
+                )));
+            };
+            let Some(target) = directory.get_attestation(target_id).await? else {
+                return Ok(());
+            };
+            if !envelope_dimension(&target.attestation_envelope)
+                .is_some_and(|d| d.starts_with(DUTY_DIMENSION_PREFIX))
+            {
+                return Ok(());
+            }
+            inherited = target
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let Some(ref p) = inherited else {
+                return Ok(());
+            };
+            p.as_str()
+        } else {
+            // (1) it must name the permission it attaches to.
+            let Some(p) = row
+                .attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(Error::InvalidArgument(format!(
+            "{dimension} is a DUTY (CC 3.1.1) and MUST name the permission it attaches to via \
+             references_attestation_id. An obligation attached to nothing is not a weaker claim, \
+             it is an unfalsifiable one."
+        )));
+            };
+            p
+        };
+
+    // The permission must be resolvable — a duty against a permission this node
+    // has never seen would let a peer establish an obligation against a grant
+    // it invented.
+    let Some(permission) = directory.get_attestation(permission_id).await? else {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} names permission {permission_id:?}, which this node does not hold. A \
+             duty is refused rather than admitted-pending: admitting it would let a peer \
+             establish an obligation against a permission it invented."
+        )));
+    };
+
+    // (2) the attester must have ISSUED that permission.
+    if row.attesting_key_id != permission.attesting_key_id {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} is attested by {:?} but the permission it names ({permission_id:?}) was \
+             issued by {:?}. You cannot attach an obligation to someone else's grant (CC 3.1.1) — \
+             the licensor for a licence, the consenting subject for a consent grant, the \
+             asset-holder for a key_grant.",
+            row.attesting_key_id, permission.attesting_key_id
+        )));
+    }
+
+    // (3) the duty may not out-reach its permission.
+    let perm_dimension = envelope_dimension(&permission.attestation_envelope).unwrap_or("");
+    let duty_projection = crate::federation::namespace::projection_for(
+        crate::federation::namespace::Plane::Attestation { dimension },
+        &row.cohort_scope,
+        crate::federation::namespace::registry::authority_for(dimension).class,
+        // A `supersedes` is measured at the TOMBSTONE CEILING, not at its own
+        // `cohort_scope` curve.
+        //
+        // I got this wrong twice, and the second reason is the real one. My
+        // first reading was that `tombstone_ceiling` governs how far a
+        // RETRACTION SIGNAL travels — a different question from whether a body
+        // may be seen. That is false for the one composer which reaches this
+        // line: `lifetime_class(supersedes) = MonotonicSupersede`, whose own
+        // documentation says it *gossips at the plane's `tombstone_ceiling`*,
+        // and `projection_for` routes ANY `is_tombstone` row to that ceiling
+        // before it looks at `cohort_scope` at all. So a `supersedes` of a duty
+        // replicates at `Cohort` whatever its own scope says, and its NEW BODY
+        // is exactly what gossips there. Measuring it at `false` computed a
+        // reach the row does not have, and admitted a leak.
+        //
+        // Consequence, stated here rather than discovered later: a duty whose
+        // permission projects `SelfOwn` cannot be renewed by `supersedes` — the
+        // renewal would gossip past the permission. Such a duty is retracted
+        // and re-issued instead. That is the honest reading of anti-rollback
+        // replication, not a limitation of this gate.
+        crate::federation::precedence::is_structural_composer(&row.attestation_type),
+    );
+    let permission_projection = crate::federation::namespace::projection_for(
+        crate::federation::namespace::Plane::Attestation {
+            dimension: perm_dimension,
+        },
+        &permission.cohort_scope,
+        crate::federation::namespace::registry::authority_for(perm_dimension).class,
+        false,
+    );
+    // v42.0.0 (found by review) — the PROJECTION comparison alone is not
+    // enough, and the hole is subtle. `Projection::Cohort` collapses
+    // `community | affiliations | species | biosphere | federation` into one
+    // value whose real audience is THE ROW'S OWN roster, so two `Cohort` rows
+    // at different `cohort_scope` have strictly different reach. A duty at
+    // `federation` on a permission at `affiliations` compared "equal" and was
+    // admitted — plaintext-gossiped federation-wide while the permission it
+    // names is DEK-encrypted to one affiliation roster, which is exactly the
+    // leak the refusal below describes.
+    //
+    // I avoided a false total order ACROSS `Projection` variants (see
+    // `duty_may_ride`) and then walked into one WITHIN a variant. So the reach
+    // test is now two questions, and both must pass: the audience KIND must be
+    // ridable, and the tier must not be wider on the closed CC 4.4.3.3.1
+    // ladder — `crossing::scope_rank`, the same ordering `check_strictly_wider`
+    // uses, not a second one derived here.
+    let duty_rank = crate::federation::crossing::scope_rank(&row.cohort_scope);
+    let perm_rank = crate::federation::crossing::scope_rank(&permission.cohort_scope);
+    let tier_ok = match (duty_rank, perm_rank) {
+        (Some(d), Some(p)) => d <= p,
+        // An unrecognized scope fails CLOSED: it has no place on the ladder, so
+        // "not wider" cannot be established.
+        _ => false,
+    };
+    if !tier_ok || !duty_may_ride(duty_projection, permission_projection) {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} @ {:?} would project {duty_projection:?} while the permission it \
+             names ({perm_dimension:?} @ {:?}) projects {permission_projection:?}. A duty \
+             projects exactly as far as its permission and NEVER wider (CC 3.1.1): a duty \
+             visible where its permission is not leaks the permission's existence. Note that \
+             two `Cohort` projections at different cohort_scope are NOT equal reach — the \
+             audience is the row's own roster.",
+            row.cohort_scope, permission.cohort_scope
+        )));
+    }
+    Ok(())
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **a renewal must supersede
+/// the row it replaces.**
+///
+/// The live set for a `(subject, cohort_scope, leaf)` must be ONE row. A node
+/// that re-publishes `config:load` without a `supersedes` naming its prior row
+/// leaves two live rows saying different things, and a composer weighting
+/// self-attestations by live count then reads one node as two — so **a node
+/// that renews correctly halves its own signal** relative to one that does not.
+/// The incentive points the wrong way, which is why this is a refusal and not
+/// a lint.
+///
+/// A `supersedes` row is itself exempt: it IS the renewal.
+///
+/// # What this does NOT do
+///
+/// It does not deduplicate on read, and it does not make the fold count
+/// distinct subjects. CC rc5 (#97) asks for both halves; this is the write-door
+/// half. A composer that weights by live ROW count is still wrong after this
+/// gate — the gate only guarantees it will not be handed two rows by a
+/// well-behaved renewer. The read-side half is a consumer rule persist cannot
+/// enforce from here, and it is recorded in CIRISPersist#814 rather than
+/// implied to be done.
+pub async fn check_config_renewal_supersedes<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    // A `withdraws`/`recants` carries no replacement body, so there is nothing
+    // to duplicate — exempt.
+    //
+    // v42.0.0 (review, P1) — a `supersedes` is NOT exempt on its own say-so. It
+    // carries a new config body, so exempting it unconditionally let a second
+    // body in as a `supersedes` pointing at an unrelated or nonexistent row:
+    // the original was never superseded, the new body was admitted, and the
+    // multiple-live-row state this gate exists to prevent was recreated by
+    // saying the magic word. A renewal must actually replace its own
+    // (subject, attester, scope, leaf).
+    if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+        if row.attestation_type != attestation_type::SUPERSEDES {
+            return Ok(());
+        }
+        let target_id = row
+            .attestation_envelope
+            .get("references_attestation_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        let target = match target_id {
+            Some(id) => directory.get_attestation(id).await?,
+            None => None,
+        };
+        let Some(target) = target else {
+            return Err(Error::InvalidArgument(format!(
+                "{dimension} is a `supersedes` naming no resolvable target. A renewal must \
+                 replace the row it claims to (CC 3.4.5.1) — a supersedes pointing nowhere \
+                 leaves the original live and adds a second body beside it."
+            )));
+        };
+        let same_leaf = envelope_dimension(&target.attestation_envelope) == Some(dimension);
+        if target.attested_key_id != row.attested_key_id
+            || target.attesting_key_id != row.attesting_key_id
+            || target.cohort_scope != row.cohort_scope
+            || !same_leaf
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{dimension} is a `supersedes` whose target {:?} is a different \
+                 (subject, attester, scope, leaf) — target is {:?}/{:?} @ {:?} on {:?}. A \
+                 renewal replaces its OWN live row; pointing at someone else's leaves the \
+                 original live and adds a second body beside it.",
+                target.attestation_id,
+                target.attested_key_id,
+                target.attesting_key_id,
+                target.cohort_scope,
+                envelope_dimension(&target.attestation_envelope).unwrap_or("<none>")
+            )));
+        }
+        return Ok(());
+    }
+    let existing = directory
+        .list_attestations_for(&row.attested_key_id)
+        .await?;
+    let refs: Vec<&super::Attestation> = existing.iter().collect();
+    let retired = crate::federation::precedence::retired_ids(&refs);
+    for prior in &existing {
+        // An idempotent re-put of the SAME row is not a renewal.
+        if prior.attestation_id == row.attestation_id {
+            continue;
+        }
+        if retired.contains(&prior.attestation_id) {
+            continue;
+        }
+        if prior.attesting_key_id != row.attesting_key_id {
+            continue;
+        }
+        if prior.cohort_scope != row.cohort_scope {
+            continue;
+        }
+        if envelope_dimension(&prior.attestation_envelope) != Some(dimension) {
+            continue;
+        }
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} from {:?} at cohort_scope {:?} already has a live row \
+             ({}, itself at cohort_scope {:?}). A renewal MUST carry a `supersedes` naming \
+             the row it replaces (CC 3.4.5.1): two live rows for one (subject, scope, leaf) \
+             make a composer that weights by live count read one node as two, so a node \
+             that renews correctly would halve its own signal against one that does not.",
+            row.attesting_key_id, row.cohort_scope, prior.attestation_id, prior.cohort_scope
+        )));
+    }
+    Ok(())
+}
+
+/// v42.0.0 (CIRISPersist#814 part 5, CC 3.4.3) — **`session:*` is a substrate
+/// SELF-REPORT: attester and subject must be the same occurrence.**
+///
+/// # The rc3 → rc5 re-vendor exposed this, it did not create it
+///
+/// Persist has always enforced the self-report rule — in the FOLD.
+/// `session_claim::resolve_claim` skips any row whose `attesting_key_id` or
+/// `attested_key_id` is not the occurrence, so a third party's claim was never
+/// *acted on*. It was, however, **stored**, and a stored row replicates and is
+/// visible to any consumer reading rows directly rather than through the fold.
+///
+/// While CC said nothing about the family, fold-only enforcement was a
+/// defensible place to draw the line. rc5 reserves the prefix with
+/// `{CC 3.4.3, substrate-self-report}`, and
+/// `authority_lists_agree_on_every_manifest_family` immediately reported the
+/// gap: *"CC reserves it; persist has no gate and no declared reason"*. That
+/// gate is the CIRISPersist#590 split-truth mechanism, and this is the first
+/// time it has caught a real under-enforcement rather than a bookkeeping
+/// mismatch.
+///
+/// # Why not a `ReservedPrefixRule`
+///
+/// [`ReservedPrefixRule`] gates on `required_identity_types` /
+/// `required_delegation_scope` — it asks *what kind of key is this*. A
+/// self-report rule asks *is the attester the subject*, which no identity type
+/// can express. `config:` sits in the same position for the same reason
+/// (`check_config_self_or_owner_admission`), which is why both families are
+/// recorded in `RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` rather than gated by
+/// one.
+///
+/// Stricter than `config:`, deliberately: `config:` admits the subject's live
+/// OWNER speaking for its instrument, because a node's operator has a real
+/// claim to state what their node is running. A session is a claim about which
+/// occurrence is *handling an exchange right now*; an owner is not in a
+/// position to know that, and CC 3.4.3 says self-report rather than
+/// self-or-owner.
+pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(crate::federation::session_claim::SESSION_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{dimension} is a substrate SELF-REPORT (CC 3.4.3): attesting_key_id {:?} must be the \
+         attested occurrence {:?}. A third party cannot say which occurrence of someone else's \
+         self is handling an exchange — and a row that is merely ignored by the fold is still a \
+         row that replicates and is visible to any consumer reading rows directly.",
+        row.attesting_key_id, row.attested_key_id
+    )))
+}
+
+/// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — **the per-segment dimension case
+/// rule, driven from the manifest.**
+///
+/// A dimension is a **case-sensitive byte string**, compared byte-exactly
+/// everywhere — admission, every family gate, `authority_for`, the
+/// sensitive-leaf floor. **Nothing case-folds.** Two strings differing only in
+/// case are two different strings, and the one that breaks its segment's rule
+/// is *malformed*, never a sibling.
+///
+/// Which rule applies is decided PER SEGMENT, and the classes come from
+/// `_meta.case_rule` + `families[].segments[]` in the vendored manifest rather
+/// than from `{...}` parsed out of prose:
+///
+/// | class | rule |
+/// |---|---|
+/// | `literal` | CC-fixed stem, lowercase by construction |
+/// | `vocab` | must match `_meta.case_rule.vocab_pattern` |
+/// | `external` | an outside standard's canonical form (`USD`, `en-US`, `PG-13`) — untouched |
+/// | `value` | caller identity (`{authority_id}`, `{target}`) — case PRESERVED |
+/// | `hex` | CC 2.6.3 digest — lowercase |
+///
+/// # Why this replaced a stem-only check
+///
+/// The first cut of this gate refused a non-lowercase family STEM, which closed
+/// `Config:Admission:v1` but left `config:Admission:v1` reaching the family gate
+/// while evading the sensitive-leaf floor. CC ruled reading 2 (CC 3.1.7 R3) and
+/// carried the classes as DATA precisely so the gate stops guessing: the
+/// `{scope}` segment of `config:{scope}` is `vocab`, so `Admission` is malformed
+/// and never reaches the floor. The floor stays byte-exact because nothing
+/// malformed survives to it.
+///
+/// An UNCATALOGUED dimension is not judged here — it has no segment classes,
+/// and inventing them would be the section-walk heuristic CC 3.1.7 R2 forbids.
+/// Such rows are governed by the family gates that already cover them.
+pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let Some((vocab_pattern, refusal_token)) = crate::federation::namespace::registry::case_rule()
+    else {
+        return Ok(());
+    };
+    // The `literal` half of R3, and it must run BEFORE the lookup — CC's ruling
+    // says this check "stays as is", and the reason is structural: a dimension
+    // whose STEM is capitalised matches no catalogued family at all, so it has
+    // no `segments[]` to judge and would sail through the per-segment pass
+    // below. `Config:admission:v1` is exactly that shape. The generator
+    // guarantees every catalogued stem is lowercase, so any uppercase here is a
+    // family nobody catalogued, imitating one somebody did.
+    let stem = crate::federation::namespace::registry::family_stem(dimension);
+    if stem.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(Error::InvalidArgument(format!(
+            "{refusal_token}: dimension {dimension:?} has a non-lowercase family stem \
+             {stem:?}. CC 3.1.7 R3 classes a stem `literal` and the CC generator refuses to \
+             build if any catalogued stem is not lowercase — so this matches no family, and \
+             would evade every family gate while looking like the family it imitates."
+        )));
+    }
+    // v42.0.0 (review, P2) — identify the family CASE-INSENSITIVELY before
+    // judging it. A byte-exact lookup fails on `audit_chain:Hash_continuity`
+    // precisely BECAUSE a later literal segment is miscased, so returning Ok on
+    // a lookup miss let every such imitation through — the exact family-imitation
+    // gap this gate exists to close, one segment further in than the stem check
+    // catches. Matching folds case only to FIND the candidate family; the
+    // enforcement below is still byte-exact against its declared classes, and
+    // nothing else in the substrate case-folds.
+    let entry = match crate::federation::namespace::registry::lookup(dimension) {
+        Some(e) => e,
+        None => {
+            let lowered = dimension.to_ascii_lowercase();
+            match crate::federation::namespace::registry::lookup(&lowered) {
+                // Not a catalogued family in any casing — not this gate's to
+                // judge; inventing classes would be the section-walk heuristic
+                // CC 3.1.7 R2 forbids.
+                None => return Ok(()),
+                Some(e) => e,
+            }
+        }
+    };
+    use crate::federation::namespace::registry::SegmentClass as SC;
+    for (seg, (_, class)) in dimension.split(':').zip(entry.segments.iter()) {
+        let bad = match *class {
+            // Lowercase alphanumerics plus `_ . -`, per the manifest's own
+            // pattern. Checked structurally rather than by pulling in a regex
+            // engine for one expression; `vocab_pattern` is asserted to BE this
+            // shape by `the_vocab_pattern_is_the_one_this_gate_implements_815`,
+            // so the manifest and this check cannot drift apart silently.
+            SC::Vocab | SC::Literal => {
+                seg.is_empty()
+                    || !seg
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    || !seg.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')
+                    })
+            }
+            SC::Hex => seg.chars().any(|c| c.is_ascii_uppercase()),
+            // Caller data and outside standards keep their case.
+            SC::Value | SC::External | SC::Wildcard => false,
+        };
+        if bad {
+            return Err(Error::InvalidArgument(format!(
+                "{refusal_token}: dimension {dimension:?} segment {seg:?} is classed \
+                 {class:?} by CC 3.1.7 R3 and must match {vocab_pattern:?}. A dimension is a \
+                 case-sensitive byte string and NOTHING case-folds, so a segment breaking its \
+                 rule is malformed rather than a sibling — it would otherwise reach the family \
+                 gate while evading the leaf checks that key on the exact spelling."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **live self-reports for a
+/// `config:{leaf}`, counted by DISTINCT SUBJECT.**
+///
+/// CC rc5 (#97) states the rule as a consumer obligation: *a composer weighting
+/// self-attestations by live count MUST count distinct subjects, never rows.*
+/// [`check_config_renewal_supersedes`] is the write-door half — it stops a
+/// well-behaved renewer handing anyone two rows — but a composer that counts
+/// ROWS is still wrong after it, because rows legitimately multiply across
+/// scopes and versions.
+///
+/// So persist ships the count instead of only describing it. A rule stated in
+/// prose and left to each consumer is the shape CIRISPersist#637 cost a release
+/// to remove: every consumer hand-rolls the fold, and the ones that get it
+/// wrong get it wrong silently, reading one node as two.
+///
+/// # Honest note on the supersedes pass
+///
+/// Unlike in `federation::licensure`, where it is load-bearing, the supersedes
+/// exclusion is **defensive rather than decisive for this boolean**: a live
+/// `supersedes` is itself a live row on the same leaf, so a subject that
+/// superseded its own report still counts through the replacement. Mutating the
+/// exclusion away does NOT red the witness, and that is recorded rather than
+/// papered over — it only changes the answer in the cross-dimension case, which
+/// no conformant emitter produces. It is kept because the fold's contract is
+/// "live rows", not "rows that happen to dominate".
+pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    subject_key_ids: &[String],
+    leaf: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let unexpired_outer = |r: &super::Attestation| r.expires_at.is_none_or(|e| e > now);
+    let mut out = std::collections::BTreeSet::new();
+    for subject in subject_key_ids {
+        let rows = directory.list_attestations_for(subject).await?;
+        let refs: Vec<&super::Attestation> = rows.iter().filter(|r| unexpired_outer(r)).collect();
+        let retired = crate::federation::precedence::retired_ids(&refs);
+        let superseded: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::SUPERSEDES
+                    && unexpired_outer(r)
+                    && !retired.contains(&r.attestation_id)
+            })
+            .filter_map(|r| {
+                r.attestation_envelope
+                    .get("references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect();
+        // v42.0.0 (review, P2) — an EXPIRED report is not a live self-report,
+        // and an expired `supersedes` must not go on hiding its target
+        // (`unexpired_outer` is applied to both, above and here).
+        let live = rows.iter().filter(|r| unexpired_outer(r)).any(|r| {
+            !retired.contains(&r.attestation_id)
+                && !superseded.contains(r.attestation_id.as_str())
+                && r.attestation_type != attestation_type::WITHDRAWS
+                && r.attestation_type != attestation_type::RECANTS
+                && envelope_dimension(&r.attestation_envelope)
+                    .is_some_and(|d| scope_covers(leaf, d) || d == leaf)
+                && r.attesting_key_id == r.attested_key_id
+        });
+        if live {
+            out.insert(subject.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// v42.0.0 (review, P1) — **was this ROW issued under `authority_id`'s
+/// authority, as of its own `asserted_at`?**
+///
+/// The fold key. Distinct from [`emitter_resolves_to_authority`], which asks
+/// only about a key *now*: this asks about a row *then*, and the difference is
+/// the whole point. Resolving stored rows against the current graph
+/// reclassifies history — a stranger's pre-published `revoked` would enter the
+/// fold the moment the authority granted that key a delegation for any reason,
+/// and an absorbing revocation would bar the holder retroactively.
+///
+/// A row qualifies iff its attester IS the authority, or it NAMES the
+/// delegation it was issued under (`delegation_id`) and that delegation was a
+/// live `license` chain to the authority at the row's `asserted_at`. A row that
+/// claims no delegation is testimony permanently; no later grant promotes it.
+pub async fn row_was_issued_under_authority(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    authority_id: &str,
+) -> Result<bool, Error> {
+    if row.attesting_key_id == authority_id {
+        return Ok(true);
+    }
+    let Some(delegation_id) = row
+        .attestation_envelope
+        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        // No delegation claimed — testimony, and it stays testimony.
+        return Ok(false);
+    };
+    let Some(delegation) = directory.get_attestation(delegation_id).await? else {
+        return Ok(false);
+    };
+    // The named edge must be the authority's own `license` grant, and it must
+    // have been live when the row was asserted — an edge issued afterwards
+    // cannot have authorised it.
+    if delegation.attesting_key_id != authority_id
+        || delegation.attestation_type != attestation_type::DELEGATES_TO
+        || !delegation_scope_grants(&delegation.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+        || delegation.asserted_at > row.asserted_at
+    {
+        return Ok(false);
+    }
+    emitter_resolves_to_authority(directory, &row.attesting_key_id, authority_id).await
+}
+
+/// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`
+/// resolve to licence authority `authority_id`?**
+///
+/// CC ruled there is no authority object and no roster: *anyone may be a
+/// licensing authority.* `authority_id` names a KEY — a
+/// `federation_keys.key_id`, or an organisation whose keys resolve through
+/// `org_membership`. So "X holds licence authority for A" means exactly:
+///
+///  * X's key **is** `A`; or
+///  * X holds a [`DELEGATION_SCOPE_LICENSE`]-scoped delegation chain from `A`
+///    (CC 4.4.3.4.3).
+///
+/// That is the whole predicate. There is no quorum for persist to check — "by
+/// quorum" in CC 2.4.1.2.1 describes an authority's OWN governance where it is
+/// a collective, never an admission gate a substrate applies to somebody else's
+/// authority.
+///
+/// # This is a FOLD key, not an admission gate
+///
+/// A `licensure:{A}` row from a key that does not resolve to `A` is perfectly
+/// admissible — it is *testimony about* `A`'s licensure, and it reaches a reader
+/// only along a flow that reader's trust or consent already admits (CC 4.4.3.8).
+/// It simply is not `A`'s licensure, so it stays out of the `(subject, A)` fold
+/// and composes at consumer confidence instead. **That is how a stranger's
+/// absorbing `revoked` binds nobody — not by refusing the row.**
+pub async fn emitter_resolves_to_authority(
+    directory: &dyn super::FederationDirectory,
+    attester: &str,
+    authority_id: &str,
+) -> Result<bool, Error> {
+    if attester == authority_id {
+        return Ok(true);
+    }
+    let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
+    issuer_reaches_target_via_scoped_delegation(
+        directory,
+        authority_id,
+        &targets,
+        DELEGATION_SCOPE_LICENSE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await
+}
+
+/// v42.0.0 (CIRISPersist#814, CC 3.3.9 / CC 4.4.3.4.3) — **the one refusal on
+/// the `license` scope**: an issuance whose delegator chain does not resolve to
+/// the authority it names.
+///
+/// A key emitting `licensure:{A}` under a delegated
+/// [`DELEGATION_SCOPE_LICENSE`] must have that delegation chain resolve to `A`
+/// itself. Emitting `licensure:{A}` under a `license` scope delegated by `B` is
+/// `B` lending authority it does not hold, and it is refused
+/// (`licensure_delegator_not_authority`).
+///
+/// # What this is NOT
+///
+/// It is **not** a check that `A` is a known or trusted authority. CC ruled
+/// there is no roster: an unknown authority is simply an authority nobody
+/// trusts yet, and there is no `licensure_authority_unknown`. A key signing
+/// `licensure:{itself}` is always its own authority and passes trivially — the
+/// bootstrap has no circle because there is no prior row to gate on.
+///
+/// So this fires only on the delegated path: someone claiming to speak FOR an
+/// authority, whose chain does not reach it.
+pub async fn check_licensure_delegator_is_authority(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
+        return Ok(());
+    };
+    // Its own authority — the bootstrap case, and the overwhelmingly common one.
+    if row.attesting_key_id == authority_id {
+        return Ok(());
+    }
+    // v42.0.0 — the trigger is an EXPLICIT delegated-issuance claim, and getting
+    // this wrong once is why it is spelled out. CC's refusal is on "the `license`
+    // scope itself: an issuance whose delegator chain does not resolve to A" —
+    // NOT on any row whose attester differs from the authority. A stranger
+    // writing `licensure:{A}` with no delegation claim is TESTIMONY about A, and
+    // CC ruled it must admit; it binds nobody because the fold excludes it, not
+    // because the door refuses it.
+    //
+    // So the gate fires only where the row carries the authorizing
+    // `delegates_to` id — the `delegation_id` convention
+    // ([`crate::federation::hard_case`]'s field, whose entire job is to name the
+    // edge an act was taken under). A row that claims delegated authority must
+    // make that claim resolve; a row that claims none is not lying about one.
+    let Some(delegation_id) = row
+        .attestation_envelope
+        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let _ = delegation_id;
+    let targets: std::collections::HashSet<String> =
+        std::iter::once(row.attesting_key_id.clone()).collect();
+    let reaches = issuer_reaches_target_via_scoped_delegation(
+        directory,
+        authority_id,
+        &targets,
+        DELEGATION_SCOPE_LICENSE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await?;
+    if reaches {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "licensure_delegator_not_authority: {:?} emitted {dimension:?} but no \
+         `license`-scoped delegation chain from {authority_id:?} reaches it (CC 3.3.9 / \
+         CC 4.4.3.4.3). A `license` scope authorises emitting on behalf of a delegator that \
+         itself holds authority for THAT authority_id; lending authority one does not hold is \
+         the refusal. Note this says nothing about whether {authority_id:?} is known or \
+         trusted — an unknown authority is simply one nobody trusts yet, and a key signing \
+         `licensure:` for ITSELF is always its own authority.",
+        row.attesting_key_id
+    )))
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
+/// floor** on `config:*`: which leaves may not travel past the node itself.
+///
+/// # Why a floor at admission, and NOT a family pinned to `SelfOwn`
+///
+/// CC rc5 (#97) is explicit that `config:*` is **not** scope-pinned as a
+/// family, and the distinction is load-bearing rather than pedantic.
+/// CIRISServer#324 correctly forced *sensitive* rows to `SelfOwn`; generalizing
+/// that to the whole family would invent an invariant CC never stated, and it
+/// would break the operational leaves — `config:load` MAY take the smallest
+/// scope that reaches the peers who route to it, which is the entire point of
+/// publishing load at all. A family-wide pin cannot express "these two leaves
+/// are secrets, that one is a routing input".
+///
+/// So projection keeps following the envelope's own `cohort_scope`, and the
+/// leaves that must not travel are stopped at the WRITE door instead — where
+/// the leaf name is legible and a refusal is a refusal, rather than a silently
+/// narrower read.
+///
+/// The set is CLOSED and spelled as literals. A third sensitive leaf must be
+/// added here deliberately; an unrecognized leaf is NOT presumed sensitive,
+/// because presuming it would re-introduce the family-wide pin by the back
+/// door.
+pub const CONFIG_SENSITIVE_LEAVES: &[&str] = &["config:admission", "config:transport"];
+
+/// v42.0.0 (CIRISPersist#814 part 3) — is `dimension` one of the
+/// [`CONFIG_SENSITIVE_LEAVES`], allowing a `:v{n}` version suffix?
+///
+/// Matched on the leaf STEM through the CC 4.5.5 sub-scope relation
+/// ([`scope_covers`]) rather than a bare `starts_with`, for the reason that
+/// function documents: a prefix test would also catch
+/// `config:admission_policy_notes`, a different leaf nobody decided was
+/// sensitive.
+#[must_use]
+pub fn is_sensitive_config_leaf(dimension: &str) -> bool {
+    CONFIG_SENSITIVE_LEAVES
+        .iter()
+        .any(|leaf| scope_covers(leaf, dimension))
+}
+
+/// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — refuse a sensitive
+/// `config:*` leaf published above `self`.
+///
+/// Runs BEFORE [`check_config_self_or_owner_admission`]'s authority arms: a
+/// row that may not travel at this scope is refused whoever wrote it, and
+/// answering "who are you" first would leak that ordering to a prober.
+pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(), Error> {
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !is_sensitive_config_leaf(dimension) {
+        return Ok(());
+    }
+    if row.cohort_scope == crate::federation::types::cohort_scope::SELF {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{dimension} is a SENSITIVE config leaf (CC 3.4.5.1) and may only be published at \
+         cohort_scope {:?}; this row carries {:?}. An admission policy says what this node will \
+         accept and a transport config says how to reach it — either published past the node \
+         itself is a map for whoever is deciding how to approach it. An operational leaf such \
+         as config:load is unaffected and may take the smallest scope reaching the peers that \
+         route to it.",
+        crate::federation::types::cohort_scope::SELF,
+        row.cohort_scope
+    )))
+}
+
 /// v38.7.0 (CIRISPersist#778, **CC 3.4.5**) — **`config:{scope}` is a
 /// SELF-REPORT.** The author is the subject, or the subject's single live
 /// owner, or the row is refused:
@@ -2967,6 +3825,9 @@ pub async fn check_config_self_or_owner_admission<F: super::FederationDirectory 
     if !dimension.starts_with(CONFIG_DIMENSION_PREFIX) {
         return Ok(());
     }
+    // v42.0.0 (CIRISPersist#814 part 3) — the sensitive-leaf floor runs FIRST:
+    // a row that may not travel at this scope is refused whoever wrote it.
+    check_config_sensitive_leaf_floor(row)?;
     // Arm 1 — the subject speaking about itself. The overwhelmingly common
     // shape, the only one persist's own producer emits, and free: it settles
     // before any directory read, so the honest path buys no walk.
@@ -5217,6 +6078,33 @@ pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 /// without re-walking the graph on every page.
 pub const DELEGATION_SCOPE_SLASH: &str = "slash";
 
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `license` — authorize
+/// emitting `licensure:{authority_id}` / `attestation:license_validity` **on
+/// behalf of a delegator that itself holds licence authority for that
+/// `authority_id`** (by quorum, CC 3.3.9).
+///
+/// # It is an enforced refusal, not an unweighted opinion
+///
+/// An issuance whose delegator does NOT hold licence authority for the
+/// `authority_id` it names is **refused at admission and never stored** — the
+/// same treatment [`DELEGATION_SCOPE_SLASH`] gets, and for the same reason:
+/// a conferral nothing gates on is a stored label (#333). A licence is a
+/// claim other parties act on; "admitted but you should not believe it" is
+/// not a state this plane may enter.
+pub const DELEGATION_SCOPE_LICENSE: &str = "license";
+
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.4.3.4.3) — `grant` — authorize
+/// emitting `key_grant` / `consent:scope:*` grants **over assets the
+/// delegator holds**.
+///
+/// # A `key_grant` stays non-transferable
+///
+/// This scope does not make one forwardable. An onward grant is a NEW grant
+/// minted by a DEK holder, never a relayed copy of someone else's — which is
+/// already true structurally, because only a DEK holder can wrap. This
+/// constant names the rule that the shape was silently enforcing.
+pub const DELEGATION_SCOPE_GRANT: &str = "grant";
+
 /// v30.11.0 (CIRISPersist#637) — **the delegated-duty ladder, as an array.**
 /// Import this; do not hand-pick the `DELEGATION_SCOPE_*` constants above.
 ///
@@ -5262,6 +6150,11 @@ pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
     DELEGATION_SCOPE_TAKEDOWN,
     DELEGATION_SCOPE_REVIEW,
     DELEGATION_SCOPE_SLASH,
+    // v42.0.0 (CIRISPersist#814 part 4) — the issuance axis. Same walk, same
+    // enforced admission; a consumer importing the ladder gets these two
+    // without hand-picking, which is the whole reason this array exists.
+    DELEGATION_SCOPE_LICENSE,
+    DELEGATION_SCOPE_GRANT,
 ];
 
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
@@ -5331,10 +6224,63 @@ pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
 /// (`consent_revocation` / `moderate` / `takedown` / `review`); the
 /// scope token is the only thing that varies — the bare-string-OR-set
 /// acceptance is identical for all four (§11.10 mirrors §3.2.3 rule-3).
+/// v42.0.0 (CIRISPersist#814 part 4, CC 4.5.5) — **does a HELD scope token
+/// cover a WANTED one?** The single sub-scope relation, used in both
+/// directions it is needed and spelled once.
+///
+/// True iff they are equal, or `wanted` is a **sub-scope** of `held` — a
+/// caveat NARROWING it, as in `infra:attest:licensure:{authority_id}` under
+/// `infra:attest` (CC 4.5.5 attenuation, which adds no member to the closed
+/// `infra:*` set).
+///
+/// # The direction is the whole point, and it is normative
+///
+/// A parent token satisfies a check for its child. **A child MUST NOT satisfy
+/// a check for its parent.** The obvious implementation —
+/// `held.starts_with(wanted)` — inverts exactly this: a holder of
+/// `infra:attest:licensure:acme` would satisfy a check for bare
+/// `infra:attest` and walk away with the FULL attest capability, repealing
+/// the attenuation that was the entire reason for issuing the narrowed token.
+/// CC 3.4.7.3 Clause B's purity-vs-membership defect in a second dress.
+///
+/// # Why the colon boundary is load-bearing beyond that
+///
+/// `wanted.strip_prefix(held)` alone would let `infra:attest` cover
+/// **`infra:attest_assurance`** — and v30.2.0 (CIRISPersist#607) split those
+/// two deliberately, because `infra:attest` already governs the build-manifest
+/// plane and reusing it "would let an attest-scoped key silently gain the
+/// power to declare a third party's age band". A naive prefix test does not
+/// merely widen a caveat; it re-merges two authorities this repo already paid
+/// to separate. The `:` is what keeps a sub-scope a sub-scope rather than a
+/// string prefix.
+///
+/// An unrecognized caveat therefore fails **closed** by construction: an
+/// unknown child is covered only by a genuine ancestor, and never widens to
+/// one. A trailing-colon token (`infra:attest:`) has an empty caveat and is
+/// covered by nothing but itself.
+#[must_use]
+pub(crate) fn scope_covers(held: &str, wanted: &str) -> bool {
+    if held.is_empty() || wanted.is_empty() {
+        return false;
+    }
+    if held == wanted {
+        return true;
+    }
+    // `wanted` is a sub-scope of `held` iff it continues PAST a `:` boundary.
+    wanted
+        .strip_prefix(held)
+        .is_some_and(|rest| rest.len() > 1 && rest.starts_with(':'))
+}
+
 fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> bool {
+    // v42.0.0 (CIRISPersist#814) — a held PARENT covers a check for its CHILD;
+    // a held child never widens to its parent. See [`scope_covers`].
     match envelope.get("scope") {
-        Some(serde_json::Value::String(s)) => s == scope_token,
-        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(scope_token)),
+        Some(serde_json::Value::String(s)) => scope_covers(s, scope_token),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|held| scope_covers(held, scope_token)),
         _ => false,
     }
 }
@@ -5878,7 +6824,17 @@ async fn scoped_delegation_reach(
             if policy.enforce_attenuation_and_sub_delegation {
                 if let Some(parent_scope) = &node.parent_scope {
                     let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    if !child_scope.is_subset(parent_scope) {
+                    // v42.0.0 (CIRISPersist#814 part 4) — "⊆-parent" is now
+                    // read modulo sub-scopes: every child token must be equal
+                    // to, or a CAVEAT ON, some parent token. Exact set-subset
+                    // would refuse `infra:attest:licensure:acme` under a parent
+                    // holding `infra:attest` — i.e. refuse the attenuation this
+                    // cut exists to allow. Still never EXPANDS: a child token
+                    // no parent token covers prunes the edge exactly as before.
+                    if !child_scope
+                        .iter()
+                        .all(|c| parent_scope.iter().any(|p| scope_covers(p, c)))
+                    {
                         continue;
                     }
                 }
@@ -7307,6 +8263,42 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
     Ok(out)
 }
 
+/// v42.0.0 (CIRISPersist#811) — **THE clause-(3) edge filter.** One
+/// definition, three callers: [`is_steward_bound`], [`steward_bindings_of`]
+/// and [`steward_binding_chain`] all resolve their delegation clause through
+/// this, so the biconditional they each document cannot drift on the axis
+/// that actually drifted.
+///
+/// The discriminator is CC 3.2 rc3's, unchanged: **can this target accept for
+/// itself?** A node (no agency) is stewarded by ANY delegation naming it — a
+/// person's delegation to it IS custody. A target that can accept for itself
+/// is stewarded only where the envelope declares custody (the CC 2.4.1.2
+/// marker); an unmarked delegation to it is a capability conferral, a job
+/// rather than ownership.
+///
+/// # Why this is a function and not three literals
+///
+/// It was three literals, and two of them were the wrong one. v30.8.0
+/// narrowed `steward_bindings_of`'s clause (3) to this discriminator and left
+/// `is_steward_bound` and `steward_binding_chain` hardcoding
+/// [`DelegationEdgeFilter::AnyDelegation`]. All three docstrings claimed the
+/// biconditional held "by construction" because clause (3) was "literally the
+/// same call" — true of the callee, false of the argument, which is exactly
+/// why it survived review. CIRISConformance#87 found it: after the sole
+/// custody edge over an `agent` key is withdrawn with a plain conferral still
+/// live, the fold correctly returned `[]` while the predicate still answered
+/// `true` — a key steward-bound to nobody.
+async fn steward_edge_filter(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<DelegationEdgeFilter, Error> {
+    Ok(if can_accept_for_itself(directory, k).await? {
+        DelegationEdgeFilter::OwnerBindingOnly
+    } else {
+        DelegationEdgeFilter::AnyDelegation
+    })
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
 /// **steward-bound**? A moderation chain ROOT must terminate in a real human
 /// (a `user`-role identity), never a free-floating agent/service key — the
@@ -7318,7 +8310,10 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
 ///      resolves `k` to an identity whose key is `user`-role (k is a
 ///      device/occurrence of a human identity); OR
 ///   3. ∃ a **live** `delegates_to(U → k)` with `U` a `user`-role key (a
-///      human delegated to k) — [`live_delegation_granters`], the ONE walk
+///      human delegated to k), **of the shape [`steward_edge_filter`] admits
+///      for this target** — custody-only where `k` can accept for itself, any
+///      delegation where it cannot (CIRISPersist#811) —
+///      [`live_delegation_granters`], the ONE walk
 ///      that owns what "live" means: not retracted by the granter (the §11.10
 ///      edge-retraction model), not retracted by ANY admitted
 ///      `withdraws`/`recants` naming the edge (CEG §3.2.3 rules 1-4 /
@@ -7366,11 +8361,10 @@ pub async fn is_steward_bound(
     //     live-delegation walk ([`live_delegation_granters`]), which owns every
     //     liveness clause (retraction by the granter OR by any admitted
     //     `withdraws` naming the edge, expiry, adult-incapacity lapse).
-    Ok(
-        !live_delegation_granters(directory, k, DelegationEdgeFilter::AnyDelegation)
-            .await?
-            .is_empty(),
-    )
+    let filter = steward_edge_filter(directory, k).await?;
+    Ok(!live_delegation_granters(directory, k, filter)
+        .await?
+        .is_empty())
 }
 
 /// #249 Cut B — the **enumeration** of [`is_steward_bound`]: the `user`-role
@@ -7388,9 +8382,20 @@ pub async fn is_steward_bound(
 /// Consistency: `is_steward_bound(k)` ⟺ `!steward_bindings_of(k).is_empty()` —
 /// the predicate returns true iff ANY clause holds, and this returns the
 /// union of all satisfying anchors (deduped, sorted). An unbound `k` yields
-/// the empty set. Clause (3) is now literally the same call in both, so the
-/// biconditional cannot drift; the memory / sqlite / postgres legs of
-/// `steward_liveness_test_support` assert it at every state transition.
+/// the empty set.
+///
+/// Clause (3) resolves through [`steward_edge_filter`] in both, so the
+/// **filter** cannot drift (CIRISPersist#811). That is a narrower claim than
+/// this comment used to make: it said the biconditional could not drift
+/// because clause (3) was "literally the same call", which was true of the
+/// callee and false of the argument — the predicate passed
+/// `AnyDelegation` while this passed the agency-discriminated filter, and the
+/// two disagreed for the whole life of that sentence. What holds the
+/// biconditional now is the shared filter PLUS
+/// `exercise_steward_binding_liveness`, which asserts it at every state
+/// transition on all three backends — and, since #811, with a plain conferral
+/// surviving alongside the custody edge, the arrangement the old harness never
+/// built and therefore could not fail on.
 pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
@@ -7447,11 +8452,7 @@ pub async fn steward_bindings_of(
     // A target that cannot accept for itself (a node, or a minor) is stewarded by
     // ANY delegation naming it; one that can is stewarded only where the envelope
     // declares custody.
-    let filter = if can_accept_for_itself(directory, k).await? {
-        DelegationEdgeFilter::OwnerBindingOnly
-    } else {
-        DelegationEdgeFilter::AnyDelegation
-    };
+    let filter = steward_edge_filter(directory, k).await?;
     out.extend(live_delegation_granters(directory, k, filter).await?);
     let mut out: Vec<String> = out.into_iter().collect();
     out.sort();
@@ -10403,10 +11404,13 @@ pub async fn is_canonical_effective(
 ///   1. `k` is itself `user`-role → `[k]` (the key IS the human anchor).
 ///   2. `k` is an occurrence of a `user`-role identity → `[identity, k]`.
 ///   3. a **live** `delegates_to(U → k)` with `U` `user`-role →
-///      `[U, k]`, liveness decided by [`live_delegation_granters`] — the same
-///      call [`is_steward_bound`] and [`steward_bindings_of`] make, so
-///      `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds by
-///      construction (CIRISPersist#584). The §11.10 steward-binding clause (3)
+///      `[U, k]`, liveness decided by [`live_delegation_granters`] and edge
+///      SHAPE by [`steward_edge_filter`] — the same call AND the same argument
+///      [`is_steward_bound`] and [`steward_bindings_of`] make, so
+///      `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds
+///      (CIRISPersist#584, argument fixed in #811 — this function was the
+///      third site hardcoding `AnyDelegation` against a fold that had already
+///      narrowed). The §11.10 steward-binding clause (3)
 ///      is a DIRECT incoming edge (same as the predicate), so the delegated
 ///      path is one hop; a multi-hop human→…→k steward-binding is not part of
 ///      the predicate and is not synthesized here.
@@ -10445,8 +11449,8 @@ pub async fn steward_binding_chain(
     //     the ONE live-delegation walk returns a BTreeSet, so `.first()` IS
     //     that minimum. Liveness is NOT re-derived here — that is the whole
     //     point of CIRISPersist#584.
-    let anchors =
-        live_delegation_granters(directory, key_id, DelegationEdgeFilter::AnyDelegation).await?;
+    let filter = steward_edge_filter(directory, key_id).await?;
+    let anchors = live_delegation_granters(directory, key_id, filter).await?;
     if let Some(anchor) = anchors.into_iter().next() {
         return Ok(vec![anchor, key_id.to_owned()]);
     }
@@ -12528,6 +13532,378 @@ pub async fn check_reserved_prefix_admission(
 
 #[cfg(test)]
 mod tests {
+
+    /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case table.
+    ///
+    /// The two REFUSAL rows are what CC's ruling closed that the first cut of
+    /// this gate did not: `config:Admission:v1` has a lowercase stem, so a
+    /// stem-only check let it reach the family gate while evading the
+    /// sensitive-leaf floor. Its `{scope}` segment is classed `vocab`, so it is
+    /// malformed and never gets there.
+    ///
+    /// The ADMISSION rows are what stops this becoming "dimensions must be
+    /// lowercase" — a `value` segment is caller identity and CC's own worked
+    /// example (`licensure:CA_medical_board`) must stay legal.
+    #[test]
+    fn dimension_case_rule_is_per_segment_815() {
+        let mk = |dim: &str| {
+            let now = chrono::Utc::now();
+            crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "k".to_owned(),
+                attested_key_id: "k".to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({ "dimension": dim }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            }
+        };
+        for (dim, refused, why) in [
+            (
+                "config:Admission:v1",
+                true,
+                "THE ONE THE STEM CHECK MISSED: `{scope}` is a `vocab` segment, so \
+                 this is malformed and never reaches the sensitive-leaf floor",
+            ),
+            (
+                "Config:admission:v1",
+                true,
+                "a `literal` stem is lowercase by construction",
+            ),
+            ("config:admission:v1", false, "the conformant spelling"),
+            (
+                "config:load:v1",
+                false,
+                "the operational leaf still travels",
+            ),
+            (
+                "licensure:CA_medical_board",
+                false,
+                "CC's OWN worked example — `{authority_id}` is a `value` segment \
+                 and its case is preserved; refusing it would be the vocabulary \
+                 change persist must not make",
+            ),
+            ("duty:attribute:v1", false, "the v42.0.0 family, conformant"),
+        ] {
+            let got = check_dimension_case_rule(&mk(dim));
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "{dim:?} should be {} — {why}. got {got:?}",
+                if refused { "REFUSED" } else { "admitted" }
+            );
+        }
+    }
+
+    /// v42.0.0 (CIRISPersist#815) — the manifest's `vocab_pattern` IS the shape
+    /// `check_dimension_case_rule` implements structurally.
+    ///
+    /// The gate checks the pattern by hand rather than pulling in a regex
+    /// engine for one expression, so this pins the two together: if CC ever
+    /// widens or narrows the pattern, this reds instead of the gate silently
+    /// enforcing the old shape against a manifest that says something else.
+    #[test]
+    fn the_vocab_pattern_is_the_one_this_gate_implements_815() {
+        let (pattern, token) = crate::federation::namespace::registry::case_rule()
+            .expect("the rc5 manifest carries _meta.case_rule");
+        assert_eq!(
+            pattern, "^[a-z0-9][a-z0-9_.-]*$",
+            "the gate implements this pattern structurally; if CC changed it, the \
+             gate must change with it rather than enforce a stale shape"
+        );
+        assert_eq!(token, "namespace_dimension_case_malformed");
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 1) — the duty/permission reach table.
+    ///
+    /// Enumerated rather than ranked. `Projection` is NOT linearly ordered —
+    /// `Capability(_)` and `Subject` are audience KINDS — so a `rank(p) -> u8`
+    /// would impose a total order the type does not have, and the first
+    /// consumer comparing a `Capability` against a `Cohort` would get an answer
+    /// that means nothing. Everything not enumerated fails CLOSED, and the
+    /// non-comparable rows below are what pin that.
+    #[test]
+    fn duty_may_ride_is_partial_and_fails_closed_814() {
+        use crate::federation::namespace::{CapabilityToken, Projection as P};
+        let cap = P::Capability(CapabilityToken::InfraServe);
+        for (duty, perm, expect, why) in [
+            (
+                P::SelfOwn,
+                P::SelfOwn,
+                true,
+                "the narrowest cannot out-reach",
+            ),
+            (
+                P::SelfOwn,
+                P::Cohort,
+                true,
+                "narrower than its permission is fine",
+            ),
+            (P::SelfOwn, P::Global, true, "narrower again"),
+            (
+                P::SelfOwn,
+                cap,
+                true,
+                "SelfOwn reaches nobody the permission missed",
+            ),
+            (P::SelfOwn, P::Subject, true, "same"),
+            (P::Cohort, P::Cohort, true, "equal reach"),
+            (P::Cohort, P::Global, true, "narrower than its permission"),
+            (
+                P::Cohort,
+                P::SelfOwn,
+                false,
+                "THE LEAK: a duty visible where its permission is not discloses \
+                 the permission's existence",
+            ),
+            (
+                P::Cohort,
+                cap,
+                false,
+                "not comparable — a capability audience is a KIND, not a reach; \
+                 fail closed rather than guess",
+            ),
+            (P::Cohort, P::Subject, false, "not comparable — fail closed"),
+            (
+                P::Global,
+                P::Global,
+                false,
+                "unreachable today (the Duty curve caps at Cohort) and a refusal \
+                 is the right answer if that cap ever moves",
+            ),
+            (
+                cap,
+                P::Global,
+                false,
+                "a duty never carries a capability audience",
+            ),
+        ] {
+            assert_eq!(
+                duty_may_ride(duty, perm),
+                expect,
+                "duty {duty:?} on permission {perm:?} should be {expect} — {why}"
+            );
+        }
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the sensitive-leaf
+    /// floor, as a table.
+    ///
+    /// The two REFUSAL rows are the ask. The `config:load` rows are what keeps
+    /// this from being the family-wide `SelfOwn` pin CC explicitly declined: if
+    /// an operational leaf stops travelling, the floor has been generalized
+    /// into the invariant CC never stated, and load is no longer publishable to
+    /// the peers that route on it.
+    #[test]
+    fn config_sensitive_leaf_floor_814() {
+        for (dimension, scope, refused, why) in [
+            (
+                "config:admission:v1",
+                "self",
+                false,
+                "the sensitive leaf at its floor",
+            ),
+            (
+                "config:admission:v1",
+                "community",
+                true,
+                "an admission policy says what this node will accept",
+            ),
+            (
+                "config:transport:v1",
+                "federation",
+                true,
+                "a transport config says how to reach it",
+            ),
+            (
+                "config:transport",
+                "self",
+                false,
+                "unversioned stem, at the floor",
+            ),
+            (
+                "config:load:v1",
+                "community",
+                false,
+                "OPERATIONAL leaf — must still travel, or the floor has become \
+                 the family-wide pin CC declined",
+            ),
+            (
+                "config:load:v1",
+                "federation",
+                false,
+                "load at the widest scope is a routing input, not a secret",
+            ),
+            (
+                "config:admission_policy_notes:v1",
+                "community",
+                false,
+                "NOT a sensitive leaf — a bare prefix test would catch this and \
+                 refuse a leaf nobody decided was sensitive",
+            ),
+            (
+                "config:replication:v1",
+                "community",
+                false,
+                "an undecided leaf is not presumed sensitive",
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let row = crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "k".to_owned(),
+                attested_key_id: "k".to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({ "dimension": dimension }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: scope.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            let got = check_config_sensitive_leaf_floor(&row);
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "{dimension} @ cohort_scope={scope} should be {} — {why}. got {got:?}",
+                if refused { "REFUSED" } else { "admitted" }
+            );
+        }
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 4, CC 4.5.5) — **the directional
+    /// sub-scope table, spelled as LITERALS.**
+    ///
+    /// Deliberately not derived from `delegation_scope::*`: a table generated
+    /// from the constants under test cannot fail when the constants are the
+    /// thing that is wrong, and the vector this exists to pin
+    /// (`infra:attest:licensure:acme` must NOT satisfy `infra:attest`) is a
+    /// relation between two strings, not a property of either.
+    #[test]
+    fn scope_covers_is_directional_and_boundary_exact_814() {
+        for (held, wanted, expect, why) in [
+            ("infra:attest", "infra:attest", true, "exact"),
+            (
+                "infra:attest",
+                "infra:attest:licensure:acme",
+                true,
+                "a parent covers its child — this is what attenuation MEANS",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest",
+                false,
+                "THE HAZARD: a child must never widen to its parent. \
+                 `held.starts_with(wanted)` returns true here and hands a \
+                 deliberately narrowed holder the full attest capability",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest:licensure:other",
+                false,
+                "siblings cover nothing",
+            ),
+            (
+                "infra:attest",
+                "infra:attest_assurance",
+                false,
+                "the COLON BOUNDARY: v30.2.0 split these two authorities on \
+                 purpose; a bare prefix test silently re-merges them",
+            ),
+            (
+                "infra:attest",
+                "infra:attestation",
+                false,
+                "colon boundary again — a string prefix is not a sub-scope",
+            ),
+            (
+                "infra:attest:licensure:acme",
+                "infra:attest:licensure:acme",
+                true,
+                "an exact caveat is still exact",
+            ),
+            (
+                "moderate",
+                "moderate",
+                true,
+                "the unprefixed duty ladder is unaffected by this cut",
+            ),
+            (
+                "moderate",
+                "moderate:something",
+                true,
+                "the relation is not infra-specific; it is about the token shape",
+            ),
+            ("infra:attest", "", false, "empty is covered by nothing"),
+            ("", "infra:attest", false, "empty covers nothing"),
+            (
+                "infra:attest",
+                "infra:attest:",
+                false,
+                "a trailing-colon caveat is EMPTY — fail closed rather than \
+                 treat it as the parent",
+            ),
+        ] {
+            assert_eq!(
+                scope_covers(held, wanted),
+                expect,
+                "scope_covers({held:?}, {wanted:?}) should be {expect} — {why}"
+            );
+        }
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 4) — the relation is ANTISYMMETRIC on
+    /// distinct tokens: if `a` covers `b` and they differ, `b` must not cover
+    /// `a`. Stated as a property because the failure mode is a symmetric
+    /// implementation (`starts_with` in either argument order), which no
+    /// single row of the table above catches on its own.
+    #[test]
+    fn scope_covers_is_antisymmetric_814() {
+        let tokens = [
+            "infra:attest",
+            "infra:attest:licensure:acme",
+            "infra:attest:licensure:other",
+            "infra:attest_assurance",
+            "infra:serve",
+            "moderate",
+        ];
+        for a in tokens {
+            for b in tokens {
+                if a != b && scope_covers(a, b) {
+                    assert!(
+                        !scope_covers(b, a),
+                        "{a:?} covers {b:?} AND {b:?} covers {a:?} — the relation \
+                         is symmetric, which means a child can widen to its parent"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     fn default_policy() -> DimensionAdmissionPolicy {
@@ -12915,6 +14291,11 @@ mod tests {
             identity_type::NODE,
             identity_type::LENSCORE_DETECTOR,
             identity_type::CANONICAL,
+            // v42.0.0 (CIRISPersist#814) — the CO_STEWARD_ROLES became
+            // authority-conferring when CC 3.4.9's rule started gating
+            // `licensure:` on them.
+            identity_type::REGISTRY,
+            identity_type::VERIFY,
         ];
         for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
             assert!(
@@ -14519,9 +15900,20 @@ mod tests {
         "delivery:",
         "delivery_receipt:",
         "key_boundary:",
+        // v42.0.0 (CIRISPersist#814) — CC ruled that CC 3.4.9 is co-stewardship
+        // of the CIRIS-ISSUED licence, NOT a reservation of the family, and
+        // that "a substrate reserving it to those identity types has misread
+        // it". The open-emitter posture is the design: anyone may be a
+        // licensing authority, and a stranger's row binds nobody because it
+        // falls OUTSIDE the (subject, authority) fold — not because it is
+        // refused. See `federation::licensure`.
         "licensure:",
         "ownership:",
         "peer_reachability:",
+        // v42.0.0 (CIRISPersist#814 part 5) — gated by
+        // `check_session_self_report_admission`, not by a prefix rule: CC 3.4.3
+        // asks "is the attester the subject", which no identity type expresses.
+        "session:",
         "trace:",
         "trace_summary:",
         "transport:",
@@ -20607,6 +21999,37 @@ pub(crate) mod steward_liveness_test_support {
         row
     }
 
+    /// v42.0.0 (CIRISPersist#811) — a `delegates_to` carrying the **CC 2.4.1.2
+    /// custody marker**, as distinct from [`delegates_to`]'s plain capability
+    /// conferral. This is the shape `is_owner_binding_envelope` recognizes via
+    /// `delegation_purpose` — the raw `emit_attestation_self` path, and what
+    /// CIRISConformance probes.
+    ///
+    /// The harness needs BOTH shapes over one target, because the #811 drift
+    /// is invisible with only one: the predicate and the fold disagree only
+    /// where a plain conferral SURVIVES a withdrawn custody edge.
+    fn delegates_to_custody(
+        granter: &str,
+        recipient: &str,
+        scope: &[&str],
+        subjects: &[&str],
+    ) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = signed_row(
+            granter,
+            recipient,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            }),
+        );
+        row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        crate::federation::tier_ingest::test_support::reseal(&mut row);
+        row
+    }
+
     pub(crate) fn withdraws_of(
         issuer: &str,
         attested: &str,
@@ -20792,6 +22215,70 @@ pub(crate) mod steward_liveness_test_support {
             steward_bindings_of(dir, &node3).await.expect("anchors"),
             vec![granter.clone()],
             "a withdraws that references some OTHER attestation must not fold this edge away"
+        );
+
+        // ── #811: a SURVIVING conferral must not answer for withdrawn custody ──
+        //
+        // Everything above uses a NODE target with exactly one edge shape, and
+        // that is why this harness was green through the whole life of the
+        // defect. A node cannot accept for itself, so `steward_edge_filter`
+        // hands every clause `AnyDelegation` and the predicate's old hardcoded
+        // `AnyDelegation` was accidentally the right answer. The drift needs a
+        // target that CAN accept for itself AND two edge shapes over it at once.
+        //
+        // An `agent` key is that target (not a node, not a minor user), and
+        // this is CIRISConformance#87's vector: custody from one adult, a plain
+        // capability conferral from another, then the custody edge withdrawn.
+        // Before #811 the fold correctly returned `[]` while the predicate
+        // still answered `true` on the strength of the conferral — a key
+        // steward-bound to nobody, which is precisely the state CC 3.2 says the
+        // substrate must be able to describe.
+        let custodian = format!("sb-custodian-{suffix}");
+        let conferrer = format!("sb-conferrer-{suffix}");
+        let agent = format!("sb-agent-{suffix}");
+        register(dir, &custodian, &[identity_type::USER]).await;
+        register(dir, &conferrer, &[identity_type::USER]).await;
+        register(dir, &agent, &[identity_type::AGENT]).await;
+
+        assert_biconditional(dir, &agent, false, "agent, no edges").await;
+
+        // The plain conferral ALONE must not steward-bind an agent: it is a
+        // job, not custody. (If this arm passes `true`, the filter is not
+        // being applied at all and every assertion below is vacuous.)
+        let conferral = delegates_to(&conferrer, &agent, &[ds::INFRA_SERVE], &[&agent]);
+        store(dir, &conferral).await.expect("conferral admitted");
+        assert_biconditional(dir, &agent, false, "plain conferral only").await;
+
+        // Custody arrives — now, and only now, the agent is steward-bound, and
+        // to the CUSTODIAN alone.
+        let custody = delegates_to_custody(
+            &custodian,
+            &agent,
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            &[&agent],
+        );
+        store(dir, &custody).await.expect("custody edge admitted");
+        assert_biconditional(dir, &agent, true, "custody + conferral").await;
+        assert_eq!(
+            steward_bindings_of(dir, &agent).await.expect("anchors"),
+            vec![custodian.clone()],
+            "only the CUSTODIAN anchors an agent; the conferrer gave it a job, not ownership"
+        );
+
+        // THE #811 STATE: the sole custody edge is withdrawn by its granter
+        // while the conferral stays live.
+        let custody_gone = bare_edge_retraction(&custodian, &agent);
+        store(dir, &custody_gone)
+            .await
+            .expect("the custodian's edge retraction must be admitted");
+        assert_biconditional(dir, &agent, false, "custody withdrawn, conferral survives").await;
+        assert!(
+            steward_bindings_of(dir, &agent)
+                .await
+                .expect("anchors")
+                .is_empty(),
+            "with custody withdrawn the agent is steward-bound to NOBODY — a live capability \
+             conferral is not a custody claim and must not answer for one (CIRISPersist#811)"
         );
     }
 

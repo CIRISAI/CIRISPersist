@@ -155,6 +155,26 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // question about the caller's row (who is speaking about whom), never on
     // the substrate's own terms.
     ("check_config_self_or_owner_admission", Class::Gate),
+    // v42.0.0 (CIRISPersist#814 part 1) — Gate: it refuses the caller's row on
+    // three properties of that row (it names a permission, its attester issued
+    // that permission, and it does not out-reach it). Every arm is a statement
+    // about the input, never about the substrate's own health.
+    ("check_duty_admission", Class::Gate),
+    // v42.0.0 (CIRISPersist#814 part 3) — Gate: refuses the caller's row when a
+    // live row already exists for its (subject, scope, leaf) and this one does
+    // not supersede it. A statement about the input, not the substrate.
+    ("check_config_renewal_supersedes", Class::Gate),
+    // v42.0.0 (CIRISPersist#814 part 5) — Gate: refuses a `session:*` row whose
+    // attester is not the attested occurrence (CC 3.4.3 substrate-self-report).
+    ("check_session_self_report_admission", Class::Gate),
+    // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
+    // segment breaks its manifest-declared case class. A statement about the
+    // caller's input.
+    ("check_dimension_case_rule", Class::Gate),
+    // v42.0.0 (CC 3.3.9, CIRISPersist#814) — Gate: refuses a row that CLAIMS
+    // delegated licence authority whose chain does not resolve to the authority
+    // it names.
+    ("check_licensure_delegator_is_authority", Class::Gate),
     ("check_community_membership_steward_binding", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),

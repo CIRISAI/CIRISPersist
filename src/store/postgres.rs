@@ -5158,6 +5158,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // 3.4.5 gates sit together and a reader finds both at one line.
         // Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+        // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
+        // permission its attester issued, and never out-reaches it.
+        crate::federation::admission::check_duty_admission(self, &row).await?;
+        // CC 3.4.5.1 — a config renewal must supersede the row it replaces
+        // (v42.0.0, CIRISPersist#814 part 3).
+        crate::federation::admission::check_config_renewal_supersedes(self, &row).await?;
+        // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
+        // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
+        crate::federation::admission::check_session_self_report_admission(&row)?;
+        // CC 3.1 — a lowercase family stem, or the row evades every family gate
+        // (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_dimension_case_rule(&row)?;
+        // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
+        // names (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_licensure_delegator_is_authority(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
@@ -23123,6 +23138,98 @@ mod tests {
     /// write-back, its TEXT round-trip (V122), and the re-stamped mirror
     /// surviving both. The receiving stack is backend-symmetric by construction
     /// and has its own parity witnesses.
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn duty_rides_only_its_own_permission_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgduty{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_duty_rides_only_its_own_permission_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn stranger_licensure_admits_but_does_not_bind_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pglic{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_stranger_licensure_admits_but_does_not_bind_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn config_renewal_must_supersede_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgcfg{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_config_renewal_must_supersede_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814) — the POSTGRES leg. Added after review found
+    /// these four exercises had memory + sqlite and no third leg, while every
+    /// other exercise in that module has all three. Not ceremony: each crosses a
+    /// backend boundary — the duty gate calls `get_attestation` from inside
+    /// postgres's own `put_attestation`, and the licensure door runs the
+    /// reserved-prefix rule against postgres's key read. `store/parity.rs` pins
+    /// the gate SEQUENCE and so structurally cannot notice a missing witness.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn session_is_a_self_report_at_the_door_814_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgsess{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_session_is_a_self_report_at_the_door_814(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn promoted_row_crosses_to_a_peer_postgres_649() {
@@ -31543,6 +31650,30 @@ mod tests {
     /// v8.7.1 (CIRISPersist#233) — a `delegates_to` edge `granter →
     /// grantee` bearing `scope` (+ optional `sub_delegation`) on the PG
     /// backend.
+    /// v42.0.0 (CIRISPersist#811) — the CC 2.4.1.2 custody-marked twin of
+    /// [`pg_delegates_to`]. Since #811 that marker decides steward-binding for
+    /// any target that can accept for itself (a person, an agent): a plain
+    /// conferral is a job, only a marked edge is ownership.
+    fn pg_delegates_to_custody(
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        sub_delegation: bool,
+    ) -> crate::federation::Attestation {
+        let mut a = pg_scores_attestation(granter, grantee, granter, "x");
+        a.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        crate::federation::tier_ingest::test_support::reseal(&mut a);
+        a.attestation_envelope = serde_json::json!({
+            "references_attestation_id": a.attestation_id,
+            "scope": scope,
+            "sub_delegation": sub_delegation,
+            "delegation_purpose":
+                crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+        });
+        pg_resign(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        a
+    }
+
     fn pg_delegates_to(
         granter: &str,
         grantee: &str,
@@ -31961,6 +32092,9 @@ mod tests {
         let owner = format!("ob-owner-{suffix}");
         let node = format!("ob-node-{suffix}");
         let agent = format!("ob-agent-{suffix}");
+        // v42.0.0 (CIRISPersist#811) — a second agent, stewarded by a PLAIN
+        // conferral only, for the blast-radius arm.
+        let agent_plain = format!("ob-agentp-{suffix}");
         let node_wd = format!("ob-node-wd-{suffix}");
         let node_exp = format!("ob-node-exp-{suffix}");
         let node_unstewarded = format!("ob-node-unstewarded-{suffix}");
@@ -31968,6 +32102,7 @@ mod tests {
             (&owner, crate::federation::types::identity_type::USER),
             (&node, crate::federation::types::identity_type::NODE),
             (&agent, crate::federation::types::identity_type::AGENT),
+            (&agent_plain, crate::federation::types::identity_type::AGENT),
             (&node_wd, crate::federation::types::identity_type::NODE),
             (&node_exp, crate::federation::types::identity_type::NODE),
             (
@@ -32014,6 +32149,8 @@ mod tests {
         let comm_unstewarded_agent = format!("ob-c2-{suffix}");
         let comm_node_ok = format!("ob-c3-{suffix}");
         let comm_agent_ok = format!("ob-c4-{suffix}");
+        // v42.0.0 (CIRISPersist#811) — the conferral-only roster's community.
+        let comm_agent_plain = format!("ob-c4b-{suffix}");
         let comm_infra = format!("ob-cinfra-{suffix}");
         let comm_fakeinfra = format!("ob-cfakeinfra-{suffix}");
         let comm_user = format!("ob-cuser-{suffix}");
@@ -32025,6 +32162,7 @@ mod tests {
             &comm_unstewarded_agent,
             &comm_node_ok,
             &comm_agent_ok,
+            &comm_agent_plain,
             &comm_infra,
             &comm_fakeinfra,
             &comm_user,
@@ -32109,10 +32247,22 @@ mod tests {
             .unwrap()
             .is_some());
 
-        // STEWARD-BOUND agent (live delegates_to(user → agent)) → ADMITTED.
+        // STEWARD-BOUND agent (live CUSTODY delegates_to(user → agent)) →
+        // ADMITTED.
+        //
+        // v42.0.0 (CIRISPersist#811): this arm used to pass a PLAIN
+        // `delegates_to` and assert admission. That is a capability conferral —
+        // a job — and under CC 3.2 rc4 it never steward-bound an agent; the
+        // predicate merely said it did. It now passes a custody-marked edge,
+        // and the conferral-only case is asserted as a REFUSAL below.
         backend
             .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(&owner, &agent, serde_json::json!(["share"]), false),
+                attestation: pg_delegates_to_custody(
+                    &owner,
+                    &agent,
+                    serde_json::json!(["share"]),
+                    false,
+                ),
             })
             .await
             .unwrap();
@@ -32125,6 +32275,40 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+
+        // v42.0.0 (CIRISPersist#811) — THE BLAST RADIUS, on the Postgres leg
+        // too. A SECOND agent whose only incoming edge is a PLAIN conferral is
+        // NOT steward-bound, so its community is refused and not stored.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &owner,
+                    &agent_plain,
+                    serde_json::json!(["share"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_community(put_comm(&comm_agent_plain, vec![&agent_plain], None))
+            .await
+            .expect_err("a conferral is not custody — the roster must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::UnstewardedCommunityMember { .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            backend
+                .lookup_community(&comm_agent_plain)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is stored on a refused roster"
+        );
 
         // `infrastructure` carve-out → unstewarded node admitted (AUTHORIZED:
         // comm_infra's key is substrate_persist).

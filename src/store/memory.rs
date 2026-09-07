@@ -3291,6 +3291,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // 3.4.5 gates sit together and a reader finds both at one line.
         // Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
+        // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
+        // permission its attester issued, and never out-reaches it.
+        crate::federation::admission::check_duty_admission(self, &row).await?;
+        // CC 3.4.5.1 — a config renewal must supersede the row it replaces
+        // (v42.0.0, CIRISPersist#814 part 3).
+        crate::federation::admission::check_config_renewal_supersedes(self, &row).await?;
+        // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
+        // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
+        crate::federation::admission::check_session_self_report_admission(&row)?;
+        // CC 3.1 — a lowercase family stem, or the row evades every family gate
+        // (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_dimension_case_rule(&row)?;
+        // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
+        // names (v42.0.0, CIRISPersist#814).
+        crate::federation::admission::check_licensure_delegator_is_authority(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
@@ -10033,6 +10048,57 @@ mod accord_tests {
         )
         .await;
     }
+
+    /// v42.0.0 (CIRISPersist#814 part 1) — the memory leg of the duty gate.
+    #[tokio::test]
+    async fn duty_rides_only_its_own_permission_814_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_duty_rides_only_its_own_permission_814(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 2) — the memory leg of the licensure fold.
+    #[tokio::test]
+    async fn stranger_licensure_admits_but_does_not_bind_814_memory() {
+        let backend = MemoryBackend::new();
+
+        crate::federation::bootstrap_admission::test_support::exercise_stranger_licensure_admits_but_does_not_bind_814(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 3) — the memory leg of the config renewal gate.
+    #[tokio::test]
+    async fn config_renewal_must_supersede_814_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_config_renewal_must_supersede_814(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 3) — the memory leg of the distinct-subject count.
+    #[tokio::test]
+    async fn distinct_self_reporting_subjects_814_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_distinct_self_reporting_subjects_814(
+            &backend, "memory",
+        )
+        .await;
+    }
+
+    /// v42.0.0 (CIRISPersist#814 part 5) — the memory leg of the session self-report door.
+    #[tokio::test]
+    async fn session_is_a_self_report_at_the_door_814_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_session_is_a_self_report_at_the_door_814(
+            &backend, "memory",
+        )
+        .await;
+    }
     #[tokio::test]
     async fn privileged_sync_door_memory_804() {
         let dir = MemoryBackend::new();
@@ -14091,6 +14157,29 @@ mod tests {
     }
 
     /// Build a memory-backend `delegates_to` carrying `scope`.
+    /// v42.0.0 (CIRISPersist#811) — a `delegates_to` carrying the CC 2.4.1.2
+    /// **custody marker**, which [`fix_delegates_to`] deliberately does not.
+    /// Since #811 that distinction decides steward-binding for any target that
+    /// can accept for itself (a person, an agent): a plain conferral is a job,
+    /// only a marked edge is ownership.
+    fn fix_delegates_to_custody(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+    ) -> Attestation {
+        let mut d = fix_attestation(id, granter, grantee, granter);
+        d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        d.attestation_envelope = serde_json::json!({
+            "references_attestation_id": id,
+            "scope": scope,
+            "delegation_purpose":
+                crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+        });
+        resign_fix(&mut d); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        d
+    }
+
     fn fix_delegates_to(
         id: &str,
         granter: &str,
@@ -16751,16 +16840,24 @@ mod tests {
             .is_none());
     }
 
-    /// An STEWARD-BOUND agent member (live `delegates_to(user → agent)`) →
-    /// ADMITTED. The agent carries no `node` role, so the delegation needs no infra
-    /// scope to store.
+    /// A STEWARD-BOUND agent member (live CUSTODY `delegates_to(user → agent)`)
+    /// → ADMITTED. The agent carries no `node` role, so the delegation needs no
+    /// infra scope to store.
+    ///
+    /// **v42.0.0 (CIRISPersist#811) — this fixture changed shape, and the
+    /// change is the point.** It used to pass a PLAIN `delegates_to` with scope
+    /// `["share"]` and assert admission. That is a capability conferral — a job
+    /// — and under CC 3.2 rc4 it never steward-bound an agent; the predicate
+    /// merely said it did, because it counted any delegation while the fold
+    /// counted only custody. With the two agreeing, this roster is admitted on
+    /// a marked edge and refused on an unmarked one (the arm below).
     #[tokio::test]
     async fn community_steward_bound_agent_member_admitted() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_delegates_to_custody(
                     "ob-d-agent",
                     "ob-owner",
                     "ob-agent",
@@ -16777,6 +16874,49 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// v42.0.0 (CIRISPersist#811) — **the blast radius, on the record.** An
+    /// agent member whose only incoming edge is a PLAIN conferral is NOT
+    /// steward-bound, so its community is refused and not stored.
+    ///
+    /// This is a real behaviour change for deployed data: before this cut the
+    /// unmarked edge kept such a roster federating. Asserted here so it is a
+    /// decision someone made rather than a surprise in a deployment — the same
+    /// treatment `exercise_objection_plane_blast_radius` gives the node case.
+    #[tokio::test]
+    async fn community_agent_member_with_only_a_conferral_is_refused_811() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "ob-d-agent-plain",
+                    "ob-owner",
+                    "ob-agent",
+                    serde_json::json!(["share"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let err = put_community_with(&backend, "comm-ob-4b", vec![member("ob-agent")], None)
+            .await
+            .expect_err("a conferral is not custody — the roster must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::UnstewardedCommunityMember { .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            backend
+                .lookup_community("comm-ob-4b")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is stored on a refused roster"
+        );
     }
 
     /// `cohort_subkind: infrastructure` community → an UNSTEWARDED node member

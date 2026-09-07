@@ -5,6 +5,672 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [42.0.0] - 2026-09-06
+
+**A conferral is not custody, a caveat is not its parent, and a secret is not
+a routing input.** MAJOR: this cut refuses input that previously succeeded, on
+two independent axes, and re-pins the whole CIRISVerify graph.
+
+### Why MAJOR
+
+Numbered MINOR while it was CIRISPersist#811 alone, and raised once
+CIRISPersist#814 part 3 landed a second refusal. Three reasons, any one of
+which a consumer must act on:
+
+1. **#811** — an agent member rostered under a plain (unmarked) conferral is no
+   longer steward-bound, so its community is refused at the write gate. Rows
+   that federated yesterday do not today.
+2. **#814 part 3** — a `config:admission` or `config:transport` row above
+   `self` is refused. Same shape: previously-admitted input, now rejected.
+3. **CIRISVerify v15.0.0** — seven pins move together and the wheel's
+   `Requires-Dist` firewall becomes `ciris-verify>=15.0.0,<16`, so
+   `pip install ciris-persist` will refuse a v14 verify. That is the
+   dep-ABI-break-as-firewall precedent (v6.0.1) rather than a quiet re-pin.
+
+CIRISPersist#814 part 4 also changes what authority matching MEANS (a held
+parent now satisfies a check for its child), though it breaks nothing today —
+no caveat tokens exist in deployed data yet.
+
+### The defect
+
+CC 3.2 rc4 states it normatively: *"The steward-binding predicate, its
+admission gate, and the `steward_bindings_of` fold key on owner-binding edges
+alone."* v30.8.0 narrowed the **fold** to that discriminator and left the
+**predicate** and the **chain** hardcoding `DelegationEdgeFilter::AnyDelegation`.
+
+With an `agent` key `N`, an adult `user` `S` holding custody and a second adult
+`S2` holding only a plain conferral:
+
+| state | `is_steward_bound(N)` | `steward_bindings_of(N)` |
+|---|---|---|
+| both edges live | `true` | `[S]` |
+| `S`'s custody edge withdrawn | **`true`** | `[]` |
+
+After the only custody edge is gone, `N` read as steward-bound **to nobody** —
+a steward-less state the substrate could create but not describe, which is the
+exact class CC 3.2's fail-secure predicate exists to prevent. Every consumer
+gating on the predicate rather than the fold (edge, server) inherited it.
+
+### Why it survived review
+
+All three functions documented the biconditional as holding "by construction"
+because clause (3) was "literally the same call". That sentence is **true of
+the callee and false of the argument** — `live_delegation_granters` was indeed
+shared; the filter passed to it was not. A comment asserting agreement is not
+agreement.
+
+The report named two functions. There were **three**: `steward_binding_chain`
+was also hardcoding `AnyDelegation` against a fold that had already narrowed,
+and carries the same "by construction" claim.
+
+### The fix
+
+One `steward_edge_filter()`, called by all three. The filter is now shared on
+the axis that actually drifted, and the docstrings say what is and is not
+guaranteed rather than repeating the claim that failed.
+
+### Witnesses
+
+`exercise_steward_binding_liveness` gained the arrangement it never built. Every
+prior case used a NODE target with one edge shape, and that is why the harness
+was green through the whole life of the defect: a node cannot accept for itself,
+so every clause gets `AnyDelegation` and the predicate's hardcoded value was
+accidentally correct. The drift needs a target that CAN accept for itself AND
+two edge shapes at once — CIRISConformance#87's vector exactly.
+
+Mutation-tested, both backends, both sites independently: reverting
+`is_steward_bound` reds the fold arm (`bound=true anchors=[]`); reverting
+`steward_binding_chain` reds the chain arm (`bound=false
+chain=["conferrer","agent"]`). Each names the function that disagreed.
+
+### BLAST RADIUS — read this
+
+**An agent member whose only incoming edge is a plain conferral is no longer
+steward-bound, so its community is refused at the write gate**
+(`UnstewardedCommunityMember`) and nothing is stored. Before this cut the
+unmarked edge kept such a roster federating.
+
+This is asserted, on both backends, by
+`community_agent_member_with_only_a_conferral_is_refused_811` — a decision on
+the record rather than a surprise in a deployment, the same treatment
+`exercise_objection_plane_blast_radius` gives the node case. The pre-existing
+`community_steward_bound_agent_member_admitted` fixture was passing a plain
+`delegates_to` and asserting admission; it now passes a custody-marked edge,
+because what it was really asserting was the defect.
+
+Deployments rostering agents under unmarked delegations must re-issue those
+edges with the CC 2.4.1.2 marker (`delegation_purpose: "owner_binding"`, the
+`emit_attestation_self` path CIRISConformance probes) before adopting. Node
+members are unaffected — a node cannot accept for itself, so any delegation
+naming it is still custody.
+
+### Also in this cut — CIRISPersist#814 part 4: directional sub-scope matching
+
+CIRISConstitution rc5 (#100 ask 2) allows `infra:attest` to be attenuated to a
+dimension family — `infra:attest:licensure:{authority_id}` — as a **caveat on
+an existing capability**, adding no member to the closed `infra:*` set.
+
+**The matcher is directional, and the direction is normative.** A parent token
+satisfies a check for its child; a child MUST NOT satisfy a check for its
+parent. One primitive, `scope_covers(held, wanted)`, spelled once:
+
+```rust
+held == wanted || wanted.strip_prefix(held).is_some_and(|r| r.len() > 1 && r.starts_with(':'))
+```
+
+The obvious implementation — `held.starts_with(wanted)` — inverts exactly this
+and hands a deliberately narrowed holder the FULL attest capability, repealing
+the attenuation that was the reason for issuing the narrow token. That is
+CC 3.4.7.3 Clause B's purity-vs-membership defect in a second dress, and it is
+pinned as a literal vector rather than a code comment.
+
+**Two sites, not the one the ask names.** The check
+(`delegation_scope_grants`) is the obvious one. The `⊆`-parent attenuation
+check is the other: it compared scope sets with exact `HashSet::is_subset`, so
+a legitimately NARROWED child (`infra:attest:licensure:acme` under a parent
+holding `infra:attest`) would have been **refused** — that is, the feature
+would have been unusable through the very rule that is supposed to permit it.
+Both now resolve through `scope_covers`. Site 2 only ever RELAXES: a child
+token no parent token covers still prunes the edge exactly as before.
+
+**The colon boundary is load-bearing beyond the stated hazard.** Without it,
+`infra:attest` would cover `infra:attest_assurance` — and v30.2.0
+(CIRISPersist#607) split those two deliberately, because `infra:attest` already
+governs the build-manifest plane and reusing it "would let an attest-scoped key
+silently gain the power to declare a third party's age band". A naive prefix
+test does not merely widen a caveat; it re-merges two authorities this repo
+already paid to separate. An unrecognized caveat therefore fails **closed**: an
+unknown child is covered only by a genuine ancestor and never widens to one.
+
+Twelve vectors, hand-written as literals rather than derived from the constants
+under test, plus an antisymmetry property (a symmetric implementation is a
+failure no single row catches alone). Mutation-tested three ways, each killed
+by a different assertion: the naive `starts_with` inversion, the missing colon
+boundary, and a symmetric relation.
+
+### A second review round — eight more defects, four P1
+
+Codex reviewed PR #816. All eight reproduced here before being acted on; the two
+most consequential are mutation-tested. Four were real holes; **two were in
+fixes made earlier in this same PR**.
+
+**A `supersedes` could lift a revocation.** The absorption check runs at the END
+of the fold, so a target hidden by supersession never reached it:
+`supersedes(revoked) → issued` returned `{Issued}` and lifted a terminal
+revocation — contradicting the contract in this module's own docstring, written
+three commits earlier. `revoked` targets are now excluded from supersession.
+Retraction still works, deliberately: an entitled `withdraws` is the authority
+saying the row was **wrong**, which is not a status transition, and an erroneous
+revocation must stay retractable or it would be permanent. That distinction was
+put back to the reviewer rather than assumed.
+
+**Licence authority was resolved from the CURRENT graph, reclassifying history.**
+The sharpest finding. A stranger pre-publishes `licensure:{A}` with
+`status: revoked`; `A` later grants that key a `license` delegation for any
+unrelated reason; the old row retroactively enters `A`'s fold, where `revoked`
+ABSORBS and immediately bars the holder. It ran backwards too — withdrawing a
+delegation made previously valid issuances vanish. Authority is now bound at
+**issuance**: the attester IS the authority, or the row NAMES the delegation it
+was issued under and that edge was the authority's own `license` grant, live at
+the row's `asserted_at`. A row claiming no delegation is testimony permanently.
+
+**Structural composers were exempted too broadly — twice.** Both share a cause:
+the `is_structural_composer` exemption was added to fix an earlier review
+finding and made too broad in two places. A `duty:` supersedes naming a non-duty
+(or an unresolvable target, or none) skipped permission, issuer and reach while
+still carrying a new duty body; a `config:` supersedes pointing anywhere let a
+second body in while the original stayed live — recreating the multiple-live-row
+state that gate exists to prevent, by saying the magic word.
+
+**Malformed literals beyond the stem.** `audit_chain:Hash_continuity` has a
+lowercase stem, so the literal half passed, and byte-exact lookup missed
+**precisely because** a later literal was miscased — the miscasing hid itself.
+Families are now identified case-insensitively to find the candidate;
+enforcement stays byte-exact against its declared classes.
+
+**Expiry, in both folds.** Expired rows stayed live indefinitely, and expired
+`supersedes` rows went on hiding their targets — expiry as a way to freeze a
+replacement in place forever.
+
+**`Duty` was missing from the projection sweep corpus.** The exhaustive helper
+mapped it; the iterated array and `FAMILY_DIMS` did not, so the assertion never
+called it. `FAMILY_DIMS`' own comment records this class recurring three times
+before — `duty:` was the fourth, in the cut that introduced it.
+
+### Both open questions were ruled on, and one ruling corrected this cut
+
+CC answered both asks on `rc5` at CIRISConstitution@71e7b2d. The registry was
+re-vendored at that ref — same 116 families, nothing added or removed, two
+descriptions lowercased, plus `_meta.case_rule` and `families[].segments[]`.
+
+**#815 — dimensions are case-sensitive, and the rule is PER SEGMENT (CC 3.1.7
+R3).** Nothing case-folds anywhere; a segment breaking its class's rule is
+*malformed*, never a sibling. The five classes ship as DATA — `literal`,
+`vocab`, `external`, `value`, `hex` — so the gate keys on the manifest rather
+than on `{...}` parsed out of prose.
+
+`check_dimension_case_rule` replaces the stem-only check, which CC confirmed was
+"the `literal` half of R3" and which **stays** — and it has to run BEFORE the
+family lookup, for a structural reason worth recording: a dimension whose stem
+is capitalised matches no catalogued family at all, so it has no `segments[]` to
+judge and would sail past a segment-only pass. `Config:admission:v1` is exactly
+that shape; `config:Admission:v1` is the one only the segment pass catches
+(`{scope}` is `vocab`). Both halves are needed and each is mutation-killed by
+its own row, as is the over-strict direction — applying the vocab rule to
+`value` segments reds on CC's own worked example, `licensure:CA_medical_board`.
+
+The manifest's `vocab_pattern` is checked by hand rather than by pulling in a
+regex engine, so `the_vocab_pattern_is_the_one_this_gate_implements_815` pins
+the two together: if CC widens the pattern, that reds instead of the gate
+silently enforcing a stale shape.
+
+Clippy then caught an unread `RawSegment.segment` field, which turned out to
+matter: the gate zips a dimension's `:`-split segments against `segments[]` **by
+position**, so a manifest whose list did not correspond to its own `prefix`
+would silently mis-class — judging a `value` segment by the `vocab` rule, or
+letting a `vocab` segment through as `value`. Invisible, because the gate would
+still pass its own table. `manifest_segments_align_with_their_prefix_815` now
+proves the alignment across all 116 families.
+
+The #724 gate — *"an unread manifest column is a claim the substrate silently
+ignores"* — refused the vendor until `segments[]` had a reader, which is how the
+ruling's own ask got enforced rather than merely intended.
+
+**#814 — there is no authority object, because there is no roster.** Anyone may
+be a licensing authority; `authority_id` names a KEY. "X holds licence authority
+for A" means X's key IS `A`, or X holds a `license`-scoped delegation chain from
+`A`. "By quorum" describes an authority's own governance, never an admission
+gate a substrate applies to somebody else's authority.
+
+**This corrected a fix made earlier in this same cut.** The `ReservedPrefixRule`
+reserving `licensure:` to `registry`/`verify` was a misreading of CC 3.4.9 —
+which is co-stewardship of the CIRIS-*issued* licence, not a reservation of the
+family. It is removed; the open-emitter posture is the design.
+
+The security property is unchanged and the mechanism is different, which is
+what the replacement witness pins: a stranger's forged, absorbing `revoked`
+**admits and is stored** — it is testimony about an authority, reaching a reader
+only along a flow that reader's trust or consent admits — and it **binds
+nobody**, because `status_set_for` now folds only rows whose emitter resolves to
+the authority. Exclusion, not refusal. Mutation-tested both ways: removing the
+resolution lets the stranger bind again; restoring the door refusal reds the
+"testimony admits" arm.
+
+The one refusal CC does specify is on the `license` scope:
+`licensure_delegator_not_authority`, when a row **claims** delegated authority
+(carrying `delegation_id`) whose chain does not resolve to the authority it
+names. Getting that trigger wrong once is recorded in the gate — firing on any
+attester-differs row would refuse the testimony CC ruled must admit.
+
+`registry` / `verify` **stay** in `AUTHORITY_CONFERRING_IDENTITY_TYPES`. That
+finding was independent of the reservation: `AccordCoScrubbed`'s own docstring
+already named the `CO_STEWARD_ROLES`, and registering such a key already failed
+through `check_accord_role_admission_over_roster`. Only the declaration was
+missing, and it still is worth having.
+
+One item from the #815 ruling needed no action: it flags
+`src/federation/migration.rs` as carrying a `slashing:PROVEN_ROGUE` literal now
+malformed under R3. **That string does not appear anywhere in this tree.**
+
+### Closing the named residue
+
+Three things were carried as "not done" and are now either shipped or asked.
+
+**The dimension-casing bypass, partly closed.** Every family gate in
+`admission.rs` tests membership with a byte-exact `starts_with`, so
+`Config:Admission:v1` matched none of them — not the `config:` family gate, not
+CC 3.4.5's self-report rule, not the sensitive-leaf floor. Any key could write
+one about a victim node. `check_dimension_stem_is_lowercase` refuses a
+non-lowercase family STEM: CC 3.1 catalogues 116 families and not one carries an
+uppercase character, so this constrains nothing a conformant emitter does.
+VALUE segments are deliberately untouched — `{authority_id}`, `{target}` and
+`{H}` are caller data and may carry case, and the table pins that with admission
+rows as well as the refusal.
+
+It does **not** close the whole class: `config:Admission:v1` still reaches the
+family gate while evading the leaf floor. Closing that needs a decision about
+whether dimensions are case-sensitive identifiers at all — a vocabulary question
+for CC, not a gate persist may add unilaterally.
+
+**The distinct-subject count, shipped rather than described.** CC rc5 states it
+as a consumer obligation; persist now provides
+`distinct_self_reporting_subjects` so consumers do not each hand-roll it. A rule
+stated in prose and left to every consumer is the shape CIRISPersist#637 cost a
+release to remove — the ones that get it wrong get it wrong silently, reading
+one node as two and penalising the node that renewed correctly.
+
+One honest note is recorded in that function rather than papered over: its
+supersedes pass is **defensive, not decisive**. A live `supersedes` is itself a
+live row on the same leaf, so mutating the exclusion away does not red the
+witness. It is kept because the contract is "live rows", not "rows that happen
+to dominate".
+
+**The CC 3.3.9 issuance quorum remains open, and is blocked on a definition.**
+`authority_id` appears nowhere in persist outside the licensure module: there is
+no primitive for *which key holds licence authority for a named authority*. The
+rc5 registry says authority "is conferred by quorum, never by `delegates_to`",
+which rules out the delegation plane but does not say what the quorum is over.
+This is an ask, not an omission — see CIRISPersist#814.
+
+### Adversarial review found five defects in this cut — all fixed
+
+An independent reviewer was run against the branch. Every finding was
+reproduced here before being acted on; every fix is mutation-tested.
+
+**A forged licensure revocation was load-bearing, absorbing and unliftable.**
+CC 3.4.9 reserves `licensure:` as co-stewarded (Registry + Verify) and persist
+gated it nowhere — no prefix rule, no purpose-built gate. That was inert while
+nothing folded those rows. **Part 2's fold made it live**: any registered key
+could mint `status = revoked` for any holder, `revoked` ABSORBS, and neither the
+real authority nor the holder could lift it — `precedence::retraction_entitled`
+admits only the forged row's own attester. Landing a fold ahead of its emitter
+gate turned a dormant hole into a live one.
+
+*The fix recorded here — a `ReservedPrefixRule` requiring a `registry`/`verify`
+attester — was itself corrected later in this cut. CC ruled it a misreading of
+CC 3.4.9 and the reservation was removed; see "Both open questions were ruled
+on" above. The shipped mechanism is exclusion from the fold, not refusal at the
+door.*
+
+**A duty could out-reach its permission inside the `Cohort` bucket.**
+`Projection::Cohort` collapses `community | affiliations | species | biosphere
+| federation` into one value whose audience is *the row's own roster*, so a duty
+at `federation` on a permission at `affiliations` compared equal and admitted —
+plaintext-gossiped federation-wide while the permission is DEK-encrypted to one
+affiliation. The reach test now asks two questions: the audience KIND must be
+ridable, **and** the tier must not be wider on the closed CC 4.4.3.3.1 ladder —
+`crossing::scope_rank`, the ordering `check_strictly_wider` already uses, not a
+second one. The irony is on the record: `duty_may_ride`'s own docstring warns
+against imposing a total order `Projection` does not have, and the defect was
+assuming one *within* a variant.
+
+**A `duty:` row was retractable only by its author.** A structural composer's
+`references_attestation_id` names its TARGET, not a permission, so a
+subject-side `withdraws` — which `retraction_entitled` explicitly admits under
+CEG §3.2.3 rule 2 — was refused as "attaching an obligation to someone else's
+grant", describing something the retractor had not done. The obvious fix
+(exempt all composers) would have opened a hole, since a `supersedes` carries a
+new duty body and could widen past the permission its target was pinned to. So
+`withdraws`/`recants` are exempt and `supersedes` inherits its target's
+permission. Both directions are mutation-pinned.
+
+**A lifted suspension stayed live.** `precedence::retired_ids` is a RETRACTION
+fold — by its own documentation it does not filter `supersedes` — and the fold
+called it "the ONE retirement fold". `supersedes` is the CEG replace-in-place
+primitive and therefore how an authority lifts a suspension, so
+`{Issued, Suspended}` persisted and any consumer testing `contains(Suspended)`
+would keep a reinstated holder out of practice. Superseded rows are now dropped
+separately, with the distinction documented.
+
+**A retraction contributed a status.** Found by a control test written for the
+above: a `withdraws` whose envelope still named the dimension was folded as a
+live status. Retractions carry no replacement body and no longer contribute one;
+`supersedes` does, which is how a lift becomes `issued`.
+
+**The certification found the hole in the security fix itself.**
+`authority_conferring_set_covers_every_reserved_prefix_rule` (CIRISPersist#543's
+gate) reported that `registry` and `verify` reserved a family in
+`default_reserved_prefix_rules` but were **not** in
+`AUTHORITY_CONFERRING_IDENTITY_TYPES` — *"so a peer can self-assert them at
+registration and emit under the family they reserve"*.
+
+The `licensure:` gate above was therefore keyed on identity types a peer can
+simply declare about itself: a Sybil registers as `registry` and mints the same
+forged, absorbing revocation. **A reserved-prefix rule and a conferral
+requirement only work as a pair**, and shipping one without the other is a gate
+that reads as protection and is decoration.
+
+The fix records what persist already enforced rather than deciding anything new.
+`CO_STEWARD_ROLES` is already `[REGISTRY, VERIFY]`; `ConferralMode::AccordCoScrubbed`'s
+own docstring already names "the `CO_STEWARD_ROLES`" among its members; and
+registering a `registry` key already failed through
+`check_accord_role_admission_over_roster`. Only the **declaration** was missing,
+so `conferral_mode` returned `None` and the claim read as self-assertable. Nine
+authority-conferring types became eleven.
+
+Unlike `trusted_publisher` / `lenscore_detector` — moved OFF `AccordCoScrubbed`
+because requiring 2-of-3 hardware humans to stand up a routine detector is an
+outage rather than a gate — the co-stewards are two named services, and a
+self-asserted one gains standing over THIRD PARTIES: it could revoke a licence.
+The ceremony is proportionate here where it was not there.
+
+**A sixth finding, and a correction to my own correction.** I initially reverted
+the reviewer's `is_tombstone` fix, reasoning that `tombstone_ceiling` governs how
+far a *retraction signal* travels rather than whether a body may be seen. That is
+false for the only composer which reaches that line:
+`lifetime_class(supersedes) = MonotonicSupersede`, whose own documentation says
+it **gossips at the plane's `tombstone_ceiling`**, and `projection_for` routes any
+`is_tombstone` row to that ceiling before it looks at `cohort_scope` at all. A
+`supersedes` of a duty therefore replicates at `Cohort` whatever its own scope
+says, and its new body is exactly what travels there. Measuring it at `false`
+computed a reach the row does not have and admitted a leak. Corrected, with the
+consequence stated rather than left to be discovered: **a duty whose permission
+projects `SelfOwn` cannot be renewed by `supersedes`** — it is retracted and
+re-issued.
+
+**Four missing postgres legs.** `exercise_duty_rides_only_its_own_permission_814`,
+`exercise_licensure_is_co_stewarded_at_the_door_814`,
+`exercise_config_renewal_must_supersede_814` and
+`exercise_session_is_a_self_report_at_the_door_814` shipped with memory + sqlite
+and no third leg, while every other exercise in that module has three. Not
+ceremony: each crosses a backend boundary — the duty gate calls
+`get_attestation` from inside postgres's own `put_attestation`, the licensure
+door runs the reserved-prefix rule against postgres's key read. `store/parity.rs`
+pins the gate SEQUENCE and so structurally cannot notice a missing witness. This
+is the "test every backend" class this repo has hit repeatedly, and it recurred
+here inside the same cut that fixed an instance of it (#811's postgres leg).
+
+One review finding was **not** adopted as proposed. The reviewer also confirmed **no defect**
+in `scope_covers` or either of its call sites — including the specific question
+of whether the relaxed attenuation can admit a chain that is not legitimately
+narrower, which it cannot, by transitivity of `covers` — nor in the config
+sensitive-leaf floor, nor in the steward biconditional across all three
+functions.
+
+`status_set_for` was split into a pure `fold_status_set` plus a thin async
+wrapper, because standing up a `registry`-role attester needs accord-roster
+admission — and an expensive fixture is precisely how the supersedes arm came to
+be documented and never asserted.
+
+### Also in this cut — the rc5 vendor exposed a real under-enforcement
+
+`authority_lists_agree_on_every_manifest_family` — CIRISPersist#590's
+split-truth gate — reported it the moment the vendor landed:
+
+> **SPLIT TRUTH — persist UNDER-ENFORCES**: `session:{kind}` (CC reserves it:
+> `substrate-self-report`; persist has no gate and no declared reason)
+
+Persist *had* always enforced the rule — in the **fold**.
+`session_claim::resolve_claim` skips any row whose attester is not the
+occurrence, so a third party's claim was never acted on. It was, however,
+**stored**, and a stored row replicates and is visible to any consumer reading
+rows directly rather than through the fold. While CC said nothing about the
+family that was a defensible line; rc5 states the rule, and the line moved.
+
+`check_session_self_report_admission` now refuses it at the door.
+Deliberately stricter than `config:`, which admits the subject's live *owner*
+speaking for its instrument: an owner has a real claim to say what their node is
+running, but a session says which occurrence is handling an exchange **right
+now**, and an owner is not in a position to know that. CC 3.4.3 says
+self-report, not self-or-owner.
+
+Not a `ReservedPrefixRule`, because that mechanism asks *what kind of key is
+this* and a self-report rule asks *is the attester the subject* — which no
+identity type can express. `session:` joins `config:` in
+`RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE` with that reason recorded.
+
+This is the first time that gate has caught a real under-enforcement rather
+than a bookkeeping mismatch, and it only fired because the re-vendor changed
+what CC claimed. A vendor bump is not a bookkeeping exercise.
+
+### Also in this cut — CIRISPersist#814 part 3: the renewal must supersede
+
+The live set for a `(subject, cohort_scope, leaf)` must be ONE row. A node
+re-publishing `config:load` without a `supersedes` leaves two live rows saying
+different things, and a composer weighting self-attestations by live count then
+reads one node as two — so **a node that renews correctly halves its own signal
+against one that does not**. The incentive points the wrong way, which is why
+this is a refusal rather than a lint.
+
+Scoped precisely, and the witness pins all of it: a `supersedes` row is exempt
+(it *is* the renewal), and a different leaf, a different scope, or a different
+attester each admit freely. A gate that refused any of those would have become
+"one config row per node", which is not the rule — and the refusal arm alone
+would not have caught that.
+
+**What this does not do**, recorded rather than implied: it is the write-door
+half. CC rc5 (#97) also asks that a composer count **distinct subjects, never
+rows**. A composer weighting by live row count is still wrong after this gate;
+the gate only guarantees a well-behaved renewer will not hand it two. That
+read-side half is a consumer rule persist cannot enforce from here.
+
+### Also in this cut — the CC registry re-vendored rc3 → rc5, and #814 parts 2 + 5
+
+**The re-vendor.** `namespace_registry.json` moves from CC `1.0-rc3` to
+`1.0-rc5`, with all three drift pins bumped in lockstep (`VENDORED_CC_VERSION`,
+`VENDORED_SOURCE_SHA256`, `VENDORED_N_FAMILIES` 114 → 116) and the two new
+families added to `VENDORED_FAMILY_PREFIXES` so the removal gate keeps covering
+them.
+
+Verified before vendoring rather than after: the rc5 artifact's own
+`_meta.source_sha256` was checked against a freshly fetched
+`constitution/part_3_the_namespace.md` from the same ref. A generated file that
+does not match its own source is the one thing a re-vendor must never carry, and
+"CC generated it" is not evidence of that.
+
+The diff is exactly the #814 surface and nothing else — **2 added, 0 removed, 1
+changed**:
+
+| | |
+|---|---|
+| `+ duty:{kind}` | `reserved: false` — registered, no machine-readable rule |
+| `+ session:{kind}` | `reserved: true`, `{CC 3.4.3, substrate-self-report}` |
+| `~ licensure:{authority_id}` | description only — now states that authority is conferred by quorum, **never** by `delegates_to` |
+
+**Part 5 falls out of it.** `session:`'s `RULES_NOT_ON_THE_ROW` pin recorded a
+gap — persist ruling where CC did not. rc5 registers the rule persist already
+enforced, so the gap is closed and the pin is retired. This was **measured, not
+assumed**: before the vendor, `authority_for("session:claim:v1").reserved` was
+`None`, so retiring the pin would have been a false claim and would have broken
+the classifier gate. `duty:`'s pin stays, because rc5 registered that family
+with `reserved: false` — persist still rules where CC does not, and the entry
+now says so with rc5 as its citation.
+
+**Part 2 — the licensure fold.** New `federation::licensure`: a set-valued fold
+over `licensure:{authority_id}` carrying two normative semantics the registry
+row could already express and this crate could not read.
+
+`revoked` is **absorbing**; `suspended` is reversible. Nothing lifts a
+revocation — a re-licence is a *new* licence under a new authority attestation,
+never a status transition — so a live `revoked` collapses the set to exactly
+`{Revoked}` whatever the arrival order.
+
+More than one status may be live at once, so the fold returns a **set**.
+`issued` + `probation` is two facts, not a blended state. Latest-wins is the
+shape that looks obviously right and quietly discards one: it would report
+either an unlimited licence or none at all depending on arrival order, and
+arrival order across a mesh is not a fact about the licence.
+
+Retirement runs through `precedence::retired_ids` — the one retirement fold,
+not a copy. An unrecognized status is ignored rather than guessed at, because a
+status nobody has defined cannot be composed against the absorption rule.
+
+Mutation-tested three ways on both backends: deleting the absorption rule,
+collapsing the set to latest-wins, and matching the authority by prefix instead
+of exactly. Each is killed by its own assertion — the third by a revocation
+from a *different* authority failing to bleed in.
+
+### Also in this cut — CIRISPersist#814 part 1: `duty:{kind}`
+
+A new family (CC 3.1.1): an **obligation attached to a permission** — the ODRL
+*Duty* leg a permission/prohibition grammar cannot express, and what every
+widely used content licence actually rests on. Rides `scores`; no new
+primitive. The WHOLE `duty:` prefix classifies, because the kind vocabulary is
+open per CC 4.5.1.1 and matching a closed list would default every unlisted
+kind to `Unknown` — the "one leaf decided, its siblings defaulted" shape #713
+spent a cut removing.
+
+**Its projection is inherited, and that is not expressible in the resolver.**
+CC's rule is that a duty projects exactly as far as the permission it attaches
+to and never wider, because a duty visible where its permission is not **leaks
+the permission's existence**. `projection_for` is pure and O(1) over
+`(plane, cohort_scope, authority, is_tombstone)` and deliberately does not read
+the referenced row — the same constraint that made #713's Attestation cell a
+deferred row for a whole release.
+
+So the invariant is enforced where it *can* be: `check_duty_admission` resolves
+the named permission at the write door and refuses three ways —
+
+1. a duty naming **no** permission (an obligation attached to nothing is not a
+   weaker claim, it is an unfalsifiable one);
+2. a duty naming a permission **this node does not hold** — refused rather than
+   admitted-pending, because admitting it would let a peer establish an
+   obligation against a grant it invented;
+3. a duty whose attester **did not issue** that permission — you cannot attach
+   an obligation to someone else's grant;
+
+and then a fourth, the reach check itself: a duty that would out-reach its
+permission is refused. An unexpressible projection rule became an enforceable
+admission rule — the same move part 3 makes for `config:*` in this cut.
+
+**The reach comparison is a partial match, not a rank.** `Projection` is not
+linearly ordered: `Capability(_)` and `Subject` are audience KINDS, not points
+on a scale, and that non-comparability is exactly what deferred #713's cell. A
+`rank(p) -> u8` would impose a total order the type does not have, and the
+first consumer comparing a `Capability` against a `Cohort` would get an answer
+that means nothing. `duty_may_ride` enumerates what rides and fails closed on
+everything else, including both non-comparable audiences.
+
+The `Duty` curve caps at `Cohort`, and the cap is what makes the invariant
+cheap: a duty can never out-reach a permission that itself reaches `Cohort`, so
+the gate only has to compare. The cost is recorded rather than hidden — a duty
+on a Global-projecting public licence propagates narrower than that licence.
+That **under-propagates an obligation rather than leaking a permission**, which
+is the safe direction of the two.
+
+Witnessed end-to-end through the real `put_attestation` door on memory and
+sqlite: all four refusals, each also asserting **nothing was stored** (a gate
+that refuses and writes anyway is the AV-9 verify-before-mutation defect), plus
+the honest path admitting. Mutation-tested three ways — deleting the issuer
+check, the reach check, or the unheld-permission refusal each reds the
+corresponding arm on both backends.
+
+**Five registration gates caught the landing before CI did**, and each one is
+a mechanism this repo built after paying for its absence: a SECOND five-rung
+ladder pin in `content_class.rs` (the first was in `types.rs`); the `duty:`
+prefix literal unclassified in `family_rules`; the same const not wired into
+`persist_ruled_prefixes()`'s derivation — which reads MINT SITES rather than
+the module holding the inventory, the #590 lesson exactly; the new door call
+unclassified in `parity::CALL_CLASSES`; and the module doc's hand-maintained
+"4 of 21" claim, checked rather than trusted. None of these would have been
+found by reading the diff.
+
+### Also in this cut — CIRISPersist#814 part 3: the sensitive-leaf floor
+
+CC rc5 (#97) is explicit that `config:*` is **not** scope-pinned as a family,
+and that distinction is load-bearing rather than pedantic. CIRISServer#324
+correctly forced *sensitive* rows to `SelfOwn`; generalizing that to the whole
+family would invent an invariant CC never stated **and break the operational
+leaves** — `config:load` MAY take the smallest scope that reaches the peers who
+route on it, which is the entire point of publishing load at all. A family-wide
+pin cannot express "these two leaves are secrets, that one is a routing input".
+
+So projection keeps following the envelope's own `cohort_scope`, and the leaves
+that must not travel are stopped at the **write door**:
+`check_config_sensitive_leaf_floor` refuses a `config:admission` or
+`config:transport` row carried above `self`. It runs BEFORE the existing
+self-or-owner authority arms — a row that may not travel at this scope is
+refused whoever wrote it, and answering "who are you" first would leak that
+ordering to a prober.
+
+`CONFIG_SENSITIVE_LEAVES` is a CLOSED literal set. An unrecognized leaf is NOT
+presumed sensitive, because presuming it would re-introduce the family-wide pin
+by the back door. Leaf matching goes through part 4's `scope_covers`, so
+`config:admission:v1` is the same leaf as `config:admission` while
+`config:admission_policy_notes` is a different one — a bare `starts_with` would
+refuse a leaf nobody decided was sensitive.
+
+Eight-row table, mutation-tested twice. Generalizing the floor to the whole
+family is killed by the `config:load @ community` row — the operational leaf CC
+declined to pin. Swapping `scope_covers` for `starts_with` is killed by
+`config:admission_policy_notes`.
+
+*Still open on part 3: the renewal-`supersedes` rule and the distinct-subject
+count.*
+
+### Also in this cut — the issuance axis joins the duty ladder
+
+`license` and `grant` join `DELEGATED_DUTY_SCOPES` (five rungs → seven) and
+`delegation_scope::ALL`, under the same walk and the same enforced admission as
+`moderate` / `takedown` / `review`. The #637 inventory gate did its job on the
+way in: it refused the commit until both constants were placed in the ladder,
+and the seven-rung count is a hand-written literal for the same reason it was a
+hand-written five — a count derived from the array under test cannot notice
+that the array changed.
+
+*Remaining on #814: the `license` issuance quorum refusal (CC 3.3.9), parts 1
+and 3 (the `duty:{kind}` family and the `config:load` self-report route), part
+2 (the widened licensure status fold), and part 5's `session:` pin retirement.*
+
+### Also in this cut — CIRISVerify v15.0.0 adopted
+
+All **seven** Cargo pins moved `v14.2.0` → `v15.0.0` together (the pins must
+flip as a set; bumping one splits `ciris_crypto` into two graph versions), and
+`pyproject.toml`'s `Requires-Dist` firewall moved to
+`ciris-verify>=15.0.0,<16`.
+
+v15.0.0 is a verify MAJOR — `FedCode` became `non_exhaustive` and admission is
+unconstructible unless verified (CIRISVerify#274), plus CC decimal assignments
+(#275). **Neither breaking change reaches persist**: `FedCode` has no use site
+in this crate, and the shipped-shape check passes across all targets with no
+source change. Adopted verified rather than assumed — the CIRISVerify v15.0.0
+tag run was green at job level (CI, Release, Bench and Post-Release Live Verify
+all success) and the release published before the pins moved, and `Cargo.lock`
+resolves to the tag's exact SHA `3531334`.
+
+Bundled here rather than cut alone, per the standing rule that a dep re-pin
+rides the next feature cut instead of burning a release on its own.
+
 ## [41.2.0] - 2026-09-05
 
 **A vocabulary persist mirrors must be a SUPERSET of the one it serves.**

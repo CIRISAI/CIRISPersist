@@ -611,6 +611,31 @@ pub fn projection_for(
                 | cohort_scope::FEDERATION => Projection::Cohort,
                 _ => Projection::Cohort,
             },
+            // duty:* — an obligation attached to a permission (v42.0.0,
+            // CIRISPersist#814 part 1). Enumerated to the last tier like its
+            // neighbours, and capped at Cohort for a reason specific to this
+            // family: the CEILING is what makes the admission-time invariant
+            // ("never wider than its permission") CHEAP to hold. A Global cell
+            // here would mean the gate had to prove the permission also
+            // projects Global before admitting the duty at a commons tier;
+            // with the cap, a duty can never out-reach any permission that
+            // itself reaches Cohort, and the gate only has to compare.
+            //
+            // The cost is honest and recorded: a duty on a Global-projecting
+            // public licence propagates narrower than that licence does. That
+            // under-propagates an obligation rather than leaking a permission,
+            // which is the safe direction of the two — a consumer who cannot
+            // see the duty has not thereby learned something private, whereas
+            // the converse leaks the permission's existence.
+            AttestationFamily::Duty => match cohort_scope {
+                cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
+                cohort_scope::COMMUNITY
+                | cohort_scope::AFFILIATIONS
+                | cohort_scope::SPECIES
+                | cohort_scope::BIOSPHERE
+                | cohort_scope::FEDERATION => Projection::Cohort,
+                _ => Projection::Cohort,
+            },
             // chat:* — interpersonal communication inside a named group
             // (v38.2.0, #757, decided for CIRISServer). Enumerated to the
             // last tier ON PURPOSE: the commons cells are the ones a
@@ -882,6 +907,32 @@ pub enum AttestationFamily {
     /// widens it either — a trust root is not a party to someone else's
     /// session — so the commons cells take no `authority` branch.
     SessionClaim,
+    /// v42.0.0 (CIRISPersist#814 part 1, CC 3.1.1) — `duty:*` — an
+    /// **obligation attached to a permission**: the ODRL *Duty* leg a
+    /// permission/prohibition grammar cannot express, and what every widely
+    /// used content licence actually rests on (attribution, share-alike,
+    /// carry-restrictions-downstream). Rides `scores`; no new primitive.
+    ///
+    /// # Its projection is inherited, and that is not expressible here
+    ///
+    /// CC's rule is that a duty projects **exactly as far as the permission it
+    /// attaches to, never wider** — a duty visible where its permission is not
+    /// leaks the permission's existence. The resolver cannot compute that: it
+    /// is pure and O(1) over `(plane, cohort_scope, authority, is_tombstone)`
+    /// and deliberately does not read the referenced permission row. This is
+    /// the shape that made #713's Attestation row a deferred cell.
+    ///
+    /// So the invariant is enforced where it CAN be checked — at admission, by
+    /// [`check_duty_admission`](crate::federation::admission::check_duty_admission),
+    /// which resolves the named permission and refuses a duty whose projection
+    /// would exceed it — and the cell below is then an ordinary curve over the
+    /// duty's own `cohort_scope`. An unexpressible projection rule became an
+    /// enforceable admission rule, which is the same move part 3 made for
+    /// `config:*`.
+    ///
+    /// No `authority` branch: a duty confers nothing and the trust root is not
+    /// a party to it.
+    Duty,
     /// Any dimension outside the decided families — the conservative row.
     Unknown,
 }
@@ -966,6 +1017,17 @@ pub fn attestation_family(dimension: &str) -> AttestationFamily {
     // them would invite the "one leaf decided, its siblings defaulted" shape.
     if under(dimension, "session:") {
         return AttestationFamily::SessionClaim;
+    }
+    // v42.0.0 (#814 part 1, CC 3.1.1) — the WHOLE `duty:` prefix. The kind
+    // vocabulary is OPEN per CC 4.5.1.1 (compensate, attribute, inform,
+    // obtain_consent, ensure_exclusivity, delete, next_policy, anonymize,
+    // review_policy, and whatever a licence needs next), so matching a closed
+    // list of kinds here would default every unlisted kind to `Unknown` — the
+    // "one leaf decided, its siblings defaulted" shape #713 spent a cut
+    // removing. Every duty is the same information type about the same
+    // audience: an obligation on a permission.
+    if under(dimension, "duty:") {
+        return AttestationFamily::Duty;
     }
     AttestationFamily::Unknown
 }
@@ -1111,6 +1173,11 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
             // wider. #782 relies on the monotonicity guarantee here: a
             // release can never be out-run by the stale claim it retracts.
             AttestationFamily::SessionClaim => Projection::Cohort,
+            // Row-max: retracting a duty must reach exactly the audience the
+            // duty reached and never wider — a withdrawn obligation
+            // republished to parties who never held it discloses the
+            // permission it was attached to.
+            AttestationFamily::Duty => Projection::Cohort,
             // Row-max: chat never widens past Cohort live, so a retraction
             // does not either — a withdrawn message must not be republished
             // to parties who never held it.
@@ -1676,7 +1743,7 @@ mod tests {
     /// One representative dimension per decided Attestation family, plus one
     /// resolving the conservative default — LITERALS, never derived from the
     /// classifier under test.
-    const FAMILY_DIMS: [&str; 13] = [
+    const FAMILY_DIMS: [&str; 14] = [
         "consent:replication:v1",
         "trace:complete:v1",
         "scores:medical",
@@ -1711,6 +1778,11 @@ mod tests {
         "chat:message:v1",
         // v38.7.0 (CIRISPersist#782) — the session-claim plane.
         "session:claim:v1",
+        // v42.0.0 (review, P2) — `duty:` is the FOURTH family added without a
+        // representative here; the comment above records the first three.
+        // Without this row every property sweep built on `all_planes()` looked
+        // straight past the family this cut introduced.
+        "duty:attribute:v1",
         "ratchet:flag:out_of_distribution_voting", // no decided row — the conservative default
     ];
 
@@ -1773,6 +1845,7 @@ mod tests {
                 AttestationFamily::ProvenanceBuildManifest => Some("provenance:build_manifest:v1"),
                 AttestationFamily::Chat => Some("chat:message:v1"),
                 AttestationFamily::SessionClaim => Some("session:claim:v1"),
+                AttestationFamily::Duty => Some("duty:attribute:v1"),
                 // The conservative default is not a decided family; its
                 // representative rides FAMILY_DIMS separately so the sweeps
                 // still exercise the fall-through.
@@ -1781,6 +1854,11 @@ mod tests {
         }
 
         for family in [
+            // v42.0.0 (review, P2) — `Duty` joins the sweep corpus. The
+            // exhaustive representative helper mapped it, but this array did
+            // not, so the assertion never called it: a cell added and never
+            // swept is a check that cannot fail.
+            AttestationFamily::Duty,
             AttestationFamily::Consent,
             AttestationFamily::Trace,
             AttestationFamily::Scores,
