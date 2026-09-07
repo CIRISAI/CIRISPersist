@@ -148,6 +148,55 @@ failure no single row catches alone). Mutation-tested three ways, each killed
 by a different assertion: the naive `starts_with` inversion, the missing colon
 boundary, and a symmetric relation.
 
+### A second review round — eight more defects, four P1
+
+Codex reviewed PR #816. All eight reproduced here before being acted on; the two
+most consequential are mutation-tested. Four were real holes; **two were in
+fixes made earlier in this same PR**.
+
+**A `supersedes` could lift a revocation.** The absorption check runs at the END
+of the fold, so a target hidden by supersession never reached it:
+`supersedes(revoked) → issued` returned `{Issued}` and lifted a terminal
+revocation — contradicting the contract in this module's own docstring, written
+three commits earlier. `revoked` targets are now excluded from supersession.
+Retraction still works, deliberately: an entitled `withdraws` is the authority
+saying the row was **wrong**, which is not a status transition, and an erroneous
+revocation must stay retractable or it would be permanent. That distinction was
+put back to the reviewer rather than assumed.
+
+**Licence authority was resolved from the CURRENT graph, reclassifying history.**
+The sharpest finding. A stranger pre-publishes `licensure:{A}` with
+`status: revoked`; `A` later grants that key a `license` delegation for any
+unrelated reason; the old row retroactively enters `A`'s fold, where `revoked`
+ABSORBS and immediately bars the holder. It ran backwards too — withdrawing a
+delegation made previously valid issuances vanish. Authority is now bound at
+**issuance**: the attester IS the authority, or the row NAMES the delegation it
+was issued under and that edge was the authority's own `license` grant, live at
+the row's `asserted_at`. A row claiming no delegation is testimony permanently.
+
+**Structural composers were exempted too broadly — twice.** Both share a cause:
+the `is_structural_composer` exemption was added to fix an earlier review
+finding and made too broad in two places. A `duty:` supersedes naming a non-duty
+(or an unresolvable target, or none) skipped permission, issuer and reach while
+still carrying a new duty body; a `config:` supersedes pointing anywhere let a
+second body in while the original stayed live — recreating the multiple-live-row
+state that gate exists to prevent, by saying the magic word.
+
+**Malformed literals beyond the stem.** `audit_chain:Hash_continuity` has a
+lowercase stem, so the literal half passed, and byte-exact lookup missed
+**precisely because** a later literal was miscased — the miscasing hid itself.
+Families are now identified case-insensitively to find the candidate;
+enforcement stays byte-exact against its declared classes.
+
+**Expiry, in both folds.** Expired rows stayed live indefinitely, and expired
+`supersedes` rows went on hiding their targets — expiry as a way to freeze a
+replacement in place forever.
+
+**`Duty` was missing from the projection sweep corpus.** The exhaustive helper
+mapped it; the iterated array and `FAMILY_DIMS` did not, so the assertion never
+called it. `FAMILY_DIMS`' own comment records this class recurring three times
+before — `duty:` was the fourth, in the cut that introduced it.
+
 ### Both open questions were ruled on, and one ruling corrected this cut
 
 CC answered both asks on `rc5` at CIRISConstitution@71e7b2d. The registry was
@@ -275,9 +324,13 @@ nothing folded those rows. **Part 2's fold made it live**: any registered key
 could mint `status = revoked` for any holder, `revoked` ABSORBS, and neither the
 real authority nor the holder could lift it — `precedence::retraction_entitled`
 admits only the forged row's own attester. Landing a fold ahead of its emitter
-gate turned a dormant hole into a live one. `licensure:` now carries a
-`ReservedPrefixRule` requiring a `registry` or `verify` attester, which is
-accord-roster admitted.
+gate turned a dormant hole into a live one.
+
+*The fix recorded here — a `ReservedPrefixRule` requiring a `registry`/`verify`
+attester — was itself corrected later in this cut. CC ruled it a misreading of
+CC 3.4.9 and the reservation was removed; see "Both open questions were ruled
+on" above. The shipped mechanism is exclusion from the fold, not refusal at the
+door.*
 
 **A duty could out-reach its permission inside the `Cohort` bucket.**
 `Projection::Cohort` collapses `community | affiliations | species | biosphere
