@@ -1034,6 +1034,10 @@ mod tests {
             "cc_section",
             "description",
             "reserved_rule",
+            // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case
+            // classes, deserialized into `NamespaceEntry::segments` and read by
+            // `admission::check_dimension_case_rule`.
+            "segments",
         ];
         // Columns read OUTSIDE the shared type, each naming its reader.
         const READ_ELSEWHERE: &[(&str, &str)] = &[(

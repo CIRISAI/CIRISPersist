@@ -167,6 +167,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v42.0.0 (CIRISPersist#814 part 5) — Gate: refuses a `session:*` row whose
     // attester is not the attested occurrence (CC 3.4.3 substrate-self-report).
     ("check_session_self_report_admission", Class::Gate),
+    // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
+    // segment breaks its manifest-declared case class. A statement about the
+    // caller's input.
+    ("check_dimension_case_rule", Class::Gate),
+    // v42.0.0 (CC 3.3.9, CIRISPersist#814) — Gate: refuses a row that CLAIMS
+    // delegated licence authority whose chain does not resolve to the authority
+    // it names.
+    ("check_licensure_delegator_is_authority", Class::Gate),
     ("check_community_membership_steward_binding", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
