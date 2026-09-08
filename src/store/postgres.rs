@@ -19352,20 +19352,44 @@ impl crate::read::ReadEngine for PostgresBackend {
                 "pqc_completed_at IS NULL".to_owned()
             });
         }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter
-        // (OR-combined LIKE on the JSONB envelope dimension).
+        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+        // v42.1.0 (#817, #818) — a half-open BYTE RANGE over V106's generated
+        // `dimension` column, matching the SQLite builder's shape exactly so the
+        // two dialects cannot answer this filter differently again.
+        //
+        // `COLLATE "C"` is LOAD-BEARING, not decoration. `>=`/`<` compare under
+        // the database collation, and ours (`en_US.utf8`) is linguistic, not
+        // byte order: measured on the test cluster, BOTH `'config:Z'` and
+        // `'config:-x'` fall OUTSIDE `['config:', 'config;')` under the default
+        // collation, though both are `config:`-prefixed rows. C collation is
+        // byte order, which is also what CC 3.1.7 R3 means by a dimension being
+        // a byte string. V137 indexes this same collated expression — the
+        // predicate and the index must agree or the planner cannot use it.
         if !filter.dimension_prefixes.is_empty() {
             let mut ors: Vec<String> = Vec::new();
             for p in &filter.dimension_prefixes {
-                let esc = p
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                params.push(Box::new(format!("{esc}%")));
-                ors.push(format!(
-                    "attestation_envelope::jsonb->>'dimension' LIKE ${}",
-                    params.len()
-                ));
+                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                    Some((lo, hi)) => {
+                        params.push(Box::new(lo));
+                        let a = params.len();
+                        params.push(Box::new(hi));
+                        let b = params.len();
+                        ors.push(format!(
+                            "(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})"
+                        ));
+                    }
+                    None => {
+                        // No representable upper bound. `=` is a byte compare
+                        // under a deterministic collation, so this is still
+                        // case-correct; it is only unindexed.
+                        params.push(Box::new(p.clone()));
+                        let a = params.len();
+                        ors.push(format!(
+                            "substr(dimension, 1, {}) = ${a}",
+                            p.chars().count()
+                        ));
+                    }
+                }
             }
             where_parts.push(format!("({})", ors.join(" OR ")));
         }
@@ -19374,12 +19398,11 @@ impl crate::read::ReadEngine for PostgresBackend {
         // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
         // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
         // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+        // v42.1.0 (#817) — V106's generated column, `COLLATE "C"` so the one
+        // V137 index serves the exact shape as well as the range shape.
         if let Some(d) = &filter.dimension_exact {
             params.push(Box::new(d.clone()));
-            where_parts.push(format!(
-                "attestation_envelope::jsonb->>'dimension' = ${}",
-                params.len()
-            ));
+            where_parts.push(format!("dimension COLLATE \"C\" = ${}", params.len()));
         }
         // v4.5 — point-in-time validity.
         if let Some(va) = filter.valid_at {
@@ -39275,8 +39298,13 @@ mod tests {
     }
 
     /// v4.5 attestation_query filters on live PG — exercises the
-    /// PG-specific SQL: `->>'dimension' LIKE`, `weight::float8 >=`, and
-    /// the `subject_key_ids ? $n` JSONB-array-membership operator.
+    /// PG-specific SQL: `weight::float8 >=` and the `subject_key_ids ? $n`
+    /// JSONB-array-membership operator.
+    ///
+    /// v42.1.0 (#817) — the dimension axis no longer goes through
+    /// `->>'dimension' LIKE`; it reads V106's generated column under
+    /// `COLLATE "C"`. Case behaviour moved to
+    /// `pg_dimension_prefix_is_case_sensitive_818`.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_attestation_query_filters() {
@@ -39446,6 +39474,148 @@ mod tests {
             })
             .await,
             vec![a.to_string()]
+        );
+    }
+
+    /// v42.1.0 (CIRISPersist#818) — the PG half of the three-backend
+    /// case-sensitivity property; see the sqlite twin
+    /// (`sqlite_dimension_prefix_is_case_sensitive_818`) for the full story.
+    ///
+    /// Postgres was already CORRECT here — its `LIKE` is case-sensitive — so
+    /// this test passed before the fix and passes after. That is exactly why it
+    /// is worth writing: the divergence was only visible by running the same
+    /// property on both backends, and a property asserted on one backend cannot
+    /// see a divergence. It also pins the thing the fix could plausibly BREAK:
+    /// `COLLATE "C"` changes which rows a linguistic collation would have
+    /// returned, so this asserts the new predicate did not shift PG's answers.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_dimension_prefix_is_case_sensitive_818() {
+        use crate::ceg::ReadEngine;
+        use crate::federation::FederationDirectory;
+        use crate::read::AttestationFilter;
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let occ = format!("occ-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &occ,
+                    "registry",
+                    crate::federation::types::identity_type::STEWARD,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let seed = |id: String, dim: &'static str| {
+            let occ = occ.clone();
+            let backend = &backend;
+            async move {
+                let client = backend.get_client().await.unwrap();
+                let env = serde_json::to_string(
+                    &serde_json::json!({"id": id.to_string(), "dimension": dim, "score": 1.0}),
+                )
+                .unwrap();
+                let empty: Vec<u8> = Vec::new();
+                let asserted = "2026-05-01T00:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap();
+                let expires: Option<chrono::DateTime<chrono::Utc>> = None;
+                let subjects = serde_json::json!([]);
+                client.execute(
+                    "INSERT INTO cirislens.federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
+                        pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
+                        cohort_scope, tier, promoted_at, additional_scrubs, admitted_at\
+                     ) VALUES ($1, $2, $2, 'scores', 0.9::float8::numeric, $3, $4, $5, $6, \
+                              'sig', NULL, $2, $3, NULL, '0', $7, NULL, 'federation', 'federation', NULL, '[]', $3)",
+                    &[&id, &occ, &asserted, &expires, &env, &empty, &subjects],
+                ).await.unwrap();
+            }
+        };
+
+        let (lower, upper, longer) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        seed(lower.clone(), "config:lower:v1").await;
+        seed(upper.clone(), "CONFIG:upper:v1").await;
+        seed(longer.clone(), "configuration:v1").await;
+        // `config:Z` and `config:-x` are the two rows a LINGUISTIC collation
+        // drops from the range — measured on this cluster before the fix went
+        // in. They are in the prefix set and must come back.
+        let (upper_tail, punct_tail) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        seed(upper_tail.clone(), "config:Z").await;
+        seed(punct_tail.clone(), "config:-x").await;
+
+        let q = |mut f: AttestationFilter| {
+            let backend = &backend;
+            let occ = occ.clone();
+            async move {
+                f.attesting_key_id = Some(occ);
+                let mut ids: Vec<String> = backend
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        // Case-sensitive, and NOT truncated to a linguistic range: the three
+        // `config:`-prefixed rows, without the uppercase one and without
+        // `configuration:v1`.
+        let mut want = vec![lower.clone(), upper_tail.clone(), punct_tail.clone()];
+        want.sort();
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["config:".into()],
+                ..Default::default()
+            })
+            .await,
+            want,
+            "COLLATE \"C\" range must be BYTE order: 'config:Z' and 'config:-x' \
+             are config:-prefixed and a linguistic collation drops both"
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["CONFIG:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec![upper.clone()]
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("config:lower:v1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec![lower.clone()]
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("CONFIG:LOWER:V1".into()),
+                ..Default::default()
+            })
+            .await,
+            Vec::<String>::new()
         );
     }
 

@@ -1,0 +1,63 @@
+-- V137 — index the V106 generated `dimension` column, SQLite dialect
+-- v42.1.0 (CIRISPersist#817, CIRISPersist#818, CIRISServer#557)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V137__dimension_seek_index.sql
+-- (same index, but the Postgres twin must spell `COLLATE "C"` — see below,
+-- and see that file's header for the collation trap in full.)
+--
+-- WHAT AND WHY
+-- ------------
+-- V106 already added the column this indexes:
+--
+--     ALTER TABLE federation_attestations
+--         ADD COLUMN dimension TEXT
+--             GENERATED ALWAYS AS (json_extract(attestation_envelope,
+--                                               '$.dimension')) VIRTUAL;
+--
+-- and then nothing ever used it. `list_attestations` kept compiling the
+-- dimension filters to a per-row `json_extract(...)`, so a read for one
+-- dimension cost O(rows this node authored): the canonical status node
+-- carries ~24k `observation:reachability:v1` rows under its own key and
+-- JSON-parsed all of them to find a dozen `config:v1` rows (CIRISServer#557
+-- measured 334k pread64 in 25s, 20s of a core, per poll cycle).
+--
+-- This index makes both dimension shapes an ordered seek:
+--
+--     dimension  = ?                     -- exact   (#817)
+--     dimension >= ? AND dimension < ?   -- prefix   (#817 + #818)
+--
+-- SQLITE NOTE — indexing a VIRTUAL generated column is legal and is the
+-- whole point: the computed value is materialised INTO THE INDEX, so the
+-- seek never re-parses the envelope. The column stays VIRTUAL because
+-- SQLite's ADD COLUMN cannot be STORED (V106 documented that asymmetry);
+-- Postgres' is STORED. Nothing about the base table changes here.
+--
+-- WHY NOT `LIKE` (this is the #818 half)
+-- --------------------------------------
+-- The prefix filter used to compile to `... LIKE ?N ESCAPE '\'`, which is
+-- wrong on TWO axes, and this index only fixes one of them unless the
+-- builder also stops emitting LIKE:
+--
+--   * SQLite's LIKE is case-INsensitive for ASCII by default, so
+--     `dimension LIKE 'config:%'` matched `CONFIG:X`. Postgres' LIKE is
+--     case-sensitive and did not; the memory backend folds with
+--     `str::starts_with` and did not. sqlite was the outlier of three, and
+--     v42.0.0's CC 3.1.7 R3 says dimensions are case-sensitive BYTE
+--     strings — so sqlite was the wrong one.
+--   * SQLite categorically declines the LIKE-to-range optimization when an
+--     ESCAPE clause is present. The index would have gone unused.
+--
+-- The builder now emits a half-open byte range instead
+-- (`ceg::list::federation::dimension_prefix_bounds`), which is exactly the
+-- prefix set under BINARY collation, is case-correct, and IS index-served.
+-- Do NOT "fix" the case axis by re-creating this index COLLATE NOCASE: that
+-- encodes the R3 violation into the schema.
+--
+-- Leading column is `attesting_key_id` because every hot caller pins the
+-- attester (a self-authored config read pins it by construction). A filter
+-- with a dimension but no attester still full-scans; that is not the shape
+-- CIRISServer#557 is about, and a second index is not worth its write cost
+-- until something measures it.
+
+CREATE INDEX federation_attestations_attester_dimension
+    ON federation_attestations (attesting_key_id, dimension);

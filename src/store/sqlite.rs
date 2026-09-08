@@ -15794,15 +15794,37 @@ fn sqlite_scores_shared_predicates(
         binds.push(SqlValue::Text(dx.clone()));
         parts.push(format!("s.dimension = ?{}", binds.len()));
     }
+    // v42.1.0 (CIRISPersist#818) — a BYTE range, not `LIKE`. The scores path
+    // was already index-served (V106's `attestation_subjects_seek` leads on
+    // `subject_key_id, dimension`), so this is purely the CORRECTNESS half:
+    // sqlite's LIKE is case-INsensitive for ASCII, so `s.dimension LIKE
+    // 'config:%'` also matched `CONFIG:...`. Postgres' LIKE is case-sensitive
+    // and the memory fold uses `str::starts_with`, so on THIS handle sqlite was
+    // the outlier of three. CC 3.1.7 R3 (v42.0.0) makes a dimension a
+    // case-sensitive byte string, so sqlite was the one that was wrong.
+    //
+    // `s.dimension` is a plain column with BINARY collation, so `>=`/`<` are
+    // byte comparisons and V106's index still serves the range.
     if !filter.dimension_prefixes.is_empty() {
         let mut ors: Vec<String> = Vec::new();
         for p in &filter.dimension_prefixes {
-            let esc = p
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            binds.push(SqlValue::Text(format!("{esc}%")));
-            ors.push(format!("s.dimension LIKE ?{} ESCAPE '\\'", binds.len()));
+            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                Some((lo, hi)) => {
+                    binds.push(SqlValue::Text(lo));
+                    let a = binds.len();
+                    binds.push(SqlValue::Text(hi));
+                    let b = binds.len();
+                    ors.push(format!("(s.dimension >= ?{a} AND s.dimension < ?{b})"));
+                }
+                None => {
+                    binds.push(SqlValue::Text(p.clone()));
+                    let a = binds.len();
+                    ors.push(format!(
+                        "substr(s.dimension, 1, {}) = ?{a}",
+                        p.chars().count()
+                    ));
+                }
+            }
         }
         parts.push(format!("({})", ors.join(" OR ")));
     }
@@ -18739,21 +18761,39 @@ impl crate::read::ReadEngine for SqliteBackend {
                 "pqc_completed_at IS NULL".to_owned()
             });
         }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter
-        // (OR-combined LIKE on the envelope dimension).
+        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+        // v42.1.0 (#817, #818) — compiled as a half-open BYTE RANGE over V106's
+        // generated `dimension` column, never `LIKE`. Two reasons, either
+        // sufficient: SQLite's LIKE is case-INsensitive for ASCII, which
+        // over-matches a dimension CC 3.1.7 R3 defines as a case-sensitive byte
+        // string (#818); and SQLite declines its LIKE-to-range optimization
+        // whenever ESCAPE is present, which we always emitted, so V137's index
+        // would go unused (#817). Served by
+        // `federation_attestations_attester_dimension`.
         if !filter.dimension_prefixes.is_empty() {
             let mut ors: Vec<String> = Vec::new();
             for p in &filter.dimension_prefixes {
-                // LIKE prefix%: escape % and _ in the prefix, then append %.
-                let esc = p
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                binds.push(SqlValue::Text(format!("{esc}%")));
-                ors.push(format!(
-                    "json_extract(attestation_envelope, '$.dimension') LIKE ?{} ESCAPE '\\'",
-                    binds.len()
-                ));
+                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                    Some((lo, hi)) => {
+                        binds.push(SqlValue::Text(lo));
+                        let a = binds.len();
+                        binds.push(SqlValue::Text(hi));
+                        let b = binds.len();
+                        ors.push(format!("(dimension >= ?{a} AND dimension < ?{b})"));
+                    }
+                    None => {
+                        // No representable upper bound (empty prefix, all-0xFF,
+                        // or a non-UTF-8 successor). `=` on TEXT is a byte
+                        // compare, so this stays case-correct — it is only
+                        // unindexed. Never fall back to LIKE: that reopens #818.
+                        binds.push(SqlValue::Text(p.clone()));
+                        let a = binds.len();
+                        ors.push(format!(
+                            "substr(dimension, 1, {}) = ?{a}",
+                            p.chars().count()
+                        ));
+                    }
+                }
             }
             parts.push(format!("({})", ors.join(" OR ")));
         }
@@ -18762,12 +18802,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
         // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
         // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+        // v42.1.0 (#817) — reads V106's generated column so the seek can use
+        // V137's index instead of json_extract-ing every row the attester wrote.
         if let Some(d) = &filter.dimension_exact {
             binds.push(SqlValue::Text(d.clone()));
-            parts.push(format!(
-                "json_extract(attestation_envelope, '$.dimension') = ?{}",
-                binds.len()
-            ));
+            parts.push(format!("dimension = ?{}", binds.len()));
         }
         // v4.5 — point-in-time validity.
         if let Some(va) = filter.valid_at {
@@ -31935,6 +31974,175 @@ mod tests {
         );
     }
 
+    /// v42.1.0 (CIRISPersist#818) — a dimension prefix filter must NOT match a
+    /// dimension differing only in case.
+    ///
+    /// This is the sqlite half of a three-backend property. Before the fix
+    /// sqlite compiled the filter to `... LIKE 'config:%' ESCAPE '\'`, and
+    /// sqlite's LIKE is case-INsensitive for ASCII, so `CONFIG:upper:v1` came
+    /// back too. Postgres' LIKE is case-sensitive and the memory backend folds
+    /// with `str::starts_with`, so sqlite was the outlier of three — and
+    /// v42.0.0's CC 3.1.7 R3 (dimensions are case-sensitive BYTE strings) says
+    /// sqlite was the one that was wrong.
+    ///
+    /// Mutation check performed: reverting the builder to the `LIKE` form turns
+    /// the first assertion red (returns `["l","u"]`). A witness for this class
+    /// that stays green on the old builder is measuring the wrong thing.
+    #[tokio::test]
+    async fn sqlite_dimension_prefix_is_case_sensitive_818() {
+        use crate::ceg::ReadEngine;
+        let backend = fresh_backend_with_occurrence("occ").await;
+        let seed = |id: &str, dim: &str| {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let env = serde_json::json!({"id": id, "dimension": dim, "score": 1.0}).to_string();
+            conn.execute(
+                "INSERT INTO federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
+                    pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
+                    cohort_scope, tier, promoted_at, additional_scrubs\
+                 ) VALUES (?1, 'occ', 'occ', 'scores', 0.9, '2026-05-01T00:00:00Z', NULL, ?2, x'', \
+                          'sig', NULL, 'occ', '2026-05-01T00:00:00Z', NULL, '0', '[]', NULL, \
+                          'federation', 'federation', NULL, '[]')",
+                rusqlite::params![id, env],
+            )
+            .unwrap();
+        };
+        seed("l", "config:lower:v1");
+        seed("u", "CONFIG:upper:v1");
+        // A row whose stem merely EXTENDS the prefix's last character, to pin
+        // that the range's upper bound is a successor and not a truncation.
+        seed("x", "configuration:v1");
+
+        let q = |f: AttestationFilter| {
+            let backend = &backend;
+            async move {
+                let mut ids: Vec<String> = backend
+                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        // THE assertion. `["l"]`, never `["l","u"]`.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["config:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["l"],
+            "prefix must match bytes: CONFIG:upper:v1 is a DIFFERENT dimension \
+             under CC 3.1.7 R3, and configuration:v1 is not config:-prefixed"
+        );
+        // The uppercase prefix selects only the uppercase row — the filter is
+        // case-sensitive in BOTH directions, not merely lowercase-preferring.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec!["CONFIG:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec!["u"]
+        );
+        // Exact match is case-sensitive too (it always was — `=` is a byte
+        // compare — but it is now reading the generated column, so pin it).
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("config:lower:v1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec!["l"]
+        );
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("CONFIG:LOWER:V1".into()),
+                ..Default::default()
+            })
+            .await,
+            Vec::<String>::new()
+        );
+        // The empty prefix takes the substr fallback (no representable upper
+        // bound) and must still mean "any row that HAS a dimension".
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_prefixes: vec![String::new()],
+                ..Default::default()
+            })
+            .await,
+            vec!["l", "u", "x"]
+        );
+    }
+
+    /// v42.1.0 (CIRISPersist#817) — the dimension predicates are INDEX-SERVED.
+    ///
+    /// A plan assertion, not a timing assertion: timings are noisy and a slow
+    /// green tells you nothing, whereas `SCAN` where `SEARCH ... USING INDEX`
+    /// belongs is unambiguous. Pinned because the fix is invisible to every
+    /// behavioural test — the old `json_extract` builder returned the same rows
+    /// for these two shapes, just after parsing every row the attester wrote.
+    #[tokio::test]
+    async fn sqlite_dimension_filters_are_index_served_817() {
+        let backend = fresh_backend_with_occurrence("occ").await;
+        let conn = backend.conn_handle();
+        let conn = conn.lock();
+
+        let plan = |sql: &str| -> String {
+            let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.join(" | ")
+        };
+
+        // The exact shape the builder now emits for `dimension_exact`.
+        let exact = plan(
+            "SELECT attestation_id FROM federation_attestations \
+             WHERE attesting_key_id = 'occ' AND dimension = 'config:load:v1'",
+        );
+        assert!(
+            exact.contains("USING INDEX federation_attestations_attester_dimension")
+                && exact.contains("dimension=?"),
+            "exact dimension must seek on V137's index, got: {exact}"
+        );
+
+        // The shape it emits for `dimension_prefixes`.
+        let prefix = plan(
+            "SELECT attestation_id FROM federation_attestations \
+             WHERE attesting_key_id = 'occ' \
+               AND dimension >= 'config:' AND dimension < 'config;'",
+        );
+        assert!(
+            prefix.contains("USING INDEX federation_attestations_attester_dimension")
+                && prefix.contains("dimension>?"),
+            "prefix range must seek on V137's index, got: {prefix}"
+        );
+
+        // And the shape we REMOVED must still be the bad plan — if sqlite ever
+        // learns to index this, the #817 rationale needs revisiting rather than
+        // silently becoming false.
+        let liked = plan(
+            "SELECT attestation_id FROM federation_attestations \
+             WHERE attesting_key_id = 'occ' \
+               AND dimension LIKE 'config:%' ESCAPE '\\'",
+        );
+        assert!(
+            !liked.contains("dimension>"),
+            "LIKE+ESCAPE is expected NOT to narrow on dimension; got: {liked}"
+        );
+    }
+
     // ── v17.4.0 (FSD-005 Appendix C) — scores read surface ──────────
 
     fn scores_base_ts() -> chrono::DateTime<chrono::Utc> {
@@ -32031,6 +32239,76 @@ mod tests {
             .into_iter()
             .map(|a| a.attestation_id)
             .collect()
+    }
+
+    /// v42.1.0 (CIRISPersist#818) — the SQLITE third of the `list_scores`
+    /// case-sensitivity property, and the one that was WRONG.
+    ///
+    /// `sqlite_scores_shared_predicates` compiled `dimension_prefixes` to
+    /// `s.dimension LIKE ?N ESCAPE '\'`, and sqlite's LIKE is case-INsensitive
+    /// for ASCII — so this handle returned `approach:GOALX:v1` for a
+    /// `approach:goal` prefix. Postgres' LIKE is case-sensitive and the memory
+    /// fold uses `str::starts_with`; sqlite was the outlier of THREE here (for
+    /// `list_attestations` there are only two backends — memory does not
+    /// implement it).
+    ///
+    /// Both dimensions are admitted by the v42 write door: `approach:{goal_id}`
+    /// classes its second segment `value`, and CC 3.1.7 R3 exempts
+    /// Value/External/Wildcard from the lowercase rule precisely because they
+    /// carry caller data. 32 catalogued families have such a segment, so this
+    /// is a reachable production shape, not a constructed one.
+    ///
+    /// Mutation check performed: restoring the `LIKE` form turns the first
+    /// assertion red (returns both ids).
+    #[tokio::test]
+    async fn sqlite_scores_dimension_prefix_is_case_sensitive_818() {
+        let be = fresh_backend_with_occurrence("occ").await;
+        put_score(
+            &be,
+            "lower",
+            "k1",
+            "subj",
+            "approach:goalx:v1",
+            0.5,
+            1.0,
+            10,
+        )
+        .await;
+        put_score(
+            &be,
+            "upper",
+            "k1",
+            "subj",
+            "approach:GOALX:v1",
+            0.5,
+            1.0,
+            20,
+        )
+        .await;
+
+        let q = |prefix: &'static str| {
+            let be = &be;
+            async move {
+                let mut f = scores_filter("subj");
+                f.dimension_prefixes = vec![prefix.into()];
+                let mut ids = list_ids(be, f).await;
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(
+            q("approach:goal").await,
+            vec!["lower"],
+            "sqlite LIKE is case-insensitive; the byte range is not — \
+             approach:GOALX:v1 is a DIFFERENT dimension under CC 3.1.7 R3"
+        );
+        assert_eq!(q("approach:GOAL").await, vec!["upper"]);
+        // The shared stem takes both: case-sensitivity is in the segment, not a
+        // blanket narrowing.
+        let mut both = q("approach:").await;
+        both.sort();
+        assert_eq!(both, vec!["lower", "upper"]);
     }
 
     /// v30.9.0 (CIRISPersist#627) — **a moderation act can address a SET of keys.**

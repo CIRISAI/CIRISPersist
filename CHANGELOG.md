@@ -5,6 +5,95 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [42.1.0] - 2026-09-08
+
+**A prefix filter compares bytes.** Two defects on one predicate: sqlite
+answered a dimension-prefix read case-INsensitively, and every dimension read
+scanned the attester's whole corpus. Both are fixed by the same edit, and
+CIRISServer#557's read stops being O(rows this node authored).
+
+### Fixed — the dimension prefix filter diverged across backends (#818)
+
+`dimension_prefixes` compiled to `LIKE` on both SQL backends. SQLite's `LIKE`
+is case-INsensitive for ASCII; Postgres' is case-sensitive; the memory backend
+folds with `str::starts_with`. So one `AttestationFilter` returned **different
+row sets depending on the backend underneath**, and sqlite was the wrong one:
+v42.0.0 ratified CC 3.1.7 R3, under which a dimension is a case-sensitive byte
+string, and `check_dimension_case_rule` enforces that at the write door. The
+read side then matched `approach:GOALX:v1` for a `approach:goal` prefix.
+
+Reachable, not theoretical: R3 exempts `Value`/`External`/`Wildcard` segments
+from the lowercase rule because they carry caller data, and **32 catalogued
+families have such a segment** (`approach:{goal_id}`,
+`delivery_receipt:{stream_id}`, `bond_posted:{currency}`, …). Those are exactly
+the segments where mixed case occurs naturally.
+
+The bug was on two handles with different backend counts — `list_scores`
+(three backends, sqlite the outlier) and `list_attestations` (two; the memory
+backend does not implement it). Both fixed.
+
+### Fixed — dimension reads were O(rows the node authored) (#817, CIRISServer#557)
+
+`list_attestations` compiled both dimension axes to a per-row
+`json_extract(attestation_envelope, '$.dimension')`, so a read for one
+dimension JSON-parsed every row its attester ever wrote. V106 had already
+added a generated `dimension` column for exactly this and **nothing ever used
+it**; V137 indexes it (`attesting_key_id, dimension`) and the builders now read
+it. No table rebuild on either backend — the column was already there.
+
+Both dimension shapes are now index-served, pinned by an `EXPLAIN` plan
+assertion rather than a timing assertion:
+
+```
+dimension  = ?                     -> SEARCH ... USING INDEX (attesting_key_id=? AND dimension=?)
+dimension >= ? AND dimension < ?   -> SEARCH ... USING INDEX (attesting_key_id=? AND dimension>? AND dimension<?)
+```
+
+### Two traps recorded, because either would have shipped a silent wrong answer
+
+**Postgres `>=`/`<` are not byte order.** They use the database collation;
+ours is `en_US.utf8`. A naive port of the sqlite range rewrite makes the
+prefix filter return **nothing at all** — not a few rows short, empty — because
+`'config:'` and `'config;'` collate adjacently when punctuation is weighted
+weakly. The predicate says `COLLATE "C"` and V137 indexes that same expression;
+the two must agree in both directions, since a default-collation predicate
+against the collated index is an index scan returning *wrong rows*. Pinned by
+mutation: removing the collation turns `pg_dimension_prefix_is_case_sensitive_818`
+red with `left: []`.
+
+**Routing through `attestation_subjects` would have been a correctness
+regression**, and was the approach #817 proposed. That projection is
+subject-keyed by construction — V106's backfill emits nothing for an empty
+`subject_key_ids` — while `list_attestations` is not subject-keyed and
+subjectless attestations are routine. A `JOIN` would have silently dropped
+them. `list_scores` may use the projection; `list_attestations` may not.
+
+`LIKE` is not used for a dimension prefix on either backend any more. Do not
+reintroduce it, and do not "fix" the case axis with a `COLLATE NOCASE` index —
+that encodes the R3 violation into the schema.
+
+### Migrations
+
+- `V137__dimension_seek_index.sql` (both dialects) — index over V106's
+  generated `dimension` column. Postgres indexes it `COLLATE "C"`; SQLite needs
+  no marking (TEXT is BINARY). Index-only; no table is rebuilt and no row
+  changes.
+
+### Witnesses
+
+Five, three mutation-verified against the pre-fix builders — a witness for this
+class that stays green on the old code is measuring the wrong thing:
+
+- `sqlite_dimension_prefix_is_case_sensitive_818` — kills the `LIKE` mutation
+- `sqlite_scores_dimension_prefix_is_case_sensitive_818` — same, scores handle
+- `pg_dimension_prefix_is_case_sensitive_818` — kills the `COLLATE "C"` mutation
+- `memory_scores_dimension_prefix_is_case_sensitive_818` — pins the backend that
+  was already correct, because a divergence is invisible from one backend
+- `sqlite_dimension_filters_are_index_served_817` — the plan assertion
+- `dimension_prefix_bounds_tests` (4) — the range-is-exactly-the-prefix-set
+  property, spelled as membership over neighbours rather than by re-deriving
+  the bound
+
 ## [42.0.0] - 2026-09-06
 
 **A conferral is not custody, a caveat is not its parent, and a secret is not
