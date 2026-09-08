@@ -251,13 +251,21 @@ fn ensure_template(admin: &str) -> Option<String> {
             let _ = run_sql(admin, &format!("DROP DATABASE IF EXISTS \"{scratch}\""));
             return Err(e);
         }
-        run_sql(
+        let renamed = run_sql(
             admin,
             &format!(
                 "ALTER DATABASE \"{scratch}\" RENAME TO \"{}\"",
                 template_db()
             ),
-        )
+        );
+        if renamed.is_err() {
+            // Never leave a scratch standing. With the lock genuinely held this
+            // should be unreachable, but an abandoned migrated database costs
+            // real disk on a shared cluster and `reap_dead` only collects it
+            // once this process exits.
+            let _ = run_sql(admin, &format!("DROP DATABASE IF EXISTS \"{scratch}\""));
+        }
+        renamed
     });
     match built {
         Ok(()) => Some(template_db()),
@@ -297,39 +305,89 @@ fn with_advisory_lock<F>(admin: &str, key: i64, f: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
+    // v42.1.0 (CIRISPersist#821, Codex review P1) — HOLD THE LOCK ACROSS `f`.
+    //
+    // The previous shape took `pg_advisory_lock` on a connection owned by a
+    // thread that then RETURNED, closing the session. Advisory locks are
+    // session-scoped, so the lock was gone before the closure ran and this
+    // function serialized nothing. Its own comment said so and argued the race
+    // was harmless because `f` re-checks existence.
+    //
+    // That argument held only by accident. Every builder raced
+    // `CREATE DATABASE "<final template name>"`, postgres let exactly one win,
+    // and the losers took the slow-but-correct path. Giving each builder a
+    // PID-unique scratch name (the fix for the readiness race) removed that
+    // accidental serialization: every `CREATE DATABASE` now succeeds, so on a
+    // cold parallel start EVERY process ran the full migration set at once —
+    // precisely the load the shared template exists to avoid — and the losers
+    // of the rename left their scratch databases standing.
+    //
+    // So the two fixes are coupled: build-then-rename is only safe if the lock
+    // is real. The lock-holding connection now stays open, and its runtime keeps
+    // polling it, until `f` has finished and the rename has landed.
     let a = admin.to_owned();
-    let guard = std::thread::spawn(move || -> Result<(), String> {
-        let rt = tokio::runtime::Builder::new_current_thread()
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let guard = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("runtime: {e}"))?;
-        rt.block_on(async {
-            let (client, connection) = tokio_postgres::connect(&a, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| format!("connect: {e}"))?;
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = acquired_tx.send(Err(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let (client, connection) =
+                match tokio_postgres::connect(&a, tokio_postgres::NoTls).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = acquired_tx.send(Err(format!("connect: {e}")));
+                        return;
+                    }
+                };
             let h = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            client
-                .execute("SELECT pg_advisory_lock($1)", &[&key])
-                .await
-                .map_err(|e| format!("lock: {e}"))?;
-            // The connection task is intentionally abandoned: the advisory
-            // lock is session-scoped and releases when this connection closes,
-            // which is what we want. `drop` rather than `let _ =` because a
-            // non-binding let on a future silently never polls it, and clippy
-            // is right that the distinction should be explicit.
-            drop(h);
-            Ok(())
-        })
+            if let Err(e) = client.execute("SELECT pg_advisory_lock($1)", &[&key]).await {
+                let _ = acquired_tx.send(Err(format!("lock: {e}")));
+                h.abort();
+                return;
+            }
+            let _ = acquired_tx.send(Ok(()));
+            // AWAIT, never block: the current-thread runtime must keep polling
+            // `connection` or the client stops being driven while the caller
+            // runs a full migration set on the other side of this channel.
+            let _ = release_rx.await;
+            // Closing the session releases the lock; the explicit unlock is
+            // belt-and-braces for a pooled server that outlives the socket.
+            let _ = client
+                .execute("SELECT pg_advisory_unlock($1)", &[&key])
+                .await;
+            drop(client);
+            h.abort();
+        });
     });
+
+    // Propagate an acquisition failure rather than running `f` unlocked.
+    let acquired = acquired_rx
+        .recv()
+        .map_err(|_| "lock thread died before acquiring".to_owned())?;
+    if let Err(e) = acquired {
+        let _ = release_tx.send(());
+        let _ = guard.join();
+        return Err(e);
+    }
+
+    let out = f();
+
+    let _ = release_tx.send(());
     guard
         .join()
-        .map_err(|_| "lock thread panicked".to_owned())??;
-    let out = f();
-    // Session-scoped locks release when the connection closes, which already
-    // happened above. Re-checking existence inside `f` is what makes the
-    // narrow window harmless.
+        .map_err(|_| "lock thread panicked".to_owned())?;
     out
 }
 
@@ -599,13 +657,88 @@ mod pg_error_detail_tests {
             err.contains("SQLSTATE"),
             "provisioning error must carry the SQLSTATE, got: {err}"
         );
+        // v42.1.0 (Codex review P2) — assert the SQLSTATE, not English. A server
+        // with a non-English `lc_messages` localizes "already exists" while
+        // still returning 42P04, so an assertion on the prose is a portability
+        // bug in the test rather than a property of the code.
         assert!(
-            err.contains("already exists"),
-            "provisioning error must carry the server's message, got: {err}"
+            err.contains("42P04"),
+            "provisioning error must carry the duplicate-database SQLSTATE, got: {err}"
+        );
+        // The server's own message must still be present — that is the whole
+        // point of `describe_pg_error` — but its CONTENT is the server's to
+        // choose, so assert only that something beyond the bare form arrived.
+        assert!(
+            err.len() > "execute: db error".len() + "[SQLSTATE 42P04]".len(),
+            "rendered error carries no server message, got: {err}"
         );
         assert_ne!(
             err, "execute: db error",
             "this is the uninformative form the fix exists to replace"
         );
+    }
+}
+
+#[cfg(test)]
+mod advisory_lock_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// v42.1.0 (CIRISPersist#821, Codex review P1) — the lock must be held for
+    /// the DURATION of the closure, not merely acquired before it.
+    ///
+    /// The previous implementation took `pg_advisory_lock` on a connection whose
+    /// thread then returned, closing the session and releasing the lock before
+    /// the closure ran. It serialized nothing, and its own comment said as much
+    /// while arguing the window was harmless.
+    ///
+    /// Measured directly: N threads enter the same lock and each records the
+    /// occupancy of its critical section. If the lock works, the peak is 1.
+    ///
+    /// Mutation check performed: restoring the release-early shape (drop the
+    /// lock session before calling `f`) drives the peak to 4 and turns this red.
+    #[test]
+    fn the_lock_is_held_for_the_whole_closure_not_just_acquired() {
+        let Some(dsn) = super::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let (host, _) = super::split(&dsn).expect("dsn");
+        let admin = format!("{host}/postgres");
+        // A key of this test's own, so it cannot contend with the template lock
+        // and cannot be satisfied by some unrelated holder.
+        const TEST_KEY: i64 = 0x0C11_3507_7E57;
+
+        let occupancy = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let admin = admin.clone();
+                let occupancy = Arc::clone(&occupancy);
+                let peak = Arc::clone(&peak);
+                s.spawn(move || {
+                    let r = super::with_advisory_lock(&admin, TEST_KEY, || {
+                        let now = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Wide enough that an unheld lock reliably overlaps;
+                        // short enough that four serialized turns stay quick.
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        occupancy.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    assert!(r.is_ok(), "lock body failed: {r:?}");
+                });
+            }
+        });
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "two closures were inside the same advisory lock at once — the lock \
+             is being released before `f` runs, so template construction is not \
+             serialized and every process migrates concurrently"
+        );
+        assert_eq!(occupancy.load(Ordering::SeqCst), 0);
     }
 }
