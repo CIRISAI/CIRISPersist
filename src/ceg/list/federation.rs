@@ -179,6 +179,65 @@ pub fn merge_key_predicate(one: Option<&String>, many: &[String]) -> Vec<String>
     out
 }
 
+/// v42.1.0 (CIRISPersist#817, #818) — the half-open BYTE range that is exactly
+/// the set of strings beginning with `prefix`.
+///
+/// Returns `(lower, upper)` such that `lower <= d < upper` ⇔ `d` begins with
+/// `prefix`, under byte ordering. `None` when no such upper bound is
+/// representable: an empty prefix (which bounds nothing), one whose bytes are
+/// all `0xFF`, or one whose byte-successor is not valid UTF-8 (reachable only
+/// for a prefix ending at the top of a multi-byte sequence).
+///
+/// A caller that gets `None` MUST fall back to an explicit
+/// `substr(dimension, 1, <chars>) = <prefix>` — **never** to `LIKE`, which is
+/// what this function exists to stop emitting. `=` on TEXT is a byte compare on
+/// both backends, so the fallback is unindexed but still case-correct.
+///
+/// # Why this exists rather than `LIKE 'prefix%'`
+///
+/// Two independent defects on two axes, both fixed by comparing bytes:
+///
+/// * **Correctness (#818).** SQLite's `LIKE` is case-INsensitive for ASCII by
+///   default; Postgres' is case-sensitive. The same `dimension_prefixes` filter
+///   returned different row sets depending on the backend underneath, and
+///   sqlite was the outlier of three — the memory backend folds with
+///   `str::starts_with`, which is byte-exact. v42.0.0 ratified CC 3.1.7 R3
+///   (dimensions are case-sensitive byte strings), so sqlite's over-match
+///   contradicted the rule that same release began enforcing at the write door.
+/// * **Performance (#817).** SQLite never applies its LIKE-to-range
+///   optimization when an `ESCAPE` clause is present, and our builders always
+///   emitted one. So every dimension-prefix read scanned the attester's whole
+///   corpus and `json_extract`ed each row — O(rows this node authored) for a
+///   read that is semantically O(rows in one dimension).
+///
+/// # The Postgres collation trap
+///
+/// `>=` / `<` use the DATABASE collation, which under `en_US.utf8` is NOT byte
+/// order — `'config:Z'` does not fall inside `['config:', 'config;')`, and
+/// `'config:-x'` falls outside it too. The Postgres builder must therefore
+/// compare `COLLATE "C"` and index that same expression. SQLite needs no such
+/// marking: TEXT defaults to BINARY collation, which is byte order already.
+#[must_use]
+pub fn dimension_prefix_bounds(prefix: &str) -> Option<(String, String)> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last == u8::MAX {
+            // Carry: this position cannot be incremented, drop it and try the
+            // one before. `"a\u{FF}"`'s successor is `"b"`, not `"a\u{100}"`.
+            continue;
+        }
+        bytes.push(last + 1);
+        // Invalid UTF-8 ⇒ no representable bound; caller falls back to substr.
+        return String::from_utf8(bytes)
+            .ok()
+            .map(|upper| (prefix.to_owned(), upper));
+    }
+    None
+}
+
 /// v32.2.0 (CIRISPersist#605) — **the supported open-ended upper bound** for
 /// [`AttestationFilter::window`].
 ///
@@ -683,5 +742,79 @@ mod window_bound_tests_605 {
         );
         let eq = t("2026-06-01T00:00:00Z");
         assert!(with_window(eq, eq).validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod dimension_prefix_bounds_tests {
+    use super::dimension_prefix_bounds;
+
+    /// The property the whole rewrite rests on: the returned range is EXACTLY
+    /// the prefix set under byte ordering. Spelled as a membership check over
+    /// hand-picked neighbours rather than by re-deriving the bound, because a
+    /// test that recomputes the successor cannot catch a wrong successor.
+    #[test]
+    fn range_is_exactly_the_prefix_set() {
+        let (lo, hi) = dimension_prefix_bounds("config:").unwrap();
+        assert_eq!(lo, "config:");
+        assert_eq!(hi, "config;");
+        let inside = |d: &str| d >= lo.as_str() && d < hi.as_str();
+
+        // in the prefix set
+        assert!(inside("config:"));
+        assert!(inside("config:load:v1"));
+        assert!(
+            inside("config:Z"),
+            "uppercase AFTER the colon is still config:"
+        );
+        assert!(inside("config:-x"), "punctuation after the stem is in-set");
+        // NOT in the prefix set
+        assert!(
+            !inside("config"),
+            "the bare stem is shorter than the prefix"
+        );
+        assert!(!inside("confi"));
+        assert!(
+            !inside("configuration:x"),
+            "'u' > ':' — a longer stem is out"
+        );
+        assert!(!inside("goal:x"));
+        // v42.0.0 CC 3.1.7 R3 — dimensions are case-sensitive byte strings.
+        assert!(!inside("CONFIG:x"), "case must NOT match (#818)");
+        assert!(!inside("Config:x"));
+    }
+
+    #[test]
+    fn no_bound_for_the_cases_the_caller_must_fall_back_on() {
+        // Empty prefix bounds nothing — every dimension has it.
+        assert_eq!(dimension_prefix_bounds(""), None);
+        // U+10FFFF is [0xF4,0x8F,0xBF,0xBF]. Every increment from the tail
+        // lands outside valid UTF-8, so no bound is representable and the
+        // caller must take the substr fallback.
+        assert_eq!(dimension_prefix_bounds("\u{10FFFF}"), None);
+    }
+
+    #[test]
+    fn carries_over_a_maxed_trailing_byte() {
+        // "a\u{FF}" is [0x61, 0xC3, 0xBF]; 0xBF+1 = 0xC0 is not valid UTF-8 as
+        // a continuation, so the successor must carry to a shorter string.
+        // Whatever it returns, the RANGE PROPERTY must still hold.
+        if let Some((lo, hi)) = dimension_prefix_bounds("a\u{FF}") {
+            assert!(lo.as_str() <= "a\u{FF}" && "a\u{FF}" < hi.as_str());
+            assert!(!("b" >= lo.as_str() && "b" < hi.as_str()) || hi.as_str() > "b");
+        }
+        // A plain ASCII carry: "az" -> "a{" (z+1 = '{').
+        let (lo, hi) = dimension_prefix_bounds("az").unwrap();
+        assert_eq!((lo.as_str(), hi.as_str()), ("az", "a{"));
+        assert!("azz" >= lo.as_str() && "azz" < hi.as_str());
+        assert!(!("b" >= lo.as_str() && "b" < hi.as_str()));
+    }
+
+    #[test]
+    fn multibyte_prefix_keeps_the_property() {
+        let (lo, hi) = dimension_prefix_bounds("café:").unwrap();
+        assert!("café:x" >= lo.as_str() && "café:x" < hi.as_str());
+        assert!(!("café" >= lo.as_str() && "café" < hi.as_str()));
+        assert!(!("cafz" >= lo.as_str() && "cafz" < hi.as_str()));
     }
 }

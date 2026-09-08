@@ -1,0 +1,54 @@
+-- V137 — index the V106 generated `dimension` column, Postgres dialect
+-- v42.1.0 (CIRISPersist#817, CIRISPersist#818, CIRISServer#557)
+--
+-- SQLITE PARITY: migrations/sqlite/lens/V137__dimension_seek_index.sql
+-- (same index; that twin needs no COLLATE because SQLite TEXT is BINARY
+-- already. See its header for the #818 case-sensitivity half.)
+--
+-- WHAT AND WHY
+-- ------------
+-- V106 added `dimension` here as a STORED generated column over
+-- `attestation_envelope->>'dimension'` and nothing ever indexed or read it;
+-- `list_attestations` kept compiling its dimension filters to a per-row
+-- `attestation_envelope::jsonb->>'dimension'`. See the SQLite twin for the
+-- measurement (CIRISServer#557).
+--
+-- THE COLLATION TRAP — why `COLLATE "C"` is load-bearing here
+-- ----------------------------------------------------------
+-- This is the part that does not transfer from the SQLite twin, and it is a
+-- silent wrong-answer bug if missed.
+--
+-- `>=` and `<` compare under the DATABASE collation. Ours is `en_US.utf8`,
+-- which is LINGUISTIC, not byte order. Under it the prefix range is simply
+-- not the prefix set — measured on this cluster:
+--
+--     'config:Z'  >= 'config:' AND 'config:Z'  < 'config;'   ->  FALSE
+--     'config:-x' >= 'config:' AND 'config:-x' < 'config;'   ->  FALSE
+--
+-- Both of those ARE `config:`-prefixed rows, and a linguistic range drops
+-- them. Under `COLLATE "C"` both are TRUE, because C collation is byte
+-- order — which is also exactly what CC 3.1.7 R3 means by a dimension being
+-- a case-sensitive byte string.
+--
+-- So the predicate must say `COLLATE "C"` and the index must be built over
+-- that same expression, or the planner cannot use it. Both halves or
+-- neither: a `COLLATE "C"` predicate against a default-collation index is a
+-- correct answer with a sequential scan, and a default-collation predicate
+-- against this index is an index scan returning WRONG ROWS.
+--
+-- Verified on this cluster that ONE index over the collated expression
+-- serves both shapes:
+--
+--     dimension COLLATE "C" =  $2                              -> Index Only Scan
+--     dimension COLLATE "C" >= $2 AND dimension COLLATE "C" < $3 -> Bitmap Index Scan
+--
+-- `text_pattern_ops` was the considered alternative. It is the idiomatic
+-- Postgres answer for LIKE-prefix, and it works — but it would have kept
+-- `LIKE` in the builder, and LIKE is what #818 is about removing on the
+-- other backend. One predicate shape across both dialects is worth more
+-- than the dialect-idiomatic one on each.
+--
+-- `attesting_key_id` leads for the same reason as the SQLite twin.
+
+CREATE INDEX federation_attestations_attester_dimension
+    ON cirislens.federation_attestations (attesting_key_id, (dimension COLLATE "C"));

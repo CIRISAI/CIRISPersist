@@ -11010,6 +11010,93 @@ mod tests {
         assert_eq!(fids, vec!["gone", "live", "wd"]);
     }
 
+    /// v42.1.0 (CIRISPersist#818) — the MEMORY third of the `list_scores`
+    /// case-sensitivity property.
+    ///
+    /// This backend was always correct: `mem_scores_row_matches` folds with
+    /// `str::starts_with`, which is byte-exact. It is pinned anyway, because
+    /// the bug this belongs to was invisible from any single backend — sqlite
+    /// compiled the same filter to a case-INsensitive `LIKE` and answered
+    /// differently, and no test on one backend could see that. A property
+    /// asserted on one backend cannot catch a divergence between two.
+    ///
+    /// Note `list_attestations` is NOT part of this: the memory backend does
+    /// not implement it (`memory_read_unsupported`), so that handle has two
+    /// backends, not three. `list_scores` is where all three meet.
+    #[tokio::test]
+    async fn memory_scores_dimension_prefix_is_case_sensitive_818() {
+        use crate::federation::FederationDirectory;
+        let be = MemoryBackend::new();
+        // A `value`-classed segment keeps its case through the v42 write door
+        // (`check_dimension_case_rule`: Value | External | Wildcard are exempt),
+        // which is exactly why a case divergence on the READ side is reachable
+        // in production rather than merely theoretical.
+        // `approach:{goal_id}` is classed [literal, value] — one of 32
+        // catalogued families whose later segment KEEPS its case by design
+        // (goal ids, currencies, stream ids, content ratings). Those are
+        // caller-supplied identifiers where mixed case is ordinary, which is
+        // what makes a case-insensitive read filter reachable in production
+        // rather than merely theoretical.
+        mem_put_score(
+            &be,
+            "lower",
+            "k1",
+            "subj",
+            "approach:goalx:v1",
+            0.5,
+            1.0,
+            10,
+        )
+        .await;
+        mem_put_score(
+            &be,
+            "upper",
+            "k1",
+            "subj",
+            "approach:GOALX:v1",
+            0.5,
+            1.0,
+            20,
+        )
+        .await;
+
+        let q = |prefix: &'static str| {
+            let be = &be;
+            async move {
+                let mut ids: Vec<String> = be
+                    .list_scores(
+                        "",
+                        crate::read::AttestationFilter {
+                            subject_key_id: Some("subj".into()),
+                            dimension_prefixes: vec![prefix.into()],
+                            ..Default::default()
+                        },
+                        None,
+                        100,
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(
+            q("approach:goal").await,
+            vec!["lower"],
+            "byte-exact prefix: approach:GOALX is a different dimension"
+        );
+        assert_eq!(q("approach:GOAL").await, vec!["upper"]);
+        // Both share the `approach:` stem, so a stem-level prefix takes both —
+        // pinning that case-sensitivity lives in the SEGMENT and is not a
+        // blanket narrowing of the filter.
+        assert_eq!(q("approach:").await, vec!["lower", "upper"]);
+    }
+
     #[tokio::test]
     async fn memory_scores_read_resolve_and_mirror() {
         use crate::federation::FederationDirectory;
