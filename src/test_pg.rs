@@ -169,6 +169,23 @@ fn template_db() -> String {
     .clone()
 }
 
+/// The name the template is BUILT under, before being renamed into place.
+///
+/// Shaped like a per-process database (`ciris_t_<pid>_…`) on purpose, so
+/// [`reap_dead`] — which parses the segment after `ciris_t_` as a PID — sweeps
+/// it if its builder dies. A finished template is `ciris_t_template_<hash>`,
+/// whose second segment does not parse as a PID, so it correctly survives as
+/// the cache it is. `scratch_and_template_names_sort_correctly_for_the_reaper`
+/// pins both halves; getting it backwards either strands half-built databases
+/// forever or reaps the live template out from under every running process.
+fn scratch_template_name() -> String {
+    format!(
+        "ciris_t_{}_tpl_{:016x}",
+        std::process::id(),
+        crate::store::postgres::embedded_migration_fingerprint()
+    )
+}
+
 /// A postgres advisory-lock key, so exactly one process builds the template
 /// while the rest wait rather than racing 116 migrations against each other.
 ///
@@ -183,7 +200,8 @@ const TEMPLATE_LOCK: i64 = 0x0C11_3507_E570;
 /// and let the test migrate it" — slower, still correct, never silently
 /// shared.
 fn ensure_template(admin: &str) -> Option<String> {
-    // Fast path: already built.
+    // Fast path: already built. Sound ONLY because the name appears at the end
+    // of construction, never at the start — see the build below.
     if database_exists(admin, &template_db()).unwrap_or(false) {
         return Some(template_db());
     }
@@ -194,9 +212,52 @@ fn ensure_template(admin: &str) -> Option<String> {
         if database_exists(admin, &template_db()).unwrap_or(false) {
             return Ok(()); // another process won the race while we waited
         }
-        run_sql(admin, &format!("CREATE DATABASE \"{}\"", template_db()))?;
+        // v42.1.0 (CIRISPersist#821) — BUILD UNDER A SCRATCH NAME, THEN RENAME.
+        //
+        // The fast path above tests EXISTENCE. Creating the template under its
+        // final name and migrating it afterwards made existence arrive BEFORE
+        // readiness, and the window between them is the length of a full
+        // migration run. In it, every other process took the fast path, skipped
+        // this lock entirely, and issued
+        // `CREATE DATABASE … TEMPLATE <half-built>`.
+        //
+        // What we SAW was postgres refusing that copy, because this process is
+        // still connected to the source — a red CI leg, which is the lucky
+        // outcome. The unlucky one is the copy succeeding against a partially
+        // migrated template: every per-test database then carries a schema the
+        // tree does not describe, and the suite goes green on it. That is the
+        // exact silent-wrong-answer the fingerprinted name exists to stop
+        // (V121 bit in both directions), reintroduced one level up in the
+        // lifecycle rather than in the name.
+        //
+        // Renaming last makes the name mean "fully migrated", so the fast path
+        // becomes true by construction instead of by timing.
+        //
+        // The scratch name is `ciris_t_<pid>_tpl_<hash>`, deliberately shaped
+        // like a per-process database rather than like a template: `reap_dead`
+        // strips `ciris_t_` and parses the next segment as a PID, so this form
+        // is swept when its builder dies, while a finished
+        // `ciris_t_template_<hash>` parses as "template", fails the PID parse,
+        // and correctly survives as the cache it is. Getting this backwards
+        // would either strand half-built databases forever or reap the template
+        // out from under every running process.
+        let scratch = scratch_template_name();
+        let _ = run_sql(admin, &format!("DROP DATABASE IF EXISTS \"{scratch}\""));
+        run_sql(admin, &format!("CREATE DATABASE \"{scratch}\""))?;
         let (host, _) = split(admin).ok_or_else(|| "admin dsn".to_owned())?;
-        migrate(&format!("{host}/{}", template_db()))
+        if let Err(e) = migrate(&format!("{host}/{scratch}")) {
+            // Do not leave a half-migrated database standing under a name that
+            // a future fingerprint might match.
+            let _ = run_sql(admin, &format!("DROP DATABASE IF EXISTS \"{scratch}\""));
+            return Err(e);
+        }
+        run_sql(
+            admin,
+            &format!(
+                "ALTER DATABASE \"{scratch}\" RENAME TO \"{}\"",
+                template_db()
+            ),
+        )
     });
     match built {
         Ok(()) => Some(template_db()),
@@ -354,6 +415,38 @@ fn run_sql(dsn: &str, sql: &str) -> Result<(), String> {
         .map_err(|_| "provisioning thread panicked".to_owned())?
 }
 
+/// v42.1.0 (CIRISPersist#821) — spell out WHY postgres refused.
+///
+/// `tokio_postgres::Error`'s `Display` is the string `"db error"` plus nothing
+/// useful: the server's actual message, SQLSTATE, detail and hint all live on
+/// the `DbError` behind `as_db_error()`. A provisioning failure in CI therefore
+/// arrived as
+///
+/// ```text
+/// could not provision a per-process database (execute: db error).
+/// ```
+///
+/// which names the SQL that failed and not one word about the reason — so a red
+/// leg could not be told apart from a dozen unrelated causes without a local
+/// repro, and the repro is precisely what a load-dependent race denies you. The
+/// panic below refuses to fall back silently, which is right; refusing to say
+/// why is not.
+fn describe_pg_error(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let mut out = format!("{} [SQLSTATE {}]", db.message(), db.code().code());
+            if let Some(d) = db.detail() {
+                out.push_str(&format!(" detail: {d}"));
+            }
+            if let Some(h) = db.hint() {
+                out.push_str(&format!(" hint: {h}"));
+            }
+            out
+        }
+        None => e.to_string(),
+    }
+}
+
 fn run_sql_blocking(dsn: &str, sql: &str) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -370,7 +463,7 @@ fn run_sql_blocking(dsn: &str, sql: &str) -> Result<(), String> {
         let out = client
             .batch_execute(sql)
             .await
-            .map_err(|e| format!("execute: {e}"));
+            .map_err(|e| format!("execute: {}", describe_pg_error(&e)));
         drop(client);
         handle.abort();
         out
@@ -428,6 +521,91 @@ mod tests {
         assert!(
             a.starts_with("ciris_t_"),
             "the harness sweeps this prefix: {a}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod template_naming_tests {
+    use super::{scratch_template_name, template_db};
+
+    /// `reap_dead`'s classifier, spelled out here rather than called, because
+    /// the real one issues DROPs. The point is the NAMING CONTRACT the two
+    /// functions must satisfy for that classifier to do the right thing.
+    fn parses_as_pid_bearing(name: &str) -> bool {
+        name.strip_prefix("ciris_t_")
+            .and_then(|rest| rest.split_once('_'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            .is_some()
+    }
+
+    /// v42.1.0 (CIRISPersist#821) — the scratch database must look reapable and
+    /// the finished template must not.
+    ///
+    /// I got this backwards on the first pass: the scratch was named
+    /// `<template>_bld_<pid>`, whose segment after `ciris_t_` is the literal
+    /// "template", so it failed the PID parse and would have been stranded on
+    /// the server forever after any builder crash.
+    #[test]
+    fn scratch_and_template_names_sort_correctly_for_the_reaper() {
+        let scratch = scratch_template_name();
+        let finished = template_db();
+
+        assert!(
+            parses_as_pid_bearing(&scratch),
+            "scratch {scratch:?} must parse as ciris_t_<pid>_… or reap_dead \
+             will never sweep a half-built template"
+        );
+        assert!(
+            !parses_as_pid_bearing(&finished),
+            "finished template {finished:?} must NOT parse as a per-process \
+             database, or reap_dead would drop the shared cache out from under \
+             every live process"
+        );
+        // They must never collide — the rename would be a no-op and the fast
+        // path would start returning a half-built database.
+        assert_ne!(scratch, finished);
+        // Postgres truncates identifiers at 63 bytes; a silent truncation could
+        // make two builders collide on one scratch name.
+        assert!(scratch.len() <= 63, "scratch name {} bytes", scratch.len());
+        assert!(
+            finished.len() <= 63,
+            "template name {} bytes",
+            finished.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_error_detail_tests {
+    /// v42.1.0 (CIRISPersist#821) — a provisioning failure must name its cause.
+    ///
+    /// Drives a real refusal (creating a database that already exists) and
+    /// asserts the rendered string carries the server's message and SQLSTATE,
+    /// not the bare `"db error"` that `Display` gives. The CI failure this
+    /// belongs to was undiagnosable for exactly that reason.
+    #[test]
+    fn a_refused_statement_names_its_reason_not_just_db_error() {
+        let Some(dsn) = super::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let (host, _) = super::split(&dsn).expect("dsn");
+        let admin = format!("{host}/postgres");
+        // `template1` always exists, so this is a guaranteed, harmless refusal.
+        let err = super::run_sql(&admin, "CREATE DATABASE \"template1\"")
+            .expect_err("creating an existing database must fail");
+        assert!(
+            err.contains("SQLSTATE"),
+            "provisioning error must carry the SQLSTATE, got: {err}"
+        );
+        assert!(
+            err.contains("already exists"),
+            "provisioning error must carry the server's message, got: {err}"
+        );
+        assert_ne!(
+            err, "execute: db error",
+            "this is the uninformative form the fix exists to replace"
         );
     }
 }
