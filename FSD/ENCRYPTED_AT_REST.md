@@ -418,6 +418,7 @@ The boundary map does **not** silently decide these. Each is a genuine
 | **JC-5** | `trace_llm_calls` `base_url`, `model`, `service_name`, `handler_name` | `base_url` can be a private/internal LLM endpoint URL. User: plaintext operational labels, or encrypt `base_url` (and possibly `model`)? |
 | **JC-6** | `cirisgraph.nodes` GIN index | Encrypting `attributes` kills `nodes_attributes_gin`. User: (a) drop the GIN index and accept full-scan attribute reads (V013 says the real workload doesn't need it), or (b) commission a `cirisgraph` shredding migration analogous to V042-final. |
 | **JC-7** | `cirisgraph.edges.attributes`, `telemetry_metrics.labels`, `occurrence_registry.metadata`, `cirisnode` `witness_set` / `aggregate_evidence`, `federation_keys` `registration_envelope` / `*_envelope`, `federation_revocations.reason` | Free-form JSONB/text blobs on otherwise projection-only substrates. Each *leans* projection (structural/provenance, not reasoning content) but none is a closed type. User: blanket "free-form blobs on projection-only tables stay plaintext", or encrypt case-by-case? |
+| **JC-10** | `cirislens.federation_attestations.attestation_envelope`, **scoped by cohort** | **REOPENED 2026-09-09 at the operator's request.** Distinct from JC-7, which asks whether free-form blobs on projection-only tables stay plaintext as a *class*. This asks something JC-7 does not contemplate: should the attestation envelope be **encrypted under the cohort's DEK** for `family` / `community` / `affiliations` (and possibly `self`), leaving commons plaintext — i.e. the envelope joins the §2.2 content side, keyed by `cohort_scope` rather than by column. §8(4) currently exempts this substrate as "a transparency substrate by purpose"; that exemption is what is being reconsidered. **Measured cost, if adopted:** (i) the generated `dimension` column (sqlite V106/V114/V117, postgres V106/V122) cannot be derived from ciphertext, which also voids V137's seek index; (ii) 14 SQL sites read inside the envelope — 12 postgres, 2 sqlite — over `references_attestation_id` (×4), `dimension` (×3), `evidence_refs` (×1); (iii) the postgres GIN on `evidence_refs` dies, making citation lookup a scan-plus-decrypt; (iv) **the sharpest one — the retraction folds are `NOT EXISTS` subqueries matching `w.attestation_envelope->>'references_attestation_id'` against another row's id, 23 sites per backend. Encrypt the withdrawing row and the match yields NULL, `NOT EXISTS` becomes true, and a retracted row reads as LIVE. That fails toward disclosure, silently.** **Prerequisite either way:** hoist the join keys (`references_attestation_id`, `dimension`, `evidence_refs`) into maintained plaintext columns first, with a gate asserting no SQL reads inside the envelope; after that the scope choice is policy, not correctness. **Note on scoping to family/community/affiliations while excluding `self`:** that excludes the *cheapest* scope — `self` never federates (`suppresses_holds_bytes`) and is never peer-verified — and encrypts the three that do reach peers. It is defensible on volume (self is the hot internal path) but it is not the cheap subset, and a mixed-encryption table makes the negative predicates in (iv) worse, not better. **User decides:** (a) keep the §8(4) exemption — the directory is the transparency surface, per the same argument that made the audit log commit to ciphertext in §8(1); (b) adopt cohort-scoped envelope encryption, after the join-key hoist; (c) adopt it only for `self`/`family`, which is where the peer-verification cost is lowest. |
 | **JC-8** | `tickets.email` / `tickets.user_identifier` (V028) | The genuine conflict (§3.10): PII that is also a lookup key. **Options:** (a) plaintext (FDE-only protection for ticket PII); (b) encrypt the value, keep a separate `email_hash` plaintext column for lookup (a deterministic-hash sidecar — equality lookup works, no range/substring); (c) encrypt and accept that ticket lookup-by-email becomes a decrypt-and-scan. |
 | **JC-9** | `wa_cert` `oauth_external_id`, `oauth_links` (V034) | `password_hash` / `api_key_hash` are already non-reversible hashes (leave plaintext). `oauth_external_id` / `oauth_links` are identifying. User: encrypt the OAuth identity columns? |
 
@@ -729,7 +730,11 @@ cleanly. The genuinely hard parts:
 4. **Substrates that do not fit the cleavage** — stated plainly rather
    than forced: `telemetry_metrics` (§3.5) has *no content column* and
    no signature — exempt; the federation directory (§3.6) is a
-   *transparency substrate* by purpose — projection-only, exempt; the
+   *transparency substrate* by purpose — projection-only, exempt **(this
+   exemption is REOPENED as JC-10, 2026-09-09: the operator has asked
+   whether the attestation envelope should be encrypted under the cohort
+   DEK for the encrypted cohorts. The exemption stands until JC-10 is
+   decided — it is not silently overridden by the blob work)**; the
    coordination primitives (§3.11) have no content — exempt;
    `credits_ledger` / `expertise_ledger` (§3.9) are pure derived
    projection — exempt. "Exempt" is an honest classification, not a gap:
@@ -740,7 +745,46 @@ cleanly. The genuinely hard parts:
    No option is free; the user picks among plaintext / hash-sidecar /
    decrypt-and-scan.
 
-6. **The GIN index on `cirisgraph.nodes.attributes` (§3.3, JC-6)** is a
+7. **The shipped blob cascade diverged from §4.3 on the master-key
+   root — found 2026-09-09, unresolved.** §4.3 states content encryption
+   "introduces **no new master-key root**; it reuses [the secrets master
+   key], under a distinct HKDF context string." The blob cascade that
+   actually shipped (`#152` / `#243`) created a **second** root:
+   `federation_content_master`, a single-row table whose initializer
+   writes `key_kind='software'` with the descriptor *"software
+   content-at-rest master (no hardware seed wired)"*. So the root the
+   FSD specifies as hardware-sealed (TPM / Keystore / Secure Enclave via
+   `derive_symmetric_key`) is, in the shipped path, permanently in the
+   software fallback and separate from `cirislens_secrets.master_key_meta`.
+
+   Consequences, all of which compound with corpus size:
+   - **No rotation surface on the blob key material.** §4.4 specifies
+     `encryption_key_ref` FK'ing into a content-key-meta table mirroring
+     `master_key_meta` "so master-key rotation has one surface." Secrets
+     rows carry that column; `federation_community_dek`,
+     `federation_community_dek_member_grants` and
+     `federation_blob_key_grants` carry no equivalent, and there is no
+     content-key-meta table. There is also no content-master rotation
+     code anywhere in the tree.
+   - **`federation_community_dek.wrap_algorithm` admits exactly one
+     value**, `aes256_gcm_content_master`, so every community DEK wrap
+     hangs off that single software root. Losing or rotating it leaves
+     the per-member hybrid wraps
+     (`federation_community_dek_member_grants`) as the only recovery
+     path.
+   - Each blob sealed before this is reconciled is a blob that must be
+     re-wrapped afterwards. The fix is O(1) now and O(corpus) later.
+
+   **Decision needed before blob storage extends to more cohorts:**
+   (a) adopt the §4.3 root — derive the content master from the secrets
+   master under a `content-at-rest-master-v1` HKDF context, migrating the
+   existing single row; or (b) amend §4.3 to sanction a separate
+   federation content root, and say why. Either way §4.4's rotation
+   surface (`encryption_key_ref` + content-key-meta) should land *before*
+   the corpus grows, because it is a schema change over sealed rows once
+   it does.
+
+8. **The GIN index on `cirisgraph.nodes.attributes` (§3.3, JC-6)** is a
    second, smaller V042 — encrypting `attributes` kills predicate
    push-down. V013's own header argues the real workload doesn't need
    it, so dropping the index is probably fine — but it is a decision,
