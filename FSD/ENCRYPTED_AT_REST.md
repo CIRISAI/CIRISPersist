@@ -745,17 +745,34 @@ cleanly. The genuinely hard parts:
    No option is free; the user picks among plaintext / hash-sidecar /
    decrypt-and-scan.
 
-7. **The shipped blob cascade diverged from §4.3 on the master-key
-   root — found 2026-09-09, unresolved.** §4.3 states content encryption
-   "introduces **no new master-key root**; it reuses [the secrets master
-   key], under a distinct HKDF context string." The blob cascade that
-   actually shipped (`#152` / `#243`) created a **second** root:
-   `federation_content_master`, a single-row table whose initializer
-   writes `key_kind='software'` with the descriptor *"software
-   content-at-rest master (no hardware seed wired)"*. So the root the
-   FSD specifies as hardware-sealed (TPM / Keystore / Secure Enclave via
-   `derive_symmetric_key`) is, in the shipped path, permanently in the
-   software fallback and separate from `cirislens_secrets.master_key_meta`.
+7. **The §4.3 master-key root was DECLARED and never IMPLEMENTED —
+   found 2026-09-09, unresolved.** Corrected from a first reading that
+   called this a deliberate second root; the truth is less deliberate and
+   more concerning.
+
+   `at_rest_cascade.rs` documents the §4.3 design exactly — *"the persist
+   content master key (`content_master_key`) … Hardware-rooted HKDF over
+   the secrets-store sealed seed under a distinct context, with a
+   software fallback honest about being software"* — and defines the
+   constant §4.3 calls for:
+
+   ```rust
+   pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
+   ```
+
+   **Neither is wired.** `content_master_key` does not exist: the module
+   header links to it and no such function is defined anywhere in the
+   tree. `CONTENT_MASTER_CONTEXT` has **zero call sites** — a "stable
+   wire constant" nothing derives from.
+
+   What runs instead is `load_or_init_content_master()`, the backend
+   table path, which generates a random software key into
+   `federation_content_master` with the descriptor *"software
+   content-at-rest master (no hardware seed wired)"*. So the software
+   fallback is not a fallback — it is the only path, reached by default
+   rather than by decision, while the constant and the doc assert
+   otherwise. A reader of this module would conclude the hardware root is
+   in place.
 
    Consequences, all of which compound with corpus size:
    - **No rotation surface on the blob key material.** §4.4 specifies
