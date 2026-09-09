@@ -1087,7 +1087,7 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// The DEK-retention root for the default tier (OQ-4). **Software
     /// default** — honest about being software (the production target is
-    /// the hardware-rooted HKDF derivation per ENCRYPTED_AT_REST.md §4.3;
+    /// the hardware-rooted HKDF derivation per BLOB_ENCRYPTION_AT_REST.md §4.3;
     /// wiring the sealed seed through the Engine is a follow-up). The
     /// 32-byte key is stored base64 in `federation_content_master`
     /// (single logical row, `id=0`); concurrent first-callers race on the

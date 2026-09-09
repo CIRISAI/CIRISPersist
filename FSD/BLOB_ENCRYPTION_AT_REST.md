@@ -1,4 +1,14 @@
-# FSD: Content Encryption at Rest — CIRISPersist
+# FSD: Blob Encryption at Rest — CIRISPersist
+
+> **Renamed 2026-09-09** from `ENCRYPTED_AT_REST.md` / "Content Encryption
+> at Rest". The document now leads with **blob encryption at rest** — the
+> cohort-keyed DEK cascade that is actually being implemented (§10).
+>
+> §3's boundary map for the other substrates (`trace_events`, `cirisgraph`,
+> `audit_log`, the agent runtime tables, …) is **retained unchanged** as the
+> forward plan; it is not superseded by the rename, and §9's sequencing
+> still governs it. The attestation question specifically is tracked as
+> **JC-10** and remains undecided.
 
 **Status:** Proposed (locked design — this document formalizes a settled
 exploration; it is the spec, not a re-exploration)
@@ -872,7 +882,210 @@ reconciliation surfaces divergence as a typed error) and belongs in the
 
 ---
 
-## 10. Summary
+## 10. Blob encryption at rest — the cohort-keyed DEK cascade (LOCKED 2026-09-09)
+
+This section is the **committed design** for blob encryption across all
+four encrypted cohorts. It supersedes nothing in §3 (the other substrates'
+boundary map stands); it makes the blob half implementable.
+
+### 10.1 Scope — four cohorts, three tiers, one cascade
+
+`cohort_scope::crypto_tier` resolves seven cohorts into three tiers. Four
+cohorts are encrypted:
+
+| cohort | tier | delivery set |
+|---|---|---|
+| `self` | `InvisibleEncrypted` | every **active occurrence** of the identity |
+| `family` | `InvisibleEncrypted` | every member's active occurrences |
+| `community` | `CommunityDek` | every active member, per epoch |
+| `affiliations` | `CommunityDek` | every active member, per epoch |
+
+`species` / `biosphere` / `federation` are `Plaintext` — commons, and the
+correct answer, not a gap. The **CC 4.4.3.2.1 infrastructure opt-out**
+stands unchanged: an *authorized* `cohort_subkind: infrastructure`
+community (own key is the `substrate_persist` authority) takes Commons
+plaintext, no DEK. A self-labeled one that is *not* authorized gets the
+full cascade — an unauthorized label can never force plaintext.
+
+### 10.2 The root — `content_master_key` MUST be implemented before minting
+
+§4.3 specifies **no new master-key root**: derive from the secrets sealed
+seed under a distinct HKDF context. `at_rest_cascade.rs` already declares
+the constant —
+
+```rust
+pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
+```
+
+— and documents `content_master_key` as *"Hardware-rooted HKDF over the
+secrets-store sealed seed under a distinct context, with a software
+fallback honest about being software."* **Neither is wired** (§8(7)):
+`content_master_key` does not exist, the constant has zero call sites, and
+`load_or_init_content_master()` generates a random software key instead.
+
+**Locked:** implement `content_master_key` as specified and make it the
+sole supplier to `wrap_dek_for_persist`. `load_or_init_content_master`
+becomes the *software fallback path only*, and must be honest about it
+(`SecretsError::HardwareKeyUnavailable` discipline, MISSION §1.6).
+
+**This lands FIRST.** There are no communities and no sealed blobs today,
+so there is nothing to migrate. Every blob sealed before this is one that
+must be re-wrapped after: O(1) now, O(corpus) later.
+
+### 10.3 HKDF derives; it cannot deliver
+
+A recurring question, settled here. **HKDF covers all four cohorts for
+derivation and none of them for delivery**, because delivery targets a
+party holding a *different* secret:
+
+| job | primitive | cohorts |
+|---|---|---|
+| content master ← secrets seed | HKDF-SHA-256 under `CONTENT_MASTER_CONTEXT` | all four |
+| per-object DEK | fresh RNG (self/family) / per-epoch (community) | all four |
+| persist self-retention wrap | AES-256-GCM under the content master | all four |
+| **delivery to occurrences / members** | **X25519 + ML-KEM-768 hybrid** (`x25519_mlkem768_aes256_gcm_hkdf_sha256`) | all four |
+
+HKDF appears *inside* the hybrid wrap as its KDF step — that is where it
+belongs. `self` is not an exception: an identity has multiple occurrences,
+so even self content is delivered, not merely derived.
+
+v1 wraps remain unrepresentable (V087 CHECK) — CC 4.4.3.4.1 / CC 5.2 HNDL.
+
+### 10.4 The keyset model — Tink semantics, not the Tink crate
+
+We adopt [Tink's keyset design](https://developers.google.com/tink/design/keysets):
+a set of keys, exactly one **primary**, old keys retained **decrypt-only**,
+and a key identifier carried with the ciphertext so decryption never scans.
+
+**We do not take the dependency.** `project-oak/tink-rust` is explicitly
+*"not an official port … not supported by Google's cryptography teams"*,
+is *"under construction"* with an API subject to change without warning,
+and implements no cryptography itself — it is an API layer over the same
+RustCrypto primitives `ciris_crypto` already provides. Adding it would
+insert an unofficial, self-disclaimed layer between us and primitives we
+already use correctly, in exchange for a table shape. MISSION §1.4 stands:
+all crypto routes through `ciris_crypto`.
+
+Our schema is already three-quarters of a keyset:
+
+| Tink | ours |
+|---|---|
+| keyset | `federation_community_dek (community_key_id, epoch)` |
+| primary pointer | `federation_community_dek_epoch.epoch` |
+| key id in ciphertext | `federation_scope_blobs.group_dek_epoch` (inline) / `federation_community_blob_epoch` (side table) |
+| **per-key state** | **NEW — §10.5** |
+
+### 10.5 Key state — and the AV-70 amendment
+
+**AV-70 today ratifies "forward-only (old-epoch blobs keep grants)"** —
+Option-A's *"once shared, always shared."* A removed member keeps read
+access to pre-rotation blobs they were already a grantee on. That is the
+same posture MLS and Tink both take: forward secrecy protects *future*
+content, not past.
+
+**This design moves past it**, at the operator's direction. Adding a
+destroy path makes the property "shared until the epoch is destroyed",
+which is **stronger than either MLS or Tink offers** and therefore ours to
+own. AV-70 is amended accordingly, and the cost is stated below rather
+than discovered later.
+
+Every DEK row gains a state:
+
+| state | new seals | decrypts | meaning |
+|---|---|---|---|
+| `enabled` | yes | yes | the primary |
+| `disabled` | no | yes | rotated past; AV-70's original behaviour, now one state among three |
+| `destroyed` | no | **no** | key material gone |
+
+**The DESTROY precondition — non-negotiable.** An epoch may move to
+`destroyed` only when **every object sealed under it has been either
+re-sealed under a live epoch or evicted from every holder**. Destroying a
+DEK whose content still exists does not erase the content; it orphans it,
+converting a confidentiality operation into unrecoverable data loss.
+
+The precondition is *checkable*, and cheaply — which is why §10.7's reverse
+index is load-bearing rather than a perf nicety. **A destroy that cannot
+prove its precondition must refuse, not proceed.**
+
+### 10.6 Distributed copies, and why the tombstone ceiling is the mechanism
+
+Neither MLS nor Tink solves recall: MLS assumes a delivery service and
+guarantees only forward secrecy; Tink assumes you control the storage. We
+assume neither — blobs are fountained to peers.
+
+The substrate already has the one primitive that reaches every holder.
+`LifetimeClass::Tombstone` and `MonotonicSupersede` **project at their
+plane's `tombstone_ceiling` regardless of scope**, precisely so a
+retraction can never be out-run by the record it retracts — *anywhere a
+copy could have travelled*. Eviction-on-rotate rides that plane.
+
+**Consequence, and it needs a gate:** the blob/shard plane's
+`tombstone_ceiling` must be **at least as wide as shards can travel**. A
+ceiling narrower than the copy set starves holders and silently
+un-revokes — the exact failure #713's per-plane ceiling was introduced to
+reason about. This is a gate, not a convention.
+
+### 10.7 Triggers — and why they are background by default
+
+Two triggers, deliberately different in kind:
+
+1. **Revocation-driven (immediate, synchronous).**
+   `put_community_membership_revocation` already bumps the epoch
+   transactionally, and future-dated `effective_at` is rejected at write
+   time (SecReview F4). Exposure window for *new* content is zero. This
+   stays exactly as-is.
+
+2. **Sweep-driven (background, asynchronous).** Re-seal and eviction are
+   O(objects at the epoch) and must **never run inline with a membership
+   change** — a community rotation would otherwise stall on its own
+   corpus. The sweep is a background job in the shape of the existing
+   `evict_fountain_content_by_consent` /
+   `evict_fountain_content_for_disk_pressure` paths, with an
+   operator-callable synchronous variant for "do it now".
+
+The sweep is **time-driven, not event-driven**: `removed_key_ids_at`
+deliberately excludes future-dated revocations, so deletion must fire at
+`effective_at`, which is a schedule rather than a reaction to arrival.
+
+**Retention policy.** OpenMLS ships a configurable *past-epoch deletion
+policy* because a delivery service cannot guarantee epoch-N content
+arrives before epoch N+1 begins. Same problem here. Retaining every epoch
+forever is unbounded; destroying eagerly orphans in-flight content. The
+policy is a declared knob — `retain_past_epochs` — not an implicit
+"keep forever".
+
+### 10.8 Ordering constraint — encrypt, then fountain. Never the reverse.
+
+A blob is sealed **before** it is fountained. Fountaining plaintext and
+encrypting afterwards leaves plaintext shards on peers that no subsequent
+rotation can recall, and the tombstone plane cannot un-see them.
+
+This is a **gate**, not a convention: the fountain path must refuse a
+plaintext body whose `cohort_scope` resolves to an encrypted tier.
+
+### 10.9 Schema deltas
+
+1. `key_state TEXT NOT NULL DEFAULT 'enabled' CHECK (key_state IN ('enabled','disabled','destroyed'))` on `federation_community_dek`.
+2. `CREATE INDEX … ON federation_community_blob_epoch (community_key_id, epoch)` — the reverse lookup the DESTROY precondition and the sweep both need. Today the PK is `at_rest_sha256` alone, so enumerating an epoch's objects full-scans. Self/family already has the analogous seek (`federation_blob_key_grants_by_recipient`, `(cohort_scope, recipient_key_id)`); this closes the asymmetry.
+3. `encryption_key_ref` + a content-key-meta table mirroring `master_key_meta` (§4.4), so master-key rotation has one surface. Secrets rows carry this; blob key material does not.
+4. `retain_past_epochs` on the community DEK epoch record.
+
+### 10.10 Implementation order
+
+Each step stands alone and is separately witnessed.
+
+1. **`content_master_key`** (§10.2) — the real root. Nothing else is safe to mint on.
+2. **Schema deltas** (§10.9) — cheap now, a migration over sealed rows later.
+3. **Community DEK mint/rotate** on the real root, with key state.
+4. **The encrypt-then-fountain gate** (§10.8).
+5. **The background sweep** (§10.6/§10.7) — re-seal, evict, then destroy.
+
+Steps 1–2 are prerequisites in the strong sense: they are O(1) today and
+O(corpus) once content exists.
+
+---
+
+## 11. Summary
 
 CIRISPersist can encrypt the *content* of every substrate at rest —
 persist-managed, hardware-rooted, 100% backend-agnostic — while keeping
@@ -888,3 +1101,12 @@ hard parts — audit-leaf canonical ordering, `trace_llm_calls` lacking a
 local signature, per-row KDF throughput, `tickets.email` — are named,
 not hidden, and the substrates that do not fit the cleavage are
 classified exempt, honestly.
+
+---
+
+**§10 (added 2026-09-09)** locks the blob half: the cohort-keyed DEK
+cascade, its real HKDF root, Tink keyset semantics with a destroy state,
+and the AV-70 amendment that a destroyed epoch's content must be
+re-sealed or evicted first. §3's boundary map for the other substrates
+is unchanged, and the attestation question stays open as JC-10.
+

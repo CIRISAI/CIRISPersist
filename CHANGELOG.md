@@ -19718,7 +19718,7 @@ The substrate-wraps default tier for `cohort_scope: self | family` (FSD `SELF_FA
 - **`BlobStorage`** at-rest grant methods (`put_at_rest_grant` / `get_at_rest_grant` / `list_at_rest_grant_recipients` / `load_or_init_content_master`) on both SQL backends.
 
 ### DEK retention (OQ-4 — the hard question)
-The default tier requires persist to recover the DEK to serve `get_blob_for_viewer`, but persist holds **no content master key / KEM identity** in the `Engine` today (the `SecretsService` master is gated + not composed into the blob path; the signer is sign-only). This cut ships a **software** content-master (generated once, persisted in `federation_content_master`, **honest about being software** — the same posture `secrets/` takes on a no-TPM host). The **hardware-rooted** derivation (HKDF over a TPM/Keystore/Secure-Enclave-sealed seed under `content-at-rest-master-v1`, per `ENCRYPTED_AT_REST.md` §4.3) is the production target and is the one remaining dependency — wiring the sealed seed through the `Engine` is a follow-up.
+The default tier requires persist to recover the DEK to serve `get_blob_for_viewer`, but persist holds **no content master key / KEM identity** in the `Engine` today (the `SecretsService` master is gated + not composed into the blob path; the signer is sign-only). This cut ships a **software** content-master (generated once, persisted in `federation_content_master`, **honest about being software** — the same posture `secrets/` takes on a no-TPM host). The **hardware-rooted** derivation (HKDF over a TPM/Keystore/Secure-Enclave-sealed seed under `content-at-rest-master-v1`, per `BLOB_ENCRYPTION_AT_REST.md` §4.3) is the production target and is the one remaining dependency — wiring the sealed seed through the `Engine` is a follow-up.
 
 ### Tests
 SQLite + live-PG: self/family cascade round-trip (ciphertext at rest ≠ plaintext; granted recipient reads plaintext; non-recipient → `NotGranted`; keyless occurrence fail-secure excluded with no grant row; no `holds_bytes` emitted), envelope + wrap unit round-trips. `-D warnings` + clippy + `cargo fmt` + `cargo check --no-default-features` + cargo-deny clean.
@@ -19736,7 +19736,7 @@ Building the #152 at-rest DEK cascade surfaced a load-bearing gap the FSD review
 - **`check_encryption_pubkeys`** admission — each half MUST base64-decode to its exact raw length (x25519 = 32 B, ML-KEM-768 = 1184 B); a malformed key is refused at admit.
 
 ### What this unblocks
-The #152 default-tier cascade can now wrap to recipients with registered encryption keys; #161 Asks 4–5 + #183's Self-DEK inherit it. **Still gated:** producers (agent) must actually register encryption keys (parallel work), and the `ENCRYPTED_AT_REST` at-rest content-encryption foundation is still unbuilt.
+The #152 default-tier cascade can now wrap to recipients with registered encryption keys; #161 Asks 4–5 + #183's Self-DEK inherit it. **Still gated:** producers (agent) must actually register encryption keys (parallel work), and the `BLOB_ENCRYPTION_AT_REST` at-rest content-encryption foundation is still unbuilt.
 
 ### Tests
 SQLite + live-PG: encryption-pubkeys round-trip, `resolve_encryption_keys` (present → keys; absent / unknown → `None` fail-secure), admission length-gate rejection. **1078 lib green on SQLite, 772 on live PG**; `-D warnings` + clippy + cargo-deny clean.

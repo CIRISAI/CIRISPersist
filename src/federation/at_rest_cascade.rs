@@ -81,7 +81,7 @@ pub const WRAP_ALGORITHM_V2: &str = "x25519_mlkem768_aes256_gcm_hkdf_sha256";
 /// **Stable wire constant** — changing it re-derives a different master
 /// and orphans every at-rest blob encrypted under the old one. Distinct
 /// from `secrets-store-master-v1` so content keys and secret-store keys
-/// are domain-separated (ENCRYPTED_AT_REST.md §4.3).
+/// are domain-separated (BLOB_ENCRYPTION_AT_REST.md §4.3).
 pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
 
 /// Error from the at-rest cascade crypto helpers.

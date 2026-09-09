@@ -79,7 +79,7 @@ CREATE INDEX federation_blob_key_grants_by_recipient
 -- is the hardware-rooted derivation (HKDF over a TPM/Keystore/Secure-
 -- Enclave-sealed seed via ciris_verify_core::derive_symmetric_key under
 -- CONTENT_MASTER_CONTEXT — the secrets-store root, distinct context), per
--- ENCRYPTED_AT_REST.md §4.3. Wiring that hardware seed through the Engine
+-- BLOB_ENCRYPTION_AT_REST.md §4.3. Wiring that hardware seed through the Engine
 -- is a follow-up (#152 P-next). Until then this single-row table holds a
 -- software content-master generated once on first encrypted write —
 -- HONEST about being software (key_kind='software'), exactly the
