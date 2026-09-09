@@ -8,116 +8,96 @@ threat-model citations because this crate's audit story is the point.
 ## [43.0.0] - 2026-09-09
 
 **Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from
-day one.** MAJOR: the write door refuses input that previously succeeded.
+day one — rebuilt to the shape where each guarantee is true by construction.**
+MAJOR: the write door refuses input that previously succeeded.
 
 `self`, `family`, `community` and `affiliations` are encrypted at rest and
 reachable end to end — store, read, rotate, sweep — from Rust and from Python.
 Commons tiers (`species` / `biosphere` / `federation`) stay plaintext, which is
 correct and is the signed build-manifest path.
 
-### Why MAJOR
+### The rebuild, and why
 
-`put_blob_signing_scoped` now refuses an unsealed body in any encrypted cohort.
-A caller that stored plaintext at those scopes yesterday is refused today.
-`External` and `ChunkDag` bodies are refused there too, with a distinct message:
-persist never dereferences an External URI and cannot see a ChunkDag's chunks
-from that door, so it cannot verify sealing — and cannot-verify must be a
-refusal, or the gate is a report.
+The first implementation of this feature (`fd43e74`, PR #827) was reviewed three
+ways — local code review (15 findings), Codex (8), cloud ultrareview (4) — and
+~17 verified issues clustered into ten root causes. They were one mistake in ten
+places: **each guarantee was a check at one site, and nothing made the check the
+only way through.** The headline write gate sat on a door with no production
+caller. Authorization lived inside two of three read branches. "Sealed" was an
+8-byte prefix test. "Destroyed" was a text column with every key wrap intact.
+The sweep satisfied its own precondition by zeroing the thing it then read. The
+rotate/sweep lifecycle had zero Engine facades and zero Python bindings while
+the CHANGELOG advertised both.
 
-### The root was declared and never implemented (§10.2)
+`FSD/BLOB_ENCRYPTION_AT_REST.md` §11 records the shape those guarantees need in
+order to be unbypassable, and fourteen invariants (§11.10) each falsifiable
+through a door a consumer actually holds. **Every invariant test was written
+first and confirmed red on `fd43e74`** — 10 of 11 behavioural/structural tests
+failed on the code they were written to catch; the eleventh was reframed once
+the state it constructed became unrepresentable.
 
-`at_rest_cascade`'s header described "hardware-rooted HKDF over the
-secrets-store sealed seed", and `CONTENT_MASTER_CONTEXT` had existed since #152
-with **zero call sites**. `content_master_key` did not exist; both backends
-generated a random software key. The software fallback was not a fallback — it
-was the only path, reached by default while the docs asserted otherwise.
+### What is true now, by construction (§11)
 
-It now derives through `ciris_verify_core::derive_symmetric_key` over the same
-sealed seed as the secrets store, separated by HKDF context alone.
+- **The blob row is the authority on its tier.** V139 adds
+  `federation_blobs.cohort_scope`; reads dispatch on it, **never on bytes**. A
+  commons document that happens to begin with the envelope magic is public; a
+  plaintext row under a private cohort is never served.
+- **One write door.** `Engine::put_blob_scoped` / `PyEngine.put_blob_scoped`
+  resolves the tier from the **directory** (the CC 4.4.3.2.1 infrastructure
+  carve-out is a property of the community record and its authority, not of a
+  label), seals where the tier requires it, and announces community content.
+  There is **no body-taking write at an encrypted cohort** — not plaintext, not
+  a magic prefix, not even a genuine envelope. The commons doors record
+  `federation` and cannot be pointed at a private cohort.
+- **One read door, and it authorizes before it dispatches.**
+  `read_blob_as(sha, viewer)`: row → authorize by tier → body once → parse the
+  envelope structurally → decrypt. A refusal names only the sha and the viewer.
+- **Destroy deletes key material, atomically.** `destroyed` sets the state,
+  NULLs the self-retention wrap and deletes every member grant in one
+  transaction, conditioned on zero bound objects. Bind is conditioned on
+  `enabled` in the same statement. **Bind and destroy are mutually exclusive by
+  statement** — the check/seal/bind race cannot strand content. V139's CHECK
+  makes "destroyed with a key" and "enabled without one" unrepresentable.
+- **The precondition destroy checks is the one it states**: no object **on
+  this node**. Recall of fountained copies is the tombstone plane's job.
+- **Eviction retracts what it announced** — a `withdraws` per `holds_bytes` this
+  node made under its own key, then delete (the `evict_actor` discipline). The
+  sweep is therefore an Engine operation with a signer.
+- **The lifecycle is on every surface**: `community_dek_set_key_state`,
+  `sweep_community_epochs`, `sweep_all_communities` — Engine and Python.
+- **The root never re-mints.** A re-derivation over an absent hardware seed
+  refuses, naming the consequence, instead of silently producing a different
+  master. Derived once per process on the blocking pool and cached.
+- **Every backend, every error.** The lifecycle harness covers the sweep on
+  sqlite **and** postgres from one function; every Python blob binding maps
+  `BlobError` through `blob_err_to_py`, keeping the `blob_not_granted` /
+  `blob_not_held` tokens callers branch on.
 
-- **The persisted row wins** — a `software` row survives hardware appearing.
-  Re-deriving would orphan every sealed blob *and* the content-KEM private
-  halves, which are sealed under that key.
-- **A `hardware` row with an unreachable seed is a hard error**, never a silent
-  re-mint over an undecryptable corpus.
+### Also fixed
 
-### Key state, rotation and the sweep (§10.5, §10.7, §10.9)
-
-Tink's keyset model adopted as a **pattern, not the crate** — `tink-rust` is
-unofficial, unsupported by Google's cryptography teams, and implements no
-cryptography of its own.
-
-`V138` adds `key_state` (`enabled`/`disabled`/`destroyed`), the
-`(community_key_id, epoch)` reverse index, and `retain_past_epochs`. No table is
-rebuilt.
-
-- **`disabled` is AV-70's ratified behaviour** — "once shared, always shared" —
-  now one state among three rather than the only option.
-- **`destroyed` amends AV-70** and is stronger than MLS or Tink offer, so its
-  precondition is enforced: an epoch may be destroyed only once its content is
-  re-sealed or evicted. Destroying a live epoch's key **orphans** content rather
-  than erasing it, and a destroy that cannot prove its precondition refuses.
-- The reverse index is what makes that precondition cheap to check. A
-  precondition expensive to verify is one that gets skipped, while the thing it
-  guards is irreversible. Measured: SCAN → SEARCH.
-- The background sweep disables rotated-past epochs, and evicts + destroys only
-  where `retain_past_epochs` authorizes it. Default is retain-indefinitely:
-  deletion is opt-in because it is irreversible.
-
-### Transfers ship the ciphertext — no re-encoding (§10.6)
-
-A blob is sealed **once**; the DEK is **wrapped** per recipient. `serve_blob_to_peer`
-returns the raw stored bytes and the at-rest address is `SHA-256` of the
-ciphertext, so dedup and fountain coding operate on sealed bytes and a relay can
-carry content it cannot read. Adding a recipient is one key wrap, never a
-reseal; rotation is O(members) in wraps, never O(corpus) in re-encryption.
-
-Pinned by the lifecycle harness — a decrypt/re-encrypt hop is otherwise
-invisible, since it returns the same plaintext to every viewer and passes every
-round-trip assertion while costing O(payload) per transfer at fan-out.
-
-### One read for consumers
-
-`read_blob_as(address, viewer)` — content address in, plaintext out. A server or
-agent needs no knowledge of cohort, DEK, epoch or grant; persist determines the
-path from the **data**, not from a caller-supplied label that could be wrong.
-
-Do not use `get_blob` / `get_blob_json` to read content: they return the stored
-body, which for the encrypted cohorts is ciphertext. Those exist for relaying
-bytes to peers.
-
-### Python surface
-
-Six new PyO3 bindings, all classified **deontic** — they decide who receives a
-DEK grant and enforce it on read, so a wrong entry is a security finding:
-`put_blob_encrypted_community`, `read_blob_for_community_viewer`,
-`put_blob_encrypted_self_family`, `get_blob_for_viewer`, `read_blob_as`.
-
-Before this cut the FFI had **no encrypted blob path at all**, so a Python
-consumer combined with the new write gate could store in no encrypted cohort by
-any route.
-
-### Fixed — six postgres tests that passed alone and failed together (#819)
-
-Their assertions depend on shared directory **state** — constitutional-root
-presence, roster size — which a neighbour in the same process database
-invalidates. CI green was luck of sharding. `test_pg::isolated_dsn()` gives an
-opt-in per-test database (one template copy, ~101 ms); six tests use it.
-Deliberately not the default.
-
-The mechanism originally filed on #819 was wrong (roster inflation only) and is
-corrected there.
+- `evict_scope_blobs` reachability and the six order-dependent postgres tests
+  (#819) carried over from the first pass; #819's originally filed mechanism was
+  wrong and is corrected on the issue.
+- The schema-parity replayer (`store::schema_parity`) could not read
+  `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL`, so its "nullability agrees"
+  line was true of its own model and false of the databases. V139 needs
+  `DROP NOT NULL`, so the replayer learnt both. It then surfaced **fourteen
+  real divergences** — `admitted_at` (V130) is NOT NULL on postgres and nullable
+  on sqlite across the federation tables (declared, filed as #828; no persist
+  write door admits a NULL on either backend) — and **three phantom
+  declarations** on `cirislens_derived.detection_events` that matched the
+  replayer's fiction, not the schema (V080 relaxed those columns on both
+  backends; deleted). A gate that reads DDL must understand every DDL the
+  migrations use, or it reports fiction.
 
 ### Witnesses
 
-A cross-backend lifecycle harness — create → encrypt → decrypt → **rotate** →
-forward secrecy → forward-only → key state → ciphertext-transfer → generic read
-— runs on sqlite and postgres from one shared function, so a diverging backend
-cannot pass with its own copy.
-
-Mutation-verified: the write gate, the DESTROY precondition, the mint gate, the
-sweep's retention policy, the sweep's current-epoch guard, forward secrecy, the
-ciphertext address, the generic read's authorization, and the #819 isolation.
+Fourteen invariants (§11.10), cross-backend where behavioural. Structural gates
+read the tree from disk: I8 (every lifecycle op reachable from Engine AND FFI),
+I13 (every blob binding routes through `blob_err_to_py`), I14 (the storage floor
+is reached only by the two cascades or with a literal commons scope). I11 drives
+the seed policy through a hardware-storage double, because the branch is
+unreachable on any TPM-less CI runner.
 
 ## [42.1.0] - 2026-09-08
 

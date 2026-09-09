@@ -303,6 +303,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // silently re-permitted sealing under a rotated-past epoch. The refusal is
     // what keeps a row-mapping failure from becoming a permission decision.
     ("parse_str", Class::Plumbing),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §11.4) — the community-DEK
+    // key-state door. PLUMBING, all three, and the reason is the same: the
+    // REFUSAL in `community_dek_set_key_state` is the conditional UPDATE
+    // itself (`… AND NOT EXISTS (bound objects)`), which is a statement, not
+    // a call. These reads run only AFTER that statement matched zero rows,
+    // to tell the caller WHICH of three causes applied; they decide nothing.
+    // `rollback` is the driver undoing the no-op transaction.
+    ("community_dek_key_state", Class::Plumbing),
+    ("community_dek_epoch_object_count", Class::Plumbing),
+    ("rollback", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

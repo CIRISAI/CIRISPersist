@@ -4937,6 +4937,166 @@ impl Engine {
         }
     }
 
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §11.2) — **THE write door.**
+    ///
+    /// Store `plaintext` at `cohort_scope`, and let the substrate decide
+    /// everything else. The caller supplies the cohort and, for
+    /// `community` / `affiliations`, WHICH community; it never supplies the
+    /// tier, and it never supplies sealed bytes.
+    ///
+    /// The tier is resolved from the DIRECTORY (`resolve_write_tier`):
+    /// - **Plaintext** (commons, or an AUTHORIZED infrastructure community —
+    ///   CC 4.4.3.2.1) → stored as given, `holds_bytes` announced, row
+    ///   records the scope;
+    /// - **InvisibleEncrypted** (`self` / `family`) → the self/family cascade:
+    ///   fresh DEK, wrapped to every active occurrence, no `holds_bytes`;
+    /// - **CommunityDek** → the community cascade under the current epoch DEK,
+    ///   wrapped to every active member, AND `holds_bytes` announced —
+    ///   community content federates with cleartext provenance, and the
+    ///   cascade alone never emitted the announcement it documented as the
+    ///   caller's job.
+    ///
+    /// There is no other consumer-reachable write that accepts an encrypted
+    /// cohort. The commons doors (`put_blob_signing`, `put_blob_json`) record
+    /// `federation` by construction and cannot be pointed at a private
+    /// cohort. That is what makes I1 (§11.10) true rather than checked.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_blob_scoped(
+        &self,
+        cohort_scope: &str,
+        community_key_id: Option<&str>,
+        plaintext: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<crate::federation::PutBlobScopedResult, crate::federation::BlobError> {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        let key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "put_blob_scoped: no local derived key: {e}"
+            ))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                put_blob_scoped(
+                    arc.as_ref(),
+                    &*self.signer,
+                    &key_id,
+                    cohort_scope,
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                put_blob_scoped(
+                    arc.as_ref(),
+                    &*self.signer,
+                    &key_id,
+                    cohort_scope,
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v43.0.0 (§11.6) — transition a community DEK epoch's key state.
+    /// Routes through `set_key_state`, which enforces the DESTROY
+    /// precondition at the door; the backend's conditional UPDATE enforces
+    /// it again by statement.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn community_dek_set_key_state(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        state: crate::federation::DekKeyState,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::community_dek::orchestrate::set_key_state;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                set_key_state(arc.as_ref(), community_key_id, epoch, state).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                set_key_state(arc.as_ref(), community_key_id, epoch, state).await
+            }
+        }
+    }
+
+    /// v43.0.0 (§11.6, §11.7) — sweep one community's rotated-past epochs:
+    /// disable, and where `retain_past_epochs` authorizes it, evict (with
+    /// `withdraws` for what this node announced — §11.5) and destroy.
+    ///
+    /// Needs the LocalSigner to hybrid-sign the withdraws; an Engine built
+    /// via `from_shared` has none and says so rather than deleting
+    /// unannounced.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_community_epochs(
+        &self,
+        community_key_id: &str,
+    ) -> Result<
+        crate::federation::community_dek::orchestrate::SweepReport,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::community_dek::orchestrate::sweep_rotated_epochs;
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "sweep_community_epochs requires a LocalSigner to hybrid-sign the withdraws \
+                 that retract this node's holds_bytes announcements (§11.5); this Engine has \
+                 none (constructed via from_shared)"
+                    .to_string(),
+            )
+        })?;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                sweep_rotated_epochs(arc.as_ref(), community_key_id, signer, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                sweep_rotated_epochs(arc.as_ref(), community_key_id, signer, now).await
+            }
+        }
+    }
+
+    /// v43.0.0 (§11.6) — the shape a scheduler calls: sweep every community
+    /// this node holds a DEK epoch record for. Per-community failures are
+    /// collected, not fatal — one community's refusal must not stop the
+    /// others' housekeeping.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_all_communities(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            Result<
+                crate::federation::community_dek::orchestrate::SweepReport,
+                crate::federation::BlobError,
+            >,
+        )>,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::BlobStorage;
+        let communities = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.community_dek_communities().await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.community_dek_communities().await?,
+        };
+        let mut out = Vec::with_capacity(communities.len());
+        for c in communities {
+            let r = self.sweep_community_epochs(&c).await;
+            out.push((c, r));
+        }
+        Ok(out)
+    }
+
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.1) — **store a blob
     /// encrypted under a community's current-epoch DEK.**
     ///

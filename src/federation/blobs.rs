@@ -366,6 +366,25 @@ impl DekKeyState {
     }
 }
 
+/// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — what
+/// [`Engine::put_blob_scoped`](crate::Engine::put_blob_scoped) returns,
+/// uniform across tiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutBlobScopedResult {
+    /// The content address — of the CIPHERTEXT for an encrypted tier.
+    pub at_rest_sha256: [u8; 32],
+    /// The tier the directory resolved for this write.
+    pub tier: crate::federation::types::cohort_scope::CryptoTier,
+    /// The community epoch sealed under (`CommunityDek` only).
+    pub epoch: Option<u64>,
+    /// Recipient occurrence key_ids that hold a grant (encrypted tiers).
+    pub granted: Vec<String>,
+    /// Recipients EXCLUDED fail-secure for carrying no valid
+    /// `encryption_pubkeys`. Never a plaintext fallback. A caller that
+    /// ignores this is ignoring who cannot read what it just wrote.
+    pub excluded: Vec<String>,
+}
+
 /// v4.1 (CIRISPersist#142, Cut A) — the result of a
 /// [`BlobStorage::get_blob_range`] byte-range read.
 ///
@@ -566,7 +585,28 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
+        cohort_scope: &str,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
+    /// with the row's `cohort_scope` recorded. `put_blob` itself is the
+    /// commons form (`federation`).
+    fn put_blob_with_scope(
+        &self,
+        sha256: &[u8; 32],
+        body: BlobBody,
+        media_type: Option<&str>,
+        attestation: PutBlobAttestation,
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (§11.1) — **the row is the authority on its tier.** The
+    /// `cohort_scope` recorded when the blob was stored, or `None` if the
+    /// blob is absent. Reads dispatch on this, never on the bytes.
+    fn blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, BlobError>> + Send;
 
     /// v4.1 (CIRISPersist#142, Cut B) — **atomic** chunked-blob upload.
     ///
@@ -866,6 +906,39 @@ pub trait BlobStorage: Send + Sync {
     where
         Self: Sync,
     {
+        // The commons form: records `federation` on the row (§11.1).
+        self.put_blob_signing_at(
+            crate::federation::types::cohort_scope::FEDERATION,
+            sha256,
+            body,
+            media_type,
+            attesting_key_id,
+            signer,
+            now,
+            attestation_id,
+        )
+    }
+
+    /// v43.0.0 (§11.1) — [`put_blob_signing`](Self::put_blob_signing) that
+    /// records an explicit `cohort_scope` on the row. Reached ONLY by the
+    /// commons wrapper and by the plaintext arm of
+    /// [`put_blob_signing_scoped`](Self::put_blob_signing_scoped); there is no
+    /// path through here for an encrypted tier.
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_signing_at<'s>(
+        &'s self,
+        cohort_scope: &'s str,
+        sha256: &'s [u8; 32],
+        body: BlobBody,
+        media_type: Option<&'s str>,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
         async move {
             use base64::engine::general_purpose::STANDARD as B64;
             use base64::Engine as _;
@@ -984,7 +1057,8 @@ pub trait BlobStorage: Send + Sync {
                 asserted_at: now,
             };
 
-            self.put_blob(sha256, body, media_type, att).await
+            self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope)
+                .await
         }
     }
 
@@ -1019,6 +1093,7 @@ pub trait BlobStorage: Send + Sync {
     fn put_blob_signing_scoped<'s>(
         &'s self,
         cohort_scope: &'s str,
+        community_key_id: Option<&'s str>,
         sha256: &'s [u8; 32],
         body: BlobBody,
         media_type: Option<&'s str>,
@@ -1028,40 +1103,48 @@ pub trait BlobStorage: Send + Sync {
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: Sync,
+        Self: crate::federation::FederationDirectory + Sync,
     {
         async move {
-            if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
-                return Err(BlobError::InvalidArgument(format!(
-                    "cohort_scope {cohort_scope:?} is not in the closed set \
-                     {{self, family, community, affiliations, species, biosphere, federation}}"
-                )));
-            }
-            // v43.0.0 (§10.8) — AN ENCRYPTED COHORT NEVER ACCEPTS AN
-            // UNSEALED BODY. Before any dispatch, before any storage.
-            //
-            // This runs first because the alternative is unrecoverable: a
-            // plaintext shard that reaches a peer cannot be recalled by any
-            // later rotation, and the tombstone plane cannot un-see it. The
-            // refusal has to happen while the bytes still exist in exactly
-            // one place.
-            crate::federation::at_rest_cascade::check_body_sealed_for_cohort(cohort_scope, &body)?;
-
-            if crate::federation::types::cohort_scope::suppresses_holds_bytes(cohort_scope) {
-                // Structurally invisible (CEG §10.1.4): store the bytes,
-                // announce nothing. No signer, no holds_bytes row.
-                self.store_blob_local(sha256, body, media_type).await
-            } else {
-                self.put_blob_signing(
-                    sha256,
-                    body,
-                    media_type,
-                    attesting_key_id,
-                    signer,
-                    now,
-                    attestation_id,
-                )
-                .await
+            // v43.0.0 (§11.2) — THE TIER IS RESOLVED FROM THE DIRECTORY,
+            // NEVER FROM THE CALLER. `community_key_id` is what lets the
+            // CC 4.4.3.2.1 infrastructure carve-out be applied to the actual
+            // community record and its authority, instead of to a label the
+            // caller asserts.
+            let tier = crate::federation::at_rest_cascade::resolve_write_tier(
+                self,
+                cohort_scope,
+                community_key_id,
+            )
+            .await?;
+            match tier {
+                crate::federation::types::cohort_scope::CryptoTier::Plaintext => {
+                    self.put_blob_signing_at(
+                        cohort_scope,
+                        sha256,
+                        body,
+                        media_type,
+                        attesting_key_id,
+                        signer,
+                        now,
+                        attestation_id,
+                    )
+                    .await
+                }
+                // v43.0.0 (§11.2, §11.10 I3) — THERE IS NO BODY-TAKING WRITE
+                // AT AN ENCRYPTED COHORT. Not plaintext, not a magic prefix,
+                // not even a genuine envelope: the substrate seals, through
+                // the cascade, which is the only caller of the storage floor.
+                // A door that accepted "already sealed" bytes on the caller's
+                // word would have to trust a marker — and the first
+                // implementation did exactly that, accepting 8 bytes of
+                // prefix as proof of encryption.
+                encrypted => Err(BlobError::InvalidArgument(format!(
+                    "cohort_scope {cohort_scope:?} resolves to {encrypted:?}, which is \
+                     encrypted at rest. Persist seals it — there is no body-taking write at \
+                     an encrypted cohort. Use `Engine::put_blob_scoped` with the plaintext \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.2)"
+                ))),
             }
         }
     }
@@ -1500,7 +1583,12 @@ pub trait BlobStorage: Send + Sync {
     /// `(community, epoch)`**, returning how many were removed.
     ///
     /// This is the destructive half of the sweep and it is deliberately
-    /// narrow: it removes this node's bytes and the epoch binding. It does
+    /// narrow: it removes this node's bytes and the epoch binding, after
+    /// emitting a `withdraws` for each `holds_bytes` this node announced
+    /// **under its own signing key** (§11.5). An announcement made under some
+    /// other attesting key — the FFI's `put_blob_signing` lets a caller name
+    /// one — is that key's holder's to retract; this node cannot sign a
+    /// withdraws for it and does not pretend to. It does
     /// **not** recall copies already fountained to peers — rotation is not
     /// recall (§10.6), and the mechanism that reaches other holders is the
     /// tombstone plane, not this call. A caller that treats this as erasure
@@ -1513,6 +1601,8 @@ pub trait BlobStorage: Send + Sync {
         &self,
         community_key_id: &str,
         epoch: u64,
+        signer: &crate::signing::LocalSigner,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 
     /// v43.0.0 (§10.7) — the community's past-epoch retention policy.
@@ -1527,6 +1617,20 @@ pub trait BlobStorage: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> impl Future<Output = Result<Option<u64>, BlobError>> + Send;
+
+    /// v43.0.0 (§11.6) — every community this node holds a DEK epoch record
+    /// for. The sweep's enumeration: exactly the set with anything to sweep.
+    fn community_dek_communities(
+        &self,
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — set the community's past-epoch retention policy.
+    /// `None` restores retain-indefinitely.
+    fn community_dek_set_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+        retain: Option<u64>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243 parts 1+2) ───────
     //   scope-native privacy: a store for caller-pre-encrypted

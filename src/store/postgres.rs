@@ -12691,6 +12691,25 @@ impl crate::federation::BlobStorage for PostgresBackend {
         media_type: Option<&str>,
         attestation: crate::federation::PutBlobAttestation,
     ) -> Result<(), crate::federation::BlobError> {
+        self.put_blob_with_scope(
+            sha256,
+            body,
+            media_type,
+            attestation,
+            crate::federation::types::cohort_scope::FEDERATION,
+        )
+        .await
+    }
+
+    async fn put_blob_with_scope(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        attestation: crate::federation::PutBlobAttestation,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let scope = cohort_scope.to_owned();
         // v3.4.0 (CIRISPersist#123) — admission ordering:
         //   1. empty-string → InvalidArgument
         //   2. trust-threshold → TrustBelowThreshold
@@ -12807,8 +12826,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let sha_vec = sha256.to_vec();
         tx.execute(
             "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-             ) VALUES ($1, $2, $3, $4, $5, $6) \
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (sha256) DO NOTHING",
             &[
                 &sha_vec,
@@ -12817,6 +12836,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 &external_ref_opt,
                 &size_bytes_i64,
                 &media_type,
+                &scope,
             ],
         )
         .await
@@ -12918,12 +12938,40 @@ impl crate::federation::BlobStorage for PostgresBackend {
     // for cohort_scope self/family). Same byte-validation as put_blob;
     // no attestation, no admission gate (local content is the
     // operator's own data — #149 anti-rec).
+    async fn blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT cohort_scope FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("blob_cohort_scope: {e}"))
+            })?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(r.safe_get_with::<String, _, _, _>(
+                "cohort_scope",
+                crate::federation::BlobError::Backend,
+            )?)),
+        }
+    }
+
     async fn store_blob_local(
         &self,
         sha256: &[u8; 32],
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
+        cohort_scope: &str,
     ) -> Result<(), crate::federation::BlobError> {
+        let scope = cohort_scope.to_owned();
         // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
         // put_blob_chunks, never store_blob_local.
         if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
@@ -12964,8 +13012,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         client
             .execute(
                 "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (sha256) DO NOTHING",
                 &[
                     &sha_vec,
@@ -12974,7 +13022,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &external_ref_opt,
                     &size_bytes_i64,
                     &media_type,
-                ],
+                &scope,
+            ],
             )
             .await
             .map_err(|e| {
@@ -13187,9 +13236,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         match row {
             None => Ok(None),
             Some(r) => {
-                let wrapped: String =
+                // NULL ⇔ destroyed (V139's CHECK): the key material is gone.
+                let wrapped: Option<String> =
                     r.safe_get_with("wrapped_dek", crate::federation::BlobError::Backend)?;
-                Ok(Some(wrapped))
+                Ok(wrapped)
             }
         }
     }
@@ -13294,19 +13344,41 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let sha_vec = at_rest_sha256.to_vec();
-        let ep = epoch as i64;
-        client
+        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
+        // v43.0.0 (§11.4) — conditional on `enabled`, in the statement.
+        let n = client
             .execute(
-                "INSERT INTO cirislens.federation_community_blob_epoch (\
-                    at_rest_sha256, community_key_id, epoch\
-                 ) VALUES ($1, $2, $3) \
+                "INSERT INTO cirislens.federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
+                 SELECT $1, $2, $3 \
+                  WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                                 WHERE community_key_id = $2 AND epoch = $3 \
+                                   AND key_state = 'enabled') \
                  ON CONFLICT (at_rest_sha256) DO NOTHING",
                 &[&sha_vec, &community_key_id, &ep],
             )
             .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("community_dek_bind_blob_epoch: {e}"))
-            })?;
+            .map_err(|e| crate::federation::BlobError::Backend(format!("bind_blob_epoch: {e}")))?;
+        if n == 0 {
+            let row = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1) AS e",
+                    &[&sha_vec],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("bind_blob_epoch check: {e}"))
+                })?;
+            let already: bool =
+                row.safe_get_with::<bool, _, _, _>("e", crate::federation::BlobError::Backend)?;
+            if !already {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} epoch {epoch} is not enabled — refusing to \
+                     bind a blob to it. A rotated or destroyed epoch accepts no new content \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -13348,28 +13420,85 @@ impl crate::federation::BlobStorage for PostgresBackend {
         epoch: u64,
         state: crate::federation::DekKeyState,
     ) -> Result<(), crate::federation::BlobError> {
-        let client = self
+        use crate::federation::DekKeyState;
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
-        let token = state.as_str();
-        let n = client
-            .execute(
+        let destroying = state == DekKeyState::Destroyed;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("set_key_state tx: {e}")))?;
+        // v43.0.0 (§11.4) — see the SQLite twin: destroy is one conditional
+        // statement that also deletes the key; bind's EXISTS(enabled) is the
+        // other half of the exclusion.
+        let n = if destroying {
+            tx.execute(
+                "UPDATE cirislens.federation_community_dek \
+                    SET key_state = 'destroyed', wrapped_dek = NULL \
+                  WHERE community_key_id = $1 AND epoch = $2 \
+                    AND key_state <> 'destroyed' \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                         WHERE community_key_id = $1 AND epoch = $2)",
+                &[&community_key_id, &ep],
+            )
+            .await
+        } else {
+            let token = state.as_str();
+            tx.execute(
                 "UPDATE cirislens.federation_community_dek SET key_state = $3 \
-                 WHERE community_key_id = $1 AND epoch = $2",
+                  WHERE community_key_id = $1 AND epoch = $2 AND key_state <> 'destroyed'",
                 &[&community_key_id, &ep, &token],
             )
             .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("community_dek_set_key_state: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "no community DEK at ({community_key_id:?}, epoch {epoch}) to set state on"
-            )));
         }
-        Ok(())
+        .map_err(|e| crate::federation::BlobError::Backend(format!("set_key_state: {e}")))?;
+        if n == 0 {
+            let _ = tx.rollback().await;
+            return match self
+                .community_dek_key_state(community_key_id, epoch)
+                .await?
+            {
+                None => Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "no community DEK at ({community_key_id:?}, epoch {epoch})"
+                ))),
+                Some(DekKeyState::Destroyed) => {
+                    Err(crate::federation::BlobError::InvalidArgument(format!(
+                        "community {community_key_id:?} epoch {epoch} is destroyed; the key \
+                         material is gone and no state transition brings it back"
+                    )))
+                }
+                Some(_) if destroying => {
+                    let n = self
+                        .community_dek_epoch_object_count(community_key_id, epoch)
+                        .await?;
+                    Err(crate::federation::BlobError::InvalidArgument(format!(
+                        "refusing to destroy community {community_key_id:?} epoch {epoch}: {n} \
+                         object(s) on this node are still sealed under it. Destroying the DEK \
+                         would ORPHAN them, not erase them — re-seal or evict first \
+                         (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+                    )))
+                }
+                Some(_) => Ok(()),
+            };
+        }
+        if destroying {
+            tx.execute(
+                "DELETE FROM cirislens.federation_community_dek_member_grants \
+                  WHERE community_key_id = $1 AND epoch = $2",
+                &[&community_key_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("destroy: delete grants: {e}"))
+            })?;
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("set_key_state commit: {e}"))
+        })
     }
 
     async fn community_dek_epoch_object_count(
@@ -13432,6 +13561,57 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }
     }
 
+    async fn community_dek_communities(&self) -> Result<Vec<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT community_key_id FROM cirislens.federation_community_dek_epoch \
+                 ORDER BY community_key_id",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_communities: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                r.safe_get_with::<String, _, _, _>(
+                    "community_key_id",
+                    crate::federation::BlobError::Backend,
+                )
+            })
+            .collect()
+    }
+
+    async fn community_dek_set_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+        retain: Option<u64>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let v: Option<i32> = retain.and_then(|n| i32::try_from(n).ok());
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_dek_epoch (community_key_id, epoch, retain_past_epochs) \
+                 VALUES ($1, 0, $2) \
+                 ON CONFLICT (community_key_id) DO UPDATE SET retain_past_epochs = EXCLUDED.retain_past_epochs",
+                &[&community_key_id, &v],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_set_retain_past_epochs: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn community_dek_epochs(
         &self,
         community_key_id: &str,
@@ -13470,52 +13650,89 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         community_key_id: &str,
         epoch: u64,
+        signer: &crate::signing::LocalSigner,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::federation::BlobError> {
-        let mut client = self
+        use crate::federation::FederationDirectory as _;
+        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
+        let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
-        // One transaction: the bytes and the binding go together, or a
-        // half-applied eviction leaves the object count disagreeing with
-        // reality — and the DESTROY precondition reads that count.
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch tx: {e}")))?;
-        let shas = tx
+        let rows = client
             .query(
                 "SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
-                 WHERE community_key_id = $1 AND epoch = $2",
+                  WHERE community_key_id = $1 AND epoch = $2",
                 &[&community_key_id, &ep],
             )
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("evict epoch select: {e}"))
             })?;
-        for row in &shas {
-            let sha: Vec<u8> = row.safe_get_with::<Vec<u8>, _, _, _>(
+        let mut sha_hexes = std::collections::HashSet::new();
+        for r in &rows {
+            let v: Vec<u8> = r.safe_get_with::<Vec<u8>, _, _, _>(
                 "at_rest_sha256",
                 crate::federation::BlobError::Backend,
             )?;
-            tx.execute(
-                "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
-                &[&sha],
-            )
+            sha_hexes.insert(hex::encode(v));
+        }
+        if sha_hexes.is_empty() {
+            return Ok(0);
+        }
+        // v43.0.0 (§11.5) — retract, then delete. See the SQLite twin.
+        let node = signer.derived_key_id();
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let announced: Vec<crate::federation::Attestation> = self
+            .list_attestations_by(&node)
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("evict epoch blob delete: {e}"))
-            })?;
+                crate::federation::BlobError::Backend(format!(
+                    "evict epoch: list_attestations_by: {e}"
+                ))
+            })?
+            .into_iter()
+            .filter(|a| a.attestation_type.starts_with(prefix))
+            .filter(|a| {
+                a.attestation_envelope
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|h| sha_hexes.contains(h))
+            })
+            .collect();
+        for prior in &announced {
+            let _ = crate::federation::blobs::emit_withdraws_attestation_helper(
+                prior, &node, signer, self, now,
+            )
+            .await;
         }
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch tx: {e}")))?;
+        tx.execute(
+            "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
+                SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
+                 WHERE community_key_id = $1 AND epoch = $2)",
+            &[&community_key_id, &ep],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch blobs: {e}")))?;
         let n = tx
             .execute(
                 "DELETE FROM cirislens.federation_community_blob_epoch \
-                 WHERE community_key_id = $1 AND epoch = $2",
+                  WHERE community_key_id = $1 AND epoch = $2",
                 &[&community_key_id, &ep],
             )
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("evict epoch binding delete: {e}"))
+                crate::federation::BlobError::Backend(format!("evict epoch binding: {e}"))
             })?;
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("evict epoch commit: {e}"))
@@ -13787,7 +14004,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
 
         // No row yet: free to take the hardware root, and this is the only
         // moment that choice is free.
-        let (kind, key_b64, descriptor) = match content_master_key() {
+        let (kind, key_b64, descriptor) = match content_master_key(true) {
             ContentMasterSource::Hardware { descriptor, .. } => {
                 ("hardware", None::<String>, descriptor)
             }
@@ -23194,7 +23411,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn operational_id_replay_refused_postgres_658() {
-        let Some(dsn) = pg_dsn() else {
+        let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
@@ -23412,6 +23629,121 @@ mod tests {
             &backend, &me, &tag,
         )
         .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i2_reads_dispatch_on_the_row_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i2_reads_dispatch_on_the_row(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i3_no_body_taking_write_at_an_encrypted_cohort_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i3_no_body_taking_write_at_an_encrypted_cohort(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i4a_read_door_authorizes_before_dispatch_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i4a_read_door_authorizes_before_dispatch(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i4b_refusal_does_not_name_the_binding_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i4b_refusal_does_not_name_the_binding(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i5_destroy_deletes_key_material_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i5_destroy_deletes_key_material(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i6_bind_and_destroy_exclude_each_other_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i6_bind_and_destroy_exclude_each_other(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i9_eviction_retracts_announcement_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i9_eviction_retracts_announcement(&backend, &tag).await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn blob_invariant_i10_infra_carveout_resolved_from_directory_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i10_infra_carveout_resolved_from_directory(&backend, &tag).await;
     }
 
     /// v43.0.0 (§10) — **the full cohort lifecycle on POSTGRES.**
@@ -31580,7 +31912,12 @@ mod tests {
         let bytes = pg_blob_payload("local-only");
         let sha = pg_sha256_of(&bytes);
         backend
-            .store_blob_local(&sha, BlobBody::Inline(bytes.clone()), None)
+            .store_blob_local(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                crate::federation::types::cohort_scope::FEDERATION,
+            )
             .await
             .expect("store_blob_local");
         // Bytes readable locally.

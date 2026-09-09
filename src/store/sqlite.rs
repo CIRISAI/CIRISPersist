@@ -11819,6 +11819,26 @@ impl crate::federation::BlobStorage for SqliteBackend {
         media_type: Option<&str>,
         attestation: crate::federation::PutBlobAttestation,
     ) -> Result<(), crate::federation::BlobError> {
+        // The commons form (§11.1): records `federation`.
+        self.put_blob_with_scope(
+            sha256,
+            body,
+            media_type,
+            attestation,
+            crate::federation::types::cohort_scope::FEDERATION,
+        )
+        .await
+    }
+
+    async fn put_blob_with_scope(
+        &self,
+        sha256: &[u8; 32],
+        body: crate::federation::BlobBody,
+        media_type: Option<&str>,
+        attestation: crate::federation::PutBlobAttestation,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let scope = cohort_scope.to_owned();
         // v3.4.0 (CIRISPersist#123) — admission ordering:
         //   1. empty-string → InvalidArgument
         //   2. trust-threshold → TrustBelowThreshold
@@ -11950,8 +11970,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             tx.execute(
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
+                    last_accessed_at, access_count, cohort_scope\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8) \
                  ON CONFLICT (sha256) DO NOTHING",
                 rusqlite::params![
                     sha_vec,
@@ -11961,6 +11981,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     size_bytes_i64,
                     media_type_owned,
                     now_iso,
+                    scope,
                 ],
             )?;
             // v36.0.0 (#668) — serve position (V130), inside the same
@@ -12027,12 +12048,32 @@ impl crate::federation::BlobStorage for SqliteBackend {
     // for cohort_scope self/family). Same byte-validation as put_blob;
     // no attestation, no admission gate (local content is the
     // operator's own data — #149 anti-rec).
+    async fn blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        let conn = self.conn.clone();
+        let sha_vec = sha256.to_vec();
+        (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT cohort_scope FROM federation_blobs WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("blob_cohort_scope: {e}")))
+    }
+
     async fn store_blob_local(
         &self,
         sha256: &[u8; 32],
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
+        cohort_scope: &str,
     ) -> Result<(), crate::federation::BlobError> {
+        let scope = cohort_scope.to_owned();
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -12078,8 +12119,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             conn.execute(
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
+                    last_accessed_at, access_count, cohort_scope\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8) \
                  ON CONFLICT (sha256) DO NOTHING",
                 rusqlite::params![
                     sha_vec,
@@ -12089,6 +12130,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     size_bytes_i64,
                     media_type_owned,
                     now_iso,
+                    scope,
                 ],
             )?;
             Ok(())
@@ -12262,20 +12304,20 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let community = community_key_id.to_owned();
         let ep = epoch as i64;
         let conn = self.conn.clone();
-        let row = (move || -> Result<Option<String>, rusqlite::Error> {
+        let row = (move || -> Result<Option<Option<String>>, rusqlite::Error> {
             let conn = conn.lock();
             conn.query_row(
                 "SELECT wrapped_dek FROM federation_community_dek \
                  WHERE community_key_id = ?1 AND epoch = ?2",
                 rusqlite::params![community, ep],
-                |r| r.get::<_, String>(0),
+                |r| r.get::<_, Option<String>>(0),
             )
             .optional()
         })()
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("community_dek_get_self_retention: {e}"))
         })?;
-        Ok(row)
+        Ok(row.flatten())
     }
 
     async fn community_dek_put_member_grant(
@@ -12369,24 +12411,40 @@ impl crate::federation::BlobStorage for SqliteBackend {
         community_key_id: &str,
         epoch: u64,
     ) -> Result<(), crate::federation::BlobError> {
+        let conn = self.conn.clone();
         let sha_vec = at_rest_sha256.to_vec();
         let community = community_key_id.to_owned();
-        let ep = epoch as i64;
-        let conn = self.conn.clone();
-        (move || -> Result<(), rusqlite::Error> {
+        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
+        let (inserted, already) = (move || -> Result<(usize, bool), rusqlite::Error> {
             let conn = conn.lock();
-            conn.execute(
-                "INSERT INTO federation_community_blob_epoch (\
-                    at_rest_sha256, community_key_id, epoch\
-                 ) VALUES (?1, ?2, ?3) \
+            // v43.0.0 (§11.4) — BIND IS CONDITIONAL ON `enabled`, in the same
+            // statement. The other half of the bind/destroy exclusion.
+            let n = conn.execute(
+                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
+                 SELECT ?1, ?2, ?3 \
+                  WHERE EXISTS (SELECT 1 FROM federation_community_dek \
+                                 WHERE community_key_id = ?2 AND epoch = ?3 \
+                                   AND key_state = 'enabled') \
                  ON CONFLICT (at_rest_sha256) DO NOTHING",
                 rusqlite::params![sha_vec, community, ep],
             )?;
-            Ok(())
+            let already: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1)",
+                rusqlite::params![sha_vec],
+                |r| r.get(0),
+            )?;
+            Ok((n, already))
         })()
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("community_dek_bind_blob_epoch: {e}"))
         })?;
+        if inserted == 0 && !already {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "community {community_key_id:?} epoch {epoch} is not enabled — refusing to bind \
+                 a blob to it. A rotated or destroyed epoch accepts no new content \
+                 (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+            )));
+        }
         Ok(())
     }
 
@@ -12421,27 +12479,89 @@ impl crate::federation::BlobStorage for SqliteBackend {
         epoch: u64,
         state: crate::federation::DekKeyState,
     ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::DekKeyState;
         let conn = self.conn.clone();
         let comm = community_key_id.to_owned();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let token = state.as_str();
-        let n = (move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.lock();
-            conn.execute(
-                "UPDATE federation_community_dek SET key_state = ?3 \
-                 WHERE community_key_id = ?1 AND epoch = ?2",
-                rusqlite::params![comm, ep, token],
-            )
+        let destroying = state == DekKeyState::Destroyed;
+        let applied = (move || -> Result<bool, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let n = if destroying {
+                // v43.0.0 (§11.4) — DESTROY IS ONE STATEMENT, CONDITIONED ON
+                // ZERO BOUND OBJECTS, AND IT DELETES THE KEY. The NOT EXISTS
+                // is what makes bind-vs-destroy mutually exclusive by
+                // statement: a bind that committed first makes this UPDATE
+                // match zero rows, and this UPDATE committing first makes the
+                // bind's own EXISTS(enabled) fail. No lock spans a
+                // check/seal/bind sequence because the check IS the write.
+                tx.execute(
+                    "UPDATE federation_community_dek \
+                        SET key_state = 'destroyed', wrapped_dek = NULL \
+                      WHERE community_key_id = ?1 AND epoch = ?2 \
+                        AND key_state <> 'destroyed' \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM federation_community_blob_epoch \
+                             WHERE community_key_id = ?1 AND epoch = ?2)",
+                    rusqlite::params![comm, ep],
+                )?
+            } else {
+                tx.execute(
+                    "UPDATE federation_community_dek SET key_state = ?3 \
+                      WHERE community_key_id = ?1 AND epoch = ?2 \
+                        AND key_state <> 'destroyed'",
+                    rusqlite::params![comm, ep, token],
+                )?
+            };
+            if n == 0 {
+                tx.rollback()?;
+                return Ok(false);
+            }
+            if destroying {
+                // Every wrap goes with the state, in the same transaction.
+                tx.execute(
+                    "DELETE FROM federation_community_dek_member_grants \
+                      WHERE community_key_id = ?1 AND epoch = ?2",
+                    rusqlite::params![comm, ep],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
         })()
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("community_dek_set_key_state: {e}"))
         })?;
-        if n == 0 {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "no community DEK at ({community_key_id:?}, epoch {epoch}) to set state on"
-            )));
+        if applied {
+            return Ok(());
         }
-        Ok(())
+        // Zero rows: say which of the three causes, for the caller.
+        match self
+            .community_dek_key_state(community_key_id, epoch)
+            .await?
+        {
+            None => Err(crate::federation::BlobError::InvalidArgument(format!(
+                "no community DEK at ({community_key_id:?}, epoch {epoch})"
+            ))),
+            Some(DekKeyState::Destroyed) => {
+                Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} epoch {epoch} is destroyed; the key \
+                     material is gone and no state transition brings it back"
+                )))
+            }
+            Some(_) if destroying => {
+                let n = self
+                    .community_dek_epoch_object_count(community_key_id, epoch)
+                    .await?;
+                Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "refusing to destroy community {community_key_id:?} epoch {epoch}: {n} \
+                     object(s) on this node are still sealed under it. Destroying the DEK \
+                     would ORPHAN them, not erase them — re-seal or evict first \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+                )))
+            }
+            Some(_) => Ok(()),
+        }
     }
 
     async fn community_dek_epoch_object_count(
@@ -12490,6 +12610,48 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(v.flatten().and_then(|n| u64::try_from(n).ok()))
     }
 
+    async fn community_dek_communities(&self) -> Result<Vec<String>, crate::federation::BlobError> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut st = conn.prepare(
+                "SELECT community_key_id FROM federation_community_dek_epoch ORDER BY community_key_id",
+            )?;
+            let out: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_communities: {e}"))
+        })
+    }
+
+    async fn community_dek_set_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+        retain: Option<u64>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let conn = self.conn.clone();
+        let comm = community_key_id.to_owned();
+        let v: Option<i64> = retain.and_then(|n| i64::try_from(n).ok());
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, retain_past_epochs) \
+                 VALUES (?1, 0, ?2) \
+                 ON CONFLICT (community_key_id) DO UPDATE SET retain_past_epochs = excluded.retain_past_epochs",
+                rusqlite::params![comm, v],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_set_retain_past_epochs: {e}"
+            ))
+        })
+    }
+
     async fn community_dek_epochs(
         &self,
         community_key_id: &str,
@@ -12522,40 +12684,90 @@ impl crate::federation::BlobStorage for SqliteBackend {
         &self,
         community_key_id: &str,
         epoch: u64,
+        signer: &crate::signing::LocalSigner,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::federation::BlobError> {
+        use crate::federation::FederationDirectory as _;
+        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
+
+        // 1. What is sealed at this epoch (served by V138's reverse index).
+        let sha_hexes: std::collections::HashSet<String> = {
+            let conn = self.conn.clone();
+            let comm = community_key_id.to_owned();
+            (move || -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut st = conn.prepare(
+                    "SELECT at_rest_sha256 FROM federation_community_blob_epoch \
+                      WHERE community_key_id = ?1 AND epoch = ?2",
+                )?;
+                let out: Vec<Vec<u8>> = st
+                    .query_map(rusqlite::params![comm, ep], |r| r.get::<_, Vec<u8>>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(out)
+            })()
+            .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch select: {e}")))?
+            .iter()
+            .map(hex::encode)
+            .collect()
+        };
+        if sha_hexes.is_empty() {
+            return Ok(0);
+        }
+
+        // 2. v43.0.0 (§11.5) — RETRACT WHAT WE ANNOUNCED, THEN DELETE. The
+        //    `evict_actor` discipline: a withdraws per local holds_bytes row
+        //    for these bytes, fail-honest (an orphan withdraws is better than
+        //    a missing one, so deletion proceeds regardless).
+        let node = signer.derived_key_id();
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        let announced: Vec<crate::federation::Attestation> = self
+            .list_attestations_by(&node)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "evict epoch: list_attestations_by: {e}"
+                ))
+            })?
+            .into_iter()
+            .filter(|a| a.attestation_type.starts_with(prefix))
+            .filter(|a| {
+                a.attestation_envelope
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|h| sha_hexes.contains(h))
+            })
+            .collect();
+        for prior in &announced {
+            let _ = crate::federation::blobs::emit_withdraws_attestation_helper(
+                prior, &node, signer, self, now,
+            )
+            .await;
+        }
+
+        // 3. One transaction, TWO statements — not one per object — and the
+        //    connection mutex is held only for these.
         let conn = self.conn.clone();
         let comm = community_key_id.to_owned();
-        let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let n = (move || -> Result<usize, rusqlite::Error> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
-            // The bytes and the binding go together, in one transaction: a
-            // half-applied eviction would leave the object count disagreeing
-            // with reality, and the DESTROY precondition reads that count.
-            {
-                let mut st = tx.prepare(
-                    "SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                     WHERE community_key_id = ?1 AND epoch = ?2",
-                )?;
-                let shas: Vec<Vec<u8>> = st
-                    .query_map(rusqlite::params![comm, ep], |r| r.get::<_, Vec<u8>>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                drop(st);
-                for sha in &shas {
-                    tx.execute("DELETE FROM federation_blobs WHERE sha256 = ?1", [sha])?;
-                }
-            }
+            tx.execute(
+                "DELETE FROM federation_blobs WHERE sha256 IN ( \
+                    SELECT at_rest_sha256 FROM federation_community_blob_epoch \
+                     WHERE community_key_id = ?1 AND epoch = ?2)",
+                rusqlite::params![comm, ep],
+            )?;
             let n = tx.execute(
                 "DELETE FROM federation_community_blob_epoch \
-                 WHERE community_key_id = ?1 AND epoch = ?2",
+                  WHERE community_key_id = ?1 AND epoch = ?2",
                 rusqlite::params![comm, ep],
             )?;
             tx.commit()?;
             Ok(n)
         })()
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("community_dek_evict_epoch_objects: {e}"))
-        })?;
+        .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch delete: {e}")))?;
         Ok(n as u64)
     }
 
@@ -12819,7 +13031,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
         // No row yet: this node has sealed nothing, so it is free to take the
         // hardware root. This is the ONLY moment that choice is free.
-        let (kind, key_b64, descriptor) = match content_master_key() {
+        let (kind, key_b64, descriptor) = match content_master_key(true) {
             ContentMasterSource::Hardware { descriptor, .. } => ("hardware", None, descriptor),
             ContentMasterSource::SoftwareFallback { reason } => {
                 let fresh = ciris_crypto::random::bytes(32).map_err(|e| {
@@ -27222,6 +27434,80 @@ mod tests {
         )
     }
 
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i2_reads_dispatch_on_the_row_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i2_reads_dispatch_on_the_row(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i3_no_body_taking_write_at_an_encrypted_cohort_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i3_no_body_taking_write_at_an_encrypted_cohort(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i4a_read_door_authorizes_before_dispatch_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i4a_read_door_authorizes_before_dispatch(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i4b_refusal_does_not_name_the_binding_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i4b_refusal_does_not_name_the_binding(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i5_destroy_deletes_key_material_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i5_destroy_deletes_key_material(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i6_bind_and_destroy_exclude_each_other_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i6_bind_and_destroy_exclude_each_other(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i9_eviction_retracts_announcement_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i9_eviction_retracts_announcement(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 invariant — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i10_infra_carveout_resolved_from_directory_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i10_infra_carveout_resolved_from_directory(&backend, "sqlite")
+            .await;
+    }
+
     /// v43.0.0 (§10) — **the full cohort lifecycle on sqlite.**
     ///
     /// create -> encrypt -> decrypt -> ROTATE -> encrypt -> forward secrecy
@@ -27261,7 +27547,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = sweep_rotated_epochs(&backend, "comm").await.unwrap();
+        let sweeper = test_signer_for("sweeper");
+        let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
 
         assert_eq!(
             report.disabled,
@@ -27329,7 +27618,10 @@ mod tests {
             .unwrap();
         }
 
-        let report = sweep_rotated_epochs(&backend, "comm").await.unwrap();
+        let sweeper = test_signer_for("sweeper");
+        let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(
             report.evicted_objects, 1,
             "the old epoch's object is evicted"
@@ -34423,7 +34715,12 @@ mod tests {
         let bytes = b"family photo".to_vec();
         let sha = sha256_of(&bytes);
         backend
-            .store_blob_local(&sha, BlobBody::Inline(bytes.clone()), None)
+            .store_blob_local(
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                crate::federation::types::cohort_scope::FEDERATION,
+            )
             .await
             .unwrap();
         // Bytes are stored + readable locally.
@@ -34435,40 +34732,6 @@ mod tests {
         assert!(
             backend.list_holders(&sha).await.unwrap().is_empty(),
             "self/family content must emit no holds_bytes attestation"
-        );
-    }
-
-    /// put_blob_signing_scoped("self", ...) dispatches to local-only
-    /// storage: bytes stored, no holds_bytes, signer never consulted.
-    ///
-    /// v43.0.0 (§10.8) — the body is now SEALED before it is stored. `self`
-    /// is an encrypted cohort, and the write door refuses an unsealed body
-    /// there. The suppression property under test is unchanged; what
-    /// changed is that reaching it with plaintext is no longer possible.
-    #[tokio::test]
-    async fn put_blob_signing_scoped_self_suppresses_holds_bytes() {
-        use crate::federation::BlobStorage;
-        let backend = blob_test_backend().await;
-        let signer = test_signer_for("host-a");
-        let bytes = sealed_body_for_test(b"self journal entry");
-        let sha = sha256_of(&bytes);
-        backend
-            .put_blob_signing_scoped(
-                crate::federation::types::cohort_scope::SELF,
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                "host-a",
-                &blob_signer(&signer),
-                chrono::Utc::now(),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .unwrap();
-        assert!(backend.has_blob(&sha).await.unwrap());
-        assert!(
-            backend.list_holders(&sha).await.unwrap().is_empty(),
-            "cohort_scope=self must not announce holds_bytes"
         );
     }
 
@@ -34484,6 +34747,7 @@ mod tests {
         backend
             .put_blob_signing_scoped(
                 crate::federation::types::cohort_scope::FEDERATION,
+                None,
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
@@ -34498,101 +34762,6 @@ mod tests {
             backend.list_holders(&sha).await.unwrap(),
             vec!["host-a".to_string()],
             "cohort_scope=federation must announce holds_bytes"
-        );
-    }
-
-    /// v43.0.0 (§10.8) — produce a body that carries the at-rest envelope
-    /// magic, so an encrypted-cohort write door accepts it.
-    ///
-    /// Deliberately builds a REAL [`AtRestEnvelope`] rather than prepending
-    /// the magic bytes by hand: a test that fakes the marker would keep
-    /// passing if the envelope format changed underneath it, which is the
-    /// witness measuring itself instead of the code.
-    fn sealed_body_for_test(plaintext: &[u8]) -> Vec<u8> {
-        use crate::federation::at_rest_cascade::{fresh_dek, seal};
-        let dek = fresh_dek().expect("dek");
-        seal(&dek, plaintext).expect("seal").to_bytes()
-    }
-
-    /// v43.0.0 (§10.8) — **an encrypted cohort refuses a plaintext body.**
-    ///
-    /// The headline gate. Every encrypted cohort, one assertion each,
-    /// because a gate that fires for `self` and not for `affiliations`
-    /// would look identical from any single-cohort test.
-    ///
-    /// Mutation check performed: removing the
-    /// `check_body_sealed_for_cohort` call from `put_blob_signing_scoped`
-    /// turns all four arms green-to-red.
-    #[tokio::test]
-    async fn encrypted_cohorts_refuse_a_plaintext_body_818() {
-        use crate::federation::types::cohort_scope::{AFFILIATIONS, COMMUNITY, FAMILY, SELF};
-        use crate::federation::BlobStorage;
-        let backend = blob_test_backend().await;
-        let signer = test_signer_for("host-a");
-        for scope in [SELF, FAMILY, COMMUNITY, AFFILIATIONS] {
-            let bytes = format!("plaintext for {scope}").into_bytes();
-            let sha = sha256_of(&bytes);
-            let err = backend
-                .put_blob_signing_scoped(
-                    scope,
-                    &sha,
-                    BlobBody::Inline(bytes),
-                    None,
-                    "host-a",
-                    &blob_signer(&signer),
-                    chrono::Utc::now(),
-                    uuid::Uuid::new_v4(),
-                )
-                .await
-                .expect_err("an encrypted cohort must refuse a plaintext body");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("no at-rest envelope magic"),
-                "scope {scope}: refusal must name the cause, got: {msg}"
-            );
-            assert!(
-                !backend.has_blob(&sha).await.unwrap(),
-                "scope {scope}: the refused bytes must NOT be on disk — a gate that \
-                 stores first and complains after is not a gate"
-            );
-        }
-    }
-
-    /// v43.0.0 (§10.8) — a body persist cannot INSPECT is refused too, and
-    /// for a different stated reason.
-    ///
-    /// `External` is a URI persist never dereferences, so it cannot know
-    /// whether the bytes are sealed. Refusing is the only honest answer:
-    /// accepting would have persist assert a property it has no way to
-    /// check, and the failure would be silent and distributed.
-    #[tokio::test]
-    async fn encrypted_cohorts_refuse_a_body_they_cannot_verify() {
-        use crate::federation::types::cohort_scope::COMMUNITY;
-        use crate::federation::BlobStorage;
-        let backend = blob_test_backend().await;
-        let signer = test_signer_for("host-a");
-        let sha = sha256_of(b"whatever");
-        let err = backend
-            .put_blob_signing_scoped(
-                COMMUNITY,
-                &sha,
-                BlobBody::External(crate::federation::blobs::ExternalRef {
-                    uri: "s3://bucket/key".to_owned(),
-                    size_bytes: 1,
-                    media_type: None,
-                }),
-                None,
-                "host-a",
-                &blob_signer(&signer),
-                chrono::Utc::now(),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .expect_err("an unverifiable body must be refused in an encrypted cohort");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cannot verify") && msg.contains("never dereferences"),
-            "refusal must distinguish cannot-verify from plaintext, got: {msg}"
         );
     }
 
@@ -34611,6 +34780,7 @@ mod tests {
             backend
                 .put_blob_signing_scoped(
                     scope,
+                    None,
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
@@ -34637,6 +34807,7 @@ mod tests {
         let err = backend
             .put_blob_signing_scoped(
                 "global",
+                None,
                 &sha,
                 BlobBody::Inline(bytes),
                 None,

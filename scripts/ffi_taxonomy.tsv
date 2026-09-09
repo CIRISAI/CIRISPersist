@@ -14,6 +14,13 @@
 # permit a read across EVERY cohort at once rather than one. A convenience
 # surface that skips authorization is a bypass, not a shortcut.
 #
+# v43.0.0 §11 — `put_blob_scoped` is deontic (it decides who receives a DEK
+# grant, like the encrypt bindings). `community_dek_set_key_state` is deontic:
+# `destroyed` revokes readability for everyone, which is a change in what the
+# mesh permits. The two sweeps are PROCEDURAL — they decide WHEN housekeeping
+# runs and report what it did; they permit nothing the state machine did not
+# already, and a wrong stub there is a scheduling wrong, not a security one.
+#
 # CIRISPersist#595 / CIRISConstitution#83. One row per symbol PyO3 exports:
 #
 #     <stub owner>\t<exported name>\t<class>\t<frame>
@@ -235,6 +242,7 @@ Engine	cohort_supersede_group	deontic
 Engine	cohort_supersede_group_with_quorum	deontic	
 Engine	cohort_swap_member	deontic	
 Engine	cohort_verify_membership_quorum	deontic	
+Engine	community_dek_set_key_state	deontic	
 Engine	compare_wholeness_witnesses_json	testimonial	equivocation_evidence
 Engine	conscience_override_rates	axiotic	
 Engine	consent_role_json	empirical	
@@ -471,6 +479,7 @@ Engine	put_blob_chunks_json	empirical
 Engine	put_blob_encrypted_community	deontic	
 Engine	put_blob_encrypted_self_family	deontic	
 Engine	put_blob_json	empirical	
+Engine	put_blob_scoped	deontic	
 Engine	put_blob_signing	deontic	
 Engine	put_calibration_bundle	empirical	
 Engine	put_community_json	deontic	
@@ -574,6 +583,8 @@ Engine	subscription_count	structural
 Engine	substrate_owner	structural	
 Engine	supersede_canonical	deontic	
 Engine	sweep_ack_timeouts	procedural	
+Engine	sweep_all_communities	procedural	
+Engine	sweep_community_epochs	procedural	
 Engine	sweep_consent_decay_once	procedural	
 Engine	sweep_evictions_once	procedural	
 Engine	sweep_expired_claims	procedural	

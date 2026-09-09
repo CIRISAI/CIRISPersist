@@ -432,6 +432,7 @@ pub mod orchestrate {
                 &at_rest_sha256,
                 BlobBody::Inline(envelope_bytes),
                 media_type,
+                crate::federation::types::cohort_scope::COMMUNITY,
             )
             .await?;
         backend
@@ -455,7 +456,10 @@ pub mod orchestrate {
     /// # The DESTROY precondition
     ///
     /// An epoch may become [`DekKeyState::Destroyed`] only when **no object
-    /// is still sealed under it**. Destroying a DEK whose content still
+    /// ON THIS NODE is still sealed under it**. The precondition is LOCAL and
+    /// says so (§11.4): persist cannot know what peers hold, and a
+    /// precondition that cannot be checked is one that gets asserted. Recall
+    /// of fountained copies is the tombstone plane's job, not destroy's. Destroying a DEK whose content still
     /// exists does not erase that content — it **orphans** it, turning a
     /// confidentiality operation into unrecoverable data loss. The content
     /// must be re-sealed under a live epoch or evicted from every holder
@@ -510,6 +514,8 @@ pub mod orchestrate {
             )));
         }
 
+        // The BACKEND's conditional UPDATE is the real guard (§11.4); this
+        // early check only produces a friendlier message.
         if to == DekKeyState::Destroyed {
             let remaining = backend
                 .community_dek_epoch_object_count(community_key_id, epoch)
@@ -587,6 +593,8 @@ pub mod orchestrate {
     pub async fn sweep_rotated_epochs<B>(
         backend: &B,
         community_key_id: &str,
+        signer: &crate::signing::LocalSigner,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<SweepReport, BlobError>
     where
         B: BlobStorage + Sync,
@@ -619,8 +627,10 @@ pub mod orchestrate {
             let deletable = retain.is_some_and(|n| current.saturating_sub(epoch) > n);
 
             if deletable {
+                // §11.5 — retracts the local holds_bytes announcement (a
+                // withdraws per row, via the signer) BEFORE deleting.
                 report.evicted_objects += backend
-                    .community_dek_evict_epoch_objects(community_key_id, epoch)
+                    .community_dek_evict_epoch_objects(community_key_id, epoch, signer, now)
                     .await?;
             }
 
@@ -674,42 +684,25 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
-
-        // v43.0.0 (§10.5) — a DESTROYED epoch has no key material. Say so
-        // here rather than letting the unwrap fail three layers down: the
-        // caller needs to know the content is gone for good, not that a
-        // decrypt "failed" as though retrying might help.
-        if backend
-            .community_dek_key_state(&community_key_id, epoch)
-            .await?
-            == Some(DekKeyState::Destroyed)
-        {
-            return Err(BlobError::InvalidArgument(format!(
-                "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
-                 is gone and this blob is permanently unreadable. It should have been \
-                 re-sealed or evicted before the epoch was destroyed \
-                 (BLOB_ENCRYPTION_AT_REST.md §10.5)"
-            )));
-        }
-
-        // Fail-secure authorization gate.
-        let authorized = backend
+        // v43.0.0 (§11.3) — AUTHORIZE FIRST. The destroyed-epoch refusal
+        // below names the community; a non-grantee must never reach it.
+        if !backend
             .community_dek_has_member_grant(&community_key_id, epoch, viewer_key_id)
-            .await?;
-        if !authorized {
+            .await?
+        {
             return Err(BlobError::NotGranted {
                 sha256_hex: hex::encode(at_rest_sha256),
-                viewer_key_id: viewer_key_id.to_string(),
+                viewer_key_id: viewer_key_id.to_owned(),
             });
         }
-
         let body = backend.get_blob(at_rest_sha256).await?;
         let envelope_bytes = match body {
             Some(BlobBody::Inline(b)) => b,
             Some(_) => {
-                return Err(BlobError::InvalidArgument(
-                    "community at-rest blob is not an inline ciphertext envelope".into(),
-                ))
+                return Err(BlobError::InvalidArgument(format!(
+                    "at-rest blob {} is not an inline body",
+                    hex::encode(at_rest_sha256)
+                )))
             }
             None => {
                 return Err(BlobError::NotHeld {
@@ -718,22 +711,58 @@ pub mod orchestrate {
             }
         };
         let envelope = AtRestEnvelope::from_bytes(&envelope_bytes).map_err(map_at_rest_err)?;
+        read_for_community_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope).await
+    }
 
-        // Recover the epoch DEK via persist's self-retention row.
-        let self_wrap = backend
-            .community_dek_get_self_retention(&community_key_id, epoch)
+    /// The decrypt half of [`read_for_community_viewer`], for a caller that
+    /// has ALREADY authorized the viewer and parsed the envelope. The
+    /// destroyed-epoch refusal lives here — i.e. strictly after
+    /// authorization — so it can name the epoch to a grantee without
+    /// disclosing the binding to anyone else.
+    pub async fn read_for_community_viewer_sealed<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        envelope: &AtRestEnvelope,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let (community_key_id, epoch) = backend
+            .community_dek_blob_epoch(at_rest_sha256)
             .await?
             .ok_or_else(|| {
-                BlobError::Backend(format!(
-                    "community blob {} bound to {community_key_id:?} epoch {epoch} has no \
-                     persist self-retention row (corrupt cascade state)",
+                BlobError::InvalidArgument(format!(
+                    "at-rest blob {} carries no community-DEK binding",
                     hex::encode(at_rest_sha256)
                 ))
             })?;
+        // Defense in depth: the §11.3 door authorized already; a direct
+        // caller of this function is re-checked rather than trusted.
+        if !backend
+            .community_dek_has_member_grant(&community_key_id, epoch, viewer_key_id)
+            .await?
+        {
+            return Err(BlobError::NotGranted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                viewer_key_id: viewer_key_id.to_owned(),
+            });
+        }
+        let wrapped = backend
+            .community_dek_get_self_retention(&community_key_id, epoch)
+            .await?
+            .ok_or_else(|| {
+                // NULL self-retention ⇔ destroyed (V139's CHECK): the key
+                // material is gone. Said to a GRANTEE, after authorization.
+                BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
+                     is gone and this blob is permanently unreadable \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+                ))
+            })?;
         let content_master = backend.load_or_init_content_master().await?;
-        let dek = unwrap_dek_for_persist(&content_master, &self_wrap).map_err(map_at_rest_err)?;
-
-        open(&dek, &envelope).map_err(map_at_rest_err)
+        let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
+        open(&dek, envelope).map_err(map_at_rest_err)
     }
 
     /// Emit one `hard_case:recipient_excluded` per fail-secure-excluded
@@ -868,14 +897,35 @@ pub mod lifecycle_support {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        seed_community_with(
+            backend,
+            community_key_id,
+            members,
+            crate::federation::types::identity_type::USER,
+            None,
+        )
+        .await
+    }
+
+    /// As [`seed_community`], with control over the community key's
+    /// identity type (SUBSTRATE_PERSIST makes an `infrastructure`-labeled
+    /// community AUTHORIZED per SecReview F2) and its policy blob.
+    pub async fn seed_community_with<B>(
+        backend: &B,
+        community_key_id: &str,
+        members: &[(&str, &str)],
+        community_identity_type: &str,
+        policy_blob: Option<serde_json::Value>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::identity_type;
 
         ts::register_hybrid_key_as(
             backend,
             community_key_id,
             community_key_id,
-            identity_type::USER,
+            community_identity_type,
         )
         .await;
         for (ident, occ) in members {
@@ -899,7 +949,7 @@ pub mod lifecycle_support {
                     founded_at: chrono::Utc::now(),
                     consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                         .to_owned(),
-                    policy_blob: None,
+                    policy_blob,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -1151,6 +1201,102 @@ pub mod lifecycle_harness {
             matches!(err, crate::federation::BlobError::NotGranted { .. }),
             "{tag}: a convenience door that skips authorization is a bypass, got {err:?}"
         );
+
+        // ── 11. THE SWEEP, ON THIS BACKEND (§11.5, §11.9 / I12) ─────────
+        //
+        // Rotated-past epoch 0 is `disabled`. Authorize deletion, sweep,
+        // and assert the three things the sweep must do IN ORDER: retract
+        // the announcement (withdraws), delete the bytes, destroy the key.
+        // The first implementation's sweep had zero postgres coverage; this
+        // step runs on every backend that runs the harness.
+        let sweeper = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-sweeper-{run}"),
+        )
+        .await;
+        let sweeper_id = sweeper.derived_key_id();
+        // Announce epoch 0's sealed bytes as this sweeper node, so there is
+        // an announcement to retract.
+        let crate::federation::BlobBody::Inline(sealed0) = backend
+            .get_blob(&before.at_rest_sha256)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("{tag}: sealed blob is inline");
+        };
+        backend
+            .put_blob_signing_at(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                &before.at_rest_sha256,
+                crate::federation::BlobBody::Inline(sealed0),
+                None,
+                &sweeper_id,
+                &crate::signing::LocalSignerHardwareAdapter::new(sweeper.clone()),
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: announce epoch-0 bytes: {e}"));
+        assert!(
+            backend
+                .list_holders(&before.at_rest_sha256)
+                .await
+                .unwrap()
+                .contains(&sweeper_id),
+            "{tag}: precondition — the sweeper is a listed holder"
+        );
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+        let report = crate::federation::community_dek::orchestrate::sweep_rotated_epochs(
+            backend,
+            &comm,
+            &sweeper,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: sweep: {e}"));
+        assert_eq!(
+            report.evicted_objects, 1,
+            "{tag}: epoch 0's one object is evicted"
+        );
+        assert_eq!(
+            report.destroyed,
+            vec![before.epoch],
+            "{tag}: epoch 0 is destroyed"
+        );
+        assert!(
+            !backend
+                .list_holders(&before.at_rest_sha256)
+                .await
+                .unwrap()
+                .contains(&sweeper_id),
+            "{tag}: the announcement was RETRACTED (withdraws) before the bytes went"
+        );
+        assert!(
+            !backend.has_blob(&before.at_rest_sha256).await.unwrap(),
+            "{tag}: the bytes are gone"
+        );
+        assert!(
+            backend
+                .community_dek_get_self_retention(&comm, before.epoch)
+                .await
+                .unwrap()
+                .is_none()
+                && backend
+                    .community_dek_member_grant_recipients(&comm, before.epoch)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+            "{tag}: destroyed ⇒ no key material (self-retention AND member grants)"
+        );
+        // The CURRENT epoch is untouched.
+        let got = read_for_community_viewer(backend, &after.at_rest_sha256, &alice_occ)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: the current epoch is never swept: {e}"));
+        assert_eq!(got, b"post-rotation minutes");
 
         // The content address is the hash of the CIPHERTEXT, which is what
         // lets dedup and fountain coding operate on sealed bytes — and why

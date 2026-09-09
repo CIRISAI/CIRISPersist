@@ -723,6 +723,9 @@ class Engine:
     def cohort_verify_membership_quorum(self, cohort: str, group_key_id: str, change_envelope_json: str, signatures_json: str) -> None:
         """(derived) deontic — #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is authorized by the group's current strict-majority quorum (composes verify v6.9...."""
 
+    def community_dek_set_key_state(self, community_key_id: str, epoch: int, state: str) -> None:
+        """(derived) deontic — v43.0.0 (§11.6) — transition a community DEK epoch's key state: enabled / disabled / destroyed. Destroy refuses while any object on this node is st..."""
+
     def corpus_want_admits(self, wire_json: str, content_id: str, object_bytes: int) -> bool:
         """(derived) deontic — #356 (§Q B4 wanted-then-pulled) — may a producer push content_id of object_bytes against this signed CorpusWantV1 wire JSON? True iff the id is wan..."""
 
@@ -942,6 +945,9 @@ class Engine:
 
     def put_blob_encrypted_self_family(self, cohort_scope: str, owner_or_family_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — store a blob encrypted for self or family."""
+
+    def put_blob_scoped(self, cohort_scope: str, plaintext_b64: str, community_key_id: str | None = None, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §11.2) — THE write door."""
 
     def put_blob_signing(
         self,
@@ -3746,6 +3752,12 @@ class Engine:
 
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""
+
+    def sweep_all_communities(self) -> str:
+        """(derived) procedural — v43.0.0 (§11.6) — the shape a scheduler calls. Sweeps every community this node holds a DEK epoch record for; per-community failures are reported,..."""
+
+    def sweep_community_epochs(self, community_key_id: str) -> str:
+        """(derived) procedural — v43.0.0 (§11.6, §11.7) — sweep one community's rotated-past epochs. Needs the LocalSigner to hybrid-sign the withdraws that retract this node's ann..."""
 
     def sweep_consent_decay_once(self) -> int:
         """(derived) procedural — #227 (residual) — drive one consent-decay sweep synchronously (the time-driven twin of [Self::sweep_evictions_once]). Ages every fountain content u..."""

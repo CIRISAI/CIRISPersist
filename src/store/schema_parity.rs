@@ -27,7 +27,7 @@
 //! | the two trees declare the same tables | none — 103 of 103 match |
 //! | the two trees declare the same columns | none — zero divergences |
 //! | every type pair is a sanctioned dialect encoding | [`DIALECT_ENCODINGS`] + [`PG_NARROWED_ID_COLUMNS`] |
-//! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (4) |
+//! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (15: 14 `admitted_at` + 1 lens-derived) |
 //! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (6) |
 //!
 //! # Why `UUID` is not just another encoding
@@ -209,36 +209,102 @@ pub(crate) struct NullabilityDivergence {
     pub reason: &'static str,
 }
 
-/// The four columns whose nullability differs. Pinned rather than fixed: all
-/// four are on `cirisnode` / `cirislens_derived` tables persist does not write
-/// through a `FederationDirectory` door, so no persist API admits a row on one
-/// backend that the other refuses. Filed as CIRISPersist#674.
+/// The columns whose nullability differs. The first fourteen are one column
+/// (`admitted_at`, V130) across the federation tables — see their shared reason
+/// and CIRISPersist#828. The remaining one is pinned rather than fixed: it is on
+/// a `cirisnode` table persist does not write through a `FederationDirectory`
+/// door, so no persist API admits a row on one backend that the other refuses.
+/// Filed as CIRISPersist#674.
+///
+/// Three `cirislens_derived.detection_events` entries were deleted in v43.0.0:
+/// they declared postgres NOT NULL on columns V080 relaxed to nullable on BOTH
+/// backends. The replayer could not read V080's `DROP NOT NULL`, so it believed
+/// postgres still strict and the declarations were written to match the
+/// replayer's fiction, not the databases. Same blindness as #828, opposite sign.
 pub(crate) const NULLABILITY_DIVERGENCES: &[NullabilityDivergence] = &[
     NullabilityDivergence {
-        table: "cirislens_derived.detection_events",
-        column: "body_sha256",
+        table: "cirislens.federation_attestations",
+        column: "admitted_at",
         postgres_not_null: true,
-        reason: "The sqlite twin of a CIRISLens-derived projection table. persist has no write \
-                 door into it — the rows are produced by the lens pipeline, which only ever \
-                 supplies the column. sqlite's laxer declaration therefore admits nothing extra \
-                 in practice, but it is a real difference and is written down rather than \
-                 assumed.",
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
     },
     NullabilityDivergence {
-        table: "cirislens_derived.detection_events",
-        column: "canonical_bytes",
+        table: "cirislens.federation_communities",
+        column: "admitted_at",
         postgres_not_null: true,
-        reason: "Same table and same reason as `body_sha256`: a lens-derived projection with no \
-                 persist write door, where the postgres declaration is the stricter of the two \
-                 and the producer always supplies the value.",
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
     },
     NullabilityDivergence {
-        table: "cirislens_derived.detection_events",
-        column: "trace_id",
+        table: "cirislens.federation_community_membership_revocations",
+        column: "admitted_at",
         postgres_not_null: true,
-        reason: "Same table and same reason as `body_sha256`: a lens-derived projection with no \
-                 persist write door, where the postgres declaration is the stricter of the two \
-                 and the producer always supplies the value.",
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_families",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_family_membership_revocations",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_identity_occurrence_revocations",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_identity_occurrences",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_keys",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_location_proofs",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_organizations",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_org_memberships",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_partner_records",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_revocations",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
+    },
+    NullabilityDivergence {
+        table: "cirislens.transport_destinations",
+        column: "admitted_at",
+        postgres_not_null: true,
+        reason: "`admitted_at` (V130) is THIS node's receiver-stamped admission instant. SQLite's `ALTER TABLE ADD COLUMN` cannot declare NOT NULL without a constant default, and a receiver-stamped instant has none, so V130 added it nullable on sqlite; postgres backfilled and `SET NOT NULL`. Hidden until v43.0.0 because this replayer could not read `SET NOT NULL` and so believed postgres nullable too — a gate that reads DDL must understand every DDL the migrations use, or it reports fiction. Every persist write door stamps `admitted_at`, so no persist API admits a NULL on either backend; a raw writer could on sqlite. Pre-existing, real, filed as CIRISPersist#828 — the fix is fourteen sqlite rebuilds, which is its own cut.",
     },
     NullabilityDivergence {
         table: "cirisnode.scheduled_takedown_actions",
@@ -683,6 +749,24 @@ mod tests {
             let Some(c) = toks.first().map(|s| norm_name(s)) else {
                 return;
             };
+            // v43.0.0 (V139) — `ALTER [COLUMN] c DROP NOT NULL` / `SET NOT NULL`.
+            // Without this the replayer kept postgres at NOT NULL after V139
+            // dropped it, and reported a nullability divergence the live
+            // database did not have — a gate that reads DDL must understand
+            // every DDL the migrations use, or it reports fiction.
+            let joined = toks[1..].join(" ").to_ascii_uppercase();
+            if joined.starts_with("DROP NOT NULL") {
+                if let Some(col) = tables.get_mut(table).and_then(|t| t.get_mut(&c)) {
+                    col.not_null = false;
+                }
+                return;
+            }
+            if joined.starts_with("SET NOT NULL") {
+                if let Some(col) = tables.get_mut(table).and_then(|t| t.get_mut(&c)) {
+                    col.not_null = true;
+                }
+                return;
+            }
             let Some(tp) = toks
                 .iter()
                 .position(|t| t.eq_ignore_ascii_case("type"))

@@ -1139,7 +1139,212 @@ community DEK reuses that pipeline per epoch.
 
 ---
 
-## 11. Summary
+## 11. The shape that §10 should have had — REBUILT 2026-09-09 after three reviews
+
+§10 locked the *design*. The first implementation of it (`fd43e74`, PR #827) was
+reviewed three ways — a local code review (15 findings), Codex (8), and a cloud
+ultrareview (4) — and ~17 verified issues clustered into ten root causes. None
+of them was a typo. They were the same mistake in ten places: **each guarantee
+was implemented as a check at one site, and nothing made the check the only
+way through.** A gate on a door nobody calls; authorization on two of three
+branches; "sealed" tested by an 8-byte prefix; "destroyed" as a text column;
+a precondition the sweep satisfied by zeroing the thing it then read.
+
+This section states the shape those guarantees need in order to be true **by
+construction**, so that a test can falsify them through the surface a consumer
+holds. §10's decisions stand; §11 is how they are made unbypassable.
+
+### 11.1 The blob row is the authority on its own tier
+
+`federation_blobs` gains `cohort_scope TEXT NOT NULL` (V139, both dialects,
+CHECK against the closed set). It is written by the door in §11.2 and read by
+the door in §11.3. **Nothing sniffs bytes to decide a tier.**
+
+This is the single change that removes two root causes at once. The first
+implementation had reads inspecting the body for the envelope magic to decide
+whether a blob was sealed — so a commons payload that happened to begin with
+`CRBLOB\x01\x00` was routed down the encrypted path, and a plaintext body in a
+private cohort was returned as public. When the row says what it is, the
+question "is this sealed?" becomes "does this row's tier require sealing, and
+does its body parse as an envelope?" — a structural check, not a guess.
+
+Backfill: every pre-V139 row is `federation`. Blob storage had not shipped, so
+there is no encrypted legacy; the migration says so and does not pretend to
+classify rows it cannot.
+
+### 11.2 One write door, and the storage floor is not a door
+
+`Engine::put_blob_scoped(cohort_scope, community_key_id, plaintext, media_type)` is
+the **only** consumer-facing write that accepts an encrypted cohort, in Rust and
+in Python (named `_scoped` to keep it distinct from the raw `BlobStorage::put_blob`
+storage method). It:
+
+1. validates `cohort_scope` against the closed set;
+2. **resolves the tier from the directory, never from the caller.** For
+   `community` / `affiliations` it looks the community up and applies
+   `is_authorized_infrastructure_community` — CC 4.4.3.2.1's carve-out is a
+   property of the community record and its authority, which is exactly why
+   the first implementation's `crypto_tier(scope, None)` was wrong: it dropped
+   the one axis a caller must not be allowed to assert;
+3. dispatches: **Plaintext** → store + announce `holds_bytes`;
+   **InvisibleEncrypted** → the self/family cascade (fresh DEK, per-occurrence
+   wraps, no `holds_bytes`); **CommunityDek** → the community cascade (epoch
+   DEK, per-member wraps) **and** announce `holds_bytes`, because community
+   content federates with cleartext provenance and the cascade never emitted
+   the announcement it documented as the caller's job;
+4. records `cohort_scope` on the row.
+
+The pre-existing commons doors (`put_blob_signing`, `put_blob_json`) remain and
+are **commons-only by construction**: they record `federation`. There is no
+consumer-reachable path that stores bytes at an encrypted cohort without
+sealing them, because the only function that accepts an encrypted cohort is
+the one that seals.
+
+`store_blob_local` is the storage floor. It is called by the two cascades — and
+by the commons doors, which may reach it **only by naming a commons scope as a
+literal constant in the call** (`cohort_scope::FEDERATION`), never through a
+variable that could carry a private cohort. A from-disk gate (I14) reds on any
+other production caller. A floor with an unconstrained caller is a bypass with a
+comment.
+
+### 11.3 One read door, and it authorizes before it dispatches
+
+`Engine::read_blob_as(sha, viewer)` — Rust and Python — is the read a server or
+agent holds. Its order is fixed and the order **is** the guarantee:
+
+1. load the row; absent ⇒ `NotHeld`;
+2. **authorize by the row's tier, before touching the body:**
+   Plaintext ⇒ public by construction, proceed;
+   InvisibleEncrypted ⇒ the viewer holds an at-rest grant on this sha;
+   CommunityDek ⇒ the viewer holds a member grant on **this blob's epoch**;
+   otherwise ⇒ `NotGranted`, naming only the sha and the viewer;
+3. only then read the body, and for an encrypted tier **require it to parse as
+   an `AtRestEnvelope`** — a row that claims an encrypted tier and carries an
+   unparseable body is corruption (`Backend`), never a plaintext return;
+4. decrypt and return.
+
+The first implementation authorized inside two of three branches and let the
+third return bytes to anyone. Authorization that lives inside a branch is
+authorization the next branch forgets. Here it lives above the dispatch, so
+adding a fourth tier cannot skip it.
+
+A destroyed-epoch refusal is reachable only **after** step 2 passes. The first
+implementation checked destruction first and named the community and epoch in
+the error, disclosing a blob's binding to a non-grantee.
+
+### 11.4 Key state is cryptographic, atomic, and honest about its reach
+
+**Destroy deletes key material.** Moving an epoch to `destroyed` deletes the
+persist self-retention wrap **and every member-grant row for that epoch**, in
+the same transaction as the state change. A text column that says "destroyed"
+while every wrap survives is a read-door refusal, not destruction; the first
+implementation shipped exactly that.
+
+**Bind and destroy are mutually exclusive by statement.** Binding a blob to an
+epoch is a conditional insert that succeeds only while the epoch is `enabled`.
+Destroying is a conditional update that succeeds only while zero objects are
+bound. Each is one statement, so the interleaving that stranded a freshly
+sealed blob on a destroyed epoch cannot occur: one side sees the other's
+write, or neither commits. No lock is taken across check-seal-bind because
+the check *is* the write.
+
+**The precondition is local, and says so.** "No object is sealed under this
+epoch" means **no object on this node**. Persist cannot know what peers hold;
+the first implementation's precondition said "evicted from every holder",
+which it then satisfied by zeroing a node-local count — a precondition that
+cannot be checked is one that gets asserted. Recall of fountained copies is the
+tombstone plane's job (§10.6), and destroy does not claim it.
+
+**What destroyed cannot undo.** A recipient who already recovered the DEK
+from a delivered wrap holds it. That is AV-70's forward-only guarantee stated
+from the other side, and it remains true. `destroyed` means *persist's* copies
+of the key material are gone and *persist* will never serve that content
+again. It does not mean the ciphertext is unreadable by a party who already
+had the key — no key-management scheme can offer that, and the FSD stops
+implying it.
+
+### 11.5 Eviction retracts what it announced
+
+Community content is announced (`holds_bytes`). The sweep's eviction therefore
+follows the established `evict_actor` discipline: emit `withdraws` for the
+local holder attestation, **then** delete. Deletion proceeds even if the
+withdraws fails (an orphan withdraws is better than a missing one). This
+requires a signer, which is why the sweep is an **Engine** operation (§11.6)
+and not a backend one.
+
+**Scope of the retraction, stated plainly.** The sweep retracts announcements
+this node made **under its own signing key** — the derived federation key its
+`LocalSigner` holds, which is what `put_blob_scoped` announces under. An
+announcement made under some other attesting key (the FFI's `put_blob_signing`
+lets a caller name one, resolved through `select_signer`) is that key's holder's
+to retract; this node cannot sign a `withdraws` for it and does not pretend to.
+Invariant I9 asserts the own-key case, which is the production shape.
+
+### 11.6 The lifecycle is on every consumer surface
+
+`Engine::community_dek_set_key_state`, `Engine::sweep_community_epochs`, and
+`Engine::sweep_all_communities` (the shape a scheduler calls), with PyO3
+bindings. The first implementation built the state machine and the sweep with
+zero facades and zero bindings — the CHANGELOG advertised "rotate, sweep …
+from Rust and from Python" over a lifecycle that was inert outside the test
+binary. The same defect this cut had just found three times in older code.
+
+### 11.7 The root never re-mints
+
+`derive_hardware_master_for_context(context, create_seed_if_absent)`. The
+secrets store's first migration legitimately creates the seed. The content
+path, once a `hardware` row exists, passes `false`: an absent seed is a hard
+error naming the consequence. The first implementation claimed this and did
+the opposite — the shared derivation sealed a fresh seed on absence, so a lost
+keyring directory silently produced a different master, every prior blob and
+every sealed content-KEM private half failed to unwrap with an opaque AEAD
+error, and new writes succeeded under the new root.
+
+### 11.8 Cost discipline
+
+- The derived content master is resolved **once per process** on the blocking
+  pool and cached; the async hot path never performs TPM or filesystem I/O.
+- Epoch eviction is one `DELETE … WHERE sha256 IN (SELECT …)` plus one binding
+  delete, not one round trip per object, and on SQLite the connection mutex is
+  not held across a per-row loop.
+- The read door loads the body once.
+
+### 11.9 Every backend, every surface, every error
+
+- The cross-backend lifecycle harness covers the sweep — disable, evict-with-
+  withdraws, destroy — on sqlite **and** postgres. The first implementation's
+  sweep had zero postgres coverage across three backend methods that differ
+  materially in implementation.
+- Every PyO3 blob binding maps `BlobError` through `blob_err_to_py`, so Python
+  keeps the stable `blob_not_granted` / `blob_not_held` tokens it branches on
+  and backend failures arrive as `RuntimeError`, not as permanent input errors.
+
+### 11.10 Invariants — each falsifiable through a consumer-held door
+
+| # | invariant | falsified by | catches |
+|---|---|---|---|
+| I1 | No consumer-reachable write stores an unsealed body at an encrypted cohort. | `Engine::put_blob_scoped("self", …, plaintext)` stores plaintext | A1 |
+| I2 | The blob row records its tier; reads dispatch on the row, never on bytes. | commons body beginning with the magic is refused/misrouted; or a private plaintext row is served | B1, C1 |
+| I3 | In an encrypted tier the stored body parses as an `AtRestEnvelope`. | magic + garbage accepted | C1 |
+| I4 | Every read door authorizes by tier **before** any dispatch, and a refusal names only sha + viewer. | stranger reads a self blob; destroyed-epoch error names the community | B1, B2 |
+| I5 | `destroyed` ⇒ zero persist key material for that epoch. | a wrap row survives destroy | D1 |
+| I6 | Bind requires `enabled`; destroy requires zero bound; both atomic. | a blob bound to a destroyed epoch | D3 |
+| I7 | The precondition destroy checks is the precondition destroy states. | doc says "every holder", code counts local | D2 |
+| I8 | Rotate/sweep/key-state are reachable from Engine and FFI. | 0 facades | A2 |
+| I9 | Eviction of announced content emits `withdraws` before delete. | `list_holders` still names this node after eviction | G1 |
+| I10 | The tier of a community blob is resolved from the directory, including the infra carve-out. | authorized infra community cannot store by any route | E1 |
+| I11 | A hardware root never re-mints. | absent seed ⇒ new master | F1 |
+| I12 | The lifecycle harness, sweep included, runs on every backend from one function. | a sqlite-only sweep test | H1 |
+| I13 | FFI preserves `BlobError` class. | `NotGranted` arrives as `ValueError` | I1 |
+| I14 | `store_blob_local` is reached only by the two cascades, or with a literal commons scope. | a floor call carrying a variable scope | A3 |
+
+Every one of these is written **before** the corresponding fix and confirmed
+red on `fd43e74`. A test that is green on the code it was written to catch is
+a report.
+
+---
+
+## 12. Summary
 
 CIRISPersist can encrypt the *content* of every substrate at rest —
 persist-managed, hardware-rooted, 100% backend-agnostic — while keeping

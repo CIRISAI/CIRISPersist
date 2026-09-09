@@ -47,6 +47,8 @@ pub mod attestation_emit;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blackhole;
+#[cfg(test)]
+mod blob_surface_gates;
 pub mod blobs;
 pub mod bootstrap_admission;
 pub mod canonical_at_rest;
@@ -300,8 +302,8 @@ pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError, BlobRange,
     BlobStorage, ChunkManifest, ChunkRef, DekKeyState, EvictActorReport, ExternalRef, GroupDekRef,
-    PutBlobAttestation, ScopeBlobSymbol, CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP,
-    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    PutBlobAttestation, PutBlobScopedResult, ScopeBlobSymbol, CHUNK_MANIFEST_VERSION,
+    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
