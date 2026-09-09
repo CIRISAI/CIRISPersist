@@ -2687,6 +2687,9 @@ pub mod blob_invariants {
     /// why the evict loop carries no second filter.
     /// (b) When the withdraws cannot be admitted, the bytes and the binding
     /// stay and the error propagates.
+    // `emit_withdraws_attestation_helper` exists only with a backend feature;
+    // the no-backend axis legs compile this module with `--all-targets`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i18_withdraw_failure_aborts_eviction<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
