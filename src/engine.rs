@@ -4993,6 +4993,32 @@ impl Engine {
         }
     }
 
+    /// v43.0.0 (§11.6) — **the retention policy the sweep enforces.**
+    /// `Some(n)`: the sweep may evict and destroy epochs more than `n` behind
+    /// the current one; `None` (the default): retain indefinitely, the sweep
+    /// only disables. Without this on the surface a deployment could run a
+    /// sweep that was structurally unable to evict anything (C3-4).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn community_dek_set_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+        retain_past_epochs: Option<u64>,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobStorage as _;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.community_dek_set_retain_past_epochs(community_key_id, retain_past_epochs)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.community_dek_set_retain_past_epochs(community_key_id, retain_past_epochs)
+                    .await
+            }
+        }
+    }
+
     /// v43.0.0 (§11.6, §11.7) — sweep one community's rotated-past epochs:
     /// disable, and where `retain_past_epochs` authorizes it, evict (with
     /// `withdraws` for what this node announced — §11.5) and destroy.

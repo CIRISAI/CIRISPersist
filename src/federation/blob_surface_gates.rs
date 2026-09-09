@@ -77,6 +77,8 @@ mod tests {
             ("read_any_for_viewer", "read_blob_as"),
             ("set_key_state", "key_state"),
             ("sweep_rotated_epochs", "sweep"),
+            // C3-4 — the sweep's POLICY, not only the sweep.
+            ("community_dek_set_retain_past_epochs", "retain"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {
@@ -178,6 +180,42 @@ mod tests {
     /// A floor with a public door is a bypass. The first implementation's
     /// scoped write door called the floor directly for self/family, which is
     /// precisely how plaintext ended up under a private cohort.
+    /// §11.6 / I30 — **the Python sweep report carries every field the
+    /// report has.** The second rebuild serialized four of five and dropped
+    /// `failed`, so an operator saw a clean report over retained bytes.
+    #[test]
+    fn i30_python_sweep_report_carries_every_field() {
+        let dek = src("src/federation/community_dek.rs");
+        let ffi = production_only(&src("src/ffi/pyo3.rs"));
+        let start = dek.find("pub struct SweepReport {").expect("SweepReport");
+        let body = &dek[start..start + dek[start..].find("\n    }\n").expect("struct end")];
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter(|l| !l.starts_with("struct "))
+            .filter_map(|l| l.split(':').next())
+            .collect();
+        assert!(fields.len() >= 5, "I30: parsed {fields:?}");
+        for func in ["fn sweep_community_epochs(", "fn sweep_all_communities("] {
+            let at = ffi
+                .find(func)
+                .unwrap_or_else(|| panic!("I30: {func} binding"));
+            let end = ffi[at..]
+                .find("\n    }\n")
+                .map(|e| at + e)
+                .unwrap_or(ffi.len());
+            let body = &ffi[at..end];
+            let missing: Vec<&&str> = fields
+                .iter()
+                .filter(|f| !body.contains(&format!("\"{f}\"")))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "I30: SweepReport fields absent from the Python serializer `{func}`: {missing:?}"
+            );
+        }
+    }
+
     #[test]
     fn i14_the_storage_floor_has_no_door() {
         let allowed = [

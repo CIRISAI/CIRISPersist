@@ -726,6 +726,9 @@ class Engine:
     def community_dek_set_key_state(self, community_key_id: str, epoch: int, state: str) -> None:
         """(derived) deontic — v43.0.0 (§11.6) — transition a community DEK epoch's key state: enabled / disabled / destroyed. Destroy refuses while any object on this node is st..."""
 
+    def community_dek_set_retain_past_epochs(self, community_key_id: str, retain_past_epochs: int | None = None) -> None:
+        """(derived) deontic — v43.0.0 (§11.6) — the retention policy the sweep enforces. retain_past_epochs=n: the sweep may evict and destroy epochs more than n behind the curr..."""
+
     def corpus_want_admits(self, wire_json: str, content_id: str, object_bytes: int) -> bool:
         """(derived) deontic — #356 (§Q B4 wanted-then-pulled) — may a producer push content_id of object_bytes against this signed CorpusWantV1 wire JSON? True iff the id is wan..."""
 

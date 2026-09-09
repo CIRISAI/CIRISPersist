@@ -12746,10 +12746,55 @@ impl PyEngine {
         })
     }
 
+    /// v43.0.0 (§11.6) — the retention policy the sweep enforces.
+    /// `retain_past_epochs=n`: the sweep may evict and destroy epochs more
+    /// than `n` behind the current one; `None` (the default): retain
+    /// indefinitely, the sweep only disables. Deletion is opt-in because it
+    /// is irreversible.
+    #[pyo3(signature = (community_key_id, retain_past_epochs=None))]
+    fn community_dek_set_retain_past_epochs(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        retain_past_epochs: Option<u64>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::BlobStorage as _;
+            let runtime = self.runtime.clone();
+            let comm = community_key_id.to_owned();
+            py.detach(move || {
+                match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            backend
+                                .community_dek_set_retain_past_epochs(&comm, retain_past_epochs)
+                                .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            backend
+                                .community_dek_set_retain_past_epochs(&comm, retain_past_epochs)
+                                .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)
+            })
+        })
+    }
+
     /// v43.0.0 (§11.6, §11.7) — sweep one community's rotated-past epochs.
     /// Needs the LocalSigner to hybrid-sign the `withdraws` that retract this
     /// node's announcements (§11.5); refuses rather than deleting unannounced.
-    /// JSON: `disabled`, `destroyed`, `evicted_objects`, `blocked`.
+    /// JSON: `disabled`, `destroyed`, `evicted_objects`, `blocked`, `failed`
+    /// (epochs whose retraction could not be admitted — bytes retained, retry
+    /// on the next sweep).
     fn sweep_community_epochs(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12785,6 +12830,7 @@ impl PyEngine {
                 Ok(serde_json::json!({
                     "disabled": r.disabled, "destroyed": r.destroyed,
                     "evicted_objects": r.evicted_objects, "blocked": r.blocked,
+                    "failed": r.failed,
                 })
                 .to_string())
             })
@@ -12836,7 +12882,8 @@ impl PyEngine {
                     .map(|(c, r)| match r {
                         Ok(r) => serde_json::json!({ "community": c, "ok": {
                             "disabled": r.disabled, "destroyed": r.destroyed,
-                            "evicted_objects": r.evicted_objects, "blocked": r.blocked }}),
+                            "evicted_objects": r.evicted_objects, "blocked": r.blocked,
+                            "failed": r.failed }}),
                         Err(e) => serde_json::json!({ "community": c, "error": e.to_string() }),
                     })
                     .collect();

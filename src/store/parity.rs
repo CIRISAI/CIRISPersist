@@ -326,6 +326,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // there is one helper. Propagated (I18) rather than swallowed, so it now
     // appears in the scanned sequence.
     ("emit_withdraws_attestation_helper", Class::Plumbing),
+    // v43.0.0 third pass (I27) — the per-community advisory lock is LOCKING,
+    // the enum's own definition of Plumbing: it can fail only on the driver's
+    // terms and decides nothing about the row. sqlite's boundary is the
+    // connection mutex, taken before any of these doors run.
+    ("lock_community_tx", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

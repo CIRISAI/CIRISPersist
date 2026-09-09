@@ -11987,28 +11987,50 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // wall-clock here so a fresh blob's last_accessed_at matches
         // its first_seen_at instead of the 1970 epoch placeholder.
         let now_iso = chrono::Utc::now().to_rfc3339();
+        let announce_only =
+            floor.tier() != crate::federation::types::cohort_scope::CryptoTier::Plaintext;
+        let needs_binding =
+            floor.tier() == crate::federation::types::cohort_scope::CryptoTier::CommunityDek;
 
         (move || -> Result<(), rusqlite::Error> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                rusqlite::params![
-                    sha_vec,
-                    storage_kind,
-                    bytes_inline_opt,
-                    external_ref_opt,
-                    size_bytes_i64,
-                    media_type_owned,
-                    now_iso,
-                    scope,
-                    tier,
-                ],
-            )?;
+            if announce_only {
+                // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES: a sealed-tier
+                // token announces a row a cascade already stored and bound.
+                // Absent (evicted under the writer) ⇒ QueryReturnedNoRows,
+                // mapped to NotHeld below. The connection mutex is sqlite's
+                // serialization boundary (§11.4).
+                let held: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM federation_blobs WHERE sha256 = ?1) \
+                        AND (?2 OR EXISTS(SELECT 1 FROM federation_community_blob_epoch \
+                                           WHERE at_rest_sha256 = ?1))",
+                    rusqlite::params![sha_vec, !needs_binding],
+                    |r| r.get(0),
+                )?;
+                if !held {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                        last_accessed_at, access_count, cohort_scope, crypto_tier\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![
+                        sha_vec,
+                        storage_kind,
+                        bytes_inline_opt,
+                        external_ref_opt,
+                        size_bytes_i64,
+                        media_type_owned,
+                        now_iso,
+                        scope,
+                        tier,
+                    ],
+                )?;
+            }
             // v36.0.0 (#668) — serve position (V130), inside the same
             // transaction as the write.
             let admitted_at =
@@ -12051,6 +12073,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
             Ok(())
         })()
         .map_err(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                return crate::federation::BlobError::NotHeld {
+                    sha256_hex: hex::encode(sha256),
+                };
+            }
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
                 crate::federation::BlobError::AttestationEmissionFailed(format!(
@@ -27797,6 +27824,15 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::at_rest_cascade::blob_invariants::exercise_i25_the_floor_refuses_a_contradictory_row(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 I28 — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i28_announce_refuses_an_evicted_row_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i28_announce_refuses_an_evicted_row(&backend, "sqlite")
             .await;
     }
 

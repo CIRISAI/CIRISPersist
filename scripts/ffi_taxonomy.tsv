@@ -243,6 +243,7 @@ Engine	cohort_supersede_group_with_quorum	deontic
 Engine	cohort_swap_member	deontic	
 Engine	cohort_verify_membership_quorum	deontic	
 Engine	community_dek_set_key_state	deontic	
+Engine	community_dek_set_retain_past_epochs	deontic	
 Engine	compare_wholeness_witnesses_json	testimonial	equivocation_evidence
 Engine	conscience_override_rates	axiotic	
 Engine	consent_role_json	empirical	

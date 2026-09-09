@@ -415,6 +415,29 @@ pub struct PostgresBackend {
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
 }
 
+/// v43.0.0 (§11.4, I27) — **the community's serialization boundary.** Every
+/// operation that reads or moves a community's epoch state — bind, key-state
+/// change, rotation, eviction, and the announcement of a community blob —
+/// takes this transaction-scoped advisory lock first. Under READ COMMITTED the
+/// statement predicates are snapshot reads; without this lock a seal that
+/// read `enabled` and a destroy that read `no binding` could both commit.
+/// Released at commit or rollback; per community, so unrelated communities
+/// never wait on each other.
+async fn lock_community_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    community_key_id: &str,
+) -> Result<(), crate::federation::BlobError> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('community_dek'), hashtext($1))",
+        &[&community_key_id],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        crate::federation::BlobError::Backend(format!("community lock {community_key_id:?}: {e}"))
+    })
+}
+
 impl PostgresBackend {
     /// Test-only: apply migrations up to and including `version` (see the
     /// sqlite twin). No advisory lock — a test database has one writer.
@@ -12848,26 +12871,70 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
 
         let sha_vec = sha256.to_vec();
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope, crypto_tier\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &storage_kind,
-                &bytes_inline_opt,
-                &external_ref_opt,
-                &size_bytes_i64,
-                &media_type,
-                &scope,
-                &tier,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
-        })?;
+        if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope, crypto_tier\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &sha_vec,
+                    &storage_kind,
+                    &bytes_inline_opt,
+                    &external_ref_opt,
+                    &size_bytes_i64,
+                    &media_type,
+                    &scope,
+                    &tier,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
+            })?;
+        } else {
+            // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES. A sealed-tier token
+            // means a cascade already stored and bound these bytes; this
+            // floor emits the holder attestation for that row and nothing
+            // else. Evicted between bind and announce ⇒ NotHeld, never a
+            // re-inserted row without its binding.
+            let not_held = || crate::federation::BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            };
+            let community_tier =
+                floor.tier() == crate::federation::types::cohort_scope::CryptoTier::CommunityDek;
+            if community_tier {
+                let bound = tx
+                    .query_opt(
+                        "SELECT community_key_id FROM cirislens.federation_community_blob_epoch \
+                          WHERE at_rest_sha256 = $1",
+                        &[&sha_vec],
+                    )
+                    .await
+                    .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
+                let Some(row) = bound else {
+                    let _ = tx.rollback().await;
+                    return Err(not_held());
+                };
+                let community: String =
+                    row.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
+                lock_community_tx(&tx, &community).await?;
+            }
+            let held = tx
+                .query_one(
+                    "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
+                        AND ($2 OR EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                           WHERE at_rest_sha256 = $1))) AS h",
+                    &[&sha_vec, &(!community_tier)],
+                )
+                .await
+                .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
+            let held: bool = held.safe_get_with("h", crate::federation::BlobError::Backend)?;
+            if !held {
+                let _ = tx.rollback().await;
+                return Err(not_held());
+            }
+        }
 
         // Holder attestation. Insert is idempotent at the
         // (attestation_id) PK; the caller supplies a fresh UUID per
@@ -13224,13 +13291,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         community_key_id: &str,
     ) -> Result<u64, crate::federation::BlobError> {
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("bump tx: {e}")))?;
+        lock_community_tx(&tx, community_key_id).await?;
         // Upsert: epoch 0 → first bump yields 1; subsequent bumps +1. The
         // RETURNING gives the post-bump epoch atomically.
-        let row = client
+        let row = tx
             .query_one(
                 "INSERT INTO cirislens.federation_community_dek_epoch \
                     (community_key_id, epoch, rotated_at) \
@@ -13246,6 +13318,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 crate::federation::BlobError::Backend(format!("community_dek_bump_epoch: {e}"))
             })?;
         let epoch: i64 = row.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("bump commit: {e}")))?;
         Ok(epoch.max(0) as u64)
     }
 
@@ -13406,14 +13481,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         community_key_id: &str,
         epoch: u64,
     ) -> Result<(), crate::federation::BlobError> {
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let sha_vec = at_rest_sha256.to_vec();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
-        // v43.0.0 (§11.4) — conditional on `enabled`, in the statement.
-        let n = client
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("bind tx: {e}")))?;
+        lock_community_tx(&tx, community_key_id).await?;
+        // v43.0.0 (§11.4) — conditional on current + `enabled`, in the
+        // statement, under the community lock (I27).
+        let n = tx
             .execute(
                 "INSERT INTO cirislens.federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
                  SELECT $1, $2, $3 \
@@ -13427,7 +13508,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("bind_blob_epoch: {e}")))?;
         if n == 0 {
-            let row = client
+            let row = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
                                     WHERE at_rest_sha256 = $1) AS e",
@@ -13440,12 +13521,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
             let already: bool =
                 row.safe_get_with::<bool, _, _, _>("e", crate::federation::BlobError::Backend)?;
             if !already {
+                let _ = tx.rollback().await;
                 return Err(crate::federation::BlobError::EpochNotCurrent {
                     community_key_id: community_key_id.to_owned(),
                     epoch,
                 });
             }
         }
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("bind commit: {e}")))?;
         Ok(())
     }
 
@@ -13499,6 +13584,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("set_key_state tx: {e}")))?;
+        lock_community_tx(&tx, community_key_id).await?;
         // v43.0.0 (§11.4) — see the SQLite twin: destroy is one conditional
         // statement that also deletes the key; bind's EXISTS(enabled) is the
         // other half of the exclusion.
@@ -13806,6 +13892,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch tx: {e}")))?;
+        lock_community_tx(&tx, community_key_id).await?;
         tx.execute(
             "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
                 SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
@@ -24098,6 +24185,170 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg{}", uuid_like());
         crate::federation::at_rest_cascade::blob_invariants::exercise_i25_the_floor_refuses_a_contradictory_row(&backend, &tag).await;
+    }
+
+    /// §11.10 I28 — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i28_announce_refuses_an_evicted_row_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i28_announce_refuses_an_evicted_row(&backend, &tag).await;
+    }
+
+    /// §11.10 I27 — **one serialization boundary per community, measured by
+    /// OCCUPANCY.** With the community's transaction lock held from another
+    /// session, none of bind / key-state / rotation / eviction / community
+    /// announcement completes; each completes once the lock is released.
+    /// Under READ COMMITTED the statement predicates alone let a seal and a
+    /// destroy both commit (C3-1); the lock is what makes them sufficient.
+    #[tokio::test]
+    async fn blob_invariant_i27_community_ops_wait_for_the_community_lock_postgres() {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::{BlobBody, BlobStorage, DekKeyState, StorageFloor};
+        use std::time::Duration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = std::sync::Arc::new(PostgresBackend::connect(&dsn).await.expect("connect"));
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        let comm = format!("{tag}-comm");
+        let node = format!("{tag}-node");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend.as_ref(),
+            &comm,
+            &[(&format!("{tag}-alice"), &format!("{tag}-alice-occ"))],
+        )
+        .await;
+        let signer = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend.as_ref(),
+            &node,
+        )
+        .await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let node_derived = signer.derived_key_id();
+        // Seed: one sealed object at epoch 0, then rotate so epoch 0 is past.
+        let sealed = encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None)
+            .await
+            .unwrap();
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("inline");
+        };
+        let past = sealed.epoch;
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+
+        // Another SESSION holds the community's lock.
+        let mut holder = backend.dedicated_connect().await.expect("holder session");
+        let hold = holder.transaction().await.expect("begin");
+        hold.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('community_dek'), hashtext($1))",
+            &[&comm],
+        )
+        .await
+        .expect("take the lock");
+
+        type Op = std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>;
+        let ops: Vec<(&str, Op)> = vec![
+            ("bump_epoch", {
+                let b = backend.clone();
+                let c = comm.clone();
+                Box::pin(async move { format!("{:?}", b.community_dek_bump_epoch(&c).await) })
+            }),
+            ("bind", {
+                let b = backend.clone();
+                let c = comm.clone();
+                Box::pin(async move {
+                    format!(
+                        "{:?}",
+                        b.community_dek_bind_blob_epoch(&[7u8; 32], &c, past).await
+                    )
+                })
+            }),
+            ("set_key_state", {
+                let b = backend.clone();
+                let c = comm.clone();
+                Box::pin(async move {
+                    format!(
+                        "{:?}",
+                        b.community_dek_set_key_state(&c, past, DekKeyState::Disabled)
+                            .await
+                    )
+                })
+            }),
+            ("announce", {
+                let b = backend.clone();
+                let c = comm.clone();
+                let sha = sealed.at_rest_sha256;
+                let bytes = bytes.clone();
+                let key = node_derived.clone();
+                let s = signer.clone();
+                Box::pin(async move {
+                    let ad = crate::signing::LocalSignerHardwareAdapter::new(s);
+                    let _ = &c;
+                    format!(
+                        "{:?}",
+                        b.put_blob_signing_at(
+                            COMMUNITY,
+                            StorageFloor::resolved(CryptoTier::CommunityDek),
+                            &sha,
+                            BlobBody::Inline(bytes),
+                            None,
+                            &key,
+                            &ad,
+                            chrono::Utc::now(),
+                            uuid::Uuid::new_v4(),
+                        )
+                        .await
+                    )
+                })
+            }),
+            ("evict", {
+                let b = backend.clone();
+                let c = comm.clone();
+                let s = signer.clone();
+                Box::pin(async move {
+                    format!(
+                        "{:?}",
+                        b.community_dek_evict_epoch_objects(&c, past, &s, chrono::Utc::now())
+                            .await
+                    )
+                })
+            }),
+        ];
+        let _ = &adapter;
+        let mut handles = Vec::new();
+        for (name, op) in ops {
+            handles.push((name, tokio::spawn(op)));
+        }
+        // OCCUPANCY: none of them finishes while the lock is held.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for (name, h) in &handles {
+            assert!(
+                !h.is_finished(),
+                "I27: `{name}` completed while another session held the community lock — \
+                 it does not take the serialization boundary"
+            );
+        }
+        hold.commit().await.expect("release");
+        for (name, h) in handles {
+            let out = tokio::time::timeout(Duration::from_secs(10), h)
+                .await
+                .unwrap_or_else(|_| panic!("I27: `{name}` did not complete after release"))
+                .unwrap();
+            eprintln!("I27 {name}: {out}");
+        }
     }
 
     /// v43.0.0 (§10) — **the full cohort lifecycle on POSTGRES.**

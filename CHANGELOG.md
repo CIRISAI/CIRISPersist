@@ -125,6 +125,35 @@ written first, confirmed red on `30fde79`, and turns red again under mutation.
   Also: `store_blob_local_json`'s docstring stopped calling itself the
   self/family privacy primitive (it writes a commons plaintext row).
 
+### The third review — one boundary that existed by accident
+
+Codex reviewed the second pass (`45bd9b4`): five findings, all real, three
+root causes, invariants I27–I30 (FSD §11, C3-1…C3-5).
+
+- **A serialization boundary that existed on sqlite by accident of its one
+  connection mutex, and not at all on postgres.** Under READ COMMITTED the
+  bind's `EXISTS (enabled)` and the destroy's `NOT EXISTS (binding)` are
+  snapshot reads, so a seal and a destroy could both commit and leave a blob
+  bound to a destroyed epoch — the interleaving §11.4 said could not happen.
+  Every postgres operation that reads or moves a community's epoch state
+  (bind, key state, rotation, eviction, community announcement) now takes a
+  per-community transaction-scoped advisory lock first; I27 measures it by
+  occupancy. The same missing boundary let the door's announcement, arriving
+  after a rotation-plus-sweep had evicted the blob, RE-INSERT the ciphertext
+  row without its binding and report success. An announcement never stores:
+  a sealed-tier token through the signing floor emits the holder attestation
+  only for a row that exists and, for community content, is still bound —
+  evicted under the writer ⇒ `NotHeld` (I28).
+- **A cache that remembered failure.** One transient TPM or filesystem error
+  at first derivation was stored in the process-wide `OnceLock`, making the
+  encrypted corpus unavailable until restart. Only a successful derivation is
+  cached (I29).
+- **A surface that exposed the operation and not its policy or its report.**
+  `retain_past_epochs` — the policy that lets a sweep evict anything — had no
+  Engine facade or Python binding, so a Python-only deployment could run
+  sweeps that were structurally unable to evict; and the Python sweep report
+  dropped `failed`. Both on the surface now, gated from disk (I30, I8).
+
 ### Also fixed
 
 - `evict_scope_blobs` reachability and the six order-dependent postgres tests

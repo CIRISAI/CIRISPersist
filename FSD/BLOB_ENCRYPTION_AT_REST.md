@@ -1315,6 +1315,22 @@ in `ensure_epoch_dek` with nothing but an unrelated membership revocation able
 to advance it. Rotation retires an epoch; the key-state door only ever acts on
 epochs rotation has already left behind.
 
+**One serialization boundary per community.** "Mutually exclusive by
+statement" is true on sqlite, where every call holds the one connection
+mutex, and was FALSE on postgres: under READ COMMITTED a bind's `EXISTS
+(enabled)` and a destroy's `NOT EXISTS (binding)` are non-locking snapshot
+reads, so a seal that read *enabled* and a destroy that read *no binding*
+can both commit, leaving a blob bound to a destroyed epoch — the exact
+interleaving §11.4 claimed impossible. Every operation that reads or moves a
+community's epoch state on postgres — bind, key-state change, rotation
+(`bump_epoch`), eviction, and the holder announcement of a community blob —
+now runs in a transaction that first takes
+`pg_advisory_xact_lock(hashtext('community_dek:' ‖ community_key_id))`. The
+lock is per community, transaction-scoped, released at commit or rollback,
+and cheap; it makes the statement predicates below sufficient rather than
+merely necessary. I27 witnesses occupancy: with the lock held from another
+session, each of those operations does not complete until it is released.
+
 **Bind and destroy are mutually exclusive by statement.** Binding a blob to an
 epoch is a conditional insert that succeeds only while the epoch is current and
 `enabled`.
@@ -1366,6 +1382,20 @@ evicted community blob left its binding behind, the epoch object count stayed
 non-zero forever, and that epoch's DEK could never be destroyed even though the
 bytes were gone. A count is only a precondition if every deletion maintains it.
 
+**An announcement never stores.** The community arm of the write door seals,
+stores and binds in the cascade, then announces `holds_bytes`. The second
+rebuild announced through the signing floor, whose row insert is
+`ON CONFLICT DO NOTHING`: if a rotation and a retention sweep evicted the
+blob between the bind and the announcement, the announcement RE-INSERTED the
+ciphertext row — without its binding — and returned success for a row
+`read_blob_as` then reported as corrupt. The announcement is now its own
+floor operation that emits the holder attestation **only for a row that
+exists**, and for a community-tier row only while its binding exists, in one
+transaction under the community's serialization boundary. Evicted under the
+writer's feet ⇒ the writer is told (`NotHeld`), never handed a success for
+bytes that are gone (I28). The other order — announce first, sweep second —
+is the ordinary case: the sweep finds the announcement and retracts it.
+
 **Scope of the retraction, stated plainly.** The sweep retracts announcements
 this node made **under its own signing key** — the derived federation key its
 `LocalSigner` holds, which is what `put_blob_scoped` announces under. An
@@ -1376,9 +1406,17 @@ Invariant I9 asserts the own-key case, which is the production shape.
 
 ### 11.6 The lifecycle is on every consumer surface
 
-`Engine::community_dek_set_key_state`, `Engine::sweep_community_epochs`, and
-`Engine::sweep_all_communities` (the shape a scheduler calls), with PyO3
-bindings. The first implementation built the state machine and the sweep with
+`Engine::community_dek_set_key_state`, `Engine::sweep_community_epochs`,
+`Engine::sweep_all_communities` (the shape a scheduler calls), and
+`Engine::community_dek_set_retain_past_epochs` — the retention policy the
+sweep enforces — with PyO3 bindings. The second rebuild exposed the sweep and
+not the policy, so a Python-only deployment could run a sweep that was
+structurally unable to evict anything: `retain_past_epochs` defaults to
+retain-indefinitely and nothing on the surface could change it. A sweep
+report also carries `failed` (epochs whose retraction could not be admitted,
+§11.5), and the Python serializer carries every field the report has (I30);
+the second rebuild dropped `failed`, so an operator saw a clean report over
+retained bytes. The first implementation built the state machine and the sweep with
 zero facades and zero bindings — the CHANGELOG advertised "rotate, sweep …
 from Rust and from Python" over a lifecycle that was inert outside the test
 binary. The same defect this cut had just found three times in older code.
@@ -1402,6 +1440,13 @@ error, and new writes succeeded under the new root.
   delete, not one round trip per object, and on SQLite the connection mutex is
   not held across a per-row loop.
 - The read door loads the body once.
+
+**The cache remembers only success.** The hardware-master cache stored
+whatever the first derivation returned — including `None` from a transient
+TPM or filesystem error or a failed join — in a process-wide `OnceLock`, so
+one bad moment at boot made the entire encrypted corpus unavailable until
+restart. Only a successfully derived key is cached; a failed derivation
+returns the error and the next call derives again (I29).
 
 ### 11.9 Every backend, every surface, every error
 
@@ -1443,6 +1488,10 @@ error, and new writes succeeded under the new root.
 | I24 | The row records the cohort the write NAMED; an `affiliations` write is not collapsed to `community`. | `blob_cohort_scope` reports `community` for an affiliations write | U4 |
 | I25 | The floor refuses a self-contradicting row: `self`/`family` at `plaintext`, commons at a sealed tier. | a token-holding in-crate caller records a private plaintext row | — |
 | I26 | Every backend resolves a hardware content master through the process cache; the uncached resolver has no backend caller. | the cache has zero callers; TPM I/O per read | U2 |
+| I27 | On postgres, bind / key-state / rotation / eviction / community announcement each take the community's transaction lock: none completes while another session holds it. | a blob bound to a destroyed epoch under READ COMMITTED | C3-1 |
+| I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep | C3-2 |
+| I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart | C3-3 |
+| I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped | C3-4, C3-5 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1457,7 +1506,11 @@ door's "current epoch" check (I20) is a friendlier message in front of the
 backend statement that is the real guard — removing the message alone leaves
 I20 green, removing the statement's predicate turns it red. I22 is a
 `compile_fail` doctest, which `cargo nextest` never runs; it has its own
-certify gate and CI step so the witness executes. A test that is green on
+certify gate and CI step so the witness executes. On postgres the community
+announcement (I28) refuses an evicted row at two points — the binding lookup
+that names the community to lock, and the existence check under that lock —
+and each alone refuses the evicted case, so removing either survives; the
+pair removed together turns I28 red, which is the evidence recorded. A test that is green on
 the code it was written to catch is a report.
 
 **C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,
@@ -1482,6 +1535,15 @@ hard-coded `community` on the row for an `affiliations` write (I24). U5: the
 V139 sqlite header claimed the final-name rebuild shape while the DDL used
 `__v139` + RENAME; the header now says that shape is safe for THIS table and
 why it is not a template.
+
+**C3 = Codex's third review, of `45bd9b4`**, five findings, all real. Two
+are the same root cause — a serialization boundary that existed on sqlite by
+accident of its single connection mutex and did not exist on postgres at
+all: the bind/destroy race under READ COMMITTED (C3-1) and the
+announce-after-cascade window that could re-insert an evicted row (C3-2).
+One is a cache that remembered failure (C3-3). Two are the same shape as
+§11.6's own finding about the first implementation — a surface that
+exposes the operation and not its policy or its report (C3-4, C3-5).
 
 ---
 

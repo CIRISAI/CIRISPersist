@@ -193,9 +193,9 @@ pub fn content_master_key(create_seed_if_absent: bool) -> ContentMasterSource {
 /// Only the HARDWARE arm is cached: a software master lives in the database
 /// row and is read there.
 pub async fn hardware_content_master_cached() -> Option<[u8; 32]> {
-    static CACHE: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     if let Some(v) = CACHE.get() {
-        return *v;
+        return Some(*v);
     }
     // Re-derivation of a master in use: NEVER mint a seed (§11.7).
     let derived = tokio::task::spawn_blocking(|| match content_master_key(false) {
@@ -205,7 +205,20 @@ pub async fn hardware_content_master_cached() -> Option<[u8; 32]> {
     .await
     .ok()
     .flatten();
-    *CACHE.get_or_init(|| derived)
+    remember_only_success(&CACHE, derived)
+}
+
+/// §11.8 / I29 — **the cache remembers only success.** A transient TPM or
+/// filesystem failure (or a failed join) yields `None` for THIS call and
+/// leaves the cache empty, so the next call derives again. The second
+/// rebuild cached whatever the first derivation returned — `None` included —
+/// so one bad moment at boot made the corpus unavailable until restart.
+fn remember_only_success(
+    cache: &'static std::sync::OnceLock<[u8; 32]>,
+    derived: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let key = derived?;
+    Some(*cache.get_or_init(|| key))
 }
 
 /// v43.0.0 (§11.8) — [`resolve_persisted_content_master`] with the hardware
@@ -3215,6 +3228,87 @@ pub mod blob_invariants {
             );
         }
     }
+    // ── I28 ──────────────────────────────────────────────────────────────
+    /// **An announcement never stores.** If a rotation and a retention sweep
+    /// evict a community blob between the cascade's bind and the door's
+    /// announcement, the announcement must refuse (`NotHeld`) — not re-insert
+    /// a ciphertext row with no binding and return success. (C3-2)
+    pub async fn exercise_i28_announce_refuses_an_evicted_row<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::StorageFloor;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let node_derived = signer.derived_key_id();
+
+        // The cascade half of the door: sealed, stored, bound.
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"raced", None)
+            .await
+            .unwrap();
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("{tag} I28: sealed blob is inline");
+        };
+        // A rotation + retention sweep evicts it before the door announces.
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        let n = backend
+            .community_dek_evict_epoch_objects(&comm, sealed.epoch, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "{tag} I28: precondition — evicted");
+        assert!(!backend.has_blob(&sealed.at_rest_sha256).await.unwrap());
+
+        // The announce half of the door, arriving late.
+        let res = backend
+            .put_blob_signing_at(
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                &sealed.at_rest_sha256,
+                BlobBody::Inline(bytes),
+                None,
+                &node_derived,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::NotHeld { .. })),
+            "{tag} I28: announcing an EVICTED community blob must refuse NotHeld, got {res:?}"
+        );
+        assert!(
+            !backend.has_blob(&sealed.at_rest_sha256).await.unwrap(),
+            "{tag} I28: the announcement RE-INSERTED the ciphertext row — without its \
+             binding, a row read_blob_as reports as corrupt"
+        );
+        assert!(
+            !backend
+                .list_holders(&sealed.at_rest_sha256)
+                .await
+                .unwrap()
+                .contains(&node_derived),
+            "{tag} I28: no holder claim for bytes this node does not hold"
+        );
+    }
 }
 
 /// Fixture-only access to the storage floor for [`blob_invariants`].
@@ -3246,5 +3340,28 @@ pub mod blob_invariants_fixture {
             )
             .await
             .expect("floor write");
+    }
+}
+
+#[cfg(test)]
+mod cache_policy_tests {
+    use super::remember_only_success;
+
+    /// I29 — a failed derivation is not remembered; the next one is.
+    #[test]
+    fn i29_the_cache_remembers_only_success() {
+        static CACHE: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        assert_eq!(remember_only_success(&CACHE, None), None);
+        assert!(
+            CACHE.get().is_none(),
+            "I29: a transient failure was CACHED — the corpus stays unavailable until restart"
+        );
+        assert_eq!(
+            remember_only_success(&CACHE, Some([7u8; 32])),
+            Some([7u8; 32])
+        );
+        // Once derived, a later failure cannot evict the good value either.
+        assert_eq!(remember_only_success(&CACHE, None), None);
+        assert_eq!(CACHE.get(), Some(&[7u8; 32]));
     }
 }
