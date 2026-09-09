@@ -404,6 +404,35 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
+        encrypt_and_cascade_community_scoped(
+            backend,
+            COMMUNITY,
+            community_key_id,
+            plaintext,
+            media_type,
+        )
+        .await
+    }
+
+    /// [`encrypt_and_cascade_community`] recording the cohort the write
+    /// NAMED (`community` or `affiliations`) on the row. Both cohorts share
+    /// this cascade and the `CommunityDek` tier; the row's `cohort_scope` is
+    /// provenance and must not be collapsed to `community` for an
+    /// `affiliations` write (§11.1).
+    pub async fn encrypt_and_cascade_community_scoped<B>(
+        backend: &B,
+        cohort_scope: &str,
+        community_key_id: &str,
+        plaintext: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<CommunityCascadeResult, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        debug_assert!(
+            cohort_scope == COMMUNITY || cohort_scope == AFFILIATIONS,
+            "the community cascade serves community/affiliations, got {cohort_scope:?}"
+        );
         // Defense-in-depth: the dispatch (crypto_tier over COMMUNITY/
         // AFFILIATIONS) should already have routed here. Both scopes share
         // this path; the subkind opt-out is enforced in resolve.
@@ -416,9 +445,79 @@ pub mod orchestrate {
             CryptoTier::CommunityDek
         ));
 
-        let epoch = backend
-            .community_dek_current_epoch(community_key_id)
-            .await?;
+        // §11.4 / I17 — read the epoch, seal, store, BIND-IF-STILL-CURRENT. A
+        // rotation that lands between the read and the bind refuses the
+        // bind; the attempt cleans up its own ciphertext row and this loop
+        // re-seals under the epoch that is current now. Bounded: a community
+        // rotating faster than a write can land is reported, not spun on.
+        const ATTEMPTS: usize = 3;
+        let mut last_epoch = 0;
+        for _ in 0..ATTEMPTS {
+            let epoch = backend
+                .community_dek_current_epoch(community_key_id)
+                .await?;
+            match seal_store_bind_at(
+                backend,
+                cohort_scope,
+                community_key_id,
+                epoch,
+                plaintext,
+                media_type,
+            )
+            .await?
+            {
+                SealOutcome::Bound(r) => return Ok(r),
+                SealOutcome::EpochMoved { at_rest_sha256 } => {
+                    tracing::debug!(
+                        community = %community_key_id,
+                        epoch,
+                        sha256_prefix = &hex::encode(at_rest_sha256)[..16],
+                        "community cascade: epoch moved under a write; orphan removed, re-sealing"
+                    );
+                    last_epoch = epoch;
+                }
+            }
+        }
+        Err(BlobError::EpochNotCurrent {
+            community_key_id: community_key_id.to_owned(),
+            epoch: last_epoch,
+        })
+    }
+
+    /// What one [`seal_store_bind_at`] attempt did.
+    #[derive(Debug)]
+    pub(crate) enum SealOutcome {
+        /// Sealed, stored, bound to `epoch`.
+        Bound(CommunityCascadeResult),
+        /// The bind was refused because `epoch` is no longer current (or not
+        /// enabled). The ciphertext row this attempt stored has been removed
+        /// again — **no orphan** — and `at_rest_sha256` names it so a test
+        /// can prove that.
+        EpochMoved {
+            /// The sha of the row that was stored and then removed.
+            at_rest_sha256: [u8; 32],
+        },
+    }
+
+    /// ONE attempt of the community cascade at a caller-named `epoch`:
+    /// ensure the DEK, seal, store the ciphertext, bind if `epoch` is still
+    /// the current enabled epoch. On a refused bind the stored row is deleted
+    /// before returning [`SealOutcome::EpochMoved`]; any other error also
+    /// removes the row (a ciphertext row with no binding is an orphan, never
+    /// a public blob). [`encrypt_and_cascade_community`] is the door and
+    /// loops over this; it is crate-private so no consumer can seal at an
+    /// epoch of its choosing.
+    pub(crate) async fn seal_store_bind_at<B>(
+        backend: &B,
+        cohort_scope: &str,
+        community_key_id: &str,
+        epoch: u64,
+        plaintext: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<SealOutcome, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
         let (dek, granted, excluded) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
 
         // Seal the body under the shared epoch DEK into the self-describing
@@ -432,19 +531,29 @@ pub mod orchestrate {
                 &at_rest_sha256,
                 BlobBody::Inline(envelope_bytes),
                 media_type,
-                crate::federation::types::cohort_scope::COMMUNITY,
+                cohort_scope,
+                crate::federation::StorageFloor::resolved(CryptoTier::CommunityDek),
             )
             .await?;
-        backend
+        match backend
             .community_dek_bind_blob_epoch(&at_rest_sha256, community_key_id, epoch)
-            .await?;
-
-        Ok(CommunityCascadeResult {
-            at_rest_sha256,
-            epoch,
-            granted,
-            excluded,
-        })
+            .await
+        {
+            Ok(()) => Ok(SealOutcome::Bound(CommunityCascadeResult {
+                at_rest_sha256,
+                epoch,
+                granted,
+                excluded,
+            })),
+            Err(BlobError::EpochNotCurrent { .. }) => {
+                backend.delete_blob(&at_rest_sha256).await?;
+                Ok(SealOutcome::EpochMoved { at_rest_sha256 })
+            }
+            Err(e) => {
+                backend.delete_blob(&at_rest_sha256).await?;
+                Err(e)
+            }
+        }
     }
 
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — **transition a
@@ -514,6 +623,24 @@ pub mod orchestrate {
             )));
         }
 
+        // §11.4 / I20 — the CURRENT epoch is the primary: it is retired by
+        // rotation, never by this door. Moving it to disabled/destroyed would
+        // leave the pointer naming an epoch no write can use. The backend's
+        // conditional UPDATE refuses this too; here it gets a reason.
+        if to != DekKeyState::Enabled {
+            let current_epoch = backend
+                .community_dek_current_epoch(community_key_id)
+                .await?;
+            if epoch == current_epoch {
+                return Err(BlobError::InvalidArgument(format!(
+                    "refusing to move community {community_key_id:?} epoch {epoch} to \
+                     {to:?}: it is the CURRENT epoch. The pointer would keep naming it and \
+                     every later write would fail — rotate first \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+                )));
+            }
+        }
+
         // The BACKEND's conditional UPDATE is the real guard (§11.4); this
         // early check only produces a friendlier message.
         if to == DekKeyState::Destroyed {
@@ -553,6 +680,11 @@ pub mod orchestrate {
         /// declining to orphan content, which is the correct outcome — but
         /// an operator watching key material accumulate deserves to see why.
         pub blocked: Vec<(u64, u64)>,
+        /// `(epoch, error)` for epochs whose eviction FAILED — a `withdraws`
+        /// could not be signed or admitted (§11.5, I18). Nothing was deleted
+        /// for that epoch; the next sweep retries. Reported, never swallowed:
+        /// the first rebuild deleted anyway and called it fail-honest.
+        pub failed: Vec<(u64, String)>,
     }
 
     /// v43.0.0 (§10.7) — **sweep one community's rotated-past epochs.**
@@ -628,10 +760,19 @@ pub mod orchestrate {
 
             if deletable {
                 // §11.5 — retracts the local holds_bytes announcement (a
-                // withdraws per row, via the signer) BEFORE deleting.
-                report.evicted_objects += backend
+                // withdraws per row, via the signer) BEFORE deleting. A
+                // failed retraction leaves the bytes in place (I18); this
+                // epoch is reported and the sweep moves on.
+                match backend
                     .community_dek_evict_epoch_objects(community_key_id, epoch, signer, now)
-                    .await?;
+                    .await
+                {
+                    Ok(n) => report.evicted_objects += n,
+                    Err(e) => {
+                        report.failed.push((epoch, e.to_string()));
+                        continue;
+                    }
+                }
             }
 
             let remaining = backend
@@ -1228,6 +1369,9 @@ pub mod lifecycle_harness {
         backend
             .put_blob_signing_at(
                 crate::federation::types::cohort_scope::COMMUNITY,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+                ),
                 &before.at_rest_sha256,
                 crate::federation::BlobBody::Inline(sealed0),
                 None,

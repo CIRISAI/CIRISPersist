@@ -2265,6 +2265,27 @@ pub mod cohort_scope {
         Plaintext,
     }
 
+    impl CryptoTier {
+        /// v43.0.0 (§11.1) — the row's `crypto_tier` column value.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                CryptoTier::Plaintext => "plaintext",
+                CryptoTier::InvisibleEncrypted => "invisible_encrypted",
+                CryptoTier::CommunityDek => "community_dek",
+            }
+        }
+
+        /// The inverse of [`as_str`](Self::as_str); `None` for anything else.
+        pub fn parse_str(s: &str) -> Option<Self> {
+            match s {
+                "plaintext" => Some(CryptoTier::Plaintext),
+                "invisible_encrypted" => Some(CryptoTier::InvisibleEncrypted),
+                "community_dek" => Some(CryptoTier::CommunityDek),
+                _ => None,
+            }
+        }
+    }
+
     /// The §8.1.13.3 / §10.1.4 at-rest dispatch — **NEGATIVE-DEFAULT
     /// (#188)**: only `self`/`family` and `community`/`affiliations` are
     /// encrypted; *everything else, including unknown future scopes, falls

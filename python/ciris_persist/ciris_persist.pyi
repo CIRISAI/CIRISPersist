@@ -3080,7 +3080,7 @@ class Engine:
         """(derived) empirical — #249 Cut B — the user-role key(s) that steward-bind key_id (who key_id is steward-bound TO). Returns a JSON array of key_ids; empty when key_id is..."""
 
     def store_blob_local_json(self, payload_json: str) -> None:
-        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes WITHOUT emitting a holds_bytes directory attestation."""
+        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holds_bytes directory attestation."""
 
     def task_delete(self, task_id: str) -> bool:
         """v1.5.9 — Delete a task by id.

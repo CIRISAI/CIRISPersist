@@ -1270,6 +1270,13 @@ jobs:
       # thing it measures without anyone being told.
       - name: generated directory double is current
         run: python3 scripts/gen_directory_double.py --check
+      # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
+      # unconstructible outside the crate. The witness is a `compile_fail`
+      # doctest, and nextest never runs doctests, so it gets its own step.
+      - name: storage floor is unconstructible outside the crate (I22)
+        run: |
+          set -euo pipefail
+          cargo test --quiet --doc --features sqlite -- StorageFloor 2>&1 | tee /dev/stderr | grep -q "test result: ok. 1 passed"
       # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
       # the --all-features pass below: `dead_code` / `unused_imports` fire only
       # when a feature is OFF, so the narrow pass catches lints the total pass

@@ -159,7 +159,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -298,6 +298,11 @@ run_bg fmt        cargo fmt --all --check
 run_bg pyi        python3 scripts/pyi_surface.py check
 run_bg featmatrix python3 scripts/ci_feature_matrix.py check
 run_bg docver     python3 scripts/doc_version_refs.py
+# v43.0.0 (I22) — the storage floor is unconstructible OUTSIDE the crate: a
+# `compile_fail` doctest is the one witness that runs as an external crate.
+# `cargo nextest` never runs doctests, so without this leg the witness would
+# exist and never execute — a check that cannot fail is a report.
+run_bg floortoken bash -c 'set -o pipefail; cargo test --quiet --doc --features sqlite -- StorageFloor 2>&1 | tee /dev/stderr | grep -q "test result: ok. 1 passed"'
 run_bg dirdouble  python3 scripts/gen_directory_double.py --check
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
 # hand-spells a `maturin develop --features` list (here or in ci.yml).
@@ -339,7 +344,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.

@@ -73,6 +73,58 @@ the state it constructed became unrepresentable.
   `BlobError` through `blob_err_to_py`, keeping the `blob_not_granted` /
   `blob_not_held` tokens callers branch on.
 
+### The second review, and what it found the rebuild still got wrong
+
+Codex reviewed the rebuild (`30fde79`) and found nine verified issues; the
+cloud ultrareview found five, one overlapping. Fourteen findings, seven root
+causes, every one the same shape as the first review's: **a guarantee
+established at one site and not carried to the next.** FSD §11 records each
+(C2-1…C2-9, U1…U5) and invariants I15–I26 witness them; every witness was
+written first, confirmed red on `30fde79`, and turns red again under mutation.
+
+- **The row stored the tier's INPUT, not the tier.** Reads re-derived the
+  tier from the scope, dropping the directory axis the write door had
+  applied, so an infrastructure community's plaintext content was unreadable
+  through `read_blob_as`. `federation_blobs.crypto_tier` now records the
+  RESOLVED tier and reads dispatch on it (I15). The same premise had made
+  V139's backfill wrong: "no encrypted legacy exists" was false (the self/
+  family door shipped in v42), and defaulting legacy ciphertext rows to
+  commons would have served them to any viewer after upgrade. V139 now
+  classifies each pre-existing row from its own grants and bindings (I16).
+- **"Enabled" was not "current."** A rotation that landed between reading
+  the epoch and binding let the racing write seal under the OLD epoch, which
+  the just-removed member can still open. The bind now requires the current
+  epoch in the same statement; the cascade cleans its orphan and re-seals
+  under the new one (I17). And the key-state door could retire the CURRENT
+  epoch, wedging every later write; refused at the door and in the
+  statement (I20).
+- **The error path undid the happy path.** Eviction swallowed a failed
+  `withdraws` and deleted anyway — "fail-honest" that was fail-silent; a
+  failed retraction now aborts with the bytes intact and the sweep reports
+  the epoch (I18). `delete_blob` left the epoch binding and grants behind,
+  so a deleted blob blocked its epoch's destroy forever; satellites now die
+  with the blob in one transaction, and V139 clears the orphans earlier
+  paths left (I19).
+- **A screen ran on the wrong bytes.** The perceptual-hash matcher saw the
+  ciphertext envelope for community writes and nothing for self/family; it
+  now screens the plaintext once, at the door, before sealing (I21).
+- **An in-crate text gate was mistaken for an API boundary.** `BlobStorage`
+  is `pub` and CIRISServer consumes this crate from Rust, so the body-taking
+  floor methods were doors for it. They now require a `StorageFloor` token
+  no external crate can construct (a `compile_fail` doctest, with its own
+  certify gate and CI step because nextest never runs doctests — I22), the
+  token carries the resolved tier the floor records, and the floor refuses a
+  row that contradicts itself (I25).
+- **A parameter with one correct value was a parameter.** The write door
+  took an attesting key id and the Python binding passed its scrub alias —
+  an announcement the sweep could never retract. The door now derives the
+  id from its signer (I23), and the cascade records the cohort the write
+  named rather than collapsing `affiliations` to `community` (I24).
+- **A perf fix that was never wired.** The §11.8 hardware-master cache had
+  zero callers; both backends now resolve through it, gated from disk (I26).
+  Also: `store_blob_local_json`'s docstring stopped calling itself the
+  self/family privacy primitive (it writes a commons plaintext row).
+
 ### Also fixed
 
 - `evict_scope_blobs` reachability and the six order-dependent postgres tests

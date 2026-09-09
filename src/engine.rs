@@ -2806,35 +2806,7 @@ impl Engine {
     /// ([`Self::with_hardware_signer_hybrid`]) engines alike — the alias
     /// is [`HardwareSigner::current_alias`].
     pub async fn local_derived_key_id(&self) -> Result<String, SignError> {
-        let pubkey = self.signer.public_key().await.map_err(|e| {
-            SignError::LocalSigner(crate::signing::LocalSignerError::ClassicalSign(format!(
-                "local_derived_key_id: hardware public_key read failed: {e}"
-            )))
-        })?;
-        // v10.1.0 (CIRISPersist#275 hardening) — fail LOUD, not silent: a
-        // federation key_id is `derive_key_id(<alias>, <32-byte Ed25519
-        // pubkey>)`. If the composed signer is NOT Ed25519 (e.g. a 65-byte
-        // P-256 `EcdsaP256` keystore fallback), deriving over its pubkey
-        // would mint a key_id that no valid Ed25519 federation row can match
-        // — and silently store an unverifiable key (the #275 3rd surface).
-        // Reject here so the misconfiguration surfaces at the source instead
-        // of as a downstream FK / invalid_length failure.
-        // An Ed25519 public key is exactly 32 bytes.
-        const ED25519_PUBLIC_KEY_LEN: usize = 32;
-        if pubkey.len() != ED25519_PUBLIC_KEY_LEN {
-            return Err(SignError::LocalSigner(
-                crate::signing::LocalSignerError::ClassicalSign(format!(
-                    "local_derived_key_id: signer public_key is {} bytes, not a 32-byte Ed25519 \
-                     key — the engine's federation signing identity must be Ed25519 (got a \
-                     non-Ed25519 signer; pass an Ed25519 local_key_id/local_key_path)",
-                    pubkey.len(),
-                )),
-            ));
-        }
-        Ok(ciris_verify_core::fedcode::derive_key_id(
-            self.signer.current_alias(),
-            &pubkey,
-        ))
+        crate::signing::federation_key_id_of(&*self.signer).await
     }
 
     /// v10.0.1 (CIRISPersist#275) — register THIS engine's **own
@@ -4969,18 +4941,12 @@ impl Engine {
         media_type: Option<&str>,
     ) -> Result<crate::federation::PutBlobScopedResult, crate::federation::BlobError> {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
-        let key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!(
-                "put_blob_scoped: no local derived key: {e}"
-            ))
-        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_scoped(
                     arc.as_ref(),
                     &*self.signer,
-                    &key_id,
                     cohort_scope,
                     community_key_id,
                     plaintext,
@@ -4993,7 +4959,6 @@ impl Engine {
                 put_blob_scoped(
                     arc.as_ref(),
                     &*self.signer,
-                    &key_id,
                     cohort_scope,
                     community_key_id,
                     plaintext,

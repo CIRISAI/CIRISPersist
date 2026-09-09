@@ -313,6 +313,19 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("community_dek_key_state", Class::Plumbing),
     ("community_dek_epoch_object_count", Class::Plumbing),
     ("rollback", Class::Plumbing),
+    // v43.0.0 second pass — `check_scope` IS a refusal (I25: the floor refuses
+    // a self-contradicting row) and both backends call it first, so it
+    // contributes its name and the sequences must agree on it.
+    ("check_scope", Class::Gate),
+    // `community_dek_current_epoch` in the key-state door only names WHICH
+    // cause a zero-row UPDATE had (the predicate itself is in the statement,
+    // I20); in the cascade it is the read the seal is keyed on.
+    ("community_dek_current_epoch", Class::Plumbing),
+    // The eviction's `withdraws` goes through ONE shared helper in blobs.rs;
+    // its gates are the put-gate's and identical on both backends because
+    // there is one helper. Propagated (I18) rather than swallowed, so it now
+    // appears in the scanned sequence.
+    ("emit_withdraws_attestation_helper", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

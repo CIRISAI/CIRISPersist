@@ -9478,14 +9478,20 @@ impl PyEngine {
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
-    /// bytes WITHOUT emitting a `holds_bytes` directory attestation.
+    /// bytes locally at the COMMONS tier WITHOUT emitting a `holds_bytes`
+    /// directory attestation.
     ///
-    /// The wheel-surface primitive for `cohort_scope: self | family`
-    /// content: the bytes are persisted locally (readable via
-    /// `get_blob_json`) but the substrate announces nothing — no
-    /// `holds_bytes` row, so non-member peers cannot discover the bytes
-    /// exist. The payload is the same shape as `put_blob_json` **minus
-    /// the `attestation` field** (there is no attestation to sign):
+    /// **v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2): this is not the
+    /// private-content door any more.** The row it writes is
+    /// `cohort_scope = federation`, `crypto_tier = plaintext`, and
+    /// `read_blob_as` will serve it to any viewer. Unannounced is not
+    /// private: the bytes are undiscoverable by peers, not protected. For
+    /// `self` / `family` / `community` / `affiliations` content use
+    /// `put_blob_scoped`, which seals; there is no consumer-reachable
+    /// write that stores unsealed bytes at an encrypted cohort.
+    ///
+    /// The payload is the same shape as `put_blob_json` **minus the
+    /// `attestation` field** (there is no attestation to sign):
     /// `{"sha256": "<hex>", "body": {"inline": "<b64>"}|{"external":
     /// {...}}, "media_type": "...|null"}`.
     fn store_blob_local_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
@@ -9505,6 +9511,9 @@ impl PyEngine {
                                 body,
                                 media_type.as_deref(),
                                 crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -9521,6 +9530,9 @@ impl PyEngine {
                                 body,
                                 media_type.as_deref(),
                                 crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -12640,8 +12652,16 @@ impl PyEngine {
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
             let media = media_type.map(str::to_owned);
-            let signer = self.signer.clone();
-            let signer_key_id = self.signer_key_id.clone();
+            // §11.2 (6) / I23 — announce under the identity the sweep retracts
+            // under: the LOCAL signer when one is configured (what
+            // `sweep_community_epochs` uses), else the composed signer. The
+            // key id is derived from whichever signs; no alias is passed.
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -12651,7 +12671,6 @@ impl PyEngine {
                             put_blob_scoped(
                                 backend.as_ref(),
                                 &*signer,
-                                &signer_key_id,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -12667,7 +12686,6 @@ impl PyEngine {
                             put_blob_scoped(
                                 backend.as_ref(),
                                 &*signer,
-                                &signer_key_id,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -31173,6 +31191,9 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
+        // so a caller sees this only if every retry lost the race.
+        crate::federation::BlobError::EpochNotCurrent { .. } => PyValueError::new_err(kind),
         // v6.8.0 (CIRISPersist#149) — disk-pressure proxy refusal.
         // PERMANENT (ValueError), NOT a retryable RuntimeError/Transient:
         // the peer should fetch from another holder; retrying this node

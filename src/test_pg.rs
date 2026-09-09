@@ -96,6 +96,23 @@ pub fn isolated_dsn() -> Option<String> {
 }
 
 /// Split a postgres URL into (everything before the final `/`, database name).
+/// v43.0.0 (I16) — **an EMPTY database of this test's own**: no template, no
+/// migrations. For a migration test that must seed rows in the PRE-migration
+/// shape and then run the migration under test; [`isolated_dsn`] cannot serve
+/// that because its template already carries every migration.
+#[must_use]
+pub fn empty_dsn() -> Option<String> {
+    let base = std::env::var(BASE_VAR).ok()?;
+    let (host_part, base_db) = split(&base)?;
+    let name = unique_name();
+    let admin = format!("{host_part}/{base_db}");
+    let sql = format!("CREATE DATABASE \"{name}\"");
+    match run_sql(&admin, &sql) {
+        Ok(()) => Some(format!("{host_part}/{name}")),
+        Err(e) => panic!("test_pg: could not provision an empty database ({e}).\nSQL: {sql}"),
+    }
+}
+
 fn split(url: &str) -> Option<(&str, &str)> {
     let cut = url.rfind('/')?;
     Some((&url[..cut], &url[cut + 1..]))

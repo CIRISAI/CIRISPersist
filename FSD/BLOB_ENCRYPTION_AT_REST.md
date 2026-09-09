@@ -1156,9 +1156,23 @@ holds. §10's decisions stand; §11 is how they are made unbypassable.
 
 ### 11.1 The blob row is the authority on its own tier
 
-`federation_blobs` gains `cohort_scope TEXT NOT NULL` (V139, both dialects,
-CHECK against the closed set). It is written by the door in §11.2 and read by
-the door in §11.3. **Nothing sniffs bytes to decide a tier.**
+`federation_blobs` gains two columns (V139, both dialects, each CHECKed
+against its closed set): `cohort_scope` — the cohort the write named, kept as
+provenance — and **`crypto_tier`** (`plaintext` / `invisible_encrypted` /
+`community_dek`) — **the tier the write door RESOLVED**, which is what reads
+dispatch on. Both are written by the door in §11.2; only `crypto_tier` is read
+by the door in §11.3. **Nothing sniffs bytes to decide a tier, and nothing
+re-derives a tier from a label.**
+
+Two columns because they are two facts. The first rebuild stored only the
+scope and had reads recompute the tier from it with `crypto_tier(scope, None)`
+— the exact call §11.2(2) says the write door must not make, because it drops
+the directory axis. So an authorized infrastructure community's write resolved
+`Plaintext`, was stored under the literal scope `community`, and every read
+then classified that same row `CommunityDek`, looked for a binding a plaintext
+row correctly does not have, and failed. The write-time resolution was
+discarded on the way to disk. Recording the resolved tier is what "the row is
+the authority" has to mean; recording the input to the resolution is not.
 
 This is the single change that removes two root causes at once. The first
 implementation had reads inspecting the body for the envelope magic to decide
@@ -1168,9 +1182,21 @@ private cohort was returned as public. When the row says what it is, the
 question "is this sealed?" becomes "does this row's tier require sealing, and
 does its body parse as an envelope?" — a structural check, not a guess.
 
-Backfill: every pre-V139 row is `federation`. Blob storage had not shipped, so
-there is no encrypted legacy; the migration says so and does not pretend to
-classify rows it cannot.
+**Backfill — corrected.** The first rebuild wrote "blob storage had not
+shipped, so there is no encrypted legacy" and defaulted every pre-V139 row to
+commons. That premise was false: `Engine::put_blob_encrypted_self_family`
+shipped in v42, and the community cascade has bound blobs to epochs since V087.
+Under that default, every ciphertext row an upgraded node already held would
+have read back through §11.3's plaintext arm — grant check skipped, envelope
+bytes returned to any viewer. A migration default is a security decision.
+
+V139 classifies each existing row from the row's OWN evidence, in this order:
+a row with a `federation_community_blob_epoch` binding is `community_dek` /
+`community`; a row with a `federation_blob_key_grants` row is
+`invisible_encrypted` under that grant's recorded `cohort_scope`; what remains
+is commons. It also deletes bindings and grants whose blob row no longer exists
+(earlier eviction paths deleted the blob and left them — §11.5). I16 seeds
+rows of each kind through V138, runs V139, and reads them back.
 
 ### 11.2 One write door, and the storage floor is not a door
 
@@ -1192,7 +1218,24 @@ storage method). It:
    DEK, per-member wraps) **and** announce `holds_bytes`, because community
    content federates with cleartext provenance and the cascade never emitted
    the announcement it documented as the caller's job;
-4. records `cohort_scope` on the row.
+4. records `cohort_scope` **and the resolved `crypto_tier`** on the row;
+5. **screens the PLAINTEXT with the perceptual-hash matcher, exactly once,
+   before anything is sealed.** The first rebuild reached the matcher only
+   through the announce step, which for a community write receives the
+   randomized ciphertext envelope — a matcher configured to refuse known-bad
+   images was handed bytes it could never match, after the cascade had already
+   persisted them — and the self/family cascade never reached it at all. The
+   screening is one shared function; the encrypted tiers call it at this door,
+   and the commons tier is screened by the floor it lands on, so every path is
+   screened once and no path twice;
+6. **derives the attesting key id from the signer it was given**, by the same
+   recipe as `Engine::local_derived_key_id` (#275: `derive_key_id(alias,
+   Ed25519 pubkey)`, refusing a non-Ed25519 signer). The door takes no key-id
+   argument. The first rebuild took one, and the Python binding passed the
+   scrub alias it holds — a `holds_bytes` row that either FK-fails or names a
+   key the sweep does not search under, so the announcement could never be
+   retracted (§11.5). A parameter that has exactly one correct value is not a
+   parameter.
 
 The pre-existing commons doors (`put_blob_signing`, `put_blob_json`) remain and
 are **commons-only by construction**: they record `federation`. There is no
@@ -1200,12 +1243,21 @@ consumer-reachable path that stores bytes at an encrypted cohort without
 sealing them, because the only function that accepts an encrypted cohort is
 the one that seals.
 
-`store_blob_local` is the storage floor. It is called by the two cascades — and
-by the commons doors, which may reach it **only by naming a commons scope as a
-literal constant in the call** (`cohort_scope::FEDERATION`), never through a
-variable that could carry a private cohort. A from-disk gate (I14) reds on any
-other production caller. A floor with an unconstrained caller is a bypass with a
-comment.
+`store_blob_local`, `put_blob_with_scope` and `put_blob_signing_at` are the
+storage floor: they take a body and a scope and persist without resolving a
+tier. In-crate, the two cascades call them, and the commons doors may reach
+them **only by naming a commons scope as a literal constant in the call**
+(`cohort_scope::FEDERATION`), never through a variable that could carry a
+private cohort; a from-disk gate (I14) reds on any other production caller.
+
+**Out-of-crate, the floor is unconstructible.** `BlobStorage` is a `pub` trait
+and CIRISServer consumes this crate from Rust, so every `pub` method on it is a
+door for a Rust consumer; the first rebuild's I14 read the in-crate text and
+called the floor sealed. Each floor method now requires a `StorageFloor`
+token — a type with a private field and a `pub(crate)` constructor. An
+external caller cannot name one, so `put_blob_with_scope(…, "self", plaintext)`
+from outside the crate is a compile error, not a policy. I22 is a
+`compile_fail` doctest — the one witness that runs as an external crate.
 
 ### 11.3 One read door, and it authorizes before it dispatches
 
@@ -1240,8 +1292,32 @@ the same transaction as the state change. A text column that says "destroyed"
 while every wrap survives is a read-door refusal, not destruction; the first
 implementation shipped exactly that.
 
+**Bind requires the CURRENT epoch, not merely an enabled one.** Rotation bumps
+the pointer; the sweep that disables the old epoch runs later, in the
+background. In that window the old epoch is still `enabled`, so an emission
+that read epoch N before a revocation bumped it to N+1 would — under the first
+rebuild's predicate — seal under N's DEK and bind to N, and the member just
+removed, who keeps N's wrap by AV-70, could read content written AFTER their
+removal. Forward secrecy would hold for every write except the one racing the
+revocation. The bind is therefore conditional on `epoch = current pointer AND
+key_state = 'enabled'`, in one statement; a refused bind is the cascade's cue
+that the world moved, so it deletes the ciphertext row it just stored (no
+orphan) and re-seals under the new current epoch, bounded to a few attempts.
+`disabled` keeps its meaning (no new seals, reads still open) as the sweep's
+belt to this predicate's braces.
+
+**The primary cannot be retired by the key-state door.** Disabling or
+destroying the current epoch is refused, at the door and in the backend's
+conditional UPDATE (`epoch <> current pointer`). Otherwise an empty current
+epoch — a failed first emission mints a DEK and stores nothing — could be
+destroyed, the pointer would keep naming it, and every later write would fail
+in `ensure_epoch_dek` with nothing but an unrelated membership revocation able
+to advance it. Rotation retires an epoch; the key-state door only ever acts on
+epochs rotation has already left behind.
+
 **Bind and destroy are mutually exclusive by statement.** Binding a blob to an
-epoch is a conditional insert that succeeds only while the epoch is `enabled`.
+epoch is a conditional insert that succeeds only while the epoch is current and
+`enabled`.
 Destroying is a conditional update that succeeds only while zero objects are
 bound. Each is one statement, so the interleaving that stranded a freshly
 sealed blob on a destroyed epoch cannot occur: one side sees the other's
@@ -1267,10 +1343,28 @@ implying it.
 
 Community content is announced (`holds_bytes`). The sweep's eviction therefore
 follows the established `evict_actor` discipline: emit `withdraws` for the
-local holder attestation, **then** delete. Deletion proceeds even if the
-withdraws fails (an orphan withdraws is better than a missing one). This
-requires a signer, which is why the sweep is an **Engine** operation (§11.6)
-and not a backend one.
+local holder attestation, **then** delete. This requires a signer, which is why
+the sweep is an **Engine** operation (§11.6) and not a backend one.
+
+**A failed withdraws aborts the eviction.** The first rebuild wrote "deletion
+proceeds even if the withdraws fails (an orphan withdraws is better than a
+missing one)" and called it fail-honest. Read again, it is the opposite: on
+failure there is no withdraws at all, the bytes are deleted anyway, and
+`list_holders` advertises this node for content it cannot serve until the
+holder TTL expires — the precise defect I9 exists to catch, reintroduced on the
+error path. Now a withdraws that cannot be signed or stored propagates, the
+bytes stay, and the sweep reports the epoch as blocked; the next run retries.
+Retry is safe because announcements this node has already retracted are
+skipped (the withdraws this node signed name their targets), so a partial
+failure never double-retracts.
+
+**A blob's satellite rows die with it.** `delete_blob` — the floor every
+eviction path ends at — removes the epoch binding and the at-rest grants in the
+same transaction as the blob row, on both backends. The first rebuild deleted
+only the blob row from the pre-existing finite-budget sweeper's path, so an
+evicted community blob left its binding behind, the epoch object count stayed
+non-zero forever, and that epoch's DEK could never be destroyed even though the
+bytes were gone. A count is only a precondition if every deletion maintains it.
 
 **Scope of the retraction, stated plainly.** The sweep retracts announcements
 this node made **under its own signing key** — the derived federation key its
@@ -1324,7 +1418,7 @@ error, and new writes succeeded under the new root.
 | # | invariant | falsified by | catches |
 |---|---|---|---|
 | I1 | No consumer-reachable write stores an unsealed body at an encrypted cohort. | `Engine::put_blob_scoped("self", …, plaintext)` stores plaintext | A1 |
-| I2 | The blob row records its tier; reads dispatch on the row, never on bytes. | commons body beginning with the magic is refused/misrouted; or a private plaintext row is served | B1, C1 |
+| I2 | The blob row records its RESOLVED tier; reads dispatch on that column, never on bytes and never on a re-derivation from the scope. | commons body beginning with the magic is refused/misrouted; a private plaintext row is served; an infra community's plaintext row is unreadable | B1, C1, C2-1 |
 | I3 | In an encrypted tier the stored body parses as an `AtRestEnvelope`. | magic + garbage accepted | C1 |
 | I4 | Every read door authorizes by tier **before** any dispatch, and a refusal names only sha + viewer. | stranger reads a self blob; destroyed-epoch error names the community | B1, B2 |
 | I5 | `destroyed` ⇒ zero persist key material for that epoch. | a wrap row survives destroy | D1 |
@@ -1337,10 +1431,57 @@ error, and new writes succeeded under the new root.
 | I12 | The lifecycle harness, sweep included, runs on every backend from one function. | a sqlite-only sweep test | H1 |
 | I13 | FFI preserves `BlobError` class. | `NotGranted` arrives as `ValueError` | I1 |
 | I14 | `store_blob_local` is reached only by the two cascades, or with a literal commons scope. | a floor call carrying a variable scope | A3 |
+| I15 | An authorized infrastructure community's write resolves `Plaintext`, stores that tier, and reads back through `read_blob_as`. | write succeeds, read reports "no binding" | C2-1 |
+| I16 | V139 classifies pre-existing rows from their grants and bindings; a pre-V139 self/family/community ciphertext row is NOT served as commons after upgrade. | upgraded node serves envelope bytes to a stranger | C2-4 |
+| I17 | Bind requires the CURRENT epoch; a bind against a rotated-past `enabled` epoch is refused, and the cascade re-seals under the current epoch leaving no orphan row. | post-revocation content sealed under the old DEK | C2-2 |
+| I18 | A withdraws failure aborts the eviction: bytes intact, error propagated, already-retracted announcements skipped on retry. | bytes gone, `list_holders` still names this node | C2-3 |
+| I19 | `delete_blob` removes the epoch binding and the at-rest grants transactionally; a deleted blob cannot hold an epoch's object count above zero. | destroy blocked forever by a binding whose blob is gone | C2-9 |
+| I20 | The current epoch cannot be disabled or destroyed through the key-state door. | pointer names a destroyed epoch; every write fails | C2-8 |
+| I21 | The matcher screens the plaintext, once, before sealing, on every tier. | matcher sees ciphertext; self/family never screened | C2-6 |
+| I22 | The storage floor is unconstructible outside the crate (`compile_fail`). | external Rust caller stores plaintext at `self` | C2-7 |
+| I23 | The write door derives the attesting key id from its signer; no surface passes an alias. | Python announces under the scrub alias; sweep cannot retract | C2-5 |
+| I24 | The row records the cohort the write NAMED; an `affiliations` write is not collapsed to `community`. | `blob_cohort_scope` reports `community` for an affiliations write | U4 |
+| I25 | The floor refuses a self-contradicting row: `self`/`family` at `plaintext`, commons at a sealed tier. | a token-holding in-crate caller records a private plaintext row | — |
+| I26 | Every backend resolves a hardware content master through the process cache; the uncached resolver has no backend caller. | the cache has zero callers; TPM I/O per read | U2 |
 
 Every one of these is written **before** the corresponding fix and confirmed
-red on `fd43e74`. A test that is green on the code it was written to catch is
-a report.
+red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
+under mutation of the logic it guards. I24–I26 (the ultrareview's nits and
+the floor's self-contradiction refusal) were written alongside their fixes,
+so their evidence is the mutation alone: each turns red when its guard is
+removed, and that is stated here rather than implied. Two honest exceptions, recorded
+rather than hidden: I18(a) (no double retraction) is held by the directory's
+retraction fold at write (#502 E7), so a second filter in the evict loop was
+mutation-tested, found to guard nothing, and removed; and the key-state
+door's "current epoch" check (I20) is a friendlier message in front of the
+backend statement that is the real guard — removing the message alone leaves
+I20 green, removing the statement's predicate turns it red. I22 is a
+`compile_fail` doctest, which `cargo nextest` never runs; it has its own
+certify gate and CI step so the witness executes. A test that is green on
+the code it was written to catch is a report.
+
+**C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,
+all verified real, six root causes: the row stored the tier's INPUT not the
+tier (C2-1, C2-4); "enabled" was not "current" (C2-2, C2-8); the error path
+of eviction undid what the happy path guaranteed (C2-3, C2-9); a screen ran on
+the wrong bytes (C2-6); an in-crate text gate was mistaken for an API boundary
+(C2-7); and a parameter with one correct value was left as a parameter (C2-5).
+The common thread with §11's own diagnosis of `fd43e74`: each was a guarantee
+established at one site and not carried to the next — into the row, across the
+race window, down the error path, past the crate boundary.
+
+**U = the cloud ultrareview of `30fde79`**, five findings. U1 is C2-1 (the
+infra read). U2: the §11.8 hardware-master cache existed with zero callers —
+the perf fix its docstring described was never applied; both backends now
+resolve through it, and I26 reds if either stops. U3: the Python
+`store_blob_local_json` still documented itself as the self/family privacy
+primitive while writing a commons plaintext row that `read_blob_as` serves
+to anyone; its contract now says what it is — unannounced is not private —
+and points private content at `put_blob_scoped`. U4: the community cascade
+hard-coded `community` on the row for an `affiliations` write (I24). U5: the
+V139 sqlite header claimed the final-name rebuild shape while the DDL used
+`__v139` + RENAME; the header now says that shape is safe for THIS table and
+why it is not a template.
 
 ---
 

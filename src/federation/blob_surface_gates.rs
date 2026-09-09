@@ -146,6 +146,32 @@ mod tests {
     }
 
     // ── I14 ──────────────────────────────────────────────────────────────
+    /// §11.8 — **the hardware content master is resolved through the
+    /// process cache by every backend.** The cache (`hardware_content_master_cached`)
+    /// existed in `30fde79` with zero callers, so each encrypted read and write
+    /// on a hardware-rooted node re-ran TPM + filesystem I/O (ultrareview).
+    /// The sync resolver is the software arm and the error vocabulary; a
+    /// backend that calls it directly bypasses the cache.
+    #[test]
+    fn i26_backends_resolve_the_content_master_through_the_cache() {
+        for rel in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            let text = production_only(&src(rel));
+            let cached = text
+                .matches("resolve_persisted_content_master_cached(")
+                .count();
+            let direct = text.matches("resolve_persisted_content_master(").count();
+            assert!(
+                cached >= 1,
+                "I26: {rel} never resolves the content master through the cache"
+            );
+            assert_eq!(
+                direct, 0,
+                "I26: {rel} calls the uncached resolver {direct} time(s) — every encrypted \
+                 read/write on a hardware-rooted node pays TPM + filesystem I/O"
+            );
+        }
+    }
+
     /// **`store_blob_local` — the storage floor — has no production caller
     /// outside the two cascades.**
     ///
@@ -170,11 +196,25 @@ mod tests {
             let text = production_only(&std::fs::read_to_string(&entry).unwrap());
             let lines: Vec<&str> = text.lines().collect();
             for (n, line) in lines.iter().enumerate() {
-                if line.contains(".store_blob_local(") || line.contains(" store_blob_local(") {
+                let floor_call = [
+                    ".store_blob_local(",
+                    ".put_blob_with_scope(",
+                    ".put_blob_signing_at(",
+                ]
+                .iter()
+                .any(|m| line.contains(m));
+                if floor_call {
                     // the trait DECLARATION and impls are not callers
-                    if line.trim_start().starts_with("fn store_blob_local")
-                        || line.trim_start().starts_with("async fn store_blob_local")
+                    if line.trim_start().starts_with("fn ")
+                        || line.trim_start().starts_with("async fn ")
                     {
+                        continue;
+                    }
+                    // blobs.rs holds the trait's own thin commons wrappers and
+                    // the default `put_blob_signing_at` → `put_blob_with_scope`
+                    // hop, which forwards a scope the CALLER already validated
+                    // at a door. The floor itself is not a caller of itself.
+                    if rel == "src/federation/blobs.rs" && !line.contains(".store_blob_local(") {
                         continue;
                     }
                     // A COMMONS door may reach the floor, but only by naming a
