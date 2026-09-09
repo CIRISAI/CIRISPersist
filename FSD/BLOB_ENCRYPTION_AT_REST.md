@@ -951,6 +951,53 @@ so even self content is delivered, not merely derived.
 
 v1 wraps remain unrepresentable (V087 CHECK) — CC 4.4.3.4.1 / CC 5.2 HNDL.
 
+
+#### 10.3.1 Delivery is SETTLED — one pipeline, four cohorts
+
+Delivery is not an open question. Every cohort resolves to the **same
+terminal**, and only the first step differs:
+
+```
+cohort  →  recipient set  →  active occurrences  →  encryption_pubkeys  →  hybrid wrap
+```
+
+| cohort | recipient enumeration |
+|---|---|
+| `self` | `list_identity_occurrences_active(owner)` |
+| `family` | members → `list_identity_occurrences_active(member)` each |
+| `community` / `affiliations` | `resolve_community_members` → `list_identity_occurrences_active(member)` each |
+
+Everything downstream of the enumeration is **identical across all four**:
+each active occurrence carries `encryption_pubkeys`, and the DEK is wrapped
+to them with
+
+```rust
+ciris_crypto::key_grant::wrap_dek_for_recipient_v2(&x_pub, &ml_kem_pub, dek)
+```
+
+**Persist does no key exchange.** The occurrence is signed and its
+`encryption_pubkeys` are bound by that signature (#418); admission
+validates them structurally (`check_encryption_pubkeys` — base64, exact
+raw byte length per half). So persist *reads verified key material* and
+wraps to it. KEX is the transport layer's; the substrate's job begins at
+"here is a verified recipient pubkey pair."
+
+**Fail-secure exclusion, never downgrade.** An occurrence carrying no
+valid `encryption_pubkeys` is **excluded from the fan-out** and a
+`hard_case:recipient_excluded` is emitted. There is no plaintext fallback
+and no v1 fallback — CEG §10.1.4, and V087's CHECK makes a v1 wrap
+unrepresentable at the schema level (CC 4.4.3.4.1 / CC 5.2, HNDL). A
+recipient we cannot wrap to is a recipient who does not receive, and that
+is recorded rather than silently tolerated.
+
+**What this settles for §10.** The delivery half needs no new design and no
+new primitive for any cohort — including `self`, whose multiple
+occurrences make it a delivery problem like the others rather than a
+derivation-only one. The work in §10.10 is therefore confined to the
+ROOT (§10.2), the KEYSET STATE (§10.5), and the SWEEP (§10.7). Minting a
+community DEK reuses this pipeline unchanged, per epoch, over
+`resolve_community_members` at the bumped epoch.
+
 ### 10.4 The keyset model — Tink semantics, not the Tink crate
 
 We adopt [Tink's keyset design](https://developers.google.com/tink/design/keysets):
@@ -1082,6 +1129,13 @@ Each step stands alone and is separately witnessed.
 
 Steps 1–2 are prerequisites in the strong sense: they are O(1) today and
 O(corpus) once content exists.
+
+**Delivery is absent from this list on purpose** (§10.3.1). The
+cohort → occurrences → `encryption_pubkeys` → hybrid-wrap pipeline is
+built, wired and identical for all four cohorts, and persist performs no
+key exchange — it wraps to signature-bound material admission has already
+validated. Nothing in §10 requires a new delivery primitive; minting a
+community DEK reuses that pipeline per epoch.
 
 ---
 
