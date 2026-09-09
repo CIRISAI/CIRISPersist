@@ -279,6 +279,30 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.2) — the content-master row
+    // read, in both SQL backends. PLUMBING: it is a single-row SELECT that
+    // can fail only on the substrate's own terms (driver, lock, row
+    // mapping). It asks nothing about the caller's input — the policy
+    // question "is this root usable" is answered by
+    // `resolve_persisted_content_master`, which is where the refusals live
+    // (a `hardware` row with an unreachable seed is a hard error there, not
+    // here). Plumbing is the fail-open direction, and the reason it is safe
+    // here is that an absent row is not treated as permission: the caller
+    // distinguishes Some/None explicitly and mints only in the None arm.
+    ("read_content_master_row", Class::Plumbing),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.5) — `parse_str`, covering both
+    // `DekKeyState::parse_str` (postgres community-DEK key state) and the
+    // `uuid::Uuid::parse_str` row-mapping in other doors. PLUMBING: the value
+    // being parsed comes from OUR OWN STORAGE, not from the caller, so by this
+    // module's definition it is row-mapping rather than a gate on caller input.
+    //
+    // Plumbing is the fail-open direction, so the reason it is safe here is
+    // specific and load-bearing: `DekKeyState::parse_str` ERRORS on an
+    // unrecognized token rather than defaulting. Had it defaulted — to
+    // `Enabled`, the permissive value — a corrupted or future state would have
+    // silently re-permitted sealing under a rotated-past epoch. The refusal is
+    // what keeps a row-mapping failure from becoming a permission decision.
+    ("parse_str", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

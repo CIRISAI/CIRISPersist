@@ -1,5 +1,19 @@
 # CIRISPersist FFI surface — the pinned classification.
 #
+# v43.0.0 — the four encrypted-blob symbols are DEONTIC, not empirical, even
+# though two of them are reads. The class follows the wrong that varying them
+# causes: `put_blob_encrypted_*` decides WHICH member occurrences receive a DEK
+# grant, and `get_blob_for_viewer` / `read_blob_for_community_viewer` ENFORCE
+# that grant on read. A wrong entry in any of the four means someone reads
+# content they hold no grant on — a security finding, which is the deontic
+# test. Contrast `put_blob_json` / `get_blob_json`, classified empirical: they
+# move plaintext bytes and permit nothing.
+#
+# `read_blob_as` is deontic for the same reason and one more: it is the
+# cohort-agnostic door, so it is the single place where a wrong entry would
+# permit a read across EVERY cohort at once rather than one. A convenience
+# surface that skips authorization is a bypass, not a shortcut.
+#
 # CIRISPersist#595 / CIRISConstitution#83. One row per symbol PyO3 exports:
 #
 #     <stub owner>\t<exported name>\t<class>\t<frame>
@@ -128,9 +142,6 @@ Engine	attach_key_pqc_signature	ontological
 Engine	attach_revocation_pqc_signature	ontological	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
-Engine	enter_mesh	deontic	
-Engine	widen_audience	deontic	
-Engine	describe_crossing	epistemic	
 Engine	attestation_upsert_local	empirical	
 Engine	attestation_upsert_local_many	empirical	
 Engine	audit_canonicalize_for_hash	nomological	
@@ -255,6 +266,7 @@ Engine	deregister_consumer	structural
 Engine	deregister_federation_key	deontic	
 Engine	deregister_occurrence	ontological	
 Engine	descend_aggregated_sources	testimonial	erasure_effect
+Engine	describe_crossing	epistemic	
 Engine	directory_ops_capsule	structural	
 Engine	disk_pressure_state	epistemic	
 Engine	duty_holders_for_community_json	empirical	
@@ -263,6 +275,7 @@ Engine	emit_attestation	deontic
 Engine	emit_attestation_self	deontic	
 Engine	engine_handle	structural	
 Engine	enqueue_outbound	procedural	
+Engine	enter_mesh	deontic	
 Engine	envelope_vocabulary	nomological	
 Engine	escrow_create	deontic	
 Engine	escrow_get	empirical	
@@ -289,6 +302,7 @@ Engine	get_accord_decision_json	empirical
 Engine	get_accord_proposal_json	empirical	
 Engine	get_active_halt_json	empirical	
 Engine	get_aggregation	axiotic	
+Engine	get_blob_for_viewer	deontic	
 Engine	get_blob_json	empirical	
 Engine	get_blob_range	pragmatic	
 Engine	get_calibration_bundle_by_version	empirical	
@@ -336,8 +350,8 @@ Engine	ledger_detect_double_head	nomological
 Engine	ledger_get	empirical	
 Engine	ledger_latest_checkpoint	empirical	
 Engine	ledger_list_entry_ranges	empirical	
-Engine	ledger_list_fork_evidence	testimonial	equivocation_evidence
 Engine	ledger_list_for_owner	empirical	
+Engine	ledger_list_fork_evidence	testimonial	equivocation_evidence
 Engine	ledger_put_checkpoint	testimonial	log_commitment
 Engine	ledger_put_entry_range	empirical	
 Engine	ledger_record_fork_evidence	testimonial	equivocation_evidence
@@ -381,6 +395,7 @@ Engine	list_partner_records_since	empirical
 Engine	list_retention	empirical	
 Engine	list_revocations	empirical	
 Engine	list_scores	axiotic	
+Engine	list_signed_accord_quorum_evidence_since	epistemic
 Engine	list_signed_communities_since	epistemic	
 Engine	list_signed_community_membership_revocations_since	epistemic	
 Engine	list_signed_families_since	epistemic	
@@ -390,7 +405,6 @@ Engine	list_signed_identity_occurrences_for_json	epistemic
 Engine	list_signed_identity_occurrences_since	epistemic	
 Engine	list_signed_key_records_since	epistemic	
 Engine	list_signed_location_proofs_since	epistemic	
-Engine	list_signed_accord_quorum_evidence_since	epistemic
 Engine	list_signed_partner_records_since	epistemic
 Engine	list_signed_revocations_since	epistemic
 Engine	list_signed_transport_destinations_since	epistemic
@@ -454,6 +468,8 @@ Engine	put_aggregated_tier	axiotic
 Engine	put_attestation	deontic	
 Engine	put_blob_chunk	empirical	
 Engine	put_blob_chunks_json	empirical	
+Engine	put_blob_encrypted_community	deontic	
+Engine	put_blob_encrypted_self_family	deontic	
 Engine	put_blob_json	empirical	
 Engine	put_blob_signing	deontic	
 Engine	put_calibration_bundle	empirical	
@@ -474,14 +490,16 @@ Engine	put_stream_sth	testimonial	log_commitment
 Engine	put_wholeness_witness_json	testimonial	equivocation_evidence
 Engine	reachable_under_scope	deontic	
 Engine	reachable_under_scope_with_reasons	deontic	
+Engine	read_blob_as	deontic	
+Engine	read_blob_for_community_viewer	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
-Engine	rematerialize_role_withdrawals	deontic
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	
 Engine	register_federation_key	deontic	
 Engine	register_occurrence	ontological	
 Engine	register_public_key	deontic	
 Engine	register_self_federation_key	ontological	
+Engine	rematerialize_role_withdrawals	deontic
 Engine	remove_moderator	deontic	
 Engine	remove_peer_record	deontic	
 Engine	replay_abandoned	procedural	
@@ -624,6 +642,7 @@ Engine	wa_cert_set_active	deontic
 Engine	wa_cert_update_last_login	empirical	
 Engine	wa_cert_upsert	deontic	
 Engine	wholeness_witness_root_hex	pragmatic	
+Engine	widen_audience	deontic	
 Engine	withdraw_canonical_role	deontic	
 Engine	wrap_dek_for_recipient_v2_b64	deontic	
 MODULE	_test_inject_panic	structural	

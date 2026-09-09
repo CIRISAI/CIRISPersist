@@ -767,6 +767,9 @@ class Engine:
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
 
+    def get_blob_for_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — read a self/family-encrypted blob as viewer_key_id."""
+
     def grant_delegation(self, delegate_key_id: str, scopes: list[str], sub_delegation: bool, delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249) — emit a general delegates_to edge: authorize delegate_key_id within scopes (a list of scope tokens), with an explicit sub_delegation..."""
 
@@ -934,6 +937,12 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
+    def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
+
+    def put_blob_encrypted_self_family(self, cohort_scope: str, owner_or_family_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — store a blob encrypted for self or family."""
+
     def put_blob_signing(
         self,
         sha256_hex: str,
@@ -1020,6 +1029,12 @@ class Engine:
         ``"reachable"`` explicitly, or use :meth:`reachable_under_scope` when you
         only need the bool.
         """
+
+    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10) — read any blob as a viewer. The one read a server or agent needs."""
+
+    def read_blob_for_community_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — read a community-encrypted blob as viewer_key_id."""
 
     def register_federation_key(
         self,

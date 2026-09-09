@@ -150,7 +150,7 @@ pub mod orchestrate {
         fresh_dek, open, seal, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
         AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
     };
-    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage};
+    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage, DekKeyState};
     use crate::federation::types::cohort_scope::{
         crypto_tier, CryptoTier, AFFILIATIONS, COMMUNITY,
     };
@@ -291,6 +291,29 @@ pub mod orchestrate {
         B: FederationDirectory + BlobStorage + Sync,
     {
         let members = resolve_community_members(backend, community_key_id).await?;
+
+        // v43.0.0 (§10.5) — NEVER SEAL UNDER A NON-ENABLED EPOCH.
+        //
+        // `disabled` means "rotated past": it still decrypts, so existing
+        // content stays readable, but new content must not join it — that is
+        // the whole point of rotating. `destroyed` has no key material at
+        // all. An absent state is a first mint and is fine.
+        //
+        // Without this the state column would be decoration: rotation would
+        // bump the pointer and sealing would carry on regardless.
+        if let Some(state) = backend
+            .community_dek_key_state(community_key_id, epoch)
+            .await?
+        {
+            if state != DekKeyState::Enabled {
+                return Err(BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} epoch {epoch} is {} — refusing to seal \
+                     new content under it. A rotated epoch still DECRYPTS what it sealed; \
+                     it does not accept more (BLOB_ENCRYPTION_AT_REST.md §10.5)",
+                    state.as_str()
+                )));
+            }
+        }
         let content_master = backend.load_or_init_content_master().await?;
 
         // Recover-or-mint the epoch DEK.
@@ -423,6 +446,200 @@ pub mod orchestrate {
         })
     }
 
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — **transition a
+    /// community DEK epoch's key state, refusing an unsafe DESTROY.**
+    ///
+    /// This is the door. [`BlobStorage::community_dek_set_key_state`] is the
+    /// raw setter and enforces nothing; callers use this.
+    ///
+    /// # The DESTROY precondition
+    ///
+    /// An epoch may become [`DekKeyState::Destroyed`] only when **no object
+    /// is still sealed under it**. Destroying a DEK whose content still
+    /// exists does not erase that content — it **orphans** it, turning a
+    /// confidentiality operation into unrecoverable data loss. The content
+    /// must be re-sealed under a live epoch or evicted from every holder
+    /// first.
+    ///
+    /// A destroy that cannot prove its precondition **refuses**. That is
+    /// deliberate and it is the whole reason V138 adds the
+    /// `(community_key_id, epoch)` reverse index: before it, the check was a
+    /// full table scan, and a precondition that is expensive to verify is one
+    /// that gets skipped — while the thing it guards is irreversible.
+    ///
+    /// # What this amends
+    ///
+    /// AV-70 ratifies "forward-only (old-epoch blobs keep grants)" — Option-A's
+    /// *once shared, always shared*, the same posture MLS and Tink both take.
+    /// `Disabled` IS that behaviour, now one state among three. `Destroyed`
+    /// is the amendment, and it is a **stronger** property than either offers,
+    /// which is exactly why the precondition is not optional.
+    ///
+    /// # Errors
+    ///
+    /// - [`BlobError::InvalidArgument`] — the epoch has no DEK row, or the
+    ///   destroy precondition is unmet (the message names the count).
+    pub async fn set_key_state<B>(
+        backend: &B,
+        community_key_id: &str,
+        epoch: u64,
+        to: DekKeyState,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        // The epoch must exist. Setting state on a DEK that was never minted
+        // would otherwise succeed-by-doing-nothing on some backends.
+        let current = backend
+            .community_dek_key_state(community_key_id, epoch)
+            .await?
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} has no DEK at epoch {epoch}"
+                ))
+            })?;
+
+        // Destroyed is terminal. Re-enabling a destroyed epoch would claim a
+        // key that no longer exists — every read under it would fail at
+        // unwrap time instead of at this door, which is a worse place to
+        // learn it.
+        if current == DekKeyState::Destroyed && to != DekKeyState::Destroyed {
+            return Err(BlobError::InvalidArgument(format!(
+                "community {community_key_id:?} epoch {epoch} is destroyed; the key material \
+                 is gone and no state transition brings it back"
+            )));
+        }
+
+        if to == DekKeyState::Destroyed {
+            let remaining = backend
+                .community_dek_epoch_object_count(community_key_id, epoch)
+                .await?;
+            if remaining > 0 {
+                return Err(BlobError::InvalidArgument(format!(
+                    "refusing to destroy community {community_key_id:?} epoch {epoch}: \
+                     {remaining} object(s) are still sealed under it. Destroying the DEK \
+                     would ORPHAN them, not erase them — re-seal them under a live epoch or \
+                     evict them from every holder first (BLOB_ENCRYPTION_AT_REST.md §10.5)"
+                )));
+            }
+        }
+
+        backend
+            .community_dek_set_key_state(community_key_id, epoch, to)
+            .await
+    }
+
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.7) — what one sweep did.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub struct SweepReport {
+        /// Epochs moved `enabled` → `disabled` (rotated past; no new seals).
+        pub disabled: Vec<u64>,
+        /// Epochs moved to `destroyed` — their content was already gone, or
+        /// this sweep evicted it under the retention policy.
+        pub destroyed: Vec<u64>,
+        /// Local objects deleted by this sweep.
+        pub evicted_objects: u64,
+        /// `(epoch, remaining)` for epochs that could NOT be destroyed
+        /// because content is still sealed under them and the retention
+        /// policy does not authorize deleting it.
+        ///
+        /// **Reported, never forced.** An epoch stuck here is the sweep
+        /// declining to orphan content, which is the correct outcome — but
+        /// an operator watching key material accumulate deserves to see why.
+        pub blocked: Vec<(u64, u64)>,
+    }
+
+    /// v43.0.0 (§10.7) — **sweep one community's rotated-past epochs.**
+    ///
+    /// Intended to run in the BACKGROUND. Re-sealing and eviction are
+    /// O(objects at the epoch), so running this inline with a membership
+    /// change would stall a community rotation on its own corpus. Callers
+    /// that want it now call it directly; the scheduled path calls the same
+    /// function.
+    ///
+    /// # What it does, per epoch below the current one
+    ///
+    /// 1. `enabled` → **`disabled`**. A rotated-past epoch must stop
+    ///    accepting new seals; it keeps decrypting what it already sealed.
+    ///    This is AV-70's ratified behaviour and is always safe.
+    /// 2. If the retention policy authorizes it (`retain_past_epochs = Some(n)`
+    ///    and the epoch is more than `n` behind), **evict** its local objects
+    ///    and then **destroy** the epoch.
+    /// 3. Otherwise, destroy only if the epoch is already empty; else record
+    ///    it in [`SweepReport::blocked`].
+    ///
+    /// # The retention policy is opt-in, and that is deliberate
+    ///
+    /// `retain_past_epochs = NULL` means retain indefinitely — today's
+    /// behaviour, and the default. Deletion is destructive and irreversible,
+    /// so it happens only where an operator has said how much history to
+    /// keep. OpenMLS ships the same knob for the same reason: a delivery
+    /// service cannot guarantee epoch-N content arrives before epoch N+1
+    /// begins, and eager deletion loses in-flight content.
+    ///
+    /// # What this does NOT do
+    ///
+    /// It does not recall copies already fountained to peers. **Rotation is
+    /// not recall** (§10.6): the mechanism that reaches other holders is the
+    /// tombstone plane, and this sweep is local. An operator who reads
+    /// `evicted_objects` as "erased from the mesh" is wrong in a way that
+    /// matters.
+    pub async fn sweep_rotated_epochs<B>(
+        backend: &B,
+        community_key_id: &str,
+    ) -> Result<SweepReport, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let current = backend
+            .community_dek_current_epoch(community_key_id)
+            .await?;
+        let retain = backend
+            .community_dek_retain_past_epochs(community_key_id)
+            .await?;
+        let mut report = SweepReport::default();
+
+        for (epoch, state) in backend.community_dek_epochs(community_key_id).await? {
+            // The current epoch is the primary. Never touched.
+            if epoch >= current || state == DekKeyState::Destroyed {
+                continue;
+            }
+
+            if state == DekKeyState::Enabled {
+                backend
+                    .community_dek_set_key_state(community_key_id, epoch, DekKeyState::Disabled)
+                    .await?;
+                report.disabled.push(epoch);
+            }
+
+            // Does the policy authorize deleting this epoch's content?
+            // `current - epoch > n` — an epoch exactly `n` behind is still
+            // retained, so `retain_past_epochs = 0` means "keep only the
+            // current epoch" rather than "keep nothing".
+            let deletable = retain.is_some_and(|n| current.saturating_sub(epoch) > n);
+
+            if deletable {
+                report.evicted_objects += backend
+                    .community_dek_evict_epoch_objects(community_key_id, epoch)
+                    .await?;
+            }
+
+            let remaining = backend
+                .community_dek_epoch_object_count(community_key_id, epoch)
+                .await?;
+            if remaining == 0 {
+                // Goes through `set_key_state`, not the raw setter, so the
+                // DESTROY precondition is re-checked at the door rather than
+                // trusted from the count we just read.
+                set_key_state(backend, community_key_id, epoch, DekKeyState::Destroyed).await?;
+                report.destroyed.push(epoch);
+            } else {
+                report.blocked.push((epoch, remaining));
+            }
+        }
+        Ok(report)
+    }
+
     /// Recover the plaintext community-content body for a member viewer.
     ///
     /// Authorization predicate: the viewer must hold a v2 grant on the
@@ -457,6 +674,23 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
+
+        // v43.0.0 (§10.5) — a DESTROYED epoch has no key material. Say so
+        // here rather than letting the unwrap fail three layers down: the
+        // caller needs to know the content is gone for good, not that a
+        // decrypt "failed" as though retrying might help.
+        if backend
+            .community_dek_key_state(&community_key_id, epoch)
+            .await?
+            == Some(DekKeyState::Destroyed)
+        {
+            return Err(BlobError::InvalidArgument(format!(
+                "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
+                 is gone and this blob is permanently unreadable. It should have been \
+                 re-sealed or evicted before the epoch was destroyed \
+                 (BLOB_ENCRYPTION_AT_REST.md §10.5)"
+            )));
+        }
 
         // Fail-secure authorization gate.
         let authorized = backend
@@ -581,5 +815,353 @@ mod tests {
         assert!(!is_infrastructure_community(&community(Some(
             serde_json::json!({"some_other_field": "x"})
         ))));
+    }
+}
+
+/// Fixture helpers for [`lifecycle_harness`]. Generic over the backend so
+/// the same setup runs on every implementation — the harness is only
+/// cross-backend if its fixture is too.
+#[cfg(any(test, feature = "test-anchor"))]
+#[allow(dead_code)]
+pub mod lifecycle_support {
+    use crate::federation::{BlobStorage, FederationDirectory};
+
+    /// Register a key, its occurrence, and give the occurrence real
+    /// content-KEM pubkeys — without which the member is **excluded
+    /// fail-secure** from the DEK fan-out and the harness would be asserting
+    /// against an empty grant set.
+    pub async fn seed_member<B>(backend: &B, identity_key_id: &str, occurrence_key_id: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        for k in [identity_key_id, occurrence_key_id] {
+            ts::register_hybrid_key_as(backend, k, k, identity_type::USER).await;
+        }
+        let (_xp, x_pub, _mp, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
+        backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: identity_key_id.to_owned(),
+                occurrence_key_id: occurrence_key_id.to_owned(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                }),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
+    }
+
+    /// Create a community whose own key is the signing authority, with the
+    /// given `(identity, occurrence)` members seeded and keyed.
+    pub async fn seed_community<B>(backend: &B, community_key_id: &str, members: &[(&str, &str)])
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+
+        ts::register_hybrid_key_as(
+            backend,
+            community_key_id,
+            community_key_id,
+            identity_type::USER,
+        )
+        .await;
+        for (ident, occ) in members {
+            seed_member(backend, ident, occ).await;
+        }
+        let roster = members
+            .iter()
+            .map(|(ident, _)| crate::federation::types::CommunityMember {
+                key_id: (*ident).to_owned(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            })
+            .collect();
+        backend
+            .put_community(ts::sign_community(
+                community_key_id,
+                crate::federation::types::Community {
+                    community_key_id: community_key_id.to_owned(),
+                    community_name: "Lifecycle Co-op".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
+    }
+
+    /// Revoke a member. The community DEK epoch bump rides this write
+    /// transactionally (AV-70), so this single call IS the rotation — there
+    /// is no separate "rotate" API to call, and a harness that invented one
+    /// would be testing something the substrate does not do.
+    ///
+    /// `effective_at` is NOW rather than future-dated: a future-dated
+    /// community revocation is rejected at write time (SecReview F4), and
+    /// `removed_key_ids_at` deliberately excludes future-dated rows from the
+    /// removed set.
+    pub async fn revoke_member<B>(backend: &B, community_key_id: &str, removed_identity: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        let now = chrono::Utc::now();
+        backend
+            .put_community_membership_revocation(ts::sign_community_membership_revocation(
+                community_key_id,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: community_key_id.to_owned(),
+                    removed_identity_key_id: removed_identity.to_owned(),
+                    removed_at: now,
+                    effective_at: now,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
+    }
+}
+
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **the cohort lifecycle
+/// harness: create → encrypt → decrypt → rotate → key-state.**
+///
+/// Cross-backend by construction, in the shape the `exercise_*` witnesses
+/// already use: one function, called from every backend's test module, so a
+/// backend that diverges cannot pass by having its own copy of the test.
+/// Generic rather than `&dyn` because [`BlobStorage`] returns `impl Future`
+/// and is not object-safe.
+///
+/// # What it drives, and why each step is here
+///
+/// 1. **CREATE** — a community with two keyed members.
+/// 2. **ENCRYPT** — seal a blob under epoch 0.
+/// 3. **DECRYPT** — both members read it. Proves the grant fan-out reached
+///    every member, not just the first.
+/// 4. **ROTATE** — revoke one member. The epoch bump is transactional with
+///    the revocation write (AV-70), so this is one call, not two.
+/// 5. **ENCRYPT AGAIN** — seal a second blob, which lands on epoch 1.
+/// 6. **FORWARD SECRECY** — the removed member CANNOT read the post-rotation
+///    blob. This is the property rotation exists for.
+/// 7. **FORWARD-ONLY** — the removed member CAN still read the
+///    pre-rotation blob. This is AV-70's ratified "once shared, always
+///    shared", and asserting it stops a future change from silently
+///    strengthening the guarantee without amending the threat model.
+/// 8. **KEY STATE** — disable epoch 0: it still decrypts, accepts no new
+///    seals, and cannot be destroyed while its content is live.
+///
+/// Steps 6 and 7 are the pair that matters. Either alone is satisfiable by a
+/// wrong implementation — one by revoking everything, the other by revoking
+/// nothing.
+#[cfg(any(test, feature = "test-anchor"))]
+#[allow(dead_code)]
+pub mod lifecycle_harness {
+    use crate::federation::{BlobStorage, DekKeyState, FederationDirectory};
+
+    /// Drive the full cycle against one backend. `tag` namespaces the keys so
+    /// two backends can share a database without colliding.
+    pub async fn exercise_cohort_lifecycle_43<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, read_for_community_viewer, set_key_state,
+        };
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+
+        // ── 1. CREATE ────────────────────────────────────────────────────
+        super::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ), (&bob, &bob_occ)],
+        )
+        .await;
+
+        // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
+        let before = encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
+        assert_eq!(
+            before.epoch, 0,
+            "{tag}: a never-rotated community is epoch 0"
+        );
+        for occ in [&alice_occ, &bob_occ] {
+            assert!(
+                before.granted.contains(occ),
+                "{tag}: {occ} must hold a grant; granted={:?} excluded={:?}",
+                before.granted,
+                before.excluded
+            );
+        }
+
+        // ── 3. DECRYPT — both members ────────────────────────────────────
+        for occ in [&alice_occ, &bob_occ] {
+            let got = read_for_community_viewer(backend, &before.at_rest_sha256, occ)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: {occ} reads the pre-rotation blob: {e}"));
+            assert_eq!(got, b"pre-rotation minutes", "{tag}: {occ} round trip");
+        }
+
+        // ── 4. ROTATE — revoking bob bumps the epoch transactionally ─────
+        super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
+
+        // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
+        let after = encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
+        assert!(
+            after.epoch > before.epoch,
+            "{tag}: rotation must advance the epoch ({} -> {})",
+            before.epoch,
+            after.epoch
+        );
+        assert!(
+            !after.granted.contains(&bob_occ),
+            "{tag}: the removed member must NOT be granted on the new epoch, got {:?}",
+            after.granted
+        );
+
+        // ── 6. FORWARD SECRECY — the removed member cannot read new content
+        let err = read_for_community_viewer(backend, &after.at_rest_sha256, &bob_occ)
+            .await
+            .expect_err("a removed member must not read post-rotation content");
+        assert!(
+            matches!(err, crate::federation::BlobError::NotGranted { .. }),
+            "{tag}: expected NotGranted for the removed member, got {err:?}"
+        );
+
+        // ...while the remaining member can.
+        let got = read_for_community_viewer(backend, &after.at_rest_sha256, &alice_occ)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: alice reads post-rotation: {e}"));
+        assert_eq!(got, b"post-rotation minutes");
+
+        // ── 7. FORWARD-ONLY — the removed member KEEPS pre-rotation access
+        //
+        // AV-70, ratified: "once shared, always shared". If this ever starts
+        // failing, the threat model changed and §10.5's destroy path — not an
+        // incidental edit — should be the reason.
+        let got = read_for_community_viewer(backend, &before.at_rest_sha256, &bob_occ)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag}: AV-70 forward-only — bob keeps pre-rotation access: {e}")
+            });
+        assert_eq!(got, b"pre-rotation minutes");
+
+        // ── 8. KEY STATE on the rotated-past epoch ───────────────────────
+        set_key_state(backend, &comm, before.epoch, DekKeyState::Disabled)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: disable epoch 0: {e}"));
+
+        // It still decrypts — the difference between disabled and destroyed.
+        let got = read_for_community_viewer(backend, &before.at_rest_sha256, &alice_occ)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a disabled epoch still decrypts: {e}"));
+        assert_eq!(got, b"pre-rotation minutes");
+
+        // And it cannot be destroyed while its content is live: destroying
+        // would ORPHAN the blob, not erase it.
+        let err = set_key_state(backend, &comm, before.epoch, DekKeyState::Destroyed)
+            .await
+            .expect_err("destroying an epoch with live content must be refused");
+        assert!(
+            err.to_string().contains("still sealed under it"),
+            "{tag}: the refusal must name the precondition, got: {err}"
+        );
+
+        // ── 9. TRANSFER SHIPS CIPHERTEXT — no decrypt/re-encrypt hop ─────
+        //
+        // The optimization the envelope design exists for: a blob is sealed
+        // ONCE under a DEK, and the DEK is WRAPPED per recipient. What
+        // crosses the wire is the stored ciphertext, byte for byte.
+        //
+        // Pinned because it is invisible to every other test. A change that
+        // decrypted on serve and re-encrypted per peer would return the same
+        // plaintext to every viewer, pass every round-trip assertion above,
+        // and cost O(payload) per transfer instead of O(key) per recipient —
+        // silently, and worst exactly at fan-out.
+        let stored = backend
+            .get_blob(&after.at_rest_sha256)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: read the stored bytes: {e}"))
+            .unwrap_or_else(|| panic!("{tag}: the sealed blob must be present"));
+        let crate::federation::BlobBody::Inline(stored_bytes) = stored else {
+            panic!("{tag}: a sealed blob is stored inline");
+        };
+
+        assert!(
+            stored_bytes.starts_with(&crate::federation::at_rest_cascade::AT_REST_ENVELOPE_MAGIC),
+            "{tag}: what is STORED must be the at-rest envelope, not plaintext"
+        );
+        assert_ne!(
+            stored_bytes.as_slice(),
+            b"post-rotation minutes",
+            "{tag}: the stored bytes must not be the plaintext"
+        );
+
+        // ── 10. THE COHORT-AGNOSTIC READ ────────────────────────────────
+        //
+        // What a server or agent actually calls: address + viewer, no
+        // knowledge of cohort, DEK, epoch or grant. It must return the SAME
+        // plaintext the cohort-specific read returns, and it must refuse the
+        // same non-viewer — otherwise the convenience door is a bypass.
+        let via_generic = crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
+            backend,
+            &after.at_rest_sha256,
+            &alice_occ,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: the cohort-agnostic read: {e}"));
+        assert_eq!(
+            via_generic, b"post-rotation minutes",
+            "{tag}: the generic read must return the same plaintext as the specific one"
+        );
+
+        let err = crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
+            backend,
+            &after.at_rest_sha256,
+            &bob_occ,
+        )
+        .await
+        .expect_err("the generic read must enforce the SAME grant check");
+        assert!(
+            matches!(err, crate::federation::BlobError::NotGranted { .. }),
+            "{tag}: a convenience door that skips authorization is a bypass, got {err:?}"
+        );
+
+        // The content address is the hash of the CIPHERTEXT, which is what
+        // lets dedup and fountain coding operate on sealed bytes — and why
+        // encrypt-then-fountain (§10.8) is a gate rather than a convention.
+        use sha2::Digest as _;
+        let recomputed: [u8; 32] = sha2::Sha256::digest(&stored_bytes).into();
+        assert_eq!(
+            recomputed, after.at_rest_sha256,
+            "{tag}: the at-rest address must be SHA-256 OF THE CIPHERTEXT — if this \
+             drifts, content addressing has moved off the sealed bytes and a peer can \
+             no longer verify what it holds without the key"
+        );
     }
 }

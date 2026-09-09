@@ -319,6 +319,53 @@ pub enum BlobBody {
     ChunkDag(ChunkManifest),
 }
 
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — the lifecycle state
+/// of a community DEK epoch. Tink's three keyset states.
+///
+/// `Disabled` is AV-70's ratified behaviour — "forward-only / once shared,
+/// always shared" — now one state among three rather than the only option.
+/// `Destroyed` is the amendment: it makes the property "shared until the
+/// epoch is destroyed", which is stronger than MLS or Tink offer and
+/// therefore ours to enforce, at the door, with a precondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DekKeyState {
+    /// The primary. New seals use this epoch.
+    Enabled,
+    /// No new seals; still decrypts. Rotated past, content still readable.
+    Disabled,
+    /// Key material gone. Content sealed under it is unreadable, so this is
+    /// reachable only once that content is re-sealed or evicted.
+    Destroyed,
+}
+
+impl DekKeyState {
+    /// The stored wire token. **Stable** — it is a CHECK-constrained column
+    /// value in V138, so a rename is a migration, not an edit.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Destroyed => "destroyed",
+        }
+    }
+
+    /// Parse a stored token. Unknown values are an ERROR, never a default:
+    /// defaulting an unrecognized state to `Enabled` would let a future
+    /// state (or a corrupted row) silently re-permit sealing.
+    pub fn parse_str(s: &str) -> Result<Self, BlobError> {
+        match s {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            "destroyed" => Ok(Self::Destroyed),
+            other => Err(BlobError::Backend(format!(
+                "unknown community DEK key_state {other:?} — refusing to guess;                  an unrecognized state must not default to a permissive one"
+            ))),
+        }
+    }
+}
+
 /// v4.1 (CIRISPersist#142, Cut A) — the result of a
 /// [`BlobStorage::get_blob_range`] byte-range read.
 ///
@@ -990,6 +1037,16 @@ pub trait BlobStorage: Send + Sync {
                      {{self, family, community, affiliations, species, biosphere, federation}}"
                 )));
             }
+            // v43.0.0 (§10.8) — AN ENCRYPTED COHORT NEVER ACCEPTS AN
+            // UNSEALED BODY. Before any dispatch, before any storage.
+            //
+            // This runs first because the alternative is unrecoverable: a
+            // plaintext shard that reaches a peer cannot be recalled by any
+            // later rotation, and the tombstone plane cannot un-see it. The
+            // refusal has to happen while the bytes still exist in exactly
+            // one place.
+            crate::federation::at_rest_cascade::check_body_sealed_for_cohort(cohort_scope, &body)?;
+
             if crate::federation::types::cohort_scope::suppresses_holds_bytes(cohort_scope) {
                 // Structurally invisible (CEG §10.1.4): store the bytes,
                 // announce nothing. No signer, no holds_bytes row.
@@ -1391,6 +1448,85 @@ pub trait BlobStorage: Send + Sync {
         &self,
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — the lifecycle
+    /// state of one `(community, epoch)` DEK.
+    ///
+    /// Tink's keyset model, adopted as a pattern rather than as a
+    /// dependency (§10.4). Without per-key state, "stop sealing under this
+    /// epoch" and "destroy this epoch's key" are the same operation, and
+    /// only one of them is recoverable.
+    fn community_dek_key_state(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<DekKeyState>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.5) — write the state of one `(community, epoch)` DEK.
+    ///
+    /// **This is the raw setter and it enforces NOTHING.** The DESTROY
+    /// precondition — every object sealed under the epoch re-sealed or
+    /// evicted first — lives in
+    /// [`community_dek::orchestrate::set_key_state`](crate::federation::community_dek::orchestrate::set_key_state),
+    /// which is what callers should use. A `destroyed` written through here
+    /// over live content orphans that content rather than erasing it.
+    fn community_dek_set_key_state(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        state: DekKeyState,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (§10.5, §10.9) — how many objects are still sealed under
+    /// `(community, epoch)`.
+    ///
+    /// The DESTROY precondition, and the reason V138 adds
+    /// `federation_community_blob_epoch_by_community_epoch`: before that
+    /// index this was a full table scan, and **a precondition that is
+    /// expensive to check is one that gets skipped** — while the thing it
+    /// guards is unrecoverable.
+    fn community_dek_epoch_object_count(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+    /// v43.0.0 (§10.7) — every `(epoch, state)` this community has a DEK for,
+    /// ascending. The sweep's input.
+    fn community_dek_epochs(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<(u64, DekKeyState)>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — **delete the LOCAL copies of every object sealed at
+    /// `(community, epoch)`**, returning how many were removed.
+    ///
+    /// This is the destructive half of the sweep and it is deliberately
+    /// narrow: it removes this node's bytes and the epoch binding. It does
+    /// **not** recall copies already fountained to peers — rotation is not
+    /// recall (§10.6), and the mechanism that reaches other holders is the
+    /// tombstone plane, not this call. A caller that treats this as erasure
+    /// across the mesh is wrong in a way that matters.
+    ///
+    /// Ordering is load-bearing: the bytes and the binding go together, so a
+    /// later `community_dek_epoch_object_count` returns 0 and the DESTROY
+    /// precondition can be satisfied honestly rather than by a stale index.
+    fn community_dek_evict_epoch_objects(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — the community's past-epoch retention policy.
+    ///
+    /// `None` = retain indefinitely, which is the DEFAULT and today's
+    /// behaviour. `Some(n)` authorizes the sweep to delete local content
+    /// more than `n` epochs behind the current one.
+    ///
+    /// Opt-in on purpose: deletion is irreversible, so it happens only where
+    /// an operator has said how much history to keep.
+    fn community_dek_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<Option<u64>, BlobError>> + Send;
 
     // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243 parts 1+2) ───────
     //   scope-native privacy: a store for caller-pre-encrypted

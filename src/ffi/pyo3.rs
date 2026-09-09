@@ -12519,6 +12519,305 @@ impl PyEngine {
 
     // ── v3.3.0 (CIRISPersist#121) — ergonomic put_blob_signing ─────
 
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.1) — **store a blob
+    /// encrypted under a community's current-epoch DEK.**
+    ///
+    /// The Python surface had NO encrypted blob path at all before this cut
+    /// — only `put_blob_json` / `put_blob_signing`, which store plaintext.
+    /// Combined with the §10.8 write gate (an encrypted cohort refuses an
+    /// unsealed body) that left a Python consumer unable to store a blob in
+    /// `self` / `family` / `community` / `affiliations` by ANY route: the
+    /// plaintext door refuses, and the sealing door was unreachable. This
+    /// binding and its three siblings close that.
+    ///
+    /// `plaintext_b64` is the CLEARTEXT — persist seals it here. Returns the
+    /// cascade result as JSON: `at_rest_sha256` (hex), `epoch`, `granted`,
+    /// `excluded`. `excluded` is the fail-secure list — members with no
+    /// valid `encryption_pubkeys` get NO grant, never a plaintext fallback,
+    /// and a caller that ignores this field is ignoring who cannot read what
+    /// it just wrote.
+    #[pyo3(signature = (community_key_id, plaintext_b64, media_type=None))]
+    fn put_blob_encrypted_community(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        plaintext_b64: &str,
+        media_type: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let plaintext = B64.decode(plaintext_b64).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "put_blob_encrypted_community plaintext_b64 decode: {e}"
+                ))
+            })?;
+            let community = community_key_id.to_owned();
+            let media = media_type.map(str::to_owned);
+            py.detach(move || {
+                use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+                let res = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            encrypt_and_cascade_community(
+                                backend.as_ref(),
+                                &community,
+                                &plaintext,
+                                media.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            encrypt_and_cascade_community(
+                                backend.as_ref(),
+                                &community,
+                                &plaintext,
+                                media.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(serde_json::json!({
+                    "at_rest_sha256": hex::encode(res.at_rest_sha256),
+                    "epoch": res.epoch,
+                    "granted": res.granted,
+                    "excluded": res.excluded,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// v43.0.0 (§10) — **read any blob as a viewer. The one read a server or
+    /// agent needs.**
+    ///
+    /// Content address in, plaintext (base64) out. The caller does not need
+    /// to know the cohort, whether the blob is encrypted, which DEK sealed
+    /// it, which epoch it belongs to, or whether a grant exists — persist
+    /// determines the path from the DATA, not from a caller-supplied label
+    /// that could be wrong.
+    ///
+    /// Prefer this over `get_blob_for_viewer` / `read_blob_for_community_viewer`,
+    /// which require the caller to already know the cohort.
+    ///
+    /// **Never use `get_blob_json` to read content.** It returns the stored
+    /// body, which for `self` / `family` / `community` / `affiliations` is
+    /// CIPHERTEXT. That accessor is for relaying bytes to peers — a
+    /// different job, and the reason transfers never re-encode.
+    fn read_blob_as(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            read_any_for_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            read_any_for_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                }
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// v43.0.0 (§10.1) — **read a community-encrypted blob as `viewer_key_id`.**
+    ///
+    /// Returns the recovered plaintext base64-encoded.
+    ///
+    /// Authorization is the viewer's grant on the BLOB'S OWN epoch, not the
+    /// community's current one — the Option-A forward-only guarantee
+    /// (AV-70): a removed member keeps reading what they could already read,
+    /// and a member who joined after a rotation cannot read what predates
+    /// their grant. FSD §10.5 proposes changing this with a `destroyed` key
+    /// state; that is not built, so the behaviour here is the ratified one.
+    fn read_blob_for_community_viewer(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::community_dek::orchestrate::read_for_community_viewer;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            read_for_community_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            read_for_community_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                }
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// v43.0.0 (§10.1) — **store a blob encrypted for `self` or `family`.**
+    ///
+    /// The `InvisibleEncrypted` tier: a fresh per-write DEK wrapped to every
+    /// ACTIVE occurrence of the owner (`self`) or of every member
+    /// (`family`), plus persist's own self-retention wrap. Unlike the
+    /// community tier this also SUPPRESSES `holds_bytes` — self/family bytes
+    /// never cost the federation a directory entry (the locality dividend,
+    /// FEDERATION_SCALING_MODEL §9.5).
+    ///
+    /// `cohort_scope` must be `self` or `family`; anything else is refused
+    /// (the community tiers go through
+    /// [`put_blob_encrypted_community`](Self::put_blob_encrypted_community)
+    /// and the commons tiers through the ordinary plaintext door).
+    #[pyo3(signature = (cohort_scope, owner_or_family_key_id, plaintext_b64, media_type=None))]
+    fn put_blob_encrypted_self_family(
+        &self,
+        py: Python<'_>,
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+        plaintext_b64: &str,
+        media_type: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let plaintext = B64.decode(plaintext_b64).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "put_blob_encrypted_self_family plaintext_b64 decode: {e}"
+                ))
+            })?;
+            let scope = cohort_scope.to_owned();
+            let owner = owner_or_family_key_id.to_owned();
+            let media = media_type.map(str::to_owned);
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+                let res = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            encrypt_and_cascade(
+                                backend.as_ref(),
+                                &scope,
+                                &owner,
+                                &plaintext,
+                                media.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            encrypt_and_cascade(
+                                backend.as_ref(),
+                                &scope,
+                                &owner,
+                                &plaintext,
+                                media.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(serde_json::json!({
+                    "at_rest_sha256": hex::encode(res.at_rest_sha256),
+                    "granted": res.granted,
+                    "excluded": res.excluded,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// v43.0.0 (§10.1) — **read a self/family-encrypted blob as `viewer_key_id`.**
+    ///
+    /// Returns the recovered plaintext base64-encoded. The viewer must hold
+    /// a grant on the blob; persist recovers the DEK through its own
+    /// self-retention row.
+    fn get_blob_for_viewer(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::read_for_viewer;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            read_for_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            read_for_viewer(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                }
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
     /// v3.3.0 (CIRISPersist#121) — one-call ingest. Persist owns the
     /// holds_bytes envelope construction, canonicalization (via the
     /// production `PythonJsonDumpsCanonicalizer`, NOT JCS), signing

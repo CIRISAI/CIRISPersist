@@ -84,6 +84,266 @@ pub const WRAP_ALGORITHM_V2: &str = "x25519_mlkem768_aes256_gcm_hkdf_sha256";
 /// are domain-separated (BLOB_ENCRYPTION_AT_REST.md §4.3).
 pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
 
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.2) — **where the
+/// content-at-rest master comes from.**
+///
+/// [`content_master_key`] returns this rather than a bare key so the
+/// caller cannot lose the provenance on the way to
+/// `federation_content_master.key_kind`. A software master recorded as
+/// hardware would be a lie the schema is specifically shaped to prevent
+/// (`master_key_b64` is "present iff `key_kind='software'`").
+#[derive(Debug)]
+pub enum ContentMasterSource {
+    /// HKDF-derived from the platform's hardware-sealed seed under
+    /// [`CONTENT_MASTER_CONTEXT`]. **Deterministic** — re-derived on every
+    /// call from the same seed, so nothing is stored and there is no key
+    /// material in the database at all.
+    Hardware {
+        /// The 32-byte derived master. `Zeroizing` — scrubbed on drop.
+        key: zeroize::Zeroizing<[u8; 32]>,
+        /// Provenance for `federation_content_master.descriptor`.
+        descriptor: String,
+    },
+    /// No hardware-backed secure storage is reachable. The caller
+    /// generates and persists a software master and MUST record it as
+    /// `key_kind='software'` with `reason` in the descriptor.
+    ///
+    /// This is a clean, expected outcome on a no-TPM host — not an error.
+    /// It is a distinct variant rather than a silent fallback so that
+    /// "we are on software" is a decision the caller makes explicitly.
+    SoftwareFallback {
+        /// Why hardware was unavailable, verbatim, for the descriptor.
+        reason: String,
+    },
+}
+
+/// v43.0.0 (§10.2) — **resolve the content-at-rest master key.**
+///
+/// This is the function `at_rest_cascade`'s module header has always
+/// pointed at and which, until now, did not exist: the header described
+/// "hardware-rooted HKDF over the secrets-store sealed seed under a
+/// distinct context, with a software fallback honest about being
+/// software", [`CONTENT_MASTER_CONTEXT`] was defined with **zero call
+/// sites**, and the backends generated a random software key instead. So
+/// the fallback was not a fallback — it was the only path, reached by
+/// default rather than by decision, while the doc asserted otherwise.
+///
+/// # The derivation
+///
+/// Same hardware-sealed seed as the secrets store, different HKDF
+/// `info` — per §4.3, "no new master-key root". CIRISVerify owns the KDF
+/// (`ciris_verify_core::derive_symmetric_key`); persist never implements
+/// it (MISSION §1.4).
+///
+/// # Why the persisted row still wins
+///
+/// A node that already has a `key_kind='software'` row keeps using it
+/// even once hardware becomes available. Re-deriving would orphan every
+/// blob sealed under the software master **and** the sealed content-KEM
+/// private halves, which are themselves sealed under this key. The same
+/// rule the content-KEM identity already states: the stable persisted
+/// material always wins. Migrating software → hardware is a re-wrap
+/// operation, not a re-derivation, and is out of scope here.
+///
+/// **Synchronous / blocking** (TPM + filesystem I/O) — call from
+/// `spawn_blocking`.
+#[must_use]
+pub fn content_master_key() -> ContentMasterSource {
+    #[cfg(feature = "secrets")]
+    {
+        match crate::secrets::hardware::derive_hardware_content_master_key() {
+            // `derive_hardware_master_for_context` already asserts the length,
+            // but this is the boundary where a wrong length would become a
+            // silent truncation, so it is re-checked rather than assumed.
+            Ok((master, descriptor)) => match <[u8; 32]>::try_from(master.as_slice()) {
+                Ok(key) => ContentMasterSource::Hardware {
+                    key: zeroize::Zeroizing::new(key),
+                    descriptor,
+                },
+                Err(_) => ContentMasterSource::SoftwareFallback {
+                    reason: format!(
+                        "verify derived a {}-byte content master, expected 32",
+                        master.len()
+                    ),
+                },
+            },
+            Err(e) => ContentMasterSource::SoftwareFallback {
+                reason: format!("hardware content master unavailable: {e}"),
+            },
+        }
+    }
+    #[cfg(not(feature = "secrets"))]
+    {
+        ContentMasterSource::SoftwareFallback {
+            reason: "built without the `secrets` feature — no hardware-sealed \
+                     seed is reachable, so no hardware-rooted content master \
+                     can be derived"
+                .to_owned(),
+        }
+    }
+}
+
+/// v43.0.0 (§10.2) — turn a persisted `federation_content_master` row into
+/// the 32-byte master, re-deriving when the row says hardware.
+///
+/// Shared by both SQL backends so the hardware/software decision cannot
+/// drift between them — the `#596` class (three axes silently ignored by
+/// one backend) is exactly what a per-backend copy of this would invite.
+///
+/// The row is the authority on WHICH root, never this function: a
+/// `software` row carries its key and is used verbatim; a `hardware` row
+/// carries no key and is re-derived from the sealed seed. That asymmetry
+/// is the schema's own (`master_key_b64` is "present iff
+/// `key_kind='software'`").
+///
+/// # Errors
+///
+/// A `hardware` row whose seed is no longer reachable is a HARD error, not
+/// a fallback. Silently minting a fresh software master there would leave
+/// every blob sealed under the old root undecryptable while reporting
+/// success — the failure mode this returns an error to avoid.
+pub fn resolve_persisted_content_master(
+    key_kind: &str,
+    master_key_b64: Option<&str>,
+) -> Result<[u8; 32], AtRestError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    match (key_kind, master_key_b64) {
+        ("software", Some(b64)) => {
+            let raw = B64
+                .decode(b64)
+                .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?;
+            <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+                AtRestError::Crypto(format!(
+                    "content master is {} bytes, expected 32",
+                    raw.len()
+                ))
+            })
+        }
+        ("hardware", _) => match content_master_key() {
+            ContentMasterSource::Hardware { key, .. } => Ok(*key),
+            ContentMasterSource::SoftwareFallback { reason } => Err(AtRestError::Crypto(format!(
+                "content master is recorded hardware-rooted but the hardware-sealed seed \
+                 is unreachable ({reason}); everything sealed under it — including the \
+                 content-KEM private halves — cannot be decrypted without it. Refusing to \
+                 mint a replacement, which would report success over an unreadable corpus"
+            ))),
+        },
+        ("software", None) => Err(AtRestError::Crypto(
+            "content master row says software but carries no key bytes".to_owned(),
+        )),
+        (other, _) => Err(AtRestError::Crypto(format!(
+            "content master row has unknown key_kind {other:?}"
+        ))),
+    }
+}
+
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.8) — **is this body
+/// sealed?**, answered from the bytes rather than from the caller's word.
+///
+/// A sealed body starts with [`AT_REST_ENVELOPE_MAGIC`]. That is the whole
+/// test for an inline body, and it is a test persist can actually perform.
+///
+/// # Why the other two variants are refusals, not passes
+///
+/// `External` — persist deliberately never dereferences the URI
+/// ([`BlobBody::External`]'s own contract). It therefore cannot see the
+/// bytes, cannot know whether they are sealed, and must not assert a
+/// property it has no way to check. `ChunkDag` — the chunks are separate
+/// rows; this door sees only the manifest, so per-chunk sealing is not
+/// verifiable here either.
+///
+/// In both cases the honest answer is "cannot verify", and in an encrypted
+/// cohort **cannot-verify is a refusal**. Accepting them would make the
+/// gate a report: it would pass, nothing would be red, and the plaintext
+/// would be on disk in a cohort whose whole confidentiality story is that
+/// it is not.
+#[must_use]
+pub fn body_is_sealed(body: &crate::federation::blobs::BlobBody) -> BodySealState {
+    use crate::federation::blobs::BlobBody;
+    match body {
+        BlobBody::Inline(bytes) => {
+            if bytes.len() >= AT_REST_ENVELOPE_MAGIC.len()
+                && bytes[..AT_REST_ENVELOPE_MAGIC.len()] == AT_REST_ENVELOPE_MAGIC
+            {
+                BodySealState::Sealed
+            } else {
+                BodySealState::Plaintext
+            }
+        }
+        BlobBody::External(_) => BodySealState::Unverifiable {
+            why: "an External body is a URI persist never dereferences, so its bytes \
+                  cannot be inspected here",
+        },
+        BlobBody::ChunkDag(_) => BodySealState::Unverifiable {
+            why: "a ChunkDag's chunks are separate rows; this door sees only the \
+                  manifest, so per-chunk sealing cannot be verified here",
+        },
+    }
+}
+
+/// The three answers [`body_is_sealed`] can give. `Unverifiable` is
+/// deliberately distinct from `Plaintext`: they refuse for different
+/// reasons and a reader of the error deserves to know which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodySealState {
+    /// Carries [`AT_REST_ENVELOPE_MAGIC`].
+    Sealed,
+    /// Inline bytes with no envelope magic — demonstrably not sealed.
+    Plaintext,
+    /// Persist cannot see the bytes from this door.
+    Unverifiable {
+        /// Why, for the refusal message.
+        why: &'static str,
+    },
+}
+
+/// v43.0.0 (§10.8) — **the write-door gate: an encrypted cohort never
+/// accepts an unsealed body.**
+///
+/// `self` / `family` / `community` / `affiliations` resolve to an encrypted
+/// [`CryptoTier`](crate::federation::types::cohort_scope::CryptoTier); the
+/// commons tiers resolve to `Plaintext` and are unaffected.
+///
+/// # Why this is a gate and not a convention
+///
+/// Fountaining a plaintext shard cannot be undone. No later rotation
+/// recalls it, and the tombstone plane cannot un-see it — §10.8. The
+/// window between "wrote plaintext" and "noticed" is unbounded, and the
+/// damage is already distributed by then. So the refusal has to be at the
+/// door, before the bytes exist anywhere.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] naming the cohort, its tier, and which
+/// of the two reasons applies.
+pub fn check_body_sealed_for_cohort(
+    cohort_scope: &str,
+    body: &crate::federation::blobs::BlobBody,
+) -> Result<(), crate::federation::BlobError> {
+    use crate::federation::types::cohort_scope::{crypto_tier, CryptoTier};
+    let tier = crypto_tier(cohort_scope, None);
+    if matches!(tier, CryptoTier::Plaintext) {
+        return Ok(());
+    }
+    match body_is_sealed(body) {
+        BodySealState::Sealed => Ok(()),
+        BodySealState::Plaintext => Err(crate::federation::BlobError::InvalidArgument(format!(
+            "cohort_scope {cohort_scope:?} resolves to {tier:?}, which is encrypted at rest, \
+             but the body carries no at-rest envelope magic — it is plaintext. Seal it first \
+             (the cascade for this tier), then store: a plaintext shard that reaches a peer \
+             cannot be recalled by any later rotation (BLOB_ENCRYPTION_AT_REST.md §10.8)"
+        ))),
+        BodySealState::Unverifiable { why } => {
+            Err(crate::federation::BlobError::InvalidArgument(format!(
+                "cohort_scope {cohort_scope:?} resolves to {tier:?}, which is encrypted at \
+                 rest, and persist cannot verify this body is sealed: {why}. Refusing rather \
+                 than asserting a property it cannot check"
+            )))
+        }
+    }
+}
+
 /// Error from the at-rest cascade crypto helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum AtRestError {
@@ -1040,6 +1300,104 @@ pub mod orchestrate {
         Ok(new_epoch)
     }
 
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **read any blob as a
+    /// viewer, without the caller knowing how it was stored.**
+    ///
+    /// This is the door a server or an agent should use. It takes a content
+    /// address and a viewer, and returns plaintext. The caller does **not**
+    /// need to know the cohort, whether the blob is encrypted, which DEK
+    /// sealed it, which epoch it belongs to, or whether a grant exists — the
+    /// substrate knows all of that and answers the only question the caller
+    /// actually has: *give me the bytes, as me.*
+    ///
+    /// MISSION §1.4's "substrate absorbs complexity" applied to reads. A
+    /// consumer that has to branch on cohort before reading is a consumer
+    /// that will eventually branch WRONG — and the wrong branch on this
+    /// surface is either a failed read or, worse, a caller reaching for the
+    /// raw-bytes accessor and getting ciphertext it then treats as content.
+    ///
+    /// # How the path is determined — from the data, never from the caller
+    ///
+    /// 1. **Community binding present?** (`community_dek_blob_epoch`) → the
+    ///    community path, authorized by the viewer's grant on the blob's own
+    ///    epoch.
+    /// 2. **Stored bytes carry [`AT_REST_ENVELOPE_MAGIC`]?** → the
+    ///    self/family path, authorized by the viewer's at-rest grant.
+    /// 3. **Otherwise** → a commons/plaintext blob; the bytes are returned
+    ///    as stored.
+    ///
+    /// The three cases are mutually exclusive and exhaustive by
+    /// construction: a sealed blob is either community-bound or it is not,
+    /// and an unsealed blob carries no magic. There is no fallthrough where
+    /// ciphertext could be returned as though it were content.
+    ///
+    /// # Errors
+    ///
+    /// Propagated from the path taken — [`BlobError::NotHeld`] if absent,
+    /// [`BlobError::NotGranted`] if the viewer holds no grant, and the
+    /// destroyed-epoch refusal if the key material is gone. Each says which
+    /// of those it is; none of them is silently an empty read.
+    pub async fn read_any_for_viewer<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        // 1. Community-sealed?
+        if backend
+            .community_dek_blob_epoch(at_rest_sha256)
+            .await?
+            .is_some()
+        {
+            return crate::federation::community_dek::orchestrate::read_for_community_viewer(
+                backend,
+                at_rest_sha256,
+                viewer_key_id,
+            )
+            .await;
+        }
+
+        // 2. Sealed at all? The magic is on the stored bytes, so this asks
+        //    the DATA rather than trusting a caller-supplied cohort label —
+        //    a label the caller might have wrong, and which is exactly what
+        //    this function exists to stop them needing.
+        let body = backend
+            .get_blob(at_rest_sha256)
+            .await?
+            .ok_or_else(|| BlobError::NotHeld {
+                sha256_hex: hex::encode(at_rest_sha256),
+            })?;
+        let sealed = matches!(
+            &body,
+            BlobBody::Inline(b)
+                if b.len() >= AT_REST_ENVELOPE_MAGIC.len()
+                    && b[..AT_REST_ENVELOPE_MAGIC.len()] == AT_REST_ENVELOPE_MAGIC
+        );
+        if sealed {
+            return read_for_viewer(backend, at_rest_sha256, viewer_key_id).await;
+        }
+
+        // 3. Plaintext (commons). Inline bodies are returned as stored;
+        //    External / ChunkDag are NOT dereferenced here — persist never
+        //    fetches an External URI, and handing back a manifest as though
+        //    it were content would be exactly the "ciphertext as content"
+        //    confusion this function prevents in the sealed case.
+        match body {
+            BlobBody::Inline(bytes) => Ok(bytes),
+            BlobBody::External(_) => Err(BlobError::InvalidArgument(format!(
+                "blob {} is an External reference; persist does not dereference it. \
+                 Fetch it from the upstream object store, or use get_blob to obtain the ref",
+                hex::encode(at_rest_sha256)
+            ))),
+            BlobBody::ChunkDag(_) => Err(BlobError::InvalidArgument(format!(
+                "blob {} is a chunk DAG; read its chunks, not the manifest",
+                hex::encode(at_rest_sha256)
+            ))),
+        }
+    }
+
     /// The default-tier read: recover the plaintext blob body for a
     /// granted viewer. Persist unwraps the DEK (via its content-master
     /// self-retention grant), AES-GCM-decrypts, and returns the bytes.
@@ -1224,5 +1582,84 @@ mod tests {
         let back =
             ciris_crypto::key_grant::unwrap_dek_v2(&x_priv, &ml_priv, &ml_pub, &wrap).unwrap();
         assert_eq!(back, dek);
+    }
+}
+
+#[cfg(test)]
+mod content_master_root_tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    /// v43.0.0 (§10.2) — a `software` row is used verbatim.
+    #[test]
+    fn software_row_yields_its_own_bytes() {
+        let key = [7u8; 32];
+        let got = resolve_persisted_content_master("software", Some(&B64.encode(key)))
+            .expect("software row resolves");
+        assert_eq!(
+            got, key,
+            "the stored bytes ARE the master; nothing re-derives"
+        );
+    }
+
+    /// The failure this function exists to make loud.
+    ///
+    /// A `hardware` row carries no key bytes, so it must re-derive. When the
+    /// sealed seed is unreachable the ONLY safe answer is an error: minting a
+    /// replacement would report success over a corpus that can no longer be
+    /// decrypted — including the content-KEM private halves, which are
+    /// themselves sealed under this key.
+    ///
+    /// Under `cfg(not(feature = "secrets"))` the derivation is structurally
+    /// unavailable, so this is exactly the production shape of "seed gone".
+    #[test]
+    #[cfg(not(feature = "secrets"))]
+    fn hardware_row_without_a_reachable_seed_is_a_hard_error_never_a_fallback() {
+        let err = resolve_persisted_content_master("hardware", None)
+            .expect_err("a hardware row with no reachable seed must NOT resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hardware-rooted") && msg.contains("unreachable"),
+            "error must name the cause, got: {msg}"
+        );
+        assert!(
+            msg.contains("Refusing to mint a replacement"),
+            "error must say why it refuses rather than falling back, got: {msg}"
+        );
+    }
+
+    /// Malformed rows fail rather than defaulting.
+    #[test]
+    fn malformed_rows_refuse() {
+        assert!(resolve_persisted_content_master("software", None).is_err());
+        assert!(resolve_persisted_content_master("nonsense", None).is_err());
+        // wrong length
+        assert!(
+            resolve_persisted_content_master("software", Some(&B64.encode([1u8; 16]))).is_err()
+        );
+        // not base64
+        assert!(resolve_persisted_content_master("software", Some("!!!not b64!!!")).is_err());
+    }
+
+    /// `ContentMasterSource` must never let a caller record a software master
+    /// as hardware: the two carry different payloads by construction, so the
+    /// mistake is not expressible rather than merely discouraged.
+    #[test]
+    fn the_source_variants_cannot_be_confused() {
+        match content_master_key() {
+            // On a host with no TPM (CI, dev) this is the expected arm.
+            ContentMasterSource::SoftwareFallback { reason } => {
+                assert!(!reason.is_empty(), "a software fallback must say WHY");
+            }
+            // On a hardware host, the key is present and there is nothing to
+            // persist — the row records provenance only.
+            ContentMasterSource::Hardware { key, descriptor } => {
+                assert_eq!(key.len(), 32);
+                assert!(
+                    descriptor.contains("context="),
+                    "descriptor must name the HKDF context it derived under, got: {descriptor}"
+                );
+            }
+        }
     }
 }

@@ -61,6 +61,40 @@ pub fn dsn() -> Option<String> {
     DSN.get_or_init(provision).clone()
 }
 
+/// v43.0.0 (CIRISPersist#819) — **a database of this test's OWN**, not the
+/// per-process one [`dsn`] hands out.
+///
+/// # Why this exists
+///
+/// [`dsn`] gives every test in a process the SAME database, deliberately: a
+/// template copy per test is cheap but not free, and most tests do not care.
+/// Some do. A test whose assertion depends on the directory being in a
+/// particular state — no constitutional root yet, a roster of exactly N —
+/// is not testing what it thinks once a neighbour has seeded that state.
+///
+/// Six postgres tests were failing this way (#819): they pass alone and fail
+/// together, and the failure surfaces as a quorum or gate-selection error
+/// that reads like a logic bug rather than a fixture one. Worse, whether
+/// they pass depends on how the suite happens to shard, so CI green was
+/// luck rather than evidence.
+///
+/// # Cost, and when to use it
+///
+/// One `CREATE DATABASE … TEMPLATE` — a file-level copy of an
+/// already-migrated database, measured at ~101 ms including docker-exec
+/// overhead. Use it for tests that assert on ABSENCE (no root, no holders,
+/// an empty roster) or on a global count. Do not use it by default: 566
+/// postgres tests each paying a copy is the cost this module's per-process
+/// design exists to avoid.
+///
+/// Returns `None` for the same reason [`dsn`] does — no base DSN configured.
+#[must_use]
+pub fn isolated_dsn() -> Option<String> {
+    // NOT the `OnceLock` path: each call provisions its own database, which
+    // is the entire point. `reap_dead` collects them by PID like any other.
+    provision()
+}
+
 /// Split a postgres URL into (everything before the final `/`, database name).
 fn split(url: &str) -> Option<(&str, &str)> {
     let cut = url.rfind('/')?;

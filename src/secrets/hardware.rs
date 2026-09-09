@@ -81,6 +81,29 @@ fn secrets_storage_dir() -> Result<std::path::PathBuf, SecretsError> {
 /// agent) treats that as "stay on the software master key" — it is a
 /// clean, expected outcome on a no-TPM host, not an error to surface.
 pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsError> {
+    derive_hardware_master_for_context(SECRETS_MASTER_CONTEXT)
+}
+
+/// v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.2) — the **content-at-rest**
+/// master, derived from the SAME hardware-sealed seed under a DISTINCT
+/// HKDF context.
+///
+/// §4.3 is explicit that content encryption "introduces no new master-key
+/// root; it reuses this one, under a distinct HKDF context string." The
+/// domain separation is the context and nothing else: same seed, same
+/// `derive_symmetric_key`, different `info`. Two roots would mean two
+/// things to seal, two things to rotate and two ways to lose the corpus.
+///
+/// [`crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT`] is the
+/// wire constant; it lives beside the cascade that consumes it, and
+/// `the_content_context_is_domain_separated` pins that the two contexts
+/// can never collide.
+pub(crate) fn derive_hardware_content_master_key() -> Result<(Vec<u8>, String), SecretsError> {
+    derive_hardware_master_for_context(crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT)
+}
+
+/// The shared body: seal-if-absent, then HKDF under `context`.
+fn derive_hardware_master_for_context(context: &str) -> Result<(Vec<u8>, String), SecretsError> {
     let storage_dir = secrets_storage_dir()?;
     let storage = create_platform_storage(SECRETS_STORAGE_ALIAS, storage_dir).map_err(|e| {
         SecretsError::HardwareKeyUnavailable(format!("secure storage init failed: {e}"))
@@ -113,14 +136,13 @@ pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsE
 
     // CIRISVerify owns the derivation (HKDF-SHA256 over the sealed
     // seed). Persist never implements the KDF itself.
-    let master = ciris_verify_core::derive_symmetric_key(
-        storage.as_ref(),
-        SECRETS_SEED_KEY_ID,
-        SECRETS_MASTER_CONTEXT,
-    )
-    .map_err(|e| {
-        SecretsError::HardwareKeyUnavailable(format!("verify derive_symmetric_key failed: {e}"))
-    })?;
+    let master =
+        ciris_verify_core::derive_symmetric_key(storage.as_ref(), SECRETS_SEED_KEY_ID, context)
+            .map_err(|e| {
+                SecretsError::HardwareKeyUnavailable(format!(
+                    "verify derive_symmetric_key failed: {e}"
+                ))
+            })?;
 
     if master.len() != crypto::KEY_LEN {
         return Err(SecretsError::Crypto(format!(
@@ -130,8 +152,31 @@ pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsE
         )));
     }
 
-    let descriptor = format!(
-        "hardware-blob-storage seed={SECRETS_SEED_KEY_ID} context={SECRETS_MASTER_CONTEXT}"
-    );
+    let descriptor = format!("hardware-blob-storage seed={SECRETS_SEED_KEY_ID} context={context}");
     Ok((master, descriptor))
+}
+
+#[cfg(test)]
+mod context_domain_separation_tests {
+    /// v43.0.0 (§10.2 / §4.3) — the secrets master and the content master
+    /// derive from the SAME hardware-sealed seed and are separated by the
+    /// HKDF context alone. If the two contexts ever collided, the secrets
+    /// store and the blob corpus would share one key: a compromise of either
+    /// would be a compromise of both, and neither could be rotated
+    /// independently.
+    ///
+    /// Both are documented "stable wire constants" — changing one orphans
+    /// everything encrypted under it — so this also pins that a careless
+    /// rename cannot silently merge them.
+    #[test]
+    fn the_content_context_is_domain_separated() {
+        let secrets = super::SECRETS_MASTER_CONTEXT;
+        let content = crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT;
+        assert_ne!(
+            secrets, content,
+            "secrets and content masters derive from ONE seed; the context is the \
+             only thing separating them"
+        );
+        assert!(!secrets.is_empty() && !content.is_empty());
+    }
 }
