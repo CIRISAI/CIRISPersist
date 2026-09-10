@@ -1336,6 +1336,196 @@ mod witnesses {
         assert_eq!(mem_by_uri.read_pool_handle().size(), 0);
     }
 
+    // ── FSD §8: the measurement ────────────────────────────────────────
+    /// The issue's shape, in-process and interleaved: a synthetic corpus of
+    /// ~24k `observation:` rows + 12 `config:` + 3k `capacity:` from ONE
+    /// attester; two tasks looping the filtered `list_attestations`
+    /// (attester pinned, `observation:` prefix, limit 10 000 — the
+    /// reconcile tick); and a point read (`get_attestation`) probed every
+    /// 5 ms for 8 s on a two-worker runtime. Arms alternate on the SAME
+    /// corpus file: A = `readers = 0` (the single-connection model: every
+    /// read behind the writer mutex), B = the default pool. Three rounds
+    /// each, A B A B A B, so a co-tenant hitting one round cannot pass for a
+    /// verdict.
+    ///
+    /// `cargo nextest run --features sqlite --run-ignored ignored-only \
+    ///    -E 'test(read_pool_bench)' --no-capture`
+    #[test]
+    #[ignore = "bench: ~1 min, prints a table; FSD/SQLITE_CONNECTION_MODEL.md §8"]
+    fn read_pool_bench() {
+        use crate::ceg::ReadEngine;
+        use crate::read::AttestationFilter;
+
+        const OBS: usize = 24_000;
+        const CAP: usize = 3_000;
+        const CFG: usize = 12;
+        const ROUNDS: usize = 3;
+        const PROBE_SECS: u64 = 8;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let path = temp_db_path("bench");
+
+        // Corpus, once, on the writer.
+        rt.block_on(async {
+            let backend = SqliteBackend::open_with_readers(&path, 0).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            backend
+                .write(move |conn| -> rusqlite::Result<()> {
+                    let tx = conn.transaction()?;
+                    for k in ["bench-attester", "occ"] {
+                        tx.execute(
+                            "INSERT INTO federation_keys (\
+                                key_id, pubkey_ed25519_base64, algorithm, identity_type, \
+                                identity_ref, valid_from, registration_envelope, \
+                                original_content_hash, scrub_signature_classical, \
+                                scrub_key_id, scrub_timestamp, persist_row_hash\
+                             ) VALUES (?1, 'AAAA', 'hybrid', 'agent', ?1, ?2, '{}', \
+                                      x'00', '', ?1, ?2, '0')",
+                            rusqlite::params![k, "2026-01-01T00:00:00+00:00"],
+                        )?;
+                    }
+                    let mut ins = tx.prepare(
+                        "INSERT INTO federation_attestations (\
+                            attestation_id, attesting_key_id, attested_key_id, \
+                            attestation_type, weight, asserted_at, expires_at, \
+                            attestation_envelope, original_content_hash, \
+                            scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                            scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                            promoted_at, additional_scrubs\
+                         ) VALUES (?1, 'bench-attester', 'occ', 'scores', 1.0, ?2, NULL, ?3, \
+                                  x'', 'sig', NULL, 'bench-attester', ?2, NULL, '0', '[]', \
+                                  NULL, 'federation', 'federation', NULL, '[]')",
+                    )?;
+                    let mut n = 0usize;
+                    for (count, dim) in [
+                        (OBS, "observation:reachability:v1"),
+                        (CFG, "config:node:v1"),
+                        (CAP, "capacity:storage:v1"),
+                    ] {
+                        for _ in 0..count {
+                            n += 1;
+                            let id = format!("att-{n:06}");
+                            let at = format!(
+                                "2026-06-{:02}T{:02}:{:02}:{:02}Z",
+                                1 + (n / 86_400) % 28,
+                                (n / 3600) % 24,
+                                (n / 60) % 60,
+                                n % 60
+                            );
+                            let env = serde_json::json!({
+                                "id": id, "dimension": dim, "score": 1.0,
+                                "payload": {"seq": n, "note": "synthetic corpus for #829"}
+                            })
+                            .to_string();
+                            ins.execute(rusqlite::params![id, at, env])?;
+                        }
+                    }
+                    drop(ins);
+                    tx.commit()
+                })
+                .await
+                .unwrap();
+        });
+
+        fn pct(sorted: &[Duration], p: f64) -> Duration {
+            let i = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[i.min(sorted.len() - 1)]
+        }
+
+        let run_arm = |readers: usize| -> (usize, Duration, Duration, Duration, usize) {
+            rt.block_on(async {
+                let backend = Arc::new(
+                    SqliteBackend::open_with_readers(&path, readers)
+                        .await
+                        .unwrap(),
+                );
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut loops = Vec::new();
+                for _ in 0..2 {
+                    let b = backend.clone();
+                    let stop = stop.clone();
+                    let scans = scans.clone();
+                    loops.push(tokio::spawn(async move {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            let page = b
+                                .list_attestations(
+                                    AttestationFilter {
+                                        attesting_key_id: Some("bench-attester".into()),
+                                        dimension_prefixes: vec!["observation:".into()],
+                                        ..Default::default()
+                                    },
+                                    None,
+                                    10_000,
+                                    crate::scope::CallerScope::Unauthenticated,
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(page.items.len(), 10_000);
+                            scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }));
+                }
+                // Let the scans get going before probing.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut samples = Vec::new();
+                let t_end = Instant::now() + Duration::from_secs(PROBE_SECS);
+                while Instant::now() < t_end {
+                    let t0 = Instant::now();
+                    let got = FederationDirectory::get_attestation(backend.as_ref(), "att-000007")
+                        .await
+                        .unwrap();
+                    samples.push(t0.elapsed());
+                    assert!(got.is_some());
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                for l in loops {
+                    l.await.unwrap();
+                }
+                samples.sort();
+                (
+                    samples.len(),
+                    pct(&samples, 0.50),
+                    pct(&samples, 0.95),
+                    *samples.last().unwrap(),
+                    scans.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+        };
+
+        let default_n = super::default_reader_count();
+        println!();
+        println!(
+            "read_pool_bench — corpus {OBS}+{CFG}+{CAP} rows, one attester, 2 scan loops \
+                  (limit 10000), point read probed every 5 ms for {PROBE_SECS}s, 2 workers"
+        );
+        println!(
+            "{:<6} {:>8} {:>6} {:>12} {:>12} {:>12} {:>6}",
+            "round", "readers", "n", "p50", "p95", "max", "scans"
+        );
+        for round in 1..=ROUNDS {
+            for (label, readers) in [("A", 0usize), ("B", default_n)] {
+                let (n, p50, p95, max, scans) = run_arm(readers);
+                println!(
+                    "{:<6} {:>8} {:>6} {:>12?} {:>12?} {:>12?} {:>6}",
+                    format!("{round}{label}"),
+                    readers,
+                    n,
+                    p50,
+                    p95,
+                    max,
+                    scans
+                );
+            }
+        }
+    }
+
     /// FSD §3.2 — the default is `available_parallelism().clamp(2, 8)` unless
     /// the environment overrides it. Asserted only when it is not overridden,
     /// and the override arm is asserted through `open` on a file.
