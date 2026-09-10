@@ -54,6 +54,10 @@ pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
+// CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
+// content under the envelope: the per-chunk seal, the sealed manifest, the
+// decrypting range read and the live-stream chunk listing.
+pub mod chunk_dag_cascade;
 pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;

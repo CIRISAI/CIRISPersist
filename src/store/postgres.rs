@@ -24009,6 +24009,32 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i20_the_primary_cannot_be_retired(&backend, &tag).await;
     }
 
+    /// §12.7 I32 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i32_commons_seal_refuses_a_sealed_chunk_row_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i32_commons_seal_refuses_a_sealed_chunk_row(&backend, &tag).await;
+    }
+
+    /// §12.7 I35 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i35_whole_read_of_a_dag_is_its_content_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i35_whole_read_of_a_dag_is_its_content(&backend, &tag).await;
+    }
+
     /// §11.10 — see `at_rest_cascade::blob_invariants`.
     #[tokio::test]
     async fn blob_invariant_i23_the_door_announces_under_the_signers_derived_key_postgres() {

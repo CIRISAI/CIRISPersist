@@ -1492,6 +1492,14 @@ returns the error and the next call derives again (I29).
 | I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep | C3-2 |
 | I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart | C3-3 |
 | I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped | C3-4, C3-5 |
+| I32 | Every seal door checks the chunk ROWS: a `chunk_dag` row is written only over chunks whose recorded `crypto_tier` (and, for a community, whose epoch binding's community) is the DAG's own; the commons `seal_stream` refuses a sealed chunk row and the scoped seal refuses a plaintext one. | a public manifest over community-sealed chunks; a "sealed" manifest over a plaintext chunk | #832 |
+| I33 | A sealed DAG's manifest row is content-addressed by its CIPHERTEXT, recorded at the DAG's tier, and the storage layer (`get_blob`, `get_blob_range`) hands out only its opaque bytes; the read door refuses a stranger before touching manifest or chunk. | `get_blob` parses (or fails to parse) a sealed manifest; a stranger reads a chunk or the manifest | #832 |
+| I34 | The decrypting range read authorizes at the manifest before dispatch, maps a PLAINTEXT range to the covering chunk set, opens each chunk independently, and returns exactly `[start, end]` of the plaintext; `start ≥ total` is `RangeNotSatisfiable` naming the plaintext size. | a ciphertext substring; an off-by-one at a chunk boundary; bytes for a non-grantee | #832 |
+| I35 | The whole read of a DAG (`read_any_for_viewer`) returns the concatenated content when `total_size ≤ DAG_WHOLE_READ_CAP_BYTES` and refuses above it with `InvalidArgument` naming the cap and the range door; a commons DAG reads the same way. | a `chunk_dag` row refused to every reader; an unbounded allocation | #832 |
+| I36 | The transfer path never decrypts: every `serve_blob*` Engine facade and both backends' `get_blob_range` contain no `open(`, `unwrap_dek`, `read_any` or `read_for_viewer` call (from-disk gate). | a relay that hands plaintext to a peer | #832, #821 |
+| I37 | `stream_chunks(stream_id)` lists a LIVE stream's chunks in `seq` order with each chunk's sha, recorded tier and plaintext size before any seal, together with the latest STH's `tree_size`, read in one transaction. | DVR/catch-up has no handle on an unsealed stream; a listing that disagrees with the STH it reports | #832 |
+| I38 | A chunk keeps the epoch it was sealed under: after a rotation the reader recovers each chunk's DEK from the CHUNK's own binding, and a viewer holding no grant on that chunk's epoch is refused `NotGranted` (AV-70 per chunk). | the manifest's epoch used for every chunk; a post-rotation joiner reads pre-join segments | #832 |
+| I39 | Every seal/open call site this cut adds carries `aad: Option<&[u8]>` down to `seal` / `open`, and until CIRISVerify#279 lands those two IGNORE it — pinned by a test, so #831 is a flip of two lines and not a hunt for surfaces. | a new door without the parameter; `seal` silently binding AAD before the primitive exists | #832, #831 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1536,6 +1544,13 @@ V139 sqlite header claimed the final-name rebuild shape while the DDL used
 `__v139` + RENAME; the header now says that shape is safe for THIS table and
 why it is not a template.
 
+**I32–I39 (#832)** are the chunked-content rows (§12). Two of them were
+confirmed RED on `170cc89` (v43.0.0) through doors that already existed: the
+commons half of I32 (`seal_stream` wrote a plaintext manifest over a chunk row
+the community cascade had sealed) and the commons half of I35
+(`read_any_for_viewer` refused every `chunk_dag` row). The rest exercise doors
+this cut adds, so their evidence is the mutation alone, recorded in §12.8.
+
 **C3 = Codex's third review, of `45bd9b4`**, five findings, all real. Two
 are the same root cause — a serialization boundary that existed on sqlite by
 accident of its single connection mutex and did not exist on postgres at
@@ -1547,7 +1562,271 @@ exposes the operation and not its policy or its report (C3-4, C3-5).
 
 ---
 
-## 12. Summary
+## 12. Chunked content under the envelope — LOCKED 2026-09-09 (#832)
+
+§10 sealed a **whole body** under one envelope; `FSD/V4_1_STREAMING_SUBSTRATE.md`
+made a body **many rows** — chunks under a `chunk_dag` manifest, appended live
+by `put_blob_chunk`, frozen by `seal_stream`, served by `get_blob_range`. The
+two documents never crossed, and the seam showed at the write door:
+`body_is_sealed(ChunkDag)` answered *Unverifiable* because the door saw only
+the manifest, and in an encrypted cohort cannot-verify is a refusal. Correct
+for that door, and it meant **community-scope video was unwritable** —
+chunking is what makes seek and range possible, and chunking is exactly what
+the encrypted door refused. On the read side `get_blob_range` over a sealed
+whole blob returned a ciphertext substring, which is not a plaintext range.
+
+This section is the crossing. Everything in §11 stands; §12 states how a DAG
+lives under the same tier column, the same doors, the same read order.
+
+### 12.1 The shape — each chunk is a whole blob
+
+**A chunk is sealed exactly as a whole blob is.** Each chunk is its own
+`AtRestEnvelope` (`CRBLOB` magic ‖ 12-byte nonce ‖ AES-256-GCM ciphertext+tag),
+a fresh random nonce per chunk, and its `federation_blobs` row is
+content-addressed by the SHA-256 of its **ciphertext**. Consequences, each
+deliberate:
+
+- **Transfer, dedup and the swarm's hash verifier are unchanged.** A relay
+  fetches `(manifest_sha, chunk_sha)`, verifies the chunk's sha over the bytes
+  it received, and stores what it cannot read. Chunks ship as opaque bytes
+  exactly like whole blobs (§10.6, the transfer model).
+- **Every chunk row records its tier.** The chunk write goes through the
+  storage floor with a `StorageFloor` token, so `cohort_scope` and
+  `crypto_tier` are written on the chunk row by the door that resolved them
+  (§11.1). That is what makes "is this DAG sealed?" **verifiable**: the seal
+  door asks the chunk ROWS, not the manifest's word (§12.3).
+- **The CEG §10.5.2 STREAM nonce is not used here.** `stream_seal.rs` (Cut C2,
+  the `prefix[7] ‖ counter_be[4] ‖ last_flag[1]` layout) remains the
+  consumer-side/interop format it was. The substrate's own seal is the
+  `CRBLOB` envelope with a random nonce because the epoch DEK is **shared by
+  every writer in the community** — a counter nonce is only safe with one
+  writer per `(key, prefix)`, and persist does not police writer count; a
+  96-bit random nonce at the `MAX_CHUNKS_PER_EPOCH = 2²⁴` cap has a collision
+  bound of ~2⁻⁴⁹ per epoch. One format for whole blobs and chunks also means
+  one `open`, one `AtRestEnvelope::from_bytes`, one overhead constant.
+
+### 12.2 The manifest — plaintext sizes, sealed under the same DEK
+
+The manifest lists the **ciphertext chunk shas** alongside **PLAINTEXT
+sizes**, so a plaintext byte range maps to a chunk set by prefix sum. It is a
+`ChunkManifest` at schema version **2**:
+
+```json
+{"chunk_tier":"community_dek","chunks":[{"sha":"<hex32 of CIPHERTEXT>","size":<plaintext u32>},…],"total_size":<plaintext u64>,"v":2}
+```
+
+- `v: 2` and `chunk_tier` appear **only for a sealed DAG**. A plaintext DAG —
+  the commons `seal_stream`, `put_blob_chunks`, or the scoped seal resolving
+  `Plaintext` — keeps emitting `v: 1` byte-for-byte as before, so every
+  build-manifest and commons-video address a consumer already holds is
+  unchanged.
+- **This is the MAJOR for manifest consumers.** A parser that rejects an
+  unknown `v` or an unknown key breaks on a v2 manifest; a consumer that
+  checks `sum(size) == Σ chunk row size_bytes` breaks, because a sealed
+  chunk's stored length is `size + 36`. `chunk_tier` is self-description for
+  the party that has opened the manifest; the door and the reader dispatch on
+  the ROW's `crypto_tier` column, never on it (I2).
+- **The manifest bytes are sealed under the same DEK as the chunks**, as an
+  inline `AtRestEnvelope`. The `chunk_dag` row therefore carries
+  `crypto_tier` like any other row (V139), is content-addressed by the sha of
+  the sealed manifest bytes, and its `size_bytes` is the **stored** (envelope)
+  length — the number `get_blob_range` bounds on — not the plaintext total,
+  which lives inside the manifest. For a v1 plaintext DAG `size_bytes` stays
+  `total_size`, as Cut B specified.
+- **At the storage layer a sealed manifest is opaque.** `get_blob` on a
+  `chunk_dag` row whose tier column is not `plaintext` returns
+  `BlobBody::Inline(envelope_bytes)` — a relay receives bytes it can forward
+  and cannot parse; `get_blob_range` serves a substring of those bytes, the
+  storage contract it has always had. Neither reads the tier from the bytes:
+  the dispatch is `(storage_kind, crypto_tier)`, both columns (I33).
+
+### 12.3 The write doors — and the seal door checks the rows
+
+Two doors, both free functions in `chunk_dag_cascade::orchestrate` shared by
+the Engine and the PyO3 surface, both resolving the tier from the DIRECTORY
+(`resolve_write_tier`, §11.2 (2)) and never from the caller:
+
+**`put_blob_chunk_scoped(cohort_scope, community_key_id, stream_id, seq,
+plaintext, epoch, media_type, aad)`** — screens the plaintext with the
+matcher once (I21), then per tier:
+
+| tier | what happens |
+|---|---|
+| `Plaintext` (commons, or an authorized infra community) | the bytes as given, through the chunk floor with a `Plaintext` token; `cohort_scope` recorded |
+| `InvisibleEncrypted` (`self` / `family`) | a **fresh per-chunk DEK**, `seal`, the envelope through the chunk floor, then persist's self-retention wrap and a v2 wrap to every active occurrence — the same grant rows a whole blob gets, keyed on the chunk's ciphertext sha |
+| `CommunityDek` | `ensure_epoch_dek` at the CURRENT epoch (idempotent past the first chunk), `seal`, the envelope through the chunk floor **with the epoch binding in the same transaction** — bind-if-still-current (I17), so a rotation racing the append refuses the whole append and the door re-seals under the new epoch; nothing is left behind, not even an index row |
+
+`epoch` is the producer's stream epoch label (the nonce-cap axis, V062) and is
+recorded on the index row as given; **which DEK sealed a community chunk is
+the chunk row's epoch binding**, a separate fact in a separate table. Two
+axes, two columns — the label is never read back as a key.
+
+**`seal_stream_scoped(signer, cohort_scope, community_key_id, stream_id,
+media_type, aad)`** — resolves the tier, lists the stream's rows through
+`stream_chunks`, and **refuses unless every chunk row's recorded tier is the
+DAG's tier** (and, for a community, every chunk's binding names the community
+being sealed). Only then does it build the manifest (v2 with plaintext sizes,
+or v1 for `Plaintext`), seal it under the DAG's DEK, and store the `chunk_dag`
+row through the manifest floor — with the epoch binding in-transaction for a
+community, with the self-retention and occurrence grants for `self`/`family`.
+The floor additionally refuses if the stream's chunk count changed between
+the listing and the write (a seal over a moving stream is refused, not
+truncated). A `Plaintext` or `CommunityDek` seal announces `holds_bytes` for
+the manifest sha under the signer's derived key, as `put_blob_scoped` does;
+`InvisibleEncrypted` announces nothing.
+
+**The commons `seal_stream` is a seal door too**, and I32 binds it: it now
+refuses a stream any of whose chunk rows is not at `plaintext`. Before #832 it
+wrote a public manifest over community-sealed rows the community cascade had
+stored (staged through `put_blob_chunk`'s `ON CONFLICT DO NOTHING`), which is
+the exact "self-contradicting DAG" the row-check exists to make unrepresentable.
+
+**The floor.** `put_blob_chunk_with_scope` and `seal_stream_with_scope` are
+storage-floor methods on `BlobStorage`: each takes a `StorageFloor` token, so
+they are unconstructible outside the crate (I22) and I14's from-disk gate
+lists them beside `store_blob_local` with `chunk_dag_cascade.rs` as the only
+permitted caller. The commons `put_blob_chunk` is the trait's own commons
+wrapper over the chunk floor with `cohort_scope::FEDERATION` as a literal. Each
+floor also refuses a self-contradicting row (I25): a sealed-tier token whose
+body does not parse as an envelope, or whose declared plaintext size is not
+`stored − 36`; a plaintext token whose declared size is not the body length.
+
+### 12.4 Reads — one door, authorize first, then per chunk
+
+**`read_any_for_viewer(sha, viewer, aad)`** keeps §11.3's order and gains the
+DAG arm: after the row-tier authorization it reads the row HEAD (`storage_kind`,
+`crypto_tier`, `size_bytes`); for a `chunk_dag` it opens the manifest (sealed
+tiers) or parses it (plaintext), and returns the **concatenated content** when
+`total_size ≤ DAG_WHOLE_READ_CAP_BYTES` (64 MiB). Above the cap it refuses
+with `InvalidArgument` naming the total, the cap and the range door — a video
+is read by range, never materialized whole by a facade a server calls in a
+request handler. The cap is a judgement recorded here: 64 chunks at the 1 MiB
+inline cap is the largest allocation the whole-read door will ever make.
+
+**`read_any_range_for_viewer(sha, viewer, start, end_inclusive, aad)`** is the
+door beside it — the decrypting range read the issue asked for. Order:
+
+1. row head; absent ⇒ `NotHeld`;
+2. **authorize by the row's tier, before touching any body** (§11.3, I4);
+3. bounds against the PLAINTEXT total: `start > end` ⇒ `InvalidArgument`,
+   `start ≥ total` ⇒ `RangeNotSatisfiable { range_start, size: total }`, `end`
+   clamped to `total − 1`;
+4. dispatch on `(storage_kind, crypto_tier)`: a plaintext inline row or DAG is
+   `get_blob_range`; a sealed inline row is opened whole and sliced (a whole
+   blob has no seek — that is what a DAG is for); a sealed DAG maps the range
+   to the covering chunk set by prefix sum and opens **only those chunks**, so
+   seek is O(segment);
+5. for each chunk it reads, the reader checks the CHUNK ROW: its recorded tier
+   must be the DAG's, its sha is re-verified over the stored bytes (CEG
+   §10.1.1), the DEK is recovered from the **chunk's own** binding (community)
+   or self-retention grant (`self`/`family`), and the opened length must equal
+   the manifest's size for that chunk.
+
+**Authorization is per epoch, not per manifest alone (I38).** A stream that
+crossed a rotation has chunks bound to epoch N and epoch N+1. The manifest
+binds to the epoch current at seal. A member who joined at N+1 holds a grant on
+the manifest and none on N; under AV-70's ratified forward-only rule they
+cannot read what was sealed before they arrived, and the read door says so —
+`NotGranted`, naming only sha and viewer — for a range that touches an
+epoch-N chunk. The check is memoized per `(community, epoch)` within one call,
+so it costs one grant lookup per distinct epoch in the range, not one per
+chunk. `self`/`family` chunks are authorized by the viewer's grant on each
+chunk row, which `rekey_for_newcomers` keeps aligned with the manifest's
+because it walks every blob a cohort holds grants on — chunk rows included,
+which is the correctness argument for per-chunk grants over a stream-level DEK.
+
+**The transfer path never decrypts (I36).** `serve_blob_to_peer`, the ranged
+serve #821 adds beside it, and both backends' `get_blob_range` contain no
+`open(` / `unwrap_dek` / `read_any` / `read_for_viewer` call — a from-disk gate
+in `blob_surface_gates.rs`, so a decrypt cannot be added to the relay path
+without turning a test red.
+
+### 12.5 `stream_chunks` — the handle a live stream has (#832 Q3, Q4)
+
+A blob is addressable only once immutable, because the address IS the content;
+that rule does not move. A growing stream is addressed by
+`(stream_id, tree_size)` on the STH plane, and each chunk by its own sha from
+the moment `put_blob_chunk*` returns. What was missing was the join:
+
+**`stream_chunks(stream_id) → StreamChunks { chunks: [(seq, chunk_sha,
+epoch, size_bytes, plaintext_size, crypto_tier, cohort_scope)], sth_tree_size }`**
+— the stream's chunks so far in `seq` order, each with the tier its row
+records and its plaintext size, plus the latest producer-signed STH's
+`tree_size`, read in ONE transaction so the listing and the STH it reports are
+the same snapshot. A DVR consumer reads the prefix `[0, tree_size)` as
+tamper-evident and the tail as best-effort; it then fetches each chunk by sha
+(`read_any_range_for_viewer` on a chunk sha, or the relay's `get_blob_range`
+for opaque transfer). Reachable from the Engine and from Python (I8).
+
+**Handoff (Q4): stream into persist as produced.** `put_blob_chunk_scoped`
+each segment as it is finalized — sealed at write under the epoch DEK the
+first chunk already needed — `put_stream_sth` as the tree grows,
+`seal_stream_scoped` at the end. Chunk rows are immutable and content-
+addressed, so persist is a correct place to buffer and there is no re-encode
+at seal: the seal writes a manifest over rows that already exist.
+
+### 12.6 Schema — V142
+
+`federation_stream_chunks.plaintext_size_bytes` (both dialects, `NOT NULL`,
+backfilled `= size_bytes` for every pre-V142 row, which were all plaintext).
+`size_bytes` keeps meaning the stored length; the manifest and `stream_chunks`
+report the plaintext length from this column, never from `stored − 36`
+arithmetic at read time (every preimage field is persisted). The chunk row's
+tier and cohort live on `federation_blobs` (V139) — one fact, one table.
+
+### 12.7 AAD per chunk lands with #831 — the hook points
+
+#831 (blocked on CIRISVerify#279, `aes_gcm::{encrypt_aad, decrypt_aad}`) binds
+a ciphertext to its referencing row through the GCM tag. For a DAG the binding
+the issue named is `(manifest sha, index)` per chunk, so a chunk lifted into
+another DAG does not open. This cut does **not** implement AAD — crypto routes
+through `ciris_crypto`, and the primitive is not there yet — but it threads the
+parameter through every new surface so #831 is a flip, not a hunt:
+
+| hook | today |
+|---|---|
+| `at_rest_cascade::seal(dek, plaintext, aad)` / `open(dek, envelope, aad)` | `aad` accepted and **ignored** — `// #831` — pinned by a test that `seal(Some(A))` opens under `None` and under `A'` |
+| `chunk_dag_cascade::orchestrate::put_blob_chunk_scoped(…, aad)` | passed to `seal` |
+| `chunk_dag_cascade::orchestrate::seal_stream_scoped(…, aad)` | passed to `seal` for the manifest |
+| `at_rest_cascade::orchestrate::read_any_for_viewer(…, aad)` and `read_any_range_for_viewer(…, aad)` | passed to `open` for the manifest and every chunk |
+| `Engine::{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as}` | `aad: Option<&[u8]>` |
+| `PyEngine.{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as}` | `aad_b64=None` |
+
+What #831 will do at those points: `seal`/`open` call the `_aad` primitives;
+`put_blob_scoped` and the whole-blob community cascade gain the parameter they
+do not carry today (their `None` sites are marked `// #831`); and a refusal
+of `Some(aad)` at a plaintext tier lands at the doors. Per-chunk AAD derived
+from `(manifest sha, index)` cannot be computed at chunk-write time — the
+manifest sha does not exist until seal — so #831's chunk binding is
+`(stream_id, seq)` at write with the manifest committing to both, or a re-seal
+at seal time; that decision is #831's and is not pre-empted here.
+
+### 12.8 What this cut does not do
+
+- No `External` chunks under an encrypted tier (the floor cannot see the
+  bytes; §10.8's cannot-verify-is-a-refusal stands for them).
+- No nested DAGs (Cut B's one-level rule).
+- No stream-level DEK for `self`/`family`: per-chunk fresh DEKs cost
+  O(chunks × occurrences) grant rows and buy per-blob semantics that every
+  existing grant walker (`rekey_for_newcomers`, `list_at_rest_blobs_for_recipients`,
+  `delete_blob`'s satellite removal) already gets right. Recorded as the
+  judgement; a stream DEK keyed off the manifest is a later optimization that
+  must not change any door.
+- `put_blob_chunks` (Cut B's atomic multi-row upload) stays commons-only; the
+  encrypted path is the live-append one, which is what video needs.
+
+**Mutation record (§11.10 discipline).** Each of I32–I39 was turned red by
+removing the logic it guards — the chunk-row tier check in both seal doors
+(I32), the `(storage_kind, crypto_tier)` dispatch in `get_blob` (I33), the
+authorization step and the prefix-sum boundary in the range read (I34), the
+cap (I35), a decrypt inserted into `serve_blob_to_peer` (I36), the STH join
+(I37), the per-epoch grant check (I38), and the `aad` parameter on a new door
+(I39) — and green again with the logic restored. The outcomes are in the
+CHANGELOG entry for this cut.
+
+---
+
+## 13. Summary
 
 CIRISPersist can encrypt the *content* of every substrate at rest —
 persist-managed, hardware-rooted, 100% backend-agnostic — while keeping
@@ -1571,4 +1850,11 @@ cascade, its real HKDF root, Tink keyset semantics with a destroy state,
 and the AV-70 amendment that a destroyed epoch's content must be
 re-sealed or evicted first. §3's boundary map for the other substrates
 is unchanged, and the attestation question stays open as JC-10.
+
+**§12 (added 2026-09-09, #832)** crosses the envelope with the streaming
+substrate: a chunk is a whole blob (its own `CRBLOB` envelope, addressed by
+ciphertext), the manifest carries plaintext sizes and is sealed under the same
+DEK, the seal door checks chunk ROWS, the range read decrypts per chunk with
+per-epoch authorization, the transfer path never decrypts, and `stream_chunks`
+is the live-stream handle. AAD per chunk waits on #831.
 

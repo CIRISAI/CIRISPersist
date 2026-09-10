@@ -27836,6 +27836,24 @@ mod tests {
             .await;
     }
 
+    /// §12.7 I32 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i32_commons_seal_refuses_a_sealed_chunk_row_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i32_commons_seal_refuses_a_sealed_chunk_row(&backend, "sqlite")
+            .await;
+    }
+
+    /// §12.7 I35 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i35_whole_read_of_a_dag_is_its_content_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i35_whole_read_of_a_dag_is_its_content(&backend, "sqlite")
+            .await;
+    }
+
     /// v43.0.0 (§10) — **the full cohort lifecycle on sqlite.**
     ///
     /// create -> encrypt -> decrypt -> ROTATE -> encrypt -> forward secrecy
