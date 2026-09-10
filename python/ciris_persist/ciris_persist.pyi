@@ -943,6 +943,9 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
+    def put_blob_chunk_scoped(self, cohort_scope: str, stream_id: str, seq: int, plaintext_b64: str, epoch: int, community_key_id: str | None = None, aad_b64: str | None = None) -> str:
+        """(derived) deontic — #832 (§12.3) — append one plaintext segment to a live stream at cohort_scope, sealed where the tier requires it. The chunk twin of put_blob_scoped:..."""
+
     def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
 
@@ -1039,11 +1042,14 @@ class Engine:
         only need the bool.
         """
 
-    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (§10) — read any blob as a viewer. The one read a server or agent needs."""
 
     def read_blob_for_community_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — read a community-encrypted blob as viewer_key_id."""
+
+    def read_blob_range_as(self, at_rest_sha256_hex: str, viewer_key_id: str, start: int, end_inclusive: int, aad_b64: str | None = None) -> str:
+        """(derived) deontic — #832 (BLOB_ENCRYPTION_AT_REST.md §12.4) — the decrypting range read. Plaintext bytes [start, end_inclusive] of any blob as viewer_key_id, base64-en..."""
 
     def register_federation_key(
         self,
@@ -1283,6 +1289,9 @@ class Engine:
         """Revoke a trust grant per FSD §3.4 (re-issuance with
         ``expires_at = now()``, rationale = ``"revocation"``). Returns
         a JSON-encoded ``TrustGrantReceipt`` for the revocation event."""
+
+    def seal_stream_scoped(self, cohort_scope: str, stream_id: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
+        """(derived) deontic — #832 (§12.3) — seal a live stream into a chunk_dag at cohort_scope. Refuses unless every chunk ROW is at the DAG's tier (I32); builds the manifest..."""
 
     def secrets_decapsulate(self, action_type: str, action_params_json: str, ctx_json: str) -> str:
         """(derived) deontic — Walk action_params_json, replacing every {SECRET:<uuid>:<description>} placeholder with the decrypted plaintext (when the action_type is in the sec... [build-conditional: #[cfg(feature = "secrets")]]"""
@@ -1752,6 +1761,9 @@ class Engine:
 
     def seal_stream(self, stream_id: str) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1a) — seal a live stream into a content-addressed chunk DAG. Walks the federation_stream_chunks index in seq order, wr..."""
+
+    def stream_chunks_json(self, stream_id: str) -> str:
+        """(derived) testimonial — #832 (§12.5, I37) — the live-stream handle for DVR / catch-up. The chunks of stream_id so far, in seq order, with the latest producer-signed STH's..."""
 
     def stream_consistency_proof(self, stream_id: str, from_size: int, to_size: int) -> str | None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — RFC 6962 §2.1.2 consistency proof between from_size and to_size, as a serialized ConsistencyProof JSON string. N..."""

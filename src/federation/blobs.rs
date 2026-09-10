@@ -171,21 +171,44 @@ pub struct ChunkRef {
 ///
 /// One-level DAG only (UnixFS flat-leaves; no nested DAGs). Each chunk
 /// is its own `federation_blobs` row (`Inline` or `External`).
+///
+/// # Version 2 — a SEALED DAG (#832, `BLOB_ENCRYPTION_AT_REST.md` §12.2)
+///
+/// ```json
+/// {"chunk_tier":"community_dek","chunks":[{"sha":"<hex32 of CIPHERTEXT>","size":<plaintext u32>},…],"total_size":<plaintext u64>,"v":2}
+/// ```
+///
+/// In a v2 manifest every `sha` addresses a chunk row storing an
+/// `AtRestEnvelope`, and every `size` is the chunk's **plaintext** length —
+/// the stored row is `size + AT_REST_ENVELOPE_OVERHEAD` bytes. A plaintext
+/// range maps to a chunk set by prefix sum over these sizes. `chunk_tier`
+/// is self-description for the party that has opened the manifest; the
+/// door and the reader dispatch on the ROW's `crypto_tier` column, never
+/// on this field (I2). A plaintext DAG stays `v: 1` byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkManifest {
-    /// Manifest schema version (currently `1`).
+    /// Manifest schema version: `1` (plaintext DAG) or `2` (sealed DAG).
     pub v: u32,
-    /// Total byte size of the reassembled blob. MUST equal the sum of
-    /// every [`ChunkRef::size`].
+    /// Total byte size of the reassembled blob (plaintext). MUST equal
+    /// the sum of every [`ChunkRef::size`].
     pub total_size: u64,
-    /// The ordered chunk list. Concatenating each chunk's bytes in
-    /// order reproduces the original blob.
+    /// The ordered chunk list. Concatenating each chunk's bytes (opened,
+    /// for a sealed DAG) in order reproduces the original blob.
     pub chunks: Vec<ChunkRef>,
+    /// #832 — `Some(tier)` iff `v == 2`: the tier every chunk row of this
+    /// DAG is sealed at. `None` for a v1 plaintext DAG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_tier: Option<crate::federation::types::cohort_scope::CryptoTier>,
 }
 
-/// v4.1 (CIRISPersist#142, Cut B) — current `ChunkManifest` schema
-/// version.
+/// v4.1 (CIRISPersist#142, Cut B) — the `ChunkManifest` schema version
+/// of a PLAINTEXT DAG. Unchanged by #832 so every commons manifest
+/// address a consumer already holds stays stable.
 pub const CHUNK_MANIFEST_VERSION: u32 = 1;
+
+/// #832 (§12.2) — the `ChunkManifest` schema version of a SEALED DAG:
+/// ciphertext chunk shas, plaintext sizes, a `chunk_tier` field.
+pub const CHUNK_MANIFEST_VERSION_SEALED: u32 = 2;
 
 /// v4.x (CIRISPersist#142, Cut C3b) — operational cap on chunks per
 /// `(stream_id, epoch)`: a **nonce-safety substrate constant** (CEG 0.15
@@ -222,8 +245,17 @@ impl ChunkManifest {
     /// stable.
     pub fn to_jcs_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Top-level keys, lexicographically: "chunks" < "total_size" < "v".
-        buf.extend_from_slice(b"{\"chunks\":[");
+        // Top-level keys, lexicographically:
+        //   "chunk_tier" < "chunks" < "total_size" < "v"
+        // ('_' 0x5F sorts before 's' 0x73). `chunk_tier` is present iff
+        // this is a sealed (v2) manifest.
+        buf.push(b'{');
+        if let Some(tier) = self.chunk_tier {
+            buf.extend_from_slice(b"\"chunk_tier\":\"");
+            buf.extend_from_slice(tier.as_str().as_bytes());
+            buf.extend_from_slice(b"\",");
+        }
+        buf.extend_from_slice(b"\"chunks\":[");
         for (i, c) in self.chunks.iter().enumerate() {
             if i > 0 {
                 buf.push(b',');
@@ -260,9 +292,42 @@ impl ChunkManifest {
             v: u32,
             total_size: u64,
             chunks: Vec<ChunkRefWire>,
+            #[serde(default)]
+            chunk_tier: Option<String>,
         }
         let wire: ManifestWire = serde_json::from_slice(bytes)
             .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
+        // #832 — the version and the tier field must agree: a v1 manifest
+        // carries no tier, a v2 manifest carries exactly one, and nothing
+        // above v2 is known to this build.
+        let chunk_tier = match (wire.v, wire.chunk_tier.as_deref()) {
+            (CHUNK_MANIFEST_VERSION, None) => None,
+            (CHUNK_MANIFEST_VERSION, Some(_)) => {
+                return Err(BlobError::Backend(
+                    "chunk_dag manifest v1 carries a chunk_tier field".into(),
+                ))
+            }
+            (CHUNK_MANIFEST_VERSION_SEALED, Some(t)) => Some(
+                crate::federation::types::cohort_scope::CryptoTier::parse_str(t).ok_or_else(
+                    || {
+                        BlobError::Backend(format!(
+                            "chunk_dag manifest v2 unknown chunk_tier {t:?}"
+                        ))
+                    },
+                )?,
+            ),
+            (CHUNK_MANIFEST_VERSION_SEALED, None) => {
+                return Err(BlobError::Backend(
+                    "chunk_dag manifest v2 carries no chunk_tier field".into(),
+                ))
+            }
+            (other, _) => {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest schema version {other} is not known to this build \
+                     (1 = plaintext DAG, 2 = sealed DAG)"
+                )))
+            }
+        };
         let mut chunks = Vec::with_capacity(wire.chunks.len());
         for c in wire.chunks {
             let raw = hex::decode(&c.sha).map_err(|e| {
@@ -282,7 +347,56 @@ impl ChunkManifest {
             v: wire.v,
             total_size: wire.total_size,
             chunks,
+            chunk_tier,
         })
+    }
+
+    /// #832 — `true` iff this manifest describes a sealed DAG (v2).
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.chunk_tier.is_some()
+    }
+
+    /// #832 (§12.4) — the chunk slices covering the inclusive PLAINTEXT
+    /// range `[start, end]` (already clamped to `[0, total_size - 1]`):
+    /// for each covering chunk, its index in `chunks` and the chunk-local
+    /// inclusive byte window. Pure prefix-sum arithmetic — the one place a
+    /// range becomes a chunk set, shared by the plaintext assembler and the
+    /// decrypting reader so both cut at the same boundaries.
+    #[must_use]
+    pub fn slices_for_range(&self, start: u64, end: u64) -> Vec<ChunkSlice> {
+        let mut out = Vec::new();
+        if start > end {
+            return out;
+        }
+        let mut chunk_start: u64 = 0;
+        for (index, cref) in self.chunks.iter().enumerate() {
+            let chunk_len = u64::from(cref.size);
+            if chunk_len == 0 {
+                continue;
+            }
+            let chunk_end = chunk_start + chunk_len - 1; // inclusive
+            if chunk_end < start {
+                chunk_start = chunk_end + 1;
+                continue;
+            }
+            if chunk_start > end {
+                break;
+            }
+            let local_start = start.saturating_sub(chunk_start);
+            let local_end_inclusive = if end >= chunk_end {
+                chunk_len - 1
+            } else {
+                end - chunk_start
+            };
+            out.push(ChunkSlice {
+                index,
+                local_start,
+                local_end_inclusive,
+            });
+            chunk_start = chunk_end + 1;
+        }
+        out
     }
 
     /// Validate internal consistency: `total_size` MUST equal the sum
@@ -409,6 +523,97 @@ pub enum BlobRange {
         /// Clamped inclusive range end the caller should fetch.
         range_end_inclusive: u64,
     },
+}
+
+/// #832 (§12.4) — one covering chunk of a plaintext range: which chunk,
+/// and the chunk-local inclusive byte window to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkSlice {
+    /// Index into [`ChunkManifest::chunks`].
+    pub index: usize,
+    /// First byte of the chunk's plaintext to keep.
+    pub local_start: u64,
+    /// Last byte (inclusive) of the chunk's plaintext to keep.
+    pub local_end_inclusive: u64,
+}
+
+/// #832 (§12.4) — a blob row's HEAD: the facts a read door dispatches on
+/// before it touches any body. Every field is a column; nothing here is
+/// derived from bytes (I2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobHead {
+    /// `storage_kind`: `inline` / `s3` / `external_url` / `chunk_dag`.
+    pub storage_kind: String,
+    /// The tier the write door RESOLVED and recorded (V139).
+    pub crypto_tier: crate::federation::types::cohort_scope::CryptoTier,
+    /// The cohort the write NAMED (V139, provenance).
+    pub cohort_scope: String,
+    /// The STORED length: an inline body's bytes, an envelope's bytes, a
+    /// v1 manifest's `total_size`, a sealed manifest's envelope length.
+    pub size_bytes: u64,
+}
+
+/// #832 (§12.5) — one chunk of a live or sealed stream, as
+/// [`BlobStorage::stream_chunks`] lists it: the index row joined to the
+/// chunk's blob row, so a consumer sees the tier the chunk was stored at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamChunkRef {
+    /// The producer's monotonic sequence number (the index).
+    pub seq: u64,
+    /// Content address of the chunk row (of the CIPHERTEXT for a sealed
+    /// chunk).
+    pub chunk_sha: [u8; 32],
+    /// The producer's stream epoch label as recorded (V062) — NOT the DEK
+    /// epoch, which is the chunk row's binding (§12.3).
+    pub epoch: u64,
+    /// The chunk row's stored length.
+    pub size_bytes: u64,
+    /// The chunk's content length (V142); `== size_bytes` when plaintext.
+    pub plaintext_size: u64,
+    /// The tier the chunk row records.
+    pub crypto_tier: crate::federation::types::cohort_scope::CryptoTier,
+    /// The cohort the chunk row records.
+    pub cohort_scope: String,
+}
+
+/// #832 (§12.5) — the live-stream handle: the chunks so far, in `seq`
+/// order, and the `tree_size` of the latest producer-signed STH, read in
+/// ONE transaction so the two are the same snapshot (I37).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StreamChunks {
+    /// Every index row for the stream, ascending `seq`.
+    pub chunks: Vec<StreamChunkRef>,
+    /// `tree_size` of the highest STH stored for the stream, if any: the
+    /// prefix `[0, tree_size)` of `chunks` is tamper-evident.
+    pub sth_tree_size: Option<u64>,
+}
+
+/// #832 (§12.3) — an epoch binding the chunk / manifest floor must write
+/// IN THE SAME TRANSACTION as the row, conditional on the epoch still
+/// being the community's current enabled one (I17). A refused bind rolls
+/// the whole append back — no row, no index entry, no orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochBinding {
+    /// The community whose DEK sealed the row.
+    pub community_key_id: String,
+    /// The epoch the row was sealed under.
+    pub epoch: u64,
+}
+
+/// #832 (§12.3) — the `chunk_dag` row a scoped seal asks the floor to
+/// write. The DOOR built it (v1 JCS or a sealed v2 envelope); the floor
+/// stores it, refusing if the stream grew since the door listed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestRowSpec {
+    /// SHA-256 over `body` — the DAG's content address.
+    pub sha256: [u8; 32],
+    /// The manifest bytes as stored: JCS for v1, an `AtRestEnvelope` for v2.
+    pub body: Vec<u8>,
+    /// The row's `size_bytes`: `total_size` for v1, `body.len()` for v2.
+    pub size_bytes: u64,
+    /// How many index rows the door listed; the floor refuses if the
+    /// stream now has a different count.
+    pub expected_chunk_count: u64,
 }
 
 impl BlobBody {
@@ -767,13 +972,100 @@ pub trait BlobStorage: Send + Sync {
     ///   [`put_blob`].
     /// - A [`BlobBody::ChunkDag`] body is rejected with
     ///   [`BlobError::InvalidArgument`] — you cannot chunk a chunk.
+    ///
+    /// #832 — this is the COMMONS form: the trait's own wrapper over
+    /// [`put_blob_chunk_with_scope`](Self::put_blob_chunk_with_scope) naming
+    /// `cohort_scope::FEDERATION` as a literal (§11.2 / I14). Backends do
+    /// not implement it; the floor is the door.
     fn put_blob_chunk(
         &self,
         stream_id: &str,
         seq: u64,
         body: BlobBody,
         epoch: u64,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send {
+        async move {
+            let plaintext_size = body.size_bytes();
+            self.put_blob_chunk_with_scope(
+                stream_id,
+                seq,
+                body,
+                epoch,
+                plaintext_size,
+                crate::federation::types::cohort_scope::FEDERATION,
+                StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                ),
+                None,
+            )
+            .await
+        }
+    }
+
+    /// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.3) — **the chunk floor.**
+    /// [`put_blob_chunk`](Self::put_blob_chunk) with the chunk row's
+    /// `cohort_scope` / `crypto_tier` recorded from the door's token, its
+    /// `plaintext_size` recorded on the index row (V142), and — for a
+    /// community — the epoch binding written in the SAME transaction,
+    /// conditional on the epoch still being current (I17): a refused bind
+    /// rolls back the blob row and the index row and returns
+    /// [`BlobError::EpochNotCurrent`], leaving nothing behind.
+    ///
+    /// The floor refuses a self-contradicting row (I25): a sealed-tier token
+    /// whose body does not parse as an `AtRestEnvelope` or whose
+    /// `plaintext_size` is not `stored − AT_REST_ENVELOPE_OVERHEAD`; a
+    /// plaintext token whose `plaintext_size` is not the body length.
+    ///
+    /// Requires a [`StorageFloor`] — unconstructible outside the crate
+    /// (I22); in-crate, only the chunk cascade may call it (I14).
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_chunk_with_scope(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        body: BlobBody,
+        epoch: u64,
+        plaintext_size: u64,
+        cohort_scope: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
+    /// #832 (§12.3) — **the manifest floor.** Store the `chunk_dag` row the
+    /// scoped seal door built (`spec.body` is v1 JCS or a v2 envelope), with
+    /// `cohort_scope` / `crypto_tier` from the token, stamp `sealed_at` on
+    /// the stream's index rows, and — for a community — write the epoch
+    /// binding in the same transaction, conditional on the epoch (I17).
+    /// Refuses with [`BlobError::InvalidArgument`] if the stream's index-row
+    /// count differs from `spec.expected_chunk_count`: a seal over a stream
+    /// that moved is refused, not truncated.
+    fn seal_stream_with_scope(
+        &self,
+        stream_id: &str,
+        spec: ManifestRowSpec,
+        media_type: Option<&str>,
+        cohort_scope: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #832 (§12.5, I37) — **the live-stream handle.** Every index row for
+    /// `stream_id` in `seq` order, each joined to its chunk row's recorded
+    /// tier and cohort, together with the latest STH's `tree_size` — read
+    /// in one transaction so the listing and the STH it reports agree. An
+    /// unknown stream is an empty listing, not an error.
+    fn stream_chunks(
+        &self,
+        stream_id: &str,
+    ) -> impl Future<Output = Result<StreamChunks, BlobError>> + Send;
+
+    /// #832 (§12.4) — the row HEAD a read door dispatches on:
+    /// `(storage_kind, crypto_tier, cohort_scope, size_bytes)`, or `None`
+    /// if absent. Columns only; nothing sniffs bytes (I2).
+    fn blob_head(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<BlobHead>, BlobError>> + Send;
 
     /// v4.1 (CIRISPersist#142, Cut C1a) — **seal** a live stream into a
     /// content-addressed [`BlobBody::ChunkDag`] (CEG §10.5.1).
@@ -2856,10 +3148,17 @@ pub(crate) struct PreparedBlobRow {
 /// range. There is no manifest here — a live chunk is one
 /// content-addressed blob row; the stream index row is bound by the
 /// backend alongside it in the same txn.
+///
+/// #832 (§12.3) — `floor` and `plaintext_size` are checked against the
+/// body (I25): a sealed-tier token needs a body that parses as an
+/// `AtRestEnvelope` whose plaintext length is `plaintext_size`; a plaintext
+/// token needs `plaintext_size == body.len()`.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn prepare_stream_chunk_row(
     body: &BlobBody,
     inline_bytes_cap: usize,
+    floor: StorageFloor,
+    plaintext_size: u64,
 ) -> Result<PreparedBlobRow, BlobError> {
     use sha2::{Digest, Sha256};
 
@@ -2871,6 +3170,7 @@ pub(crate) fn prepare_stream_chunk_row(
                     cap: inline_bytes_cap,
                 });
             }
+            check_chunk_body_against_floor(bytes, floor, plaintext_size)?;
             // Hash-on-write: the chunk's content address is computed from
             // its bytes (this IS the SHA returned to the caller + the PK).
             let sha: [u8; 32] = Sha256::digest(bytes).into();
@@ -2901,18 +3201,69 @@ pub(crate) fn prepare_stream_chunk_row(
     })
 }
 
+/// #832 (§12.3 / I25) — the chunk floor's self-contradiction check: the
+/// body must be what the token says it is, and `plaintext_size` must be
+/// the length the body actually carries.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn check_chunk_body_against_floor(
+    bytes: &[u8],
+    floor: StorageFloor,
+    plaintext_size: u64,
+) -> Result<(), BlobError> {
+    use crate::federation::at_rest_cascade::{sealed_plaintext_len, AtRestEnvelope};
+    use crate::federation::types::cohort_scope::CryptoTier;
+    let stored = bytes.len() as u64;
+    match floor.tier() {
+        CryptoTier::Plaintext => {
+            if plaintext_size != stored {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk floor: a plaintext chunk of {stored} bytes declared plaintext_size \
+                     {plaintext_size} (BLOB_ENCRYPTION_AT_REST.md §12.3)"
+                )));
+            }
+        }
+        CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => {
+            AtRestEnvelope::from_bytes(bytes).map_err(|e| {
+                BlobError::InvalidArgument(format!(
+                    "chunk floor: a {:?}-tier chunk body is not an at-rest envelope ({e}) — \
+                     the floor refuses to record a sealed tier over bytes that are not sealed \
+                     (BLOB_ENCRYPTION_AT_REST.md §12.3)",
+                    floor.tier()
+                ))
+            })?;
+            if sealed_plaintext_len(stored) != Some(plaintext_size) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk floor: a sealed chunk of {stored} stored bytes declared plaintext_size \
+                     {plaintext_size}; the envelope carries {:?} (BLOB_ENCRYPTION_AT_REST.md §12.3)",
+                    sealed_plaintext_len(stored)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// v4.1 (CIRISPersist#142, Cut C1a) — from the seq-ordered
-/// `(chunk_sha, size_bytes)` rows read out of `federation_stream_chunks`,
-/// build the sealed [`ChunkManifest`] + the prepared `chunk_dag`
-/// manifest [`PreparedBlobRow`] (its SHA-256 = the sealed stream's
-/// content address). Does NOT touch the chunk rows — they already exist.
+/// `(chunk_sha, size_bytes, crypto_tier)` rows read out of
+/// `federation_stream_chunks` joined to `federation_blobs`, build the
+/// sealed [`ChunkManifest`] + the prepared `chunk_dag` manifest
+/// [`PreparedBlobRow`] (its SHA-256 = the sealed stream's content
+/// address). Does NOT touch the chunk rows — they already exist.
 ///
 /// Empty input → [`BlobError::InvalidArgument`] (`stream_id` carried by
 /// the caller for the message). `total_size` is Σ `size_bytes`.
+///
+/// #832 (§12.3 / I32) — this is the COMMONS seal: it writes a `plaintext`
+/// manifest, so it **refuses a chunk row at any other tier**. Before #832 it
+/// wrote a public manifest over community-sealed rows.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn prepare_sealed_manifest_row(
     stream_id: &str,
-    chunk_rows: &[([u8; 32], i64)],
+    chunk_rows: &[(
+        [u8; 32],
+        i64,
+        crate::federation::types::cohort_scope::CryptoTier,
+    )],
     inline_bytes_cap: usize,
 ) -> Result<(ChunkManifest, PreparedBlobRow), BlobError> {
     use sha2::{Digest, Sha256};
@@ -2924,7 +3275,16 @@ pub(crate) fn prepare_sealed_manifest_row(
     }
     let mut total_size: u64 = 0;
     let mut chunks = Vec::with_capacity(chunk_rows.len());
-    for (sha, size_i64) in chunk_rows {
+    for (sha, size_i64, tier) in chunk_rows {
+        if *tier != crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+            return Err(BlobError::InvalidArgument(format!(
+                "seal_stream: stream {stream_id} chunk {} is recorded at tier {tier:?}; the \
+                 commons seal writes a plaintext manifest and refuses to write one over a \
+                 sealed chunk row — seal an encrypted stream through seal_stream_scoped \
+                 (BLOB_ENCRYPTION_AT_REST.md §12.3, I32)",
+                hex::encode(sha)
+            )));
+        }
         let size = u32::try_from(*size_i64).map_err(|_| {
             BlobError::InvalidArgument(format!(
                 "seal_stream: chunk size {size_i64} does not fit u32 (one-chunk cap)"
@@ -2939,6 +3299,7 @@ pub(crate) fn prepare_sealed_manifest_row(
         v: CHUNK_MANIFEST_VERSION,
         total_size,
         chunks,
+        chunk_tier: None,
     };
     let manifest_bytes = manifest.to_jcs_bytes();
     if manifest_bytes.len() > inline_bytes_cap {
@@ -3542,6 +3903,7 @@ mod tests {
         let c0 = sha_of(b"chunk-zero");
         let c1 = sha_of(b"chunk-one");
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 19,
             chunks: vec![
@@ -3562,6 +3924,163 @@ mod tests {
         assert!(!s.chars().any(|ch| ch.is_ascii_uppercase()));
     }
 
+    /// #832 (§12.2) — a SEALED manifest is v2, carries `chunk_tier` first
+    /// (lexicographically before `chunks`), and its sizes are plaintext
+    /// sizes; a plaintext manifest is byte-identical to before.
+    #[test]
+    fn chunk_manifest_v2_jcs_is_canonical_and_v1_is_unchanged() {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let c0 = sha_of(b"sealed-zero");
+        let sealed = ChunkManifest {
+            v: CHUNK_MANIFEST_VERSION_SEALED,
+            total_size: 10,
+            chunks: vec![ChunkRef { sha: c0, size: 10 }],
+            chunk_tier: Some(CryptoTier::CommunityDek),
+        };
+        let s = String::from_utf8(sealed.to_jcs_bytes()).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                "{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{}\",\"size\":10}}],\"total_size\":10,\"v\":2}}",
+                hex::encode(c0)
+            )
+        );
+        assert!(sealed.is_sealed());
+        let plain = ChunkManifest {
+            chunk_tier: None,
+            v: CHUNK_MANIFEST_VERSION,
+            ..sealed.clone()
+        };
+        assert!(!plain.is_sealed());
+        assert!(!String::from_utf8(plain.to_jcs_bytes())
+            .unwrap()
+            .contains("chunk_tier"));
+    }
+
+    /// #832 (§12.2) — the parser accepts v1 and v2 and refuses a manifest
+    /// whose version and `chunk_tier` disagree, or a version it does not know.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn chunk_manifest_v2_round_trips_and_version_tier_must_agree() {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let c0 = sha_of(b"z");
+        let sealed = ChunkManifest {
+            v: CHUNK_MANIFEST_VERSION_SEALED,
+            total_size: 3,
+            chunks: vec![ChunkRef { sha: c0, size: 3 }],
+            chunk_tier: Some(CryptoTier::InvisibleEncrypted),
+        };
+        assert_eq!(
+            ChunkManifest::from_manifest_bytes(&sealed.to_jcs_bytes()).unwrap(),
+            sealed
+        );
+        let hex0 = hex::encode(c0);
+        for bad in [
+            // v1 with a tier
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":1}}"),
+            // v2 without a tier
+            format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            // v2 with an unknown tier
+            format!("{{\"chunk_tier\":\"rot13\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            // an unknown version
+            format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":3}}"),
+        ] {
+            assert!(
+                ChunkManifest::from_manifest_bytes(bad.as_bytes()).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    /// #832 (§12.4) — the range → chunk-set map, at every boundary shape.
+    #[test]
+    fn slices_for_range_cuts_at_chunk_boundaries() {
+        let m = ChunkManifest {
+            v: 1,
+            total_size: 10,
+            chunks: vec![
+                ChunkRef {
+                    sha: [1; 32],
+                    size: 4,
+                }, // bytes 0..=3
+                ChunkRef {
+                    sha: [2; 32],
+                    size: 0,
+                }, // empty, skipped
+                ChunkRef {
+                    sha: [3; 32],
+                    size: 3,
+                }, // bytes 4..=6
+                ChunkRef {
+                    sha: [4; 32],
+                    size: 3,
+                }, // bytes 7..=9
+            ],
+            chunk_tier: None,
+        };
+        let s = |a, b| m.slices_for_range(a, b);
+        assert_eq!(
+            s(0, 9),
+            vec![
+                ChunkSlice {
+                    index: 0,
+                    local_start: 0,
+                    local_end_inclusive: 3
+                },
+                ChunkSlice {
+                    index: 2,
+                    local_start: 0,
+                    local_end_inclusive: 2
+                },
+                ChunkSlice {
+                    index: 3,
+                    local_start: 0,
+                    local_end_inclusive: 2
+                },
+            ]
+        );
+        assert_eq!(
+            s(3, 4),
+            vec![
+                ChunkSlice {
+                    index: 0,
+                    local_start: 3,
+                    local_end_inclusive: 3
+                },
+                ChunkSlice {
+                    index: 2,
+                    local_start: 0,
+                    local_end_inclusive: 0
+                },
+            ]
+        );
+        assert_eq!(
+            s(5, 5),
+            vec![ChunkSlice {
+                index: 2,
+                local_start: 1,
+                local_end_inclusive: 1
+            }]
+        );
+        assert_eq!(
+            s(7, 9),
+            vec![ChunkSlice {
+                index: 3,
+                local_start: 0,
+                local_end_inclusive: 2
+            }]
+        );
+        assert!(s(5, 4).is_empty());
+        // Total bytes covered always equal the range length.
+        for (a, b) in [(0u64, 9u64), (1, 8), (4, 6), (6, 7), (0, 0), (9, 9)] {
+            let covered: u64 = s(a, b)
+                .iter()
+                .map(|c| c.local_end_inclusive - c.local_start + 1)
+                .sum();
+            assert_eq!(covered, b - a + 1, "range {a}..={b}");
+        }
+    }
+
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
     #[serial_test::serial(postgres)]
@@ -3569,6 +4088,7 @@ mod tests {
         let c0 = sha_of(b"a");
         let c1 = sha_of(b"bb");
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 3,
             chunks: vec![ChunkRef { sha: c0, size: 1 }, ChunkRef { sha: c1, size: 2 }],
@@ -3581,6 +4101,7 @@ mod tests {
     #[test]
     fn chunk_manifest_validate_total_size() {
         let m_ok = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 5,
             chunks: vec![
@@ -3612,6 +4133,7 @@ mod tests {
         let real = sha_of(b"real");
         let fake = [0xAB; 32];
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 4,
             chunks: vec![ChunkRef { sha: fake, size: 4 }],
@@ -3630,6 +4152,7 @@ mod tests {
     fn prepare_chunk_rows_rejects_total_size_mismatch() {
         let c = sha_of(b"abcd");
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 99, // wrong
             chunks: vec![ChunkRef { sha: c, size: 4 }],
@@ -3645,6 +4168,7 @@ mod tests {
     fn prepare_chunk_rows_manifest_row_is_last_and_chunk_dag() {
         let c = sha_of(b"xyz");
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 3,
             chunks: vec![ChunkRef { sha: c, size: 3 }],
@@ -3686,6 +4210,7 @@ mod tests {
         );
         // v4.1 (Cut B) — chunk_dag storage_kind + size_bytes = total_size.
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 42,
             chunks: vec![ChunkRef {

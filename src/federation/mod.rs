@@ -54,6 +54,10 @@ pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
+// CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
+// content under the envelope: the per-chunk seal, the sealed manifest, the
+// decrypting range read and the live-stream chunk listing.
+pub mod chunk_dag_cascade;
 pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
@@ -300,10 +304,7 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobEpochBinding,
-    BlobError, BlobRange, BlobStorage, ChunkManifest, ChunkRef, DekKeyState, EvictActorReport,
-    ExternalRef, GroupDekRef, PutBlobAttestation, PutBlobScopedResult, ScopeBlobSymbol,
-    StorageFloor, CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP,
+    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport, ExternalRef, GroupDekRef, ManifestRowSpec, PutBlobAttestation, PutBlobScopedResult, ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};

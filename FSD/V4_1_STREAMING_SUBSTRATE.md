@@ -213,6 +213,21 @@ Cuts A and B are immediately shippable (pure additive, no upstream dependency). 
 
 ---
 
+## 8.1 Encryption at rest — crossed with `BLOB_ENCRYPTION_AT_REST.md` §12 (#832)
+
+This document's §5 sealing posture (per-segment AES-256-GCM, STREAM nonce) is
+the CEG §10.5.2 interop format; the SUBSTRATE's own at-rest seal for a chunk
+DAG is specified in `FSD/BLOB_ENCRYPTION_AT_REST.md` §12 and differs on
+purpose: each chunk is its own `CRBLOB` `AtRestEnvelope` with a random nonce
+(the epoch DEK is shared by every writer in a community, so a counter nonce is
+not safe for the substrate to mint), content-addressed by its ciphertext; the
+manifest is `ChunkManifest` **v2** — ciphertext shas, PLAINTEXT sizes,
+`chunk_tier` — sealed under the same DEK; the seal door checks the chunk ROWS'
+recorded tier; the decrypting range read is `read_blob_range_as` beside
+`read_blob_as`, while `get_blob_range` keeps serving stored bytes to relays;
+and `stream_chunks` is the live-stream handle (§4.3's "read before seal"
+question, answered). Cut B's v1 manifest is unchanged for plaintext DAGs.
+
 ## 9. Cross-references
 
 - **CEG 0.10** `CIRISRegistry/FSD/CEG/10_endpoints.md` §10.5 (.0 framing, .1 per-stream STH V1, .2 STREAM nonce V2, .3 epoch cascade D2/D3 + PQC wrap, .4 delivery receipts V3); §7.9 reserved prefix; §0.9 JCS; §10.1.1 full-SHA MUST; §10.3 SignedTreeHead reuse.
