@@ -334,6 +334,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // terms and decides nothing about the row. sqlite's boundary is the
     // connection mutex, taken before any of these doors run.
     ("lock_community_tx", Class::Plumbing),
+    // v44 (#832 on the #829 read pool) — `stream_chunks` reads its listing and
+    // the STH in one deferred transaction on a READ-ONLY connection;
+    // `unchecked_transaction` is the driver's `&Connection` form of BEGIN.
+    ("unchecked_transaction", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

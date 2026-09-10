@@ -1568,7 +1568,7 @@ pub mod orchestrate {
         //    WRITE DOOR RESOLVED and recorded — never re-derived here from
         //    the scope, which would drop the directory axis (the infra
         //    carve-out) the door applied (I15).
-        
+
         // 1. The ROW says what this is. (§11.1) The tier is the one the
         //    WRITE DOOR RESOLVED and recorded — never re-derived here from
         //    the scope, which would drop the directory axis (the infra
@@ -3600,7 +3600,7 @@ pub mod blob_invariants {
 
         // The removed member holds the e0 grant and is NOT on the roster:
         // authorized by the grant leg alone.
-        let bob_res = read_any_for_viewer(backend, &at_rest, &bob_occ).await;
+        let bob_res = read_any_for_viewer(backend, &at_rest, &bob_occ, None).await;
         match &bob_res {
             Err(BlobError::Evicted {
                 community_key_id,
@@ -3652,7 +3652,7 @@ pub mod blob_invariants {
         );
 
         // A current member: authorized by the roster leg.
-        let alice_res = read_any_for_viewer(backend, &at_rest, &alice_occ).await;
+        let alice_res = read_any_for_viewer(backend, &at_rest, &alice_occ, None).await;
         match &alice_res {
             Err(BlobError::Evicted {
                 community_key_id,
@@ -3671,7 +3671,7 @@ pub mod blob_invariants {
 
         // A stranger: refused, and the refusal names neither community nor
         // epoch (I4b) — the same class a stranger gets on a live blob.
-        let err = read_any_for_viewer(backend, &at_rest, &stranger)
+        let err = read_any_for_viewer(backend, &at_rest, &stranger, None)
             .await
             .expect_err("a stranger must be refused");
         assert!(
@@ -3708,7 +3708,7 @@ pub mod blob_invariants {
 
         // The removed member, now that destroy erased the e0 grant: not a
         // grantee, not on the roster ⇒ NotGranted.
-        let err = read_any_for_viewer(backend, &at_rest, &bob_occ)
+        let err = read_any_for_viewer(backend, &at_rest, &bob_occ, None)
             .await
             .expect_err("a removed member with no surviving grant must be refused");
         assert!(
@@ -3720,7 +3720,7 @@ pub mod blob_invariants {
         // A sha that was never ours: NotHeld, to a member and to a stranger.
         let random = sha(format!("{tag}-never-ours-{run}").as_bytes());
         for viewer in [&alice_occ, &stranger] {
-            let err = read_any_for_viewer(backend, &random, viewer)
+            let err = read_any_for_viewer(backend, &random, viewer, None)
                 .await
                 .expect_err("an unknown sha must be refused");
             assert!(

@@ -458,7 +458,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_aggregated_tier", ConnClass::Write),
     ("put_at_rest_grant", ConnClass::Write),
     ("put_attestation_with_origin", ConnClass::Write),
-    ("put_blob_chunk", ConnClass::Write),
+    ("put_blob_chunk_with_scope", ConnClass::Write),
+    ("seal_stream_with_scope", ConnClass::Write),
+    ("blob_head", ConnClass::Read),
+    ("stream_chunks", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
@@ -707,7 +710,13 @@ mod gate {
         ".execute(",
         ".transaction(",
         "execute_batch(",
-        "unchecked_transaction(",
+        // NOT `unchecked_transaction(`: it is the `&Connection` form of
+        // BEGIN, and on the reader path the connection is
+        // `SQLITE_OPEN_READ_ONLY`, so it can only ever open a READ
+        // transaction — the one way a Read fn takes two statements from the
+        // same snapshot (I37: `stream_chunks` lists the chunks and the STH
+        // together). `.transaction(` needs `&mut Connection` and so cannot
+        // occur on the reader path at all.
         "BEGIN",
         "COMMIT",
     ];
