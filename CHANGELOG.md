@@ -113,7 +113,37 @@ chunks by position. The mutation record is below.
 
 ### Mutation record
 
-(filled in below, one runner at a time, every restore `cmp`-verified)
+Twenty-two mutations, each applied to one file, the named witnesses run on
+ONE backend in the foreground, the file restored from a byte snapshot of
+`HEAD` and the restore `cmp`-verified; 20 KILLED, 2 SURVIVED and recorded.
+Two of the kills were first obtained by breakage (a no-op `UPDATE` that
+dropped a bound parameter on sqlite, an untyped `$2` on postgres) and were
+re-run with valid SQL so the kill is the guard's logic, not a syntax error.
+
+| # | file | mutation | witness | verdict |
+|---|---|---|---|---|
+| M1 | sqlite floor | drop the cohort/community comparison | I41 | KILLED — "another community appended to the stream: Ok(…)" |
+| M2 | sqlite floor | accept a foreign keyed writer (`(Some(_), Some(_)) => {}`) | I41, I41-legacy | KILLED — "a second writer appended … Ok(…)"; "an adopted legacy stream is owned: Ok(…)" |
+| M3b | sqlite floor | never adopt (a valid no-op `UPDATE`) | I41, I41-legacy | KILLED — "adopted" |
+| M18 | sqlite floor | drop `AND owner_key_id IS NULL` from the adoption `UPDATE` | I41, I41-legacy | **SURVIVED** — the predicate is the RACE guard between two adopters; a serial witness cannot observe it (the I27 class: a boundary only occupancy can measure). Recorded, not dressed up. |
+| M8 | sqlite `seal_stream` | drop the stream-row cohort check | I41 | KILLED — "the commons seal wrote a federation manifest over a community-cohort stream (all-plaintext, so I32 could not refuse it)" |
+| M17 | sqlite `stream_chunk_at` | always `None` | I42 | KILLED — "has no chunk at seq 0" |
+| M6 | postgres floor | drop the cohort/community comparison | I41 (pg) | KILLED |
+| M7 | postgres floor | accept a foreign keyed writer | I41, I41-legacy (pg) | KILLED |
+| M19 | postgres `seal_stream` | drop the stream-row cohort check | I41 (pg) | KILLED |
+| M3pg2 | postgres floor | never adopt (valid no-op `UPDATE`) | I41, I41-legacy (pg) | KILLED — "adopted" |
+| M4 | seal door | drop the owner check | I41 | KILLED — "a non-owner sealed the stream: Ok(…)" |
+| M5 | seal door | drop the stream-row cohort/community check | I41 | KILLED — by the `"belongs to"` discriminator: I32's chunk-row check refused the same call with "is bound to", which is the neighbouring-gate shape §11.10 warns about |
+| M9 | `chunk_aad` | omit `seq` | byte pin, I42 | KILLED — "a chunk moved to another index OPENED (100 bytes)" |
+| M10 | `chunk_aad` | omit `stream_id` | byte pin, I42 | KILLED — "a chunk lifted into a second stream's DAG OPENED there" (the swap leg passed; only the lift leg caught it) |
+| M11 | door + both readers | the three `chunk_aad(aad, stream_id, seq)` sites replaced by the caller's data (the binding removed end to end; every honest read still opens) | I42, I37, I38 | KILLED — I42 only, as designed: "a chunk moved to another index OPENED" |
+| M14 | `read_stream_chunk_as` | drop the authorize-first step | I42, I37, I38 | **SURVIVED** — the per-chunk grant check inside `open_stream_chunk_row_for_viewer` refuses the same stranger `NotGranted` (the I34 class: right outcome, neighbouring mechanism). The ORDERING property (refuse before parsing the body) is unobservable through a door: I25 refuses staging a sealed-tier row with unparseable bytes into a stream. The step stays as §11.3's doctrine; recorded. |
+| M15 | `read_stream_chunk_as` | drop the plaintext-tier AAD refusal | I42 | KILLED — "associated data at a plaintext position is refused, not dropped" |
+| M16 | seal door | build a sealed manifest without positions | I42, I34, I34b | KILLED — the parser refuses "v2 chunk carries no seq" |
+| M20 | DAG reader | rebuild the AAD from the list index, not the manifest's `seq` | I42, I34, I38 | KILLED — only the sparse-seq (5, 7) leg: GCM tag mismatch |
+| M12 | parser | drop the strictly-increasing check | manifest unit | KILLED |
+| M13 | parser | accept v2 without `stream_id` | manifest unit | KILLED — by the every-chunk-positioned-but-no-stream_id case (the per-chunk seq check alone would have let it survive) |
+| M21 | parser | accept v1 with a `seq` | manifest unit | KILLED |
 
 ## [44.0.0] - 2026-09-10
 

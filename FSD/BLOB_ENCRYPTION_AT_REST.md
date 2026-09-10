@@ -1665,6 +1665,16 @@ the community cascade had sealed) and the commons half of I35
 (`read_any_for_viewer` refused every `chunk_dag` row). The rest exercise doors
 this cut adds, so their evidence is the mutation alone, recorded in §12.8.
 
+**I41–I42 (#837, #838)** were written first in a PROBE form against the
+v44.0.0 surface — the chunk door had no writer parameter, so I41's foreign
+append was a second community, a second cohort and the commons door on one
+id, and I42's swapped manifest carried no positions — and confirmed RED on
+`8d5e860` on sqlite and postgres (I41: the second community's append
+returned `Ok`; I42: "a chunk moved to another index OPENED (100 bytes)").
+The final forms use two node signers and a positioned swapped manifest; the
+legacy backfill has its own per-backend witness on an empty database seeded
+through V142. §12.10 carries the mutation summary.
+
 **C3 = Codex's third review, of `45bd9b4`**, five findings, all real. Two
 are the same root cause — a serialization boundary that existed on sqlite by
 accident of its single connection mutex and did not exist on postgres at
@@ -2072,7 +2082,17 @@ Reachable from the Engine and Python (I8). The hand-assembly answer to Edge's
 Q3 is "don't", and now the AAD enforces it: the manifest stays the contract,
 and a chunk read outside it fails.
 
-**Mutation record.** In the CHANGELOG entry for this cut.
+**Mutation record (§11.10 discipline).** Twenty-two mutations over the
+floor (both backends), the doors, the AAD function and the parser — 20
+KILLED, 2 SURVIVED and recorded: the adoption `UPDATE`'s `IS NULL` predicate
+(a race guard a serial witness cannot see) and the by-position door's
+authorize-first step (shadowed by the per-chunk grant check behind it; the
+ordering is unobservable through a door because I25 refuses the staging).
+Three kills needed a discriminator written first — the seal's stream-row
+refusal asserted by its text ahead of I32's, a sparse-seq stream for a
+reader that would use the list index, a positioned-but-unnamed manifest for
+a parser that would lean on the per-chunk check. The table is in the
+CHANGELOG entry for this cut.
 
 ---
 
