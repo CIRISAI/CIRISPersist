@@ -289,7 +289,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // here). Plumbing is the fail-open direction, and the reason it is safe
     // here is that an absent row is not treated as permission: the caller
     // distinguishes Some/None explicitly and mints only in the None arm.
-    ("read_content_master_row", Class::Plumbing),
     // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.5) — `parse_str`, covering both
     // `DekKeyState::parse_str` (postgres community-DEK key state) and the
     // `uuid::Uuid::parse_str` row-mapping in other doors. PLUMBING: the value
@@ -450,6 +449,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("query_one", Class::Plumbing),
     ("query_opt", Class::Plumbing),
     ("query_row", Class::Plumbing),
+    // CIRISPersist#829 — the sqlite doors (`SqliteBackend::read` / `::write`).
+    // Plumbing: each dispatches a closure onto a connection and returns what
+    // the closure returned; the closure's own propagated calls are scanned
+    // exactly as before, so nothing a door wraps goes dark.
+    ("read", Class::Plumbing),
+    ("write", Class::Plumbing),
     ("recompute_and_assert_root", Class::Gate),
     ("record_hard_case", Class::Delegates),
     ("references_attestation_id_from_envelope", Class::Plumbing),
@@ -465,8 +470,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("self_key_id", Class::Plumbing),
     ("serialize_signature", Class::Plumbing),
     ("serialize_witness_signatures", Class::Plumbing),
-    ("spawn_blocking", Class::Plumbing),
-    ("sqlite_load_stream_chunk_hashes", Class::Delegates),
     // v36.0.0 (CIRISPersist#707/#668) — the sqlite allocator spellings.
     // Plumbing, same rationale as `next_key_admission_position` above.
     ("sqlite_next_key_serve_position", Class::Plumbing),
