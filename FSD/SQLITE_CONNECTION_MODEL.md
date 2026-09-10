@@ -201,9 +201,10 @@ A reader connection with no open transaction starts a fresh WAL snapshot
 on every statement, and that snapshot includes every frame the writer has
 committed. So `put_x().await` followed by `get_x().await` on the same
 backend sees the row, on any reader. Read closures never leave a
-transaction open — the pool asserts `!conn.is_autocommit()` is false on
-return in debug builds, because a reader holding a snapshot is also a
+transaction open — the pool guard `debug_assert!`s `is_autocommit()` when
+a reader is returned, because a reader holding a snapshot is also a
 reader pinning the WAL against checkpoint (the #768 liveness note).
+Witnessed by I7 (twenty write-then-read rounds, every read on a reader).
 
 ## 4. The in-memory case
 
@@ -245,6 +246,20 @@ with one of:
 | `Write` | uses `self.write(…)` (may also `self.read(…)` for a pre-check that need not be atomic with the write) | mentions the writer path |
 | `HelperRead` | free fn taking `&Connection`, called from inside a closure | no write verb in body |
 | `HelperWrite` | free fn taking `&Connection`/`&mut Connection`/`&Transaction` that writes | — |
+| `Door` | the two doors and the two handle accessors — `read`, `write`, `conn_handle`, `read_pool_handle` | the set is pinned by name; nothing else may be filed here |
+
+Two free `async fn`s take `&SqliteBackend` rather than a connection and
+go through the doors as `backend.read(…)` / `backend.write(…)`
+(`check_revocation_anti_rollback_sqlite`, `sqlite_update_peer_field`);
+they are filed `Read` / `Write` like any method. Token matching is
+whitespace-insensitive because rustfmt splits `self.read(` into
+`self\n    .read(` in a chained expression — the first version of the gate
+found 200 of 286 fns for exactly that reason, and a parser floor
+(≥ 350 production fns, ≥ 250 touching a connection) is what turned that
+into a red rather than a quiet pass.
+
+As shipped: **286 rows — Read 155, Write 121, Door 4, HelperRead 3,
+HelperWrite 3, unclassified 0.**
 
 The gate is from-disk (the `parity.rs` / `blob_surface_gates.rs` idiom:
 read the source as text, strip test modules, scan) and is a **partition in
@@ -270,9 +285,17 @@ had to look, not a list of things that were broken.
 | `insert_trace_events_batch` — `MAX(admitted_at)` read inside the tx | the read must see concurrent batches | inside the write tx on the writer — unchanged |
 | `register_accord_public_key` — insert-then-read-on-no-op | same connection sees the row that won | one `Write` closure — unchanged |
 | `get_blob` / `get_blob_range` / `has_blob` | read-named; write `access_count` in a tx | `Write` (§3.4) |
-| `sqlite_load_stream_chunk_hashes(&Arc<Mutex<Connection>>, …)` | took the writer handle by reference | now takes `&Connection`; callers pass whichever connection their closure holds |
-| `check_revocation_anti_rollback_sqlite(&Arc<Mutex<Connection>>, …)` | same | same; it is a `HelperRead`, and the write it guards happens after it on the writer — the window between was already there under one mutex, since the check and the insert were two lock acquisitions |
-| `sqlite_next_key_serve_position(&conn)` / `index_stored_key_row` | called inside write closures | `HelperWrite`; every caller is a `Write` |
+| `sqlite_load_stream_chunk_hashes(&Arc<Mutex<Connection>>, …)` | took the writer handle by reference | now takes `&Connection` (`HelperRead`); its three callers run it inside `self.read(…)` |
+| `check_revocation_anti_rollback_sqlite(&Arc<Mutex<Connection>>, …)` | same | now takes `&SqliteBackend` and reads through `backend.read(…)` (`Read`); the write it guards happens after it on the writer — the window between was already there, since the check and the insert were two lock acquisitions |
+| `sqlite_update_peer_field(backend, …)` | free fn that opened a tx on the writer | `backend.write(…)` (`Write`) |
+| `sqlite_next_key_serve_position` / `sqlite_next_plane_position` | `MAX(position)` reads called from inside write closures to allocate the next position | `HelperRead` by body; every production caller is a `Write` closure, so the allocation stays under the writer mutex. `next_key_admission_position` (the door for callers that do NOT yet hold the writer) became `async` and reads on a reader — it never held the lock across the following write |
+| `put_revocation` / `put_accord_proposal` / `put_accord_participation` — `MAX(admitted_at | created_at | server_arrival_at)` read before the INSERT | the comment claimed "read under the same connection lock as the INSERT" | it was not: the block released the guard before the write closure took it. The read now runs on a reader; the comment is corrected. Folding the read into the write closure (as `insert_trace_events_batch` does) is the real fix for the two-writer tie and is out of scope here |
+| `sqlite_upsert_wire_index` / `sqlite_project_attestation_subjects` / `sqlite_project_consent_peer_set` | take `&Connection`/`&Transaction` and write | `HelperWrite`; the gate refuses any `Read` body that names them |
+| `index_stored_record` | `sqlite_upsert_wire_index(&conn.lock(), …)` inside an `async` block | one `self.write(…)` |
+| `load_or_init_content_master` — local closure over `&Arc<Mutex<Connection>>` | read-before-insert-then-re-read on one handle | nested `fn(&Connection)` run through `self.read(…)` twice; the INSERT between them is `ON CONFLICT DO NOTHING` on the writer and the re-read is the authority, as before |
+| `reanchor_*` / `list_scores` / `list_attestation_log` / `record_announced_peer` / `list_announced_peers` / `resolve_scores` (the 20 `spawn_blocking` sites) | already off the runtime, still on the one connection | rewritten to the doors; their `join` error arms are gone (the dispatcher re-raises a panic and never returns a join error) |
+| `has_blob` / `get_blob` / `get_blob_range` | `let mut conn` + `transaction()` | `Write` (§3.4) — filed by body |
+| `get_attestation` (FederationDirectory) and `list_attestations_for` / `lookup_public_key` (two impls each) | same name, two bodies | keyed by name; both occurrences must carry one class and the gate checks each |
 | `run_migrations_through` (test-anchor) | refinery needs `&mut Connection` | writer |
 | `PRAGMA table_info` reads | none in production text (test-only) | — |
 | `last_insert_rowid` / `changes()` | none in `sqlite.rs` | rule stated in §3.4 |
@@ -284,7 +307,7 @@ had to look, not a list of things that were broken.
 
 - **I1 — Occupancy.** With one reader connection held inside a long
   query, a second read on the same backend completes.
-  `read_completes_while_one_reader_is_held`.
+  `read_completes_while_one_reader_is_held_in_a_long_query`.
 - **I2 — Held writer does not block readers.** With the writer mutex held
   (the CIRISEdge#547 shape), a read completes.
   `read_completes_while_the_writer_connection_is_held`.
@@ -294,8 +317,8 @@ had to look, not a list of things that were broken.
   within 250 ms while the read is in flight.
   `runtime_keeps_spinning_while_a_read_waits_on_a_reader`,
   `runtime_keeps_spinning_while_an_in_memory_read_waits_on_the_writer`.
-- **I4 — Classification is a partition.** §5's gate. Mutation: routing one
-  `Read` back to the writer reds it.
+- **I4 — Classification is a partition.** §5's gate. Mutation M1 (below):
+  routing one `Read` back to the writer reds it.
 - **I5 — No runtime, no panic** (#158 preserved). A read and a write
   driven by an executor with no tokio runtime on the thread both complete.
   `sqlite_path_runs_with_no_tokio_runtime_on_the_thread`.
@@ -304,33 +327,70 @@ had to look, not a list of things that were broken.
 - **I7 — Readers see committed writes.** A write on the writer is visible
   to the next read on any reader with no explicit sync.
   `readers_see_the_writers_committed_rows`.
-- **I8 — In-memory has zero readers and stays green.** The pool reports
-  `0` for `open_in_memory`; the whole existing sqlite suite runs on this
-  path.
+- **I8 — In-memory and borrowed views have zero readers and stay green;
+  `from_handles` shares.** The pool reports `0` for `open_in_memory`,
+  `from_conn_handle`, `readers = 0`, `":memory:"` and a `file:…mode=memory`
+  URI; `from_handles` returns the same `Arc`; the whole existing sqlite
+  suite runs on the zero-reader path.
+  `in_memory_and_borrowed_views_have_zero_readers_and_from_handles_shares`.
+- **I9 — The default is bounded.** `default_reader_count()` is in `[2, 8]`
+  when the environment does not override it, and `open` uses it.
+  `default_reader_count_is_clamped_and_open_honours_it`.
+
+### 7.1 Mutations (the witnesses were tested, not just the fix)
+
+- **M1** — `get_attestation` routed through `self.write(…)` instead of
+  `self.read(…)`. RED: the I4 gate (`get_attestation reaches the writer via
+  self.write(`), I2 (the read waited 2.000 s behind the held writer), and
+  the reader arm of I3 (its premise — the read must wait on the reader —
+  no longer held). 12/15 otherwise green; reverted.
+- **M2** — `dispatch_blocking` forced onto its inline arm. RED: both I3
+  witnesses (the 10 ms sleep fired after ~1.0 s on the in-memory arm and
+  the reader arm alike). 13/15 otherwise green; reverted.
 
 ## 8. The measurement
 
-The issue's shape: a synthetic corpus of ~24k attestation rows from one
-attester, two concurrent filtered `list_attestations` readers looping,
-and a small point read (`get_attestation`) probed in between. p50/p95 of
-the point read, before and after, interleaved A/B (a blocked run cannot
-tell a regression from a co-tenant; see `feedback_interleave_ab_perf_runs`).
+The issue's shape: a synthetic corpus of 24 000 `observation:` + 12
+`config:` + 3 000 `capacity:` attestation rows from ONE attester; two tasks
+looping the filtered `list_attestations` (attester pinned, `observation:`
+prefix, limit 10 000 — the reconcile tick); a point read
+(`get_attestation`) probed every 5 ms for 8 s on a two-worker runtime.
+p50/p95 of the point read, before and after, **interleaved A/B in one
+process on one corpus file** (a blocked run cannot tell a regression from
+a co-tenant; see `feedback_interleave_ab_perf_runs`). Arm A opens the
+backend with `readers = 0` — the single-connection model exactly: same
+writer, every read behind the same mutex. Arm B is the default pool.
 
-`cargo nextest run --features sqlite --run-ignored ignored-only -E 'test(read_pool_bench)'`
-— the harness is `store::sqlite_conn_model::bench::read_pool_bench`, and
-`CIRIS_PERSIST_SQLITE_READERS=0` is the "before" arm on the same binary
-(it restores the single-connection model exactly: same writer, reads
-behind the same mutex) so the A/B is one build, alternated.
+`cargo nextest run --features sqlite --run-ignored ignored-only -E 'test(read_pool_bench)' --no-capture`
+— `store::sqlite_conn_model::witnesses::read_pool_bench`.
 
-| arm | readers | point-read p50 | point-read p95 | n |
-|---|---:|---:|---:|---:|
-| before (single connection) | 0 | _filled in §8.1_ | | |
-| after (read pool) | default | | | |
+### 8.1 Results (debug profile, 32-core box, default pool = 8 readers)
 
-### 8.1 Results
+| round | readers | probes (n) | p50 | p95 | max | scans in 8 s |
+|---|---:|---:|---:|---:|---:|---:|
+| 1A | 0 | 41 | 180.5 ms | 347.5 ms | 380.4 ms | 44 |
+| 1B | 8 | 1220 | 249 µs | 346 µs | 3.9 ms | 76 |
+| 2A | 0 | 34 | 179.5 ms | 334.0 ms | 499.5 ms | 37 |
+| 2B | 8 | 1199 | 265 µs | 465 µs | 19.8 ms | 66 |
+| 3A | 0 | 32 | 183.3 ms | 336.4 ms | 513.7 ms | 35 |
+| 3B | 8 | 1218 | 258 µs | 387 µs | 4.7 ms | 65 |
 
-_Filled in from the interleaved runs; see the CHANGELOG entry for the
-numbers as shipped._
+Three things the table says, in order of importance:
+
+1. **p50 ~700× lower** with the pool (≈180 ms → ≈250 µs), the same ratio
+   CIRISServer#575 measured on the canonical (1.1 ms → 780 ms). The point
+   read no longer waits for a scan to finish.
+2. **The probe loop itself was starved on arm A** — 32–41 probes in 8 s
+   against ~1200 — which is the "nothing fails, it hangs" the issue
+   describes: an uptime check on arm A would have called the node healthy.
+3. **Scan throughput rose** (35–44 → 65–76 per 8 s) because the two loops
+   run on two readers instead of taking turns on one connection.
+
+Absolute numbers are debug-profile and box-specific; the ratio is the
+finding. Arm A is not byte-for-byte v43.0.0 — v43.0.0 also ran the wait
+*inline on the worker*, which this harness cannot show as latency (it is
+I3's domain); arm A reproduces the serialization, which is the half that
+produced the numbers above.
 
 ## 9. What this does not do
 

@@ -5,6 +5,92 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #829]
+
+**The SQLite connection model: one writer plus a read pool under WAL, and
+every call off the async runtime when there is one.**
+`FSD/SQLITE_CONNECTION_MODEL.md`. Storage-layer, node-local, no on-disk or
+wire change; persist is the sole DB opener, so this is unilateral.
+
+### The defect (CIRISPersist#829, measured in CIRISServer#575 and CIRISEdge#547)
+
+`src/store/sqlite.rs` held ONE `Arc<Mutex<Connection>>` behind 351
+`conn.lock()` sites that ran **inline on the tokio worker** — the v3.14.0
+(#158) inline-sync rewrite — while the module doc still promised
+`spawn_blocking` for every call and premised the single connection on "one
+ingest writer, contention negligible". Every reader serialized behind every
+other reader AND parked the worker it ran on. CIRISServer#575: two reconcile
+loops calling the filtered `list_attestations` took `GET /v1/identity` from
+p50 1.1 ms to 780 ms (~700×) with zero non-200s. CIRISEdge#547: the
+connection holder page-faulting a corpus scan, every other thread in
+`futex_wait` behind it, a node that never recovered.
+
+### What changed
+
+- **Read pool.** `SqliteBackend` opens `N` additional `SQLITE_OPEN_READ_ONLY`
+  connections after the writer has set WAL (`ReadPool`, hand-rolled: free
+  list + condvar, no tokio primitive). Default
+  `N = available_parallelism().clamp(2, 8)`; `CIRIS_PERSIST_SQLITE_READERS`
+  overrides, `0` is the kill switch (single-connection model, still off the
+  runtime). `open_with_readers`, `from_handles`, `read_pool_handle` added.
+- **Two doors.** `SqliteBackend::read(|&Connection| …)` and
+  `::write(|&mut Connection| …)`. Both dispatch through
+  `sqlite_conn_model::dispatch_blocking`: `Handle::try_current()` →
+  `spawn_blocking`, else inline. **#158's property is kept, not overridden**:
+  the cohabitation copy of persist on a foreign worker takes the inline arm
+  instead of panicking. Writes move off the runtime too — the stall applies
+  to a write waiting for the writer mutex identically.
+- **274 closures rewritten to the doors** by script (anchored on the
+  closure opener and the `conn.lock()` line), 20 `spawn_blocking` sites and
+  3 `&Arc<Mutex<Connection>>` helpers by hand. Nothing in the production text
+  of `sqlite.rs` locks a connection outside the two doors (gate).
+- **In-memory: zero readers**, reads fall back to the writer (a private
+  `:memory:` database is invisible to a second connection; shared-cache
+  was rejected — a different locking model, not a smaller WAL). Same for
+  `from_conn_handle` views. Every existing test runs on this path.
+- **Classification table + from-disk gate** (`sqlite_conn_model`):
+  286 rows — Read 155 / Write 121 / Door 4 / HelperRead 3 / HelperWrite 3 /
+  unclassified 0 — a partition in both directions with a parser floor. A
+  `Read` that reaches the writer, a write verb, or a `HelperWrite` reds the
+  build; readers are read-only, so a misfiled write also fails loudly at
+  runtime.
+- The module doc in `sqlite.rs` now says what is true.
+
+### Witnesses (all RED-first where the old code could express them)
+
+I1 held reader → second read completes; I2 held writer → read completes
+(RED on v43.0.0: waited 2.000 s); I3 a waiting read does not stall a
+one-worker runtime (RED on v43.0.0: 10 ms sleep fired after 1.011 s);
+I4 the gate (RED: 285 unclassified, 292 direct locks); I5 no runtime, no
+panic (#158 preserved); I6 readers refuse writes (`SQLITE_READONLY`);
+I7 readers see committed rows; I8 zero-reader cases + `from_handles`
+shares; I9 default bounded. Mutations: a read routed to the writer reds
+I4/I2/I3; the dispatcher forced inline reds both I3 arms.
+
+### Measurement (`read_pool_bench`, in-process interleaved A/B, debug profile)
+
+24k `observation:` + 12 `config:` + 3k `capacity:` rows, one attester; two
+loops of the filtered `list_attestations` (limit 10 000); point read probed
+every 5 ms for 8 s, 2 workers. A = `readers 0`, B = 8 readers, A B A B A B:
+
+| arm | p50 | p95 | max | probes/8 s | scans/8 s |
+|---|---:|---:|---:|---:|---:|
+| A (single connection) | 180–183 ms | 334–348 ms | 380–514 ms | 32–41 | 35–44 |
+| B (read pool) | 249–265 µs | 346–465 µs | 3.9–19.8 ms | 1199–1220 | 65–76 |
+
+### Parity / gates
+
+`store::parity`: `read` / `write` registered as `Plumbing`; three rows that
+no longer propagate removed. `family_rules`: the `file:` URI-scheme
+literal declared NOT a family rule.
+
+### Out of scope, recorded
+
+Sibling modules that lock `conn_handle()` themselves (`audit/sqlite.rs`,
+`retention`, `telemetry`, `scheduled_tasks`, `secrets`, `ledgers`,
+`cirisnode`, …) keep their inline single-connection reads — FSD §6 lists
+them; the same doors are what they should adopt.
+
 ## [43.0.0] - 2026-09-09
 
 **Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from
