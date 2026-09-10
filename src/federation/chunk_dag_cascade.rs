@@ -2499,8 +2499,9 @@ pub mod invariants {
         .await;
         match res {
             Err(BlobError::InvalidArgument(msg)) => assert!(
-                msg.contains(&comm),
-                "{tag} I41: the seal refusal names the stream's community: {msg}"
+                msg.contains(&comm) && msg.contains("belongs to"),
+                "{tag} I41: the seal refusal is the STREAM ROW's (\"belongs to\"), naming the \
+                 stream's community, and fires before I32's chunk-row check: {msg}"
             ),
             other => panic!("{tag} I41: the stream sealed under another community: {other:?}"),
         }
@@ -2567,6 +2568,39 @@ pub mod invariants {
                 "{tag} I41: the mixed stream is refused by I32's tier check: {msg}"
             ),
             other => panic!("{tag} I41: a mixed stream sealed: {other:?}"),
+        }
+
+        // The COMMONS seal refuses a stream whose row is not at `federation`,
+        // on the one stream I32 cannot refuse: an infra-shaped community
+        // stream whose chunk rows are all plaintext. Without the row check
+        // the commons seal writes a public manifest over community rows.
+        let infra = format!("{tag}-infra-{run}");
+        backend
+            .put_blob_chunk_with_scope(
+                &infra,
+                0,
+                BlobBody::Inline(b"infra plaintext".to_vec()),
+                0,
+                15,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+                StreamClaim {
+                    community_key_id: Some(comm.clone()),
+                    owner_key_id: Some(key_a.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        match backend.seal_stream(&infra).await {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains("belongs to cohort"),
+                "{tag} I41: the commons seal's refusal is the stream row's: {msg}"
+            ),
+            other => panic!(
+                "{tag} I41: the commons seal wrote a federation manifest over a community-cohort \
+                 stream (all-plaintext, so I32 could not refuse it): {other:?}"
+            ),
         }
 
         // An UNCLAIMED stream (commons-started: no writer) is adopted by its
@@ -2850,6 +2884,27 @@ pub mod invariants {
             ),
             "{tag} I42: an unknown position is InvalidArgument"
         );
+        // A plaintext (commons) stream reads by position the same way, and
+        // refuses associated data it cannot bind (I40 at this door too).
+        let commons = format!("{tag}-commons-{run}");
+        backend
+            .put_blob_chunk(&commons, 3, BlobBody::Inline(b"public bytes".to_vec()), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_stream_chunk_as(backend, &commons, 3, &stranger, None)
+                .await
+                .unwrap(),
+            b"public bytes".to_vec(),
+            "{tag} I42: a commons chunk reads by position, by anyone"
+        );
+        assert!(
+            matches!(
+                read_stream_chunk_as(backend, &commons, 3, &stranger, Some(b"x")).await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "{tag} I42: associated data at a plaintext position is refused, not dropped"
+        );
         match read_any_range_for_viewer(backend, &shas[0], &alice_occ, 0, 9, None).await {
             Err(BlobError::Backend(_)) => {}
             other => panic!(
@@ -2863,6 +2918,67 @@ pub mod invariants {
                 .await
                 .unwrap(),
             plain
+        );
+
+        // `seq` is the manifest's WORD, not the list index: a stream whose
+        // producer skipped numbers (5, 7) seals and reads honestly, whole,
+        // by range across the boundary, and by position. A reader that
+        // rebuilt the AAD from the index would fail here and nowhere else.
+        let sparse = format!("{tag}-sparse-{run}");
+        let sparse_segs = [segment(41, 64), segment(42, 32)];
+        for (seq, seg) in [(5u64, &sparse_segs[0]), (7u64, &sparse_segs[1])] {
+            put_blob_chunk_scoped(
+                backend,
+                &writer,
+                COMMUNITY,
+                Some(&comm),
+                &sparse,
+                seq,
+                seg,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let sealed_sparse = seal_stream_scoped(
+            backend,
+            &writer,
+            COMMUNITY,
+            Some(&comm),
+            &sparse,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut sparse_plain = sparse_segs[0].clone();
+        sparse_plain.extend_from_slice(&sparse_segs[1]);
+        assert_eq!(
+            read_any_for_viewer(backend, &sealed_sparse.manifest_sha256, &alice_occ, None)
+                .await
+                .unwrap(),
+            sparse_plain,
+            "{tag} I42: a sparse-seq stream opens whole — the AAD uses the manifest's seq"
+        );
+        assert_eq!(
+            read_any_range_for_viewer(
+                backend,
+                &sealed_sparse.manifest_sha256,
+                &alice_occ,
+                60,
+                70,
+                None
+            )
+            .await
+            .unwrap(),
+            sparse_plain[60..=70].to_vec()
+        );
+        assert_eq!(
+            read_stream_chunk_as(backend, &sparse, 7, &alice_occ, None)
+                .await
+                .unwrap(),
+            sparse_segs[1]
         );
     }
 

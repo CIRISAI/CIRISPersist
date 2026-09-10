@@ -4208,6 +4208,8 @@ mod tests {
             format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":3}}"),
             // #838 — a v44.0.0 sealed manifest: v2 without a position
             format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            // v2 with every chunk positioned but no stream_id
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"seq\":0,\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
             // v2 with a stream_id but a chunk without seq
             format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":3,\"v\":2}}"),
             // v2 with positions out of order (not strictly increasing)
