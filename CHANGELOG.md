@@ -108,7 +108,28 @@ I32 (commons half) and I35 (commons half) were written first and confirmed
 RED on `170cc89` (v43.0.0) on sqlite AND postgres. The remaining rows exercise
 doors this cut adds; their evidence is the mutation record below.
 
-MUTATION RECORD: see the final report / §12.8.
+**Mutation record** (each mutation applied, the named witnesses run on sqlite,
+the file restored from the committed baseline; KILLED = the witness went red):
+
+| mutation | witness | outcome |
+|---|---|---|
+| seal door: drop the chunk-row tier check | I32 (scoped) | KILLED — in pass 1 SURVIVED because the witness's plaintext chunk was a commons row and the cohort check caught it; the witness now stages a plaintext row at the SAME cohort |
+| commons `seal_stream`: drop the tier refusal | I32 (commons) | KILLED |
+| `get_blob`: parse a sealed manifest as JSON | I33 | KILLED |
+| range read: skip `authorize_viewer_by_tier` | I33 + I34 + I34b | KILLED — in pass 1 SURVIVED behind the community open's re-check and the per-chunk grant; I34b now reads a sealed self WHOLE blob as a stranger |
+| `slices_for_range`: off-by-one at a chunk boundary | I34 + unit | KILLED |
+| whole read: drop the cap | I35 | KILLED |
+| whole-read door passes `u64::MAX` instead of the cap | I35 (from-disk) | KILLED |
+| `serve_blob_to_peer` grows a decrypting token | I36 | KILLED |
+| `stream_chunks` drops the STH `tree_size` | I37 | KILLED |
+| chunk open uses the MANIFEST's epoch for every chunk | I38 | KILLED |
+| `seal_stream_scoped` loses its `aad` parameter | I39 | KILLED |
+| chunk floor accepts plaintext under a sealed token | I32 (floor) | KILLED |
+| chunk floor binds at a non-current (still enabled) epoch | I38 (floor) | KILLED |
+| DAG read drops the per-chunk-row grant check (self) | I34b | KILLED — in pass 1 SURVIVED behind the manifest authorization; I34b now reads as an occurrence granted on the manifest but not on the chunk row |
+
+`seal_ignores_aad_until_831` is itself the pin: it turns red the day #831
+flips `seal` / `open`, which is the point.
 
 ## [43.0.0] - 2026-09-09
 

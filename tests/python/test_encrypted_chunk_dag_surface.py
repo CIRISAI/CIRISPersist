@@ -48,9 +48,9 @@ def _engine(tmp_path):
             "sqlite::memory:",
             alias,
             local_key_id=alias,
-            local_key_path=seed,
+            local_key_path=str(seed),
             local_pqc_key_id=alias + "-pqc",
-            local_pqc_key_path=pqc_seed,
+            local_pqc_key_path=str(pqc_seed),
         )
     except ValueError as exc:
         if "sqlite" in str(exc) and "feature" in str(exc):
@@ -78,6 +78,8 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
                     "asserted_at": "2026-09-09T00:00:00Z",
                     "valid_until": None,
                     "encryption_pubkeys": enc,
+                    "transport_binding": None,
+                    "persist_row_hash": "",
                 }
             )
         )

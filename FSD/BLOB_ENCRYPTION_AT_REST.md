@@ -1815,14 +1815,20 @@ at seal time; that decision is #831's and is not pre-empted here.
 - `put_blob_chunks` (Cut B's atomic multi-row upload) stays commons-only; the
   encrypted path is the live-append one, which is what video needs.
 
-**Mutation record (§11.10 discipline).** Each of I32–I39 was turned red by
-removing the logic it guards — the chunk-row tier check in both seal doors
-(I32), the `(storage_kind, crypto_tier)` dispatch in `get_blob` (I33), the
-authorization step and the prefix-sum boundary in the range read (I34), the
-cap (I35), a decrypt inserted into `serve_blob_to_peer` (I36), the STH join
-(I37), the per-epoch grant check (I38), and the `aad` parameter on a new door
-(I39) — and green again with the logic restored. The outcomes are in the
-CHANGELOG entry for this cut.
+**Mutation record (§11.10 discipline).** Fourteen mutations, each applied,
+the named witnesses run, the file restored from the committed baseline; all
+fourteen KILLED. Three needed a second pass, and each of the three was the
+class §11.10 warns about — the right outcome through a neighbouring gate:
+the dropped chunk-row tier check (I32) was caught by the cohort check because
+the witness's plaintext chunk was a commons row; the dropped range-read
+authorization (I34) was masked by the community open's defense-in-depth
+re-check and by the per-chunk grant; the dropped per-chunk grant check (I34b)
+was masked by the manifest authorization. The witnesses now stage a plaintext
+row at the SAME cohort, read a sealed self WHOLE blob by range as a stranger,
+and read as an occurrence granted on the manifest but not on the chunk row.
+The full table is in the CHANGELOG entry for this cut. `seal_ignores_aad_until_831`
+is the pin for I39's other half: it turns red the day #831 flips `seal` /
+`open`.
 
 ---
 
