@@ -78,9 +78,9 @@ async fn seed_corpus(n_rows: usize, n_subjects: usize, n_dims: usize) -> SqliteB
                 "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
                    identity_type, identity_ref, valid_from, registration_envelope, \
                    original_content_hash, scrub_signature_classical, scrub_key_id, \
-                   scrub_timestamp, persist_row_hash) \
+                   scrub_timestamp, persist_row_hash, admitted_at) \
                  VALUES (?1, 'cA==', 'hybrid', 'agent', ?1, '2026-01-01T00:00:00+00:00', '{}', \
-                   x'', 's', ?1, '2026-01-01T00:00:00+00:00', '0')",
+                   x'', 's', ?1, '2026-01-01T00:00:00+00:00', '0', '2026-01-01T00:00:00+00:00')",
             )
             .unwrap();
         let mut att_stmt = conn
@@ -90,9 +90,9 @@ async fn seed_corpus(n_rows: usize, n_subjects: usize, n_dims: usize) -> SqliteB
                    attestation_envelope, original_content_hash, scrub_signature_classical, \
                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                   tier, promoted_at) \
+                   tier, promoted_at, admitted_at) \
                  VALUES (?1, ?2, ?2, 'scores', 1.0, ?3, NULL, ?4, x'', 's', NULL, ?2, ?3, \
-                   NULL, '0', ?5, NULL, 'federation', 'federation', NULL)",
+                   NULL, '0', ?5, NULL, 'federation', 'federation', NULL, ?3)",
             )
             .unwrap();
         let mut proj_stmt = conn
