@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #831]
+
+### Changed
+
+- **CIRISVerify re-pin v15.0.0 → v15.1.0** (CIRISVerify#279 / PR #280): all
+  seven `Cargo.toml` tag pins (`ciris-keyring` ×4 feature variants,
+  `ciris-verify-core` ×2, `ciris-crypto` ×1) flip together, per the
+  crate-coherence rule — one flipped alone lands `ciris_crypto` in the graph
+  twice and its types stop unifying. Additive MINOR on the verify side:
+  `ciris_crypto::aes_gcm::{encrypt_aad, decrypt_aad}` (same key / nonce /
+  appended-tag conventions as the AAD-empty pair, which is untouched and
+  whose KAT still passes; `encrypt_aad(.., b"", ..)` is byte-identical to
+  `encrypt`). The wheel's `Requires-Dist: ciris-verify>=15.0.0,<16` already
+  admits 15.1.0 and the persist-side gate
+  (`verify_pin_major_matches_the_wheel_requires_dist`) compares MAJORS, so
+  the Python floor does not move: nothing in the Python surface needs a
+  15.1.0-only symbol — the AAD pair is consumed from Rust inside the wheel.
+
 ## [43.0.0] - 2026-09-09
 
 **Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from
