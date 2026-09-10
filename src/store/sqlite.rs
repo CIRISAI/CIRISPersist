@@ -22321,9 +22321,9 @@ mod tests {
                         identity_type, identity_ref, valid_from, \
                         registration_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash\
+                        scrub_timestamp, persist_row_hash, admitted_at\
                      ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                              x'00', '', ?1, ?3, '0')",
+                              x'00', '', ?1, ?3, '0', ?3)",
                     rusqlite::params!["key-test", pk_b64, "2026-04-30T00:00:00+00:00"],
                 )?;
                 Ok(())
@@ -22372,9 +22372,9 @@ mod tests {
                         identity_type, identity_ref, valid_from, \
                         registration_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash\
+                        scrub_timestamp, persist_row_hash, admitted_at\
                      ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                              x'00', '', ?1, ?3, '0')",
+                              x'00', '', ?1, ?3, '0', ?3)",
                     rusqlite::params!["key-active", pk_b64, "2026-04-30T00:00:00+00:00"],
                 )?;
                 conn.execute(
@@ -22383,9 +22383,9 @@ mod tests {
                         identity_type, identity_ref, valid_from, valid_until, \
                         registration_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, \
-                        scrub_timestamp, persist_row_hash\
+                        scrub_timestamp, persist_row_hash, admitted_at\
                      ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, ?4, '{}', \
-                              x'00', '', ?1, ?3, '0')",
+                              x'00', '', ?1, ?3, '0', ?3)",
                     rusqlite::params![
                         "key-expired",
                         pk_b64,
@@ -22750,10 +22750,10 @@ mod tests {
                         attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         asserted_at, attestation_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash\
+                        persist_row_hash, admitted_at\
                      ) VALUES (?1, 'apply-amb-owner2', 'apply-amb-node', 'delegates_to', \
                         '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', 'apply-amb-owner2', \
-                        '2026-05-01T00:00:00+00:00', '0')",
+                        '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00')",
                     rusqlite::params![anomaly.attestation_id, env_text],
                 )?;
                 Ok(())
@@ -22864,10 +22864,10 @@ mod tests {
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     asserted_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash\
+                    persist_row_hash, admitted_at\
                  ) VALUES (?1, 'cfg-amb-owner2', 'cfg-amb-node', 'delegates_to', \
                     '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', 'cfg-amb-owner2', \
-                    '2026-05-01T00:00:00+00:00', '0')",
+                    '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00')",
                 rusqlite::params![anomaly.attestation_id, env_text],
             )
             .unwrap();
@@ -26535,12 +26535,18 @@ mod tests {
     /// #682 — the allocator reads `COALESCE(admitted_at, scrub_timestamp)`, the
     /// same expression the cursor orders by, not the bare column.
     ///
-    /// This dialect leaves `admitted_at` nullable — `ALTER TABLE` cannot add a
-    /// NOT NULL column to a populated table and cannot alter nullability in
-    /// place — so a row whose position comes from the fallback is a real state,
-    /// and it is the one a bare `MAX(admitted_at)` is blind to.
+    /// Until V141 this dialect left `admitted_at` nullable, so a row whose
+    /// position came from the fallback was a real state — the one a bare
+    /// `MAX(admitted_at)` is blind to — and this test planted it with
+    /// `UPDATE … SET admitted_at = NULL`. CIRISPersist#828 made that state
+    /// UNREPRESENTABLE here, as it always was on postgres: the plant is now
+    /// refused by the schema, which is the whole point of V141, and this
+    /// test pins the refusal instead. The memory backend, whose row can
+    /// still hold `None`, keeps the original witness
+    /// (`allocator_reads_the_fallback_position_memory_682`), so the
+    /// allocator's fallback leg is still exercised where it is reachable.
     #[tokio::test]
-    async fn allocator_reads_the_fallback_position_sqlite_682() {
+    async fn allocator_fallback_position_is_unrepresentable_sqlite_828() {
         use crate::federation::register::test_support as rts;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
@@ -26551,30 +26557,32 @@ mod tests {
             .await
             .unwrap();
 
-        // THE UNSTAMPED ROW, as state: no stored position, and a
-        // `scrub_timestamp` an hour ahead — so the fallback is the largest
-        // position in the table and an allocator that ignores it stamps below.
         let fallback_at = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
-        {
-            let conn = backend.conn.lock();
-            let n = conn
-                .execute(
-                    "UPDATE federation_keys SET admitted_at = NULL, scrub_timestamp = ?1 \
-                     WHERE key_id = ?2",
-                    rusqlite::params![fallback_at.to_rfc3339(), "k682-sq-fb"],
-                )
-                .unwrap();
-            assert_eq!(n, 1, "the fallback plant must touch the seeded row");
-        }
-
-        rts::assert_allocator_reads_the_fallback_position(
-            &backend,
-            "sq",
-            "k682-sq-fb",
-            fallback_at,
-        )
-        .await
-        .unwrap();
+        let conn = backend.conn.lock();
+        let err = conn
+            .execute(
+                "UPDATE federation_keys SET admitted_at = NULL, scrub_timestamp = ?1 \
+                 WHERE key_id = ?2",
+                rusqlite::params![fallback_at.to_rfc3339(), "k682-sq-fb"],
+            )
+            .expect_err("#828: an unstamped key row is unrepresentable on sqlite since V141")
+            .to_string();
+        assert!(
+            err.contains("NOT NULL constraint failed: federation_keys.admitted_at"),
+            "refused for the wrong reason: {err}"
+        );
+        // And the row the door stamped is untouched by the refused plant.
+        let stamped: Option<String> = conn
+            .query_row(
+                "SELECT admitted_at FROM federation_keys WHERE key_id = ?1",
+                ["k682-sq-fb"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stamped.is_some(),
+            "the write door stamps admitted_at on sqlite"
+        );
     }
 
     #[tokio::test]
@@ -31103,8 +31111,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO federation_communities (\
                     community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    consensus_protocol, policy_blob, persist_row_hash, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?4)",
                 rusqlite::params![
                     "c504-community-unsigned",
                     "504 Unsigned Co-op",
@@ -31190,8 +31198,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO federation_location_proofs (\
                     subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    attestation_evidence, withdrawn_at, persist_row_hash, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4)",
                 rusqlite::params![
                     "lp504-subj",
                     cell7,
@@ -31264,8 +31272,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3)",
                 rusqlite::params![
                     "fmr504-fam",
                     "fmr504-removed2",
@@ -31341,8 +31349,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO federation_community_membership_revocations (\
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3)",
                 rusqlite::params![
                     "cmr504-comm",
                     "cmr504-removed2",
@@ -32952,10 +32960,10 @@ mod tests {
                     weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
                     pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                    cohort_scope, tier, promoted_at, additional_scrubs\
+                    cohort_scope, tier, promoted_at, additional_scrubs, admitted_at\
                  ) VALUES (?1, ?2, 'occ', 'scores', 1.0, ?3, NULL, ?4, x'', \
                           'sig', NULL, ?2, ?3, NULL, '0', '[]', NULL, \
-                          'federation', ?5, NULL, '[]')",
+                          'federation', ?5, NULL, '[]', ?3)",
                 rusqlite::params![id, attester, at, env, tier],
             )
             .unwrap();
@@ -33083,10 +33091,10 @@ mod tests {
                     weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
                     pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                    cohort_scope, tier, promoted_at, additional_scrubs\
+                    cohort_scope, tier, promoted_at, additional_scrubs, admitted_at\
                  ) VALUES (?1, 'occ', 'occ', 'scores', ?2, '2026-05-01T00:00:00Z', ?3, ?4, x'', \
                           'sig', NULL, 'occ', '2026-05-01T00:00:00Z', NULL, '0', ?5, NULL, \
-                          'federation', 'federation', NULL, '[]')",
+                          'federation', 'federation', NULL, '[]', '2026-05-01T00:00:00Z')",
                 rusqlite::params![id, weight, expires, env, subj],
             )
             .unwrap();
@@ -33217,10 +33225,10 @@ mod tests {
                     weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
                     pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                    cohort_scope, tier, promoted_at, additional_scrubs\
+                    cohort_scope, tier, promoted_at, additional_scrubs, admitted_at\
                  ) VALUES (?1, 'occ', 'occ', 'scores', 0.9, '2026-05-01T00:00:00Z', NULL, ?2, x'', \
                           'sig', NULL, 'occ', '2026-05-01T00:00:00Z', NULL, '0', '[]', NULL, \
-                          'federation', 'federation', NULL, '[]')",
+                          'federation', 'federation', NULL, '[]', '2026-05-01T00:00:00Z')",
                 rusqlite::params![id, env],
             )
             .unwrap();
@@ -33851,9 +33859,9 @@ mod tests {
                    attestation_envelope, original_content_hash, scrub_signature_classical, \
                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                   tier, promoted_at) VALUES ('hid','k9','k9','scores',1.0,\
+                   tier, promoted_at, admitted_at) VALUES ('hid','k9','k9','scores',1.0,\
                    '2026-01-01T00:00:00Z',NULL,?1,x'','s',NULL,'k9','2026-01-01T00:00:00Z',\
-                   NULL,'0','[\"subj\"]',NULL,'self','federation',NULL)",
+                   NULL,'0','[\"subj\"]',NULL,'self','federation',NULL,'2026-01-01T00:00:00Z')",
                 rusqlite::params![env],
             )
             .unwrap();
@@ -33912,9 +33920,9 @@ mod tests {
                    attestation_envelope, original_content_hash, scrub_signature_classical, \
                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                   tier, promoted_at) VALUES ('hid','k9','k9','scores',1.0,\
+                   tier, promoted_at, admitted_at) VALUES ('hid','k9','k9','scores',1.0,\
                    '2026-01-01T00:00:00Z',NULL,?1,x'','s',NULL,'k9','2026-01-01T00:00:00Z',\
-                   NULL,'0','[\"subj\"]',NULL,'self','federation',NULL)",
+                   NULL,'0','[\"subj\"]',NULL,'self','federation',NULL,'2026-01-01T00:00:00Z')",
                 rusqlite::params![env],
             )
             .unwrap();
@@ -33938,9 +33946,9 @@ mod tests {
                    attestation_envelope, original_content_hash, scrub_signature_classical, \
                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                   tier, promoted_at) VALUES ('loc','k1','k1','scores',1.0,\
+                   tier, promoted_at, admitted_at) VALUES ('loc','k1','k1','scores',1.0,\
                    '2026-01-02T00:00:00Z',NULL,?1,x'','','NULL','k1','2026-01-02T00:00:00Z',\
-                   NULL,'rowhash','[\"subj\"]',NULL,'self','local',NULL)",
+                   NULL,'rowhash','[\"subj\"]',NULL,'self','local',NULL,'2026-01-02T00:00:00Z')",
                 rusqlite::params![env],
             )
             .unwrap();
@@ -34022,9 +34030,9 @@ mod tests {
                    attestation_envelope, original_content_hash, scrub_signature_classical, \
                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                   tier, promoted_at) VALUES ('bf','k1','k1','scores',1.0,\
+                   tier, promoted_at, admitted_at) VALUES ('bf','k1','k1','scores',1.0,\
                    '2026-01-01T00:00:00Z',NULL,?1,x'','s',NULL,'k1','2026-01-01T00:00:00Z',\
-                   NULL,'0','[\"p\",\"q\"]',NULL,'federation','federation',NULL)",
+                   NULL,'0','[\"p\",\"q\"]',NULL,'federation','federation',NULL,'2026-01-01T00:00:00Z')",
                 rusqlite::params![env],
             )
             .unwrap();
@@ -39414,10 +39422,10 @@ mod tests {
                 "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
                     identity_type, identity_ref, valid_from, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash) \
+                    scrub_timestamp, persist_row_hash, admitted_at) \
                  VALUES ('ah-direct', 'AA==', 'hybrid', 'accord_holder', 'x', \
                     '2026-01-01T00:00:00Z', '{}', X'aa', 's', 'ah-direct', \
-                    '2026-01-01T00:00:00Z', 'h')",
+                    '2026-01-01T00:00:00Z', 'h', '2026-01-01T00:00:00Z')",
                 [],
             )
         })();
@@ -43393,6 +43401,476 @@ mod tests {
         );
     }
 
+    /// The fourteen tables V141 rebuilds, each with the ROW FILTER that
+    /// isolates its seeded pre-V141 row and the instant that row's
+    /// `admitted_at` must be backfilled to — the source column the header of
+    /// `migrations/sqlite/lens/V141__admitted_at_not_null.sql` names per
+    /// table. Spelled as literals, not derived from the migration text, so
+    /// the witness cannot agree with a wrong backfill by construction.
+    const V141_TABLES: [(&str, &str, &str); 14] = [
+        // federation_keys backfills from scrub_timestamp (V126).
+        (
+            "federation_keys",
+            "key_id = 'k1'",
+            "2026-01-01T00:00:01+00:00",
+        ),
+        // federation_attestations backfills from COALESCE(promoted_at, asserted_at);
+        // the seeded row has promoted_at set, so promoted_at must win.
+        (
+            "federation_attestations",
+            "1 = 1",
+            "2026-01-04T00:00:00+00:00",
+        ),
+        // federation_revocations backfills from scrub_timestamp (V123).
+        (
+            "federation_revocations",
+            "1 = 1",
+            "2026-01-05T00:00:01+00:00",
+        ),
+        (
+            "federation_identity_occurrences",
+            "1 = 1",
+            "2026-01-09T00:00:00+00:00",
+        ),
+        (
+            "federation_identity_occurrence_revocations",
+            "1 = 1",
+            "2026-01-10T00:00:00+00:00",
+        ),
+        (
+            "federation_family_membership_revocations",
+            "1 = 1",
+            "2026-01-11T00:00:00+00:00",
+        ),
+        (
+            "federation_community_membership_revocations",
+            "1 = 1",
+            "2026-01-12T00:00:00+00:00",
+        ),
+        (
+            "federation_location_proofs",
+            "1 = 1",
+            "2026-01-13T00:00:00+00:00",
+        ),
+        (
+            "federation_communities",
+            "1 = 1",
+            "2026-01-14T00:00:00+00:00",
+        ),
+        ("federation_families", "1 = 1", "2026-01-15T00:00:00+00:00"),
+        (
+            "federation_organizations",
+            "1 = 1",
+            "2026-01-16T00:00:00+00:00",
+        ),
+        (
+            "federation_org_memberships",
+            "1 = 1",
+            "2026-01-17T00:00:00+00:00",
+        ),
+        (
+            "federation_partner_records",
+            "1 = 1",
+            "2026-01-18T00:00:00+00:00",
+        ),
+        (
+            "transport_destinations",
+            "1 = 1",
+            "2026-01-19T00:00:00+00:00",
+        ),
+    ];
+
+    /// The eight tables V141 stages WITHOUT rebuilding, because they
+    /// reference a table being dropped (directly, or through a cascade the
+    /// drop would fire). Each seeded with one row; each must still hold it.
+    const V141_STAGED_REFERRERS: [&str; 8] = [
+        "attestation_subjects",
+        "identity_canonical_binding",
+        "federation_revocation_quorum_state",
+        "goals",
+        "federation_peer_metadata",
+        "edge_outbound_queue",
+        "edge_detection_events",
+        "federation_trust_grants",
+    ];
+
+    /// One `PRAGMA table_xinfo` row: `(cid, name, type, notnull, dflt, pk, hidden)`.
+    type V141Column = (i64, String, String, i64, Option<String>, i64, i64);
+
+    /// Everything `sqlite_master`, `table_xinfo` and `foreign_key_list` say
+    /// about one table, whitespace-normalised so a re-created index compares
+    /// equal to the original regardless of how the DDL was wrapped.
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    struct V141Shape {
+        /// `"index NAME"` / `"trigger NAME"` -> normalised CREATE text.
+        objects: std::collections::BTreeMap<String, String>,
+        /// Columns in cid order.
+        columns: Vec<V141Column>,
+        /// `(to_table, from_col, to_col, on_update, on_delete)` in id order.
+        fks: Vec<(String, String, String, String, String)>,
+    }
+
+    fn v141_shape(conn: &rusqlite::Connection, table: &str) -> V141Shape {
+        let mut objects = std::collections::BTreeMap::new();
+        let mut st = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE type IN ('index', 'trigger') AND tbl_name = ?1 AND sql IS NOT NULL",
+            )
+            .unwrap();
+        for row in st
+            .query_map([table], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (ty, name, sql) = row.unwrap();
+            let norm = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            objects.insert(format!("{ty} {name}"), norm);
+        }
+        let mut st = conn
+            .prepare(&format!("PRAGMA table_xinfo({table})"))
+            .unwrap();
+        let columns = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut st = conn
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .unwrap();
+        let fks = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        V141Shape {
+            objects,
+            columns,
+            fks,
+        }
+    }
+
+    /// CIRISPersist#828 — V141 rebuilds fourteen tables so that
+    /// `admitted_at` is `NOT NULL` on sqlite as it has been on postgres since
+    /// V130, and the rebuild must be a rebuild of NOTHING ELSE.
+    ///
+    /// A table rebuild is the one moment a constraint, index, trigger or
+    /// foreign key is silently lost by transcription; and on this schema a
+    /// naive `DROP TABLE federation_keys` is an implicit `DELETE FROM` that
+    /// CASCADE-wipes `federation_peer_metadata` and
+    /// `identity_canonical_binding`, SET-NULLs the binding's attestation
+    /// column, and is REFUSED by `goals` (RESTRICT) — see the migration
+    /// header, and V136's for the measurements. `migrations_run_clean_in_memory`
+    /// cannot see any of that: it runs against empty tables, where a drop
+    /// fires nothing and a lost index costs nothing.
+    ///
+    /// So this witness seeds the V140 shape — one row with a NULL
+    /// `admitted_at` in each of the fourteen, one row in each of the eight
+    /// referrers the migration stages without rebuilding, a self-referencing
+    /// key pair and a key that already carries an `admitted_at` — snapshots
+    /// every index, trigger, column and foreign key, runs V141, and asserts:
+    ///
+    /// 1. the snapshot is IDENTICAL afterwards except for exactly fourteen
+    ///    `notnull` flags (a dropped index, a renamed trigger, a reordered
+    ///    column, a lost FK action all red here);
+    /// 2. every NULL was backfilled from the source the header names, and a
+    ///    value already present was NOT overwritten;
+    /// 3. every referrer still holds its row and the SET NULL did not fire;
+    /// 4. the database is FK-consistent and passes `integrity_check`;
+    /// 5. `NOT NULL` is live on all fourteen, and both re-created trigger
+    ///    families still fire.
+    ///
+    /// Vacuity is pinned first: the seed must land NULLs, or the backfill
+    /// leg proves nothing.
+    #[tokio::test]
+    async fn v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828()
+    {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(140).await.unwrap();
+
+        let before: Vec<(String, V141Shape)> = {
+            let conn = backend.conn.lock();
+            conn.execute_batch(V141_SEED).expect("seed the V140 shape");
+            // Vacuity: every one of the fourteen holds exactly one NULL.
+            for (table, filter, _) in V141_TABLES {
+                let nulls: i64 = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table} WHERE admitted_at IS NULL AND {filter}"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    nulls, 1,
+                    "{table}: the pre-V141 seed must land a NULL admitted_at, or the \
+                     backfill leg of this witness is vacuous"
+                );
+            }
+            V141_TABLES
+                .iter()
+                .map(|(t, _, _)| ((*t).to_owned(), v141_shape(&conn, t)))
+                .collect()
+        };
+
+        backend
+            .run_migrations()
+            .await
+            .expect("V141 applies to a populated V140 database");
+
+        let conn = backend.conn.lock();
+
+        // 1. Shape parity: identical except the fourteen notnull flips.
+        for (table, was) in &before {
+            let now = v141_shape(&conn, table);
+            assert_eq!(
+                was.objects, now.objects,
+                "{table}: the set of indexes/triggers (or their DDL) changed across V141 — a \
+                 rebuild that drops or reshapes an index or a trigger is a silent regression"
+            );
+            assert_eq!(
+                was.fks, now.fks,
+                "{table}: foreign keys (or their ON DELETE/UPDATE actions) changed across V141"
+            );
+            let mut expected = was.columns.clone();
+            let flipped = expected
+                .iter_mut()
+                .filter(|c| c.1 == "admitted_at")
+                .map(|c| c.3 = 1)
+                .count();
+            assert_eq!(
+                flipped, 1,
+                "{table}: seeded shape has one admitted_at column"
+            );
+            assert_eq!(
+                expected, now.columns,
+                "{table}: columns differ across V141 beyond admitted_at's NOT NULL — order, \
+                 type, default, pk or generated-ness moved"
+            );
+            assert!(
+                !now.objects.is_empty(),
+                "{table}: no index or trigger at all — the snapshot leg is vacuous"
+            );
+        }
+
+        // 2. Backfill from the named source; a present value is preserved.
+        for (table, filter, want) in V141_TABLES {
+            let got: String = conn
+                .query_row(
+                    &format!("SELECT admitted_at FROM {table} WHERE {filter}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                got, want,
+                "{table}: admitted_at backfilled from the wrong source"
+            );
+            let nulls: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE admitted_at IS NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(nulls, 0, "{table}: a NULL admitted_at survived V141");
+        }
+        let k2: String = conn
+            .query_row(
+                "SELECT admitted_at FROM federation_keys WHERE key_id = 'k2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            k2, "2026-02-02T00:00:00+00:00",
+            "a row that already carried admitted_at must keep it — the backfill is WHERE IS NULL"
+        );
+
+        // 3. Referrers survived the drop; no cascade, no SET NULL fired.
+        for table in V141_STAGED_REFERRERS {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                n, 1,
+                "{table}: lost its row across V141 — the DROP TABLE of a parent fired an FK \
+                 action the migration did not stage for"
+            );
+        }
+        let bound: Option<String> = conn
+            .query_row(
+                "SELECT binding_attestation_id FROM identity_canonical_binding",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound.as_deref(),
+            Some("a1"),
+            "identity_canonical_binding.binding_attestation_id was SET NULL by the \
+             federation_attestations drop"
+        );
+
+        // 4. Consistent and intact; no stage table left behind.
+        let fk_violations: i64 = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count() as i64;
+        assert_eq!(
+            fk_violations, 0,
+            "foreign_key_check reports violations after V141"
+        );
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '\\_v141%' ESCAPE '\\'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0, "V141 left a stage table behind");
+
+        // 5. NOT NULL is live on all fourteen …
+        for (table, _, _) in V141_TABLES {
+            let err = conn
+                .execute(&format!("UPDATE {table} SET admitted_at = NULL"), [])
+                .expect_err(&format!(
+                    "{table}: a NULL admitted_at must be refused after V141"
+                ))
+                .to_string();
+            assert!(
+                err.contains("NOT NULL constraint failed"),
+                "{table}: refused for the wrong reason: {err}"
+            );
+        }
+        // … and both re-created trigger families still fire.
+        let err = conn
+            .execute(
+                "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('k3', 'p', 'hybrid', 'accord_holder', 'r', '2026', '{}', X'00', 's', \
+                    'k1', '2026', 'h', '2026')",
+                [],
+            )
+            .expect_err("the accord_holder trigger must have been re-created")
+            .to_string();
+        assert!(
+            err.contains("federation_keys_accord_holder_requires_attestation"),
+            "wrong refusal: {err}"
+        );
+        let err = conn
+            .execute(
+                "INSERT INTO federation_attestations (attestation_id, attesting_key_id, \
+                    attested_key_id, attestation_type, asserted_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash, tier, admitted_at) \
+                 VALUES ('a2', 'k1', 'k2', 'vouch', '2026', '{}', X'00', '', 'k1', '2026', \
+                    'h', 'federation', '2026')",
+                [],
+            )
+            .expect_err("the federation-tier-signed trigger must have been re-created")
+            .to_string();
+        assert!(
+            err.contains("tier=federation requires a non-empty scrub_signature_classical"),
+            "wrong refusal: {err}"
+        );
+
+        // 6. The self-FK is still DEFERRABLE INITIALLY DEFERRED (V004): a
+        //    child key may be written BEFORE the key that scrubbed it, inside
+        //    one transaction, and the pair commits. `PRAGMA foreign_key_list`
+        //    does not report deferrability, so the shape snapshot above is
+        //    blind to it — a mutation that dropped the clause survived every
+        //    other leg. An immediate FK refuses the first INSERT.
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                identity_type, identity_ref, valid_from, registration_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_key_id, \
+                scrub_timestamp, persist_row_hash, admitted_at) \
+             VALUES ('k9', 'p', 'hybrid', 'node', 'r', '2026', '{}', X'00', 's', 'k10', \
+                '2026', 'h', '2026');
+             INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                identity_type, identity_ref, valid_from, registration_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_key_id, \
+                scrub_timestamp, persist_row_hash, admitted_at) \
+             VALUES ('k10', 'p', 'hybrid', 'node', 'r', '2026', '{}', X'00', 's', 'k10', \
+                '2026', 'h', '2026');
+             COMMIT;",
+        )
+        .expect(
+            "federation_keys.scrub_key_id must stay DEFERRABLE INITIALLY DEFERRED across \
+             V141 — the bootstrap order (child before its scrubbing key) was refused",
+        );
+    }
+
+    /// The V140-shape seed for the V141 witness: two keys (k2 scrubbed by k1,
+    /// so the self-FK is exercised across the swap; k1 NULL, k2 already
+    /// stamped), one NULL-`admitted_at` row in each of the other thirteen, and
+    /// one row in each of the eight staged referrers. Distinct legacy
+    /// instants per table so a backfill from the WRONG column is visible.
+    const V141_SEED: &str = "
+INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
+VALUES ('k1','pk1','hybrid','node','ref1','2026-01-01T00:00:00+00:00','{}',X'00','sig','k1','2026-01-01T00:00:01+00:00','h', NULL);
+INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
+VALUES ('k2','pk2','hybrid','node','ref2','2026-01-01T00:00:00+00:00','{}',X'00','sig','k1','2026-01-01T00:00:02+00:00','h','2026-02-02T00:00:00+00:00');
+INSERT INTO federation_attestations (attestation_id, attesting_key_id, attested_key_id, attestation_type, asserted_at, attestation_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, tier, promoted_at, admitted_at)
+VALUES ('a1','k1','k2','vouch','2026-01-03T00:00:00+00:00','{\"dimension\":\"coherence\"}',X'00','sig','k1','2026-01-03T00:00:01+00:00','h','federation','2026-01-04T00:00:00+00:00',NULL);
+INSERT INTO attestation_subjects (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) VALUES ('k2','coherence','2026-01-03T00:00:00+00:00','a1','federation','federation');
+INSERT INTO identity_canonical_binding (canonical_hash, federation_key_id, bound_at, binding_attestation_id) VALUES ('ch1','k1','2026-01-03T00:00:00+00:00','a1');
+INSERT INTO federation_revocations (revocation_id, revoked_key_id, revoking_key_id, revoked_at, effective_at, revocation_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
+VALUES ('r1','k2','k1','2026-01-05T00:00:00+00:00','2026-01-05T00:00:00+00:00','{}',X'00','sig','k1','2026-01-05T00:00:01+00:00','h',NULL);
+INSERT INTO federation_revocation_quorum_state (revocation_id, us_observed_at) VALUES ('r1','2026-01-05T00:00:00+00:00');
+INSERT INTO goals (goal_id, declared_by_key_id, declared_at, goal_text, goal_text_canonical, scope_kind, meta_dimension, meta_rationale, persist_row_hash) VALUES ('g1','k1','2026-01-06T00:00:00+00:00','t','t','federation','coherence','r','h');
+INSERT INTO federation_peer_metadata (key_id, persist_row_hash) VALUES ('k1','h');
+INSERT INTO edge_outbound_queue (queue_id, sender_key_id, destination_key_id, message_type, edge_schema_version, envelope_bytes, body_sha256, body_size_bytes, status, next_attempt_after, max_attempts, ttl_seconds, requires_ack)
+VALUES ('q1','k1','k2','m','1',X'00',X'0000000000000000000000000000000000000000000000000000000000000000',1,'pending','2026-01-07T00:00:00+00:00',3,60,0);
+INSERT INTO edge_detection_events (detection_id, tenant_id, detector_kind, subject_key_id, observed_at, evidence, severity, signature, signing_key_id, persist_row_hash) VALUES ('d1','t','kind','k2','2026-01-08T00:00:00+00:00','{}','low','sig','k1','h');
+INSERT INTO federation_trust_grants (grant_id, grantee_key, granter_key, purpose, scope, chain_event_id, chain_event_hash, tenant_id) VALUES ('tg1','k2','k1','technical','s',1,X'00','t');
+INSERT INTO federation_identity_occurrences (identity_key_id, occurrence_key_id, device_class, asserted_at, persist_row_hash, admitted_at) VALUES ('k1','k2','server','2026-01-09T00:00:00+00:00','h',NULL);
+INSERT INTO federation_identity_occurrence_revocations (identity_key_id, occurrence_key_id, revoked_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-10T00:00:00+00:00','2026-01-10T00:00:00+00:00','h',NULL);
+INSERT INTO federation_family_membership_revocations (family_key_id, removed_identity_key_id, removed_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-11T00:00:00+00:00','2026-01-11T00:00:00+00:00','h',NULL);
+INSERT INTO federation_community_membership_revocations (community_key_id, removed_identity_key_id, removed_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-12T00:00:00+00:00','2026-01-12T00:00:00+00:00','h',NULL);
+INSERT INTO federation_location_proofs (subject_key_id, cell_id, cell_resolution, asserted_at, persist_row_hash, admitted_at) VALUES ('k1','cell',5,'2026-01-13T00:00:00+00:00','h',NULL);
+INSERT INTO federation_communities (community_key_id, community_name, members, founded_at, consensus_protocol, persist_row_hash, admitted_at) VALUES ('c1','c','[]','2026-01-14T00:00:00+00:00','quorum:2/3','h',NULL);
+INSERT INTO federation_families (family_key_id, family_name, founded_at, consensus_protocol, persist_row_hash, admitted_at) VALUES ('f1','f','2026-01-15T00:00:00+00:00','majority','h',NULL);
+INSERT INTO federation_organizations (attestation_id, org_id, name, org_type, status, asserted_at, attesting_key_id, signed_envelope, ed25519_signature_base64, persist_row_hash, admitted_at) VALUES ('o1','org','n','t','active','2026-01-16T00:00:00+00:00','k1','{}','s','h',NULL);
+INSERT INTO federation_org_memberships (attestation_id, user_id, org_id, role, status, asserted_at, attesting_key_id, signed_envelope, ed25519_signature_base64, persist_row_hash, admitted_at) VALUES ('m1','u','org','r','active','2026-01-17T00:00:00+00:00','k1','{}','s','h',NULL);
+INSERT INTO federation_partner_records (attestation_id, license_id, partner_id, org_id, license_type, max_autonomy_tier, requires_supervisor, deployment_limit, offline_grace_hours, status, revision, issued_at, expires_at, asserted_at, signed_envelope, persist_row_hash, admitted_at) VALUES ('p1','l','p','org','t','t',0,1,1,'active',1,'2026-01-18T00:00:00+00:00','2027-01-18T00:00:00+00:00','2026-01-18T00:00:00+00:00','{}','h',NULL);
+INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destination, asserted_at, admitted_at) VALUES ('k2','https','d','2026-01-19T00:00:00+00:00',NULL);
+";
+
     /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table
     /// rebuild MUST preserve existing federation_blobs rows (incl. the
     /// V053 access-tracking columns), keep every index, and admit
@@ -44031,10 +44509,10 @@ mod tests {
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, ?2, ?3, 'hybrid', 'agent', ?1, \
                           '2026-01-01T00:00:00Z', '{}', x'00', '', ?1, \
-                          '2026-01-01T00:00:00Z', '0')",
+                          '2026-01-01T00:00:00Z', '0', '2026-01-01T00:00:00Z')",
                 rusqlite::params![key_id, ed_b64, mldsa_b64],
             )
             .expect("seed federation_keys");

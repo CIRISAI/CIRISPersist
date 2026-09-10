@@ -85,6 +85,90 @@ UPDATE predicate guards) and the announcement's binding check (the row check
 guards). The `None => NotHeld` arm for a row-less sha with a live binding is
 a state I19 forbids and no door constructs; it is untested and said so in
 the FSD.
+## [Unreleased — #828]
+
+### Fixed
+
+- **`admitted_at` is `NOT NULL` on sqlite, as it has been on postgres since
+  V130 — fourteen tables rebuilt (CIRISPersist#828).** `admitted_at` is this
+  node's receiver-stamped serve position, added by V123 / V126 / V130. Postgres
+  backfilled and `SET NOT NULL`; SQLite's `ALTER TABLE ADD COLUMN` cannot
+  declare `NOT NULL` without a constant default and cannot alter nullability in
+  place, so on that dialect the column was added nullable and left nullable
+  across `federation_attestations`, `federation_communities`,
+  `federation_community_membership_revocations`, `federation_families`,
+  `federation_family_membership_revocations`,
+  `federation_identity_occurrence_revocations`,
+  `federation_identity_occurrences`, `federation_keys`,
+  `federation_location_proofs`, `federation_organizations`,
+  `federation_org_memberships`, `federation_partner_records`,
+  `federation_revocations` and `transport_destinations`. Invisible for thirteen
+  versions because the schema-parity replayer could not read `SET NOT NULL`;
+  v43.0.0 taught it and declared the fourteen. This cut fixes them.
+
+  **sqlite V141** rebuilds all fourteen under their FINAL names with the drop
+  made inert (the V136 recipe): everything that references a table being
+  dropped — directly or through a cascade — is staged and emptied leaf-first,
+  the table is dropped empty, re-created with `admitted_at TEXT NOT NULL`, and
+  everything is restored parent-first. Thirteen of the fourteen reference
+  `federation_keys`, which is itself rebuilt and carries a self-FK, and whose
+  drop would otherwise CASCADE-wipe `federation_peer_metadata` and
+  `identity_canonical_binding`, SET NULL the binding's attestation column, and
+  be refused outright by `goals` (RESTRICT) — so those, plus
+  `attestation_subjects`, `federation_revocation_quorum_state`,
+  `edge_outbound_queue`, `edge_detection_events` and `federation_trust_grants`,
+  are staged without being rebuilt. Any NULL is backfilled first from the
+  instant the row's cursor ordered by before the column existed (the exact
+  V123 / V126 / V130 expression; the source per table is in the migration
+  header), so no consumer's saved cursor goes backward. Every column (in its
+  existing order), CHECK, default, FK, the `dimension` generated column, all
+  47 indexes and all 4 triggers are reproduced verbatim. The `*_admitted`
+  cursor indexes deliberately keep their now-degenerate `COALESCE(admitted_at,
+  <legacy>)` expressions because the sqlite read doors spell that exact
+  expression; simplifying both is a separate read-side cut.
+
+  **postgres V141** is a no-op twin (catalog comments only) so both trees
+  carry the same version for the same change.
+
+  **Witness.** `v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828`
+  seeds the V140 shape through `run_migrations_through(140)` — a NULL
+  `admitted_at` row in each of the fourteen, one row in each of the eight
+  staged referrers, a self-referencing key pair, a key already stamped —
+  snapshots `sqlite_master` (indexes + triggers), `table_xinfo` and
+  `foreign_key_list` for each table, runs V141, and asserts the snapshot is
+  identical except for exactly fourteen `notnull` flags; every NULL backfilled
+  from the source the header names and no present value overwritten; every
+  referrer still holds its row and the SET NULL did not fire;
+  `foreign_key_check` empty and `integrity_check` ok; `NOT NULL` live on all
+  fourteen; both re-created trigger families still fire. The primary gate is
+  `schema_parity::nullability_agrees_across_the_two_trees`: the fourteen
+  `NULLABILITY_DIVERGENCES` entries are deleted, so a table the rebuild missed
+  reds as an undeclared divergence and a stale entry reds as "delete the
+  entry". `NULLABILITY_DIVERGENCES` now holds one entry (`cirisnode`, #674).
+
+  **Test fixtures.** Thirty-two raw `INSERT`s in sqlite test fixtures (never a
+  production door — every persist write door already stamps `admitted_at` on
+  every backend) omitted the column and relied on sqlite admitting the NULL;
+  each now binds the same instant the old `COALESCE` fallback produced, so
+  cursor-ordering tests are unchanged. `allocator_reads_the_fallback_position_sqlite_682`
+  planted `admitted_at = NULL` to reach the allocator's fallback leg; that
+  state is now unrepresentable on sqlite (as it always was on postgres), so it
+  is reframed as `allocator_fallback_position_is_unrepresentable_sqlite_828`,
+  which pins the refusal — the memory backend keeps the original witness where
+  the state is still reachable.
+
+  **A second text-reading gate corrected.** `crypto_cardinality::every_crypto_column_declares_its_natural_key_789`
+  scans the sqlite migrations line by line for signature/pubkey columns, and
+  its "current table" survived past the end of each statement. V141's
+  `INSERT INTO … SELECT scrub_signature_pqc …` restores were therefore read as
+  columns of whichever `CREATE TABLE` came last — it reported
+  `transport_destinations` carrying `pubkey_ml_dsa_65`, which it never has —
+  and its `CREATE TABLE … AS SELECT` stage tables were read as declaring
+  columns they only copy. The scanner now resets at `;` and treats a CTAS as
+  declaring nothing; a dye run (removing the real `federation_keys.pubkey_ml_dsa_65`
+  declaration) still reds it, so the reset did not blind it. Same class as
+  #828 itself: a gate that reads DDL text must model the DDL the migrations
+  actually use.
 
 ## [43.0.0] - 2026-09-09
 

@@ -275,9 +275,29 @@ mod tests {
                     current = rest.split_whitespace().next().unwrap_or("").to_owned();
                 } else if let Some(rest) = t.strip_prefix("CREATE TABLE ") {
                     current = rest.split_whitespace().next().unwrap_or("").to_owned();
+                    // CIRISPersist#828 — `CREATE TABLE x AS SELECT …` DECLARES no
+                    // column: it copies columns whose own declarations this
+                    // gate already read. V141 stages twenty-two tables that
+                    // way across a rebuild, and attributing their SELECT lists
+                    // would demand a natural key for a table that exists for
+                    // one transaction.
+                    if rest
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+                    {
+                        current.clear();
+                    }
                 } else if let Some(rest) = t.strip_prefix("ALTER TABLE ") {
                     current = rest.split_whitespace().next().unwrap_or("").to_owned();
                 }
+                // CIRISPersist#828 — a marker is attributed only INSIDE the
+                // statement that named the table. Before this the "current"
+                // table survived past its `;`, so V141's `INSERT INTO … SELECT
+                // scrub_signature_pqc …` restores were read as columns of
+                // whichever CREATE TABLE came last — `transport_destinations`
+                // was reported carrying `pubkey_ml_dsa_65`, which it never has.
+                let statement_ends_here = t.ends_with(';');
                 for marker in CRYPTO_COLUMN_MARKERS {
                     if t.contains(marker) && !current.is_empty() {
                         // A DROP retires the column: the migrations are a
@@ -291,6 +311,9 @@ mod tests {
                             found.insert((current.clone(), (*marker).to_owned()));
                         }
                     }
+                }
+                if statement_ends_here {
+                    current.clear();
                 }
             }
         }

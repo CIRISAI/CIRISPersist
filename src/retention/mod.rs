@@ -1007,8 +1007,9 @@ mod tests {
             guard
                 .execute(
                     "INSERT INTO transport_destinations \
-                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
-                     VALUES ('assert-key', 'reticulum', 'dest-assert', ?1, NULL)",
+                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                      admitted_at) \
+                     VALUES ('assert-key', 'reticulum', 'dest-assert', ?1, NULL, ?1)",
                     rusqlite::params![old],
                 )
                 .expect("seed assertion");
@@ -1016,8 +1017,9 @@ mod tests {
             guard
                 .execute(
                     "INSERT INTO transport_destinations \
-                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
-                     VALUES ('seen-key', 'reticulum', 'dest-seen', ?1, ?1)",
+                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                      admitted_at) \
+                     VALUES ('seen-key', 'reticulum', 'dest-seen', ?1, ?1, ?1)",
                     rusqlite::params![old],
                 )
                 .expect("seed observation");
