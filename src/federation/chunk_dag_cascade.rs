@@ -32,6 +32,38 @@ use crate::federation::types::cohort_scope::CryptoTier;
 /// request handler. A judgement, recorded in §12.4.
 pub const DAG_WHOLE_READ_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
+/// #838 (§12.10) — the domain-separation label of a chunk's AAD.
+pub const CHUNK_AAD_DOMAIN: &[u8] = b"ciris-persist:chunk:v1";
+
+/// #838 (§12.10) — **a chunk's associated data is its position.** The bytes
+/// every sealed chunk is bound to at write and every reader rebuilds:
+///
+/// ```text
+/// "ciris-persist:chunk:v1"
+///   ‖ u64_be(len(caller_aad)) ‖ caller_aad      (absent ⇒ length 0)
+///   ‖ u64_be(len(stream_id))  ‖ stream_id       (UTF-8)
+///   ‖ u64_be(seq)
+/// ```
+///
+/// Domain-separated (a chunk's AAD can never collide with a caller's own
+/// bytes on a whole blob or a manifest) and length-prefixed (no boundary
+/// ambiguity between the caller's data and the stream id). Pure, no backend
+/// `cfg`; its bytes are pinned by `tests::chunk_aad_bytes_are_pinned`. The
+/// manifest's own AAD stays the caller's — it has no position.
+#[must_use]
+pub fn chunk_aad(caller_aad: Option<&[u8]>, stream_id: &str, seq: u64) -> Vec<u8> {
+    let caller = caller_aad.unwrap_or(&[]);
+    let mut out =
+        Vec::with_capacity(CHUNK_AAD_DOMAIN.len() + 8 + caller.len() + 8 + stream_id.len() + 8);
+    out.extend_from_slice(CHUNK_AAD_DOMAIN);
+    out.extend_from_slice(&(caller.len() as u64).to_be_bytes());
+    out.extend_from_slice(caller);
+    out.extend_from_slice(&(stream_id.len() as u64).to_be_bytes());
+    out.extend_from_slice(stream_id.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out
+}
+
 /// What `put_blob_chunk_scoped` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutChunkScopedResult {
@@ -80,7 +112,7 @@ pub mod orchestrate {
     };
     use crate::federation::blobs::{
         BlobHead, ChunkManifest, ChunkRef, EpochBinding, ManifestRowSpec, StreamChunkRef,
-        CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
+        StreamClaim, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
     };
     use crate::federation::community_dek::orchestrate::{
         ensure_epoch_dek, open_community_row_as_persist, read_for_community_viewer_sealed,
@@ -116,11 +148,18 @@ pub mod orchestrate {
     ///
     /// `epoch` is the producer's stream epoch label (the nonce-cap axis) and
     /// is recorded as given; which DEK sealed a community chunk is the chunk
-    /// row's binding — a separate fact. `aad` is the #831 hook, passed to
-    /// `seal` and ignored there until CIRISVerify#279 lands.
+    /// row's binding — a separate fact.
+    ///
+    /// `signer` is the WRITER (#837, §12.9): its derived key id is the
+    /// stream's owner on the first append and must match on every later
+    /// one; a foreign writer is refused at its first chunk. `aad` (#831) is
+    /// the caller's associated data; at a sealed tier the chunk is bound to
+    /// `chunk_aad(aad, stream_id, seq)` — its position — not to `aad` alone
+    /// (#838, §12.10).
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_chunk_scoped<B>(
         backend: &B,
+        signer: &dyn ciris_keyring::HardwareSigner,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         stream_id: &str,
@@ -133,11 +172,24 @@ pub mod orchestrate {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let tier = resolve_write_tier(backend, cohort_scope, community_key_id).await?;
+        // #837 (§12.9) — the writer, derived from the signer (never an
+        // alias, I23): the stream's owner on its first append.
+        let owner_key_id = crate::signing::federation_key_id_of(signer)
+            .await
+            .map_err(|e| {
+                BlobError::Backend(format!("put_blob_chunk_scoped: signer key id: {e}"))
+            })?;
+        let claim = || StreamClaim {
+            community_key_id: community_key_id.map(str::to_owned),
+            owner_key_id: Some(owner_key_id.clone()),
+        };
         // §11.2 (5) / I21 — the matcher sees the PLAINTEXT, once, before
         // anything is sealed; the chunk floor never screens.
         let plain_sha: [u8; 32] = Sha256::digest(plaintext).into();
         backend.screen_inline_body(&plain_sha, plaintext).await?;
         let plaintext_size = plaintext.len() as u64;
+        // #838 (§12.10) — a sealed chunk's AAD is its POSITION.
+        let bound_aad = chunk_aad(aad, stream_id, seq);
         match tier {
             CryptoTier::Plaintext => {
                 crate::federation::at_rest_cascade::refuse_aad_at_plaintext(&plain_sha, aad)?;
@@ -151,6 +203,7 @@ pub mod orchestrate {
                         cohort_scope,
                         StorageFloor::resolved(CryptoTier::Plaintext),
                         None,
+                        claim(),
                     )
                     .await?;
                 Ok(PutChunkScopedResult {
@@ -169,7 +222,7 @@ pub mod orchestrate {
                     ))
                 })?;
                 let dek = fresh_dek().map_err(map_at_rest_err)?;
-                let envelope = seal(&dek, plaintext, aad).map_err(map_at_rest_err)?;
+                let envelope = seal(&dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
                 let sha = backend
                     .put_blob_chunk_with_scope(
                         stream_id,
@@ -180,6 +233,7 @@ pub mod orchestrate {
                         cohort_scope,
                         StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
                         None,
+                        claim(),
                     )
                     .await?;
                 let (granted, excluded) =
@@ -201,7 +255,8 @@ pub mod orchestrate {
                     let dek_epoch = backend.community_dek_current_epoch(comm).await?;
                     let (dek, granted, excluded) =
                         ensure_epoch_dek(backend, comm, dek_epoch).await?;
-                    let envelope = seal(&dek, plaintext, aad).map_err(map_at_rest_err)?;
+                    let envelope =
+                        seal(&dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
                     match backend
                         .put_blob_chunk_with_scope(
                             stream_id,
@@ -215,6 +270,7 @@ pub mod orchestrate {
                                 community_key_id: comm.to_owned(),
                                 epoch: dek_epoch,
                             }),
+                            claim(),
                         )
                         .await
                     {
@@ -284,6 +340,20 @@ pub mod orchestrate {
                 "stream {stream_id} has no chunks"
             )));
         }
+        let signer_key_id = crate::signing::federation_key_id_of(signer)
+            .await
+            .map_err(|e| BlobError::Backend(format!("seal_stream_scoped: signer key id: {e}")))?;
+        // #837 (§12.9 / I41) — the stream's ROW first: a seal by a signer
+        // that is not the owner, or at a cohort / community that is not
+        // the stream's, is refused before any chunk row is looked at.
+        check_stream_head_matches(
+            listing.stream.as_ref(),
+            stream_id,
+            cohort_scope,
+            community_key_id,
+            &signer_key_id,
+            "seal_stream_scoped",
+        )?;
         // I32 — the door checks the ROWS, not the stream's word.
         check_chunk_rows_match_dag(
             backend,
@@ -293,14 +363,11 @@ pub mod orchestrate {
             community_key_id,
         )
         .await?;
-        let manifest = build_manifest(&listing.chunks, tier)?;
+        let manifest = build_manifest(stream_id, &listing.chunks, tier)?;
         let chunk_count = listing.chunks.len() as u64;
         let total_size = manifest.total_size;
         let jcs = manifest.to_jcs_bytes();
         let now = chrono::Utc::now();
-        let signer_key_id = crate::signing::federation_key_id_of(signer)
-            .await
-            .map_err(|e| BlobError::Backend(format!("seal_stream_scoped: signer key id: {e}")))?;
 
         match tier {
             CryptoTier::Plaintext => {
@@ -510,14 +577,59 @@ pub mod orchestrate {
         Ok(())
     }
 
-    /// The manifest over a listing: v2 with `chunk_tier` for a sealed tier,
-    /// v1 for plaintext; sizes are PLAINTEXT sizes either way.
+    /// #837 (§12.9 / I41) — **the stream's row is the first guard at the
+    /// seal.** `None` (a stream with chunks but no row) cannot arise after
+    /// V143 — the floor writes the row in the first chunk's transaction and
+    /// the backfill covers every older stream — so it is corruption, not a
+    /// pass. An owner that is not the signer is refused WITHOUT naming the
+    /// owner; a `NULL` owner (unclaimed) admits any signer.
+    fn check_stream_head_matches(
+        head: Option<&crate::federation::StreamHead>,
+        stream_id: &str,
+        cohort_scope: &str,
+        community_key_id: Option<&str>,
+        signer_key_id: &str,
+        door: &str,
+    ) -> Result<(), BlobError> {
+        let Some(head) = head else {
+            return Err(BlobError::Backend(format!(
+                "{door}: stream {stream_id} has chunk rows but no federation_streams row — \
+                 corruption (V143 writes it with the first chunk and backfills the rest)"
+            )));
+        };
+        if head.cohort_scope != cohort_scope || head.community_key_id.as_deref() != community_key_id
+        {
+            return Err(BlobError::InvalidArgument(format!(
+                "{door}: stream {stream_id} belongs to cohort {:?}, community {:?}; this call \
+                 names cohort {cohort_scope:?}, community {community_key_id:?} \
+                 (BLOB_ENCRYPTION_AT_REST.md §12.9, I41)",
+                head.cohort_scope, head.community_key_id
+            )));
+        }
+        if let Some(owner) = head.owner_key_id.as_deref() {
+            if owner != signer_key_id {
+                return Err(BlobError::InvalidArgument(format!(
+                    "{door}: stream {stream_id} belongs to another writer (cohort {:?}, \
+                     community {:?}); a seal by a different key is refused \
+                     (BLOB_ENCRYPTION_AT_REST.md §12.9, I41)",
+                    head.cohort_scope, head.community_key_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The manifest over a listing: v2 with `chunk_tier`, `stream_id` and
+    /// each chunk's `seq` for a sealed tier (#838), v1 for plaintext; sizes
+    /// are PLAINTEXT sizes either way.
     fn build_manifest(
+        stream_id: &str,
         chunks: &[StreamChunkRef],
         tier: CryptoTier,
     ) -> Result<ChunkManifest, BlobError> {
         let mut total_size: u64 = 0;
         let mut refs = Vec::with_capacity(chunks.len());
+        let positioned = tier != CryptoTier::Plaintext;
         for c in chunks {
             let size = u32::try_from(c.plaintext_size).map_err(|_| {
                 BlobError::InvalidArgument(format!(
@@ -531,17 +643,23 @@ pub mod orchestrate {
             refs.push(ChunkRef {
                 sha: c.chunk_sha,
                 size,
+                seq: positioned.then_some(c.seq),
             });
         }
-        let (v, chunk_tier) = match tier {
-            CryptoTier::Plaintext => (CHUNK_MANIFEST_VERSION, None),
-            sealed => (CHUNK_MANIFEST_VERSION_SEALED, Some(sealed)),
+        let (v, chunk_tier, stream_id) = match tier {
+            CryptoTier::Plaintext => (CHUNK_MANIFEST_VERSION, None, None),
+            sealed => (
+                CHUNK_MANIFEST_VERSION_SEALED,
+                Some(sealed),
+                Some(stream_id.to_owned()),
+            ),
         };
         Ok(ChunkManifest {
             v,
             total_size,
             chunks: refs,
             chunk_tier,
+            stream_id,
         })
     }
 
@@ -825,97 +943,34 @@ pub mod orchestrate {
         // lookup per distinct epoch in the range, not one per chunk.
         let mut authorized_epochs: std::collections::HashSet<(String, u64)> =
             std::collections::HashSet::new();
+        // #838 (§12.10) — the manifest names the position every chunk was
+        // sealed at; the parser guarantees both fields for v2.
+        let stream_id = manifest.stream_id.as_deref().ok_or_else(|| {
+            BlobError::Backend(format!(
+                "blob {} is a sealed chunk_dag whose manifest carries no stream_id",
+                hex::encode(sha256)
+            ))
+        })?;
         for slice in manifest.slices_for_range(start, end) {
             let cref = &manifest.chunks[slice.index];
-            // A covering chunk with no row: the same fact as a missing blob —
-            // swept (I31) or never ours — told the same way (I4b).
-            let Some(chunk_head) = backend.blob_head(&cref.sha).await? else {
-                return Err(
-                    crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
-                        backend,
-                        &cref.sha,
-                        viewer_key_id,
-                    )
-                    .await?,
-                );
-            };
-            // The CHUNK ROW is the authority on its own tier (I2 / I32).
-            if chunk_head.crypto_tier != tier {
-                return Err(BlobError::Backend(format!(
-                    "chunk_dag chunk {} is recorded at tier {:?} but the DAG is {tier:?}",
-                    hex::encode(cref.sha),
-                    chunk_head.crypto_tier
-                )));
-            }
-            let Some(BlobBody::Inline(bytes)) = backend.get_blob(&cref.sha).await? else {
-                return Err(BlobError::Backend(format!(
-                    "chunk_dag covering chunk {} is not an inline row",
-                    hex::encode(cref.sha)
-                )));
-            };
-            // CEG §10.1.1 — the chunk's sha (over its CIPHERTEXT) before use.
-            let computed: [u8; 32] = Sha256::digest(&bytes).into();
-            if computed != cref.sha {
-                return Err(BlobError::HashMismatch {
-                    expected_hex: hex::encode(cref.sha),
-                    got_hex: hex::encode(computed),
-                });
-            }
-            let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+            let seq = cref.seq.ok_or_else(|| {
                 BlobError::Backend(format!(
-                    "chunk_dag chunk {} is recorded at tier {tier:?} but is not an envelope ({e})",
+                    "blob {} is a sealed chunk_dag whose manifest chunk {} carries no seq",
+                    hex::encode(sha256),
                     hex::encode(cref.sha)
                 ))
             })?;
-            let plain = match tier {
-                CryptoTier::Plaintext => unreachable!("dispatched above"),
-                CryptoTier::InvisibleEncrypted => {
-                    // The viewer's grant on THIS chunk row (I38).
-                    if backend
-                        .get_at_rest_grant(&cref.sha, viewer_key_id)
-                        .await?
-                        .is_none()
-                    {
-                        return Err(BlobError::NotGranted {
-                            sha256_hex: hex::encode(sha256),
-                            viewer_key_id: viewer_key_id.to_owned(),
-                        });
-                    }
-                    read_for_viewer_sealed(backend, &cref.sha, &envelope, aad).await?
-                }
-                CryptoTier::CommunityDek => {
-                    // The chunk's OWN binding names the DEK that sealed it —
-                    // a pre-rotation chunk opens under its old epoch (I38) —
-                    // and the viewer must hold a grant on that epoch.
-                    let (community, epoch) = backend
-                        .community_dek_blob_epoch(&cref.sha)
-                        .await?
-                        .ok_or_else(|| {
-                            BlobError::Backend(format!(
-                                "chunk_dag chunk {} is recorded at community_dek but carries no \
-                                 epoch binding",
-                                hex::encode(cref.sha)
-                            ))
-                        })?;
-                    let key = (community.clone(), epoch);
-                    if !authorized_epochs.contains(&key) {
-                        if !backend
-                            .community_dek_has_member_grant(&community, epoch, viewer_key_id)
-                            .await?
-                        {
-                            return Err(BlobError::NotGranted {
-                                sha256_hex: hex::encode(sha256),
-                                viewer_key_id: viewer_key_id.to_owned(),
-                            });
-                        }
-                        authorized_epochs.insert(key);
-                    }
-                    open_community_row_as_persist(
-                        backend, &cref.sha, &community, epoch, &envelope, aad,
-                    )
-                    .await?
-                }
-            };
+            let bound_aad = chunk_aad(aad, stream_id, seq);
+            let plain = open_stream_chunk_row_for_viewer(
+                backend,
+                sha256,
+                &cref.sha,
+                tier,
+                viewer_key_id,
+                &bound_aad,
+                &mut authorized_epochs,
+            )
+            .await?;
             if plain.len() as u64 != u64::from(cref.size) {
                 return Err(BlobError::Backend(format!(
                     "chunk_dag chunk {} opened to {} bytes but the manifest says {}",
@@ -929,6 +984,209 @@ pub mod orchestrate {
             );
         }
         Ok(out)
+    }
+
+    /// §12.4 / §12.10 — **open ONE sealed stream chunk row for a viewer,
+    /// under its position-bound AAD.** The row must exist (else the shared
+    /// #833 refusal — swept or never ours, told only to an authorized
+    /// viewer), must record `tier`, its sha is re-verified over the stored
+    /// bytes (CEG §10.1.1), the viewer is authorized on THIS chunk — their
+    /// grant on the row at `self` / `family`, their grant on the row's OWN
+    /// binding's epoch at `community` (I38; memoized in `authorized_epochs`
+    /// so a range costs one lookup per distinct epoch) — and only then the
+    /// envelope opens under `bound_aad`. A refusal names `refused_sha` (the
+    /// DAG the viewer asked for, or the chunk itself).
+    async fn open_stream_chunk_row_for_viewer<B>(
+        backend: &B,
+        refused_sha: &[u8; 32],
+        chunk_sha: &[u8; 32],
+        tier: CryptoTier,
+        viewer_key_id: &str,
+        bound_aad: &[u8],
+        authorized_epochs: &mut std::collections::HashSet<(String, u64)>,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        // A chunk with no row: the same fact as a missing blob — swept (I31)
+        // or never ours — told the same way (I4b).
+        let Some(chunk_head) = backend.blob_head(chunk_sha).await? else {
+            return Err(
+                crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
+                    backend,
+                    chunk_sha,
+                    viewer_key_id,
+                )
+                .await?,
+            );
+        };
+        // The CHUNK ROW is the authority on its own tier (I2 / I32).
+        if chunk_head.crypto_tier != tier {
+            return Err(BlobError::Backend(format!(
+                "stream chunk {} is recorded at tier {:?} but was asked for at {tier:?}",
+                hex::encode(chunk_sha),
+                chunk_head.crypto_tier
+            )));
+        }
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(chunk_sha).await? else {
+            return Err(BlobError::Backend(format!(
+                "stream chunk {} is not an inline row",
+                hex::encode(chunk_sha)
+            )));
+        };
+        // CEG §10.1.1 — the chunk's sha (over its CIPHERTEXT) before use.
+        let computed: [u8; 32] = Sha256::digest(&bytes).into();
+        if computed != *chunk_sha {
+            return Err(BlobError::HashMismatch {
+                expected_hex: hex::encode(chunk_sha),
+                got_hex: hex::encode(computed),
+            });
+        }
+        let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+            BlobError::Backend(format!(
+                "stream chunk {} is recorded at tier {tier:?} but is not an envelope ({e})",
+                hex::encode(chunk_sha)
+            ))
+        })?;
+        match tier {
+            CryptoTier::Plaintext => Err(BlobError::Backend(format!(
+                "stream chunk {} is plaintext; nothing to open",
+                hex::encode(chunk_sha)
+            ))),
+            CryptoTier::InvisibleEncrypted => {
+                // The viewer's grant on THIS chunk row (I38).
+                if backend
+                    .get_at_rest_grant(chunk_sha, viewer_key_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(BlobError::NotGranted {
+                        sha256_hex: hex::encode(refused_sha),
+                        viewer_key_id: viewer_key_id.to_owned(),
+                    });
+                }
+                read_for_viewer_sealed(backend, chunk_sha, &envelope, Some(bound_aad)).await
+            }
+            CryptoTier::CommunityDek => {
+                // The chunk's OWN binding names the DEK that sealed it — a
+                // pre-rotation chunk opens under its old epoch (I38) — and the
+                // viewer must hold a grant on that epoch.
+                let (community, epoch) = backend
+                    .community_dek_blob_epoch(chunk_sha)
+                    .await?
+                    .ok_or_else(|| {
+                        BlobError::Backend(format!(
+                            "stream chunk {} is recorded at community_dek but carries no epoch \
+                             binding",
+                            hex::encode(chunk_sha)
+                        ))
+                    })?;
+                let key = (community.clone(), epoch);
+                if !authorized_epochs.contains(&key) {
+                    if !backend
+                        .community_dek_has_member_grant(&community, epoch, viewer_key_id)
+                        .await?
+                    {
+                        return Err(BlobError::NotGranted {
+                            sha256_hex: hex::encode(refused_sha),
+                            viewer_key_id: viewer_key_id.to_owned(),
+                        });
+                    }
+                    authorized_epochs.insert(key);
+                }
+                open_community_row_as_persist(
+                    backend,
+                    chunk_sha,
+                    &community,
+                    epoch,
+                    &envelope,
+                    Some(bound_aad),
+                )
+                .await
+            }
+        }
+    }
+
+    /// #838 (§12.10) — **read one chunk of a stream by POSITION, as
+    /// `viewer_key_id`.** The DVR / catch-up read (§12.5): `stream_chunk_at`
+    /// names the row at `(stream_id, seq)`, the row's tier authorizes the
+    /// viewer before any body is touched (I4), and a sealed chunk opens
+    /// under `chunk_aad(aad, stream_id, seq)` — the position it was written
+    /// at, which is why a sealed chunk no longer opens by its sha alone
+    /// through the whole-blob doors. A plaintext chunk is returned as stored
+    /// (and `Some(aad)` is refused, I40). An unknown position is
+    /// `InvalidArgument`; a position whose row is gone is the shared #833
+    /// refusal.
+    pub async fn read_stream_chunk_as<B>(
+        backend: &B,
+        stream_id: &str,
+        seq: u64,
+        viewer_key_id: &str,
+        aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(c) = backend.stream_chunk_at(stream_id, seq).await? else {
+            return Err(BlobError::InvalidArgument(format!(
+                "stream {stream_id} has no chunk at seq {seq}"
+            )));
+        };
+        // 1. The ROW says what this is (§11.1); absent ⇒ the shared refusal.
+        let Some(head) = backend.blob_head(&c.chunk_sha).await? else {
+            return Err(
+                crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
+                    backend,
+                    &c.chunk_sha,
+                    viewer_key_id,
+                )
+                .await?,
+            );
+        };
+        // 2. AUTHORIZE BY TIER, BEFORE TOUCHING ANY BODY (§11.3 / I4).
+        authorize_viewer_by_tier(backend, &c.chunk_sha, head.crypto_tier, viewer_key_id).await?;
+        // 3. Open under the position.
+        let plain = match head.crypto_tier {
+            CryptoTier::Plaintext => {
+                crate::federation::at_rest_cascade::refuse_aad_at_plaintext(&c.chunk_sha, aad)?;
+                let Some(BlobBody::Inline(bytes)) = backend.get_blob(&c.chunk_sha).await? else {
+                    return Err(BlobError::Backend(format!(
+                        "stream chunk {} is not an inline row",
+                        hex::encode(c.chunk_sha)
+                    )));
+                };
+                let computed: [u8; 32] = Sha256::digest(&bytes).into();
+                if computed != c.chunk_sha {
+                    return Err(BlobError::HashMismatch {
+                        expected_hex: hex::encode(c.chunk_sha),
+                        got_hex: hex::encode(computed),
+                    });
+                }
+                bytes
+            }
+            tier => {
+                let bound_aad = chunk_aad(aad, stream_id, seq);
+                open_stream_chunk_row_for_viewer(
+                    backend,
+                    &c.chunk_sha,
+                    &c.chunk_sha,
+                    tier,
+                    viewer_key_id,
+                    &bound_aad,
+                    &mut std::collections::HashSet::new(),
+                )
+                .await?
+            }
+        };
+        if plain.len() as u64 != c.plaintext_size {
+            return Err(BlobError::Backend(format!(
+                "stream chunk {} opened to {} bytes but its index row says {}",
+                hex::encode(c.chunk_sha),
+                plain.len(),
+                c.plaintext_size
+            )));
+        }
+        Ok(plain)
     }
 }
 
@@ -984,11 +1242,28 @@ pub mod invariants {
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
+        sealed_community_stream_as(backend, &adapter, tag, comm, stream, segments).await
+    }
+
+    /// [`sealed_community_stream`] with the WRITER given: every chunk and
+    /// the seal are signed by `adapter`, so the stream belongs to it (#837).
+    async fn sealed_community_stream_as<B>(
+        backend: &B,
+        adapter: &dyn ciris_keyring::HardwareSigner,
+        tag: &str,
+        comm: &str,
+        stream: &str,
+        segments: &[Vec<u8>],
+    ) -> ([u8; 32], Vec<[u8; 32]>, Vec<u8>)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         let mut shas = Vec::new();
         let mut plain = Vec::new();
         for (i, seg) in segments.iter().enumerate() {
             let r = put_blob_chunk_scoped(
                 backend,
+                adapter,
                 COMMUNITY,
                 Some(comm),
                 stream,
@@ -1004,7 +1279,7 @@ pub mod invariants {
             plain.extend_from_slice(seg);
         }
         let sealed =
-            seal_stream_scoped(backend, &adapter, COMMUNITY, Some(comm), stream, None, None)
+            seal_stream_scoped(backend, adapter, COMMUNITY, Some(comm), stream, None, None)
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: a community stream must seal: {e}"));
         assert_eq!(sealed.chunk_count, segments.len() as u64);
@@ -1085,39 +1360,11 @@ pub mod invariants {
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
 
-        // A community stream whose second chunk arrived through the commons
-        // door: a plaintext row under a sealed DAG.
-        let mixed = format!("{tag}-mixed-{run}");
-        put_blob_chunk_scoped(
-            backend,
-            COMMUNITY,
-            Some(&comm),
-            &mixed,
-            0,
-            b"sealed",
-            0,
-            None,
-        )
-        .await
-        .unwrap();
-        backend
-            .put_blob_chunk(&mixed, 1, BlobBody::Inline(b"in the clear".to_vec()), 0)
+        let owner = crate::signing::federation_key_id_of(&adapter)
             .await
             .unwrap();
-        let res = seal_stream_scoped(
-            backend,
-            &adapter,
-            COMMUNITY,
-            Some(&comm),
-            &mixed,
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(res, Err(BlobError::InvalidArgument(_))),
-            "{tag} I32: a community DAG was sealed over a PLAINTEXT chunk row: {res:?}"
-        );
+        // (Before #837 this witness also staged a mixed stream through the
+        // commons door; the chunk floor now refuses that append — I41.)
 
         // A community stream carrying a chunk row at the SAME cohort but at
         // `plaintext` (placed through the floor as an infra-community write
@@ -1125,10 +1372,11 @@ pub mod invariants {
         // matches — and the refusal must be the door's InvalidArgument, not
         // a corruption report from a later step.
         {
-            use crate::federation::StorageFloor;
+            use crate::federation::{StorageFloor, StreamClaim};
             let same_cohort = format!("{tag}-same-cohort-{run}");
             put_blob_chunk_scoped(
                 backend,
+                &adapter,
                 COMMUNITY,
                 Some(&comm),
                 &same_cohort,
@@ -1149,6 +1397,10 @@ pub mod invariants {
                     COMMUNITY,
                     StorageFloor::resolved(CryptoTier::Plaintext),
                     None,
+                    StreamClaim {
+                        community_key_id: Some(comm.clone()),
+                        owner_key_id: Some(owner.clone()),
+                    },
                 )
                 .await
                 .unwrap();
@@ -1199,7 +1451,7 @@ pub mod invariants {
         // token over a body that is not an envelope, and a plaintext token
         // whose declared size is not the body's.
         {
-            use crate::federation::{EpochBinding, StorageFloor};
+            use crate::federation::{EpochBinding, StorageFloor, StreamClaim};
             let floor_stream = format!("{tag}-floor-{run}");
             let res = backend
                 .put_blob_chunk_with_scope(
@@ -1214,6 +1466,7 @@ pub mod invariants {
                         community_key_id: comm.clone(),
                         epoch: 0,
                     }),
+                    StreamClaim::default(),
                 )
                 .await;
             assert!(
@@ -1234,6 +1487,7 @@ pub mod invariants {
                     COMMUNITY,
                     StorageFloor::resolved(CryptoTier::Plaintext),
                     None,
+                    StreamClaim::default(),
                 )
                 .await;
             assert!(
@@ -1466,10 +1720,19 @@ pub mod invariants {
         let mut plain = Vec::new();
         let mut chunk_shas = Vec::new();
         for (i, seg) in segs.iter().enumerate() {
-            let r =
-                put_blob_chunk_scoped(backend, SELF, Some(&owner), &stream, i as u64, seg, 0, None)
-                    .await
-                    .unwrap_or_else(|e| panic!("{tag} I34b: self chunk {i}: {e}"));
+            let r = put_blob_chunk_scoped(
+                backend,
+                &adapter,
+                SELF,
+                Some(&owner),
+                &stream,
+                i as u64,
+                seg,
+                0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I34b: self chunk {i}: {e}"));
             assert_eq!(r.tier, CryptoTier::InvisibleEncrypted);
             assert!(
                 r.granted.contains(&occ),
@@ -1554,9 +1817,19 @@ pub mod invariants {
         {
             let stream2 = format!("{tag}-stream2-{run}");
             let seg = segment(13, 700);
-            let c = put_blob_chunk_scoped(backend, SELF, Some(&owner), &stream2, 0, &seg, 0, None)
-                .await
-                .unwrap();
+            let c = put_blob_chunk_scoped(
+                backend,
+                &adapter,
+                SELF,
+                Some(&owner),
+                &stream2,
+                0,
+                &seg,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
             let later_occ = format!("{tag}-owner-later-occ-{run}");
             seed_occurrence(backend, &owner, &later_occ).await;
             let sealed2 =
@@ -1716,6 +1989,13 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let writer = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                backend,
+                &format!("{tag}-writer-{run}"),
+            )
+            .await,
+        );
         let stream = format!("{tag}-stream-{run}");
         assert_eq!(
             backend.stream_chunks(&stream).await.unwrap(),
@@ -1727,6 +2007,7 @@ pub mod invariants {
         for (i, seg) in segs.iter().enumerate() {
             let r = put_blob_chunk_scoped(
                 backend,
+                &writer,
                 COMMUNITY,
                 Some(&comm),
                 &stream,
@@ -1742,6 +2023,17 @@ pub mod invariants {
         let listing = backend.stream_chunks(&stream).await.unwrap();
         assert_eq!(listing.sth_tree_size, None, "{tag} I37: no STH yet");
         assert_eq!(listing.chunks.len(), 2);
+        // #837 — the listing carries the stream's row: cohort, community,
+        // owner (the writer's DERIVED key id).
+        assert_eq!(
+            listing.stream,
+            Some(crate::federation::StreamHead {
+                cohort_scope: COMMUNITY.into(),
+                community_key_id: Some(comm.clone()),
+                owner_key_id: Some(crate::signing::federation_key_id_of(&writer).await.unwrap()),
+            }),
+            "{tag} I37: the listing reports who owns the stream and at what cohort"
+        );
         for (i, c) in listing.chunks.iter().enumerate() {
             assert_eq!(c.seq, i as u64, "{tag} I37: seq order");
             assert_eq!(c.chunk_sha, shas[i]);
@@ -1778,13 +2070,14 @@ pub mod invariants {
             2,
             "{tag} I37: the tail past the STH is still listed"
         );
-        // The chunk is readable by its own sha, before any seal (DVR).
+        // The chunk is readable by its POSITION, before any seal (DVR) —
+        // #838: a sealed chunk is bound to where it was written.
         assert_eq!(
-            read_any_range_for_viewer(backend, &shas[0], &alice_occ, 10, 19, None)
+            super::orchestrate::read_stream_chunk_as(backend, &stream, 0, &alice_occ, None)
                 .await
                 .unwrap(),
-            segs[0][10..=19].to_vec(),
-            "{tag} I37: an unsealed stream's chunk opens by its own address"
+            segs[0],
+            "{tag} I37: an unsealed stream's chunk opens by its position"
         );
     }
 
@@ -1814,9 +2107,22 @@ pub mod invariants {
         let seg0 = segment(21, 900);
         let seg1 = segment(22, 600);
 
-        let c0 = put_blob_chunk_scoped(backend, COMMUNITY, Some(&comm), &stream, 0, &seg0, 0, None)
+        let owner = crate::signing::federation_key_id_of(&adapter)
             .await
             .unwrap();
+        let c0 = put_blob_chunk_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            0,
+            &seg0,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         let e0 = c0.epoch.unwrap();
         assert!(
             c0.granted.contains(&bob_occ),
@@ -1824,9 +2130,19 @@ pub mod invariants {
         );
         // The rotation: bob is removed and the epoch bumps transactionally.
         revoke_member(backend, &comm, &bob).await;
-        let c1 = put_blob_chunk_scoped(backend, COMMUNITY, Some(&comm), &stream, 1, &seg1, 0, None)
-            .await
-            .unwrap();
+        let c1 = put_blob_chunk_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            &seg1,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         let e1 = c1.epoch.unwrap();
         assert!(e1 > e0, "{tag} I38: precondition — rotated");
         assert!(
@@ -1838,7 +2154,7 @@ pub mod invariants {
         // blob row, no index row, nothing to orphan.
         {
             use crate::federation::at_rest_cascade::{fresh_dek, seal};
-            use crate::federation::{EpochBinding, StorageFloor};
+            use crate::federation::{EpochBinding, StorageFloor, StreamClaim};
             assert_eq!(
                 backend.community_dek_key_state(&comm, e0).await.unwrap(),
                 Some(crate::federation::DekKeyState::Enabled),
@@ -1861,6 +2177,10 @@ pub mod invariants {
                         community_key_id: comm.clone(),
                         epoch: e0,
                     }),
+                    StreamClaim {
+                        community_key_id: Some(comm.clone()),
+                        owner_key_id: Some(owner.clone()),
+                    },
                 )
                 .await;
             assert!(
@@ -1945,18 +2265,720 @@ pub mod invariants {
             "{tag} I38: the removed member is refused the post-rotation manifest"
         );
         assert_eq!(
-            read_any_range_for_viewer(backend, &c0.chunk_sha256, &bob_occ, 0, 9, None)
+            super::orchestrate::read_stream_chunk_as(backend, &stream, 0, &bob_occ, None)
                 .await
                 .unwrap(),
-            seg0[..10].to_vec(),
-            "{tag} I38: AV-70 forward-only — bob keeps the pre-rotation chunk"
+            seg0,
+            "{tag} I38: AV-70 forward-only — bob keeps the pre-rotation chunk (by position)"
         );
         assert!(
             matches!(
-                read_any_range_for_viewer(backend, &c1.chunk_sha256, &bob_occ, 0, 9, None).await,
+                super::orchestrate::read_stream_chunk_as(backend, &stream, 1, &bob_occ, None).await,
                 Err(BlobError::NotGranted { .. })
             ),
             "{tag} I38: bob is refused the post-rotation chunk"
+        );
+    }
+
+    // ── I41 ──────────────────────────────────────────────────────────────
+    /// **A stream belongs to its first append** (§12.9, #837). The first
+    /// chunk of a `stream_id` fixes its cohort, community and WRITER; a later
+    /// append that does not match all three is refused AT THAT CHUNK, storing
+    /// nothing, with a refusal that names the stream's cohort and community
+    /// and never the owner's key; the owner keeps appending; a seal by a
+    /// different signer is refused; the seal over a mixed stream stays
+    /// refused by I32; an unclaimed (commons-started) stream is adopted by
+    /// its first attributed append and is then owned; `stream_chunks`
+    /// reports the row.
+    ///
+    /// Written first in a PROBE form against the v44.0.0 surface (the door
+    /// had no writer parameter, so the foreign append was a second
+    /// community, a second cohort and the commons door on one id) and RED
+    /// on 8d5e860 on both backends: the second community's append returned
+    /// `Ok` and interleaved. This is the final form, with two writers.
+    pub async fn exercise_i41_a_stream_belongs_to_its_first_append<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::types::cohort_scope::FEDERATION;
+        use crate::federation::{StorageFloor, StreamClaim, StreamHead};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let other = format!("{tag}-other-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+        seed_community(backend, &other, &[(&bob, &bob_occ)]).await;
+        // Two writers, each a registered node key.
+        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                backend,
+                &format!("{tag}-writer-a-{run}"),
+            )
+            .await,
+        );
+        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                backend,
+                &format!("{tag}-writer-b-{run}"),
+            )
+            .await,
+        );
+        let key_a = crate::signing::federation_key_id_of(&writer_a)
+            .await
+            .unwrap();
+        let key_b = crate::signing::federation_key_id_of(&writer_b)
+            .await
+            .unwrap();
+        assert_ne!(key_a, key_b);
+        let stream = format!("{tag}-stream-{run}");
+
+        put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            0,
+            b"first",
+            0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I41: the first append: {e}"));
+        assert_eq!(
+            backend.stream_chunks(&stream).await.unwrap().stream,
+            Some(StreamHead {
+                cohort_scope: COMMUNITY.into(),
+                community_key_id: Some(comm.clone()),
+                owner_key_id: Some(key_a.clone()),
+            }),
+            "{tag} I41: the first append wrote the stream's row"
+        );
+
+        // A SECOND WRITER, same community, at a seq the first never used:
+        // refused at its first chunk, nothing stored, the owner not named.
+        let res = put_blob_chunk_scoped(
+            backend,
+            &writer_b,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            b"interloper",
+            0,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => {
+                assert!(
+                    msg.contains(&comm) && msg.contains(COMMUNITY),
+                    "{tag} I41: the refusal names the stream's cohort and community: {msg}"
+                );
+                assert!(
+                    !msg.contains(&key_a),
+                    "{tag} I41: the refusal must not name the owner's key to a non-owner: {msg}"
+                );
+            }
+            other => panic!(
+                "{tag} I41: a second writer appended to a stream the first writer started — \
+                 the id was shared until the seal: {other:?}"
+            ),
+        }
+        assert_eq!(
+            backend.stream_chunks(&stream).await.unwrap().chunks.len(),
+            1,
+            "{tag} I41: a refused append stores nothing"
+        );
+        assert!(
+            !backend.has_blob(&sha(b"interloper")).await.unwrap(),
+            "{tag} I41: no plaintext of a refused append is on disk"
+        );
+
+        // The same writer, another community on the same id.
+        let res = put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&other),
+            &stream,
+            1,
+            b"elsewhere",
+            0,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains(&comm),
+                "{tag} I41: the refusal names the stream's community: {msg}"
+            ),
+            other => panic!("{tag} I41: another community appended to the stream: {other:?}"),
+        }
+        // The same writer, another cohort on the same id.
+        let res = put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            SELF,
+            Some(&alice),
+            &stream,
+            2,
+            b"mine",
+            0,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains(COMMUNITY),
+                "{tag} I41: the refusal names the stream's cohort: {msg}"
+            ),
+            other => panic!("{tag} I41: another cohort appended to a community stream: {other:?}"),
+        }
+        // The commons door (no writer at all) on the same id.
+        let res = backend
+            .put_blob_chunk(&stream, 3, BlobBody::Inline(b"public".to_vec()), 0)
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I41: the commons door appended to a community stream: {res:?}"
+        );
+
+        // The owner keeps appending.
+        put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            b"second",
+            0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I41: the owner's second append: {e}"));
+        assert_eq!(
+            backend.stream_chunks(&stream).await.unwrap().chunks.len(),
+            2
+        );
+
+        // A FOREIGN SEAL is refused, without naming the owner; the owner's
+        // seal is not.
+        let res = seal_stream_scoped(
+            backend,
+            &writer_b,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            None,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                !msg.contains(&key_a),
+                "{tag} I41: the seal refusal must not name the owner's key: {msg}"
+            ),
+            other => panic!("{tag} I41: a non-owner sealed the stream: {other:?}"),
+        }
+        // The seal at another community / cohort is refused too, naming
+        // the stream's.
+        let res = seal_stream_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&other),
+            &stream,
+            None,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains(&comm) && msg.contains("belongs to"),
+                "{tag} I41: the seal refusal is the STREAM ROW's (\"belongs to\"), naming the \
+                 stream's community, and fires before I32's chunk-row check: {msg}"
+            ),
+            other => panic!("{tag} I41: the stream sealed under another community: {other:?}"),
+        }
+        let sealed = seal_stream_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I41: the owner's seal: {e}"));
+        assert_eq!(sealed.chunk_count, 2);
+
+        // The seal over a MIXED stream stays refused by I32 (the second
+        // guard): a plaintext row placed through the floor with the owner's
+        // own claim — the infra-community shape — under the owner's seal.
+        let mixed = format!("{tag}-mixed-{run}");
+        put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&comm),
+            &mixed,
+            0,
+            b"sealed",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        backend
+            .put_blob_chunk_with_scope(
+                &mixed,
+                1,
+                BlobBody::Inline(b"in the clear".to_vec()),
+                0,
+                12,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+                StreamClaim {
+                    community_key_id: Some(comm.clone()),
+                    owner_key_id: Some(key_a.clone()),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I41: the owner's claim passes the floor: {e}"));
+        match seal_stream_scoped(
+            backend,
+            &writer_a,
+            COMMUNITY,
+            Some(&comm),
+            &mixed,
+            None,
+            None,
+        )
+        .await
+        {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains("tier"),
+                "{tag} I41: the mixed stream is refused by I32's tier check: {msg}"
+            ),
+            other => panic!("{tag} I41: a mixed stream sealed: {other:?}"),
+        }
+
+        // The COMMONS seal refuses a stream whose row is not at `federation`,
+        // on the one stream I32 cannot refuse: an infra-shaped community
+        // stream whose chunk rows are all plaintext. Without the row check
+        // the commons seal writes a public manifest over community rows.
+        let infra = format!("{tag}-infra-{run}");
+        backend
+            .put_blob_chunk_with_scope(
+                &infra,
+                0,
+                BlobBody::Inline(b"infra plaintext".to_vec()),
+                0,
+                15,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+                StreamClaim {
+                    community_key_id: Some(comm.clone()),
+                    owner_key_id: Some(key_a.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        match backend.seal_stream(&infra).await {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains("belongs to cohort"),
+                "{tag} I41: the commons seal's refusal is the stream row's: {msg}"
+            ),
+            other => panic!(
+                "{tag} I41: the commons seal wrote a federation manifest over a community-cohort \
+                 stream (all-plaintext, so I32 could not refuse it): {other:?}"
+            ),
+        }
+
+        // An UNCLAIMED stream (commons-started: no writer) is adopted by its
+        // first attributed append, and is then owned.
+        let unclaimed = format!("{tag}-unclaimed-{run}");
+        backend
+            .put_blob_chunk(&unclaimed, 0, BlobBody::Inline(b"public 0".to_vec()), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.stream_chunks(&unclaimed).await.unwrap().stream,
+            Some(StreamHead {
+                cohort_scope: FEDERATION.into(),
+                community_key_id: None,
+                owner_key_id: None,
+            }),
+            "{tag} I41: the commons door starts an unclaimed stream"
+        );
+        put_blob_chunk_scoped(
+            backend,
+            &writer_b,
+            FEDERATION,
+            None,
+            &unclaimed,
+            1,
+            b"public 1",
+            0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{tag} I41: an attributed append adopts an unclaimed stream: {e}")
+        });
+        assert_eq!(
+            backend
+                .stream_chunks(&unclaimed)
+                .await
+                .unwrap()
+                .stream
+                .and_then(|h| h.owner_key_id),
+            Some(key_b.clone()),
+            "{tag} I41: adopted"
+        );
+        let res = put_blob_chunk_scoped(
+            backend,
+            &writer_a,
+            FEDERATION,
+            None,
+            &unclaimed,
+            2,
+            b"public 2",
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I41: an adopted stream is owned: {res:?}"
+        );
+        let res = backend
+            .put_blob_chunk(&unclaimed, 2, BlobBody::Inline(b"public 2".to_vec()), 0)
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I41: the commons door cannot append to an owned stream: {res:?}"
+        );
+    }
+
+    // ── I42 ──────────────────────────────────────────────────────────────
+    /// **A chunk is bound to its position** (§12.10, #838). A manifest over
+    /// the same rows with two chunks swapped — carrying the swapped
+    /// positions, sealed under the community's own DEK, stored through the
+    /// floor — does not open: the range read across the boundary and the
+    /// whole read fail as a crypto-class error AFTER authorization (a
+    /// stranger is still `NotGranted`). A chunk row lifted into a second
+    /// stream's DAG does not open there. A stream chunk reads by POSITION
+    /// (`read_stream_chunk_as`), at its own position only; by its sha alone
+    /// it no longer opens. The honest DAG still opens.
+    ///
+    /// Written first in a PROBE form (a swapped manifest without positions,
+    /// against v44.0.0's reader) and RED on 8d5e860 on both backends: "a
+    /// chunk moved to another index OPENED (100 bytes)". This is the final
+    /// form.
+    pub async fn exercise_i42_a_chunk_is_bound_to_its_position<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use super::orchestrate::read_stream_chunk_as;
+        use crate::federation::at_rest_cascade::seal;
+        use crate::federation::blobs::{
+            ChunkManifest, ChunkRef, EpochBinding, ManifestRowSpec, CHUNK_MANIFEST_VERSION_SEALED,
+        };
+        use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
+        use crate::federation::{StorageFloor, StreamClaim};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let stranger = format!("{tag}-stranger-{run}");
+        let writer = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                backend,
+                &format!("{tag}-writer-{run}"),
+            )
+            .await,
+        );
+        let owner = crate::signing::federation_key_id_of(&writer).await.unwrap();
+        let stream = format!("{tag}-stream-{run}");
+        let segs = [segment(31, 100), segment(32, 200)];
+        let (manifest, shas, plain) =
+            sealed_community_stream_as(backend, &writer, tag, &comm, &stream, &segs).await;
+
+        // The honest read, across the boundary and whole.
+        assert_eq!(
+            read_any_range_for_viewer(backend, &manifest, &alice_occ, 90, 110, None)
+                .await
+                .unwrap(),
+            plain[90..=110].to_vec(),
+            "{tag} I42: the honest range read opens"
+        );
+        assert_eq!(
+            read_any_for_viewer(backend, &manifest, &alice_occ, None)
+                .await
+                .unwrap(),
+            plain,
+            "{tag} I42: the honest whole read opens"
+        );
+
+        // A manifest over the SAME rows with the two chunks SWAPPED — each
+        // now claiming the other's position — sealed under the community's
+        // DEK (reached the way the door reaches it) and stored through the
+        // floor as a second DAG over the stream.
+        let epoch = backend.community_dek_current_epoch(&comm).await.unwrap();
+        let (dek, _, _) = ensure_epoch_dek(backend, &comm, epoch).await.unwrap();
+        let swapped = ChunkManifest {
+            v: CHUNK_MANIFEST_VERSION_SEALED,
+            total_size: 300,
+            chunks: vec![
+                ChunkRef {
+                    sha: shas[1],
+                    size: 200,
+                    seq: Some(0),
+                },
+                ChunkRef {
+                    sha: shas[0],
+                    size: 100,
+                    seq: Some(1),
+                },
+            ],
+            chunk_tier: Some(CryptoTier::CommunityDek),
+            stream_id: Some(stream.clone()),
+        };
+        let body = seal(&dek, &swapped.to_jcs_bytes(), None)
+            .unwrap()
+            .to_bytes();
+        let swapped_sha = sha(&body);
+        backend
+            .seal_stream_with_scope(
+                &stream,
+                ManifestRowSpec {
+                    sha256: swapped_sha,
+                    size_bytes: body.len() as u64,
+                    body,
+                    expected_chunk_count: 2,
+                },
+                None,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                Some(EpochBinding {
+                    community_key_id: comm.clone(),
+                    epoch,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I42: the floor stores a second DAG: {e}"));
+
+        // A stranger is refused before any chunk is touched.
+        assert!(
+            matches!(
+                read_any_range_for_viewer(backend, &swapped_sha, &stranger, 0, 10, None).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "{tag} I42: the stranger is refused at the manifest"
+        );
+        // The member: a chunk at another index does not open — a
+        // crypto-class error, never bytes, never NotGranted.
+        match read_any_range_for_viewer(backend, &swapped_sha, &alice_occ, 0, 99, None).await {
+            Err(BlobError::Backend(_)) => {}
+            Err(other) => panic!("{tag} I42: wrong refusal class for a moved chunk: {other:?}"),
+            Ok(bytes) => panic!(
+                "{tag} I42: a chunk moved to another index OPENED ({} bytes) — the chunk's \
+                 AAD does not carry its position",
+                bytes.len()
+            ),
+        }
+        match read_any_for_viewer(backend, &swapped_sha, &alice_occ, None).await {
+            Err(BlobError::Backend(_)) => {}
+            other => panic!("{tag} I42: the whole read of a swapped DAG: {other:?}"),
+        }
+
+        // Lifted into a second stream's DAG, by the SAME writer (so #837
+        // admits it): the row exists (content-addressed); the index row is
+        // what a lift is. Sealed through the door, it must not open there.
+        let stream2 = format!("{tag}-stream2-{run}");
+        let Some(BlobBody::Inline(bytes0)) = backend.get_blob(&shas[0]).await.unwrap() else {
+            panic!("{tag} I42: chunk 0 is inline");
+        };
+        backend
+            .put_blob_chunk_with_scope(
+                &stream2,
+                0,
+                BlobBody::Inline(bytes0),
+                0,
+                100,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                Some(EpochBinding {
+                    community_key_id: comm.clone(),
+                    epoch,
+                }),
+                StreamClaim {
+                    community_key_id: Some(comm.clone()),
+                    owner_key_id: Some(owner.clone()),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I42: lift through the floor: {e}"));
+        let sealed2 = seal_stream_scoped(
+            backend,
+            &writer,
+            COMMUNITY,
+            Some(&comm),
+            &stream2,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I42: the second stream seals: {e}"));
+        match read_any_for_viewer(backend, &sealed2.manifest_sha256, &alice_occ, None).await {
+            Err(BlobError::Backend(_)) => {}
+            Err(other) => panic!("{tag} I42: wrong refusal class for a lifted chunk: {other:?}"),
+            Ok(_) => panic!(
+                "{tag} I42: a chunk lifted into a second stream's DAG OPENED there — the \
+                 chunk's AAD does not carry its stream"
+            ),
+        }
+
+        // By POSITION: the chunk opens at its own position, for a member,
+        // whole; not at the lifted position; not for a stranger; and not by
+        // its sha alone through the whole-blob doors (the sha carries no
+        // position), as a crypto-class error after authorization.
+        assert_eq!(
+            read_stream_chunk_as(backend, &stream, 0, &alice_occ, None)
+                .await
+                .unwrap(),
+            segs[0],
+            "{tag} I42: the by-position read opens the chunk at its own position"
+        );
+        assert_eq!(
+            read_stream_chunk_as(backend, &stream, 1, &alice_occ, None)
+                .await
+                .unwrap(),
+            segs[1]
+        );
+        match read_stream_chunk_as(backend, &stream2, 0, &alice_occ, None).await {
+            Err(BlobError::Backend(_)) => {}
+            other => panic!("{tag} I42: the lifted position opened the chunk: {other:?}"),
+        }
+        assert!(
+            matches!(
+                read_stream_chunk_as(backend, &stream, 0, &stranger, None).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "{tag} I42: the by-position read authorizes first"
+        );
+        assert!(
+            matches!(
+                read_stream_chunk_as(backend, &stream, 7, &alice_occ, None).await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "{tag} I42: an unknown position is InvalidArgument"
+        );
+        // A plaintext (commons) stream reads by position the same way, and
+        // refuses associated data it cannot bind (I40 at this door too).
+        let commons = format!("{tag}-commons-{run}");
+        backend
+            .put_blob_chunk(&commons, 3, BlobBody::Inline(b"public bytes".to_vec()), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_stream_chunk_as(backend, &commons, 3, &stranger, None)
+                .await
+                .unwrap(),
+            b"public bytes".to_vec(),
+            "{tag} I42: a commons chunk reads by position, by anyone"
+        );
+        assert!(
+            matches!(
+                read_stream_chunk_as(backend, &commons, 3, &stranger, Some(b"x")).await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "{tag} I42: associated data at a plaintext position is refused, not dropped"
+        );
+        match read_any_range_for_viewer(backend, &shas[0], &alice_occ, 0, 9, None).await {
+            Err(BlobError::Backend(_)) => {}
+            other => panic!(
+                "{tag} I42: a sealed stream chunk opened by its sha alone — the position \
+                 binding is not enforced: {other:?}"
+            ),
+        }
+        // The honest DAG is untouched by any of it.
+        assert_eq!(
+            read_any_for_viewer(backend, &manifest, &alice_occ, None)
+                .await
+                .unwrap(),
+            plain
+        );
+
+        // `seq` is the manifest's WORD, not the list index: a stream whose
+        // producer skipped numbers (5, 7) seals and reads honestly, whole,
+        // by range across the boundary, and by position. A reader that
+        // rebuilt the AAD from the index would fail here and nowhere else.
+        let sparse = format!("{tag}-sparse-{run}");
+        let sparse_segs = [segment(41, 64), segment(42, 32)];
+        for (seq, seg) in [(5u64, &sparse_segs[0]), (7u64, &sparse_segs[1])] {
+            put_blob_chunk_scoped(
+                backend,
+                &writer,
+                COMMUNITY,
+                Some(&comm),
+                &sparse,
+                seq,
+                seg,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let sealed_sparse = seal_stream_scoped(
+            backend,
+            &writer,
+            COMMUNITY,
+            Some(&comm),
+            &sparse,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut sparse_plain = sparse_segs[0].clone();
+        sparse_plain.extend_from_slice(&sparse_segs[1]);
+        assert_eq!(
+            read_any_for_viewer(backend, &sealed_sparse.manifest_sha256, &alice_occ, None)
+                .await
+                .unwrap(),
+            sparse_plain,
+            "{tag} I42: a sparse-seq stream opens whole — the AAD uses the manifest's seq"
+        );
+        assert_eq!(
+            read_any_range_for_viewer(
+                backend,
+                &sealed_sparse.manifest_sha256,
+                &alice_occ,
+                60,
+                70,
+                None
+            )
+            .await
+            .unwrap(),
+            sparse_plain[60..=70].to_vec()
+        );
+        assert_eq!(
+            read_stream_chunk_as(backend, &sparse, 7, &alice_occ, None)
+                .await
+                .unwrap(),
+            sparse_segs[1]
         );
     }
 
@@ -2087,6 +3109,38 @@ pub mod invariants {
 
 #[cfg(test)]
 mod tests {
+    /// #838 (§12.10) — **the chunk AAD's bytes are pinned.** Domain label,
+    /// u64-BE length-prefixed caller data (absent ⇒ 0), u64-BE
+    /// length-prefixed stream id, u64-BE seq. A change here changes what
+    /// every sealed chunk opens under; the FSD's layout is this test.
+    #[test]
+    fn chunk_aad_bytes_are_pinned() {
+        use super::chunk_aad;
+        let mut want = b"ciris-persist:chunk:v1".to_vec();
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 3]);
+        want.extend_from_slice(b"row");
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 4]);
+        want.extend_from_slice(b"s-01");
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 2]);
+        assert_eq!(chunk_aad(Some(b"row"), "s-01", 258), want);
+        // No caller data: a zero length, then the position.
+        let mut want = b"ciris-persist:chunk:v1".to_vec();
+        want.extend_from_slice(&[0; 8]);
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        want.extend_from_slice(b"x");
+        want.extend_from_slice(&[0; 8]);
+        assert_eq!(chunk_aad(None, "x", 0), want);
+        assert_eq!(chunk_aad(None, "x", 0), chunk_aad(Some(b""), "x", 0));
+        // Length prefixes keep the boundary: (caller "ab", stream "c") and
+        // (caller "a", stream "bc") are different bytes.
+        assert_ne!(
+            chunk_aad(Some(b"ab"), "c", 0),
+            chunk_aad(Some(b"a"), "bc", 0)
+        );
+        assert_ne!(chunk_aad(None, "s", 0), chunk_aad(None, "s", 1));
+        assert_ne!(chunk_aad(None, "s", 0), chunk_aad(None, "t", 0));
+    }
+
     /// I35 — the production whole-read door passes the documented cap, so
     /// the capped internal the witness drives is the code a consumer hits.
     #[test]

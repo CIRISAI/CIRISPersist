@@ -514,6 +514,7 @@ Engine	reachable_under_scope_with_reasons	deontic
 Engine	read_blob_as	deontic	
 Engine	read_blob_for_community_viewer	deontic	
 Engine	read_blob_range_as	deontic	
+Engine	read_stream_chunk_as	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	

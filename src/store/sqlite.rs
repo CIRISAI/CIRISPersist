@@ -13508,6 +13508,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         cohort_scope: &str,
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
+        claim: crate::federation::StreamClaim,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         let cap = self.inline_bytes_cap();
@@ -13540,13 +13541,79 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let tier = floor.tier().as_str().to_owned();
         let chunk_sha = row.sha256;
         let bind = binding.clone();
+        let claim_tx = claim.clone();
         enum Appended {
             Ok,
             SeqConflict,
             EpochMoved,
+            /// #837 — the stream's row names another cohort / community.
+            StreamElsewhere {
+                cohort_scope: String,
+                community_key_id: Option<String>,
+            },
+            /// #837 — the stream's row names another owner (never disclosed).
+            StreamForeign {
+                cohort_scope: String,
+                community_key_id: Option<String>,
+            },
         }
         let outcome = self.write(move |conn| -> Result<Appended, rusqlite::Error> {
             let tx = conn.transaction()?;
+            // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in
+            //    this transaction, then compared: a stream belongs to its
+            //    first append. Refused ⇒ nothing below runs, nothing is
+            //    stored. A NULL owner (unclaimed) is adopted by the first
+            //    attributed claim.
+            tx.execute(
+                "INSERT INTO federation_streams \
+                    (stream_id, cohort_scope, community_key_id, owner_key_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (stream_id) DO NOTHING",
+                rusqlite::params![
+                    stream_id_owned,
+                    scope,
+                    claim_tx.community_key_id,
+                    claim_tx.owner_key_id,
+                    now_iso,
+                ],
+            )?;
+            let (s_cohort, s_comm, s_owner): (String, Option<String>, Option<String>) = tx
+                .query_row(
+                    "SELECT cohort_scope, community_key_id, owner_key_id \
+                       FROM federation_streams WHERE stream_id = ?1",
+                    rusqlite::params![stream_id_owned],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            if s_cohort != scope || s_comm != claim_tx.community_key_id {
+                return Ok(Appended::StreamElsewhere {
+                    cohort_scope: s_cohort,
+                    community_key_id: s_comm,
+                });
+            }
+            match (&s_owner, &claim_tx.owner_key_id) {
+                (None, None) => {}
+                (Some(owner), Some(mine)) if owner == mine => {}
+                (None, Some(mine)) => {
+                    // Adopt. The predicate makes two adopters resolve to one.
+                    let n = tx.execute(
+                        "UPDATE federation_streams SET owner_key_id = ?2 \
+                          WHERE stream_id = ?1 AND owner_key_id IS NULL",
+                        rusqlite::params![stream_id_owned, mine],
+                    )?;
+                    if n == 0 {
+                        return Ok(Appended::StreamForeign {
+                            cohort_scope: s_cohort,
+                            community_key_id: s_comm,
+                        });
+                    }
+                }
+                _ => {
+                    return Ok(Appended::StreamForeign {
+                        cohort_scope: s_cohort,
+                        community_key_id: s_comm,
+                    })
+                }
+            }
             // 1. The chunk's bytes as a normal federation_blobs row
             //    (content-addressed + idempotent), carrying the cohort and
             //    the tier the door resolved (§11.1 / §12.1).
@@ -13657,6 +13724,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     epoch: b.epoch,
                 })
             }
+            Appended::StreamElsewhere {
+                cohort_scope: s_cohort,
+                community_key_id: s_comm,
+            } => Err(crate::federation::blobs::stream_elsewhere_refusal(
+                stream_id,
+                &s_cohort,
+                s_comm.as_deref(),
+                cohort_scope,
+                claim.community_key_id.as_deref(),
+            )),
+            Appended::StreamForeign {
+                cohort_scope: s_cohort,
+                community_key_id: s_comm,
+            } => Err(crate::federation::blobs::stream_foreign_refusal(
+                stream_id,
+                &s_cohort,
+                s_comm.as_deref(),
+            )),
         }
     }
 
@@ -13776,14 +13861,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<crate::federation::StreamChunks, crate::federation::BlobError> {
         let stream_id_owned = stream_id.to_string();
         type Row = (i64, Vec<u8>, i64, i64, i64, String, String);
-        let (rows, sth): (Vec<Row>, Option<i64>) = self
-            .read(
-                move |conn| -> Result<(Vec<Row>, Option<i64>), rusqlite::Error> {
-                    // One transaction: the listing and the STH are one snapshot
-                    // (I37). The connection mutex is sqlite's boundary anyway.
-                    let tx = conn.unchecked_transaction()?;
-                    let rows = {
-                        let mut stmt = tx.prepare(
+        type Head = (String, Option<String>, Option<String>);
+        type Snapshot = (Vec<Row>, Option<i64>, Option<Head>);
+        let (rows, sth, head): Snapshot = self
+            .read(move |conn| -> Result<Snapshot, rusqlite::Error> {
+                // One transaction: the listing, the STH and the stream's
+                // own row (#837) are one snapshot (I37). The connection
+                // mutex is sqlite's boundary anyway.
+                let tx = conn.unchecked_transaction()?;
+                let head: Option<Head> = tx
+                    .query_row(
+                        "SELECT cohort_scope, community_key_id, owner_key_id \
+                               FROM federation_streams WHERE stream_id = ?1",
+                        rusqlite::params![stream_id_owned],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let rows = {
+                    let mut stmt = tx.prepare(
                         "SELECT c.seq, c.chunk_sha, c.epoch, c.size_bytes, c.plaintext_size_bytes, \
                                 b.crypto_tier, b.cohort_scope \
                            FROM federation_stream_chunks c \
@@ -13791,63 +13886,87 @@ impl crate::federation::BlobStorage for SqliteBackend {
                           WHERE c.stream_id = ?1 \
                           ORDER BY c.seq ASC",
                     )?;
-                        let it = stmt.query_map(rusqlite::params![stream_id_owned], |r| {
-                            Ok((
-                                r.get(0)?,
-                                r.get(1)?,
-                                r.get(2)?,
-                                r.get(3)?,
-                                r.get(4)?,
-                                r.get(5)?,
-                                r.get(6)?,
-                            ))
-                        })?;
-                        it.collect::<Result<Vec<Row>, _>>()?
-                    };
-                    let sth: Option<i64> = tx
-                        .query_row(
-                            "SELECT MAX(tree_size) FROM federation_stream_sth WHERE stream_id = ?1",
-                            rusqlite::params![stream_id_owned],
-                            |r| r.get::<_, Option<i64>>(0),
-                        )
-                        .optional()?
-                        .flatten();
-                    tx.commit()?;
-                    Ok((rows, sth))
-                },
-            )
+                    let it = stmt.query_map(rusqlite::params![stream_id_owned], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    })?;
+                    it.collect::<Result<Vec<Row>, _>>()?
+                };
+                let sth: Option<i64> = tx
+                    .query_row(
+                        "SELECT MAX(tree_size) FROM federation_stream_sth WHERE stream_id = ?1",
+                        rusqlite::params![stream_id_owned],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                tx.commit()?;
+                Ok((rows, sth, head))
+            })
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("stream_chunks: {e}")))?;
         let mut chunks = Vec::with_capacity(rows.len());
-        for (seq, sha_vec, epoch, size, plain, tier, scope) in rows {
-            if sha_vec.len() != 32 {
-                return Err(crate::federation::BlobError::Backend(format!(
-                    "stream_chunks: chunk_sha is {} bytes, expected 32",
-                    sha_vec.len()
-                )));
-            }
-            let mut chunk_sha = [0u8; 32];
-            chunk_sha.copy_from_slice(&sha_vec);
-            let crypto_tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&tier)
-                .ok_or_else(|| {
-                    crate::federation::BlobError::Backend(format!(
-                        "stream_chunks: chunk row carries unknown tier {tier:?}"
-                    ))
-                })?;
-            chunks.push(crate::federation::StreamChunkRef {
-                seq: seq.max(0) as u64,
-                chunk_sha,
-                epoch: epoch.max(0) as u64,
-                size_bytes: size.max(0) as u64,
-                plaintext_size: plain.max(0) as u64,
-                crypto_tier,
-                cohort_scope: scope,
-            });
+        for row in rows {
+            chunks.push(sqlite_stream_chunk_ref(row)?);
         }
         Ok(crate::federation::StreamChunks {
             chunks,
             sth_tree_size: sth.map(|n| n.max(0) as u64),
+            stream: head.map(|(cohort_scope, community_key_id, owner_key_id)| {
+                crate::federation::StreamHead {
+                    cohort_scope,
+                    community_key_id,
+                    owner_key_id,
+                }
+            }),
         })
+    }
+
+    async fn stream_chunk_at(
+        &self,
+        stream_id: &str,
+        seq: u64,
+    ) -> Result<Option<crate::federation::StreamChunkRef>, crate::federation::BlobError> {
+        let stream_id_owned = stream_id.to_string();
+        let seq_i64 = i64::try_from(seq).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "stream_chunk_at: seq exceeds i64 — federation_stream_chunks.seq is INTEGER".into(),
+            )
+        })?;
+        type Row = (i64, Vec<u8>, i64, i64, i64, String, String);
+        let row: Option<Row> = self
+            .read(move |conn| -> Result<Option<Row>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT c.seq, c.chunk_sha, c.epoch, c.size_bytes, c.plaintext_size_bytes, \
+                            b.crypto_tier, b.cohort_scope \
+                       FROM federation_stream_chunks c \
+                       JOIN federation_blobs b ON b.sha256 = c.chunk_sha \
+                      WHERE c.stream_id = ?1 AND c.seq = ?2",
+                    rusqlite::params![stream_id_owned, seq_i64],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_chunk_at: {e}")))?;
+        row.map(sqlite_stream_chunk_ref).transpose()
     }
 
     async fn blob_head(
@@ -13897,6 +14016,31 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     let tx = conn.transaction().map_err(|e| {
                         crate::federation::BlobError::Backend(format!("seal_stream tx: {e}"))
                     })?;
+
+                    // 0. #837 (§12.9) — the commons seal writes a FEDERATION
+                    //    manifest; a stream whose row says otherwise is not its
+                    //    to seal.
+                    let stream_cohort: Option<String> = tx
+                        .query_row(
+                            "SELECT cohort_scope FROM federation_streams WHERE stream_id = ?1",
+                            rusqlite::params![stream_id_owned],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            crate::federation::BlobError::Backend(format!(
+                                "seal_stream stream row: {e}"
+                            ))
+                        })?;
+                    if let Some(c) = stream_cohort {
+                        if c != crate::federation::types::cohort_scope::FEDERATION {
+                            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                                "seal_stream: stream {stream_id_owned} belongs to cohort {c:?}; \
+                                 the commons seal writes a federation manifest — seal it through \
+                                 seal_stream_scoped (BLOB_ENCRYPTION_AT_REST.md §12.9, I41)"
+                            )));
+                        }
+                    }
 
                     // 1. Read the seq-ordered chunk index, joined to each chunk
                     //    ROW's recorded tier (#832 §12.3 / I32 — the commons seal
@@ -15081,6 +15225,37 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         Ok(report)
     }
+}
+
+/// #832 / #838 — one stream index row joined to its chunk row, as
+/// `stream_chunks` and `stream_chunk_at` read it, into the shared ref. The
+/// tier string is the row's word; an unknown one is corruption.
+fn sqlite_stream_chunk_ref(
+    (seq, sha_vec, epoch, size, plain, tier, scope): (i64, Vec<u8>, i64, i64, i64, String, String),
+) -> Result<crate::federation::StreamChunkRef, crate::federation::BlobError> {
+    if sha_vec.len() != 32 {
+        return Err(crate::federation::BlobError::Backend(format!(
+            "stream_chunks: chunk_sha is {} bytes, expected 32",
+            sha_vec.len()
+        )));
+    }
+    let mut chunk_sha = [0u8; 32];
+    chunk_sha.copy_from_slice(&sha_vec);
+    let crypto_tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&tier)
+        .ok_or_else(|| {
+            crate::federation::BlobError::Backend(format!(
+                "stream_chunks: chunk row carries unknown tier {tier:?}"
+            ))
+        })?;
+    Ok(crate::federation::StreamChunkRef {
+        seq: seq.max(0) as u64,
+        chunk_sha,
+        epoch: epoch.max(0) as u64,
+        size_bytes: size.max(0) as u64,
+        plaintext_size: plain.max(0) as u64,
+        crypto_tier,
+        cohort_scope: scope,
+    })
 }
 
 /// v4.1 (CIRISPersist#142, Cut C1b) — load a stream's chunk hashes in
@@ -28319,6 +28494,152 @@ mod tests {
         );
     }
 
+    /// §11.10 I41 (the backfill) — **V143 gives every PRE-EXISTING stream a
+    /// row from its first chunk**: cohort from that chunk's blob row,
+    /// community from its epoch binding, owner NULL (unclaimed — no writer
+    /// column ever existed). Seeds the pre-V143 shape through V142, then
+    /// migrates. The lowest `seq` is what the backfill reads, so the seeded
+    /// community stream starts at seq 5 and carries a commons row after it
+    /// (a legacy mixed stream: the FIRST chunk decides). Then an attributed
+    /// append adopts the unclaimed commons stream, and a second writer is
+    /// refused.
+    #[tokio::test]
+    async fn blob_invariant_i41_v143_backfills_legacy_streams_sqlite() {
+        use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
+        use crate::federation::types::cohort_scope::FEDERATION;
+        use crate::federation::{BlobError, BlobStorage, StreamHead};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(142).await.unwrap();
+        let a = [0x41u8; 32];
+        let b = [0x42u8; 32];
+        {
+            let conn = backend.conn.lock();
+            for (sha, cohort, tier) in [
+                (&a, "community", "community_dek"),
+                (&b, "federation", "plaintext"),
+            ] {
+                conn.execute(
+                    "INSERT INTO federation_blobs \
+                        (sha256, storage_kind, bytes_inline, size_bytes, cohort_scope, crypto_tier) \
+                     VALUES (?1, 'inline', ?2, 1, ?3, ?4)",
+                    rusqlite::params![sha.to_vec(), b"x".to_vec(), cohort, tier],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
+                 VALUES (?1, 'comm-legacy', 0)",
+                rusqlite::params![a.to_vec()],
+            )
+            .unwrap();
+            for (stream, seq, sha) in [
+                ("legacy-comm", 5i64, &a),
+                ("legacy-comm", 6, &b),
+                ("legacy-commons", 0, &b),
+            ] {
+                conn.execute(
+                    "INSERT INTO federation_stream_chunks \
+                        (stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes) \
+                     VALUES (?1, ?2, ?3, 0, 1, 1)",
+                    rusqlite::params![stream, seq, sha.to_vec()],
+                )
+                .unwrap();
+            }
+            assert!(
+                conn.prepare("SELECT 1 FROM federation_streams").is_err(),
+                "precondition: no federation_streams before V143"
+            );
+        }
+        backend.run_migrations().await.unwrap();
+
+        assert_eq!(
+            backend.stream_chunks("legacy-comm").await.unwrap().stream,
+            Some(StreamHead {
+                cohort_scope: "community".into(),
+                community_key_id: Some("comm-legacy".into()),
+                owner_key_id: None,
+            }),
+            "I41: a legacy community stream is backfilled from its FIRST chunk's row and binding"
+        );
+        assert_eq!(
+            backend
+                .stream_chunks("legacy-commons")
+                .await
+                .unwrap()
+                .stream,
+            Some(StreamHead {
+                cohort_scope: "federation".into(),
+                community_key_id: None,
+                owner_key_id: None,
+            }),
+            "I41: a legacy commons stream is backfilled unclaimed"
+        );
+        assert_eq!(
+            backend.stream_chunks("never-seen").await.unwrap().stream,
+            None
+        );
+
+        // An attributed append adopts the unclaimed commons stream; a second
+        // writer is then refused; the commons door is then refused.
+        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                &backend,
+                "legacy-writer-a",
+            )
+            .await,
+        );
+        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(
+                &backend,
+                "legacy-writer-b",
+            )
+            .await,
+        );
+        put_blob_chunk_scoped(
+            &backend,
+            &writer_a,
+            FEDERATION,
+            None,
+            "legacy-commons",
+            1,
+            b"more",
+            0,
+            None,
+        )
+        .await
+        .expect("I41: an attributed append adopts a legacy (unclaimed) stream");
+        assert_eq!(
+            backend
+                .stream_chunks("legacy-commons")
+                .await
+                .unwrap()
+                .stream
+                .and_then(|h| h.owner_key_id),
+            Some(
+                crate::signing::federation_key_id_of(&writer_a)
+                    .await
+                    .unwrap()
+            ),
+            "I41: adopted by the first attributed writer"
+        );
+        let res = put_blob_chunk_scoped(
+            &backend,
+            &writer_b,
+            FEDERATION,
+            None,
+            "legacy-commons",
+            2,
+            b"else",
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "I41: an adopted legacy stream is owned: {res:?}"
+        );
+    }
+
     /// §11.10 I17 — see `at_rest_cascade::blob_invariants`.
     #[tokio::test]
     async fn blob_invariant_i17_bind_requires_the_current_epoch_sqlite() {
@@ -28523,6 +28844,24 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i41_a_stream_belongs_to_its_first_append(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 I42 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i42_a_chunk_is_bound_to_its_position_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i42_a_chunk_is_bound_to_its_position(&backend, "sqlite")
             .await;
     }
 
@@ -42969,20 +43308,24 @@ mod tests {
         let total = (c0.len() + c1.len() + c2.len()) as u64;
         let manifest = crate::federation::ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: total,
             chunks: vec![
                 crate::federation::ChunkRef {
                     sha: s0,
                     size: c0.len() as u32,
+                    seq: None,
                 },
                 crate::federation::ChunkRef {
                     sha: s1,
                     size: c1.len() as u32,
+                    seq: None,
                 },
                 crate::federation::ChunkRef {
                     sha: s2,
                     size: c2.len() as u32,
+                    seq: None,
                 },
             ],
         };
@@ -43103,13 +43446,19 @@ mod tests {
         let s_ext = [0x9Au8; 32];
         let manifest = crate::federation::ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 4 + 100,
             chunks: vec![
-                crate::federation::ChunkRef { sha: s0, size: 4 },
+                crate::federation::ChunkRef {
+                    sha: s0,
+                    size: 4,
+                    seq: None,
+                },
                 crate::federation::ChunkRef {
                     sha: s_ext,
                     size: 100,
+                    seq: None,
                 },
             ],
         };
@@ -43256,11 +43605,13 @@ mod tests {
         let backend = blob_test_backend().await;
         let nested = crate::federation::ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 4,
             chunks: vec![crate::federation::ChunkRef {
                 sha: sha256_of(b"AAAA"),
                 size: 4,
+                seq: None,
             }],
         };
         let err = backend

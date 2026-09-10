@@ -1585,6 +1585,8 @@ returns the error and the next call derives again (I29).
 | I38 | A chunk keeps the epoch it was sealed under: after a rotation the reader recovers each chunk's DEK from the CHUNK's own binding, and a viewer holding no grant on that chunk's epoch is refused `NotGranted` (AV-70 per chunk). | the manifest's epoch used for every chunk; a post-rotation joiner reads pre-join segments | #832 |
 | I39 | Every seal/open call site this cut adds carries `aad: Option<&[u8]>` down to `seal` / `open`, and until CIRISVerify#279 lands those two IGNORE it — pinned by a test, so #831 is a flip of two lines and not a hunt for surfaces. | a new door without the parameter; `seal` silently binding AAD before the primitive exists | #832, #831 |
 | I40 | Caller-supplied associated data is bound into the seal and never stored: a seal under `A` opens under `A` and fails under `A'` — after authorization (a non-member presenting `A` is `NotGranted`), as a crypto-class error, at both encrypted tiers; `Some(aad)` at a plaintext tier is refused at EVERY seal/open door — whole-blob, chunk write, stream seal, range read. | the `A'` open succeeds; a mismatch surfaces as `NotGranted`; a commons write accepts and drops the data | #830 |
+| I41 | A stream belongs to its first append: the chunk floor records `(cohort_scope, community_key_id, owner = the first attributed writer's derived key id)` on a stream's first chunk, in the chunk's transaction, and refuses every later append that does not match all three — a different writer at its FIRST chunk (nothing stored), a different cohort or community naming the stream's; the refusal never names the owner's key to a non-owner; the scoped seal refuses a non-owner signer and a foreign cohort/community BEFORE I32, and I32 still refuses a mixed stream; an unclaimed (`NULL`-owner: pre-V143 or commons-started) stream is adopted by its first attributed append; V143 backfills every existing stream from its first chunk's row and binding. | two writers interleave on one id; a foreign seal; a refusal that leaks the owner's key id; a legacy stream with no row | #837 |
+| I42 | A chunk is bound to its position: `chunk_aad(caller_aad, stream_id, seq)` — domain-separated, length-prefixed, bytes pinned — is the AAD of every sealed chunk at write; sealed manifest v2 carries `stream_id` and each chunk's `seq` (required, strictly increasing; v1 byte-identical); every reader rebuilds the AAD from the manifest, so a chunk at another index or in another stream's DAG fails as a crypto-class error AFTER authorization (never `NotGranted`); a stream chunk is read by position through `read_stream_chunk_as`, reachable from the Engine and Python. | a swapped manifest opens; a lifted chunk opens in a second stream; a mismatch reported as `NotGranted`; a by-position read nobody can call | #838 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1662,6 +1664,16 @@ commons half of I32 (`seal_stream` wrote a plaintext manifest over a chunk row
 the community cascade had sealed) and the commons half of I35
 (`read_any_for_viewer` refused every `chunk_dag` row). The rest exercise doors
 this cut adds, so their evidence is the mutation alone, recorded in §12.8.
+
+**I41–I42 (#837, #838)** were written first in a PROBE form against the
+v44.0.0 surface — the chunk door had no writer parameter, so I41's foreign
+append was a second community, a second cohort and the commons door on one
+id, and I42's swapped manifest carried no positions — and confirmed RED on
+`8d5e860` on sqlite and postgres (I41: the second community's append
+returned `Ok`; I42: "a chunk moved to another index OPENED (100 bytes)").
+The final forms use two node signers and a positioned swapped manifest; the
+legacy backfill has its own per-backend witness on an empty database seeded
+through V142. §12.10 carries the mutation summary.
 
 **C3 = Codex's third review, of `45bd9b4`**, five findings, all real. Two
 are the same root cause — a serialization boundary that existed on sqlite by
@@ -1866,9 +1878,10 @@ epoch, size_bytes, plaintext_size, crypto_tier, cohort_scope)], sth_tree_size }`
 records and its plaintext size, plus the latest producer-signed STH's
 `tree_size`, read in ONE transaction so the listing and the STH it reports are
 the same snapshot. A DVR consumer reads the prefix `[0, tree_size)` as
-tamper-evident and the tail as best-effort; it then fetches each chunk by sha
-(`read_any_range_for_viewer` on a chunk sha, or the relay's `get_blob_range`
-for opaque transfer). Reachable from the Engine and from Python (I8).
+tamper-evident and the tail as best-effort; it then reads each chunk by
+POSITION (`read_stream_chunk_as(stream_id, seq, …)` — since #838 a sealed chunk
+opens only under the position it was written at, §12.10; the relay's
+`get_blob_range` on the chunk sha stays the opaque transfer). Reachable from the Engine and from Python (I8).
 
 **Handoff (Q4): stream into persist as produced.** `put_blob_chunk_scoped`
 each segment as it is finalized — sealed at write under the epoch DEK the
@@ -1886,32 +1899,34 @@ report the plaintext length from this column, never from `stored − 36`
 arithmetic at read time (every preimage field is persisted). The chunk row's
 tier and cohort live on `federation_blobs` (V139) — one fact, one table.
 
-### 12.7 AAD per chunk lands with #831 — the hook points
+### 12.7 AAD per chunk — the hook points, and what #831 / #838 made of them
 
-#831 (blocked on CIRISVerify#279, `aes_gcm::{encrypt_aad, decrypt_aad}`) binds
-a ciphertext to its referencing row through the GCM tag. For a DAG the binding
-the issue named is `(manifest sha, index)` per chunk, so a chunk lifted into
-another DAG does not open. This cut does **not** implement AAD — crypto routes
-through `ciris_crypto`, and the primitive is not there yet — but it threads the
-parameter through every new surface so #831 is a flip, not a hunt:
+#831 binds a ciphertext to its referencing row through the GCM tag
+(`ciris_crypto::aes_gcm::{encrypt_aad, decrypt_aad}`, CIRISVerify 15.1.0).
+#832 threaded the parameter through every new surface before the primitive
+existed; #831 landed in the SAME release (v44.0.0) and flipped the two
+primitives, so the table below is the state of the code, not a plan. The
+"accepted and ignored — pinned by a test" row this section carried between
+the two cuts was stale the day v44.0.0 shipped (the `seal_ignores_aad_until_831`
+pin was deleted when #831 landed); I40 is the pin now, and it says the
+opposite.
 
-| hook | today |
+| hook | today (v44.0.0 + #838) |
 |---|---|
-| `at_rest_cascade::seal(dek, plaintext, aad)` / `open(dek, envelope, aad)` | `aad` accepted and **ignored** — `// #831` — pinned by a test that `seal(Some(A))` opens under `None` and under `A'` |
-| `chunk_dag_cascade::orchestrate::put_blob_chunk_scoped(…, aad)` | passed to `seal` |
-| `chunk_dag_cascade::orchestrate::seal_stream_scoped(…, aad)` | passed to `seal` for the manifest |
-| `at_rest_cascade::orchestrate::read_any_for_viewer(…, aad)` and `read_any_range_for_viewer(…, aad)` | passed to `open` for the manifest and every chunk |
-| `Engine::{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as}` | `aad: Option<&[u8]>` |
-| `PyEngine.{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as}` | `aad_b64=None` |
+| `at_rest_cascade::seal(dek, plaintext, aad)` / `open(dek, envelope, aad)` | `aad` is **bound** into the GCM tag by `seal_aad` / `open_aad`; a mismatch is a crypto-class error (I40) |
+| `chunk_dag_cascade::orchestrate::put_blob_chunk_scoped(…, aad)` | the caller's data is folded with the chunk's POSITION into `chunk_aad` (§12.10) and that is what `seal` binds |
+| `chunk_dag_cascade::orchestrate::seal_stream_scoped(…, aad)` | passed to `seal` for the manifest, unchanged — the manifest's AAD is the caller's |
+| `at_rest_cascade::orchestrate::read_any_for_viewer(…, aad)` and `read_any_range_for_viewer(…, aad)` | the caller's data opens the manifest; each chunk is opened under `chunk_aad(aad, manifest.stream_id, chunk.seq)` |
+| `chunk_dag_cascade::orchestrate::read_stream_chunk_as(stream_id, seq, …, aad)` | the by-position read of one chunk (§12.10); opens under `chunk_aad(aad, stream_id, seq)` |
+| `Engine::{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as, read_stream_chunk_as}` | `aad: Option<&[u8]>` |
+| `PyEngine.{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as, read_stream_chunk_as}` | `aad_b64=None` |
 
-What #831 will do at those points: `seal`/`open` call the `_aad` primitives;
-`put_blob_scoped` and the whole-blob community cascade gain the parameter they
-do not carry today (their `None` sites are marked `// #831`); and a refusal
-of `Some(aad)` at a plaintext tier lands at the doors. Per-chunk AAD derived
-from `(manifest sha, index)` cannot be computed at chunk-write time — the
-manifest sha does not exist until seal — so #831's chunk binding is
-`(stream_id, seq)` at write with the manifest committing to both, or a re-seal
-at seal time; that decision is #831's and is not pre-empted here.
+`Some(aad)` at a plaintext tier is refused at every one of these doors
+(`refuse_aad_at_plaintext`, I40). The per-chunk binding the issue first
+named — `(manifest sha, index)` — cannot be computed at chunk-write time
+because the manifest sha does not exist until seal; the binding that CAN be
+is `(stream_id, seq)`, both known at `put_blob_chunk_scoped`, and that is
+what #838 built (§12.10). The manifest commits to both.
 
 ### 12.8 What this cut does not do
 
@@ -1941,6 +1956,143 @@ and read as an occurrence granted on the manifest but not on the chunk row.
 The full table is in the CHANGELOG entry for this cut. (The `seal_ignores_aad_until_831` pin was deleted when #831 landed in the same release; I40
 is the pin for I39's other half: it turns red the day #831 flips `seal` /
 `open`.
+
+### 12.9 A stream belongs to its first append (#837, from #836 Q2)
+
+**The gap.** `federation_stream_chunks` is `PRIMARY KEY (stream_id, seq)` and
+carries no cohort, community or writer. Two writers on one `stream_id`: the
+same `seq` is refused (monotonicity); a *different* `seq` interleaves into one
+stream, and the mismatch surfaces only at `seal_stream_scoped`, where I32
+refuses a manifest over rows not all at the DAG's tier and community.
+`MAX_CHUNKS_PER_EPOCH` is per `(stream_id, epoch)`, so a shared id lets one
+writer spend another's budget until the seal refuses. Uniqueness of the id
+was the caller's (`<writer derived key id>-<ULID>`), and the substrate did not
+check it.
+
+**The shape.** A stream is a row. V143 adds `federation_streams (stream_id
+PK, cohort_scope, community_key_id NULL, owner_key_id NULL, created_at)` on
+both dialects. The chunk floor writes it **insert-if-absent in the same
+transaction as the chunk** — under the community lock on postgres when the
+append binds, like every other epoch-state write (I27) — and then compares
+what the row says to what this append claims:
+
+- `cohort_scope` and `community_key_id` must equal the stream's, or the
+  append is refused with a typed `InvalidArgument` **naming the stream's
+  cohort and community** — the two facts the refused writer is entitled to.
+- `owner_key_id` is the **first attributed writer's derived key id**. The
+  door takes the signer and derives it with `federation_key_id_of` (never an
+  alias, I23); the floor records it on the first append. A later append by a
+  different key is refused with an `InvalidArgument` that says the stream
+  belongs to another writer and **never names that writer's key** (I4b's
+  class: a refusal discloses no more than the fact of refusal).
+- A `NULL` owner is an **unclaimed** stream: every pre-V143 stream (the
+  backfill cannot attribute them — no writer column existed) and every
+  stream the commons `put_blob_chunk` starts (that door has no signer). The
+  first attributed append **adopts** it — `UPDATE … SET owner_key_id WHERE
+  owner_key_id IS NULL`, so two adopters racing resolve to one — and from
+  then on the stream is owned. An unattributed append (the commons door) on
+  an OWNED stream is refused: an attributed claim beats an unattributed one,
+  never the reverse. Recorded as a judgement: the alternative (a NULL owner
+  admits no keyed writer ever) freezes every legacy stream for the scoped
+  door, and the alternative to that (a NULL owner admits every keyed writer)
+  is the gap this section closes.
+
+**The seal is the second guard.** `seal_stream_scoped` reads the stream row
+with the listing (one snapshot) and refuses a signer that is not the owner
+(same disclosure rule), a cohort or community that is not the stream's, and
+then runs I32 over the chunk rows as before. I32's cohort and community legs
+are now reachable only by direct row manipulation — the floor refuses the
+inputs that used to stage them — and stay as defense in depth; its TIER leg
+is still live (an authorized infra community resolves `Plaintext`, so a
+stream can honestly hold a plaintext row beside a sealed one if the
+community's standing changes mid-stream). The commons `seal_stream` refuses
+a stream whose row is not at `cohort_scope::FEDERATION`.
+
+**Backfill (V143).** Every existing stream gets a row from its lowest-`seq`
+chunk: `cohort_scope` from that chunk's blob row (V139 classified every row),
+`community_key_id` from the chunk's epoch binding where one exists, owner
+`NULL`. `stream_chunks` reports the row beside the listing, so a consumer
+sees who owns a stream and at what cohort before appending.
+
+**What this does not do.** The stream row does not police `MAX_CHUNKS_PER_EPOCH`
+differently — the cap stays per `(stream_id, epoch)`; what changed is that
+only one writer can reach it. No FK from `federation_stream_chunks` to
+`federation_streams` (SQLite's `ADD CONSTRAINT` does not exist; the floor is
+the only writer and it writes both in one transaction).
+
+### 12.10 A chunk is bound to its position (#838, from #836 Q3)
+
+**The gap.** v44.0.0 folds ONE caller `aad` into every chunk and into the
+manifest of a DAG. Across DAGs a lifted chunk does not open; within one DAG a
+chunk could be moved to another index and still open, so only the sealed
+manifest's ordered list fixed the order and `read_blob_range_as` was the only
+in-contract assembly — a hand-assembler had no way to detect a reorder.
+
+**The AAD.** Both `stream_id` and `seq` ARE known at `put_blob_chunk_scoped`.
+Persist folds them, domain-separated and length-prefixed, into each CHUNK's
+associated data at write:
+
+```
+chunk_aad = "ciris-persist:chunk:v1"
+          ‖ u64_be(len(caller_aad)) ‖ caller_aad        (absent ⇒ length 0)
+          ‖ u64_be(len(stream_id))  ‖ stream_id (UTF-8)
+          ‖ u64_be(seq)
+```
+
+One pure function (`chunk_dag_cascade::chunk_aad`), its bytes pinned by a
+unit test, no backend `cfg`. A chunk's AAD is therefore ALWAYS `Some` at a
+sealed tier — a caller passing no data still gets the position binding. The
+manifest's own AAD stays the caller's (it has no position).
+
+**Manifest v2 carries the position.** A sealed manifest now has a top-level
+`stream_id` and a per-chunk `seq`:
+
+```json
+{"chunk_tier":"community_dek","chunks":[{"seq":0,"sha":"…","size":…},…],"stream_id":"…","total_size":…,"v":2}
+```
+
+JCS key order is unchanged in kind (`chunk_tier` < `chunks` < `stream_id` <
+`total_size` < `v`; `seq` < `sha` < `size`). Both fields are **required** in
+v2 and refused in v1; the plaintext v1 manifest is byte-identical to Cut B
+(pinned). A v2 manifest's `seq` values must be strictly increasing in list
+order, so the list order and the position order are one fact. Sealed
+manifests are read only by persist — a v2 manifest opens only under the DEK —
+so this is a minor, and a v44.0.0 sealed manifest (no `stream_id`, no `seq`)
+is refused by the parser naming this section rather than opened under a
+guessed binding: nothing sealed under v44.0.0 exists outside a test, and a
+tolerant branch would be an untested downgrade arm.
+
+**Every reader reconstructs.** The DAG whole read and the range read open
+each chunk under `chunk_aad(caller_aad, manifest.stream_id, chunk.seq)`. A
+chunk placed at another index, or lifted into another stream's DAG, fails to
+open as a crypto-class error (`Backend`) **after** authorization — never
+`NotGranted`, never a parse of anything the viewer was not granted.
+
+**A stream chunk is read by POSITION.** A consequence, stated rather than
+hidden: a sealed chunk row no longer opens by its sha alone through
+`read_blob_as` / `read_blob_range_as` (the reader would need the position to
+rebuild the AAD, and the sha does not carry it — the sha IS the ciphertext,
+and the ciphertext is bound to where it was written). The DVR / catch-up read
+§12.5 described becomes `read_stream_chunk_as(stream_id, seq, viewer, aad)`:
+`stream_chunk_at(stream_id, seq)` names the row, the row's tier authorizes
+the viewer (I4, I38 per chunk), and the chunk opens under its position. A
+plaintext chunk reads the same way (and refuses `Some(aad)`). `get_blob` /
+`get_blob_range` on a chunk sha are unchanged — opaque bytes for a relay.
+Reachable from the Engine and Python (I8). The hand-assembly answer to Edge's
+Q3 is "don't", and now the AAD enforces it: the manifest stays the contract,
+and a chunk read outside it fails.
+
+**Mutation record (§11.10 discipline).** Twenty-two mutations over the
+floor (both backends), the doors, the AAD function and the parser — 20
+KILLED, 2 SURVIVED and recorded: the adoption `UPDATE`'s `IS NULL` predicate
+(a race guard a serial witness cannot see) and the by-position door's
+authorize-first step (shadowed by the per-chunk grant check behind it; the
+ordering is unobservable through a door because I25 refuses the staging).
+Three kills needed a discriminator written first — the seal's stream-row
+refusal asserted by its text ahead of I32's, a sparse-seq stream for a
+reader that would use the list index, a positioned-but-unnamed manifest for
+a parser that would lean on the per-chunk check. The table is in the
+CHANGELOG entry for this cut.
 
 ---
 
@@ -1974,5 +2126,6 @@ substrate: a chunk is a whole blob (its own `CRBLOB` envelope, addressed by
 ciphertext), the manifest carries plaintext sizes and is sealed under the same
 DEK, the seal door checks chunk ROWS, the range read decrypts per chunk with
 per-epoch authorization, the transfer path never decrypts, and `stream_chunks`
-is the live-stream handle. AAD per chunk waits on #831.
+is the live-stream handle. §12.9–§12.10 (#837, #838) bind a stream to its
+first append and a chunk to its position.
 

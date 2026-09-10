@@ -13076,6 +13076,15 @@ impl PyEngine {
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
             let stream = stream_id.to_owned();
+            // #837 — the WRITER: the same signer choice `seal_stream_scoped`
+            // makes (the LOCAL signer when configured, else the composed
+            // one), so the stream's owner and its sealer are one key.
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13084,6 +13093,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_chunk_scoped(
                                 backend.as_ref(),
+                                &*signer,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -13101,6 +13111,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_chunk_scoped(
                                 backend.as_ref(),
+                                &*signer,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -13213,14 +13224,82 @@ impl PyEngine {
         })
     }
 
+    /// #838 (§12.10) — **read one chunk of a stream by POSITION as
+    /// `viewer_key_id`**, base64-encoded. The DVR / catch-up read: the row
+    /// at `(stream_id, seq)` authorizes the viewer by its tier first
+    /// (`blob_not_granted` for a stranger), then a sealed chunk opens under
+    /// its position-bound associated data — so a sealed stream chunk no
+    /// longer opens by its sha alone through `read_blob_as`; this is its
+    /// door. An unknown position is `ValueError` (`blob_invalid_argument`).
+    /// `aad_b64`: the caller's data the chunk was written under, if any; a
+    /// mismatch fails after authorization as a backend/crypto error.
+    #[pyo3(signature = (stream_id, seq, viewer_key_id, aad_b64=None))]
+    fn read_stream_chunk_as(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        seq: u64,
+        viewer_key_id: &str,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let stream = stream_id.to_owned();
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(aad_b64)?;
+            py.detach(move || {
+                use crate::federation::chunk_dag_cascade::orchestrate::read_stream_chunk_as;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            read_stream_chunk_as(
+                                backend.as_ref(),
+                                &stream,
+                                seq,
+                                &viewer,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            read_stream_chunk_as(
+                                backend.as_ref(),
+                                &stream,
+                                seq,
+                                &viewer,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
     /// #832 (§12.5, I37) — **the live-stream handle for DVR / catch-up.**
     /// The chunks of `stream_id` so far, in `seq` order, with the latest
     /// producer-signed STH's `tree_size` — one snapshot. JSON:
     /// `{"chunks":[{"seq","chunk_sha256","epoch","size_bytes",
-    /// "plaintext_size","crypto_tier","cohort_scope"},…],"sth_tree_size":n|null}`.
+    /// "plaintext_size","crypto_tier","cohort_scope"},…],"sth_tree_size":n|null,
+    /// "stream":{"cohort_scope","community_key_id","owner_key_id"}|null}`.
     /// The prefix `[0, sth_tree_size)` is tamper-evident; the tail is
-    /// best-effort. Fetch each chunk by `chunk_sha256` (`read_blob_range_as`
-    /// to open it; `get_blob_range` for opaque relay).
+    /// best-effort. `stream` (#837) is the stream's own row: who owns it
+    /// (the first attributed writer's derived key id, or null while
+    /// unclaimed) and at what cohort / community. Read each chunk by
+    /// position (`read_stream_chunk_as`; `get_blob_range` on `chunk_sha256`
+    /// for opaque relay).
     fn stream_chunks_json(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -13259,6 +13338,11 @@ impl PyEngine {
                 Ok(serde_json::json!({
                     "chunks": chunks,
                     "sth_tree_size": listing.sth_tree_size,
+                    "stream": listing.stream.map(|h| serde_json::json!({
+                        "cohort_scope": h.cohort_scope,
+                        "community_key_id": h.community_key_id,
+                        "owner_key_id": h.owner_key_id,
+                    })),
                 })
                 .to_string())
             })
@@ -31790,10 +31874,16 @@ fn parse_put_blob_chunks_payload(
     let mut mrefs = Vec::with_capacity(wire.manifest.chunks.len());
     for c in wire.manifest.chunks {
         let sha = parse_sha256_hex(&c.sha)?;
-        mrefs.push(crate::federation::ChunkRef { sha, size: c.size });
+        // The commons atomic upload builds a v1 (plaintext) manifest: no position.
+        mrefs.push(crate::federation::ChunkRef {
+            sha,
+            size: c.size,
+            seq: None,
+        });
     }
     let manifest = crate::federation::ChunkManifest {
         chunk_tier: None,
+        stream_id: None,
         v: wire.manifest.v,
         total_size: wire.manifest.total_size,
         chunks: mrefs,

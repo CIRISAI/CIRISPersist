@@ -5291,11 +5291,15 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
+        // #837 — the WRITER is this Engine's signer, the same one
+        // `seal_stream_scoped` seals under, so the stream's owner and its
+        // sealer are one key.
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_chunk_scoped(
                     arc.as_ref(),
+                    &*self.signer,
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -5310,6 +5314,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 put_blob_chunk_scoped(
                     arc.as_ref(),
+                    &*self.signer,
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -5319,6 +5324,35 @@ impl Engine {
                     aad,
                 )
                 .await
+            }
+        }
+    }
+
+    /// #838 (§12.10) — **read one chunk of a stream by POSITION, as
+    /// `viewer_key_id`.** The DVR / catch-up read: the row at
+    /// `(stream_id, seq)` authorizes the viewer by its tier first, then a
+    /// sealed chunk opens under `chunk_aad(aad, stream_id, seq)` — the
+    /// position it was written at. A sealed stream chunk does not open by
+    /// its sha alone through [`read_blob_as`](Engine::read_blob_as); this is
+    /// its door. `aad`: the caller's data the chunk was written under, if
+    /// any (refused at a plaintext tier).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn read_stream_chunk_as(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        viewer_key_id: &str,
+        aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        use crate::federation::chunk_dag_cascade::orchestrate::read_stream_chunk_as;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                read_stream_chunk_as(arc.as_ref(), stream_id, seq, viewer_key_id, aad).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                read_stream_chunk_as(arc.as_ref(), stream_id, seq, viewer_key_id, aad).await
             }
         }
     }
