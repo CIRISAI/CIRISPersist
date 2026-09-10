@@ -280,7 +280,6 @@ impl ChunkManifest {
     /// key order on the way in (uses `serde_json` to parse), but the
     /// round-trip through `to_jcs_bytes` re-canonicalizes on the way
     /// out. Returns [`BlobError::Backend`] on malformed manifest bytes.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub(crate) fn from_manifest_bytes(bytes: &[u8]) -> Result<Self, BlobError> {
         #[derive(Deserialize)]
         struct ChunkRefWire {
