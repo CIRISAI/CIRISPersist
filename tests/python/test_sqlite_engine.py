@@ -920,12 +920,15 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
         raise
     try:
         kid = eng.register_self_federation_key("agent", "ref", None, None, None)
-        # One keyed occurrence of the self identity — the grantee. The node's
-        # own content-tier pubkeys are a valid recipient shape; persist opens
-        # through its self-retention row, so the grantee's private halves
-        # are never needed here.
+        # One keyed occurrence of the self identity — the grantee. The
+        # occurrence key IS the identity key (the v3.12.0 binding shape; the
+        # occurrence column carries an FK to `federation_keys`, and the self
+        # key is the one this engine registered). The node's own content-tier
+        # pubkeys are a valid recipient shape; persist opens through its
+        # self-retention row, so the grantee's private halves are never
+        # needed here.
         keys = eng.self_enc_pubkeys()
-        occ = kid + "-occ"
+        occ = kid
         eng.put_identity_occurrence_json(
             json.dumps(
                 {
