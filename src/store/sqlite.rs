@@ -12001,10 +12001,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 // Absent (evicted under the writer) ⇒ QueryReturnedNoRows,
                 // mapped to NotHeld below. The connection mutex is sqlite's
                 // serialization boundary (§11.4).
+                // #833 — an evicted binding is an eviction RECORD, not a
+                // bound row; the announcement treats it as absent.
                 let held: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM federation_blobs WHERE sha256 = ?1) \
                         AND (?2 OR EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                           WHERE at_rest_sha256 = ?1))",
+                                           WHERE at_rest_sha256 = ?1 AND evicted_at IS NULL))",
                     rusqlite::params![sha_vec, !needs_binding],
                     |r| r.get(0),
                 )?;
@@ -12586,6 +12588,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 // match zero rows, and this UPDATE committing first makes the
                 // bind's own EXISTS(enabled) fail. No lock spans a
                 // check/seal/bind sequence because the check IS the write.
+                // #833 (I31) — "bound" means a LIVE binding: one the sweep
+                // kept as an eviction record is not an object. This is the
+                // same predicate as `community_dek_epoch_object_count`; the
+                // count is the friendly message, this statement is the guard.
                 tx.execute(
                     "UPDATE federation_community_dek \
                         SET key_state = 'destroyed', wrapped_dek = NULL \
@@ -12594,7 +12600,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         AND epoch <> COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1), 0) \
                         AND NOT EXISTS ( \
                             SELECT 1 FROM federation_community_blob_epoch \
-                             WHERE community_key_id = ?1 AND epoch = ?2)",
+                             WHERE community_key_id = ?1 AND epoch = ?2 \
+                               AND evicted_at IS NULL)",
                     rusqlite::params![comm, ep],
                 )?
             } else {
@@ -12675,9 +12682,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let n = (move || -> Result<i64, rusqlite::Error> {
             let conn = conn.lock();
             // Served by V138's federation_community_blob_epoch_by_community_epoch.
+            // #833 (I31) — a binding the sweep kept as an eviction record is
+            // not an object; only live bindings hold the count above zero.
             conn.query_row(
                 "SELECT COUNT(*) FROM federation_community_blob_epoch \
-                 WHERE community_key_id = ?1 AND epoch = ?2",
+                 WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
                 rusqlite::params![comm, ep],
                 |r| r.get::<_, i64>(0),
             )
@@ -12791,6 +12800,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
 
         // 1. What is sealed at this epoch (served by V138's reverse index).
+        //    #833 — LIVE bindings only: an already-evicted binding is a
+        //    record, not an object, and a re-run must not re-stamp it.
         let sha_hexes: std::collections::HashSet<String> = {
             let conn = self.conn.clone();
             let comm = community_key_id.to_owned();
@@ -12798,7 +12809,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 let conn = conn.lock();
                 let mut st = conn.prepare(
                     "SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                      WHERE community_key_id = ?1 AND epoch = ?2",
+                      WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
                 )?;
                 let out: Vec<Vec<u8>> = st
                     .query_map(rusqlite::params![comm, ep], |r| r.get::<_, Vec<u8>>(0))?
@@ -12858,29 +12869,89 @@ impl crate::federation::BlobStorage for SqliteBackend {
             })?;
         }
 
-        // 3. One transaction, TWO statements — not one per object — and the
-        //    connection mutex is held only for these.
+        // 3. One transaction, THREE statements — not one per object — and
+        //    the connection mutex is held only for these. #833 (§11.5, I31):
+        //    the bytes and the at-rest grants go; THE BINDING STAYS, stamped
+        //    `evicted_at`, so a later read can say "swept under epoch N"
+        //    rather than "never ours". Every statement is scoped to LIVE
+        //    bindings, so a re-run evicts nothing and never re-stamps.
         let conn = self.conn.clone();
         let comm = community_key_id.to_owned();
+        let stamp = now.to_rfc3339();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             tx.execute(
+                "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 IN ( \
+                    SELECT at_rest_sha256 FROM federation_community_blob_epoch \
+                     WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL)",
+                rusqlite::params![comm, ep],
+            )?;
+            tx.execute(
                 "DELETE FROM federation_blobs WHERE sha256 IN ( \
                     SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                     WHERE community_key_id = ?1 AND epoch = ?2)",
+                     WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL)",
                 rusqlite::params![comm, ep],
             )?;
             let n = tx.execute(
-                "DELETE FROM federation_community_blob_epoch \
-                  WHERE community_key_id = ?1 AND epoch = ?2",
-                rusqlite::params![comm, ep],
+                "UPDATE federation_community_blob_epoch SET evicted_at = ?3 \
+                  WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
+                rusqlite::params![comm, ep, stamp],
             )?;
             tx.commit()?;
             Ok(n)
         })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch delete: {e}")))?;
         Ok(n as u64)
+    }
+
+    async fn community_dek_blob_binding(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobEpochBinding>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<(String, i64, Option<String>)>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT community_key_id, epoch, evicted_at FROM federation_community_blob_epoch \
+                 WHERE at_rest_sha256 = ?1",
+                rusqlite::params![sha_vec],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_blob_binding: {e}"))
+        })?;
+        let Some((community_key_id, epoch, evicted)) = row else {
+            return Ok(None);
+        };
+        // A stamp this backend wrote (`to_rfc3339`) that does not parse is
+        // corruption, not "live": refuse rather than report the blob as
+        // never evicted.
+        let evicted_at = evicted
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "community_dek_blob_binding: evicted_at {s:?} is not RFC 3339: {e}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(Some(crate::federation::BlobEpochBinding {
+            community_key_id,
+            epoch: u64::try_from(epoch).unwrap_or(0),
+            evicted_at,
+        }))
     }
 
     async fn community_dek_blob_epoch(
@@ -27833,6 +27904,15 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::at_rest_cascade::blob_invariants::exercise_i28_announce_refuses_an_evicted_row(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 I31 (#833) — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i31_eviction_is_a_fact_a_reader_is_told_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i31_eviction_is_a_fact_a_reader_is_told(&backend, "sqlite")
             .await;
     }
 

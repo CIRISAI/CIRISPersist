@@ -238,15 +238,31 @@ pub mod orchestrate {
             )));
         }
 
-        // Active membership = roster minus effective revocations (the
-        // CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
-        // from the wrap fan-out BEFORE we wrap). The roster-minus-effective-
-        // revocations subtraction is the shared #249 Cut B
-        // [`removed_key_ids_at`](crate::federation::removed_key_ids_at) fold —
-        // the SAME rule the `active_*_members` group-roster readers compose,
-        // so the forward-secrecy subtraction is never forked.
+        active_member_occurrences(backend, &community).await
+    }
+
+    /// The community's ACTIVE member occurrences: roster minus effective
+    /// revocations, then each remaining identity's active occurrences.
+    ///
+    /// Active membership = roster minus effective revocations (the
+    /// CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
+    /// from the wrap fan-out BEFORE we wrap). The roster-minus-effective-
+    /// revocations subtraction is the shared #249 Cut B
+    /// [`removed_key_ids_at`](crate::federation::removed_key_ids_at) fold —
+    /// the SAME rule the `active_*_members` group-roster readers compose,
+    /// so the forward-secrecy subtraction is never forked. Shared by the
+    /// wrap fan-out ([`resolve_community_members`]) and the eviction
+    /// disclosure predicate ([`may_learn_epoch_fate`], #833) so "who is a
+    /// member" has one answer.
+    async fn active_member_occurrences<B>(
+        backend: &B,
+        community: &crate::federation::types::Community,
+    ) -> Result<Vec<(String, Option<EncryptionPubkeys>)>, BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
         let revs = backend
-            .list_community_membership_revocations_for(community_key_id)
+            .list_community_membership_revocations_for(&community.community_key_id)
             .await
             .map_err(map_dir_err)?;
         let removed = crate::federation::removed_key_ids_at(
@@ -269,6 +285,53 @@ pub mod orchestrate {
             }
         }
         Ok(out)
+    }
+
+    /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — may `viewer_key_id`
+    /// be told what became of content sealed under `(community, epoch)`?
+    ///
+    /// Two legs, either suffices:
+    /// 1. the viewer holds a member grant on that epoch — the same predicate
+    ///    that authorizes reading a LIVE blob under it (a removed member
+    ///    keeps pre-rotation grants by AV-70, until the epoch is destroyed);
+    /// 2. the viewer is an active occurrence of a member on the community's
+    ///    current roster — the set the next emission would wrap to.
+    ///
+    /// The second leg is load-bearing, not a convenience: the sweep destroys
+    /// an epoch in the same pass that evicts it, and destroy deletes every
+    /// member-grant row (I5), so by the time a member asks, the epoch's own
+    /// grants are gone. A predicate with only leg 1 would refuse every
+    /// member `NotGranted` after a production sweep.
+    ///
+    /// An unknown community (its record gone) authorizes nobody — the
+    /// refusal to a non-member must not name it (I4b), so this returns
+    /// `false` rather than an error that would.
+    pub async fn may_learn_epoch_fate<B>(
+        backend: &B,
+        community_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<bool, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        if backend
+            .community_dek_has_member_grant(community_key_id, epoch, viewer_key_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        let Some(community) = backend
+            .lookup_community(community_key_id)
+            .await
+            .map_err(map_dir_err)?
+        else {
+            return Ok(false);
+        };
+        Ok(active_member_occurrences(backend, &community)
+            .await?
+            .iter()
+            .any(|(occ, _)| occ == viewer_key_id))
     }
 
     /// Mint (or read) the shared DEK for `(community, epoch)` and ensure it
