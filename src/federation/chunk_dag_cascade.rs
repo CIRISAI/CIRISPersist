@@ -1104,6 +1104,61 @@ pub mod invariants {
             "{tag} I32: a community DAG was sealed over a PLAINTEXT chunk row: {res:?}"
         );
 
+        // A community stream carrying a chunk row at the SAME cohort but at
+        // `plaintext` (placed through the floor as an infra-community write
+        // would leave it): only the TIER check can refuse this — the cohort
+        // matches — and the refusal must be the door's InvalidArgument, not
+        // a corruption report from a later step.
+        {
+            use crate::federation::StorageFloor;
+            let same_cohort = format!("{tag}-same-cohort-{run}");
+            put_blob_chunk_scoped(
+                backend,
+                COMMUNITY,
+                Some(&comm),
+                &same_cohort,
+                0,
+                b"sealed",
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+            backend
+                .put_blob_chunk_with_scope(
+                    &same_cohort,
+                    1,
+                    BlobBody::Inline(b"clear, same cohort".to_vec()),
+                    0,
+                    18,
+                    COMMUNITY,
+                    StorageFloor::resolved(CryptoTier::Plaintext),
+                    None,
+                )
+                .await
+                .unwrap();
+            let res = seal_stream_scoped(
+                backend,
+                &adapter,
+                COMMUNITY,
+                Some(&comm),
+                &same_cohort,
+                None,
+                None,
+            )
+            .await;
+            match res {
+                Err(BlobError::InvalidArgument(msg)) => assert!(
+                    msg.contains("tier"),
+                    "{tag} I32: the refusal names the TIER mismatch: {msg}"
+                ),
+                other => panic!(
+                    "{tag} I32: a community DAG over a same-cohort PLAINTEXT chunk row was not \
+                     refused by the tier check: {other:?}"
+                ),
+            }
+        }
+
         // A commons stream sealed at community: every chunk row is plaintext.
         let commons = format!("{tag}-commons-{run}");
         backend
@@ -1450,6 +1505,78 @@ pub mod invariants {
             read_any_range_for_viewer(backend, &manifest, &stranger, 0, 10, None).await,
             Err(BlobError::NotGranted { .. })
         ));
+
+        // A sealed self WHOLE blob: the range read's own authorization is the
+        // only gate in front of persist's self-retention (no per-chunk check
+        // behind it), so a stranger must be refused HERE (I4 / I34).
+        {
+            use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+            let whole = segment(9, 4000);
+            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_any_range_for_viewer(backend, &r.at_rest_sha256, &occ, 1000, 1999, None)
+                    .await
+                    .unwrap(),
+                whole[1000..=1999].to_vec(),
+                "{tag} I34b: a sealed whole blob is sliced after one open"
+            );
+            assert!(
+                matches!(
+                    read_any_range_for_viewer(backend, &r.at_rest_sha256, &stranger, 0, 10, None)
+                        .await,
+                    Err(BlobError::NotGranted { .. })
+                ),
+                "{tag} I34b: the range read handed a stranger a sealed whole blob"
+            );
+        }
+
+        // A second occurrence of the owner that arrived AFTER the chunk was
+        // written and BEFORE the seal: granted on the manifest, on no chunk
+        // row. The reader checks the CHUNK ROW's grant (I38 for self): it is
+        // refused until `rekey_for_newcomers` walks the chunk rows too.
+        {
+            let stream2 = format!("{tag}-stream2-{run}");
+            let seg = segment(13, 700);
+            let c = put_blob_chunk_scoped(backend, SELF, Some(&owner), &stream2, 0, &seg, 0, None)
+                .await
+                .unwrap();
+            let later_occ = format!("{tag}-owner-later-occ-{run}");
+            seed_occurrence(backend, &owner, &later_occ).await;
+            let sealed2 =
+                seal_stream_scoped(backend, &adapter, SELF, Some(&owner), &stream2, None, None)
+                    .await
+                    .unwrap();
+            assert!(
+                sealed2.granted.contains(&later_occ),
+                "{tag} I34b: the later occurrence is granted on the manifest"
+            );
+            assert!(
+                backend
+                    .get_at_rest_grant(&c.chunk_sha256, &later_occ)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{tag} I34b: precondition — and NOT on the chunk row"
+            );
+            assert!(
+                matches!(
+                    read_any_range_for_viewer(
+                        backend,
+                        &sealed2.manifest_sha256,
+                        &later_occ,
+                        0,
+                        9,
+                        None
+                    )
+                    .await,
+                    Err(BlobError::NotGranted { .. })
+                ),
+                "{tag} I34b: a viewer granted on the manifest but not on the chunk row read the \
+                 chunk — the reader trusted the manifest's grant for every chunk"
+            );
+        }
     }
 
     // ── I35 (commons half) ───────────────────────────────────────────────
@@ -1816,6 +1943,43 @@ pub mod invariants {
             ),
             "{tag} I38: bob is refused the post-rotation chunk"
         );
+    }
+
+    /// A SECOND occurrence of an already-registered identity: registers the
+    /// occurrence key and publishes a keyed occurrence, without touching
+    /// the identity's own key row (`seed_member` re-registers it).
+    async fn seed_occurrence<B>(backend: &B, identity_key_id: &str, occurrence_key_id: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        ts::register_hybrid_key_as(
+            backend,
+            occurrence_key_id,
+            occurrence_key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let (_xp, x_pub, _mp, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
+        backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: identity_key_id.to_owned(),
+                occurrence_key_id: occurrence_key_id.to_owned(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                }),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
     }
 
     // ── fixtures for the STH leg of I37 ─────────────────────────────────
