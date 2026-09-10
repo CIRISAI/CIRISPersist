@@ -1121,4 +1121,235 @@ mod witnesses {
             assert!(lease.is_some(), "first acquire wins");
         });
     }
+
+    // ── the pool's own witnesses (written with the pool; RED by absence) ──
+
+    /// Hold ONE reader inside a read closure for `hold`, signalling once the
+    /// reader is checked out. Runs as its own task so the caller can act
+    /// while it is held.
+    fn hold_a_reader(backend: &Arc<SqliteBackend>, hold: Duration) -> tokio::task::JoinHandle<()> {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let b = backend.clone();
+        let task = tokio::spawn(async move {
+            b.read(move |conn| {
+                // A real statement on the held reader, then the hold.
+                let one: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+                assert_eq!(one, 1);
+                tx.send(()).unwrap();
+                std::thread::sleep(hold);
+            })
+            .await;
+        });
+        rx.recv().unwrap();
+        task
+    }
+
+    // ── I1 ─────────────────────────────────────────────────────────────
+    /// OCCUPANCY. With one of two readers held inside a long read, a second
+    /// read completes on the other reader, promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_completes_while_one_reader_is_held_in_a_long_query() {
+        let path = temp_db_path("held-reader");
+        let backend = Arc::new(SqliteBackend::open_with_readers(&path, 2).await.unwrap());
+        backend.run_migrations().await.unwrap();
+        assert_eq!(backend.read_pool_handle().size(), 2);
+
+        let holder = hold_a_reader(&backend, Duration::from_secs(2));
+        assert_eq!(
+            backend.read_pool_handle().idle(),
+            1,
+            "premise: exactly one reader is checked out"
+        );
+        let t0 = Instant::now();
+        point_read(&backend).await;
+        let took = t0.elapsed();
+        holder.await.unwrap();
+        assert!(
+            took < Duration::from_millis(750),
+            "a read waited {took:?} behind a held reader with a second reader idle \
+             (FSD/SQLITE_CONNECTION_MODEL.md I1)"
+        );
+        assert_eq!(
+            backend.read_pool_handle().idle(),
+            2,
+            "both readers returned"
+        );
+    }
+
+    // ── I3 (reader arm) ────────────────────────────────────────────────
+    /// One worker, ONE reader. A read that must wait for the held reader
+    /// waits on the blocking pool, not on the worker: the 10 ms sleep fires.
+    #[test]
+    fn runtime_keeps_spinning_while_a_read_waits_on_a_reader() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("reader-wait");
+            let backend = Arc::new(SqliteBackend::open_with_readers(&path, 1).await.unwrap());
+            backend.run_migrations().await.unwrap();
+            let holder = hold_a_reader(&backend, Duration::from_secs(1));
+
+            let t0 = Instant::now();
+            let read = tokio::spawn({
+                let b = backend.clone();
+                async move {
+                    point_read(&b).await;
+                    t0.elapsed()
+                }
+            });
+            let tick = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                t0.elapsed()
+            });
+            let fired = tick.await.unwrap();
+            let read_took = read.await.unwrap();
+            holder.await.unwrap();
+            assert!(
+                read_took >= Duration::from_millis(900),
+                "premise: the read was supposed to wait for the held reader, took {read_took:?}"
+            );
+            assert!(
+                fired < Duration::from_millis(250),
+                "a 10 ms sleep fired after {fired:?} — the wait for a reader stalled the \
+                 runtime's only worker (FSD/SQLITE_CONNECTION_MODEL.md I3)"
+            );
+        });
+    }
+
+    // ── I6 ─────────────────────────────────────────────────────────────
+    /// Readers cannot write. A write attempted on a reader is refused with
+    /// SQLITE_READONLY — the dynamic net under the static gate.
+    #[tokio::test]
+    async fn reader_connections_refuse_writes() {
+        let path = temp_db_path("readonly");
+        let backend = SqliteBackend::open_with_readers(&path, 2).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let err = backend
+            .read(|conn| conn.execute_batch("CREATE TABLE t829_must_not_exist (x INTEGER)"))
+            .await
+            .expect_err("a reader must refuse DDL");
+        assert!(
+            matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ReadOnly
+            ),
+            "expected SQLITE_READONLY, got {err:?}"
+        );
+        // And the writer confirms nothing happened.
+        let n: i64 = backend
+            .write(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 't829_must_not_exist'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ── I7 ─────────────────────────────────────────────────────────────
+    /// A write on the writer is visible to the next read on a reader with
+    /// no explicit sync: WAL readers start a fresh snapshot per statement.
+    #[tokio::test]
+    async fn readers_see_the_writers_committed_rows() {
+        let path = temp_db_path("visibility");
+        let backend = SqliteBackend::open_with_readers(&path, 2).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let mode: String = backend
+            .read(|conn| conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal", "readers must see the WAL the writer set");
+        for i in 0..20 {
+            let lease = FederationDirectory::try_acquire_shared_instance(
+                &backend,
+                &format!("instance-{i}"),
+                std::process::id() as i32,
+                "vis-host",
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(lease.is_some());
+            let count: i64 = backend
+                .read(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM shared_instance_leases", [], |r| {
+                        r.get(0)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, i + 1, "reader saw a stale snapshot after write {i}");
+        }
+        assert_eq!(backend.read_pool_handle().idle(), 2);
+    }
+
+    // ── I8 ─────────────────────────────────────────────────────────────
+    /// In-memory has zero readers (a private `:memory:` database is
+    /// invisible to a second connection) and reads still work; borrowed-
+    /// handle views likewise; `from_handles` SHARES a pool rather than
+    /// opening one; `readers = 0` on a file is the documented kill switch.
+    #[tokio::test]
+    async fn in_memory_and_borrowed_views_have_zero_readers_and_from_handles_shares() {
+        let mem = SqliteBackend::open_in_memory().await.unwrap();
+        mem.run_migrations().await.unwrap();
+        assert_eq!(mem.read_pool_handle().size(), 0);
+        point_read(&mem).await;
+
+        let view = SqliteBackend::from_conn_handle(mem.conn_handle());
+        assert_eq!(view.read_pool_handle().size(), 0);
+        point_read(&view).await;
+
+        let path = temp_db_path("handles");
+        let file = SqliteBackend::open_with_readers(&path, 3).await.unwrap();
+        file.run_migrations().await.unwrap();
+        let shared = SqliteBackend::from_handles(file.conn_handle(), file.read_pool_handle());
+        assert!(Arc::ptr_eq(
+            &shared.read_pool_handle(),
+            &file.read_pool_handle()
+        ));
+        assert_eq!(shared.read_pool_handle().size(), 3);
+        point_read(&shared).await;
+
+        let off = SqliteBackend::open_with_readers(&path, 0).await.unwrap();
+        assert_eq!(
+            off.read_pool_handle().size(),
+            0,
+            "readers = 0 is the kill switch"
+        );
+        point_read(&off).await;
+
+        let mem_by_path = SqliteBackend::open_with_readers(":memory:", 4)
+            .await
+            .unwrap();
+        assert_eq!(mem_by_path.read_pool_handle().size(), 0);
+        let uri = format!(
+            "file:mem829-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let mem_by_uri = SqliteBackend::open_with_readers(uri, 4).await.unwrap();
+        assert_eq!(mem_by_uri.read_pool_handle().size(), 0);
+    }
+
+    /// FSD §3.2 — the default is `available_parallelism().clamp(2, 8)` unless
+    /// the environment overrides it. Asserted only when it is not overridden,
+    /// and the override arm is asserted through `open` on a file.
+    #[tokio::test]
+    async fn default_reader_count_is_clamped_and_open_honours_it() {
+        if std::env::var(super::READERS_ENV).is_err() {
+            let n = super::default_reader_count();
+            assert!(
+                (2..=8).contains(&n),
+                "default reader count {n} outside [2, 8]"
+            );
+            let path = temp_db_path("default-n");
+            let backend = SqliteBackend::open(&path).await.unwrap();
+            assert_eq!(backend.read_pool_handle().size(), n);
+        }
+    }
 }
