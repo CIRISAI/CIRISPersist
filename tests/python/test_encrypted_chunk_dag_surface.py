@@ -91,7 +91,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
             r = json.loads(
                 eng.put_blob_chunk_scoped("self", stream, seq, _b64(seg), 0, community_key_id=kid)
             )
-            assert r["tier"] == "InvisibleEncrypted", r
+            assert r["tier"] == "invisible_encrypted", r
             assert r["epoch"] is None, r
             assert kid in r["granted"], r
             chunk_shas.append(r["chunk_sha256"])
@@ -117,7 +117,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
         assert len(stored) == len(segs[0]) + ENVELOPE_OVERHEAD
 
         sealed = json.loads(eng.seal_stream_scoped("self", stream, community_key_id=kid))
-        assert sealed["tier"] == "InvisibleEncrypted"
+        assert sealed["tier"] == "invisible_encrypted"
         assert sealed["chunk_count"] == 2
         assert sealed["total_size"] == 4500
         manifest = sealed["manifest_sha256"]

@@ -953,7 +953,7 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
         row_mallory = base64.b64encode(b"mallory\n2026-09-09T00:00:01.000Z\n1").decode()
 
         put = json.loads(eng.put_blob_scoped("self", body_b64, kid, None, aad_b64=row_alice))
-        assert put["tier"] == "InvisibleEncrypted", put
+        assert put["tier"] == "invisible_encrypted", put
         assert occ in put["granted"], put
         sha = put["at_rest_sha256"]
 

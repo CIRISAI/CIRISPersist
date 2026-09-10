@@ -5191,7 +5191,8 @@ impl Engine {
     /// plaintext, under [`DAG_WHOLE_READ_CAP_BYTES`](crate::federation::chunk_dag_cascade::DAG_WHOLE_READ_CAP_BYTES);
     /// above it, `InvalidArgument` pointing at
     /// [`read_blob_range_as`](Engine::read_blob_range_as). `aad` is the
-    /// #831 hook (ignored until CIRISVerify#279 lands).
+    /// #831 associated data: the same bytes the blob was sealed under, or the
+    /// open fails after authorization; `Some` against a plaintext row is refused.
     /// `aad` (#831, §11.3 (5)) — the associated data the blob was sealed
     /// with, if any. A mismatch fails AFTER authorization as a crypto-class
     /// `Backend` error, never `NotGranted`: the viewer was authorized; the
@@ -5223,7 +5224,7 @@ impl Engine {
     /// body is touched; a sealed chunk DAG opens only the covering chunks
     /// (seek is O(segment)); a plaintext row is `get_blob_range`. RFC 9110
     /// §14.4: `range_start ≥ total` is `RangeNotSatisfiable` naming the
-    /// PLAINTEXT total; the end is clamped. `aad` is the #831 hook.
+    /// PLAINTEXT total; the end is clamped. `aad` (#831): the bytes the content was sealed under, if any.
     ///
     /// `get_blob_range` stays the storage-layer read: it serves stored
     /// bytes — ciphertext, for a sealed row — to relays, and never decrypts.
@@ -5273,7 +5274,7 @@ impl Engine {
     /// `family`. `epoch` is the producer's stream epoch label (recorded as
     /// given); which DEK sealed a community chunk is the chunk row's
     /// binding. Returns the chunk's content address — of the CIPHERTEXT at
-    /// a sealed tier — plus the grant split. `aad` is the #831 hook.
+    /// a sealed tier — plus the grant split. `aad` (#831): the bytes the content was sealed under, if any.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_chunk_scoped(
@@ -5327,7 +5328,7 @@ impl Engine {
     /// builds the manifest (v2 with plaintext sizes for a sealed tier),
     /// seals it under the DAG's DEK, stores it, and announces `holds_bytes`
     /// under this Engine's signer at `Plaintext` / `CommunityDek`. Returns
-    /// the DAG's content address. `aad` is the #831 hook for the manifest.
+    /// the DAG's content address. `aad` (#831) binds the manifest's seal.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn seal_stream_scoped(
         &self,

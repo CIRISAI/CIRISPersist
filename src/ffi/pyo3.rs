@@ -12711,7 +12711,7 @@ impl PyEngine {
                 .map_err(blob_err_to_py)?;
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(r.at_rest_sha256),
-                    "tier": format!("{:?}", r.tier),
+                    "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
@@ -12924,8 +12924,8 @@ impl PyEngine {
     ///
     /// #832 (§12.4) — a `chunk_dag` row is its CONTENT (concatenated, under
     /// the 64 MiB whole-read cap; above it `ValueError` pointing at
-    /// `read_blob_range_as`). `aad_b64` is the #831 hook, ignored until
-    /// CIRISVerify#279 lands.
+    /// `read_blob_range_as`). `aad_b64` (#831): base64 of the data the
+    /// content was sealed under, if any; a mismatch fails after authorization.
     /// `aad_b64` (#831, §11.3 (5)) — base64 of the associated data the blob
     /// was sealed with, if any. A mismatch fails AFTER authorization as a
     /// backend/crypto error, never `blob_not_granted`: the viewer was
@@ -12979,7 +12979,7 @@ impl PyEngine {
     /// RFC 9110 §14.4 bounds against the PLAINTEXT total: `start >= total`
     /// raises `ValueError` (`blob_range_not_satisfiable`); the end is clamped.
     /// `get_blob_range` remains the storage-layer read (stored bytes, for
-    /// relays; never decrypts). `aad_b64` is the #831 hook.
+    /// relays; never decrypts). `aad_b64` (#831): the data the content was sealed under, if any.
     #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, start, end_inclusive, aad_b64=None))]
     fn read_blob_range_as(
         &self,
@@ -13049,7 +13049,7 @@ impl PyEngine {
     ///
     /// Returns JSON: `chunk_sha256` (hex — of the CIPHERTEXT at a sealed
     /// tier), `tier`, `epoch` (community only), `granted`, `excluded`.
-    /// `aad_b64` is the #831 hook.
+    /// `aad_b64` (#831): the data the content was sealed under, if any.
     #[pyo3(signature = (cohort_scope, stream_id, seq, plaintext_b64, epoch, community_key_id=None, aad_b64=None))]
     #[allow(clippy::too_many_arguments)]
     fn put_blob_chunk_scoped(
@@ -13116,7 +13116,7 @@ impl PyEngine {
                 .map_err(blob_err_to_py)?;
                 Ok(serde_json::json!({
                     "chunk_sha256": hex::encode(r.chunk_sha256),
-                    "tier": format!("{:?}", r.tier),
+                    "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
@@ -13134,7 +13134,7 @@ impl PyEngine {
     ///
     /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
     /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
-    /// `excluded`. `aad_b64` is the #831 hook for the manifest's seal.
+    /// `excluded`. `aad_b64` (#831) binds the manifest's seal.
     #[pyo3(signature = (cohort_scope, stream_id, community_key_id=None, media_type=None, aad_b64=None))]
     fn seal_stream_scoped(
         &self,
@@ -13201,7 +13201,7 @@ impl PyEngine {
                 .map_err(blob_err_to_py)?;
                 Ok(serde_json::json!({
                     "manifest_sha256": hex::encode(r.manifest_sha256),
-                    "tier": format!("{:?}", r.tier),
+                    "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "chunk_count": r.chunk_count,
                     "total_size": r.total_size,

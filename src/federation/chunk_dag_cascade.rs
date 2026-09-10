@@ -140,6 +140,7 @@ pub mod orchestrate {
         let plaintext_size = plaintext.len() as u64;
         match tier {
             CryptoTier::Plaintext => {
+                crate::federation::at_rest_cascade::refuse_aad_at_plaintext(&plain_sha, aad)?;
                 let sha = backend
                     .put_blob_chunk_with_scope(
                         stream_id,
@@ -304,6 +305,7 @@ pub mod orchestrate {
         match tier {
             CryptoTier::Plaintext => {
                 let sha: [u8; 32] = Sha256::digest(&jcs).into();
+                crate::federation::at_rest_cascade::refuse_aad_at_plaintext(&sha, aad)?;
                 backend
                     .seal_stream_with_scope(
                         stream_id,
@@ -464,7 +466,7 @@ pub mod orchestrate {
         community_key_id: Option<&str>,
     ) -> Result<(), BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         for c in chunks {
             if c.crypto_tier != tier {
@@ -565,18 +567,23 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         if range_start > range_end_inclusive {
             return Err(BlobError::InvalidArgument("range_start > range_end".into()));
         }
-        // 1. The ROW says what this is (§11.1).
-        let head = backend
-            .blob_head(sha256)
-            .await?
-            .ok_or_else(|| BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
-            })?;
+        // 1. The ROW says what this is (§11.1). No row ⇒ the shared refusal
+        //    (#833 / I31): swept or never ours, told only to an authorized viewer.
+        let Some(head) = backend.blob_head(sha256).await? else {
+            return Err(
+                crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
+                    backend,
+                    sha256,
+                    viewer_key_id,
+                )
+                .await?,
+            );
+        };
         // 2. AUTHORIZE BY TIER, BEFORE TOUCHING ANY BODY (§11.3 / I4).
         authorize_viewer_by_tier(backend, sha256, head.crypto_tier, viewer_key_id).await?;
         // 3. Dispatch on the columns.
@@ -598,6 +605,7 @@ pub mod orchestrate {
                 .await
             }
             (_, CryptoTier::Plaintext) => {
+                crate::federation::at_rest_cascade::refuse_aad_at_plaintext(sha256, aad)?;
                 let total = head.size_bytes;
                 let end = clamp_range(range_start, range_end_inclusive, total)?;
                 match backend.get_blob_range(sha256, range_start, end).await? {
@@ -662,7 +670,7 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(sha256).await? else {
             return Err(BlobError::NotHeld {
@@ -702,7 +710,7 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         read_dag_for_viewer_authorized_capped(
             backend,
@@ -730,7 +738,7 @@ pub mod orchestrate {
         whole_read_cap: u64,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         let tier = head.crypto_tier;
         // The manifest: parsed for a plaintext DAG, opened for a sealed one.
@@ -795,6 +803,7 @@ pub mod orchestrate {
             }
         };
         if tier == CryptoTier::Plaintext {
+            crate::federation::at_rest_cascade::refuse_aad_at_plaintext(sha256, aad)?;
             // The plaintext assembler: chunk shas re-verified on read.
             return match backend.get_blob_range(sha256, start, end).await? {
                 Some(crate::federation::BlobRange::Inline(b)) => Ok(b),
@@ -818,12 +827,18 @@ pub mod orchestrate {
             std::collections::HashSet::new();
         for slice in manifest.slices_for_range(start, end) {
             let cref = &manifest.chunks[slice.index];
-            let chunk_head = backend.blob_head(&cref.sha).await?.ok_or_else(|| {
-                BlobError::Backend(format!(
-                    "chunk_dag covering chunk {} is missing from federation_blobs",
-                    hex::encode(cref.sha)
-                ))
-            })?;
+            // A covering chunk with no row: the same fact as a missing blob —
+            // swept (I31) or never ours — told the same way (I4b).
+            let Some(chunk_head) = backend.blob_head(&cref.sha).await? else {
+                return Err(
+                    crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
+                        backend,
+                        &cref.sha,
+                        viewer_key_id,
+                    )
+                    .await?,
+                );
+            };
             // The CHUNK ROW is the authority on its own tier (I2 / I32).
             if chunk_head.crypto_tier != tier {
                 return Err(BlobError::Backend(format!(

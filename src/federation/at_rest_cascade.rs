@@ -594,13 +594,12 @@ pub fn sealed_plaintext_len(stored_len: u64) -> Option<u64> {
 /// AES-256-GCM-encrypt `plaintext` under `dek` with a fresh random
 /// nonce, returning the self-describing [`AtRestEnvelope`].
 ///
-/// `aad` — **#831 hook, currently IGNORED.** Caller-supplied associated
-/// data that will be folded into the GCM tag once `ciris_crypto::aes_gcm`
-/// gains `encrypt_aad` (CIRISVerify#279). Until then the parameter exists on
-/// every surface so #831 is a flip of this function and [`open`], not a hunt
-/// for call sites; I40 pins that it binds
-/// nothing today, so no caller can believe it does. Crypto routes through
-/// `ciris_crypto` only — this must NOT reach for `ring` directly.
+/// `aad` — caller-supplied associated data (#831, §11.2 (7)), folded into
+/// the GCM tag by [`seal_aad`] and never stored: the envelope opens only for
+/// a reader presenting the same bytes to [`open`]. `None` is the AAD-empty
+/// seal, byte-identical to every row sealed before #831. I40 pins the
+/// binding. Crypto routes through `ciris_crypto` only — this must NOT reach
+/// for `ring` directly.
 pub fn seal(
     dek: &[u8; DEK_LEN],
     plaintext: &[u8],
@@ -613,13 +612,34 @@ pub fn seal(
 /// plaintext blob body. GCM auth-tag failure is an
 /// [`AtRestError::Crypto`].
 ///
-/// `aad` — the #831 hook, ignored today exactly as in [`seal`].
+/// `aad` — the associated data the envelope was sealed under (#831); the
+/// same bytes or the open fails. `None` for a seal made without any.
 pub fn open(
     dek: &[u8; DEK_LEN],
     envelope: &AtRestEnvelope,
     aad: Option<&[u8]>,
 ) -> Result<Vec<u8>, AtRestError> {
     open_aad(dek, aad, envelope)
+}
+
+/// §11.2 (7) / §11.3 (5) / I40 — **associated data at a plaintext tier is
+/// refused, never dropped.** One check for every seal and open door
+/// (whole-blob, chunk write, stream seal, range read): a caller that passes
+/// data against a row that is not sealed would otherwise believe in a
+/// binding that does not exist — the hazard the parameter exists to
+/// prevent. (Ultrareview of v44: the chunk doors had skipped it.)
+pub(crate) fn refuse_aad_at_plaintext(
+    sha256: &[u8; 32],
+    aad: Option<&[u8]>,
+) -> Result<(), crate::federation::BlobError> {
+    if aad.is_some() {
+        return Err(crate::federation::BlobError::InvalidArgument(format!(
+            "blob {} is at the plaintext tier; associated data has nothing to bind to — a \
+             plaintext row is not sealed",
+            hex::encode(sha256)
+        )));
+    }
+    Ok(())
 }
 
 /// [`seal`] with **associated data** (#831, `BLOB_ENCRYPTION_AT_REST.md`
@@ -1571,6 +1591,54 @@ pub mod orchestrate {
             .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
         Ok(new_epoch)
     }
+    /// #833 (§11.5, I31) — **the refusal for a sha with no row**, shared by
+    /// every read door (whole-blob, range, and a DAG's covering chunk —
+    /// ultrareview of v44 found the range door saying "never ours" where the
+    /// whole-blob door says "swept"). Swept, or never ours? The epoch binding
+    /// — which the retention sweep KEEPS, stamped — knows; but it is told only
+    /// to a viewer who could have read the blob. So: AUTHORIZE FIRST, on the
+    /// binding's (community, epoch), the same order as a live community blob
+    /// (§11.3). A stranger gets `NotGranted`, naming neither (I4b). Returns
+    /// `Ok(err)`: the refusal to hand back, or a backend error while deciding.
+    pub(crate) async fn refuse_missing_row<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<BlobError, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let not_held = BlobError::NotHeld {
+            sha256_hex: hex::encode(at_rest_sha256),
+        };
+        let Some(binding) = backend.community_dek_blob_binding(at_rest_sha256).await? else {
+            return Ok(not_held);
+        };
+        if !crate::federation::community_dek::orchestrate::may_learn_epoch_fate(
+            backend,
+            &binding.community_key_id,
+            binding.epoch,
+            viewer_key_id,
+        )
+        .await?
+        {
+            return Ok(BlobError::NotGranted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                viewer_key_id: viewer_key_id.to_owned(),
+            });
+        }
+        Ok(match binding.evicted_at {
+            Some(evicted_at) => BlobError::Evicted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                community_key_id: binding.community_key_id,
+                epoch: binding.epoch,
+                evicted_at,
+            },
+            // A live binding with no row is the state I19 forbids:
+            // reported as absent, never as swept.
+            None => not_held,
+        })
+    }
 
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **read any blob as a
     /// viewer, without the caller knowing how it was stored.**
@@ -1629,10 +1697,6 @@ pub mod orchestrate {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::types::cohort_scope::CryptoTier;
-        let not_granted = || BlobError::NotGranted {
-            sha256_hex: hex::encode(at_rest_sha256),
-            viewer_key_id: viewer_key_id.to_owned(),
-        };
         let not_held = || BlobError::NotHeld {
             sha256_hex: hex::encode(at_rest_sha256),
         };
@@ -1649,36 +1713,7 @@ pub mod orchestrate {
         //    dispatch below also knows whether this row is a chunk DAG —
         //    from a column, not from bytes.
         let Some(head) = backend.blob_head(at_rest_sha256).await? else {
-            // No row. Swept, or never ours? (#833, §11.5, I31) The epoch
-            // binding — which the retention sweep KEEPS, stamped — knows;
-            // but it is told only to a viewer who could have read the
-            // blob. So: AUTHORIZE FIRST, on the binding's (community,
-            // epoch), the same order as a live community blob (§11.3). A
-            // stranger gets NotGranted, naming neither (I4b).
-            let Some(binding) = backend.community_dek_blob_binding(at_rest_sha256).await? else {
-                return Err(not_held());
-            };
-            if !crate::federation::community_dek::orchestrate::may_learn_epoch_fate(
-                backend,
-                &binding.community_key_id,
-                binding.epoch,
-                viewer_key_id,
-            )
-            .await?
-            {
-                return Err(not_granted());
-            }
-            return Err(match binding.evicted_at {
-                Some(evicted_at) => BlobError::Evicted {
-                    sha256_hex: hex::encode(at_rest_sha256),
-                    community_key_id: binding.community_key_id,
-                    epoch: binding.epoch,
-                    evicted_at,
-                },
-                // A live binding with no row is the state I19 forbids:
-                // reported as absent, never as swept.
-                None => not_held(),
-            });
+            return Err(refuse_missing_row(backend, at_rest_sha256, viewer_key_id).await?);
         };
         let tier = head.crypto_tier;
 
@@ -3741,6 +3776,18 @@ pub mod blob_invariants {
              bindings (the stamp must be written once)"
         );
 
+        // The RANGE read door tells the authorized viewer the same fact —
+        // "swept", not "never ours" (ultrareview of v44).
+        let ranged = crate::federation::chunk_dag_cascade::orchestrate::read_any_range_for_viewer(
+            backend, &at_rest, &bob_occ, 0, 0, None,
+        )
+        .await;
+        assert!(
+            matches!(&ranged, Err(BlobError::Evicted { epoch, .. }) if *epoch == e0),
+            "{tag} I31: the range door reported an EVICTED sha as {ranged:?} to an authorized \
+             viewer — 'never ours' where the whole-blob door says Evicted"
+        );
+
         // The removed member holds the e0 grant and is NOT on the roster:
         // authorized by the grant leg alone.
         let bob_res = read_any_for_viewer(backend, &at_rest, &bob_occ, None).await;
@@ -4058,6 +4105,46 @@ pub mod blob_invariants {
                 .unwrap(),
             body,
             "{tag} I40: the commons row is still public without data"
+        );
+
+        // Every seal/open door, not only the whole-blob ones: the chunk
+        // write, the stream seal and the range read at a PLAINTEXT tier
+        // refuse data rather than dropping it (ultrareview of v44).
+        use crate::federation::chunk_dag_cascade::orchestrate::{
+            put_blob_chunk_scoped, read_any_range_for_viewer, seal_stream_scoped,
+        };
+        let stream = format!("{tag}-i40-stream-{run}");
+        let res =
+            put_blob_chunk_scoped(backend, FEDERATION, None, &stream, 0, b"seg", 0, Some(a)).await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I40: a commons CHUNK write accepted associated data it cannot bind: {res:?}"
+        );
+        put_blob_chunk_scoped(backend, FEDERATION, None, &stream, 0, b"seg", 0, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: commons chunk without data: {e}"));
+        let res =
+            seal_stream_scoped(backend, &adapter, FEDERATION, None, &stream, None, Some(a)).await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I40: a commons STREAM seal accepted associated data it cannot bind: {res:?}"
+        );
+        let sealed = seal_stream_scoped(backend, &adapter, FEDERATION, None, &stream, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: commons seal without data: {e}"));
+        let res =
+            read_any_range_for_viewer(backend, &sealed.manifest_sha256, &stranger, 0, 2, Some(a))
+                .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I40: the RANGE read of a plaintext DAG accepted associated data: {res:?}"
+        );
+        assert_eq!(
+            read_any_range_for_viewer(backend, &sealed.manifest_sha256, &stranger, 0, 2, None)
+                .await
+                .unwrap(),
+            b"seg".to_vec(),
+            "{tag} I40: the commons DAG is still public without data"
         );
     }
 }

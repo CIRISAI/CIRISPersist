@@ -23,6 +23,23 @@ migration needs, which a row-side commitment cannot give under a per-epoch
 DEK (#831, from #830; CIRISVerify 15.1.0's `encrypt_aad`/`decrypt_aad`,
 re-pinned here). Built on the v43.1.0 read pool.
 
+### Ultrareview of the v44 diff — two findings, two nits, all built
+
+- The new chunk write, stream seal and range read at a PLAINTEXT tier
+  silently dropped `aad=Some(_)` where the whole-blob doors refuse it; one
+  shared refusal now sits in every seal/open door (I40 widened).
+- The range door reported an evicted community row as `NotHeld` ("never
+  ours") where the whole-blob door says `Evicted`; the #833 missing-row
+  refusal is one shared helper used by the whole-blob door, the range door,
+  and a DAG's covering-chunk read (I31 widened).
+- **Wire:** the JSON `tier` field of `put_blob_scoped`, `put_blob_chunk_scoped`
+  and `seal_stream_scoped` is now the row's spelling (`invisible_encrypted`,
+  `community_dek`, `plaintext`), the same as `stream_chunks_json`'s
+  `crypto_tier` — it was Debug-cased (`InvisibleEncrypted`) in v43.0.0.
+  Covered by this MAJOR.
+- Stale "hook, ignored" doc comments on `seal`/`open`, the Engine and Python
+  doors corrected.
+
 ### #832 — chunked content under the envelope
 
 **Chunked content under the envelope: community-scope video is writable.**
@@ -94,8 +111,8 @@ sealed blob returned a ciphertext substring. `FSD/BLOB_ENCRYPTION_AT_REST.md`
   chunk floor (backends no longer implement it).
 - V142 (both dialects): `federation_stream_chunks.plaintext_size_bytes`,
   backfilled `= size_bytes`.
-- `seal` / `open` take `aad: Option<&[u8]>` — **the #831 hook, IGNORED until
-  CIRISVerify#279 lands**, pinned by `seal_ignores_aad_until_831`; threaded
+- `seal` / `open` take `aad: Option<&[u8]>` — real in this release (#831
+  landed in the same cut, so the "ignored until #279" pin was deleted); threaded
   through every new door and the Engine / Python surfaces (I39, a from-disk
   gate). Whole-blob doors (`put_blob_scoped`, the community cascade) keep
   passing `None`, marked `// #831`.
@@ -146,8 +163,8 @@ the file restored from the committed baseline; KILLED = the witness went red):
 | chunk floor binds at a non-current (still enabled) epoch | I38 (floor) | KILLED |
 | DAG read drops the per-chunk-row grant check (self) | I34b | KILLED — in pass 1 SURVIVED behind the manifest authorization; I34b now reads as an occurrence granted on the manifest but not on the chunk row |
 
-`seal_ignores_aad_until_831` is itself the pin: it turns red the day #831
-flips `seal` / `open`, which is the point.
+(The `seal_ignores_aad_until_831` pin did its job and was deleted when #831
+flipped `seal` / `open` in this same release; I40 pins the binding.)
 
 ### #831 — associated data binds the seal to its row
 
