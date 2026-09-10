@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased — v44.1.0]
+## [44.1.0] - 2026-09-10
 
 **A stream belongs to its first append, and a chunk is bound to its
 position.** Two of the four questions CIRISEdge's group-content design asked
