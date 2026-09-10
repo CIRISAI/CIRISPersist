@@ -4114,15 +4114,27 @@ pub mod blob_invariants {
             put_blob_chunk_scoped, read_any_range_for_viewer, seal_stream_scoped,
         };
         let stream = format!("{tag}-i40-stream-{run}");
-        let res =
-            put_blob_chunk_scoped(backend, FEDERATION, None, &stream, 0, b"seg", 0, Some(a)).await;
+        let res = put_blob_chunk_scoped(
+            backend,
+            &adapter,
+            FEDERATION,
+            None,
+            &stream,
+            0,
+            b"seg",
+            0,
+            Some(a),
+        )
+        .await;
         assert!(
             matches!(res, Err(BlobError::InvalidArgument(_))),
             "{tag} I40: a commons CHUNK write accepted associated data it cannot bind: {res:?}"
         );
-        put_blob_chunk_scoped(backend, FEDERATION, None, &stream, 0, b"seg", 0, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I40: commons chunk without data: {e}"));
+        put_blob_chunk_scoped(
+            backend, &adapter, FEDERATION, None, &stream, 0, b"seg", 0, None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I40: commons chunk without data: {e}"));
         let res =
             seal_stream_scoped(backend, &adapter, FEDERATION, None, &stream, None, Some(a)).await;
         assert!(

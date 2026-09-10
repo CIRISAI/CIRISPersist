@@ -1051,6 +1051,9 @@ class Engine:
     def read_blob_range_as(self, at_rest_sha256_hex: str, viewer_key_id: str, start: int, end_inclusive: int, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (BLOB_ENCRYPTION_AT_REST.md §12.4) — the decrypting range read. Plaintext bytes [start, end_inclusive] of any blob as viewer_key_id, base64-en..."""
 
+    def read_stream_chunk_as(self, stream_id: str, seq: int, viewer_key_id: str, aad_b64: str | None = None) -> str:
+        """(derived) deontic — #838 (§12.10) — read one chunk of a stream by POSITION as viewer_key_id, base64-encoded. The DVR / catch-up read: the row at (stream_id, seq) autho..."""
+
     def register_federation_key(
         self,
         signed_key_record_json: str,

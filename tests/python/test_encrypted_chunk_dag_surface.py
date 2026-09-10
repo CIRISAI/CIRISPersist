@@ -183,3 +183,75 @@ def test_commons_seal_stream_refuses_a_sealed_chunk_row_832(tmp_path) -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_a_stream_belongs_to_its_first_append_and_a_chunk_to_its_position_837_838(tmp_path) -> None:
+    """#837 / #838 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §12.9–§12.10) through the
+    wheel: the listing reports the stream's row (cohort, community, owner =
+    this node's derived key); an append naming another cohort on the same id
+    is refused with the stable `blob_invalid_argument` token; a chunk reads
+    by POSITION (`read_stream_chunk_as`) and no longer by its sha alone
+    (`blob_backend`: a crypto-class error after authorization); a stranger
+    is `blob_not_granted`; an unknown position is `blob_invalid_argument`."""
+    eng = _engine(tmp_path)
+    try:
+        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        enc = eng.self_enc_pubkeys()
+        eng.put_identity_occurrence_json(
+            json.dumps(
+                {
+                    "identity_key_id": kid,
+                    "occurrence_key_id": kid,
+                    "device_class": "server",
+                    "hardware_attestation": None,
+                    "asserted_at": "2026-09-10T00:00:00Z",
+                    "valid_until": None,
+                    "encryption_pubkeys": enc,
+                    "transport_binding": None,
+                    "persist_row_hash": "",
+                }
+            )
+        )
+        stream = "py-837-" + secrets.token_hex(4)
+        segs = [_segment(5, 700), _segment(6, 300)]
+        shas = []
+        for seq, seg in enumerate(segs):
+            r = json.loads(eng.put_blob_chunk_scoped("self", stream, seq, _b64(seg), 0, community_key_id=kid))
+            shas.append(r["chunk_sha256"])
+
+        # #837 — the stream's row rides with the listing.
+        listing = json.loads(eng.stream_chunks_json(stream))
+        assert listing["stream"] == {
+            "cohort_scope": "self",
+            "community_key_id": kid,
+            "owner_key_id": kid,
+        }, listing
+        assert json.loads(eng.stream_chunks_json("never-" + secrets.token_hex(4)))["stream"] is None
+        # Another cohort on the same id is refused at the chunk, storing nothing.
+        with pytest.raises(ValueError, match="blob_invalid_argument"):
+            eng.put_blob_chunk_scoped("federation", stream, 2, _b64(b"public"), 0)
+        assert len(json.loads(eng.stream_chunks_json(stream))["chunks"]) == 2
+
+        # #838 — by position: opens at its own position, refuses a stranger,
+        # refuses an unknown position; by sha alone it no longer opens.
+        assert base64.b64decode(eng.read_stream_chunk_as(stream, 0, kid)) == segs[0]
+        assert base64.b64decode(eng.read_stream_chunk_as(stream, 1, kid)) == segs[1]
+        with pytest.raises(ValueError, match="blob_not_granted"):
+            eng.read_stream_chunk_as(stream, 0, "stranger-" + secrets.token_hex(4))
+        with pytest.raises(ValueError, match="blob_invalid_argument"):
+            eng.read_stream_chunk_as(stream, 9, kid)
+        with pytest.raises(RuntimeError, match="blob_backend"):
+            eng.read_blob_as(shas[0], kid)
+        with pytest.raises(RuntimeError, match="blob_backend"):
+            eng.read_stream_chunk_as(stream, 0, kid, aad_b64=_b64(b"not what it was written under"))
+
+        # The sealed DAG still assembles through the manifest, whole and by range.
+        sealed = json.loads(eng.seal_stream_scoped("self", stream, community_key_id=kid))
+        plain = segs[0] + segs[1]
+        assert base64.b64decode(eng.read_blob_as(sealed["manifest_sha256"], kid)) == plain
+        assert base64.b64decode(eng.read_blob_range_as(sealed["manifest_sha256"], kid, 695, 705)) == plain[695:706]
+        # The relay's opaque read of a chunk is unchanged.
+        assert eng.get_blob_range(shas[0], 0, 7) == CRBLOB_MAGIC
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

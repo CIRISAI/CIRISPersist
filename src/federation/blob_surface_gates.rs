@@ -85,6 +85,10 @@ mod tests {
             ("seal_stream_scoped", "seal_scoped"),
             ("read_any_range_for_viewer", "read_blob_range_as"),
             ("stream_chunks(", "stream_chunks"),
+            // #838 (§12.10) — the by-position chunk read: since a sealed
+            // chunk is bound to where it was written, this is the only door
+            // that opens one outside its manifest.
+            ("read_stream_chunk_as", "read_stream_chunk_as"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {
@@ -365,11 +369,27 @@ mod tests {
     /// `seal` / `open` and no surface has to be found.
     #[test]
     fn i39_every_new_door_carries_the_aad_hook() {
-        let want: [(&str, &str, &str); 12] = [
+        let want: [(&str, &str, &str); 15] = [
             (
                 "src/federation/at_rest_cascade.rs",
                 "pub fn seal(",
                 "aad: Option<&[u8]>",
+            ),
+            // #838 — the by-position chunk read, on all three surfaces.
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn read_stream_chunk_as<",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn read_stream_chunk_as(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/ffi/pyo3.rs",
+                "fn read_stream_chunk_as(",
+                "aad_b64: Option<&str>",
             ),
             (
                 "src/federation/at_rest_cascade.rs",

@@ -5,6 +5,116 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — v44.1.0]
+
+**A stream belongs to its first append, and a chunk is bound to its
+position.** Two of the four questions CIRISEdge's group-content design asked
+(#836 Q2, Q3) were persist's to close, and both are now enforced by the
+substrate rather than documented away: `federation_stream_chunks` was
+`PRIMARY KEY (stream_id, seq)` with no cohort, community or writer, so two
+writers on one `stream_id` interleaved at different seqs and were caught only
+at the seal (#837); v44.0.0 folded ONE caller `aad` into every chunk, so
+within a DAG a chunk could move to another index and still open (#838).
+MINOR: the sealed (v2) manifest gains fields, and sealed manifests are read
+only by persist — a v2 manifest opens only under the DEK — so no consumer
+parses one; the plaintext v1 manifest is byte-identical (pinned). One
+consumer-visible change, stated rather than hidden: a **sealed stream chunk
+no longer opens by its sha alone** through `read_blob_as` /
+`read_blob_range_as` — it is bound to its position and reads through the new
+`read_stream_chunk_as` (§12.10). `FSD/BLOB_ENCRYPTION_AT_REST.md` §12.9,
+§12.10, and invariants I41–I42.
+
+### #837 — a stream belongs to its first append (§12.9, I41)
+
+- **V143** (both dialects, ADD-only): `federation_streams (stream_id PK,
+  cohort_scope, community_key_id NULL, owner_key_id NULL, created_at)`, one
+  row per stream, **backfilled** for every existing stream from its
+  lowest-`seq` chunk — cohort from the chunk's blob row, community from its
+  epoch binding, owner `NULL`.
+- **The chunk floor** (`put_blob_chunk_with_scope`) takes a `StreamClaim`
+  and writes the row insert-if-absent in the chunk's own transaction (under
+  the community lock on postgres when the append binds, I27), then compares:
+  a cohort or community that is not the stream's is refused with an
+  `InvalidArgument` **naming the stream's**; a writer that is not the owner
+  is refused with one that **never names the owner's key**; nothing is
+  stored on refusal. A `NULL` owner (pre-V143, or a stream the commons
+  `put_blob_chunk` started — that door has no signer) is **adopted** by the
+  first attributed append (`UPDATE … WHERE owner_key_id IS NULL`, so two
+  adopters resolve to one); an unattributed append on an owned stream is
+  refused. Judgement recorded in §12.9: the alternatives either freeze every
+  legacy stream for the scoped door or admit every keyed writer, which is
+  the gap.
+- **`put_blob_chunk_scoped` takes the signer** (in-crate: the orchestrate
+  door gains a `signer` parameter; the Engine passes its own, the Python
+  binding the same local-signer-else-composed choice `seal_stream_scoped`
+  makes, so the owner and the sealer are one key). The owner is the
+  signer's DERIVED key id (`federation_key_id_of`, never an alias — I23).
+- **`seal_stream_scoped`** refuses a non-owner signer and a foreign
+  cohort/community BEFORE I32; I32 stays the second guard (its tier leg is
+  still live: an infra community resolves `Plaintext`, so a stream can
+  honestly hold a plaintext row beside a sealed one; its cohort and
+  community legs are now reachable only by direct row manipulation). The
+  commons `seal_stream` refuses a stream whose row is not at `federation`.
+- **`stream_chunks`** reports the row as `StreamChunks::stream:
+  Option<StreamHead { cohort_scope, community_key_id, owner_key_id }>`;
+  `stream_chunks_json` carries it as `"stream"`.
+
+### #838 — a chunk is bound to its position (§12.10, I42)
+
+- **`chunk_aad(caller_aad, stream_id, seq)`** — one pure function, bytes
+  pinned by a unit test, no backend `cfg`:
+  `"ciris-persist:chunk:v1" ‖ u64_be(len(caller_aad)) ‖ caller_aad ‖
+  u64_be(len(stream_id)) ‖ stream_id ‖ u64_be(seq)` (absent caller data ⇒
+  length 0). Every sealed chunk is sealed under it at write; the manifest's
+  own AAD stays the caller's.
+- **Manifest v2** carries a top-level `stream_id` and a per-chunk `seq`
+  (JCS: `chunk_tier` < `chunks` < `stream_id` < `total_size` < `v`; `seq` <
+  `sha` < `size`), **required** in v2, refused in v1, `seq` strictly
+  increasing. A v44.0.0 sealed manifest (no position) is refused by the
+  parser naming §12.10 rather than opened under a guessed binding — nothing
+  sealed under v44.0.0 exists outside a test, and a tolerant branch would be
+  an untested downgrade arm.
+- **Every reader rebuilds the AAD** from the manifest: the DAG whole read
+  and the range read open each chunk under `chunk_aad(aad,
+  manifest.stream_id, chunk.seq)`, through one shared
+  `open_stream_chunk_row_for_viewer` (row → tier → sha → the viewer's grant
+  on THIS chunk, I38 → open). A chunk at another index, or lifted into
+  another stream's DAG, fails as a crypto-class error (`Backend`) AFTER
+  authorization — never `NotGranted`.
+- **`read_stream_chunk_as(stream_id, seq, viewer, aad)`** — the by-position
+  read, on the Engine and Python (`read_stream_chunk_as(stream_id, seq,
+  viewer_key_id, aad_b64=None)`, DEONTIC in the taxonomy), reachable (I8)
+  and carrying the AAD hook (I39). `stream_chunk_at(stream_id, seq)` is the
+  point lookup behind it (a DVR reader does not list the whole stream per
+  chunk). A plaintext chunk reads the same way and refuses `Some(aad)`
+  (I40). §12.5's DVR handoff now reads by position.
+
+### Docs
+
+- FSD §12.7's hook table still said the v44 `aad` parameter was "accepted
+  and ignored — pinned by a test", from before #831 landed in the same
+  release; the code and I40 bind it, and the table now says so, with the
+  #838 rows added.
+
+### Witnesses, RED first
+
+I41 and I42 were written in a PROBE form against the v44.0.0 surface (the
+chunk door had no writer parameter, so I41's foreign append was a second
+community, a second cohort and the commons door on one id; I42's swapped
+manifest carried no positions) and confirmed RED on `8d5e860` on sqlite AND
+postgres — I41: "a second community appended to a stream the first community
+started … Ok(…)"; I42: "a chunk moved to another index OPENED (100 bytes)".
+The final forms use two node signers and a positioned swapped manifest, and
+add the by-position read, the adoption of an unclaimed stream, and the
+legacy backfill (`blob_invariant_i41_v143_backfills_legacy_streams_*`, seeded
+through V142 on an empty database, both backends). I32's commons-door mixed
+leg moved to I41 (the floor now refuses that append); I37 and I38 read
+chunks by position. The mutation record is below.
+
+### Mutation record
+
+(filled in below, one runner at a time, every restore `cmp`-verified)
+
 ## [44.0.0] - 2026-09-10
 
 **Chunked content under the envelope, and a seal that binds to its row.**

@@ -28,7 +28,7 @@
 //! | the two trees declare the same columns | none — zero divergences |
 //! | every type pair is a sanctioned dialect encoding | [`DIALECT_ENCODINGS`] + [`PG_NARROWED_ID_COLUMNS`] |
 //! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (1, `cirisnode`; the 14 `admitted_at` entries closed by V141 / #828) |
-//! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (6) |
+//! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (7) |
 //!
 //! # Why `UUID` is not just another encoding
 //!
@@ -317,6 +317,15 @@ pub(crate) const WRITE_COLUMN_DIVERGENCES: &[WriteColumnDivergence] = &[
                  by the sqlite door because SQLite has no column-level `NOW()`. Nothing orders \
                  or seals on this column — the chunk DAG is addressed by hash — so the two \
                  instants are a diagnostic, not a fold input.",
+    },
+    WriteColumnDivergence {
+        table: "federation_streams",
+        columns: &["created_at"],
+        omitted_by: "postgres",
+        reason: "#837 (V143) — the stream row's first-append instant, the same shape as its \
+                 chunk index: postgres defaults `NOW()`, the sqlite floor binds the instant it \
+                 already computed for the chunk row. Ownership is decided by the three \
+                 compared columns, never by this one; it is a diagnostic.",
     },
 ];
 

@@ -399,6 +399,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_load_stream_chunk_hashes", Class::Delegates),
     ("pg_project_attestation_subjects", Class::Delegates),
     ("pg_project_consent_peer_set", Class::Delegates),
+    // #838 — row mapping for `stream_chunks` / `stream_chunk_at`: decodes a
+    // stream index row joined to its chunk row. It fails only on a corrupt
+    // row (a sha that is not 32 bytes, a tier string the enum does not
+    // know) — the substrate's own terms, never the caller's input.
+    ("pg_stream_chunk_ref", Class::Plumbing),
     // v36.0.0 (CIRISPersist#668) — newly VISIBLE rather than newly written,
     // the whole cursor family this time: every `list_*_since` used to pass
     // its row mapper as a bare function reference to `query`/`query_map`;
@@ -484,6 +489,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_next_plane_position", Class::Plumbing),
     ("sqlite_project_attestation_subjects", Class::Delegates),
     ("sqlite_project_consent_peer_set", Class::Delegates),
+    // #838 — the sqlite twin of `pg_stream_chunk_ref`: row mapping.
+    ("sqlite_stream_chunk_ref", Class::Plumbing),
     // v36.0.0 (CIRISPersist#668) — newly VISIBLE for the whole cursor
     // family; see the `pg_row_to_*` block's note.
     ("sqlite_row_to_attestation", Class::Delegates),

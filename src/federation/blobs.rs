@@ -154,6 +154,12 @@ pub struct ChunkRef {
     pub sha: [u8; 32],
     /// Byte length of the chunk.
     pub size: u32,
+    /// #838 (§12.10) — the chunk's `seq` in its stream: `Some` in every v2
+    /// (sealed) manifest, `None` in a v1 (plaintext) one. The reader rebuilds
+    /// the chunk's AAD from the manifest's `stream_id` and this, so a chunk
+    /// at another index does not open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 /// v4.1 (CIRISPersist#142, Cut B) — a flat (one-level) content-addressed
@@ -185,6 +191,20 @@ pub struct ChunkRef {
 /// is self-description for the party that has opened the manifest; the
 /// door and the reader dispatch on the ROW's `crypto_tier` column, never
 /// on this field (I2). A plaintext DAG stays `v: 1` byte-for-byte.
+///
+/// # #838 (§12.10) — a v2 manifest carries the POSITION
+///
+/// ```json
+/// {"chunk_tier":"community_dek","chunks":[{"seq":0,"sha":"…","size":…},…],"stream_id":"…","total_size":…,"v":2}
+/// ```
+///
+/// `stream_id` and every chunk's `seq` are REQUIRED in v2 and refused in
+/// v1 (v1 stays byte-identical). `seq` is strictly increasing in list order.
+/// Every reader rebuilds each chunk's AAD as `chunk_aad(caller_aad,
+/// stream_id, seq)`, so a chunk moved to another index, or lifted into
+/// another stream's DAG, fails to open. A v44.0.0 sealed manifest (no
+/// position) is refused by the parser rather than opened under a guessed
+/// binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkManifest {
     /// Manifest schema version: `1` (plaintext DAG) or `2` (sealed DAG).
@@ -199,6 +219,11 @@ pub struct ChunkManifest {
     /// DAG is sealed at. `None` for a v1 plaintext DAG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_tier: Option<crate::federation::types::cohort_scope::CryptoTier>,
+    /// #838 (§12.10) — the stream this DAG was sealed from: `Some` iff
+    /// `v == 2`. With each chunk's `seq`, what the reader needs to rebuild
+    /// the chunk's position-bound AAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
 }
 
 /// v4.1 (CIRISPersist#142, Cut B) — the `ChunkManifest` schema version
@@ -246,9 +271,9 @@ impl ChunkManifest {
     pub fn to_jcs_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         // Top-level keys, lexicographically:
-        //   "chunk_tier" < "chunks" < "total_size" < "v"
-        // ('_' 0x5F sorts before 's' 0x73). `chunk_tier` is present iff
-        // this is a sealed (v2) manifest.
+        //   "chunk_tier" < "chunks" < "stream_id" < "total_size" < "v"
+        // ('_' 0x5F sorts before 's' 0x73). `chunk_tier` and `stream_id`
+        // are present iff this is a sealed (v2) manifest (#832, #838).
         buf.push(b'{');
         if let Some(tier) = self.chunk_tier {
             buf.extend_from_slice(b"\"chunk_tier\":\"");
@@ -260,14 +285,33 @@ impl ChunkManifest {
             if i > 0 {
                 buf.push(b',');
             }
-            // Per-chunk keys, lexicographically: "sha" < "size".
-            buf.extend_from_slice(b"{\"sha\":\"");
+            // Per-chunk keys, lexicographically: "seq" < "sha" < "size".
+            // `seq` is present iff this is a v2 manifest (#838).
+            buf.push(b'{');
+            if let Some(seq) = c.seq {
+                buf.extend_from_slice(b"\"seq\":");
+                buf.extend_from_slice(seq.to_string().as_bytes());
+                buf.push(b',');
+            }
+            buf.extend_from_slice(b"\"sha\":\"");
             buf.extend_from_slice(hex::encode(c.sha).as_bytes());
             buf.extend_from_slice(b"\",\"size\":");
             buf.extend_from_slice(c.size.to_string().as_bytes());
             buf.push(b'}');
         }
-        buf.extend_from_slice(b"],\"total_size\":");
+        buf.push(b']');
+        if let Some(stream_id) = &self.stream_id {
+            // A producer-chosen string: JSON-escaped the way RFC 8785 §3.2.2.2
+            // requires (the short escapes, lowercase `\u00xx` for the other
+            // controls, raw UTF-8 otherwise), which is serde_json's escaping.
+            buf.extend_from_slice(b",\"stream_id\":");
+            buf.extend_from_slice(
+                serde_json::to_string(stream_id)
+                    .unwrap_or_else(|_| "\"\"".into())
+                    .as_bytes(),
+            );
+        }
+        buf.extend_from_slice(b",\"total_size\":");
         buf.extend_from_slice(self.total_size.to_string().as_bytes());
         buf.extend_from_slice(b",\"v\":");
         buf.extend_from_slice(self.v.to_string().as_bytes());
@@ -285,6 +329,8 @@ impl ChunkManifest {
         struct ChunkRefWire {
             sha: String,
             size: u32,
+            #[serde(default)]
+            seq: Option<u64>,
         }
         #[derive(Deserialize)]
         struct ManifestWire {
@@ -293,9 +339,54 @@ impl ChunkManifest {
             chunks: Vec<ChunkRefWire>,
             #[serde(default)]
             chunk_tier: Option<String>,
+            #[serde(default)]
+            stream_id: Option<String>,
         }
         let wire: ManifestWire = serde_json::from_slice(bytes)
             .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
+        // #838 (§12.10) — a v2 manifest carries its POSITION: `stream_id` and
+        // every chunk's `seq`, strictly increasing; a v1 carries neither. A
+        // sealed manifest without them was written by v44.0.0 and is refused
+        // rather than opened under a guessed binding.
+        let positioned = wire.stream_id.is_some();
+        let sealed = wire.v == CHUNK_MANIFEST_VERSION_SEALED;
+        if sealed && !positioned {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v2 carries no stream_id: sealed before #838 (v44.0.0) — \
+                 re-seal the stream (BLOB_ENCRYPTION_AT_REST.md §12.10)"
+                    .into(),
+            ));
+        }
+        if !sealed && positioned {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v1 carries a stream_id field".into(),
+            ));
+        }
+        let mut last_seq: Option<u64> = None;
+        for c in &wire.chunks {
+            match (sealed, c.seq) {
+                (true, Some(seq)) => {
+                    if last_seq.is_some_and(|prev| seq <= prev) {
+                        return Err(BlobError::Backend(format!(
+                            "chunk_dag manifest v2 chunk seq {seq} is not above the previous \
+                             chunk's; positions must be strictly increasing (§12.10)"
+                        )));
+                    }
+                    last_seq = Some(seq);
+                }
+                (true, None) => {
+                    return Err(BlobError::Backend(
+                        "chunk_dag manifest v2 chunk carries no seq (§12.10)".into(),
+                    ))
+                }
+                (false, Some(_)) => {
+                    return Err(BlobError::Backend(
+                        "chunk_dag manifest v1 chunk carries a seq field".into(),
+                    ))
+                }
+                (false, None) => {}
+            }
+        }
         // #832 — the version and the tier field must agree: a v1 manifest
         // carries no tier, a v2 manifest carries exactly one, and nothing
         // above v2 is known to this build.
@@ -340,13 +431,18 @@ impl ChunkManifest {
             }
             let mut sha = [0u8; 32];
             sha.copy_from_slice(&raw);
-            chunks.push(ChunkRef { sha, size: c.size });
+            chunks.push(ChunkRef {
+                sha,
+                size: c.size,
+                seq: c.seq,
+            });
         }
         Ok(ChunkManifest {
             v: wire.v,
             total_size: wire.total_size,
             chunks,
             chunk_tier,
+            stream_id: wire.stream_id,
         })
     }
 
@@ -585,6 +681,41 @@ pub struct StreamChunks {
     /// `tree_size` of the highest STH stored for the stream, if any: the
     /// prefix `[0, tree_size)` of `chunks` is tamper-evident.
     pub sth_tree_size: Option<u64>,
+    /// #837 (§12.9) — the stream's own row (V143): who owns it and at what
+    /// cohort / community, read in the same snapshot as the listing. `None`
+    /// for a stream that has never been appended to.
+    #[serde(default)]
+    pub stream: Option<StreamHead>,
+}
+
+/// #837 (§12.9, V143) — **a stream belongs to its first append.** The
+/// `federation_streams` row the chunk floor writes insert-if-absent in the
+/// first chunk's transaction and compares on every later one: the cohort,
+/// the community (the door's `community_key_id` argument — the owner or
+/// family key for `self` / `family`, `None` for the commons) and the first
+/// ATTRIBUTED writer's derived key id (`None` until an attributed append
+/// claims it: every pre-V143 stream, every commons-started one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamHead {
+    /// The cohort the first append named.
+    pub cohort_scope: String,
+    /// The community (or owner / family key) the first append named.
+    pub community_key_id: Option<String>,
+    /// The first attributed writer's DERIVED federation key id.
+    pub owner_key_id: Option<String>,
+}
+
+/// #837 (§12.9) — what an append CLAIMS about its stream, compared by the
+/// chunk floor against the stream's row (`cohort_scope` travels beside it
+/// as the floor's existing parameter). The door builds it: `community_key_id`
+/// is the door's argument, `owner_key_id` the signer's derived key id. The
+/// commons `put_blob_chunk` claims neither.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamClaim {
+    /// The community / owner / family key this append names.
+    pub community_key_id: Option<String>,
+    /// The writer's derived key id; `None` for an unattributed append.
+    pub owner_key_id: Option<String>,
 }
 
 /// #832 (§12.3) — an epoch binding the chunk / manifest floor must write
@@ -996,6 +1127,7 @@ pub trait BlobStorage: Send + Sync {
                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                 ),
                 None,
+                StreamClaim::default(),
             )
             .await
         }
@@ -1015,6 +1147,15 @@ pub trait BlobStorage: Send + Sync {
     /// `plaintext_size` is not `stored − AT_REST_ENVELOPE_OVERHEAD`; a
     /// plaintext token whose `plaintext_size` is not the body length.
     ///
+    /// #837 (§12.9, I41) — **a stream belongs to its first append.** In the
+    /// same transaction the floor writes the stream's `federation_streams`
+    /// row insert-if-absent from `(cohort_scope, claim)` and then compares:
+    /// a cohort or community that is not the stream's is refused with an
+    /// [`BlobError::InvalidArgument`] naming the stream's; an owner that is
+    /// not the stream's is refused with one that names NO key; a `NULL`
+    /// owner (pre-V143, or commons-started) is adopted by the first
+    /// attributed claim. Nothing is stored on refusal.
+    ///
     /// Requires a [`StorageFloor`] — unconstructible outside the crate
     /// (I22); in-crate, only the chunk cascade may call it (I14).
     #[allow(clippy::too_many_arguments)]
@@ -1028,6 +1169,7 @@ pub trait BlobStorage: Send + Sync {
         cohort_scope: &str,
         floor: StorageFloor,
         binding: Option<EpochBinding>,
+        claim: StreamClaim,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
     /// #832 (§12.3) — **the manifest floor.** Store the `chunk_dag` row the
@@ -1057,6 +1199,17 @@ pub trait BlobStorage: Send + Sync {
         &self,
         stream_id: &str,
     ) -> impl Future<Output = Result<StreamChunks, BlobError>> + Send;
+
+    /// #838 (§12.10) — **one chunk of a stream, by position.** The index
+    /// row at `(stream_id, seq)` joined to its chunk row, or `None`. What
+    /// `read_stream_chunk_as` names before it authorizes and opens the
+    /// chunk under its position-bound AAD; a point lookup so a DVR reader
+    /// does not list the whole stream per chunk.
+    fn stream_chunk_at(
+        &self,
+        stream_id: &str,
+        seq: u64,
+    ) -> impl Future<Output = Result<Option<StreamChunkRef>, BlobError>> + Send;
 
     /// #832 (§12.4) — the row HEAD a read door dispatches on:
     /// `(storage_kind, crypto_tier, cohort_scope, size_bytes)`, or `None`
@@ -3242,6 +3395,43 @@ pub(crate) fn check_chunk_body_against_floor(
     Ok(())
 }
 
+/// #837 (§12.9 / I41) — the chunk floor's refusal of an append whose cohort
+/// or community is not the stream's: names the STREAM's (the two facts the
+/// refused writer is entitled to) and what the call named. One text for
+/// both backends.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn stream_elsewhere_refusal(
+    stream_id: &str,
+    stream_cohort: &str,
+    stream_community: Option<&str>,
+    named_cohort: &str,
+    named_community: Option<&str>,
+) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "put_blob_chunk: stream {stream_id} belongs to cohort {stream_cohort:?}, community \
+         {stream_community:?}; this append names cohort {named_cohort:?}, community \
+         {named_community:?} — a stream belongs to its first append \
+         (BLOB_ENCRYPTION_AT_REST.md §12.9, I41)"
+    ))
+}
+
+/// #837 (§12.9 / I41) — the chunk floor's refusal of an append by a writer
+/// that is not the stream's owner (or of an unattributed append on an owned
+/// stream). Names the stream's cohort and community and NEVER the owner's
+/// key: a refusal discloses no more than the fact of refusal (I4b's class).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn stream_foreign_refusal(
+    stream_id: &str,
+    stream_cohort: &str,
+    stream_community: Option<&str>,
+) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "put_blob_chunk: stream {stream_id} belongs to another writer (cohort {stream_cohort:?}, \
+         community {stream_community:?}); an append by a different key is refused at its first \
+         chunk (BLOB_ENCRYPTION_AT_REST.md §12.9, I41)"
+    ))
+}
+
 /// v4.1 (CIRISPersist#142, Cut C1a) — from the seq-ordered
 /// `(chunk_sha, size_bytes, crypto_tier)` rows read out of
 /// `federation_stream_chunks` joined to `federation_blobs`, build the
@@ -3292,13 +3482,18 @@ pub(crate) fn prepare_sealed_manifest_row(
         total_size = total_size
             .checked_add(u64::from(size))
             .ok_or_else(|| BlobError::InvalidArgument("seal_stream: total_size overflow".into()))?;
-        chunks.push(ChunkRef { sha: *sha, size });
+        chunks.push(ChunkRef {
+            sha: *sha,
+            size,
+            seq: None,
+        });
     }
     let manifest = ChunkManifest {
         v: CHUNK_MANIFEST_VERSION,
         total_size,
         chunks,
         chunk_tier: None,
+        stream_id: None,
     };
     let manifest_bytes = manifest.to_jcs_bytes();
     if manifest_bytes.len() > inline_bytes_cap {
@@ -3903,11 +4098,20 @@ mod tests {
         let c1 = sha_of(b"chunk-one");
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 19,
             chunks: vec![
-                ChunkRef { sha: c0, size: 10 },
-                ChunkRef { sha: c1, size: 9 },
+                ChunkRef {
+                    sha: c0,
+                    size: 10,
+                    seq: None,
+                },
+                ChunkRef {
+                    sha: c1,
+                    size: 9,
+                    seq: None,
+                },
             ],
         };
         let bytes = manifest.to_jcs_bytes();
@@ -3933,27 +4137,41 @@ mod tests {
         let sealed = ChunkManifest {
             v: CHUNK_MANIFEST_VERSION_SEALED,
             total_size: 10,
-            chunks: vec![ChunkRef { sha: c0, size: 10 }],
+            chunks: vec![ChunkRef {
+                sha: c0,
+                size: 10,
+                seq: Some(7),
+            }],
             chunk_tier: Some(CryptoTier::CommunityDek),
+            stream_id: Some("cam-1/\"live\"".into()),
         };
         let s = String::from_utf8(sealed.to_jcs_bytes()).unwrap();
+        // #838 — `stream_id` between `chunks` and `total_size`, `seq` first
+        // in each chunk; the stream id JSON-escaped per RFC 8785.
         assert_eq!(
             s,
             format!(
-                "{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{}\",\"size\":10}}],\"total_size\":10,\"v\":2}}",
+                "{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"seq\":7,\"sha\":\"{}\",\"size\":10}}],\"stream_id\":\"cam-1/\\\"live\\\"\",\"total_size\":10,\"v\":2}}",
                 hex::encode(c0)
             )
         );
         assert!(sealed.is_sealed());
+        // A v1 manifest: no tier, no stream id, no seq — byte-identical to
+        // Cut B (pinned by `chunk_manifest_jcs_is_canonical`).
         let plain = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: CHUNK_MANIFEST_VERSION,
-            ..sealed.clone()
+            chunks: vec![ChunkRef {
+                sha: c0,
+                size: 10,
+                seq: None,
+            }],
+            total_size: 10,
         };
         assert!(!plain.is_sealed());
-        assert!(!String::from_utf8(plain.to_jcs_bytes())
-            .unwrap()
-            .contains("chunk_tier"));
+        let p = String::from_utf8(plain.to_jcs_bytes()).unwrap();
+        assert!(!p.contains("chunk_tier") && !p.contains("stream_id") && !p.contains("seq"));
     }
 
     /// #832 (§12.2) — the parser accepts v1 and v2 and refuses a manifest
@@ -3966,8 +4184,13 @@ mod tests {
         let sealed = ChunkManifest {
             v: CHUNK_MANIFEST_VERSION_SEALED,
             total_size: 3,
-            chunks: vec![ChunkRef { sha: c0, size: 3 }],
+            chunks: vec![ChunkRef {
+                sha: c0,
+                size: 3,
+                seq: Some(0),
+            }],
             chunk_tier: Some(CryptoTier::InvisibleEncrypted),
+            stream_id: Some("s".into()),
         };
         assert_eq!(
             ChunkManifest::from_manifest_bytes(&sealed.to_jcs_bytes()).unwrap(),
@@ -3978,11 +4201,21 @@ mod tests {
             // v1 with a tier
             format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":1}}"),
             // v2 without a tier
-            format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            format!("{{\"chunks\":[{{\"seq\":0,\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":3,\"v\":2}}"),
             // v2 with an unknown tier
-            format!("{{\"chunk_tier\":\"rot13\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            format!("{{\"chunk_tier\":\"rot13\",\"chunks\":[{{\"seq\":0,\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":3,\"v\":2}}"),
             // an unknown version
             format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":3}}"),
+            // #838 — a v44.0.0 sealed manifest: v2 without a position
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":2}}"),
+            // v2 with a stream_id but a chunk without seq
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":3,\"v\":2}}"),
+            // v2 with positions out of order (not strictly increasing)
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"seq\":1,\"sha\":\"{hex0}\",\"size\":3}},{{\"seq\":1,\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":6,\"v\":2}}"),
+            format!("{{\"chunk_tier\":\"community_dek\",\"chunks\":[{{\"seq\":2,\"sha\":\"{hex0}\",\"size\":3}},{{\"seq\":1,\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":6,\"v\":2}}"),
+            // v1 with a position
+            format!("{{\"chunks\":[{{\"sha\":\"{hex0}\",\"size\":3}}],\"stream_id\":\"s\",\"total_size\":3,\"v\":1}}"),
+            format!("{{\"chunks\":[{{\"seq\":0,\"sha\":\"{hex0}\",\"size\":3}}],\"total_size\":3,\"v\":1}}"),
         ] {
             assert!(
                 ChunkManifest::from_manifest_bytes(bad.as_bytes()).is_err(),
@@ -4001,21 +4234,26 @@ mod tests {
                 ChunkRef {
                     sha: [1; 32],
                     size: 4,
+                    seq: None,
                 }, // bytes 0..=3
                 ChunkRef {
                     sha: [2; 32],
                     size: 0,
+                    seq: None,
                 }, // empty, skipped
                 ChunkRef {
                     sha: [3; 32],
                     size: 3,
+                    seq: None,
                 }, // bytes 4..=6
                 ChunkRef {
                     sha: [4; 32],
                     size: 3,
+                    seq: None,
                 }, // bytes 7..=9
             ],
             chunk_tier: None,
+            stream_id: None,
         };
         let s = |a, b| m.slices_for_range(a, b);
         assert_eq!(
@@ -4088,9 +4326,21 @@ mod tests {
         let c1 = sha_of(b"bb");
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 3,
-            chunks: vec![ChunkRef { sha: c0, size: 1 }, ChunkRef { sha: c1, size: 2 }],
+            chunks: vec![
+                ChunkRef {
+                    sha: c0,
+                    size: 1,
+                    seq: None,
+                },
+                ChunkRef {
+                    sha: c1,
+                    size: 2,
+                    seq: None,
+                },
+            ],
         };
         let bytes = manifest.to_jcs_bytes();
         let parsed = ChunkManifest::from_manifest_bytes(&bytes).unwrap();
@@ -4101,16 +4351,19 @@ mod tests {
     fn chunk_manifest_validate_total_size() {
         let m_ok = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 5,
             chunks: vec![
                 ChunkRef {
                     sha: [0; 32],
                     size: 2,
+                    seq: None,
                 },
                 ChunkRef {
                     sha: [1; 32],
                     size: 3,
+                    seq: None,
                 },
             ],
         };
@@ -4133,9 +4386,14 @@ mod tests {
         let fake = [0xAB; 32];
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 4,
-            chunks: vec![ChunkRef { sha: fake, size: 4 }],
+            chunks: vec![ChunkRef {
+                sha: fake,
+                size: 4,
+                seq: None,
+            }],
         };
         let chunks = vec![(fake, BlobBody::Inline(b"real".to_vec()))];
         // chunk[0] sha == manifest sha (fake) so alignment passes, but the
@@ -4152,9 +4410,14 @@ mod tests {
         let c = sha_of(b"abcd");
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 99, // wrong
-            chunks: vec![ChunkRef { sha: c, size: 4 }],
+            chunks: vec![ChunkRef {
+                sha: c,
+                size: 4,
+                seq: None,
+            }],
         };
         let chunks = vec![(c, BlobBody::Inline(b"abcd".to_vec()))];
         let err = prepare_chunk_rows(&manifest, &chunks, DEFAULT_INLINE_BYTES_CAP).unwrap_err();
@@ -4168,9 +4431,14 @@ mod tests {
         let c = sha_of(b"xyz");
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 3,
-            chunks: vec![ChunkRef { sha: c, size: 3 }],
+            chunks: vec![ChunkRef {
+                sha: c,
+                size: 3,
+                seq: None,
+            }],
         };
         let chunks = vec![(c, BlobBody::Inline(b"xyz".to_vec()))];
         let rows = prepare_chunk_rows(&manifest, &chunks, DEFAULT_INLINE_BYTES_CAP).unwrap();
@@ -4210,11 +4478,13 @@ mod tests {
         // v4.1 (Cut B) — chunk_dag storage_kind + size_bytes = total_size.
         let manifest = ChunkManifest {
             chunk_tier: None,
+            stream_id: None,
             v: 1,
             total_size: 42,
             chunks: vec![ChunkRef {
                 sha: [0; 32],
                 size: 42,
+                seq: None,
             }],
         };
         let body = BlobBody::ChunkDag(manifest);
