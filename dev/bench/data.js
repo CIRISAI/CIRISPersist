@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788891385912,
+  "lastUpdate": 1789001511273,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -85511,6 +85511,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 116,
             "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "170cc8926cce197707f73b7ad29778fae7cee59f",
+          "message": "merge(#827): v43.0.0 — blob storage is end-to-end encrypted at rest for all four DEK cohorts, from day one\n\nBlob storage is end-to-end encrypted at rest for all four DEK cohorts, from day one.\n\n`self`, `family`, `community` and `affiliations` are sealed with AES-256-GCM\nunder a per-write or per-epoch DEK, the DEK hybrid-wrapped (X25519 + ML-KEM-768\n→ HKDF-SHA256 → AES-256-GCM) to every authorized recipient and symmetrically to\npersist's own hardware-rooted content master; the commons tiers stay plaintext.\nTransfers ship the ciphertext verbatim — sealed once, wrapped per recipient —\nand one read door decrypts for an authorized viewer with no knowledge of\ncohorts, DEKs or epochs. MAJOR: the write door refuses an unsealed body at an\nencrypted cohort, which previously succeeded.\n\nBuilt to the shape where each guarantee holds by construction (FSD §11): the\nrow records its RESOLVED tier; one write door and a storage floor no external\ncrate can reach; one read door that authorizes before it dispatches; key state\nthat is cryptographic, atomic, and serialized per community on postgres; an\neviction that retracts before it deletes and never deletes on a failed\nretraction; a root that never re-mints and a cache that remembers only\nsuccess. Thirty invariants (I1–I30), each written before its fix, confirmed\nred on the code it was written to catch, and red again under mutation.\n\nFour review rounds shaped it — local (15), Codex ×3 (9 + 9 + 5), cloud\nultrareview ×2 (4 + 5) — every finding verified against the code and recorded\nin §11 as the root cause it belonged to. Also: #819 (order-dependent postgres\ntests) fixed with an opt-in isolated database; #828 filed (the schema-parity\nreplayer could not read SET/DROP NOT NULL — 14 real divergences hidden, 3\nphantom declarations deleted); #826 records the transfer contract for Edge.\n\nCloses #824.",
+          "timestamp": "2026-09-09T19:16:22-05:00",
+          "tree_id": "76555acc1389a8cb213766796b6346472d59dee9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/170cc8926cce197707f73b7ad29778fae7cee59f"
+        },
+        "date": 1789001508480,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45685407,
+            "range": "± 44333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2381322,
+            "range": "± 29981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 11235,
+            "range": "± 158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 17615,
+            "range": "± 153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 29665,
+            "range": "± 192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 84123,
+            "range": "± 238",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 185,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 509,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 580,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1995,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 71,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 226,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 973,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 27990,
+            "range": "± 526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 69409,
+            "range": "± 648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 234095,
+            "range": "± 3937",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 10403,
+            "range": "± 365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11682,
+            "range": "± 377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 16198,
+            "range": "± 642",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 26771,
+            "range": "± 1152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 6337688,
+            "range": "± 25136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 6243274,
+            "range": "± 54294",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 387747,
+            "range": "± 7543",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1082794,
+            "range": "± 19831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 61276980,
+            "range": "± 692175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1918859,
+            "range": "± 92646",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 9569961,
+            "range": "± 240415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 152350365,
+            "range": "± 1105225",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4699435,
+            "range": "± 113176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 25340713,
+            "range": "± 208874",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 6477,
+            "range": "± 109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 97485,
+            "range": "± 582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 127791,
+            "range": "± 2003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 14340,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 124904,
+            "range": "± 1021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 248553,
+            "range": "± 575",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 48898,
+            "range": "± 315",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 240463,
+            "range": "± 2545",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 739503,
+            "range": "± 3216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 68258,
+            "range": "± 302",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 289087,
+            "range": "± 403",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1596562,
+            "range": "± 2693",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1928564,
+            "range": "± 4106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 65,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 59,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 142884,
+            "range": "± 3383",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 136918,
+            "range": "± 4768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 8706,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 59094,
+            "range": "± 1477",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 546514,
+            "range": "± 1862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 520,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 95,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 216,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 184,
+            "range": "± 0",
             "unit": "ns/iter"
           },
           {
