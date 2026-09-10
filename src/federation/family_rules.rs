@@ -523,6 +523,15 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "file:",
+        "a SQLite URI-filename SCHEME, not a dimension family. CIRISPersist#829: \
+         `SqliteBackend::open_with_readers` inspects the path it was handed for \
+         `file:…?mode=memory` so an in-memory URI database gets zero readers (a \
+         second connection to a private in-memory database is a second, empty \
+         database). The literal decides how many connections to OPEN; it never \
+         touches a row, a dimension, or an admission.",
+    ),
+    (
         "cohort:",
         "a SCOPE-ADDRESS-TABLE id prefix, not a dimension family — a different \
          namespace entirely. v38.0.0 (CIRISPersist#746): edge's ContentScope::Group \

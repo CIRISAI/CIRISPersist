@@ -5217,6 +5217,9 @@ impl Engine {
     /// - [`BlobError::NotGranted`] — the viewer holds no grant on that epoch.
     /// - [`BlobError::InvalidArgument`] — the blob carries no community-DEK
     ///   binding, i.e. it is not a community blob.
+    /// - [`BlobError::Evicted`] (#833) — the retention sweep deleted the
+    ///   local copy; told only to a viewer the binding authorizes (an epoch
+    ///   grantee, or an active occurrence on the current roster).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn read_blob_for_community_viewer(
         &self,
@@ -8862,9 +8865,9 @@ mod tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                          x'00', '', ?1, ?3, '0')",
+                          x'00', '', ?1, ?3, '0', ?3)",
                 rusqlite::params![key_id_owned, agent_pk_b64, "2026-04-30T00:00:00+00:00"],
             )
             .expect("seed federation key");
@@ -8878,10 +8881,10 @@ mod tests {
                     algorithm, identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES ('engine-89-mldsa', '', ?1, 'hybrid', 'agent', \
                           'engine-89-mldsa', ?2, '{}', x'00', '', \
-                          'engine-89-mldsa', ?2, '0')",
+                          'engine-89-mldsa', ?2, '0', ?2)",
                 rusqlite::params![pqc_pk_b64, "2026-04-30T00:00:00+00:00"],
             )
             .expect("seed producer PQC key");
@@ -10834,10 +10837,10 @@ mod tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', \
                           'hybrid', 'primitive', ?1, ?2, '{}', x'00', '', \
-                          ?1, ?2, '0')",
+                          ?1, ?2, '0', ?2)",
                 rusqlite::params![key_id_owned, "2026-04-30T00:00:00+00:00"],
             )
             .expect("seed federation key");
@@ -18069,10 +18072,11 @@ mod tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, ?3, ?4, 'hybrid', ?2, ?1, \
                           '2026-01-01T00:00:00Z', '{}', \
-                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0')",
+                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0', \
+                          '2026-01-01T00:00:00Z')",
                 rusqlite::params![key_id_owned, identity_type, ed_pk, mldsa_pk],
             )
             .unwrap();
@@ -18094,10 +18098,11 @@ mod tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, 'AAAA', 'hybrid', ?2, ?1, \
                           '2026-01-01T00:00:00Z', '{}', \
-                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0')",
+                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0', \
+                          '2026-01-01T00:00:00Z')",
                 rusqlite::params![key_id, identity_type],
             )
             .unwrap();

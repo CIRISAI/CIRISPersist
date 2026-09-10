@@ -238,15 +238,31 @@ pub mod orchestrate {
             )));
         }
 
-        // Active membership = roster minus effective revocations (the
-        // CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
-        // from the wrap fan-out BEFORE we wrap). The roster-minus-effective-
-        // revocations subtraction is the shared #249 Cut B
-        // [`removed_key_ids_at`](crate::federation::removed_key_ids_at) fold —
-        // the SAME rule the `active_*_members` group-roster readers compose,
-        // so the forward-secrecy subtraction is never forked.
+        active_member_occurrences(backend, &community).await
+    }
+
+    /// The community's ACTIVE member occurrences: roster minus effective
+    /// revocations, then each remaining identity's active occurrences.
+    ///
+    /// Active membership = roster minus effective revocations (the
+    /// CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
+    /// from the wrap fan-out BEFORE we wrap). The roster-minus-effective-
+    /// revocations subtraction is the shared #249 Cut B
+    /// [`removed_key_ids_at`](crate::federation::removed_key_ids_at) fold —
+    /// the SAME rule the `active_*_members` group-roster readers compose,
+    /// so the forward-secrecy subtraction is never forked. Shared by the
+    /// wrap fan-out ([`resolve_community_members`]) and the eviction
+    /// disclosure predicate ([`may_learn_epoch_fate`], #833) so "who is a
+    /// member" has one answer.
+    async fn active_member_occurrences<B>(
+        backend: &B,
+        community: &crate::federation::types::Community,
+    ) -> Result<Vec<(String, Option<EncryptionPubkeys>)>, BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
         let revs = backend
-            .list_community_membership_revocations_for(community_key_id)
+            .list_community_membership_revocations_for(&community.community_key_id)
             .await
             .map_err(map_dir_err)?;
         let removed = crate::federation::removed_key_ids_at(
@@ -269,6 +285,53 @@ pub mod orchestrate {
             }
         }
         Ok(out)
+    }
+
+    /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — may `viewer_key_id`
+    /// be told what became of content sealed under `(community, epoch)`?
+    ///
+    /// Two legs, either suffices:
+    /// 1. the viewer holds a member grant on that epoch — the same predicate
+    ///    that authorizes reading a LIVE blob under it (a removed member
+    ///    keeps pre-rotation grants by AV-70, until the epoch is destroyed);
+    /// 2. the viewer is an active occurrence of a member on the community's
+    ///    current roster — the set the next emission would wrap to.
+    ///
+    /// The second leg is load-bearing, not a convenience: the sweep destroys
+    /// an epoch in the same pass that evicts it, and destroy deletes every
+    /// member-grant row (I5), so by the time a member asks, the epoch's own
+    /// grants are gone. A predicate with only leg 1 would refuse every
+    /// member `NotGranted` after a production sweep.
+    ///
+    /// An unknown community (its record gone) authorizes nobody — the
+    /// refusal to a non-member must not name it (I4b), so this returns
+    /// `false` rather than an error that would.
+    pub async fn may_learn_epoch_fate<B>(
+        backend: &B,
+        community_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<bool, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        if backend
+            .community_dek_has_member_grant(community_key_id, epoch, viewer_key_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        let Some(community) = backend
+            .lookup_community(community_key_id)
+            .await
+            .map_err(map_dir_err)?
+        else {
+            return Ok(false);
+        };
+        Ok(active_member_occurrences(backend, &community)
+            .await?
+            .iter()
+            .any(|(occ, _)| occ == viewer_key_id))
     }
 
     /// Mint (or read) the shared DEK for `(community, epoch)` and ensure it
@@ -808,16 +871,19 @@ pub mod orchestrate {
     ///   blob's epoch.
     /// - [`BlobError::InvalidArgument`] if the blob carries no
     ///   community-DEK binding (not a community blob).
+    /// - [`BlobError::Evicted`] (#833, I31) if the retention sweep deleted
+    ///   the local copy — told only to a viewer
+    ///   [`may_learn_epoch_fate`] authorizes; a stranger gets `NotGranted`.
     pub async fn read_for_community_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + FederationDirectory + Sync,
     {
-        let (community_key_id, epoch) = backend
-            .community_dek_blob_epoch(at_rest_sha256)
+        let binding = backend
+            .community_dek_blob_binding(at_rest_sha256)
             .await?
             .ok_or_else(|| {
                 BlobError::InvalidArgument(format!(
@@ -825,6 +891,28 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
+        let (community_key_id, epoch) = (binding.community_key_id, binding.epoch);
+        // #833 (§11.5, I31) — the sweep kept the binding as an eviction
+        // record. This door is a production surface
+        // (`Engine::read_blob_for_community_viewer`, PyO3), so it gives the
+        // same answer as `read_any_for_viewer`: the epoch's own grants are
+        // gone by the time a member asks (destroy erases them, I5), so the
+        // predicate is the two-leg one — and it runs BEFORE the fact is
+        // named.
+        if let Some(evicted_at) = binding.evicted_at {
+            if !may_learn_epoch_fate(backend, &community_key_id, epoch, viewer_key_id).await? {
+                return Err(BlobError::NotGranted {
+                    sha256_hex: hex::encode(at_rest_sha256),
+                    viewer_key_id: viewer_key_id.to_owned(),
+                });
+            }
+            return Err(BlobError::Evicted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                community_key_id,
+                epoch,
+                evicted_at,
+            });
+        }
         // v43.0.0 (§11.3) — AUTHORIZE FIRST. The destroyed-epoch refusal
         // below names the community; a non-grantee must never reach it.
         if !backend

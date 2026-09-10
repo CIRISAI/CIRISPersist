@@ -5,6 +5,273 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [43.1.0] - 2026-09-10
+
+**One writer, a read pool, and every call off the async runtime.** The sqlite
+backend held one connection behind one mutex and ran every query inline on
+the caller's tokio worker; a server node serving a read API off the same
+engine stalled its own identity read ~700× while two reconcile loops took
+turns (#829, CIRISServer#575, CIRISEdge#547). Reads now run on a pool of
+read-only WAL connections and every call is dispatched off the runtime when
+one is current. Bundled: eviction keeps its binding so a reader is told
+"swept", not "never ours" (#833); `admitted_at` is NOT NULL on sqlite across
+the fourteen federation tables it was nullable on since V130 (#828); and the
+FSD now states that "rotation is not recall" reaches only as far as Edge's
+store gate, which does not exist yet (#826, CIRISEdge#581). MINOR: additive
+surfaces, no wire or manifest change.
+
+### #829 — the sqlite read pool
+
+**The SQLite connection model: one writer plus a read pool under WAL, and
+every call off the async runtime when there is one.**
+`FSD/SQLITE_CONNECTION_MODEL.md`. Storage-layer, node-local, no on-disk or
+wire change; persist is the sole DB opener, so this is unilateral.
+
+#### The defect (CIRISPersist#829, measured in CIRISServer#575 and CIRISEdge#547)
+
+`src/store/sqlite.rs` held ONE `Arc<Mutex<Connection>>` behind 351
+`conn.lock()` sites that ran **inline on the tokio worker** — the v3.14.0
+(#158) inline-sync rewrite — while the module doc still promised
+`spawn_blocking` for every call and premised the single connection on "one
+ingest writer, contention negligible". Every reader serialized behind every
+other reader AND parked the worker it ran on. CIRISServer#575: two reconcile
+loops calling the filtered `list_attestations` took `GET /v1/identity` from
+p50 1.1 ms to 780 ms (~700×) with zero non-200s. CIRISEdge#547: the
+connection holder page-faulting a corpus scan, every other thread in
+`futex_wait` behind it, a node that never recovered.
+
+#### What changed
+
+- **Read pool.** `SqliteBackend` opens `N` additional `SQLITE_OPEN_READ_ONLY`
+  connections after the writer has set WAL (`ReadPool`, hand-rolled: free
+  list + condvar, no tokio primitive). Default
+  `N = available_parallelism().clamp(2, 8)`; `CIRIS_PERSIST_SQLITE_READERS`
+  overrides, `0` is the kill switch (single-connection model, still off the
+  runtime). `open_with_readers`, `from_handles`, `read_pool_handle` added.
+- **Two doors.** `SqliteBackend::read(|&Connection| …)` and
+  `::write(|&mut Connection| …)`. Both dispatch through
+  `sqlite_conn_model::dispatch_blocking`: `Handle::try_current()` →
+  `spawn_blocking`, else inline. **#158's property is kept, not overridden**:
+  the cohabitation copy of persist on a foreign worker takes the inline arm
+  instead of panicking. Writes move off the runtime too — the stall applies
+  to a write waiting for the writer mutex identically.
+- **274 closures rewritten to the doors** by script (anchored on the
+  closure opener and the `conn.lock()` line), 20 `spawn_blocking` sites and
+  3 `&Arc<Mutex<Connection>>` helpers by hand. Nothing in the production text
+  of `sqlite.rs` locks a connection outside the two doors (gate).
+- **In-memory: zero readers**, reads fall back to the writer (a private
+  `:memory:` database is invisible to a second connection; shared-cache
+  was rejected — a different locking model, not a smaller WAL). Same for
+  `from_conn_handle` views. Every existing test runs on this path.
+- **Classification table + from-disk gate** (`sqlite_conn_model`):
+  286 rows — Read 155 / Write 121 / Door 4 / HelperRead 3 / HelperWrite 3 /
+  unclassified 0 — a partition in both directions with a parser floor. A
+  `Read` that reaches the writer, a write verb, or a `HelperWrite` reds the
+  build; readers are read-only, so a misfiled write also fails loudly at
+  runtime.
+- The module doc in `sqlite.rs` now says what is true.
+
+#### Witnesses (all RED-first where the old code could express them)
+
+I1 held reader → second read completes; I2 held writer → read completes
+(RED on v43.0.0: waited 2.000 s); I3 a waiting read does not stall a
+one-worker runtime (RED on v43.0.0: 10 ms sleep fired after 1.011 s);
+I4 the gate (RED: 285 unclassified, 292 direct locks); I5 no runtime, no
+panic (#158 preserved); I6 readers refuse writes (`SQLITE_READONLY`);
+I7 readers see committed rows; I8 zero-reader cases + `from_handles`
+shares; I9 default bounded. Mutations: a read routed to the writer reds
+I4/I2/I3; the dispatcher forced inline reds both I3 arms.
+
+#### Measurement (`read_pool_bench`, in-process interleaved A/B, debug profile)
+
+24k `observation:` + 12 `config:` + 3k `capacity:` rows, one attester; two
+loops of the filtered `list_attestations` (limit 10 000); point read probed
+every 5 ms for 8 s, 2 workers. A = `readers 0`, B = 8 readers, A B A B A B:
+
+| arm | p50 | p95 | max | probes/8 s | scans/8 s |
+|---|---:|---:|---:|---:|---:|
+| A (single connection) | 180–183 ms | 334–348 ms | 380–514 ms | 32–41 | 35–44 |
+| B (read pool) | 249–265 µs | 346–465 µs | 3.9–19.8 ms | 1199–1220 | 65–76 |
+
+#### Parity / gates
+
+`store::parity`: `read` / `write` registered as `Plumbing`; three rows that
+no longer propagate removed. `family_rules`: the `file:` URI-scheme
+literal declared NOT a family rule.
+
+#### Out of scope, recorded
+
+Sibling modules that lock `conn_handle()` themselves (`audit/sqlite.rs`,
+`retention`, `telemetry`, `scheduled_tasks`, `secrets`, `ledgers`,
+`cirisnode`, …) keep their inline single-connection reads — FSD §6 lists
+them; the same doors are what they should adopt.
+
+### #833 — eviction is a fact a reader is told
+
+**Eviction is a fact a reader is told; deletion is not.** After a retention
+sweep, v43.0.0 reported an evicted community blob as *"carries no
+community-DEK binding"* — indistinguishable from a sha that was never ours
+(`NotHeld`), because the sweep deleted the binding with the bytes. An operator
+could not tell "evicted by policy" from "wrong handle" (CIRISEdge, #826).
+
+#### Changed
+
+- **The retention sweep keeps the epoch binding.**
+  `community_dek_evict_epoch_objects` (both backends) deletes the blob row and
+  its at-rest grants but KEEPS `federation_community_blob_epoch`, stamping a
+  new nullable `evicted_at` column (V140, both dialects; no rebuild, no
+  backfill) with the instant the sweep was given. Every statement is scoped to
+  live bindings, so a second run over the same epoch evicts nothing and never
+  re-stamps. `delete_blob` — the generic floor — still removes the binding
+  outright (I19 unchanged): only the sweep marks, because only the sweep is a
+  policy action a reader should be told about. Cost: one small row per blob
+  that once existed under a community epoch — bounded by the corpus that was.
+- **"Bound" means a LIVE binding** at every site that reads it:
+  `community_dek_epoch_object_count`, the destroy statement's own `NOT EXISTS`
+  predicate (the I6 guard — the count is the friendly message, the statement
+  is the door; the existing I5/I6/I9 witnesses caught this third site when the
+  first two were changed alone), the sweep's object select, and the community
+  announcement's binding check (I28: an evicted binding is a record, not a
+  bound row). The destroy precondition is therefore unchanged: destroy after
+  a sweep still succeeds.
+- **`read_blob_as` on a row-less sha now has a third answer, after
+  authorization.** New `BlobError::Evicted { sha256_hex, community_key_id,
+  epoch, evicted_at }` (`kind() = "blob_evicted"`; Python: `ValueError`
+  carrying the token, community and epoch, routed through `blob_err_to_py` —
+  the I13 gate checks it). Reachable only for a viewer the binding authorizes:
+  a member grant on that epoch, **or** an active occurrence of a member on the
+  community's current roster. The second leg is load-bearing, not a
+  convenience — the production sweep destroys an epoch in the same pass it
+  evicts, and destroy erases every member-grant row (I5), so a door that
+  authorized by the epoch grant alone would refuse every member `NotGranted`
+  after the sweep it exists to explain. A stranger, or a removed member whose
+  old grants the destroy erased, gets `NotGranted` naming neither community
+  nor epoch (I4b holds). No binding ⇒ `NotHeld` as before. A row-less sha
+  with a live binding (the state I19 forbids) is `NotHeld`, never `Evicted`.
+- `orchestrate::read_any_for_viewer` now requires `FederationDirectory` on
+  its backend (the roster leg); both production callers (`Engine::read_blob_as`,
+  the PyO3 binding) already hand it one.
+
+#### Added
+
+- `BlobStorage::community_dek_blob_binding(sha) -> Option<BlobEpochBinding>`
+  (community, epoch, `evicted_at`) — the read door's answer for a row-less
+  sha. `community_dek_blob_epoch` is unchanged and answers for an evicted
+  binding too: the binding is a fact about the bytes.
+- `community_dek::orchestrate::may_learn_epoch_fate` — the two-leg
+  disclosure predicate. The roster fold it shares with the wrap fan-out
+  (`active_member_occurrences`) is now one function, so "who is a member" has
+  one answer.
+- Invariant **I31** (`FSD/BLOB_ENCRYPTION_AT_REST.md` §11.5, §11.10) with a
+  cross-backend witness `exercise_i31_eviction_is_a_fact_a_reader_is_told`,
+  registered on sqlite and postgres. Written first and confirmed RED on
+  v43.0.0 (the sweep deleted the binding). It exercises both authorization
+  legs: a REMOVED member who still holds the old epoch's grant (AV-70) is told
+  `Evicted` before the epoch is destroyed; a CURRENT member is told `Evicted`
+  after the production sweep destroyed the epoch and erased its grants;
+  a stranger and the removed member (post-destroy) get `NotGranted`; an unknown
+  sha gets `NotHeld`; the sweep's destroy succeeds; a second eviction returns 0.
+
+#### Evidence
+
+Every guard above was mutation-verified with the restore `cmp`-checked: the
+count filter (sqlite: I31, I5, I6 red; postgres: I31, I5 red), the destroy
+statement's predicate (sqlite: I31, I5, I6, I9 red; postgres: I31, I5 red),
+stamp-vs-delete (I31 red, both backends), the read door's authorization (a
+stranger is handed `Evicted` — I31 red), the roster leg (a current member is
+refused after the production sweep — I31 red) and the grant leg (a removed
+member holding the epoch grant is refused — I31 red). Two filters survive
+mutation and are recorded as belt, not guard: the sweep's object SELECT (the
+UPDATE predicate guards) and the announcement's binding check (the row check
+guards). The `None => NotHeld` arm for a row-less sha with a live binding is
+a state I19 forbids and no door constructs; it is untested and said so in
+the FSD.
+
+### #828 — `admitted_at` NOT NULL on sqlite
+
+#### Fixed
+
+- **`admitted_at` is `NOT NULL` on sqlite, as it has been on postgres since
+  V130 — fourteen tables rebuilt (CIRISPersist#828).** `admitted_at` is this
+  node's receiver-stamped serve position, added by V123 / V126 / V130. Postgres
+  backfilled and `SET NOT NULL`; SQLite's `ALTER TABLE ADD COLUMN` cannot
+  declare `NOT NULL` without a constant default and cannot alter nullability in
+  place, so on that dialect the column was added nullable and left nullable
+  across `federation_attestations`, `federation_communities`,
+  `federation_community_membership_revocations`, `federation_families`,
+  `federation_family_membership_revocations`,
+  `federation_identity_occurrence_revocations`,
+  `federation_identity_occurrences`, `federation_keys`,
+  `federation_location_proofs`, `federation_organizations`,
+  `federation_org_memberships`, `federation_partner_records`,
+  `federation_revocations` and `transport_destinations`. Invisible for thirteen
+  versions because the schema-parity replayer could not read `SET NOT NULL`;
+  v43.0.0 taught it and declared the fourteen. This cut fixes them.
+
+  **sqlite V141** rebuilds all fourteen under their FINAL names with the drop
+  made inert (the V136 recipe): everything that references a table being
+  dropped — directly or through a cascade — is staged and emptied leaf-first,
+  the table is dropped empty, re-created with `admitted_at TEXT NOT NULL`, and
+  everything is restored parent-first. Thirteen of the fourteen reference
+  `federation_keys`, which is itself rebuilt and carries a self-FK, and whose
+  drop would otherwise CASCADE-wipe `federation_peer_metadata` and
+  `identity_canonical_binding`, SET NULL the binding's attestation column, and
+  be refused outright by `goals` (RESTRICT) — so those, plus
+  `attestation_subjects`, `federation_revocation_quorum_state`,
+  `edge_outbound_queue`, `edge_detection_events` and `federation_trust_grants`,
+  are staged without being rebuilt. Any NULL is backfilled first from the
+  instant the row's cursor ordered by before the column existed (the exact
+  V123 / V126 / V130 expression; the source per table is in the migration
+  header), so no consumer's saved cursor goes backward. Every column (in its
+  existing order), CHECK, default, FK, the `dimension` generated column, all
+  47 indexes and all 4 triggers are reproduced verbatim. The `*_admitted`
+  cursor indexes deliberately keep their now-degenerate `COALESCE(admitted_at,
+  <legacy>)` expressions because the sqlite read doors spell that exact
+  expression; simplifying both is a separate read-side cut.
+
+  **postgres V141** is a no-op twin (catalog comments only) so both trees
+  carry the same version for the same change.
+
+  **Witness.** `v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828`
+  seeds the V140 shape through `run_migrations_through(140)` — a NULL
+  `admitted_at` row in each of the fourteen, one row in each of the eight
+  staged referrers, a self-referencing key pair, a key already stamped —
+  snapshots `sqlite_master` (indexes + triggers), `table_xinfo` and
+  `foreign_key_list` for each table, runs V141, and asserts the snapshot is
+  identical except for exactly fourteen `notnull` flags; every NULL backfilled
+  from the source the header names and no present value overwritten; every
+  referrer still holds its row and the SET NULL did not fire;
+  `foreign_key_check` empty and `integrity_check` ok; `NOT NULL` live on all
+  fourteen; both re-created trigger families still fire. The primary gate is
+  `schema_parity::nullability_agrees_across_the_two_trees`: the fourteen
+  `NULLABILITY_DIVERGENCES` entries are deleted, so a table the rebuild missed
+  reds as an undeclared divergence and a stale entry reds as "delete the
+  entry". `NULLABILITY_DIVERGENCES` now holds one entry (`cirisnode`, #674).
+
+  **Test fixtures.** Thirty-two raw `INSERT`s in sqlite test fixtures (never a
+  production door — every persist write door already stamps `admitted_at` on
+  every backend) omitted the column and relied on sqlite admitting the NULL;
+  each now binds the same instant the old `COALESCE` fallback produced, so
+  cursor-ordering tests are unchanged. `allocator_reads_the_fallback_position_sqlite_682`
+  planted `admitted_at = NULL` to reach the allocator's fallback leg; that
+  state is now unrepresentable on sqlite (as it always was on postgres), so it
+  is reframed as `allocator_fallback_position_is_unrepresentable_sqlite_828`,
+  which pins the refusal — the memory backend keeps the original witness where
+  the state is still reachable.
+
+  **A second text-reading gate corrected.** `crypto_cardinality::every_crypto_column_declares_its_natural_key_789`
+  scans the sqlite migrations line by line for signature/pubkey columns, and
+  its "current table" survived past the end of each statement. V141's
+  `INSERT INTO … SELECT scrub_signature_pqc …` restores were therefore read as
+  columns of whichever `CREATE TABLE` came last — it reported
+  `transport_destinations` carrying `pubkey_ml_dsa_65`, which it never has —
+  and its `CREATE TABLE … AS SELECT` stage tables were read as declaring
+  columns they only copy. The scanner now resets at `;` and treats a CTAS as
+  declaring nothing; a dye run (removing the real `federation_keys.pubkey_ml_dsa_65`
+  declaration) still reds it, so the reset did not blind it. Same class as
+  #828 itself: a gate that reads DDL text must model the DDL the migrations
+  actually use.
+
 ## [43.0.0] - 2026-09-09
 
 **Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from

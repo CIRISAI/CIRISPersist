@@ -31241,6 +31241,15 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.
         crate::federation::BlobError::EpochNotCurrent { .. } => PyValueError::new_err(kind),
+        // #833 (I31) — evicted by the retention sweep. PERMANENT: the local
+        // copy is gone by policy and no retry brings it back. The community
+        // and epoch ride in the message so an operator can find the sweep
+        // that did it; only an authorized viewer ever sees this variant.
+        crate::federation::BlobError::Evicted {
+            ref community_key_id,
+            epoch,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {community_key_id} epoch {epoch}")),
         // v6.8.0 (CIRISPersist#149) — disk-pressure proxy refusal.
         // PERMANENT (ValueError), NOT a retryable RuntimeError/Transient:
         // the peer should fetch from another holder; retrying this node
