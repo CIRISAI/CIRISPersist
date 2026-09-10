@@ -89,7 +89,7 @@ ambition (#84). 3.x adds:
 
 Persist-managed, 100% backend-agnostic content encryption at rest —
 the locked design in
-[`FSD/ENCRYPTED_AT_REST.md`](../FSD/ENCRYPTED_AT_REST.md): encrypt
+[`FSD/BLOB_ENCRYPTION_AT_REST.md`](../FSD/BLOB_ENCRYPTION_AT_REST.md): encrypt
 every substrate's content (AES-256-GCM via CIRISVerify) while
 keeping a plaintext, signed, queryable projection. The capability —
 a federation that measures reasoning quality without reading

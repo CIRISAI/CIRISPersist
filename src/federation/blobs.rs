@@ -319,6 +319,72 @@ pub enum BlobBody {
     ChunkDag(ChunkManifest),
 }
 
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — the lifecycle state
+/// of a community DEK epoch. Tink's three keyset states.
+///
+/// `Disabled` is AV-70's ratified behaviour — "forward-only / once shared,
+/// always shared" — now one state among three rather than the only option.
+/// `Destroyed` is the amendment: it makes the property "shared until the
+/// epoch is destroyed", which is stronger than MLS or Tink offer and
+/// therefore ours to enforce, at the door, with a precondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DekKeyState {
+    /// The primary. New seals use this epoch.
+    Enabled,
+    /// No new seals; still decrypts. Rotated past, content still readable.
+    Disabled,
+    /// Key material gone. Content sealed under it is unreadable, so this is
+    /// reachable only once that content is re-sealed or evicted.
+    Destroyed,
+}
+
+impl DekKeyState {
+    /// The stored wire token. **Stable** — it is a CHECK-constrained column
+    /// value in V138, so a rename is a migration, not an edit.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Destroyed => "destroyed",
+        }
+    }
+
+    /// Parse a stored token. Unknown values are an ERROR, never a default:
+    /// defaulting an unrecognized state to `Enabled` would let a future
+    /// state (or a corrupted row) silently re-permit sealing.
+    pub fn parse_str(s: &str) -> Result<Self, BlobError> {
+        match s {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            "destroyed" => Ok(Self::Destroyed),
+            other => Err(BlobError::Backend(format!(
+                "unknown community DEK key_state {other:?} — refusing to guess;                  an unrecognized state must not default to a permissive one"
+            ))),
+        }
+    }
+}
+
+/// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — what
+/// [`Engine::put_blob_scoped`](crate::Engine::put_blob_scoped) returns,
+/// uniform across tiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutBlobScopedResult {
+    /// The content address — of the CIPHERTEXT for an encrypted tier.
+    pub at_rest_sha256: [u8; 32],
+    /// The tier the directory resolved for this write.
+    pub tier: crate::federation::types::cohort_scope::CryptoTier,
+    /// The community epoch sealed under (`CommunityDek` only).
+    pub epoch: Option<u64>,
+    /// Recipient occurrence key_ids that hold a grant (encrypted tiers).
+    pub granted: Vec<String>,
+    /// Recipients EXCLUDED fail-secure for carrying no valid
+    /// `encryption_pubkeys`. Never a plaintext fallback. A caller that
+    /// ignores this is ignoring who cannot read what it just wrote.
+    pub excluded: Vec<String>,
+}
+
 /// v4.1 (CIRISPersist#142, Cut A) — the result of a
 /// [`BlobStorage::get_blob_range`] byte-range read.
 ///
@@ -440,6 +506,72 @@ pub struct ScopeBlobSymbol {
     pub group_dek_epoch: u64,
 }
 
+/// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — **proof that the caller
+/// resolved the tier, and the resolution itself.**
+///
+/// Every body-taking storage-floor method (`store_blob_local`,
+/// `put_blob_with_scope`, `put_blob_signing_at`) requires one. The field is
+/// private and the constructor is `pub(crate)`, so **no code outside this
+/// crate can name a `StorageFloor`** — which makes the floor unreachable
+/// from a Rust consumer (CIRISServer consumes this crate from Rust; a `pub`
+/// trait method is a door for it). The only ways to store bytes from
+/// outside are the doors that resolve the tier themselves.
+///
+/// The token also CARRIES the resolved [`CryptoTier`], which the floor
+/// records on the row as `crypto_tier` (§11.1) and uses to decide whether
+/// the bytes it was handed are plaintext that must still be screened by the
+/// perceptual-hash matcher (a sealed tier's bytes are ciphertext, already
+/// screened at the door — I21).
+///
+/// ```compile_fail
+/// // I22 — an external crate cannot construct the floor token.
+/// let _floor = ciris_persist::federation::StorageFloor::resolved(
+///     ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
+/// );
+/// ```
+///
+/// [`CryptoTier`]: crate::federation::types::cohort_scope::CryptoTier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageFloor {
+    tier: crate::federation::types::cohort_scope::CryptoTier,
+}
+
+impl StorageFloor {
+    /// The door resolved `tier` (§11.2 (2)) and vouches for it.
+    pub(crate) const fn resolved(tier: crate::federation::types::cohort_scope::CryptoTier) -> Self {
+        Self { tier }
+    }
+
+    /// The tier this token vouches for.
+    #[must_use]
+    pub const fn tier(self) -> crate::federation::types::cohort_scope::CryptoTier {
+        self.tier
+    }
+
+    /// §11.1 / I25 — the floor refuses a row that contradicts itself: a
+    /// `self` / `family` row can never be plaintext (no carve-out exists for
+    /// those cohorts), and a commons row can never be sealed. `community` /
+    /// `affiliations` may be either (the infrastructure carve-out), which is
+    /// exactly why the tier is a separate recorded fact.
+    pub fn check_scope(self, cohort_scope: &str) -> Result<(), BlobError> {
+        use crate::federation::types::cohort_scope::{self as cs, CryptoTier};
+        let plaintext = self.tier == CryptoTier::Plaintext;
+        let contradiction = match cohort_scope {
+            cs::SELF | cs::FAMILY => plaintext,
+            cs::COMMUNITY | cs::AFFILIATIONS => self.tier == CryptoTier::InvisibleEncrypted,
+            _ => !plaintext,
+        };
+        if contradiction {
+            return Err(BlobError::InvalidArgument(format!(
+                "storage floor: a {cohort_scope:?} row cannot be recorded at tier {:?} \
+                 (BLOB_ENCRYPTION_AT_REST.md §11.1)",
+                self.tier
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// v2.3 (CIRISPersist#103) — Content-addressable byte storage trait.
 ///
 /// Sibling to [`FederationDirectory`](crate::federation::FederationDirectory).
@@ -519,7 +651,49 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
+        cohort_scope: &str,
+        floor: StorageFloor,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
+    /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
+    /// `put_blob` itself is the commons form (`federation`, plaintext).
+    fn put_blob_with_scope(
+        &self,
+        sha256: &[u8; 32],
+        body: BlobBody,
+        media_type: Option<&str>,
+        attestation: PutBlobAttestation,
+        cohort_scope: &str,
+        floor: StorageFloor,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (§11.1) — the `cohort_scope` recorded when the blob was
+    /// stored (provenance: the cohort the write NAMED), or `None` if the blob
+    /// is absent.
+    fn blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, BlobError>> + Send;
+
+    /// v43.0.0 (§11.1) — **the row is the authority on its tier.** The
+    /// `crypto_tier` the write door RESOLVED (directory included) and
+    /// recorded, or `None` if the blob is absent. Reads dispatch on this —
+    /// never on the bytes, never on a re-derivation from the scope (I2, I15).
+    fn blob_crypto_tier(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<
+        Output = Result<Option<crate::federation::types::cohort_scope::CryptoTier>, BlobError>,
+    > + Send;
+
+    /// v43.0.0 (§11.5, I19) — delete a blob row **and its satellites** (the
+    /// epoch binding, the at-rest grants) in one transaction. `Ok(false)` if
+    /// no blob row existed. The floor every eviction path ends at.
+    fn delete_blob(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
     /// v4.1 (CIRISPersist#142, Cut B) — **atomic** chunked-blob upload.
     ///
@@ -819,25 +993,46 @@ pub trait BlobStorage: Send + Sync {
     where
         Self: Sync,
     {
+        // The commons form: records `federation` / plaintext on the row (§11.1).
+        self.put_blob_signing_at(
+            crate::federation::types::cohort_scope::FEDERATION,
+            StorageFloor::resolved(crate::federation::types::cohort_scope::CryptoTier::Plaintext),
+            sha256,
+            body,
+            media_type,
+            attesting_key_id,
+            signer,
+            now,
+            attestation_id,
+        )
+    }
+
+    /// v3.6.0 (CIRISPersist#134) / v43.0.0 (§11.2 (5), I21) — **the
+    /// perceptual-hash screen, ONE shared function.** Inline-only (architect
+    /// §6.5); External bodies have nothing to hash. The default backend impl
+    /// of [`perceptual_hash_matcher`](Self::perceptual_hash_matcher) returns
+    /// `None`, so this is a no-op unless operator config installed a matcher.
+    ///
+    /// Called by the commons floor on plaintext bytes, and by
+    /// [`orchestrate::put_blob_scoped`](crate::federation::at_rest_cascade::orchestrate::put_blob_scoped)
+    /// on the PLAINTEXT before an encrypted tier seals it — so every write
+    /// is screened exactly once, and never on ciphertext.
+    fn screen_inline_body<'s>(
+        &'s self,
+        sha256: &'s [u8; 32],
+        body: &'s [u8],
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
         async move {
-            use base64::engine::general_purpose::STANDARD as B64;
-            use base64::Engine as _;
-            use sha2::{Digest, Sha256};
-
-            if attesting_key_id.is_empty() {
-                return Err(BlobError::InvalidArgument(
-                    "attesting_key_id is empty".into(),
-                ));
-            }
-
             // v3.6.0 (CIRISPersist#134) — perceptual-hash hook runs
             // BEFORE the sign / commit. Inline-only (architect §6.5);
             // External bodies have nothing to hash here. Default
             // backend impl returns None so the hook is a no-op unless
             // operator-config has installed a matcher.
-            if let (Some(matcher), BlobBody::Inline(inline_bytes)) =
-                (self.perceptual_hash_matcher(), &body)
-            {
+            if let Some(matcher) = self.perceptual_hash_matcher() {
+                let inline_bytes = body;
                 match matcher.check(sha256, inline_bytes).await {
                     Ok(crate::federation::HashMatchResult::Match {
                         database,
@@ -884,6 +1079,52 @@ pub trait BlobStorage: Send + Sync {
                             "perceptual_hash matcher rejected body: {detail}"
                         )));
                     }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// v43.0.0 (§11.1) — [`put_blob_signing`](Self::put_blob_signing) that
+    /// records an explicit `cohort_scope` on the row. Reached ONLY by the
+    /// commons wrapper and by the plaintext arm of
+    /// [`put_blob_signing_scoped`](Self::put_blob_signing_scoped); there is no
+    /// path through here for an encrypted tier.
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_signing_at<'s>(
+        &'s self,
+        cohort_scope: &'s str,
+        floor: StorageFloor,
+        sha256: &'s [u8; 32],
+        body: BlobBody,
+        media_type: Option<&'s str>,
+        attesting_key_id: &'s str,
+        signer: &'s dyn ciris_keyring::HardwareSigner,
+        now: chrono::DateTime<chrono::Utc>,
+        attestation_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
+        async move {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            use sha2::{Digest, Sha256};
+
+            if attesting_key_id.is_empty() {
+                return Err(BlobError::InvalidArgument(
+                    "attesting_key_id is empty".into(),
+                ));
+            }
+
+            // v43.0.0 (§11.2 (5) / I21) — the matcher screens PLAINTEXT, once.
+            // A plaintext-tier token means these bytes are the plaintext and
+            // this floor is their first stop; a sealed-tier token means they
+            // are ciphertext, screened at the door before sealing — showing
+            // the matcher an envelope would be screening noise.
+            if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+                if let BlobBody::Inline(inline) = &body {
+                    self.screen_inline_body(sha256, inline).await?;
                 }
             }
 
@@ -937,7 +1178,8 @@ pub trait BlobStorage: Send + Sync {
                 asserted_at: now,
             };
 
-            self.put_blob(sha256, body, media_type, att).await
+            self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope, floor)
+                .await
         }
     }
 
@@ -972,6 +1214,7 @@ pub trait BlobStorage: Send + Sync {
     fn put_blob_signing_scoped<'s>(
         &'s self,
         cohort_scope: &'s str,
+        community_key_id: Option<&'s str>,
         sha256: &'s [u8; 32],
         body: BlobBody,
         media_type: Option<&'s str>,
@@ -981,30 +1224,51 @@ pub trait BlobStorage: Send + Sync {
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
-        Self: Sync,
+        Self: crate::federation::FederationDirectory + Sync,
     {
         async move {
-            if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
-                return Err(BlobError::InvalidArgument(format!(
-                    "cohort_scope {cohort_scope:?} is not in the closed set \
-                     {{self, family, community, affiliations, species, biosphere, federation}}"
-                )));
-            }
-            if crate::federation::types::cohort_scope::suppresses_holds_bytes(cohort_scope) {
-                // Structurally invisible (CEG §10.1.4): store the bytes,
-                // announce nothing. No signer, no holds_bytes row.
-                self.store_blob_local(sha256, body, media_type).await
-            } else {
-                self.put_blob_signing(
-                    sha256,
-                    body,
-                    media_type,
-                    attesting_key_id,
-                    signer,
-                    now,
-                    attestation_id,
-                )
-                .await
+            // v43.0.0 (§11.2) — THE TIER IS RESOLVED FROM THE DIRECTORY,
+            // NEVER FROM THE CALLER. `community_key_id` is what lets the
+            // CC 4.4.3.2.1 infrastructure carve-out be applied to the actual
+            // community record and its authority, instead of to a label the
+            // caller asserts.
+            let tier = crate::federation::at_rest_cascade::resolve_write_tier(
+                self,
+                cohort_scope,
+                community_key_id,
+            )
+            .await?;
+            match tier {
+                crate::federation::types::cohort_scope::CryptoTier::Plaintext => {
+                    self.put_blob_signing_at(
+                        cohort_scope,
+                        StorageFloor::resolved(
+                            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                        ),
+                        sha256,
+                        body,
+                        media_type,
+                        attesting_key_id,
+                        signer,
+                        now,
+                        attestation_id,
+                    )
+                    .await
+                }
+                // v43.0.0 (§11.2, §11.10 I3) — THERE IS NO BODY-TAKING WRITE
+                // AT AN ENCRYPTED COHORT. Not plaintext, not a magic prefix,
+                // not even a genuine envelope: the substrate seals, through
+                // the cascade, which is the only caller of the storage floor.
+                // A door that accepted "already sealed" bytes on the caller's
+                // word would have to trust a marker — and the first
+                // implementation did exactly that, accepting 8 bytes of
+                // prefix as proof of encryption.
+                encrypted => Err(BlobError::InvalidArgument(format!(
+                    "cohort_scope {cohort_scope:?} resolves to {encrypted:?}, which is \
+                     encrypted at rest. Persist seals it — there is no body-taking write at \
+                     an encrypted cohort. Use `Engine::put_blob_scoped` with the plaintext \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.2)"
+                ))),
             }
         }
     }
@@ -1087,7 +1351,7 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// The DEK-retention root for the default tier (OQ-4). **Software
     /// default** — honest about being software (the production target is
-    /// the hardware-rooted HKDF derivation per ENCRYPTED_AT_REST.md §4.3;
+    /// the hardware-rooted HKDF derivation per BLOB_ENCRYPTION_AT_REST.md §4.3;
     /// wiring the sealed seed through the Engine is a follow-up). The
     /// 32-byte key is stored base64 in `federation_content_master`
     /// (single logical row, `id=0`); concurrent first-callers race on the
@@ -1391,6 +1655,106 @@ pub trait BlobStorage: Send + Sync {
         &self,
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — the lifecycle
+    /// state of one `(community, epoch)` DEK.
+    ///
+    /// Tink's keyset model, adopted as a pattern rather than as a
+    /// dependency (§10.4). Without per-key state, "stop sealing under this
+    /// epoch" and "destroy this epoch's key" are the same operation, and
+    /// only one of them is recoverable.
+    fn community_dek_key_state(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<DekKeyState>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.5) — write the state of one `(community, epoch)` DEK.
+    ///
+    /// **This is the raw setter and it enforces NOTHING.** The DESTROY
+    /// precondition — every object sealed under the epoch re-sealed or
+    /// evicted first — lives in
+    /// [`community_dek::orchestrate::set_key_state`](crate::federation::community_dek::orchestrate::set_key_state),
+    /// which is what callers should use. A `destroyed` written through here
+    /// over live content orphans that content rather than erasing it.
+    fn community_dek_set_key_state(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        state: DekKeyState,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v43.0.0 (§10.5, §10.9) — how many objects are still sealed under
+    /// `(community, epoch)`.
+    ///
+    /// The DESTROY precondition, and the reason V138 adds
+    /// `federation_community_blob_epoch_by_community_epoch`: before that
+    /// index this was a full table scan, and **a precondition that is
+    /// expensive to check is one that gets skipped** — while the thing it
+    /// guards is unrecoverable.
+    fn community_dek_epoch_object_count(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+    /// v43.0.0 (§10.7) — every `(epoch, state)` this community has a DEK for,
+    /// ascending. The sweep's input.
+    fn community_dek_epochs(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<(u64, DekKeyState)>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — **delete the LOCAL copies of every object sealed at
+    /// `(community, epoch)`**, returning how many were removed.
+    ///
+    /// This is the destructive half of the sweep and it is deliberately
+    /// narrow: it removes this node's bytes and the epoch binding, after
+    /// emitting a `withdraws` for each `holds_bytes` this node announced
+    /// **under its own signing key** (§11.5). An announcement made under some
+    /// other attesting key — the FFI's `put_blob_signing` lets a caller name
+    /// one — is that key's holder's to retract; this node cannot sign a
+    /// withdraws for it and does not pretend to. It does
+    /// **not** recall copies already fountained to peers — rotation is not
+    /// recall (§10.6), and the mechanism that reaches other holders is the
+    /// tombstone plane, not this call. A caller that treats this as erasure
+    /// across the mesh is wrong in a way that matters.
+    ///
+    /// Ordering is load-bearing: the bytes and the binding go together, so a
+    /// later `community_dek_epoch_object_count` returns 0 and the DESTROY
+    /// precondition can be satisfied honestly rather than by a stale index.
+    fn community_dek_evict_epoch_objects(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        signer: &crate::signing::LocalSigner,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — the community's past-epoch retention policy.
+    ///
+    /// `None` = retain indefinitely, which is the DEFAULT and today's
+    /// behaviour. `Some(n)` authorizes the sweep to delete local content
+    /// more than `n` epochs behind the current one.
+    ///
+    /// Opt-in on purpose: deletion is irreversible, so it happens only where
+    /// an operator has said how much history to keep.
+    fn community_dek_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<Option<u64>, BlobError>> + Send;
+
+    /// v43.0.0 (§11.6) — every community this node holds a DEK epoch record
+    /// for. The sweep's enumeration: exactly the set with anything to sweep.
+    fn community_dek_communities(
+        &self,
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v43.0.0 (§10.7) — set the community's past-epoch retention policy.
+    /// `None` restores retain-indefinitely.
+    fn community_dek_set_retain_past_epochs(
+        &self,
+        community_key_id: &str,
+        retain: Option<u64>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243 parts 1+2) ───────
     //   scope-native privacy: a store for caller-pre-encrypted
@@ -1709,6 +2073,20 @@ pub enum BlobError {
         key_id: String,
     },
 
+    /// v43.0.0 (§11.4, I17) — a community blob could not be bound because
+    /// `epoch` is no longer the community's CURRENT epoch (a rotation landed
+    /// between reading the epoch and binding), or is not `enabled`. The
+    /// cascade treats this as "re-seal under the current epoch".
+    #[error(
+        "community {community_key_id:?} epoch {epoch} is not the current enabled epoch — a \
+         rotated or destroyed epoch accepts no new content (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+    )]
+    EpochNotCurrent {
+        /// The community whose epoch moved.
+        community_key_id: String,
+        /// The epoch the writer sealed under.
+        epoch: u64,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -1731,6 +2109,7 @@ impl BlobError {
             BlobError::NotHeld { .. } => "blob_not_held",
             BlobError::DiskPressureProxyRefused { .. } => "blob_disk_pressure_proxy_refused",
             BlobError::QuarantineWithheld { .. } => "blob_quarantine_withheld",
+            BlobError::EpochNotCurrent { .. } => "blob_epoch_not_current",
             BlobError::Backend(_) => "blob_backend",
         }
     }

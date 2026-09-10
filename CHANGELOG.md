@@ -5,6 +5,181 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [43.0.0] - 2026-09-09
+
+**Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from
+day one — rebuilt to the shape where each guarantee is true by construction.**
+MAJOR: the write door refuses input that previously succeeded.
+
+`self`, `family`, `community` and `affiliations` are encrypted at rest and
+reachable end to end — store, read, rotate, sweep — from Rust and from Python.
+Commons tiers (`species` / `biosphere` / `federation`) stay plaintext, which is
+correct and is the signed build-manifest path.
+
+### The rebuild, and why
+
+The first implementation of this feature (`fd43e74`, PR #827) was reviewed three
+ways — local code review (15 findings), Codex (8), cloud ultrareview (4) — and
+~17 verified issues clustered into ten root causes. They were one mistake in ten
+places: **each guarantee was a check at one site, and nothing made the check the
+only way through.** The headline write gate sat on a door with no production
+caller. Authorization lived inside two of three read branches. "Sealed" was an
+8-byte prefix test. "Destroyed" was a text column with every key wrap intact.
+The sweep satisfied its own precondition by zeroing the thing it then read. The
+rotate/sweep lifecycle had zero Engine facades and zero Python bindings while
+the CHANGELOG advertised both.
+
+`FSD/BLOB_ENCRYPTION_AT_REST.md` §11 records the shape those guarantees need in
+order to be unbypassable, and fourteen invariants (§11.10) each falsifiable
+through a door a consumer actually holds. **Every invariant test was written
+first and confirmed red on `fd43e74`** — 10 of 11 behavioural/structural tests
+failed on the code they were written to catch; the eleventh was reframed once
+the state it constructed became unrepresentable.
+
+### What is true now, by construction (§11)
+
+- **The blob row is the authority on its tier.** V139 adds
+  `federation_blobs.cohort_scope`; reads dispatch on it, **never on bytes**. A
+  commons document that happens to begin with the envelope magic is public; a
+  plaintext row under a private cohort is never served.
+- **One write door.** `Engine::put_blob_scoped` / `PyEngine.put_blob_scoped`
+  resolves the tier from the **directory** (the CC 4.4.3.2.1 infrastructure
+  carve-out is a property of the community record and its authority, not of a
+  label), seals where the tier requires it, and announces community content.
+  There is **no body-taking write at an encrypted cohort** — not plaintext, not
+  a magic prefix, not even a genuine envelope. The commons doors record
+  `federation` and cannot be pointed at a private cohort.
+- **One read door, and it authorizes before it dispatches.**
+  `read_blob_as(sha, viewer)`: row → authorize by tier → body once → parse the
+  envelope structurally → decrypt. A refusal names only the sha and the viewer.
+- **Destroy deletes key material, atomically.** `destroyed` sets the state,
+  NULLs the self-retention wrap and deletes every member grant in one
+  transaction, conditioned on zero bound objects. Bind is conditioned on
+  `enabled` in the same statement. **Bind and destroy are mutually exclusive by
+  statement** — the check/seal/bind race cannot strand content. V139's CHECK
+  makes "destroyed with a key" and "enabled without one" unrepresentable.
+- **The precondition destroy checks is the one it states**: no object **on
+  this node**. Recall of fountained copies is the tombstone plane's job.
+- **Eviction retracts what it announced** — a `withdraws` per `holds_bytes` this
+  node made under its own key, then delete (the `evict_actor` discipline). The
+  sweep is therefore an Engine operation with a signer.
+- **The lifecycle is on every surface**: `community_dek_set_key_state`,
+  `sweep_community_epochs`, `sweep_all_communities` — Engine and Python.
+- **The root never re-mints.** A re-derivation over an absent hardware seed
+  refuses, naming the consequence, instead of silently producing a different
+  master. Derived once per process on the blocking pool and cached.
+- **Every backend, every error.** The lifecycle harness covers the sweep on
+  sqlite **and** postgres from one function; every Python blob binding maps
+  `BlobError` through `blob_err_to_py`, keeping the `blob_not_granted` /
+  `blob_not_held` tokens callers branch on.
+
+### The second review, and what it found the rebuild still got wrong
+
+Codex reviewed the rebuild (`30fde79`) and found nine verified issues; the
+cloud ultrareview found five, one overlapping. Fourteen findings, seven root
+causes, every one the same shape as the first review's: **a guarantee
+established at one site and not carried to the next.** FSD §11 records each
+(C2-1…C2-9, U1…U5) and invariants I15–I26 witness them; every witness was
+written first, confirmed red on `30fde79`, and turns red again under mutation.
+
+- **The row stored the tier's INPUT, not the tier.** Reads re-derived the
+  tier from the scope, dropping the directory axis the write door had
+  applied, so an infrastructure community's plaintext content was unreadable
+  through `read_blob_as`. `federation_blobs.crypto_tier` now records the
+  RESOLVED tier and reads dispatch on it (I15). The same premise had made
+  V139's backfill wrong: "no encrypted legacy exists" was false (the self/
+  family door shipped in v42), and defaulting legacy ciphertext rows to
+  commons would have served them to any viewer after upgrade. V139 now
+  classifies each pre-existing row from its own grants and bindings (I16).
+- **"Enabled" was not "current."** A rotation that landed between reading
+  the epoch and binding let the racing write seal under the OLD epoch, which
+  the just-removed member can still open. The bind now requires the current
+  epoch in the same statement; the cascade cleans its orphan and re-seals
+  under the new one (I17). And the key-state door could retire the CURRENT
+  epoch, wedging every later write; refused at the door and in the
+  statement (I20).
+- **The error path undid the happy path.** Eviction swallowed a failed
+  `withdraws` and deleted anyway — "fail-honest" that was fail-silent; a
+  failed retraction now aborts with the bytes intact and the sweep reports
+  the epoch (I18). `delete_blob` left the epoch binding and grants behind,
+  so a deleted blob blocked its epoch's destroy forever; satellites now die
+  with the blob in one transaction, and V139 clears the orphans earlier
+  paths left (I19).
+- **A screen ran on the wrong bytes.** The perceptual-hash matcher saw the
+  ciphertext envelope for community writes and nothing for self/family; it
+  now screens the plaintext once, at the door, before sealing (I21).
+- **An in-crate text gate was mistaken for an API boundary.** `BlobStorage`
+  is `pub` and CIRISServer consumes this crate from Rust, so the body-taking
+  floor methods were doors for it. They now require a `StorageFloor` token
+  no external crate can construct (a `compile_fail` doctest, with its own
+  certify gate and CI step because nextest never runs doctests — I22), the
+  token carries the resolved tier the floor records, and the floor refuses a
+  row that contradicts itself (I25).
+- **A parameter with one correct value was a parameter.** The write door
+  took an attesting key id and the Python binding passed its scrub alias —
+  an announcement the sweep could never retract. The door now derives the
+  id from its signer (I23), and the cascade records the cohort the write
+  named rather than collapsing `affiliations` to `community` (I24).
+- **A perf fix that was never wired.** The §11.8 hardware-master cache had
+  zero callers; both backends now resolve through it, gated from disk (I26).
+  Also: `store_blob_local_json`'s docstring stopped calling itself the
+  self/family privacy primitive (it writes a commons plaintext row).
+
+### The third review — one boundary that existed by accident
+
+Codex reviewed the second pass (`45bd9b4`): five findings, all real, three
+root causes, invariants I27–I30 (FSD §11, C3-1…C3-5).
+
+- **A serialization boundary that existed on sqlite by accident of its one
+  connection mutex, and not at all on postgres.** Under READ COMMITTED the
+  bind's `EXISTS (enabled)` and the destroy's `NOT EXISTS (binding)` are
+  snapshot reads, so a seal and a destroy could both commit and leave a blob
+  bound to a destroyed epoch — the interleaving §11.4 said could not happen.
+  Every postgres operation that reads or moves a community's epoch state
+  (bind, key state, rotation, eviction, community announcement) now takes a
+  per-community transaction-scoped advisory lock first; I27 measures it by
+  occupancy. The same missing boundary let the door's announcement, arriving
+  after a rotation-plus-sweep had evicted the blob, RE-INSERT the ciphertext
+  row without its binding and report success. An announcement never stores:
+  a sealed-tier token through the signing floor emits the holder attestation
+  only for a row that exists and, for community content, is still bound —
+  evicted under the writer ⇒ `NotHeld` (I28).
+- **A cache that remembered failure.** One transient TPM or filesystem error
+  at first derivation was stored in the process-wide `OnceLock`, making the
+  encrypted corpus unavailable until restart. Only a successful derivation is
+  cached (I29).
+- **A surface that exposed the operation and not its policy or its report.**
+  `retain_past_epochs` — the policy that lets a sweep evict anything — had no
+  Engine facade or Python binding, so a Python-only deployment could run
+  sweeps that were structurally unable to evict; and the Python sweep report
+  dropped `failed`. Both on the surface now, gated from disk (I30, I8).
+
+### Also fixed
+
+- `evict_scope_blobs` reachability and the six order-dependent postgres tests
+  (#819) carried over from the first pass; #819's originally filed mechanism was
+  wrong and is corrected on the issue.
+- The schema-parity replayer (`store::schema_parity`) could not read
+  `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL`, so its "nullability agrees"
+  line was true of its own model and false of the databases. V139 needs
+  `DROP NOT NULL`, so the replayer learnt both. It then surfaced **fourteen
+  real divergences** — `admitted_at` (V130) is NOT NULL on postgres and nullable
+  on sqlite across the federation tables (declared, filed as #828; no persist
+  write door admits a NULL on either backend) — and **three phantom
+  declarations** on `cirislens_derived.detection_events` that matched the
+  replayer's fiction, not the schema (V080 relaxed those columns on both
+  backends; deleted). A gate that reads DDL must understand every DDL the
+  migrations use, or it reports fiction.
+
+### Witnesses
+
+Fourteen invariants (§11.10), cross-backend where behavioural. Structural gates
+read the tree from disk: I8 (every lifecycle op reachable from Engine AND FFI),
+I13 (every blob binding routes through `blob_err_to_py`), I14 (the storage floor
+is reached only by the two cascades or with a literal commons scope). I11 drives
+the seed policy through a hardware-storage double, because the branch is
+unreachable on any TPM-less CI runner.
+
 ## [42.1.0] - 2026-09-08
 
 **A prefix filter compares bytes.** Two defects on one predicate: sqlite
@@ -19718,7 +19893,7 @@ The substrate-wraps default tier for `cohort_scope: self | family` (FSD `SELF_FA
 - **`BlobStorage`** at-rest grant methods (`put_at_rest_grant` / `get_at_rest_grant` / `list_at_rest_grant_recipients` / `load_or_init_content_master`) on both SQL backends.
 
 ### DEK retention (OQ-4 — the hard question)
-The default tier requires persist to recover the DEK to serve `get_blob_for_viewer`, but persist holds **no content master key / KEM identity** in the `Engine` today (the `SecretsService` master is gated + not composed into the blob path; the signer is sign-only). This cut ships a **software** content-master (generated once, persisted in `federation_content_master`, **honest about being software** — the same posture `secrets/` takes on a no-TPM host). The **hardware-rooted** derivation (HKDF over a TPM/Keystore/Secure-Enclave-sealed seed under `content-at-rest-master-v1`, per `ENCRYPTED_AT_REST.md` §4.3) is the production target and is the one remaining dependency — wiring the sealed seed through the `Engine` is a follow-up.
+The default tier requires persist to recover the DEK to serve `get_blob_for_viewer`, but persist holds **no content master key / KEM identity** in the `Engine` today (the `SecretsService` master is gated + not composed into the blob path; the signer is sign-only). This cut ships a **software** content-master (generated once, persisted in `federation_content_master`, **honest about being software** — the same posture `secrets/` takes on a no-TPM host). The **hardware-rooted** derivation (HKDF over a TPM/Keystore/Secure-Enclave-sealed seed under `content-at-rest-master-v1`, per `BLOB_ENCRYPTION_AT_REST.md` §4.3) is the production target and is the one remaining dependency — wiring the sealed seed through the `Engine` is a follow-up.
 
 ### Tests
 SQLite + live-PG: self/family cascade round-trip (ciphertext at rest ≠ plaintext; granted recipient reads plaintext; non-recipient → `NotGranted`; keyless occurrence fail-secure excluded with no grant row; no `holds_bytes` emitted), envelope + wrap unit round-trips. `-D warnings` + clippy + `cargo fmt` + `cargo check --no-default-features` + cargo-deny clean.
@@ -19736,7 +19911,7 @@ Building the #152 at-rest DEK cascade surfaced a load-bearing gap the FSD review
 - **`check_encryption_pubkeys`** admission — each half MUST base64-decode to its exact raw length (x25519 = 32 B, ML-KEM-768 = 1184 B); a malformed key is refused at admit.
 
 ### What this unblocks
-The #152 default-tier cascade can now wrap to recipients with registered encryption keys; #161 Asks 4–5 + #183's Self-DEK inherit it. **Still gated:** producers (agent) must actually register encryption keys (parallel work), and the `ENCRYPTED_AT_REST` at-rest content-encryption foundation is still unbuilt.
+The #152 default-tier cascade can now wrap to recipients with registered encryption keys; #161 Asks 4–5 + #183's Self-DEK inherit it. **Still gated:** producers (agent) must actually register encryption keys (parallel work), and the `BLOB_ENCRYPTION_AT_REST` at-rest content-encryption foundation is still unbuilt.
 
 ### Tests
 SQLite + live-PG: encryption-pubkeys round-trip, `resolve_encryption_keys` (present → keys; absent / unknown → `None` fail-secure), admission length-gate rejection. **1078 lib green on SQLite, 772 on live PG**; `-D warnings` + clippy + cargo-deny clean.

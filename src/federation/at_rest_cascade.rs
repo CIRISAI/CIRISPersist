@@ -81,8 +81,392 @@ pub const WRAP_ALGORITHM_V2: &str = "x25519_mlkem768_aes256_gcm_hkdf_sha256";
 /// **Stable wire constant** — changing it re-derives a different master
 /// and orphans every at-rest blob encrypted under the old one. Distinct
 /// from `secrets-store-master-v1` so content keys and secret-store keys
-/// are domain-separated (ENCRYPTED_AT_REST.md §4.3).
+/// are domain-separated (BLOB_ENCRYPTION_AT_REST.md §4.3).
 pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
+
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.2) — **where the
+/// content-at-rest master comes from.**
+///
+/// [`content_master_key`] returns this rather than a bare key so the
+/// caller cannot lose the provenance on the way to
+/// `federation_content_master.key_kind`. A software master recorded as
+/// hardware would be a lie the schema is specifically shaped to prevent
+/// (`master_key_b64` is "present iff `key_kind='software'`").
+#[derive(Debug)]
+pub enum ContentMasterSource {
+    /// HKDF-derived from the platform's hardware-sealed seed under
+    /// [`CONTENT_MASTER_CONTEXT`]. **Deterministic** — re-derived on every
+    /// call from the same seed, so nothing is stored and there is no key
+    /// material in the database at all.
+    Hardware {
+        /// The 32-byte derived master. `Zeroizing` — scrubbed on drop.
+        key: zeroize::Zeroizing<[u8; 32]>,
+        /// Provenance for `federation_content_master.descriptor`.
+        descriptor: String,
+    },
+    /// No hardware-backed secure storage is reachable. The caller
+    /// generates and persists a software master and MUST record it as
+    /// `key_kind='software'` with `reason` in the descriptor.
+    ///
+    /// This is a clean, expected outcome on a no-TPM host — not an error.
+    /// It is a distinct variant rather than a silent fallback so that
+    /// "we are on software" is a decision the caller makes explicitly.
+    SoftwareFallback {
+        /// Why hardware was unavailable, verbatim, for the descriptor.
+        reason: String,
+    },
+}
+
+/// v43.0.0 (§10.2) — **resolve the content-at-rest master key.**
+///
+/// This is the function `at_rest_cascade`'s module header has always
+/// pointed at and which, until now, did not exist: the header described
+/// "hardware-rooted HKDF over the secrets-store sealed seed under a
+/// distinct context, with a software fallback honest about being
+/// software", [`CONTENT_MASTER_CONTEXT`] was defined with **zero call
+/// sites**, and the backends generated a random software key instead. So
+/// the fallback was not a fallback — it was the only path, reached by
+/// default rather than by decision, while the doc asserted otherwise.
+///
+/// # The derivation
+///
+/// Same hardware-sealed seed as the secrets store, different HKDF
+/// `info` — per §4.3, "no new master-key root". CIRISVerify owns the KDF
+/// (`ciris_verify_core::derive_symmetric_key`); persist never implements
+/// it (MISSION §1.4).
+///
+/// # Why the persisted row still wins
+///
+/// A node that already has a `key_kind='software'` row keeps using it
+/// even once hardware becomes available. Re-deriving would orphan every
+/// blob sealed under the software master **and** the sealed content-KEM
+/// private halves, which are themselves sealed under this key. The same
+/// rule the content-KEM identity already states: the stable persisted
+/// material always wins. Migrating software → hardware is a re-wrap
+/// operation, not a re-derivation, and is out of scope here.
+///
+/// **Synchronous / blocking** (TPM + filesystem I/O) — call from
+/// `spawn_blocking`.
+#[must_use]
+pub fn content_master_key(create_seed_if_absent: bool) -> ContentMasterSource {
+    #[cfg(feature = "secrets")]
+    {
+        match crate::secrets::hardware::derive_hardware_content_master_key(create_seed_if_absent) {
+            // `derive_hardware_master_for_context` already asserts the length,
+            // but this is the boundary where a wrong length would become a
+            // silent truncation, so it is re-checked rather than assumed.
+            Ok((master, descriptor)) => match <[u8; 32]>::try_from(master.as_slice()) {
+                Ok(key) => ContentMasterSource::Hardware {
+                    key: zeroize::Zeroizing::new(key),
+                    descriptor,
+                },
+                Err(_) => ContentMasterSource::SoftwareFallback {
+                    reason: format!(
+                        "verify derived a {}-byte content master, expected 32",
+                        master.len()
+                    ),
+                },
+            },
+            Err(e) => ContentMasterSource::SoftwareFallback {
+                reason: format!("hardware content master unavailable: {e}"),
+            },
+        }
+    }
+    #[cfg(not(feature = "secrets"))]
+    {
+        let _ = create_seed_if_absent;
+        ContentMasterSource::SoftwareFallback {
+            reason: "built without the `secrets` feature — no hardware-sealed \
+                     seed is reachable, so no hardware-rooted content master \
+                     can be derived"
+                .to_owned(),
+        }
+    }
+}
+
+/// v43.0.0 (§11.8) — the hardware-derived content master, resolved ONCE per
+/// process on the blocking pool and cached. The derivation is deterministic
+/// for a host (same seed, same context), so a process-global cache is
+/// correct; the first implementation re-ran TPM + filesystem I/O inline on
+/// a tokio worker for EVERY encrypted read and write.
+///
+/// Only the HARDWARE arm is cached: a software master lives in the database
+/// row and is read there.
+pub async fn hardware_content_master_cached() -> Option<[u8; 32]> {
+    static CACHE: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if let Some(v) = CACHE.get() {
+        return Some(*v);
+    }
+    // Re-derivation of a master in use: NEVER mint a seed (§11.7).
+    let derived = tokio::task::spawn_blocking(|| match content_master_key(false) {
+        ContentMasterSource::Hardware { key, .. } => Some(*key),
+        ContentMasterSource::SoftwareFallback { .. } => None,
+    })
+    .await
+    .ok()
+    .flatten();
+    remember_only_success(&CACHE, derived)
+}
+
+/// §11.8 / I29 — **the cache remembers only success.** A transient TPM or
+/// filesystem failure (or a failed join) yields `None` for THIS call and
+/// leaves the cache empty, so the next call derives again. The second
+/// rebuild cached whatever the first derivation returned — `None` included —
+/// so one bad moment at boot made the corpus unavailable until restart.
+fn remember_only_success(
+    cache: &'static std::sync::OnceLock<[u8; 32]>,
+    derived: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let key = derived?;
+    Some(*cache.get_or_init(|| key))
+}
+
+/// v43.0.0 (§11.8) — [`resolve_persisted_content_master`] with the hardware
+/// arm served from [`hardware_content_master_cached`]: ONE TPM + filesystem
+/// derivation per process instead of one per encrypted read and write. The
+/// backends call THIS; the sync resolver below is the software arm and the
+/// error vocabulary. (Ultrareview of `30fde79`: the cache existed with zero
+/// callers, so the perf fix its docstring described was not applied.)
+pub async fn resolve_persisted_content_master_cached(
+    key_kind: &str,
+    stored_b64: Option<&str>,
+) -> Result<[u8; 32], AtRestError> {
+    if key_kind == "hardware" {
+        return hardware_content_master_cached().await.ok_or_else(|| {
+            AtRestError::Crypto(
+                "content master is recorded hardware-rooted but the hardware-sealed seed \
+                 cannot be reached on this host — refusing to re-mint over a corpus sealed \
+                 under it (BLOB_ENCRYPTION_AT_REST.md §11.7)"
+                    .to_owned(),
+            )
+        });
+    }
+    resolve_persisted_content_master(key_kind, stored_b64)
+}
+
+/// v43.0.0 (§10.2) — turn a persisted `federation_content_master` row into
+/// the 32-byte master, re-deriving when the row says hardware.
+///
+/// Shared by both SQL backends so the hardware/software decision cannot
+/// drift between them — the `#596` class (three axes silently ignored by
+/// one backend) is exactly what a per-backend copy of this would invite.
+///
+/// The row is the authority on WHICH root, never this function: a
+/// `software` row carries its key and is used verbatim; a `hardware` row
+/// carries no key and is re-derived from the sealed seed. That asymmetry
+/// is the schema's own (`master_key_b64` is "present iff
+/// `key_kind='software'`").
+///
+/// # Errors
+///
+/// A `hardware` row whose seed is no longer reachable is a HARD error, not
+/// a fallback. Silently minting a fresh software master there would leave
+/// every blob sealed under the old root undecryptable while reporting
+/// success — the failure mode this returns an error to avoid.
+pub fn resolve_persisted_content_master(
+    key_kind: &str,
+    master_key_b64: Option<&str>,
+) -> Result<[u8; 32], AtRestError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    match (key_kind, master_key_b64) {
+        ("software", Some(b64)) => {
+            let raw = B64
+                .decode(b64)
+                .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?;
+            <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+                AtRestError::Crypto(format!(
+                    "content master is {} bytes, expected 32",
+                    raw.len()
+                ))
+            })
+        }
+        ("hardware", _) => match content_master_key(false) {
+            ContentMasterSource::Hardware { key, .. } => Ok(*key),
+            ContentMasterSource::SoftwareFallback { reason } => Err(AtRestError::Crypto(format!(
+                "content master is recorded hardware-rooted but the hardware-sealed seed \
+                 is unreachable ({reason}); everything sealed under it — including the \
+                 content-KEM private halves — cannot be decrypted without it. Refusing to \
+                 mint a replacement, which would report success over an unreadable corpus"
+            ))),
+        },
+        ("software", None) => Err(AtRestError::Crypto(
+            "content master row says software but carries no key bytes".to_owned(),
+        )),
+        (other, _) => Err(AtRestError::Crypto(format!(
+            "content master row has unknown key_kind {other:?}"
+        ))),
+    }
+}
+
+/// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.8) — **is this body
+/// sealed?**, answered from the bytes rather than from the caller's word.
+///
+/// A sealed body starts with [`AT_REST_ENVELOPE_MAGIC`]. That is the whole
+/// test for an inline body, and it is a test persist can actually perform.
+///
+/// # Why the other two variants are refusals, not passes
+///
+/// `External` — persist deliberately never dereferences the URI
+/// ([`BlobBody::External`]'s own contract). It therefore cannot see the
+/// bytes, cannot know whether they are sealed, and must not assert a
+/// property it has no way to check. `ChunkDag` — the chunks are separate
+/// rows; this door sees only the manifest, so per-chunk sealing is not
+/// verifiable here either.
+///
+/// In both cases the honest answer is "cannot verify", and in an encrypted
+/// cohort **cannot-verify is a refusal**. Accepting them would make the
+/// gate a report: it would pass, nothing would be red, and the plaintext
+/// would be on disk in a cohort whose whole confidentiality story is that
+/// it is not.
+#[must_use]
+pub fn body_is_sealed(body: &crate::federation::blobs::BlobBody) -> BodySealState {
+    use crate::federation::blobs::BlobBody;
+    match body {
+        BlobBody::Inline(bytes) => {
+            if bytes.len() >= AT_REST_ENVELOPE_MAGIC.len()
+                && bytes[..AT_REST_ENVELOPE_MAGIC.len()] == AT_REST_ENVELOPE_MAGIC
+            {
+                BodySealState::Sealed
+            } else {
+                BodySealState::Plaintext
+            }
+        }
+        BlobBody::External(_) => BodySealState::Unverifiable {
+            why: "an External body is a URI persist never dereferences, so its bytes \
+                  cannot be inspected here",
+        },
+        BlobBody::ChunkDag(_) => BodySealState::Unverifiable {
+            why: "a ChunkDag's chunks are separate rows; this door sees only the \
+                  manifest, so per-chunk sealing cannot be verified here",
+        },
+    }
+}
+
+/// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — **the tier a write at
+/// `cohort_scope` lands on, resolved from the DIRECTORY.**
+///
+/// For `community` / `affiliations` the tier depends on the community
+/// record and its authority: an AUTHORIZED `cohort_subkind: infrastructure`
+/// community is Commons-tier plaintext (CC 4.4.3.2.1, normative), a
+/// merely-labeled one is not (SecReview F2). That is why `community_key_id`
+/// is required for those scopes and why the caller's own opinion of the
+/// tier is never consulted — the first implementation called
+/// `crypto_tier(scope, None)`, dropping the one axis a caller must not be
+/// allowed to assert, and made infra content unstorable by any route.
+pub async fn resolve_write_tier<D>(
+    dir: &D,
+    cohort_scope: &str,
+    community_key_id: Option<&str>,
+) -> Result<crate::federation::types::cohort_scope::CryptoTier, crate::federation::BlobError>
+where
+    D: crate::federation::FederationDirectory + ?Sized + Sync,
+{
+    use crate::federation::types::cohort_scope::{self as cs, CryptoTier};
+    if !cs::is_valid(cohort_scope) {
+        return Err(crate::federation::BlobError::InvalidArgument(format!(
+            "cohort_scope {cohort_scope:?} is not in the closed set \
+             {{self, family, community, affiliations, species, biosphere, federation}}"
+        )));
+    }
+    if cohort_scope != cs::COMMUNITY && cohort_scope != cs::AFFILIATIONS {
+        return Ok(cs::crypto_tier(cohort_scope, None));
+    }
+    let Some(comm) = community_key_id else {
+        return Err(crate::federation::BlobError::InvalidArgument(format!(
+            "cohort_scope {cohort_scope:?} requires community_key_id: the tier of community \
+             content is a property of the community record, not of the label"
+        )));
+    };
+    let community = dir
+        .lookup_community(comm)
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "resolve_write_tier: lookup_community: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            crate::federation::BlobError::InvalidArgument(format!(
+                "unknown community_key_id {comm:?}"
+            ))
+        })?;
+    let infra =
+        crate::federation::admission::is_authorized_infrastructure_community(dir, &community)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "resolve_write_tier: infra check: {e}"
+                ))
+            })?;
+    Ok(if infra {
+        CryptoTier::Plaintext
+    } else {
+        cs::crypto_tier(cohort_scope, None)
+    })
+}
+
+/// The three answers [`body_is_sealed`] can give. `Unverifiable` is
+/// deliberately distinct from `Plaintext`: they refuse for different
+/// reasons and a reader of the error deserves to know which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodySealState {
+    /// Carries [`AT_REST_ENVELOPE_MAGIC`].
+    Sealed,
+    /// Inline bytes with no envelope magic — demonstrably not sealed.
+    Plaintext,
+    /// Persist cannot see the bytes from this door.
+    Unverifiable {
+        /// Why, for the refusal message.
+        why: &'static str,
+    },
+}
+
+/// v43.0.0 (§10.8) — **the write-door gate: an encrypted cohort never
+/// accepts an unsealed body.**
+///
+/// `self` / `family` / `community` / `affiliations` resolve to an encrypted
+/// [`CryptoTier`](crate::federation::types::cohort_scope::CryptoTier); the
+/// commons tiers resolve to `Plaintext` and are unaffected.
+///
+/// # Why this is a gate and not a convention
+///
+/// Fountaining a plaintext shard cannot be undone. No later rotation
+/// recalls it, and the tombstone plane cannot un-see it — §10.8. The
+/// window between "wrote plaintext" and "noticed" is unbounded, and the
+/// damage is already distributed by then. So the refusal has to be at the
+/// door, before the bytes exist anywhere.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] naming the cohort, its tier, and which
+/// of the two reasons applies.
+pub fn check_body_sealed_for_cohort(
+    cohort_scope: &str,
+    body: &crate::federation::blobs::BlobBody,
+) -> Result<(), crate::federation::BlobError> {
+    use crate::federation::types::cohort_scope::{crypto_tier, CryptoTier};
+    let tier = crypto_tier(cohort_scope, None);
+    if matches!(tier, CryptoTier::Plaintext) {
+        return Ok(());
+    }
+    match body_is_sealed(body) {
+        BodySealState::Sealed => Ok(()),
+        BodySealState::Plaintext => Err(crate::federation::BlobError::InvalidArgument(format!(
+            "cohort_scope {cohort_scope:?} resolves to {tier:?}, which is encrypted at rest, \
+             but the body carries no at-rest envelope magic — it is plaintext. Seal it first \
+             (the cascade for this tier), then store: a plaintext shard that reaches a peer \
+             cannot be recalled by any later rotation (BLOB_ENCRYPTION_AT_REST.md §10.8)"
+        ))),
+        BodySealState::Unverifiable { why } => {
+            Err(crate::federation::BlobError::InvalidArgument(format!(
+                "cohort_scope {cohort_scope:?} resolves to {tier:?}, which is encrypted at \
+                 rest, and persist cannot verify this body is sealed: {why}. Refusing rather \
+                 than asserting a property it cannot check"
+            )))
+        }
+    }
+}
 
 /// Error from the at-rest cascade crypto helpers.
 #[derive(Debug, thiserror::Error)]
@@ -489,6 +873,10 @@ pub mod orchestrate {
                 &at_rest_sha256,
                 BlobBody::Inline(envelope_bytes),
                 media_type,
+                cohort_scope,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+                ),
             )
             .await?;
 
@@ -1040,6 +1428,328 @@ pub mod orchestrate {
         Ok(new_epoch)
     }
 
+    /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **read any blob as a
+    /// viewer, without the caller knowing how it was stored.**
+    ///
+    /// This is the door a server or an agent should use. It takes a content
+    /// address and a viewer, and returns plaintext. The caller does **not**
+    /// need to know the cohort, whether the blob is encrypted, which DEK
+    /// sealed it, which epoch it belongs to, or whether a grant exists — the
+    /// substrate knows all of that and answers the only question the caller
+    /// actually has: *give me the bytes, as me.*
+    ///
+    /// MISSION §1.4's "substrate absorbs complexity" applied to reads. A
+    /// consumer that has to branch on cohort before reading is a consumer
+    /// that will eventually branch WRONG — and the wrong branch on this
+    /// surface is either a failed read or, worse, a caller reaching for the
+    /// raw-bytes accessor and getting ciphertext it then treats as content.
+    ///
+    /// # How the path is determined — from the data, never from the caller
+    ///
+    /// 1. **Community binding present?** (`community_dek_blob_epoch`) → the
+    ///    community path, authorized by the viewer's grant on the blob's own
+    ///    epoch.
+    /// 2. **Stored bytes carry [`AT_REST_ENVELOPE_MAGIC`]?** → the
+    ///    self/family path, authorized by the viewer's at-rest grant.
+    /// 3. **Otherwise** → a commons/plaintext blob; the bytes are returned
+    ///    as stored.
+    ///
+    /// The three cases are mutually exclusive and exhaustive by
+    /// construction: a sealed blob is either community-bound or it is not,
+    /// and an unsealed blob carries no magic. There is no fallthrough where
+    /// ciphertext could be returned as though it were content.
+    ///
+    /// # Errors
+    ///
+    /// Propagated from the path taken — [`BlobError::NotHeld`] if absent,
+    /// [`BlobError::NotGranted`] if the viewer holds no grant, and the
+    /// destroyed-epoch refusal if the key material is gone. Each says which
+    /// of those it is; none of them is silently an empty read.
+    pub async fn read_any_for_viewer<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let not_granted = || BlobError::NotGranted {
+            sha256_hex: hex::encode(at_rest_sha256),
+            viewer_key_id: viewer_key_id.to_owned(),
+        };
+
+        // 1. The ROW says what this is. Absent ⇒ NotHeld. (§11.1) The tier
+        //    is the one the WRITE DOOR RESOLVED and recorded — never
+        //    re-derived here from the scope, which would drop the directory
+        //    axis (the infra carve-out) the door applied (I15).
+        let tier = backend
+            .blob_crypto_tier(at_rest_sha256)
+            .await?
+            .ok_or_else(|| BlobError::NotHeld {
+                sha256_hex: hex::encode(at_rest_sha256),
+            })?;
+
+        // 2. AUTHORIZE BY TIER, BEFORE TOUCHING THE BODY. (§11.3) The
+        //    decision lives above the dispatch so a new tier cannot skip it.
+        //    A refusal names only the sha and the viewer.
+        match tier {
+            // Commons is public by construction. NOTE: on a relaying node the
+            // row is commons-tier and the bytes it holds may be another
+            // cohort's ciphertext — returned as held, which is the transfer
+            // model (§10.6): a relay carries what it cannot read.
+            CryptoTier::Plaintext => {}
+            CryptoTier::InvisibleEncrypted => {
+                if backend
+                    .get_at_rest_grant(at_rest_sha256, viewer_key_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(not_granted());
+                }
+            }
+            CryptoTier::CommunityDek => {
+                let Some((community, epoch)) =
+                    backend.community_dek_blob_epoch(at_rest_sha256).await?
+                else {
+                    // A community-tier row with no binding is corruption,
+                    // not a public blob.
+                    return Err(BlobError::Backend(format!(
+                        "blob {} is recorded at tier {tier:?} but carries no community-DEK binding",
+                        hex::encode(at_rest_sha256)
+                    )));
+                };
+                if !backend
+                    .community_dek_has_member_grant(&community, epoch, viewer_key_id)
+                    .await?
+                {
+                    return Err(not_granted());
+                }
+            }
+        }
+
+        // 3. Now — and only now — the body, once. An encrypted tier whose
+        //    body does not parse as an envelope is corruption, never a
+        //    plaintext return. (§11.3)
+        let body = backend
+            .get_blob(at_rest_sha256)
+            .await?
+            .ok_or_else(|| BlobError::NotHeld {
+                sha256_hex: hex::encode(at_rest_sha256),
+            })?;
+        let bytes = match body {
+            BlobBody::Inline(b) => b,
+            BlobBody::External(_) => {
+                return Err(BlobError::InvalidArgument(format!(
+                    "blob {} is an External reference; persist does not dereference it — \
+                     use get_blob to obtain the ref",
+                    hex::encode(at_rest_sha256)
+                )))
+            }
+            BlobBody::ChunkDag(_) => {
+                return Err(BlobError::InvalidArgument(format!(
+                    "blob {} is a chunk DAG; read its chunks, not the manifest",
+                    hex::encode(at_rest_sha256)
+                )))
+            }
+        };
+        match tier {
+            CryptoTier::Plaintext => Ok(bytes),
+            CryptoTier::InvisibleEncrypted => {
+                let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+                    BlobError::Backend(format!(
+                        "blob {} is recorded at tier {tier:?} but its body is not an at-rest \
+                         envelope ({e}) — corruption, not plaintext",
+                        hex::encode(at_rest_sha256)
+                    ))
+                })?;
+                read_for_viewer_sealed(backend, at_rest_sha256, &envelope).await
+            }
+            CryptoTier::CommunityDek => {
+                let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+                    BlobError::Backend(format!(
+                        "blob {} is recorded at tier {tier:?} but its body is not an at-rest \
+                         envelope ({e}) — corruption, not plaintext",
+                        hex::encode(at_rest_sha256)
+                    ))
+                })?;
+                crate::federation::community_dek::orchestrate::read_for_community_viewer_sealed(
+                    backend,
+                    at_rest_sha256,
+                    viewer_key_id,
+                    &envelope,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — **THE write door**, as
+    /// a free function so the Engine and the PyO3 surface share one body
+    /// rather than two copies that can drift.
+    ///
+    /// Store `plaintext` at `cohort_scope`. The tier is resolved from the
+    /// DIRECTORY ([`resolve_write_tier`](super::resolve_write_tier)); the
+    /// caller never supplies it and never supplies sealed bytes:
+    /// - **Plaintext** (commons, or an AUTHORIZED infrastructure community —
+    ///   CC 4.4.3.2.1) → stored as given, `holds_bytes` announced, row
+    ///   records the scope;
+    /// - **InvisibleEncrypted** (`self` / `family`) → the self/family cascade:
+    ///   fresh DEK, wrapped to every active occurrence, no `holds_bytes`. The
+    ///   owner (self) or family key rides in `community_key_id`'s slot;
+    /// - **CommunityDek** → the community cascade under the current epoch
+    ///   DEK, wrapped to every active member, AND `holds_bytes` announced for
+    ///   the SEALED bytes — community content federates with cleartext
+    ///   provenance, and the cascade alone never emitted the announcement it
+    ///   documented as the caller's job.
+    ///
+    /// There is no other consumer-reachable write that accepts an encrypted
+    /// cohort. The commons doors record `federation` by construction and
+    /// cannot be pointed at a private cohort. That is what makes §11.10 I1
+    /// true rather than checked.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_blob_scoped<B>(
+        backend: &B,
+        signer: &dyn ciris_keyring::HardwareSigner,
+        cohort_scope: &str,
+        community_key_id: Option<&str>,
+        plaintext: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<crate::federation::PutBlobScopedResult, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community_scoped;
+        use crate::federation::types::cohort_scope::CryptoTier;
+        use crate::federation::PutBlobScopedResult;
+        use sha2::Digest as _;
+
+        let now = chrono::Utc::now();
+        // §11.2 (6) / I23 — the attesting key id has exactly one correct
+        // value per signer; derive it, never accept it.
+        let signer_key_id = crate::signing::federation_key_id_of(signer)
+            .await
+            .map_err(|e| BlobError::Backend(format!("put_blob_scoped: signer key id: {e}")))?;
+        let signer_key_id = signer_key_id.as_str();
+        let tier = super::resolve_write_tier(backend, cohort_scope, community_key_id).await?;
+        match tier {
+            CryptoTier::Plaintext => {
+                let sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
+                backend
+                    .put_blob_signing_at(
+                        cohort_scope,
+                        crate::federation::StorageFloor::resolved(CryptoTier::Plaintext),
+                        &sha,
+                        BlobBody::Inline(plaintext.to_vec()),
+                        media_type,
+                        signer_key_id,
+                        signer,
+                        now,
+                        uuid::Uuid::new_v4(),
+                    )
+                    .await?;
+                Ok(PutBlobScopedResult {
+                    at_rest_sha256: sha,
+                    tier,
+                    epoch: None,
+                    granted: Vec::new(),
+                    excluded: Vec::new(),
+                })
+            }
+            CryptoTier::InvisibleEncrypted => {
+                let owner = community_key_id.ok_or_else(|| {
+                    BlobError::InvalidArgument(format!(
+                        "cohort_scope {cohort_scope:?} requires the owner (self) or family key id \
+                         in the community_key_id argument"
+                    ))
+                })?;
+                // §11.2 (5) / I21 — the matcher sees the PLAINTEXT, before sealing.
+                let plain_sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
+                backend.screen_inline_body(&plain_sha, plaintext).await?;
+                let r = encrypt_and_cascade(backend, cohort_scope, owner, plaintext, media_type)
+                    .await?;
+                Ok(PutBlobScopedResult {
+                    at_rest_sha256: r.at_rest_sha256,
+                    tier,
+                    epoch: None,
+                    granted: r.granted,
+                    excluded: r.excluded,
+                })
+            }
+            CryptoTier::CommunityDek => {
+                let comm = community_key_id.ok_or_else(|| {
+                    BlobError::InvalidArgument("community_key_id required".into())
+                })?;
+                // §11.2 (5) / I21 — screened as plaintext, once; the announce below
+                // carries a sealed-tier token so the floor does not screen the envelope.
+                let plain_sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
+                backend.screen_inline_body(&plain_sha, plaintext).await?;
+                let r = encrypt_and_cascade_community_scoped(
+                    backend,
+                    cohort_scope,
+                    comm,
+                    plaintext,
+                    media_type,
+                )
+                .await?;
+                // ANNOUNCE the sealed bytes: community content federates with
+                // cleartext provenance.
+                let Some(BlobBody::Inline(sealed)) = backend.get_blob(&r.at_rest_sha256).await?
+                else {
+                    return Err(BlobError::Backend(
+                        "community cascade stored no inline body".into(),
+                    ));
+                };
+                backend
+                    .put_blob_signing_at(
+                        cohort_scope,
+                        crate::federation::StorageFloor::resolved(CryptoTier::CommunityDek),
+                        &r.at_rest_sha256,
+                        BlobBody::Inline(sealed),
+                        media_type,
+                        signer_key_id,
+                        signer,
+                        now,
+                        uuid::Uuid::new_v4(),
+                    )
+                    .await?;
+                Ok(PutBlobScopedResult {
+                    at_rest_sha256: r.at_rest_sha256,
+                    tier,
+                    epoch: Some(r.epoch),
+                    granted: r.granted,
+                    excluded: r.excluded,
+                })
+            }
+        }
+    }
+
+    /// The decrypt half of [`read_for_viewer`], for a caller that has ALREADY
+    /// authorized the viewer and parsed the envelope (the §11.3 read door).
+    /// Recovers the DEK through persist's self-retention row.
+    pub async fn read_for_viewer_sealed<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        envelope: &AtRestEnvelope,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let self_grant = backend
+            .get_at_rest_grant(at_rest_sha256, PERSIST_SELF_RECIPIENT)
+            .await?
+            .ok_or_else(|| {
+                BlobError::Backend(format!(
+                    "at-rest blob {} has no persist self-retention grant",
+                    hex::encode(at_rest_sha256)
+                ))
+            })?;
+        let content_master = backend.load_or_init_content_master().await?;
+        let dek =
+            unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
+        open(&dek, envelope).map_err(map_at_rest_err)
+    }
+
     /// The default-tier read: recover the plaintext blob body for a
     /// granted viewer. Persist unwraps the DEK (via its content-master
     /// self-retention grant), AES-GCM-decrypts, and returns the bytes.
@@ -1224,5 +1934,1434 @@ mod tests {
         let back =
             ciris_crypto::key_grant::unwrap_dek_v2(&x_priv, &ml_priv, &ml_pub, &wrap).unwrap();
         assert_eq!(back, dek);
+    }
+}
+
+#[cfg(test)]
+mod content_master_root_tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    /// v43.0.0 (§10.2) — a `software` row is used verbatim.
+    #[test]
+    fn software_row_yields_its_own_bytes() {
+        let key = [7u8; 32];
+        let got = resolve_persisted_content_master("software", Some(&B64.encode(key)))
+            .expect("software row resolves");
+        assert_eq!(
+            got, key,
+            "the stored bytes ARE the master; nothing re-derives"
+        );
+    }
+
+    /// The failure this function exists to make loud.
+    ///
+    /// A `hardware` row carries no key bytes, so it must re-derive. When the
+    /// sealed seed is unreachable the ONLY safe answer is an error: minting a
+    /// replacement would report success over a corpus that can no longer be
+    /// decrypted — including the content-KEM private halves, which are
+    /// themselves sealed under this key.
+    ///
+    /// Under `cfg(not(feature = "secrets"))` the derivation is structurally
+    /// unavailable, so this is exactly the production shape of "seed gone".
+    #[test]
+    #[cfg(not(feature = "secrets"))]
+    fn hardware_row_without_a_reachable_seed_is_a_hard_error_never_a_fallback() {
+        let err = resolve_persisted_content_master("hardware", None)
+            .expect_err("a hardware row with no reachable seed must NOT resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hardware-rooted") && msg.contains("unreachable"),
+            "error must name the cause, got: {msg}"
+        );
+        assert!(
+            msg.contains("Refusing to mint a replacement"),
+            "error must say why it refuses rather than falling back, got: {msg}"
+        );
+    }
+
+    /// Malformed rows fail rather than defaulting.
+    #[test]
+    fn malformed_rows_refuse() {
+        assert!(resolve_persisted_content_master("software", None).is_err());
+        assert!(resolve_persisted_content_master("nonsense", None).is_err());
+        // wrong length
+        assert!(
+            resolve_persisted_content_master("software", Some(&B64.encode([1u8; 16]))).is_err()
+        );
+        // not base64
+        assert!(resolve_persisted_content_master("software", Some("!!!not b64!!!")).is_err());
+    }
+
+    /// `ContentMasterSource` must never let a caller record a software master
+    /// as hardware: the two carry different payloads by construction, so the
+    /// mistake is not expressible rather than merely discouraged.
+    #[test]
+    fn the_source_variants_cannot_be_confused() {
+        match content_master_key(true) {
+            // On a host with no TPM (CI, dev) this is the expected arm.
+            ContentMasterSource::SoftwareFallback { reason } => {
+                assert!(!reason.is_empty(), "a software fallback must say WHY");
+            }
+            // On a hardware host, the key is present and there is nothing to
+            // persist — the row records provenance only.
+            ContentMasterSource::Hardware { key, descriptor } => {
+                assert_eq!(key.len(), 32);
+                assert!(
+                    descriptor.contains("context="),
+                    "descriptor must name the HKDF context it derived under, got: {descriptor}"
+                );
+            }
+        }
+    }
+}
+
+/// `FSD/BLOB_ENCRYPTION_AT_REST.md` §11.10 — **the blob-encryption invariants,
+/// each falsifiable through a door a consumer holds.**
+///
+/// Written BEFORE the §11 rebuild and confirmed RED on `fd43e74` (the first
+/// implementation, PR #827). Cross-backend by construction: one function per
+/// invariant, called from every backend's test module, so a backend that
+/// diverges cannot pass by carrying its own copy. Generic rather than `&dyn`
+/// because [`BlobStorage`] returns `impl Future`.
+///
+/// The discipline these encode: **a mutation test proves the function
+/// refuses; it says nothing about whether any shipping path calls it.** Every
+/// exercise here therefore asserts through the read/write door itself, never
+/// by calling a gate function directly.
+#[cfg(any(test, feature = "test-anchor"))]
+#[allow(dead_code)]
+pub mod blob_invariants {
+    use crate::federation::blobs::BlobBody;
+    use crate::federation::{BlobError, BlobStorage, DekKeyState, FederationDirectory};
+
+    fn sha(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    }
+
+    /// A registered node key + its signer, for doors that announce.
+    ///
+    /// Registers BOTH the alias and the signer's DERIVED key id: since
+    /// v9.3.0 (#247) a `holds_bytes` row's `scrub_key_id` is the signer's
+    /// derived federation key (`<label>-<fp>`), and the FK on it is what the
+    /// first draft of this fixture tripped — an announce that fails at the
+    /// FK is a fixture defect, not a door defect, and it would have read as
+    /// "the door refuses commons writes" to anyone not looking closely.
+    pub async fn node_signer<B>(
+        backend: &B,
+        key_id: &str,
+    ) -> std::sync::Arc<crate::signing::LocalSigner>
+    where
+        B: FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::USER;
+        ts::register_hybrid_key_as(backend, key_id, key_id, USER).await;
+        let signer = ts::local_signer(key_id);
+        // The derived id, carrying the alias's real pubkeys (so the emitted
+        // signature verifies against the registered key).
+        let derived = signer.derived_key_id();
+        ts::register_hybrid_key_as(backend, &derived, key_id, USER).await;
+        signer
+    }
+
+    // ── I2 ───────────────────────────────────────────────────────────────
+    /// **Reads dispatch on the ROW, never on the bytes.**
+    ///
+    /// A COMMONS blob whose bytes happen to begin with the at-rest envelope
+    /// magic is still a commons blob: public, returned to anyone. The first
+    /// implementation sniffed the magic and routed it down the sealed path,
+    /// refusing a public document to every reader.
+    pub async fn exercise_i2_reads_dispatch_on_the_row<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::{
+            orchestrate::read_any_for_viewer, AT_REST_ENVELOPE_MAGIC,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        // A public document that begins with the magic bytes by coincidence.
+        let mut body = AT_REST_ENVELOPE_MAGIC.to_vec();
+        body.extend_from_slice(b"public doc that merely starts with the marker");
+        let id = sha(&body);
+        backend
+            .put_blob_signing(
+                &id,
+                BlobBody::Inline(body.clone()),
+                None,
+                &node,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I2: a commons write must succeed: {e}"));
+
+        let got = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag} I2: a COMMONS blob is public, but the read door refused it — it \
+                     decided the tier from the BYTES (the magic prefix) instead of from the \
+                     row: {e}"
+                )
+            });
+        assert_eq!(got, body, "{tag} I2: commons bytes returned verbatim");
+    }
+
+    // ── I3 ───────────────────────────────────────────────────────────────
+    /// **There is no body-taking write at an encrypted cohort.**
+    ///
+    /// The substrate seals. A caller cannot hand persist bytes and assert
+    /// "these are sealed" — not plaintext, not magic-plus-garbage, not even a
+    /// genuine envelope. The first implementation accepted anything with an
+    /// 8-byte prefix.
+    pub async fn exercise_i3_no_body_taking_write_at_an_encrypted_cohort<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::AT_REST_ENVELOPE_MAGIC;
+        use crate::federation::types::cohort_scope::{AFFILIATIONS, COMMUNITY, FAMILY, SELF};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        // A real, non-infra community so the refusal is "encrypted tier",
+        // not "unknown community".
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let mut spoofed = AT_REST_ENVELOPE_MAGIC.to_vec();
+        spoofed.extend_from_slice(b"board minutes in the clear");
+        for scope in [SELF, FAMILY, COMMUNITY, AFFILIATIONS] {
+            let id = sha(&spoofed);
+            let comm_arg = (scope == COMMUNITY || scope == AFFILIATIONS).then_some(comm.as_str());
+            let res = backend
+                .put_blob_signing_scoped(
+                    scope,
+                    comm_arg,
+                    &id,
+                    BlobBody::Inline(spoofed.clone()),
+                    None,
+                    &node,
+                    &adapter,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await;
+            assert!(
+                res.is_err(),
+                "{tag} I3 [{scope}]: a magic-prefixed plaintext body was ACCEPTED at an \
+                 encrypted cohort — the gate tests a marker, not the envelope"
+            );
+            assert!(
+                !backend.has_blob(&id).await.unwrap(),
+                "{tag} I3 [{scope}]: refused bytes must not be on disk"
+            );
+        }
+    }
+
+    // ── I4a ──────────────────────────────────────────────────────────────
+    /// **Every read door authorizes by tier BEFORE any dispatch.**
+    ///
+    /// A plaintext body sitting under a private cohort — however it got
+    /// there — is never served to a stranger. The first implementation's
+    /// cohort-agnostic read returned it: authorization lived inside two of
+    /// three branches and the third had none.
+    pub async fn exercise_i4a_read_door_authorizes_before_dispatch<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        // A private plaintext row, placed through the storage floor as a
+        // bypass would leave it. The floor is a FIXTURE here; I14 pins that
+        // production code never reaches it outside the cascades.
+        let body = b"self journal entry, in the clear".to_vec();
+        let id = sha(&body);
+        super::blob_invariants_fixture::place_private_plaintext(backend, &id, body.clone()).await;
+
+        let res = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}")).await;
+        match res {
+            Ok(bytes) if bytes == body => panic!(
+                "{tag} I4a: the read door returned a PRIVATE plaintext blob to a stranger — \
+                 authorization is per-branch, not per-door"
+            ),
+            Ok(_) => panic!("{tag} I4a: returned bytes to a stranger at all"),
+            Err(BlobError::NotGranted { .. }) => {}
+            Err(other) => panic!("{tag} I4a: expected NotGranted, got {other:?}"),
+        }
+    }
+
+    // ── I4b ──────────────────────────────────────────────────────────────
+    /// **A refusal names only the sha and the viewer.**
+    ///
+    /// A non-grantee asking about a community blob must not learn which
+    /// community it belongs to, or which epoch. The first implementation
+    /// checked epoch destruction BEFORE the grant and named both in the
+    /// error. (The destroyed-with-binding state that exercise originally
+    /// constructed is now unrepresentable — I6 made bind and destroy
+    /// mutually exclusive by statement — so this asserts the property on a
+    /// live blob, where the refusal path is the ordinary one.)
+    pub async fn exercise_i4b_refusal_does_not_name_the_binding<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None)
+            .await
+            .unwrap();
+
+        let err = read_any_for_viewer(
+            backend,
+            &sealed.at_rest_sha256,
+            &format!("{tag}-stranger-{run}"),
+        )
+        .await
+        .expect_err("a stranger must be refused");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I4b: expected NotGranted, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(&comm) && !msg.contains("epoch"),
+            "{tag} I4b: the refusal to a NON-GRANTEE disclosed the binding: {msg}"
+        );
+    }
+
+    // ── I5 ───────────────────────────────────────────────────────────────
+    /// **`destroyed` ⇒ zero persist key material for that epoch.**
+    ///
+    /// The self-retention wrap and every member grant are gone. A text column
+    /// that says "destroyed" while the wraps survive is a read-door refusal,
+    /// not destruction — the first implementation shipped exactly that.
+    pub async fn exercise_i5_destroy_deletes_key_material<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, set_key_state,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+            .await
+            .unwrap();
+        let epoch = sealed.epoch;
+        assert!(
+            backend
+                .community_dek_get_self_retention(&comm, epoch)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I5: precondition — a self-retention wrap exists before destroy"
+        );
+        assert!(
+            !backend
+                .community_dek_member_grant_recipients(&comm, epoch)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I5: precondition — member grants exist before destroy"
+        );
+
+        // I20 — destroy acts only on an epoch rotation has left behind.
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        backend
+            .community_dek_evict_epoch_objects(&comm, epoch, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        set_key_state(backend, &comm, epoch, DekKeyState::Destroyed)
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .community_dek_get_self_retention(&comm, epoch)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I5: the self-retention wrap SURVIVED destroy — persist can still recover \
+             the DEK, so 'destroyed' is a label, not destruction"
+        );
+        assert!(
+            backend
+                .community_dek_member_grant_recipients(&comm, epoch)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I5: member grant rows SURVIVED destroy"
+        );
+    }
+
+    // ── I6 ───────────────────────────────────────────────────────────────
+    /// **Bind requires `enabled`; destroy requires zero bound; both atomic.**
+    ///
+    /// The falsifier is a blob bound to an epoch that is not enabled. The
+    /// first implementation's bind was an unconditional INSERT, so an emission
+    /// that read `enabled` and then lost a race with the sweep bound its blob
+    /// to a destroyed epoch — permanently unreadable.
+    pub async fn exercise_i6_bind_and_destroy_exclude_each_other<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, set_key_state,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+            .await
+            .unwrap();
+        let epoch = sealed.epoch;
+
+        // Destroy with content bound → refused (already pinned elsewhere; kept
+        // so this exercise states BOTH halves of the exclusion).
+        assert!(
+            set_key_state(backend, &comm, epoch, DekKeyState::Destroyed)
+                .await
+                .is_err(),
+            "{tag} I6: destroy with a bound object must refuse"
+        );
+
+        // Rotate (I20), empty + destroy, THEN try to bind a late arrival.
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        backend
+            .community_dek_evict_epoch_objects(&comm, epoch, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        set_key_state(backend, &comm, epoch, DekKeyState::Destroyed)
+            .await
+            .unwrap();
+        let late = sha(b"a blob sealed by a writer that read `enabled` a moment ago");
+        let res = backend
+            .community_dek_bind_blob_epoch(&late, &comm, epoch)
+            .await;
+        assert!(
+            res.is_err(),
+            "{tag} I6: a blob was BOUND to a destroyed epoch — bind is an unconditional \
+             insert, so the check/seal/bind race strands content"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, epoch)
+                .await
+                .unwrap(),
+            0,
+            "{tag} I6: nothing may be bound to a destroyed epoch"
+        );
+    }
+
+    // ── I9 ───────────────────────────────────────────────────────────────
+    /// **Eviction of announced content emits `withdraws` before delete.**
+    ///
+    /// After the sweep evicts a community blob this node announced, this
+    /// node is no longer a listed holder. The first implementation deleted
+    /// bytes and binding with no signer and no withdraws, so peers kept
+    /// routing to a node that answered `NotHeld`.
+    pub async fn exercise_i9_eviction_retracts_announcement<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, sweep_rotated_epochs,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None)
+            .await
+            .unwrap();
+        // Announce this node as a holder of the sealed bytes (community
+        // content federates with cleartext provenance) — under the node's
+        // DERIVED signing key, which is what the production door
+        // (`orchestrate::put_blob_scoped`) announces under and what the sweep
+        // looks up. An announcement under an arbitrary attesting key is that
+        // key's holder's to retract; the sweep cannot sign for it.
+        let node_derived = signer.derived_key_id();
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("{tag} I9: sealed blob is inline");
+        };
+        backend
+            .put_blob_signing_at(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+                ),
+                &sealed.at_rest_sha256,
+                BlobBody::Inline(bytes),
+                None,
+                &node_derived,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I9: announce holds_bytes: {e}"));
+        assert!(
+            backend
+                .list_holders(&sealed.at_rest_sha256)
+                .await
+                .unwrap()
+                .contains(&node_derived),
+            "{tag} I9: precondition — this node is a listed holder"
+        );
+
+        // Rotate past it and authorize deletion, then sweep.
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+        let report = sweep_rotated_epochs(backend, &comm, &signer, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.evicted_objects, 1,
+            "{tag} I9: the old epoch's object is evicted"
+        );
+
+        let holders = backend.list_holders(&sealed.at_rest_sha256).await.unwrap();
+        assert!(
+            !holders.contains(&node_derived),
+            "{tag} I9: this node STILL advertises holds_bytes for bytes it no longer holds — \
+             eviction deleted without emitting withdraws: holders={holders:?}"
+        );
+    }
+
+    // ── I10 ──────────────────────────────────────────────────────────────
+    /// **A community blob's tier is resolved from the DIRECTORY, including
+    /// the CC 4.4.3.2.1 infrastructure carve-out.**
+    ///
+    /// An AUTHORIZED infrastructure community stores plaintext and announces
+    /// `holds_bytes`; a merely-labeled one does not get the carve-out. The
+    /// first implementation passed `cohort_subkind = None` to the tier
+    /// resolver, so infra content was refused at the write door AND by the
+    /// cascade — unstorable by any route.
+    pub async fn exercise_i10_infra_carveout_resolved_from_directory<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-infra-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community_with(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+            crate::federation::types::identity_type::SUBSTRATE_PERSIST,
+            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        let body = b"canonical governance root, plaintext by constitution".to_vec();
+        let id = sha(&body);
+        backend
+            .put_blob_signing_scoped(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                Some(&comm),
+                &id,
+                BlobBody::Inline(body.clone()),
+                None,
+                &node,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag} I10: an AUTHORIZED infrastructure community could not store its \
+                     plaintext governance content — the carve-out was dropped at the door: {e}"
+                )
+            });
+        assert!(
+            backend.list_holders(&id).await.unwrap().contains(&node),
+            "{tag} I10: commons-tier infra content announces holds_bytes"
+        );
+    }
+    // ── I15 ──────────────────────────────────────────────────────────────
+    /// **An authorized infrastructure community's write resolves `Plaintext`,
+    /// STORES that tier, and reads back through the generic read door.**
+    ///
+    /// The first rebuild stored only the scope and had reads re-derive the
+    /// tier from it — the exact `crypto_tier(scope, None)` call the write
+    /// door is forbidden to make. So the infra row was written as plaintext,
+    /// classified `CommunityDek` on read, and failed for lack of a binding it
+    /// correctly did not have. (C2-1)
+    pub async fn exercise_i15_infra_row_reads_back_as_plaintext<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            put_blob_scoped, read_any_for_viewer,
+        };
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-infra-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community_with(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+            crate::federation::types::identity_type::SUBSTRATE_PERSIST,
+            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        let body = b"governance root: plaintext by constitution, readable by anyone".to_vec();
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            Some(&comm),
+            &body,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I15: infra write through THE door: {e}"));
+        assert_eq!(res.tier, CryptoTier::Plaintext, "{tag} I15: resolved tier");
+        assert_eq!(
+            backend.blob_crypto_tier(&res.at_rest_sha256).await.unwrap(),
+            Some(CryptoTier::Plaintext),
+            "{tag} I15: the ROW records the RESOLVED tier, not the label's tier"
+        );
+
+        let got = read_any_for_viewer(backend, &res.at_rest_sha256, &format!("{tag}-stranger"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag} I15: content written through the infra carve-out is UNREADABLE \
+                     through the generic read — the read re-derived the tier from the scope \
+                     and discarded the write-time resolution: {e}"
+                )
+            });
+        assert_eq!(got, body, "{tag} I15: plaintext round-trips");
+    }
+
+    // ── I17 ──────────────────────────────────────────────────────────────
+    /// **Bind requires the CURRENT epoch, not merely an enabled one.**
+    ///
+    /// After a rotation the old epoch stays `enabled` until a background
+    /// sweep disables it. An emission that read the old epoch before the
+    /// bump must NOT be able to bind under it: the member the rotation
+    /// removed keeps that epoch's wrap (AV-70) and would read content
+    /// written after their removal. (C2-2)
+    pub async fn exercise_i17_bind_requires_the_current_epoch<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"before", None)
+            .await
+            .unwrap();
+        let old = sealed.epoch;
+        let new = backend.community_dek_bump_epoch(&comm).await.unwrap();
+        assert!(new > old, "{tag} I17: precondition — rotated");
+        assert_eq!(
+            backend.community_dek_key_state(&comm, old).await.unwrap(),
+            Some(DekKeyState::Enabled),
+            "{tag} I17: precondition — the rotated-past epoch is STILL enabled (no sweep ran)"
+        );
+
+        let late = sha(b"sealed by a writer that read the old epoch a moment before the bump");
+        let res = backend
+            .community_dek_bind_blob_epoch(&late, &comm, old)
+            .await;
+        assert!(
+            res.is_err(),
+            "{tag} I17: a blob was BOUND to a rotated-past epoch — the removed member holds \
+             that epoch's wrap and can read content written after their removal"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, old)
+                .await
+                .unwrap(),
+            1,
+            "{tag} I17: the pre-rotation binding is untouched"
+        );
+        let again = encrypt_and_cascade_community(backend, &comm, b"after", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.epoch, new,
+            "{tag} I17: the door seals under the current epoch"
+        );
+
+        // The attempt the door loops over, driven at the STALE epoch as the
+        // racing writer would: refused, and the ciphertext row it stored is
+        // gone again — no orphan, no public blob of unreadable bytes.
+        use crate::federation::community_dek::orchestrate::{seal_store_bind_at, SealOutcome};
+        match seal_store_bind_at(
+            backend,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            &comm,
+            old,
+            b"raced",
+            None,
+        )
+        .await
+        .unwrap()
+        {
+            SealOutcome::EpochMoved { at_rest_sha256 } => assert!(
+                !backend.has_blob(&at_rest_sha256).await.unwrap(),
+                "{tag} I17: a refused bind left its ciphertext row behind (orphan)"
+            ),
+            SealOutcome::Bound(r) => panic!(
+                "{tag} I17: a writer holding the STALE epoch {old} bound a blob (epoch {})",
+                r.epoch
+            ),
+        }
+    }
+
+    // ── I18 ──────────────────────────────────────────────────────────────
+    /// **A withdraws failure aborts the eviction; retry never double-retracts.**
+    ///
+    /// The first rebuild swallowed the withdraws error and deleted anyway —
+    /// "fail-honest" that was fail-silent: no withdraws, bytes gone,
+    /// `list_holders` naming this node until TTL. (C2-3)
+    ///
+    /// Two halves. (a) An announcement this node ALREADY retracted is not
+    /// retracted again by the sweep (retry after a partial failure is safe) —
+    /// held by the directory's retraction fold at write (#502 E7), which is
+    /// why the evict loop carries no second filter.
+    /// (b) When the withdraws cannot be admitted, the bytes and the binding
+    /// stay and the error propagates.
+    // `emit_withdraws_attestation_helper` exists only with a backend feature;
+    // the no-backend axis legs compile this module with `--all-targets`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn exercise_i18_withdraw_failure_aborts_eviction<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let node_derived = signer.derived_key_id();
+        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+        async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
+            backend
+                .list_attestations_by(node)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|a| {
+                    a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                })
+                .count()
+        }
+
+        // (a) announce, retract by hand, then sweep: exactly ONE withdraws.
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None)
+            .await
+            .unwrap();
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("{tag} I18: sealed blob is inline");
+        };
+        backend
+            .put_blob_signing_at(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+                ),
+                &sealed.at_rest_sha256,
+                BlobBody::Inline(bytes),
+                None,
+                &node_derived,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let prior = backend
+            .list_attestations_by(&node_derived)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.attestation_type.starts_with(prefix))
+            .expect("the announcement");
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            &prior,
+            &node_derived,
+            &signer,
+            backend,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I18: retract by hand: {e}"));
+        assert_eq!(
+            withdraws_by(backend, &node_derived).await,
+            1,
+            "{tag} I18: precondition"
+        );
+
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+        let n = backend
+            .community_dek_evict_epoch_objects(&comm, sealed.epoch, &signer, chrono::Utc::now())
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I18(a): evict after a manual retraction: {e}"));
+        assert_eq!(n, 1, "{tag} I18(a): evicted");
+        assert_eq!(
+            withdraws_by(backend, &node_derived).await,
+            1,
+            "{tag} I18(a): the sweep re-retracted an announcement this node had ALREADY \
+             withdrawn — a retry after a partial failure double-retracts"
+        );
+
+        // (b) announce again under a NEW epoch; make the withdraws inadmissible
+        //     by handing the sweep a `now` far outside the admission skew; the
+        //     bytes and binding must survive and the error must surface.
+        let sealed2 = encrypt_and_cascade_community(backend, &comm, b"newer", None)
+            .await
+            .unwrap();
+        let Some(BlobBody::Inline(bytes2)) =
+            backend.get_blob(&sealed2.at_rest_sha256).await.unwrap()
+        else {
+            panic!("{tag} I18: sealed blob is inline");
+        };
+        backend
+            .put_blob_signing_at(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+                ),
+                &sealed2.at_rest_sha256,
+                BlobBody::Inline(bytes2),
+                None,
+                &node_derived,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let res = backend
+            .community_dek_evict_epoch_objects(&comm, sealed2.epoch, &signer, far_future)
+            .await;
+        assert!(
+            res.is_err(),
+            "{tag} I18(b): the withdraws could not be admitted and the eviction reported SUCCESS"
+        );
+        assert!(
+            backend
+                .get_blob(&sealed2.at_rest_sha256)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I18(b): the bytes were DELETED although the retraction failed — \
+             list_holders will name this node for content it cannot serve"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, sealed2.epoch)
+                .await
+                .unwrap(),
+            1,
+            "{tag} I18(b): the binding survives a failed eviction"
+        );
+    }
+
+    // ── I19 ──────────────────────────────────────────────────────────────
+    /// **A blob's satellite rows die with it.** `delete_blob` removes the
+    /// epoch binding and the at-rest grants transactionally, so a deleted
+    /// blob can never hold an epoch's object count above zero. (C2-9)
+    pub async fn exercise_i19_delete_blob_removes_satellites<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, sealed.epoch)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(backend.delete_blob(&sealed.at_rest_sha256).await.unwrap());
+        assert!(
+            backend
+                .community_dek_blob_epoch(&sealed.at_rest_sha256)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I19: the epoch binding OUTLIVED its blob"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, sealed.epoch)
+                .await
+                .unwrap(),
+            0,
+            "{tag} I19: a deleted blob holds the epoch's object count above zero — its DEK \
+             can never be destroyed"
+        );
+        assert!(
+            backend
+                .get_at_rest_grant(&sealed.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I19: an at-rest grant OUTLIVED its blob"
+        );
+    }
+
+    // ── I20 ──────────────────────────────────────────────────────────────
+    /// **The current epoch cannot be disabled or destroyed through the
+    /// key-state door.** Rotation retires an epoch; the door only acts on
+    /// epochs rotation has already left behind. (C2-8)
+    pub async fn exercise_i20_the_primary_cannot_be_retired<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, set_key_state,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+            .await
+            .unwrap();
+        let current = backend.community_dek_current_epoch(&comm).await.unwrap();
+        assert_eq!(sealed.epoch, current);
+
+        for to in [DekKeyState::Disabled, DekKeyState::Destroyed] {
+            assert!(
+                set_key_state(backend, &comm, current, to).await.is_err(),
+                "{tag} I20: the door let the CURRENT epoch be moved to {to:?} — the pointer \
+                 keeps naming it and every later write fails in ensure_epoch_dek"
+            );
+            // The backend's own conditional statement refuses too — the door's
+            // check is a friendlier message, not the guard.
+            let _ = backend
+                .community_dek_set_key_state(&comm, current, to)
+                .await;
+            assert_eq!(
+                backend
+                    .community_dek_key_state(&comm, current)
+                    .await
+                    .unwrap(),
+                Some(DekKeyState::Enabled),
+                "{tag} I20: the backend statement moved the CURRENT epoch to {to:?}"
+            );
+        }
+        // Still writable.
+        encrypt_and_cascade_community(backend, &comm, b"still fine", None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I20: the community is wedged: {e}"));
+    }
+
+    // ── I21 ──────────────────────────────────────────────────────────────
+    /// A matcher double that records every body it is shown.
+    pub struct RecordingMatcher {
+        /// Every body `check` was shown, in order.
+        pub seen: std::sync::Mutex<Vec<Vec<u8>>>,
+        /// Report a match (policy: refuse) for every body.
+        pub refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::federation::PerceptualHashMatcher for RecordingMatcher {
+        async fn check(
+            &self,
+            _sha256: &[u8; 32],
+            body: &[u8],
+        ) -> Result<crate::federation::HashMatchResult, crate::federation::HashMatchError> {
+            self.seen.lock().unwrap().push(body.to_vec());
+            Ok(if self.refuse {
+                crate::federation::HashMatchResult::Match {
+                    database: crate::federation::HashDatabaseId("i21".into()),
+                    score: 0.99,
+                    threshold: 0.5,
+                }
+            } else {
+                crate::federation::HashMatchResult::NoMatch
+            })
+        }
+        fn databases(&self) -> &[crate::federation::HashDatabaseId] {
+            &[]
+        }
+        fn on_match_policy(&self) -> crate::federation::OnMatchPolicy {
+            crate::federation::OnMatchPolicy::Refuse
+        }
+    }
+
+    /// **The matcher screens the PLAINTEXT, once, before sealing, on every
+    /// tier.** The caller installs `matcher` on the backend first. (C2-6)
+    pub async fn exercise_i21_matcher_screens_plaintext_before_sealing<B>(
+        backend: &B,
+        tag: &str,
+        matcher: &RecordingMatcher,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        let plaintext = format!("{tag} an image the matcher must see AS IS {run}").into_bytes();
+        matcher.seen.lock().unwrap().clear();
+        put_blob_scoped(
+            backend,
+            &adapter,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            Some(&comm),
+            &plaintext,
+            None,
+        )
+        .await
+        .unwrap();
+        let seen = matcher.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![plaintext.clone()],
+            "{tag} I21 (community): the matcher must be shown the PLAINTEXT exactly once — \
+             not the ciphertext, not twice, not never; it saw {} body(ies)",
+            seen.len()
+        );
+
+        matcher.seen.lock().unwrap().clear();
+        put_blob_scoped(
+            backend,
+            &adapter,
+            crate::federation::types::cohort_scope::FEDERATION,
+            None,
+            &plaintext,
+            None,
+        )
+        .await
+        .unwrap();
+        let seen = matcher.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![plaintext.clone()],
+            "{tag} I21 (commons): screened exactly once; saw {} body(ies)",
+            seen.len()
+        );
+    }
+
+    /// The refusing half of I21: a refused plaintext leaves NOTHING behind —
+    /// no ciphertext row, no binding — because the screen ran before the
+    /// cascade, not after it.
+    pub async fn exercise_i21b_a_refused_plaintext_is_never_sealed<B>(
+        backend: &B,
+        tag: &str,
+        matcher: &RecordingMatcher,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
+        let epoch = backend.community_dek_current_epoch(&comm).await.unwrap();
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            Some(&comm),
+            b"known-bad",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(BlobError::HashMatchedKnownBad { .. })),
+            "{tag} I21b: a matcher hit must refuse the write: {res:?}"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, epoch)
+                .await
+                .unwrap(),
+            0,
+            "{tag} I21b: the cascade PERSISTED the content before the screen refused it"
+        );
+    }
+
+    // ── I23 ──────────────────────────────────────────────────────────────
+    /// **The write door derives the attesting key id from its signer.** An
+    /// announcement is under the signer's DERIVED federation key — the one
+    /// the sweep searches under — never an alias a surface happened to hold.
+    /// (C2-5)
+    pub async fn exercise_i23_the_door_announces_under_the_signers_derived_key<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let derived = signer.derived_key_id();
+        assert_ne!(
+            derived, node,
+            "{tag} I23: fixture — alias and derived id differ"
+        );
+
+        let body = format!("{tag} commons {run}").into_bytes();
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            crate::federation::types::cohort_scope::FEDERATION,
+            None,
+            &body,
+            None,
+        )
+        .await
+        .unwrap();
+        let holders = backend.list_holders(&res.at_rest_sha256).await.unwrap();
+        assert!(
+            holders.contains(&derived) && !holders.contains(&node),
+            "{tag} I23: the announcement must be under the signer's DERIVED key {derived:?} \
+             (what the sweep retracts under), never the alias {node:?}: holders={holders:?}"
+        );
+    }
+    // ── I24 ──────────────────────────────────────────────────────────────
+    /// **The row records the cohort the write NAMED.** `affiliations` and
+    /// `community` share a cascade and a tier; an `affiliations` write must
+    /// not land as `community` on the row §11.1 calls the authority.
+    /// (Ultrareview of `30fde79`.)
+    pub async fn exercise_i24_the_row_records_the_named_cohort<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        use crate::federation::types::cohort_scope::{CryptoTier, AFFILIATIONS};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let res = put_blob_scoped(backend, &adapter, AFFILIATIONS, Some(&comm), b"affil", None)
+            .await
+            .unwrap();
+        assert_eq!(res.tier, CryptoTier::CommunityDek);
+        assert_eq!(
+            backend
+                .blob_cohort_scope(&res.at_rest_sha256)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(AFFILIATIONS),
+            "{tag} I24: an affiliations write was recorded as some other cohort"
+        );
+    }
+    // ── I25 ──────────────────────────────────────────────────────────────
+    /// **The floor refuses a self-contradicting row.** `self`/`family` at
+    /// `plaintext`, or commons at a sealed tier, is refused by the floor
+    /// itself — so even an in-crate caller holding a token cannot record the
+    /// row §11.1 says is unrepresentable.
+    pub async fn exercise_i25_the_floor_refuses_a_contradictory_row<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::types::cohort_scope::{CryptoTier, FAMILY, FEDERATION, SELF};
+        use crate::federation::StorageFloor;
+        for (scope, tier) in [
+            (SELF, CryptoTier::Plaintext),
+            (FAMILY, CryptoTier::Plaintext),
+            (FEDERATION, CryptoTier::InvisibleEncrypted),
+            (FEDERATION, CryptoTier::CommunityDek),
+        ] {
+            let body = format!("{tag} {scope} {tier:?}").into_bytes();
+            let id = sha(&body);
+            let res = backend
+                .store_blob_local(
+                    &id,
+                    BlobBody::Inline(body),
+                    None,
+                    scope,
+                    StorageFloor::resolved(tier),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(BlobError::InvalidArgument(_))),
+                "{tag} I25 [{scope} @ {tier:?}]: the floor recorded a self-contradicting row: {res:?}"
+            );
+            assert!(
+                !backend.has_blob(&id).await.unwrap(),
+                "{tag} I25: nothing stored"
+            );
+        }
+    }
+    // ── I28 ──────────────────────────────────────────────────────────────
+    /// **An announcement never stores.** If a rotation and a retention sweep
+    /// evict a community blob between the cascade's bind and the door's
+    /// announcement, the announcement must refuse (`NotHeld`) — not re-insert
+    /// a ciphertext row with no binding and return success. (C3-2)
+    pub async fn exercise_i28_announce_refuses_an_evicted_row<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::StorageFloor;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let node = format!("{tag}-node-{run}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let node_derived = signer.derived_key_id();
+
+        // The cascade half of the door: sealed, stored, bound.
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"raced", None)
+            .await
+            .unwrap();
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("{tag} I28: sealed blob is inline");
+        };
+        // A rotation + retention sweep evicts it before the door announces.
+        backend.community_dek_bump_epoch(&comm).await.unwrap();
+        backend
+            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .await
+            .unwrap();
+        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        let n = backend
+            .community_dek_evict_epoch_objects(&comm, sealed.epoch, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "{tag} I28: precondition — evicted");
+        assert!(!backend.has_blob(&sealed.at_rest_sha256).await.unwrap());
+
+        // The announce half of the door, arriving late.
+        let res = backend
+            .put_blob_signing_at(
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                &sealed.at_rest_sha256,
+                BlobBody::Inline(bytes),
+                None,
+                &node_derived,
+                &adapter,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::NotHeld { .. })),
+            "{tag} I28: announcing an EVICTED community blob must refuse NotHeld, got {res:?}"
+        );
+        assert!(
+            !backend.has_blob(&sealed.at_rest_sha256).await.unwrap(),
+            "{tag} I28: the announcement RE-INSERTED the ciphertext row — without its \
+             binding, a row read_blob_as reports as corrupt"
+        );
+        assert!(
+            !backend
+                .list_holders(&sealed.at_rest_sha256)
+                .await
+                .unwrap()
+                .contains(&node_derived),
+            "{tag} I28: no holder claim for bytes this node does not hold"
+        );
+    }
+}
+
+/// Fixture-only access to the storage floor for [`blob_invariants`].
+#[cfg(any(test, feature = "test-anchor"))]
+#[allow(dead_code)]
+pub mod blob_invariants_fixture {
+    use crate::federation::blobs::BlobBody;
+    use crate::federation::BlobStorage;
+
+    /// Place a plaintext body under a PRIVATE cohort, as a bypass would.
+    /// The row is recorded at the tier the cohort REQUIRES (the floor refuses
+    /// a `self`/`family` row at `plaintext` — I25), so what this plants is a
+    /// row that claims sealed and carries clear bytes — the I4a probe: the
+    /// read door must refuse a stranger BEFORE it looks at those bytes.
+    pub async fn place_private_plaintext<B: BlobStorage + Sync>(
+        backend: &B,
+        sha: &[u8; 32],
+        body: Vec<u8>,
+    ) {
+        backend
+            .store_blob_local(
+                sha,
+                BlobBody::Inline(body),
+                None,
+                crate::federation::types::cohort_scope::SELF,
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+                ),
+            )
+            .await
+            .expect("floor write");
+    }
+}
+
+#[cfg(test)]
+mod cache_policy_tests {
+    use super::remember_only_success;
+
+    /// I29 — a failed derivation is not remembered; the next one is.
+    #[test]
+    fn i29_the_cache_remembers_only_success() {
+        static CACHE: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        assert_eq!(remember_only_success(&CACHE, None), None);
+        assert!(
+            CACHE.get().is_none(),
+            "I29: a transient failure was CACHED — the corpus stays unavailable until restart"
+        );
+        assert_eq!(
+            remember_only_success(&CACHE, Some([7u8; 32])),
+            Some([7u8; 32])
+        );
+        // Once derived, a later failure cannot evict the good value either.
+        assert_eq!(remember_only_success(&CACHE, None), None);
+        assert_eq!(CACHE.get(), Some(&[7u8; 32]));
     }
 }

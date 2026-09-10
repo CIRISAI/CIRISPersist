@@ -767,6 +767,46 @@ pub struct KeyringSignerHandle {
     pub key_id: String,
 }
 
+/// v43.0.0 (§11.2 (6)) — **the federation key id of a signer, derived from
+/// the signer itself.** The #275 recipe, formerly the body of
+/// `Engine::local_derived_key_id`: `derive_key_id(<alias>, <32-byte Ed25519
+/// pubkey>)`, refusing a non-Ed25519 signer LOUDLY rather than minting an id
+/// no federation row can match. A door that announces takes a signer and
+/// calls this; it never takes a key id, because a key id has exactly one
+/// correct value per signer (I23).
+pub async fn federation_key_id_of(
+    signer: &dyn ciris_keyring::HardwareSigner,
+) -> Result<String, crate::engine::SignError> {
+    use crate::engine::SignError;
+    let pubkey = signer.public_key().await.map_err(|e| {
+        SignError::LocalSigner(LocalSignerError::ClassicalSign(format!(
+            "federation_key_id_of: hardware public_key read failed: {e}"
+        )))
+    })?;
+    // v10.1.0 (CIRISPersist#275 hardening) — fail LOUD, not silent: a
+    // federation key_id is `derive_key_id(<alias>, <32-byte Ed25519
+    // pubkey>)`. If the composed signer is NOT Ed25519 (e.g. a 65-byte
+    // P-256 `EcdsaP256` keystore fallback), deriving over its pubkey
+    // would mint a key_id that no valid Ed25519 federation row can match
+    // — and silently store an unverifiable key (the #275 3rd surface).
+    // An Ed25519 public key is exactly 32 bytes.
+    const ED25519_PUBLIC_KEY_LEN: usize = 32;
+    if pubkey.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(SignError::LocalSigner(LocalSignerError::ClassicalSign(
+            format!(
+                "federation_key_id_of: signer public_key is {} bytes, not a 32-byte Ed25519 \
+                 key — the federation signing identity must be Ed25519 (got a non-Ed25519 \
+                 signer; pass an Ed25519 local_key_id/local_key_path)",
+                pubkey.len(),
+            ),
+        )));
+    }
+    Ok(ciris_verify_core::fedcode::derive_key_id(
+        signer.current_alias(),
+        &pubkey,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

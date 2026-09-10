@@ -723,6 +723,12 @@ class Engine:
     def cohort_verify_membership_quorum(self, cohort: str, group_key_id: str, change_envelope_json: str, signatures_json: str) -> None:
         """(derived) deontic — #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is authorized by the group's current strict-majority quorum (composes verify v6.9...."""
 
+    def community_dek_set_key_state(self, community_key_id: str, epoch: int, state: str) -> None:
+        """(derived) deontic — v43.0.0 (§11.6) — transition a community DEK epoch's key state: enabled / disabled / destroyed. Destroy refuses while any object on this node is st..."""
+
+    def community_dek_set_retain_past_epochs(self, community_key_id: str, retain_past_epochs: int | None = None) -> None:
+        """(derived) deontic — v43.0.0 (§11.6) — the retention policy the sweep enforces. retain_past_epochs=n: the sweep may evict and destroy epochs more than n behind the curr..."""
+
     def corpus_want_admits(self, wire_json: str, content_id: str, object_bytes: int) -> bool:
         """(derived) deontic — #356 (§Q B4 wanted-then-pulled) — may a producer push content_id of object_bytes against this signed CorpusWantV1 wire JSON? True iff the id is wan..."""
 
@@ -766,6 +772,9 @@ class Engine:
 
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
+
+    def get_blob_for_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — read a self/family-encrypted blob as viewer_key_id."""
 
     def grant_delegation(self, delegate_key_id: str, scopes: list[str], sub_delegation: bool, delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249) — emit a general delegates_to edge: authorize delegate_key_id within scopes (a list of scope tokens), with an explicit sub_delegation..."""
@@ -934,6 +943,15 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
+    def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
+
+    def put_blob_encrypted_self_family(self, cohort_scope: str, owner_or_family_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — store a blob encrypted for self or family."""
+
+    def put_blob_scoped(self, cohort_scope: str, plaintext_b64: str, community_key_id: str | None = None, media_type: str | None = None) -> str:
+        """(derived) deontic — v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §11.2) — THE write door."""
+
     def put_blob_signing(
         self,
         sha256_hex: str,
@@ -1020,6 +1038,12 @@ class Engine:
         ``"reachable"`` explicitly, or use :meth:`reachable_under_scope` when you
         only need the bool.
         """
+
+    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10) — read any blob as a viewer. The one read a server or agent needs."""
+
+    def read_blob_for_community_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) deontic — v43.0.0 (§10.1) — read a community-encrypted blob as viewer_key_id."""
 
     def register_federation_key(
         self,
@@ -3059,7 +3083,7 @@ class Engine:
         """(derived) empirical — #249 Cut B — the user-role key(s) that steward-bind key_id (who key_id is steward-bound TO). Returns a JSON array of key_ids; empty when key_id is..."""
 
     def store_blob_local_json(self, payload_json: str) -> None:
-        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes WITHOUT emitting a holds_bytes directory attestation."""
+        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holds_bytes directory attestation."""
 
     def task_delete(self, task_id: str) -> bool:
         """v1.5.9 — Delete a task by id.
@@ -3731,6 +3755,12 @@ class Engine:
 
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""
+
+    def sweep_all_communities(self) -> str:
+        """(derived) procedural — v43.0.0 (§11.6) — the shape a scheduler calls. Sweeps every community this node holds a DEK epoch record for; per-community failures are reported,..."""
+
+    def sweep_community_epochs(self, community_key_id: str) -> str:
+        """(derived) procedural — v43.0.0 (§11.6, §11.7) — sweep one community's rotated-past epochs. Needs the LocalSigner to hybrid-sign the withdraws that retract this node's ann..."""
 
     def sweep_consent_decay_once(self) -> int:
         """(derived) procedural — #227 (residual) — drive one consent-decay sweep synchronously (the time-driven twin of [Self::sweep_evictions_once]). Ages every fountain content u..."""

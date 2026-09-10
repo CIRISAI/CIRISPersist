@@ -5,7 +5,7 @@
 **Created:** 2026-06-09 · **Accepted:** 2026-06-10
 **Repo:** `~/CIRISPersist`
 **Normative anchor:** CEG §10.1.4 (substrate MUST wrap), §11.7.1 (Option-A forward secrecy), §8.1.12.4 (self DEK cascade), §8.1.13.3 (community DEK), §10.5.3 (epoch-DEK cascade), §5.6.8.4 (`key_grant` wire). CEG 0.17.
-**Builds on:** `FSD/ENCRYPTED_AT_REST.md` (the locked, unilateral at-rest content-encryption design) + the shipped §10.5.3 epoch-DEK cascade (`list_key_grants_for_stream_epoch`, v4.4.0). This FSD adds the **per-recipient DEK delivery** layer so cohort members *other than the writer* can decrypt.
+**Builds on:** `FSD/BLOB_ENCRYPTION_AT_REST.md` (the locked, unilateral at-rest content-encryption design) + the shipped §10.5.3 epoch-DEK cascade (`list_key_grants_for_stream_epoch`, v4.4.0). This FSD adds the **per-recipient DEK delivery** layer so cohort members *other than the writer* can decrypt.
 **Driving context:** the keystone under **#161 Asks 4–5** (forward-secrecy producer gate), **#183** (Self-at-login), **#153's** remaining at-rest half, and the CEG-0.17 **community-at-rest** tier. Dispatch shape tracked on **#188** (negative-default, not an allowlist).
 
 ---
@@ -39,7 +39,7 @@ Per CEG 0.17 (`v-ceg-0.17`) the cohort scopes resolve to **three** at-rest postu
 
 ## 0. TL;DR for reviewers
 
-`ENCRYPTED_AT_REST.md` settled that **persist encrypts content at rest** (master-key, application-layer, backend-agnostic, sole-DB-opener → unilateral). This FSD answers the one question that layer left open for the *shared* cohorts: when content lands at `cohort_scope: self | family`, **who wraps the content DEK to each recipient occurrence/member, and who re-wraps on membership change?**
+`BLOB_ENCRYPTION_AT_REST.md` settled that **persist encrypts content at rest** (master-key, application-layer, backend-agnostic, sole-DB-opener → unilateral). This FSD answers the one question that layer left open for the *shared* cohorts: when content lands at `cohort_scope: self | family`, **who wraps the content DEK to each recipient occurrence/member, and who re-wraps on membership change?**
 
 **The decision (§2): default = the substrate wraps; zero-trust-of-host = an opt-in where the producer wraps in a hardware enclave and persist stores the wrap opaque.** This is the secrets-path model (persist already AES-GCM-encrypts secrets at rest by *calling* CIRISVerify primitives — MISSION §1.4 forbids reimplementing crypto, not orchestrating it) generalized to blob content. It is **not** "every producer re-orchestrates the cascade" — that was an over-generalization of the C3b streaming precedent (corrected on #152), and it would replicate a security-critical path across N consumers, the opposite of why the substrate exists.
 
@@ -49,13 +49,13 @@ Persist already owns the two pieces the default tier needs: the **recipient enum
 
 ## 1. Why this exists
 
-CEWP's structural-invisibility promise (no `holds_bytes:*` broadcast for self/family) hides *existence* from federation peers. `ENCRYPTED_AT_REST.md` adds confidentiality of *content* against the host (operator shell, lost device, leaked backup). But self/family content has a third requirement neither covers: **the user's *other* devices, and family members, must be able to read it.** A phone writes a `cohort_scope: self` note; the user's laptop + agent occurrence must decrypt it. That requires the content DEK delivered to each recipient — the §5.6.8.4 `key_grant` (HPKE-wrapped DEK per recipient pubkey).
+CEWP's structural-invisibility promise (no `holds_bytes:*` broadcast for self/family) hides *existence* from federation peers. `BLOB_ENCRYPTION_AT_REST.md` adds confidentiality of *content* against the host (operator shell, lost device, leaked backup). But self/family content has a third requirement neither covers: **the user's *other* devices, and family members, must be able to read it.** A phone writes a `cohort_scope: self` note; the user's laptop + agent occurrence must decrypt it. That requires the content DEK delivered to each recipient — the §5.6.8.4 `key_grant` (HPKE-wrapped DEK per recipient pubkey).
 
 And membership is not static (§11.7.1): a new occurrence is admitted (must get retroactive grants for existing content), or one is revoked (must stop receiving grants for *new* content — forward secrecy). #161 shipped the substrate's expression of revocation + the `list_*_active` enumeration; this FSD is the wrap/delivery that consumes it.
 
 ## 2. The who-wraps decision — **RESOLVED: substrate wraps, default tier** (see §0.4)
 
-**Default tier — the substrate wraps (host-trusted, defense-in-depth).** On a `cohort_scope: self | family` write, persist (inside the `put_blob_signing` content-encryption path that `ENCRYPTED_AT_REST.md` already establishes):
+**Default tier — the substrate wraps (host-trusted, defense-in-depth).** On a `cohort_scope: self | family` write, persist (inside the `put_blob_signing` content-encryption path that `BLOB_ENCRYPTION_AT_REST.md` already establishes):
 
 1. generates / reuses the content DEK and AES-GCM-encrypts the body (existing at-rest path);
 2. **enumerates active recipients** — `list_identity_occurrences_active(attesting_identity)` for `self`, `list_families_for_member_active(family_id)` for `family` (#161, v4.8.0);
@@ -95,7 +95,7 @@ Consumers write `cohort_scope: self` and read back via a new `get_blob_for_viewe
 | Phase | Work | Gate |
 |---|---|---|
 | 1 | This FSD + OQ resolution | ✅ **done** — review converged (substrate-wraps, three tiers) |
-| 2 | Default-tier produce — `put_blob_signing` three-way negative-default dispatch (#188) + per-write self/family cascade (v2) + `get_blob_for_viewer` | `ENCRYPTED_AT_REST.md` at-rest layer |
+| 2 | Default-tier produce — `put_blob_signing` three-way negative-default dispatch (#188) + per-write self/family cascade (v2) + `get_blob_for_viewer` | `BLOB_ENCRYPTION_AT_REST.md` at-rest layer |
 | 3 | Community-DEK tier — reuse the §10.5.3 epoch-DEK cascade for `cohort_scope: community/affiliations` (roster = subscribers; `holds_bytes` + provenance) | Phase 2 |
 | 4 | Membership-change watcher (`Ask 2`) = #161 Asks 4–5 enforcement + Self-at-login re-key (#183) | Phase 2 |
 | 5 | Zero-trust-of-host opt-in (opaque-store path) | Phase 2 |

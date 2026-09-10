@@ -279,6 +279,58 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.2) — the content-master row
+    // read, in both SQL backends. PLUMBING: it is a single-row SELECT that
+    // can fail only on the substrate's own terms (driver, lock, row
+    // mapping). It asks nothing about the caller's input — the policy
+    // question "is this root usable" is answered by
+    // `resolve_persisted_content_master`, which is where the refusals live
+    // (a `hardware` row with an unreachable seed is a hard error there, not
+    // here). Plumbing is the fail-open direction, and the reason it is safe
+    // here is that an absent row is not treated as permission: the caller
+    // distinguishes Some/None explicitly and mints only in the None arm.
+    ("read_content_master_row", Class::Plumbing),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.5) — `parse_str`, covering both
+    // `DekKeyState::parse_str` (postgres community-DEK key state) and the
+    // `uuid::Uuid::parse_str` row-mapping in other doors. PLUMBING: the value
+    // being parsed comes from OUR OWN STORAGE, not from the caller, so by this
+    // module's definition it is row-mapping rather than a gate on caller input.
+    //
+    // Plumbing is the fail-open direction, so the reason it is safe here is
+    // specific and load-bearing: `DekKeyState::parse_str` ERRORS on an
+    // unrecognized token rather than defaulting. Had it defaulted — to
+    // `Enabled`, the permissive value — a corrupted or future state would have
+    // silently re-permitted sealing under a rotated-past epoch. The refusal is
+    // what keeps a row-mapping failure from becoming a permission decision.
+    ("parse_str", Class::Plumbing),
+    // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §11.4) — the community-DEK
+    // key-state door. PLUMBING, all three, and the reason is the same: the
+    // REFUSAL in `community_dek_set_key_state` is the conditional UPDATE
+    // itself (`… AND NOT EXISTS (bound objects)`), which is a statement, not
+    // a call. These reads run only AFTER that statement matched zero rows,
+    // to tell the caller WHICH of three causes applied; they decide nothing.
+    // `rollback` is the driver undoing the no-op transaction.
+    ("community_dek_key_state", Class::Plumbing),
+    ("community_dek_epoch_object_count", Class::Plumbing),
+    ("rollback", Class::Plumbing),
+    // v43.0.0 second pass — `check_scope` IS a refusal (I25: the floor refuses
+    // a self-contradicting row) and both backends call it first, so it
+    // contributes its name and the sequences must agree on it.
+    ("check_scope", Class::Gate),
+    // `community_dek_current_epoch` in the key-state door only names WHICH
+    // cause a zero-row UPDATE had (the predicate itself is in the statement,
+    // I20); in the cascade it is the read the seal is keyed on.
+    ("community_dek_current_epoch", Class::Plumbing),
+    // The eviction's `withdraws` goes through ONE shared helper in blobs.rs;
+    // its gates are the put-gate's and identical on both backends because
+    // there is one helper. Propagated (I18) rather than swallowed, so it now
+    // appears in the scanned sequence.
+    ("emit_withdraws_attestation_helper", Class::Plumbing),
+    // v43.0.0 third pass (I27) — the per-community advisory lock is LOCKING,
+    // the enum's own definition of Plumbing: it can fail only on the driver's
+    // terms and decides nothing about the row. sqlite's boundary is the
+    // connection mutex, taken before any of these doors run.
+    ("lock_community_tx", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a
