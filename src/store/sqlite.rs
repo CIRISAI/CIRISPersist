@@ -28526,6 +28526,24 @@ mod tests {
             .await;
     }
 
+    /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i41_a_stream_belongs_to_its_first_append(&backend, "sqlite")
+            .await;
+    }
+
+    /// §11.10 I42 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i42_a_chunk_is_bound_to_its_position_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::chunk_dag_cascade::invariants::exercise_i42_a_chunk_is_bound_to_its_position(&backend, "sqlite")
+            .await;
+    }
+
     /// v43.0.0 (§10) — **the full cohort lifecycle on sqlite.**
     ///
     /// create -> encrypt -> decrypt -> ROTATE -> encrypt -> forward secrecy

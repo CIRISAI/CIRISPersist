@@ -1960,6 +1960,290 @@ pub mod invariants {
         );
     }
 
+    // ── I41 ──────────────────────────────────────────────────────────────
+    /// **A stream belongs to its first append** (§12.9, #837). The first
+    /// chunk of a `stream_id` fixes its cohort, community and writer; a later
+    /// append that does not match is refused AT THAT CHUNK, storing nothing,
+    /// with a refusal that names the stream's cohort and community and never
+    /// the owner's key. The first writer keeps appending.
+    ///
+    /// PROBE FORM (RED on 8d5e860): the door had no writer identity, so the
+    /// foreign append is expressed as a second community, a second cohort
+    /// and the commons door on one id — every one of which v44.0.0 accepted
+    /// and interleaved.
+    pub async fn exercise_i41_a_stream_belongs_to_its_first_append<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let other = format!("{tag}-other-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+        seed_community(backend, &other, &[(&bob, &bob_occ)]).await;
+        let stream = format!("{tag}-stream-{run}");
+
+        put_blob_chunk_scoped(
+            backend,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            0,
+            b"first",
+            0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I41: the first append: {e}"));
+
+        // A second community on the same id, at a seq the first never used.
+        let res = put_blob_chunk_scoped(
+            backend,
+            COMMUNITY,
+            Some(&other),
+            &stream,
+            1,
+            b"interloper",
+            0,
+            None,
+        )
+        .await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => {
+                assert!(
+                    msg.contains(&comm) && msg.contains(COMMUNITY),
+                    "{tag} I41: the refusal names the stream's cohort and community: {msg}"
+                );
+            }
+            other => panic!(
+                "{tag} I41: a second community appended to a stream the first community \
+                 started — the id was shared until the seal: {other:?}"
+            ),
+        }
+        assert_eq!(
+            backend.stream_chunks(&stream).await.unwrap().chunks.len(),
+            1,
+            "{tag} I41: a refused append stores nothing"
+        );
+        assert!(
+            !backend.has_blob(&sha(b"interloper")).await.unwrap(),
+            "{tag} I41: no plaintext of a refused append is on disk"
+        );
+
+        // The same id at another cohort.
+        let res =
+            put_blob_chunk_scoped(backend, SELF, Some(&alice), &stream, 2, b"mine", 0, None).await;
+        match res {
+            Err(BlobError::InvalidArgument(msg)) => assert!(
+                msg.contains(COMMUNITY),
+                "{tag} I41: the refusal names the stream's cohort: {msg}"
+            ),
+            other => panic!("{tag} I41: another cohort appended to a community stream: {other:?}"),
+        }
+
+        // The commons door on the same id.
+        let res = backend
+            .put_blob_chunk(&stream, 3, BlobBody::Inline(b"public".to_vec()), 0)
+            .await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I41: the commons door appended to a community stream: {res:?}"
+        );
+
+        // The first writer keeps appending.
+        put_blob_chunk_scoped(
+            backend,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            b"second",
+            0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I41: the owner's second append: {e}"));
+        assert_eq!(
+            backend.stream_chunks(&stream).await.unwrap().chunks.len(),
+            2
+        );
+    }
+
+    // ── I42 ──────────────────────────────────────────────────────────────
+    /// **A chunk is bound to its position** (§12.10, #838). A manifest over
+    /// the same rows with two chunks swapped — sealed under the community's
+    /// own DEK, stored through the floor — does not open: the range read
+    /// across the boundary and the whole read fail as a crypto-class error
+    /// AFTER authorization (a stranger is still `NotGranted`). A chunk row
+    /// lifted into a second stream's DAG does not open there. The honest
+    /// DAG still opens.
+    ///
+    /// PROBE FORM (RED on 8d5e860): v44.0.0 folded one caller AAD into every
+    /// chunk, so the swapped manifest opened and returned the wrong bytes
+    /// without an error, and the lifted chunk opened in the second stream.
+    pub async fn exercise_i42_a_chunk_is_bound_to_its_position<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::seal;
+        use crate::federation::blobs::{
+            ChunkManifest, ChunkRef, EpochBinding, ManifestRowSpec, CHUNK_MANIFEST_VERSION_SEALED,
+        };
+        use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
+        use crate::federation::StorageFloor;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        let stranger = format!("{tag}-stranger-{run}");
+        let stream = format!("{tag}-stream-{run}");
+        let segs = [segment(31, 100), segment(32, 200)];
+        let (manifest, shas, plain) =
+            sealed_community_stream(backend, tag, &run, &comm, &stream, &segs).await;
+
+        // The honest read, across the boundary and whole.
+        assert_eq!(
+            read_any_range_for_viewer(backend, &manifest, &alice_occ, 90, 110, None)
+                .await
+                .unwrap(),
+            plain[90..=110].to_vec(),
+            "{tag} I42: the honest range read opens"
+        );
+        assert_eq!(
+            read_any_for_viewer(backend, &manifest, &alice_occ, None)
+                .await
+                .unwrap(),
+            plain,
+            "{tag} I42: the honest whole read opens"
+        );
+
+        // A manifest over the SAME rows with the two chunks swapped, sealed
+        // under the community's DEK (reached the way the door reaches it) and
+        // stored through the floor as a second DAG over the stream.
+        let epoch = backend.community_dek_current_epoch(&comm).await.unwrap();
+        let (dek, _, _) = ensure_epoch_dek(backend, &comm, epoch).await.unwrap();
+        let swapped = ChunkManifest {
+            v: CHUNK_MANIFEST_VERSION_SEALED,
+            total_size: 300,
+            chunks: vec![
+                ChunkRef {
+                    sha: shas[1],
+                    size: 200,
+                },
+                ChunkRef {
+                    sha: shas[0],
+                    size: 100,
+                },
+            ],
+            chunk_tier: Some(CryptoTier::CommunityDek),
+        };
+        let body = seal(&dek, &swapped.to_jcs_bytes(), None)
+            .unwrap()
+            .to_bytes();
+        let swapped_sha = sha(&body);
+        backend
+            .seal_stream_with_scope(
+                &stream,
+                ManifestRowSpec {
+                    sha256: swapped_sha,
+                    size_bytes: body.len() as u64,
+                    body,
+                    expected_chunk_count: 2,
+                },
+                None,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                Some(EpochBinding {
+                    community_key_id: comm.clone(),
+                    epoch,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I42: the floor stores a second DAG: {e}"));
+
+        // A stranger is refused before any chunk is touched.
+        assert!(
+            matches!(
+                read_any_range_for_viewer(backend, &swapped_sha, &stranger, 0, 10, None).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "{tag} I42: the stranger is refused at the manifest"
+        );
+        // The member: a chunk at another index does not open — a
+        // crypto-class error, never bytes, never NotGranted.
+        match read_any_range_for_viewer(backend, &swapped_sha, &alice_occ, 0, 99, None).await {
+            Err(BlobError::Backend(_)) => {}
+            Err(other) => panic!("{tag} I42: wrong refusal class for a moved chunk: {other:?}"),
+            Ok(bytes) => panic!(
+                "{tag} I42: a chunk moved to another index OPENED ({} bytes) — the chunk's \
+                 AAD does not carry its position",
+                bytes.len()
+            ),
+        }
+        match read_any_for_viewer(backend, &swapped_sha, &alice_occ, None).await {
+            Err(BlobError::Backend(_)) => {}
+            other => panic!("{tag} I42: the whole read of a swapped DAG: {other:?}"),
+        }
+
+        // Lifted into a second stream's DAG: the row exists (content-
+        // addressed); the index row is what a lift is. Sealed through the
+        // door, it must not open there.
+        let stream2 = format!("{tag}-stream2-{run}");
+        let Some(BlobBody::Inline(bytes0)) = backend.get_blob(&shas[0]).await.unwrap() else {
+            panic!("{tag} I42: chunk 0 is inline");
+        };
+        backend
+            .put_blob_chunk_with_scope(
+                &stream2,
+                0,
+                BlobBody::Inline(bytes0),
+                0,
+                100,
+                COMMUNITY,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                Some(EpochBinding {
+                    community_key_id: comm.clone(),
+                    epoch,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I42: lift through the floor: {e}"));
+        let node2 = format!("{tag}-node2-{run}");
+        let signer2 =
+            crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node2).await;
+        let adapter2 = crate::signing::LocalSignerHardwareAdapter::new(signer2);
+        let sealed2 = seal_stream_scoped(
+            backend,
+            &adapter2,
+            COMMUNITY,
+            Some(&comm),
+            &stream2,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I42: the second stream seals: {e}"));
+        match read_any_for_viewer(backend, &sealed2.manifest_sha256, &alice_occ, None).await {
+            Err(BlobError::Backend(_)) => {}
+            Err(other) => panic!("{tag} I42: wrong refusal class for a lifted chunk: {other:?}"),
+            Ok(_) => panic!(
+                "{tag} I42: a chunk lifted into a second stream's DAG OPENED there — the \
+                 chunk's AAD does not carry its stream"
+            ),
+        }
+        // The honest DAG is untouched by any of it.
+        assert_eq!(
+            read_any_for_viewer(backend, &manifest, &alice_occ, None)
+                .await
+                .unwrap(),
+            plain
+        );
+    }
+
     /// A SECOND occurrence of an already-registered identity: registers the
     /// occurrence key and publishes a keyed occurrence, without touching
     /// the identity's own key row (`seed_member` re-registers it).

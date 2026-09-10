@@ -24780,6 +24780,32 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, &tag).await;
     }
 
+    /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i41_a_stream_belongs_to_its_first_append(&backend, &tag).await;
+    }
+
+    /// §11.10 I42 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i42_a_chunk_is_bound_to_its_position_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i42_a_chunk_is_bound_to_its_position(&backend, &tag).await;
+    }
+
     /// §11.10 I27 — **one serialization boundary per community, measured by
     /// OCCUPANCY.** With the community's transaction lock held from another
     /// session, none of bind / key-state / rotation / eviction / community
