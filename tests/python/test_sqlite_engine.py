@@ -876,3 +876,113 @@ def test_deletion_window_watch_reachable_from_python_543() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
+    """#831 (`BLOB_ENCRYPTION_AT_REST.md` §11.2 (7) / §11.3 (5) / I40) —
+    ``put_blob_scoped(..., aad_b64=)`` folds caller-supplied associated data
+    into the seal, never stores it, and ``read_blob_as(..., aad_b64=)`` must
+    present the same bytes: another row's data fails AFTER authorization as
+    a backend/crypto ``RuntimeError`` (not ``blob_not_granted``), a stranger
+    presenting the right data is still ``blob_not_granted``, and data at a
+    plaintext tier is refused rather than dropped. The positional
+    signatures are unchanged (``aad_b64`` is a trailing keyword, default
+    ``None``). Skips on a non-sqlite wheel."""
+    import base64
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        # One keyed occurrence of the self identity — the grantee. The node's
+        # own content-tier pubkeys are a valid recipient shape; persist opens
+        # through its self-retention row, so the grantee's private halves
+        # are never needed here.
+        keys = eng.self_enc_pubkeys()
+        occ = kid + "-occ"
+        eng.put_identity_occurrence_json(
+            json.dumps(
+                {
+                    "identity_key_id": kid,
+                    "occurrence_key_id": occ,
+                    "device_class": "server",
+                    "hardware_attestation": None,
+                    "asserted_at": "2026-09-09T00:00:00Z",
+                    "valid_until": None,
+                    "encryption_pubkeys": {
+                        "x25519_base64": keys["x25519_base64"],
+                        "ml_kem_768_base64": keys["ml_kem_768_base64"],
+                    },
+                    "persist_row_hash": "",
+                }
+            )
+        )
+
+        body = b"alice's message body"
+        body_b64 = base64.b64encode(body).decode()
+        row_alice = base64.b64encode(b"alice\n2026-09-09T00:00:00.000Z\n1").decode()
+        row_mallory = base64.b64encode(b"mallory\n2026-09-09T00:00:01.000Z\n1").decode()
+
+        put = json.loads(eng.put_blob_scoped("self", body_b64, kid, None, aad_b64=row_alice))
+        assert put["tier"] == "InvisibleEncrypted", put
+        assert occ in put["granted"], put
+        sha = put["at_rest_sha256"]
+
+        # The sealing data opens it.
+        assert base64.b64decode(eng.read_blob_as(sha, occ, aad_b64=row_alice)) == body
+
+        # Another row's data does not — and it is NOT an authorization refusal.
+        with pytest.raises(RuntimeError) as ei:
+            eng.read_blob_as(sha, occ, aad_b64=row_mallory)
+        assert "blob_not_granted" not in str(ei.value)
+        # Nor does the positional call (no data): the seal demands what bound it.
+        with pytest.raises(RuntimeError):
+            eng.read_blob_as(sha, occ)
+
+        # A stranger presenting the right data is refused FIRST, by authorization.
+        with pytest.raises(ValueError) as ei:
+            eng.read_blob_as(sha, "stranger-" + secrets.token_hex(4), aad_b64=row_alice)
+        assert "blob_not_granted" in str(ei.value)
+
+        # The positional write (no data) is the v43 row: readable without data.
+        put0 = json.loads(eng.put_blob_scoped("self", base64.b64encode(b"unbound").decode(), kid))
+        assert base64.b64decode(eng.read_blob_as(put0["at_rest_sha256"], occ)) == b"unbound"
+
+        # Data at a plaintext tier: refused, not dropped.
+        with pytest.raises(ValueError) as ei:
+            eng.put_blob_scoped("federation", body_b64, None, None, aad_b64=row_alice)
+        assert "blob_not_granted" not in str(ei.value)
+
+        # A malformed aad_b64 is an input error, before anything is sealed.
+        with pytest.raises(ValueError) as ei:
+            eng.put_blob_scoped("self", body_b64, kid, aad_b64="%%not-base64%%")
+        assert "aad_b64" in str(ei.value)
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

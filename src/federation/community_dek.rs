@@ -147,7 +147,7 @@ pub fn is_infrastructure_community(community: &Community) -> bool {
 /// [`BlobStorage`]: crate::federation::blobs::BlobStorage
 pub mod orchestrate {
     use crate::federation::at_rest_cascade::{
-        fresh_dek, open, seal, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
+        fresh_dek, open_aad, seal_aad, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
         AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
     };
     use crate::federation::blobs::{BlobBody, BlobError, BlobStorage, DekKeyState};
@@ -410,6 +410,7 @@ pub mod orchestrate {
             community_key_id,
             plaintext,
             media_type,
+            None,
         )
         .await
     }
@@ -425,6 +426,7 @@ pub mod orchestrate {
         community_key_id: &str,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -463,6 +465,7 @@ pub mod orchestrate {
                 epoch,
                 plaintext,
                 media_type,
+                aad,
             )
             .await?
             {
@@ -514,6 +517,7 @@ pub mod orchestrate {
         epoch: u64,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<SealOutcome, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -521,8 +525,9 @@ pub mod orchestrate {
         let (dek, granted, excluded) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
 
         // Seal the body under the shared epoch DEK into the self-describing
-        // CRBLOB envelope (same format as self/family).
-        let envelope = seal(&dek, plaintext).map_err(map_at_rest_err)?;
+        // CRBLOB envelope (same format as self/family). `aad` (#831) is bound
+        // into the tag and never stored.
+        let envelope = seal_aad(&dek, aad, plaintext).map_err(map_at_rest_err)?;
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
@@ -852,7 +857,8 @@ pub mod orchestrate {
             }
         };
         let envelope = AtRestEnvelope::from_bytes(&envelope_bytes).map_err(map_at_rest_err)?;
-        read_for_community_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope).await
+        read_for_community_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, None)
+            .await
     }
 
     /// The decrypt half of [`read_for_community_viewer`], for a caller that
@@ -865,6 +871,7 @@ pub mod orchestrate {
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
         envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
@@ -903,7 +910,7 @@ pub mod orchestrate {
             })?;
         let content_master = backend.load_or_init_content_master().await?;
         let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
-        open(&dek, envelope).map_err(map_at_rest_err)
+        open_aad(&dek, aad, envelope).map_err(map_at_rest_err)
     }
 
     /// Emit one `hard_case:recipient_excluded` per fail-secure-excluded
@@ -1323,6 +1330,7 @@ pub mod lifecycle_harness {
             backend,
             &after.at_rest_sha256,
             &alice_occ,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: the cohort-agnostic read: {e}"));
@@ -1335,6 +1343,7 @@ pub mod lifecycle_harness {
             backend,
             &after.at_rest_sha256,
             &bob_occ,
+            None,
         )
         .await
         .expect_err("the generic read must enforce the SAME grant check");

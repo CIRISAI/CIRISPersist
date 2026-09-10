@@ -7,8 +7,72 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased — #831]
 
+**Caller-supplied associated data binds a sealed blob to its referencing row
+in the ciphertext, not beside it** (#831, from #830 — CIRISEdge's chat
+migration onto community-cohort blobs). `FSD/BLOB_ENCRYPTION_AT_REST.md`
+§11.2 (7), §11.3 (5), invariant I40.
+
+### Added
+
+- **`aad: Option<&[u8]>` on the write and read doors.**
+  `orchestrate::put_blob_scoped(…, media_type, aad)` /
+  `Engine::put_blob_scoped(…, aad)` / Python `put_blob_scoped(…, aad_b64=None)`
+  fold the bytes into the AES-256-GCM tag at both encrypted tiers — the
+  self/family cascade (`encrypt_and_cascade`) and the community cascade
+  (`seal_store_bind_at`) — through new `at_rest_cascade::{seal_aad, open_aad}`
+  twins routed via `ciris_crypto::aes_gcm::{encrypt_aad, decrypt_aad}`.
+  `orchestrate::read_any_for_viewer(…, viewer, aad)` / `Engine::read_blob_as(…,
+  aad)` / Python `read_blob_as(…, aad_b64=None)` must present the same bytes.
+  **The data is never stored** — not on the row, not in the `AtRestEnvelope`
+  (on-disk layout unchanged), not in any grant — so what it binds is whatever
+  the caller holds beside the blob: for a chat message, the referencing row's
+  author, signed instant and epoch. Under a per-epoch community DEK a
+  ciphertext lifted from Alice's row onto an attacker's own validly-signed row
+  opened for every member, and a row-side commitment to `(sha, author,
+  asserted_at)` could not stop it (the attacker signs a self-consistent
+  tuple); only the seal can, and now does. Transfers are unchanged: the
+  ciphertext ships verbatim, and a peer holding the row holds what opens it.
+- **Refusals, in order.** `Some(aad)` at a **plaintext** tier — commons, or the
+  authorized-infrastructure carve-out — is refused (`InvalidArgument` /
+  `blob_invalid_argument`) at both doors rather than silently dropped: there is
+  no seal to bind it to, and a caller left believing in a binding that does not
+  exist is worse than one told there is none. A mismatch at the read door fails
+  **after** authorization (a non-member presenting the right data is still
+  `NotGranted` and learns nothing) as a crypto-class `Backend` error
+  (`blob_backend` → Python `RuntimeError`), never `NotGranted`: the viewer was
+  authorized; the bytes did not belong to the row they arrived on. The message
+  says exactly that and names neither the data nor the binding — by the verify
+  pair's contract a wrong AAD is indistinguishable from a tampered body, and
+  the door does not try to distinguish them. `None` is exactly the v43 seal
+  and open, so every existing row reads as before; a bound seal does not open
+  for a reader presenting nothing, and an unbound seal does not open for a
+  reader presenting something (the two entry points refuse each other's
+  ciphertext, asserted upstream and re-asserted here).
+- **I40** (`blob_invariant_i40_associated_data_binds_the_seal_{sqlite,postgres}`,
+  one shared `exercise_i40_*` in `at_rest_cascade::blob_invariants`): at both
+  encrypted tiers a seal under `A` opens under `A`, fails under `A'` and under
+  no data as `Backend` naming neither row, a stranger with `A` is `NotGranted`,
+  the data is not in the stored body, an AAD-less seal stays readable, and the
+  plaintext tier refuses data at write (nothing stored) and at read. Written
+  before the binding existed and confirmed RED on the re-pinned tree with the
+  parameter threaded but unused (the self-tier `A'` open returned Alice's
+  plaintext); mutation-verified per the FSD's evidence note. Plus a unit test
+  on the twins and a Python test on `aad_b64`.
+
 ### Changed
 
+- **Signatures widened, existing callers pass `None`**:
+  `orchestrate::{put_blob_scoped, read_any_for_viewer, encrypt_and_cascade,
+  read_for_viewer_sealed}`, `community_dek::orchestrate::{encrypt_and_cascade_community_scoped,
+  seal_store_bind_at, read_for_community_viewer_sealed}`, `Engine::{put_blob_scoped,
+  read_blob_as}` — a trailing `aad: Option<&[u8]>`. The narrower doors
+  (`encrypt_and_cascade_community`, `read_for_viewer`,
+  `read_for_community_viewer`, `put_blob_encrypted_*`, `get_blob_for_viewer`,
+  `read_blob_for_community_viewer`) are unchanged and pass `None`: a blob
+  sealed with data is readable only through `read_blob_as` with that data. The
+  Python bindings keep their positional signatures; `aad_b64` is a trailing
+  keyword defaulting to `None`. Stub regenerated; no new exported symbol, so no
+  taxonomy row.
 - **CIRISVerify re-pin v15.0.0 → v15.1.0** (CIRISVerify#279 / PR #280): all
   seven `Cargo.toml` tag pins (`ciris-keyring` ×4 feature variants,
   `ciris-verify-core` ×2, `ciris-crypto` ×1) flip together, per the

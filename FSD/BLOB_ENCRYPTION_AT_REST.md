@@ -1236,6 +1236,25 @@ storage method). It:
    key the sweep does not search under, so the announcement could never be
    retracted (§11.5). A parameter that has exactly one correct value is not a
    parameter.
+7. **takes caller-supplied associated data and binds it into the seal, never
+   into the row** (#831, from #830). `aad: Option<&[u8]>` (Python `aad_b64`)
+   is folded into the AES-GCM tag through `ciris_crypto::aes_gcm::encrypt_aad`
+   at both encrypted tiers — the self/family cascade and the community
+   cascade's `seal_store_bind_at` — and is **not stored**: not on the row, not
+   in the `AtRestEnvelope` (whose on-disk layout is unchanged), not in any
+   grant. The reader supplies it again at the read door, so what it binds is
+   whatever the caller holds elsewhere — for a chat message, the referencing
+   row's author, signed instant and epoch. Under a per-epoch community DEK a
+   ciphertext lifted from Alice's row onto an attacker's own validly-signed
+   row opens for every member; a row-side commitment to `(sha, author,
+   asserted_at)` does not stop that, because the attacker signs a
+   self-consistent tuple. Only the seal can refuse it, and it does so without
+   the blob layer learning what a row is. `Some(aad)` at a **plaintext** tier
+   — commons, or the authorized-infrastructure carve-out — is refused
+   (`InvalidArgument`): there is no seal to bind it to, and dropping it
+   silently would leave the caller believing in a binding that does not
+   exist. Transfers are unchanged: the ciphertext ships verbatim, and a peer
+   that holds the referencing row also holds what it needs to open it.
 
 The pre-existing commons doors (`put_blob_signing`, `put_blob_json`) remain and
 are **commons-only by construction**: they record `federation`. There is no
@@ -1273,7 +1292,18 @@ agent holds. Its order is fixed and the order **is** the guarantee:
 3. only then read the body, and for an encrypted tier **require it to parse as
    an `AtRestEnvelope`** — a row that claims an encrypted tier and carries an
    unparseable body is corruption (`Backend`), never a plaintext return;
-4. decrypt and return.
+4. decrypt and return —
+5. **under the associated data the reader presented, if any** (#831):
+   `read_blob_as(sha, viewer, aad)` hands `aad` to
+   `ciris_crypto::aes_gcm::decrypt_aad`; the same bytes, or the open fails.
+   That failure is reachable only **after** step 2 — a non-member presenting
+   the right data is still `NotGranted` — and it is a crypto-class error
+   (`Backend`), never `NotGranted`: the viewer was authorized; the bytes did
+   not belong to the row they arrived on. The message says exactly that and
+   names neither the data nor the binding. By the verify pair's contract a
+   wrong AAD is indistinguishable from a tampered body, and the door does not
+   try to distinguish them. `Some(aad)` against a plaintext row is refused as
+   at the write door, for the same reason: nothing bound it.
 
 The first implementation authorized inside two of three branches and let the
 third return bytes to anyone. Authorization that lives inside a branch is
@@ -1492,6 +1522,7 @@ returns the error and the next call derives again (I29).
 | I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep | C3-2 |
 | I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart | C3-3 |
 | I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped | C3-4, C3-5 |
+| I40 | Caller-supplied associated data is bound into the seal and never stored: a seal under `A` opens under `A` and fails under `A'` — after authorization (a non-member presenting `A` is `NotGranted`), as a crypto-class error, at both encrypted tiers; `Some(aad)` at a plaintext tier is refused. | the `A'` open succeeds; a mismatch surfaces as `NotGranted`; a commons write accepts and drops the data | #830 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1510,7 +1541,12 @@ certify gate and CI step so the witness executes. On postgres the community
 announcement (I28) refuses an evicted row at two points — the binding lookup
 that names the community to lock, and the existence check under that lock —
 and each alone refuses the evicted case, so removing either survives; the
-pair removed together turns I28 red, which is the evidence recorded. A test that is green on
+pair removed together turns I28 red, which is the evidence recorded. I40 (#831)
+was written before the binding existed and confirmed red on the re-pinned
+tree with `aad` threaded through every seal and open but unused — the
+self-tier `A'` open returned Alice's plaintext; it reds again when either
+twin drops the data (the seal, or the open), when the community cascade stops
+passing it, and when the plaintext-tier refusal is removed at either door. A test that is green on
 the code it was written to catch is a report.
 
 **C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,

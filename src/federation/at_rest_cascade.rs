@@ -495,6 +495,11 @@ pub enum AtRestError {
 /// The AES-256-GCM ciphertext (with its appended 16-byte tag, per
 /// `ciris_crypto::aes_gcm::encrypt`) covers the *plaintext* blob body
 /// under the per-write DEK and `nonce`.
+///
+/// #831 — a seal made with associated data ([`seal_aad`]) has the SAME
+/// layout: the data is authenticated by the tag and is not on disk. Nothing
+/// in the envelope says whether data was bound; the reader either presents
+/// it or the open fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtRestEnvelope {
     /// The GCM nonce the body was sealed under (12 bytes).
@@ -578,6 +583,66 @@ pub fn seal(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<AtRestEnvelope, AtR
 pub fn open(dek: &[u8; DEK_LEN], envelope: &AtRestEnvelope) -> Result<Vec<u8>, AtRestError> {
     ciris_crypto::aes_gcm::decrypt(dek, &envelope.nonce, &envelope.ciphertext)
         .map_err(|e| AtRestError::Crypto(format!("aes-gcm open: {e}")))
+}
+
+/// [`seal`] with **associated data** (#831, `BLOB_ENCRYPTION_AT_REST.md`
+/// §11.2 (7)).
+///
+/// When `aad` is present it is folded into the AES-256-GCM tag through
+/// `ciris_crypto::aes_gcm::encrypt_aad`, so the envelope opens only for a
+/// reader presenting the same bytes to [`open_aad`]. The data is NOT part of
+/// the envelope and is never stored — that is the point: the caller binds
+/// the ciphertext to something it holds elsewhere (a referencing row's
+/// author and signed instant), and a ciphertext lifted onto another row
+/// does not open there. `None` is exactly [`seal`]: the on-disk format is
+/// unchanged and an AAD-less seal stays byte-compatible with every existing
+/// row. (`Some(b"")` is equivalent to `None` — the verify crate pins
+/// `encrypt_aad(.., b"", ..)` byte-identical to `encrypt`.)
+pub fn seal_aad(
+    dek: &[u8; DEK_LEN],
+    aad: Option<&[u8]>,
+    plaintext: &[u8],
+) -> Result<AtRestEnvelope, AtRestError> {
+    let Some(aad) = aad else {
+        return seal(dek, plaintext);
+    };
+    let nv = ciris_crypto::random::bytes(NONCE_LEN)
+        .map_err(|e| AtRestError::Crypto(format!("random nonce: {e}")))?;
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&nv);
+    let ciphertext = ciris_crypto::aes_gcm::encrypt_aad(dek, &nonce, aad, plaintext)
+        .map_err(|e| AtRestError::Crypto(format!("aes-gcm seal under associated data: {e}")))?;
+    Ok(AtRestEnvelope { nonce, ciphertext })
+}
+
+/// [`open`] with **associated data** (#831, §11.3 (5)): the reader's `aad`
+/// must be the bytes the seal was bound to, or the tag does not verify.
+/// `None` is exactly [`open`] — which is also why a seal bound to data does
+/// not open for a reader presenting none, and an AAD-less seal does not open
+/// for a reader presenting some: the two entry points refuse each other's
+/// ciphertext by construction (asserted in the verify crate).
+///
+/// A wrong AAD is indistinguishable from a tampered body, and this does not
+/// try to distinguish them: the [`AtRestError::Crypto`] says the bytes did
+/// not belong to the row they arrived on, and names neither the data nor
+/// what it bound.
+pub fn open_aad(
+    dek: &[u8; DEK_LEN],
+    aad: Option<&[u8]>,
+    envelope: &AtRestEnvelope,
+) -> Result<Vec<u8>, AtRestError> {
+    let Some(aad) = aad else {
+        return open(dek, envelope);
+    };
+    ciris_crypto::aes_gcm::decrypt_aad(dek, &envelope.nonce, aad, &envelope.ciphertext).map_err(
+        |e| {
+            AtRestError::Crypto(format!(
+                "aes-gcm open under associated data refused ({e}): the viewer was authorized, \
+                 but the bytes did not belong to the row they arrived on — the body was altered, \
+                 or it was not sealed under the data this reader presented"
+            ))
+        },
+    )
 }
 
 /// Wrap `dek` under the persist content master key for self-retention.
@@ -844,12 +909,17 @@ pub mod orchestrate {
     /// [`CryptoTier::InvisibleEncrypted`] (the caller's dispatch already
     /// checked); other scopes are rejected with
     /// [`BlobError::InvalidArgument`].
+    ///
+    /// `aad` (#831) is bound into the seal through [`seal_aad`] and never
+    /// stored; a reader must present the same bytes to
+    /// [`read_any_for_viewer`].
     pub async fn encrypt_and_cascade<B>(
         backend: &B,
         cohort_scope: &str,
         owner_or_family_key_id: &str,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<CascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -862,7 +932,7 @@ pub mod orchestrate {
         // 1. Fresh per-write DEK + seal the body into a self-describing
         //    ciphertext envelope (the format/version marker).
         let dek = fresh_dek().map_err(map_at_rest_err)?;
-        let envelope = seal(&dek, plaintext).map_err(map_at_rest_err)?;
+        let envelope = seal_aad(&dek, aad, plaintext).map_err(map_at_rest_err)?;
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
@@ -1465,10 +1535,19 @@ pub mod orchestrate {
     /// [`BlobError::NotGranted`] if the viewer holds no grant, and the
     /// destroyed-epoch refusal if the key material is gone. Each says which
     /// of those it is; none of them is silently an empty read.
+    ///
+    /// `aad` (#831, §11.3 (5)) — the associated data the seal was bound to,
+    /// if any. The same bytes, or the open fails AFTER authorization as a
+    /// crypto-class [`BlobError::Backend`], never `NotGranted`: the viewer
+    /// was authorized; the bytes did not belong to the row they arrived on.
+    /// A non-grantee presenting the right data is still `NotGranted` and
+    /// learns nothing. `Some(aad)` against a plaintext row is refused
+    /// (`InvalidArgument`), as at the write door.
     pub async fn read_any_for_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
@@ -1498,7 +1577,17 @@ pub mod orchestrate {
             // row is commons-tier and the bytes it holds may be another
             // cohort's ciphertext — returned as held, which is the transfer
             // model (§10.6): a relay carries what it cannot read.
-            CryptoTier::Plaintext => {}
+            CryptoTier::Plaintext => {
+                // §11.3 (5) / I40 — data presented against a row that was
+                // never sealed: refused, as at the write door.
+                if aad.is_some() {
+                    return Err(BlobError::InvalidArgument(format!(
+                        "blob {} is recorded at the plaintext tier; associated data has nothing \
+                         to bind to — a plaintext row is not sealed",
+                        hex::encode(at_rest_sha256)
+                    )));
+                }
+            }
             CryptoTier::InvisibleEncrypted => {
                 if backend
                     .get_at_rest_grant(at_rest_sha256, viewer_key_id)
@@ -1563,7 +1652,7 @@ pub mod orchestrate {
                         hex::encode(at_rest_sha256)
                     ))
                 })?;
-                read_for_viewer_sealed(backend, at_rest_sha256, &envelope).await
+                read_for_viewer_sealed(backend, at_rest_sha256, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
                 let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
@@ -1578,6 +1667,7 @@ pub mod orchestrate {
                     at_rest_sha256,
                     viewer_key_id,
                     &envelope,
+                    aad,
                 )
                 .await
             }
@@ -1607,6 +1697,15 @@ pub mod orchestrate {
     /// cohort. The commons doors record `federation` by construction and
     /// cannot be pointed at a private cohort. That is what makes §11.10 I1
     /// true rather than checked.
+    ///
+    /// `aad` (#831, §11.2 (7)) — caller-supplied associated data, bound into
+    /// the seal at both encrypted tiers and NEVER stored; the reader presents
+    /// the same bytes to [`read_any_for_viewer`] or the open fails. What it
+    /// binds is whatever the caller holds beside the blob — a chat row's
+    /// author, signed instant and epoch — so a ciphertext lifted onto another
+    /// row does not open there. `Some(aad)` at a plaintext tier is refused
+    /// (`InvalidArgument`): nothing to bind it to, and dropping it would leave
+    /// the caller believing in a binding that does not exist.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_scoped<B>(
         backend: &B,
@@ -1615,6 +1714,7 @@ pub mod orchestrate {
         community_key_id: Option<&str>,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<crate::federation::PutBlobScopedResult, BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
@@ -1634,6 +1734,15 @@ pub mod orchestrate {
         let tier = super::resolve_write_tier(backend, cohort_scope, community_key_id).await?;
         match tier {
             CryptoTier::Plaintext => {
+                // §11.2 (7) / I40 — nothing here is sealed, so nothing can
+                // be bound. Refuse rather than drop: a caller that supplied
+                // data believes in a binding, and must not be left believing.
+                if aad.is_some() {
+                    return Err(BlobError::InvalidArgument(format!(
+                        "cohort_scope {cohort_scope:?} resolves to the plaintext tier; associated \
+                         data has nothing to bind to — a plaintext row is not sealed"
+                    )));
+                }
                 let sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
                 backend
                     .put_blob_signing_at(
@@ -1666,8 +1775,9 @@ pub mod orchestrate {
                 // §11.2 (5) / I21 — the matcher sees the PLAINTEXT, before sealing.
                 let plain_sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
                 backend.screen_inline_body(&plain_sha, plaintext).await?;
-                let r = encrypt_and_cascade(backend, cohort_scope, owner, plaintext, media_type)
-                    .await?;
+                let r =
+                    encrypt_and_cascade(backend, cohort_scope, owner, plaintext, media_type, aad)
+                        .await?;
                 Ok(PutBlobScopedResult {
                     at_rest_sha256: r.at_rest_sha256,
                     tier,
@@ -1690,6 +1800,7 @@ pub mod orchestrate {
                     comm,
                     plaintext,
                     media_type,
+                    aad,
                 )
                 .await?;
                 // ANNOUNCE the sealed bytes: community content federates with
@@ -1731,6 +1842,7 @@ pub mod orchestrate {
         backend: &B,
         at_rest_sha256: &[u8; 32],
         envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
@@ -1747,7 +1859,7 @@ pub mod orchestrate {
         let content_master = backend.load_or_init_content_master().await?;
         let dek =
             unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
-        open(&dek, envelope).map_err(map_at_rest_err)
+        open_aad(&dek, aad, envelope).map_err(map_at_rest_err)
     }
 
     /// The default-tier read: recover the plaintext blob body for a
@@ -1865,6 +1977,46 @@ mod tests {
         let env = seal(&dek, b"secret").unwrap();
         let wrong = [0x99u8; DEK_LEN];
         assert!(matches!(open(&wrong, &env), Err(AtRestError::Crypto(_))));
+    }
+
+    /// #831 — the twins bind the data and refuse across entry points.
+    #[test]
+    fn seal_aad_binds_the_data_and_refuses_across_entry_points() {
+        let dek = fresh_dek().unwrap();
+        let pt = b"alice's message";
+        let row_a: &[u8] = b"alice\n2026-09-09T00:00:00.000Z\n1";
+        let row_m: &[u8] = b"mallory\n2026-09-09T00:00:01.000Z\n1";
+        let env = seal_aad(&dek, Some(row_a), pt).unwrap();
+        assert_ne!(env.to_bytes(), pt.to_vec());
+        assert!(
+            !env.to_bytes().windows(row_a.len()).any(|w| w == row_a),
+            "the data is bound, not stored"
+        );
+        assert_eq!(open_aad(&dek, Some(row_a), &env).unwrap(), pt);
+        assert!(matches!(
+            open_aad(&dek, Some(row_m), &env),
+            Err(AtRestError::Crypto(_))
+        ));
+        assert!(matches!(
+            open_aad(&dek, None, &env),
+            Err(AtRestError::Crypto(_))
+        ));
+        assert!(matches!(open(&dek, &env), Err(AtRestError::Crypto(_))));
+        let msg = open_aad(&dek, Some(row_m), &env).unwrap_err().to_string();
+        assert!(msg.contains("did not belong to the row"), "{msg}");
+        assert!(!msg.contains("alice") && !msg.contains("mallory"), "{msg}");
+
+        // `None` is exactly seal/open; data against an AAD-less seal refuses.
+        let plain = seal_aad(&dek, None, pt).unwrap();
+        assert_eq!(open(&dek, &plain).unwrap(), pt);
+        assert_eq!(open_aad(&dek, None, &plain).unwrap(), pt);
+        assert!(matches!(
+            open_aad(&dek, Some(row_a), &plain),
+            Err(AtRestError::Crypto(_))
+        ));
+        // `Some(b"")` ≡ `None` — verify pins encrypt_aad(.., b"", ..) ≡ encrypt.
+        let empty = seal_aad(&dek, Some(b""), pt).unwrap();
+        assert_eq!(open(&dek, &empty).unwrap(), pt);
     }
 
     #[test]
@@ -2102,7 +2254,7 @@ pub mod blob_invariants {
             .await
             .unwrap_or_else(|e| panic!("{tag} I2: a commons write must succeed: {e}"));
 
-        let got = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"))
+        let got = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"), None)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -2193,7 +2345,7 @@ pub mod blob_invariants {
         let id = sha(&body);
         super::blob_invariants_fixture::place_private_plaintext(backend, &id, body.clone()).await;
 
-        let res = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}")).await;
+        let res = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"), None).await;
         match res {
             Ok(bytes) if bytes == body => panic!(
                 "{tag} I4a: the read door returned a PRIVATE plaintext blob to a stranger — \
@@ -2239,6 +2391,7 @@ pub mod blob_invariants {
             backend,
             &sealed.at_rest_sha256,
             &format!("{tag}-stranger-{run}"),
+            None,
         )
         .await
         .expect_err("a stranger must be refused");
@@ -2579,6 +2732,7 @@ pub mod blob_invariants {
             Some(&comm),
             &body,
             None,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I15: infra write through THE door: {e}"));
@@ -2589,15 +2743,20 @@ pub mod blob_invariants {
             "{tag} I15: the ROW records the RESOLVED tier, not the label's tier"
         );
 
-        let got = read_any_for_viewer(backend, &res.at_rest_sha256, &format!("{tag}-stranger"))
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{tag} I15: content written through the infra carve-out is UNREADABLE \
+        let got = read_any_for_viewer(
+            backend,
+            &res.at_rest_sha256,
+            &format!("{tag}-stranger"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{tag} I15: content written through the infra carve-out is UNREADABLE \
                      through the generic read — the read re-derived the tier from the scope \
                      and discarded the write-time resolution: {e}"
-                )
-            });
+            )
+        });
         assert_eq!(got, body, "{tag} I15: plaintext round-trips");
     }
 
@@ -2671,6 +2830,7 @@ pub mod blob_invariants {
             &comm,
             old,
             b"raced",
+            None,
             None,
         )
         .await
@@ -3031,6 +3191,7 @@ pub mod blob_invariants {
             Some(&comm),
             &plaintext,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3050,6 +3211,7 @@ pub mod blob_invariants {
             crate::federation::types::cohort_scope::FEDERATION,
             None,
             &plaintext,
+            None,
             None,
         )
         .await
@@ -3095,6 +3257,7 @@ pub mod blob_invariants {
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             b"known-bad",
+            None,
             None,
         )
         .await;
@@ -3142,6 +3305,7 @@ pub mod blob_invariants {
             None,
             &body,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3176,9 +3340,17 @@ pub mod blob_invariants {
         .await;
         let signer = node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-        let res = put_blob_scoped(backend, &adapter, AFFILIATIONS, Some(&comm), b"affil", None)
-            .await
-            .unwrap();
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            AFFILIATIONS,
+            Some(&comm),
+            b"affil",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(res.tier, CryptoTier::CommunityDek);
         assert_eq!(
             backend
@@ -3307,6 +3479,194 @@ pub mod blob_invariants {
                 .unwrap()
                 .contains(&node_derived),
             "{tag} I28: no holder claim for bytes this node does not hold"
+        );
+    }
+
+    // ── I40 ──────────────────────────────────────────────────────────────
+    /// **Caller-supplied associated data is bound into the seal, never
+    /// stored.** (#831, from #830 — the chat migration's lifted-ciphertext
+    /// substitution.)
+    ///
+    /// Under a per-epoch community DEK a ciphertext lifted from Alice's
+    /// message row onto Mallory's own validly-signed row opens for every
+    /// member: the blob is addressed by sha and authorized by membership, and
+    /// neither knows which row asked. A row-side commitment to `(sha, author,
+    /// asserted_at)` does not close that — Mallory signs a self-consistent
+    /// tuple. Only the seal can refuse it: the writer folds the row's data
+    /// into the GCM tag, the reader presents the same data, and the data is
+    /// never on disk. Both encrypted tiers; the plaintext tier refuses the
+    /// data rather than dropping it.
+    pub async fn exercise_i40_associated_data_binds_the_seal<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            put_blob_scoped, read_any_for_viewer,
+        };
+        use crate::federation::community_dek::lifecycle_support::{seed_community, seed_member};
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY, FEDERATION, SELF};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let stranger = format!("{tag}-stranger-{run}");
+
+        // What a chat row supplies: author ‖ signed instant ‖ epoch. Alice's
+        // row, and the row Mallory signs after lifting Alice's sha onto it.
+        let alice_row = format!("{tag}-alice-{run}\n2026-09-09T00:00:00.000Z\n1");
+        let mallory_row = format!("{tag}-mallory-{run}\n2026-09-09T00:00:01.000Z\n1");
+        let a: &[u8] = alice_row.as_bytes();
+        let a_prime: &[u8] = mallory_row.as_bytes();
+
+        // self/family: an owner with one keyed occurrence.
+        let owner = format!("{tag}-owner-{run}");
+        let owner_occ = format!("{tag}-owner-occ-{run}");
+        seed_member(backend, &owner, &owner_occ).await;
+        // community: alice as a member.
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+
+        for (scope, key, viewer, tier) in [
+            (
+                SELF,
+                owner.as_str(),
+                owner_occ.as_str(),
+                CryptoTier::InvisibleEncrypted,
+            ),
+            (
+                COMMUNITY,
+                comm.as_str(),
+                alice_occ.as_str(),
+                CryptoTier::CommunityDek,
+            ),
+        ] {
+            let body = format!("message body sealed at {scope}").into_bytes();
+            let put = put_blob_scoped(backend, &adapter, scope, Some(key), &body, None, Some(a))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
+            assert_eq!(
+                put.tier, tier,
+                "{tag} I40: precondition — {scope} resolved sealed"
+            );
+            let id = put.at_rest_sha256;
+
+            // The data is a binding, not a column: not in the stored body.
+            let Some(BlobBody::Inline(stored)) = backend.get_blob(&id).await.unwrap() else {
+                panic!("{tag} I40: the sealed {scope} row is inline");
+            };
+            assert!(
+                !stored.windows(a.len()).any(|w| w == a),
+                "{tag} I40: the associated data is STORED in the {scope} body"
+            );
+
+            // Alice's row opens it.
+            let got = read_any_for_viewer(backend, &id, viewer, Some(a))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{tag} I40: open at {scope} under the sealing data: {e}")
+                });
+            assert_eq!(
+                got, body,
+                "{tag} I40: {scope} plaintext under the sealing data"
+            );
+
+            // Mallory's row does not — after authorization, as a crypto-class
+            // refusal, naming neither row nor binding.
+            let err = read_any_for_viewer(backend, &id, viewer, Some(a_prime))
+                .await
+                .expect_err(&format!(
+                    "{tag} I40: the {scope} ciphertext OPENED under another row's data — lifted \
+                     onto Mallory's row, Alice's message reads as Mallory's"
+                ));
+            assert!(
+                matches!(err, BlobError::Backend(_)),
+                "{tag} I40: a mismatch after authorization is a crypto-class error (the viewer \
+                 was authorized; the bytes did not belong to the row), got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(&alice_row) && !msg.contains(&mallory_row) && !msg.contains(&comm),
+                "{tag} I40: the refusal named the data or the binding: {msg}"
+            );
+
+            // No data at all does not open it either: the seal demands what
+            // bound it.
+            let err = read_any_for_viewer(backend, &id, viewer, None)
+                .await
+                .expect_err(&format!(
+                "{tag} I40: the {scope} ciphertext opened with NO data — the binding was dropped"
+            ));
+            assert!(
+                matches!(err, BlobError::Backend(_)),
+                "{tag} I40: an absent binding is the same crypto-class refusal, got {err:?}"
+            );
+
+            // A stranger presenting the right data is still refused FIRST, by
+            // authorization, and learns nothing about the seal.
+            let err = read_any_for_viewer(backend, &id, &stranger, Some(a))
+                .await
+                .expect_err(&format!("{tag} I40: a stranger read a {scope} blob"));
+            assert!(
+                matches!(err, BlobError::NotGranted { .. }),
+                "{tag} I40: authorization comes before the open — a stranger with the right \
+                 data is NotGranted, got {err:?}"
+            );
+
+            // A seal WITHOUT data at the same tier is the v43 row: it opens
+            // without data, and presenting data against it is refused — the
+            // two entry points do not open each other's ciphertext.
+            let unbound =
+                put_blob_scoped(backend, &adapter, scope, Some(key), b"unbound", None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
+            assert_eq!(
+                read_any_for_viewer(backend, &unbound.at_rest_sha256, viewer, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag} I40: AAD-less open at {scope}: {e}")),
+                b"unbound",
+                "{tag} I40: an AAD-less seal stays readable without data"
+            );
+            assert!(
+                matches!(
+                    read_any_for_viewer(backend, &unbound.at_rest_sha256, viewer, Some(a)).await,
+                    Err(BlobError::Backend(_))
+                ),
+                "{tag} I40: data presented against an AAD-less seal must refuse — a reader that \
+                 believes in a binding that does not exist is told so"
+            );
+        }
+
+        // The plaintext tier: nothing to bind to. Refused, not dropped; and
+        // nothing stored.
+        let body = b"public doc with a binding nobody could hold".to_vec();
+        let id = sha(&body);
+        let res = put_blob_scoped(backend, &adapter, FEDERATION, None, &body, None, Some(a)).await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I40: associated data at a PLAINTEXT tier must be refused, not silently \
+             dropped, got {res:?}"
+        );
+        assert!(
+            !backend.has_blob(&id).await.unwrap(),
+            "{tag} I40: the refused commons write stored the row anyway"
+        );
+        put_blob_scoped(backend, &adapter, FEDERATION, None, &body, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: the commons write without data: {e}"));
+        let res = read_any_for_viewer(backend, &id, &stranger, Some(a)).await;
+        assert!(
+            matches!(res, Err(BlobError::InvalidArgument(_))),
+            "{tag} I40: data presented against a PLAINTEXT row must be refused at the read door \
+             as at the write door, got {res:?}"
+        );
+        assert_eq!(
+            read_any_for_viewer(backend, &id, &stranger, None)
+                .await
+                .unwrap(),
+            body,
+            "{tag} I40: the commons row is still public without data"
         );
     }
 }

@@ -949,7 +949,7 @@ class Engine:
     def put_blob_encrypted_self_family(self, cohort_scope: str, owner_or_family_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — store a blob encrypted for self or family."""
 
-    def put_blob_scoped(self, cohort_scope: str, plaintext_b64: str, community_key_id: str | None = None, media_type: str | None = None) -> str:
+    def put_blob_scoped(self, cohort_scope: str, plaintext_b64: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §11.2) — THE write door."""
 
     def put_blob_signing(
@@ -1039,7 +1039,7 @@ class Engine:
         only need the bool.
         """
 
-    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+    def read_blob_as(self, at_rest_sha256_hex: str, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (§10) — read any blob as a viewer. The one read a server or agent needs."""
 
     def read_blob_for_community_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
