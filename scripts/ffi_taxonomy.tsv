@@ -21,6 +21,16 @@
 # runs and report what it did; they permit nothing the state machine did not
 # already, and a wrong stub there is a scheduling wrong, not a security one.
 #
+# #832 (§12) — `put_blob_chunk_scoped`, `seal_stream_scoped` and
+# `read_blob_range_as` are DEONTIC for the reasons `put_blob_scoped` and
+# `read_blob_as` are: the chunk door decides which occurrences receive a DEK
+# wrap, the scoped seal decides that AND whether a manifest may be written over
+# the chunk rows it lists (a wrong entry writes a public manifest over sealed
+# chunks), and the range read enforces the grant per chunk. `stream_chunks_json`
+# is TESTIMONIAL under `log_commitment`, like `latest_stream_sth`: it reports
+# which prefix of a live stream a producer-signed STH commits to, and a wrong
+# entry makes a DVR consumer treat an uncommitted tail as tamper-evident.
+#
 # CIRISPersist#595 / CIRISConstitution#83. One row per symbol PyO3 exports:
 #
 #     <stub owner>\t<exported name>\t<class>\t<frame>
@@ -476,6 +486,7 @@ Engine	put_accord_proposal_json	deontic
 Engine	put_aggregated_tier	axiotic	
 Engine	put_attestation	deontic	
 Engine	put_blob_chunk	empirical	
+Engine	put_blob_chunk_scoped	deontic	
 Engine	put_blob_chunks_json	empirical	
 Engine	put_blob_encrypted_community	deontic	
 Engine	put_blob_encrypted_self_family	deontic	
@@ -502,6 +513,7 @@ Engine	reachable_under_scope	deontic
 Engine	reachable_under_scope_with_reasons	deontic	
 Engine	read_blob_as	deontic	
 Engine	read_blob_for_community_viewer	deontic	
+Engine	read_blob_range_as	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	
@@ -534,6 +546,7 @@ Engine	scheduled_task_list_due	procedural
 Engine	scheduled_task_update_after_trigger	procedural	
 Engine	scheduled_task_upsert	procedural	
 Engine	seal_stream	testimonial	log_commitment
+Engine	seal_stream_scoped	deontic	
 Engine	secrets_decapsulate	deontic	
 Engine	secrets_decrypt	deontic	
 Engine	secrets_encrypt	pragmatic	
@@ -577,6 +590,7 @@ Engine	steward_binding_chain_json	empirical
 Engine	steward_bindings_of_json	empirical	
 Engine	storage_budget_supersedes	deontic	
 Engine	store_blob_local_json	empirical	
+Engine	stream_chunks_json	testimonial	log_commitment
 Engine	stream_consistency_proof	testimonial	log_commitment
 Engine	stream_inclusion_proof	testimonial	log_commitment
 Engine	subscribe	structural	

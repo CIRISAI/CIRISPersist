@@ -311,14 +311,21 @@ pub fn resolve_persisted_content_master(
 /// ([`BlobBody::External`]'s own contract). It therefore cannot see the
 /// bytes, cannot know whether they are sealed, and must not assert a
 /// property it has no way to check. `ChunkDag` — the chunks are separate
-/// rows; this door sees only the manifest, so per-chunk sealing is not
-/// verifiable here either.
+/// rows; THIS function sees only the manifest, so per-chunk sealing is not
+/// verifiable from a body alone.
 ///
 /// In both cases the honest answer is "cannot verify", and in an encrypted
 /// cohort **cannot-verify is a refusal**. Accepting them would make the
 /// gate a report: it would pass, nothing would be red, and the plaintext
 /// would be on disk in a cohort whose whole confidentiality story is that
 /// it is not.
+///
+/// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.3) — a DAG IS verifiable, by a
+/// different door: `chunk_dag_cascade::orchestrate::seal_stream_scoped`
+/// checks the chunk ROWS (each chunk row records the tier it was stored at)
+/// and refuses a DAG whose chunks are not all at its tier. This body-only
+/// verdict stays a refusal precisely so nobody routes a DAG through a door
+/// that cannot look at the rows.
 #[must_use]
 pub fn body_is_sealed(body: &crate::federation::blobs::BlobBody) -> BodySealState {
     use crate::federation::blobs::BlobBody;
@@ -560,9 +567,41 @@ pub fn fresh_dek() -> Result<[u8; DEK_LEN], AtRestError> {
     Ok(dek)
 }
 
+/// The AES-256-GCM authentication tag appended to every envelope's
+/// ciphertext (`ciris_crypto::aes_gcm::encrypt` returns `ct ‖ tag`).
+pub const AES_GCM_TAG_LEN: usize = 16;
+
+/// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.1) — bytes an [`AtRestEnvelope`]
+/// adds over its plaintext: `magic[8] ‖ nonce[12] ‖ … ‖ tag[16]`. The one
+/// constant the chunk floor uses to refuse a chunk row whose declared
+/// plaintext size contradicts its stored body (§12.3).
+pub const AT_REST_ENVELOPE_OVERHEAD: usize =
+    AT_REST_ENVELOPE_MAGIC.len() + NONCE_LEN + AES_GCM_TAG_LEN;
+
+/// The plaintext length an envelope of `stored_len` bytes carries, or
+/// `None` if `stored_len` is shorter than the envelope overhead (not an
+/// envelope at all).
+#[must_use]
+pub fn sealed_plaintext_len(stored_len: u64) -> Option<u64> {
+    stored_len.checked_sub(AT_REST_ENVELOPE_OVERHEAD as u64)
+}
+
 /// AES-256-GCM-encrypt `plaintext` under `dek` with a fresh random
 /// nonce, returning the self-describing [`AtRestEnvelope`].
-pub fn seal(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<AtRestEnvelope, AtRestError> {
+///
+/// `aad` — **#831 hook, currently IGNORED.** Caller-supplied associated
+/// data that will be folded into the GCM tag once `ciris_crypto::aes_gcm`
+/// gains `encrypt_aad` (CIRISVerify#279). Until then the parameter exists on
+/// every surface so #831 is a flip of this function and [`open`], not a hunt
+/// for call sites; `tests::seal_ignores_aad_until_831` pins that it binds
+/// nothing today, so no caller can believe it does. Crypto routes through
+/// `ciris_crypto` only — this must NOT reach for `ring` directly.
+pub fn seal(
+    dek: &[u8; DEK_LEN],
+    plaintext: &[u8],
+    aad: Option<&[u8]>,
+) -> Result<AtRestEnvelope, AtRestError> {
+    let _ = aad; // #831 — fold into the tag via `aes_gcm::encrypt_aad` when it lands.
     let nv = ciris_crypto::random::bytes(NONCE_LEN)
         .map_err(|e| AtRestError::Crypto(format!("random nonce: {e}")))?;
     let mut nonce = [0u8; NONCE_LEN];
@@ -575,7 +614,14 @@ pub fn seal(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<AtRestEnvelope, AtR
 /// AES-256-GCM-decrypt an [`AtRestEnvelope`] under `dek`, returning the
 /// plaintext blob body. GCM auth-tag failure is an
 /// [`AtRestError::Crypto`].
-pub fn open(dek: &[u8; DEK_LEN], envelope: &AtRestEnvelope) -> Result<Vec<u8>, AtRestError> {
+///
+/// `aad` — the #831 hook, ignored today exactly as in [`seal`].
+pub fn open(
+    dek: &[u8; DEK_LEN],
+    envelope: &AtRestEnvelope,
+    aad: Option<&[u8]>,
+) -> Result<Vec<u8>, AtRestError> {
+    let _ = aad; // #831 — verify under `aes_gcm::decrypt_aad` when it lands.
     ciris_crypto::aes_gcm::decrypt(dek, &envelope.nonce, &envelope.ciphertext)
         .map_err(|e| AtRestError::Crypto(format!("aes-gcm open: {e}")))
 }
@@ -862,7 +908,8 @@ pub mod orchestrate {
         // 1. Fresh per-write DEK + seal the body into a self-describing
         //    ciphertext envelope (the format/version marker).
         let dek = fresh_dek().map_err(map_at_rest_err)?;
-        let envelope = seal(&dek, plaintext).map_err(map_at_rest_err)?;
+        // #831 — the whole-blob door does not carry AAD yet; that issue adds it.
+        let envelope = seal(&dek, plaintext, None).map_err(map_at_rest_err)?;
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
@@ -880,13 +927,50 @@ pub mod orchestrate {
             )
             .await?;
 
-        // 3. persist self-retention: wrap the DEK under the content master
-        //    so get_blob_for_viewer can recover it in the default tier.
+        // 3 + 4. Self-retention + recipient fan-out (shared with the chunk
+        //        cascade, §12.3: a chunk row gets exactly these grants).
+        let (granted, excluded) = grant_dek_to_cohort(
+            backend,
+            &at_rest_sha256,
+            cohort_scope,
+            owner_or_family_key_id,
+            &dek,
+        )
+        .await?;
+
+        Ok(CascadeResult {
+            at_rest_sha256,
+            granted,
+            excluded,
+        })
+    }
+
+    /// The grant half of the self/family cascade: persist's content-master
+    /// self-retention wrap for `at_rest_sha256`, then a v2 wrap of `dek` to
+    /// every active recipient occurrence whose keys are usable, fail-secure
+    /// excluding the rest. Returns `(granted, excluded)`.
+    ///
+    /// #832 (§12.3) — factored out so a sealed CHUNK row and a sealed
+    /// MANIFEST row receive precisely the grants a whole blob does, from the
+    /// same code. Crate-private: the caller must already have stored the
+    /// row through the floor under the `InvisibleEncrypted` tier.
+    pub(crate) async fn grant_dek_to_cohort<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+        dek: &[u8; DEK_LEN],
+    ) -> Result<(Vec<String>, Vec<String>), BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        // persist self-retention: wrap the DEK under the content master so
+        // the read door can recover it in the default tier.
         let content_master = backend.load_or_init_content_master().await?;
-        let self_wrap = wrap_dek_for_persist(&content_master, &dek).map_err(map_at_rest_err)?;
+        let self_wrap = wrap_dek_for_persist(&content_master, dek).map_err(map_at_rest_err)?;
         backend
             .put_at_rest_grant(
-                &at_rest_sha256,
+                at_rest_sha256,
                 PERSIST_SELF_RECIPIENT,
                 WRAP_ALGORITHM_CONTENT_MASTER,
                 &self_wrap,
@@ -894,9 +978,9 @@ pub mod orchestrate {
             )
             .await?;
 
-        // 4. Recipient cascade — wrap the DEK to each active recipient
-        //    whose occurrence carries valid encryption_pubkeys; fail-
-        //    secure exclude the rest (no plaintext / v1 fallback).
+        // Recipient cascade — wrap the DEK to each active recipient whose
+        // occurrence carries valid encryption_pubkeys; fail-secure exclude
+        // the rest (no plaintext / v1 fallback).
         let recipients = resolve_recipients(backend, cohort_scope, owner_or_family_key_id).await?;
         let v2_algo = WRAP_ALGORITHM_V2;
         let mut granted = Vec::new();
@@ -904,11 +988,11 @@ pub mod orchestrate {
         for (occ_key_id, keys) in recipients {
             match usable_keys(&keys) {
                 Some(k) => {
-                    let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, &dek)
+                    let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, dek)
                         .map_err(map_at_rest_err)?;
                     backend
                         .put_at_rest_grant(
-                            &at_rest_sha256,
+                            at_rest_sha256,
                             &occ_key_id,
                             v2_algo,
                             &wrapped,
@@ -920,12 +1004,7 @@ pub mod orchestrate {
                 None => excluded.push(occ_key_id),
             }
         }
-
-        Ok(CascadeResult {
-            at_rest_sha256,
-            granted,
-            excluded,
-        })
+        Ok((granted, excluded))
     }
 
     /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
@@ -1469,63 +1548,46 @@ pub mod orchestrate {
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
     {
         use crate::federation::types::cohort_scope::CryptoTier;
-        let not_granted = || BlobError::NotGranted {
-            sha256_hex: hex::encode(at_rest_sha256),
-            viewer_key_id: viewer_key_id.to_owned(),
-        };
 
         // 1. The ROW says what this is. Absent ⇒ NotHeld. (§11.1) The tier
         //    is the one the WRITE DOOR RESOLVED and recorded — never
         //    re-derived here from the scope, which would drop the directory
-        //    axis (the infra carve-out) the door applied (I15).
-        let tier = backend
-            .blob_crypto_tier(at_rest_sha256)
+        //    axis (the infra carve-out) the door applied (I15). #832: the
+        //    HEAD, so the dispatch below also knows whether this row is a
+        //    chunk DAG — from a column, not from bytes.
+        let head = backend
+            .blob_head(at_rest_sha256)
             .await?
             .ok_or_else(|| BlobError::NotHeld {
                 sha256_hex: hex::encode(at_rest_sha256),
             })?;
+        let tier = head.crypto_tier;
 
         // 2. AUTHORIZE BY TIER, BEFORE TOUCHING THE BODY. (§11.3) The
         //    decision lives above the dispatch so a new tier cannot skip it.
         //    A refusal names only the sha and the viewer.
-        match tier {
-            // Commons is public by construction. NOTE: on a relaying node the
-            // row is commons-tier and the bytes it holds may be another
-            // cohort's ciphertext — returned as held, which is the transfer
-            // model (§10.6): a relay carries what it cannot read.
-            CryptoTier::Plaintext => {}
-            CryptoTier::InvisibleEncrypted => {
-                if backend
-                    .get_at_rest_grant(at_rest_sha256, viewer_key_id)
-                    .await?
-                    .is_none()
-                {
-                    return Err(not_granted());
-                }
-            }
-            CryptoTier::CommunityDek => {
-                let Some((community, epoch)) =
-                    backend.community_dek_blob_epoch(at_rest_sha256).await?
-                else {
-                    // A community-tier row with no binding is corruption,
-                    // not a public blob.
-                    return Err(BlobError::Backend(format!(
-                        "blob {} is recorded at tier {tier:?} but carries no community-DEK binding",
-                        hex::encode(at_rest_sha256)
-                    )));
-                };
-                if !backend
-                    .community_dek_has_member_grant(&community, epoch, viewer_key_id)
-                    .await?
-                {
-                    return Err(not_granted());
-                }
-            }
+        authorize_viewer_by_tier(backend, at_rest_sha256, tier, viewer_key_id).await?;
+
+        // #832 (§12.4 / I35) — a chunk DAG is its CONTENT, concatenated, under
+        // the whole-read cap; a sealed one opens the manifest and every chunk
+        // under this viewer's authorization. The row's storage_kind decides,
+        // never the bytes.
+        if head.storage_kind == "chunk_dag" {
+            return crate::federation::chunk_dag_cascade::orchestrate::read_dag_for_viewer_authorized(
+                backend,
+                at_rest_sha256,
+                &head,
+                viewer_key_id,
+                None,
+                aad,
+            )
+            .await;
         }
 
         // 3. Now — and only now — the body, once. An encrypted tier whose
@@ -1547,8 +1609,8 @@ pub mod orchestrate {
                 )))
             }
             BlobBody::ChunkDag(_) => {
-                return Err(BlobError::InvalidArgument(format!(
-                    "blob {} is a chunk DAG; read its chunks, not the manifest",
+                return Err(BlobError::Backend(format!(
+                    "blob {} read back as a chunk DAG but its row head did not say so",
                     hex::encode(at_rest_sha256)
                 )))
             }
@@ -1563,7 +1625,7 @@ pub mod orchestrate {
                         hex::encode(at_rest_sha256)
                     ))
                 })?;
-                read_for_viewer_sealed(backend, at_rest_sha256, &envelope).await
+                read_for_viewer_sealed(backend, at_rest_sha256, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
                 let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
@@ -1578,8 +1640,65 @@ pub mod orchestrate {
                     at_rest_sha256,
                     viewer_key_id,
                     &envelope,
+                    aad,
                 )
                 .await
+            }
+        }
+    }
+
+    /// §11.3 step 2 — **authorize `viewer_key_id` on a row by its recorded
+    /// tier, before any body is touched.** Shared by the whole read, the
+    /// range read (#832) and the per-chunk checks, so one predicate decides
+    /// every read. A refusal names only the sha and the viewer (I4).
+    pub(crate) async fn authorize_viewer_by_tier<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        tier: crate::federation::types::cohort_scope::CryptoTier,
+        viewer_key_id: &str,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let not_granted = || BlobError::NotGranted {
+            sha256_hex: hex::encode(at_rest_sha256),
+            viewer_key_id: viewer_key_id.to_owned(),
+        };
+        match tier {
+            // Commons is public by construction. NOTE: on a relaying node the
+            // row is commons-tier and the bytes it holds may be another
+            // cohort's ciphertext — returned as held, which is the transfer
+            // model (§10.6): a relay carries what it cannot read.
+            CryptoTier::Plaintext => Ok(()),
+            CryptoTier::InvisibleEncrypted => {
+                if backend
+                    .get_at_rest_grant(at_rest_sha256, viewer_key_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(not_granted());
+                }
+                Ok(())
+            }
+            CryptoTier::CommunityDek => {
+                let Some((community, epoch)) =
+                    backend.community_dek_blob_epoch(at_rest_sha256).await?
+                else {
+                    // A community-tier row with no binding is corruption,
+                    // not a public blob.
+                    return Err(BlobError::Backend(format!(
+                        "blob {} is recorded at tier {tier:?} but carries no community-DEK binding",
+                        hex::encode(at_rest_sha256)
+                    )));
+                };
+                if !backend
+                    .community_dek_has_member_grant(&community, epoch, viewer_key_id)
+                    .await?
+                {
+                    return Err(not_granted());
+                }
+                Ok(())
             }
         }
     }
@@ -1731,6 +1850,7 @@ pub mod orchestrate {
         backend: &B,
         at_rest_sha256: &[u8; 32],
         envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
@@ -1747,7 +1867,7 @@ pub mod orchestrate {
         let content_master = backend.load_or_init_content_master().await?;
         let dek =
             unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
-        open(&dek, envelope).map_err(map_at_rest_err)
+        open(&dek, envelope, aad).map_err(map_at_rest_err)
     }
 
     /// The default-tier read: recover the plaintext blob body for a
@@ -1813,8 +1933,8 @@ pub mod orchestrate {
         let dek =
             unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
 
-        // 4. Decrypt + return plaintext.
-        open(&dek, &envelope).map_err(map_at_rest_err)
+        // 4. Decrypt + return plaintext. (#831 — this legacy door carries no AAD.)
+        open(&dek, &envelope, None).map_err(map_at_rest_err)
     }
 }
 
@@ -1852,19 +1972,53 @@ mod tests {
     fn seal_open_round_trip_recovers_plaintext() {
         let dek = fresh_dek().unwrap();
         let pt = b"family photo bytes";
-        let env = seal(&dek, pt).unwrap();
+        let env = seal(&dek, pt, None).unwrap();
         // The sealed envelope must NOT equal the plaintext.
         assert_ne!(env.to_bytes(), pt.to_vec());
-        let back = open(&dek, &env).unwrap();
+        let back = open(&dek, &env, None).unwrap();
         assert_eq!(back, pt);
+        assert_eq!(
+            env.to_bytes().len(),
+            pt.len() + AT_REST_ENVELOPE_OVERHEAD,
+            "the overhead constant IS the envelope's overhead"
+        );
+        assert_eq!(
+            sealed_plaintext_len(env.to_bytes().len() as u64),
+            Some(pt.len() as u64)
+        );
+        assert_eq!(
+            sealed_plaintext_len(AT_REST_ENVELOPE_OVERHEAD as u64 - 1),
+            None
+        );
     }
 
     #[test]
     fn open_rejects_wrong_dek() {
         let dek = fresh_dek().unwrap();
-        let env = seal(&dek, b"secret").unwrap();
+        let env = seal(&dek, b"secret", None).unwrap();
         let wrong = [0x99u8; DEK_LEN];
-        assert!(matches!(open(&wrong, &env), Err(AtRestError::Crypto(_))));
+        assert!(matches!(
+            open(&wrong, &env, None),
+            Err(AtRestError::Crypto(_))
+        ));
+    }
+
+    /// §12.7 / I39 — **`seal` and `open` IGNORE `aad` until #831 lands.**
+    ///
+    /// The parameter is a hook, and a hook that silently bound something
+    /// would make callers believe in a property the primitive does not
+    /// provide yet. This pins the inert behaviour so that when
+    /// CIRISVerify#279 ships and #831 flips the two functions, THIS test
+    /// turns red and is rewritten into I31 — the flip cannot be forgotten
+    /// and cannot happen by accident.
+    #[test]
+    fn seal_ignores_aad_until_831() {
+        let dek = fresh_dek().unwrap();
+        let env = seal(&dek, b"segment", Some(b"manifest-sha|7")).unwrap();
+        assert_eq!(open(&dek, &env, None).unwrap(), b"segment");
+        assert_eq!(open(&dek, &env, Some(b"other-row")).unwrap(), b"segment");
+        let env2 = seal(&dek, b"segment", None).unwrap();
+        assert_eq!(open(&dek, &env2, Some(b"anything")).unwrap(), b"segment");
     }
 
     #[test]
@@ -2102,7 +2256,7 @@ pub mod blob_invariants {
             .await
             .unwrap_or_else(|e| panic!("{tag} I2: a commons write must succeed: {e}"));
 
-        let got = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"))
+        let got = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"), None)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -2193,7 +2347,7 @@ pub mod blob_invariants {
         let id = sha(&body);
         super::blob_invariants_fixture::place_private_plaintext(backend, &id, body.clone()).await;
 
-        let res = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}")).await;
+        let res = read_any_for_viewer(backend, &id, &format!("{tag}-stranger-{run}"), None).await;
         match res {
             Ok(bytes) if bytes == body => panic!(
                 "{tag} I4a: the read door returned a PRIVATE plaintext blob to a stranger — \
@@ -2239,6 +2393,7 @@ pub mod blob_invariants {
             backend,
             &sealed.at_rest_sha256,
             &format!("{tag}-stranger-{run}"),
+            None,
         )
         .await
         .expect_err("a stranger must be refused");
@@ -2589,15 +2744,20 @@ pub mod blob_invariants {
             "{tag} I15: the ROW records the RESOLVED tier, not the label's tier"
         );
 
-        let got = read_any_for_viewer(backend, &res.at_rest_sha256, &format!("{tag}-stranger"))
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{tag} I15: content written through the infra carve-out is UNREADABLE \
+        let got = read_any_for_viewer(
+            backend,
+            &res.at_rest_sha256,
+            &format!("{tag}-stranger"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{tag} I15: content written through the infra carve-out is UNREADABLE \
                      through the generic read — the read re-derived the tier from the scope \
                      and discarded the write-time resolution: {e}"
-                )
-            });
+            )
+        });
         assert_eq!(got, body, "{tag} I15: plaintext round-trips");
     }
 

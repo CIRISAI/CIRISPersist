@@ -12908,11 +12908,18 @@ impl PyEngine {
     /// body, which for `self` / `family` / `community` / `affiliations` is
     /// CIPHERTEXT. That accessor is for relaying bytes to peers — a
     /// different job, and the reason transfers never re-encode.
+    ///
+    /// #832 (§12.4) — a `chunk_dag` row is its CONTENT (concatenated, under
+    /// the 64 MiB whole-read cap; above it `ValueError` pointing at
+    /// `read_blob_range_as`). `aad_b64` is the #831 hook, ignored until
+    /// CIRISVerify#279 lands.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, aad_b64=None))]
     fn read_blob_as(
         &self,
         py: Python<'_>,
         at_rest_sha256_hex: &str,
         viewer_key_id: &str,
+        aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12921,6 +12928,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(aad_b64)?;
             py.detach(move || {
                 use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
                 let bytes = match &self.backend {
@@ -12928,19 +12936,314 @@ impl PyEngine {
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            read_any_for_viewer(backend.as_ref(), &sha, &viewer).await
+                            read_any_for_viewer(backend.as_ref(), &sha, &viewer, aad.as_deref())
+                                .await
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            read_any_for_viewer(backend.as_ref(), &sha, &viewer).await
+                            read_any_for_viewer(backend.as_ref(), &sha, &viewer, aad.as_deref())
+                                .await
                         })
                     }
                 }
                 .map_err(blob_err_to_py)?;
                 Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.4) — **the decrypting range
+    /// read.** Plaintext bytes `[start, end_inclusive]` of any blob as
+    /// `viewer_key_id`, base64-encoded. Authorizes by the row's tier first; a
+    /// sealed chunk DAG opens only the covering chunks (seek is O(segment)).
+    /// RFC 9110 §14.4 bounds against the PLAINTEXT total: `start >= total`
+    /// raises `ValueError` (`blob_range_not_satisfiable`); the end is clamped.
+    /// `get_blob_range` remains the storage-layer read (stored bytes, for
+    /// relays; never decrypts). `aad_b64` is the #831 hook.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, start, end_inclusive, aad_b64=None))]
+    fn read_blob_range_as(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        start: u64,
+        end_inclusive: u64,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(aad_b64)?;
+            py.detach(move || {
+                use crate::federation::chunk_dag_cascade::orchestrate::read_any_range_for_viewer;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            read_any_range_for_viewer(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                start,
+                                end_inclusive,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            read_any_range_for_viewer(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                start,
+                                end_inclusive,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// #832 (§12.3) — **append one plaintext segment to a live stream at
+    /// `cohort_scope`, sealed where the tier requires it.** The chunk twin of
+    /// `put_blob_scoped`: `plaintext_b64` in, the tier resolved from the
+    /// DIRECTORY; `community_key_id` names the community for `community` /
+    /// `affiliations` and the owner / family key for `self` / `family`.
+    /// `epoch` is the producer's stream epoch label (recorded as given, the
+    /// nonce-cap axis); which DEK sealed a community chunk is the chunk row's
+    /// epoch binding, reported as `epoch` in the result.
+    ///
+    /// Returns JSON: `chunk_sha256` (hex — of the CIPHERTEXT at a sealed
+    /// tier), `tier`, `epoch` (community only), `granted`, `excluded`.
+    /// `aad_b64` is the #831 hook.
+    #[pyo3(signature = (cohort_scope, stream_id, seq, plaintext_b64, epoch, community_key_id=None, aad_b64=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn put_blob_chunk_scoped(
+        &self,
+        py: Python<'_>,
+        cohort_scope: &str,
+        stream_id: &str,
+        seq: u64,
+        plaintext_b64: &str,
+        epoch: u64,
+        community_key_id: Option<&str>,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let plaintext = B64.decode(plaintext_b64).map_err(|e| {
+                PyValueError::new_err(format!("put_blob_chunk_scoped plaintext_b64 decode: {e}"))
+            })?;
+            let aad = decode_aad_b64(aad_b64)?;
+            let scope = cohort_scope.to_owned();
+            let comm = community_key_id.map(str::to_owned);
+            let stream = stream_id.to_owned();
+            py.detach(move || {
+                let r = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            put_blob_chunk_scoped(
+                                backend.as_ref(),
+                                &scope,
+                                comm.as_deref(),
+                                &stream,
+                                seq,
+                                &plaintext,
+                                epoch,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            put_blob_chunk_scoped(
+                                backend.as_ref(),
+                                &scope,
+                                comm.as_deref(),
+                                &stream,
+                                seq,
+                                &plaintext,
+                                epoch,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({
+                    "chunk_sha256": hex::encode(r.chunk_sha256),
+                    "tier": format!("{:?}", r.tier),
+                    "epoch": r.epoch,
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// #832 (§12.3) — **seal a live stream into a `chunk_dag` at
+    /// `cohort_scope`.** Refuses unless every chunk ROW is at the DAG's tier
+    /// (I32); builds the manifest (v2 with PLAINTEXT sizes for a sealed
+    /// tier), seals it under the DAG's DEK, stores it, and announces
+    /// `holds_bytes` under the local signer at `Plaintext` / `CommunityDek`.
+    ///
+    /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
+    /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
+    /// `excluded`. `aad_b64` is the #831 hook for the manifest's seal.
+    #[pyo3(signature = (cohort_scope, stream_id, community_key_id=None, media_type=None, aad_b64=None))]
+    fn seal_stream_scoped(
+        &self,
+        py: Python<'_>,
+        cohort_scope: &str,
+        stream_id: &str,
+        community_key_id: Option<&str>,
+        media_type: Option<&str>,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::chunk_dag_cascade::orchestrate::seal_stream_scoped;
+            let runtime = self.runtime.clone();
+            let aad = decode_aad_b64(aad_b64)?;
+            let scope = cohort_scope.to_owned();
+            let comm = community_key_id.map(str::to_owned);
+            let stream = stream_id.to_owned();
+            let media = media_type.map(str::to_owned);
+            // §11.2 (6) / I23 — announce under the identity the sweep retracts
+            // under: the LOCAL signer when one is configured, else the
+            // composed signer; the key id is derived from whichever signs.
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
+            py.detach(move || {
+                let r = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            seal_stream_scoped(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                comm.as_deref(),
+                                &stream,
+                                media.as_deref(),
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            seal_stream_scoped(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                comm.as_deref(),
+                                &stream,
+                                media.as_deref(),
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({
+                    "manifest_sha256": hex::encode(r.manifest_sha256),
+                    "tier": format!("{:?}", r.tier),
+                    "epoch": r.epoch,
+                    "chunk_count": r.chunk_count,
+                    "total_size": r.total_size,
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// #832 (§12.5, I37) — **the live-stream handle for DVR / catch-up.**
+    /// The chunks of `stream_id` so far, in `seq` order, with the latest
+    /// producer-signed STH's `tree_size` — one snapshot. JSON:
+    /// `{"chunks":[{"seq","chunk_sha256","epoch","size_bytes",
+    /// "plaintext_size","crypto_tier","cohort_scope"},…],"sth_tree_size":n|null}`.
+    /// The prefix `[0, sth_tree_size)` is tamper-evident; the tail is
+    /// best-effort. Fetch each chunk by `chunk_sha256` (`read_blob_range_as`
+    /// to open it; `get_blob_range` for opaque relay).
+    fn stream_chunks_json(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let stream = stream_id.to_owned();
+            py.detach(move || {
+                use crate::federation::BlobStorage;
+                let listing = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move { backend.stream_chunks(&stream).await })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move { backend.stream_chunks(&stream).await })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                let chunks: Vec<serde_json::Value> = listing
+                    .chunks
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "seq": c.seq,
+                            "chunk_sha256": hex::encode(c.chunk_sha),
+                            "epoch": c.epoch,
+                            "size_bytes": c.size_bytes,
+                            "plaintext_size": c.plaintext_size,
+                            "crypto_tier": c.crypto_tier.as_str(),
+                            "cohort_scope": c.cohort_scope,
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!({
+                    "chunks": chunks,
+                    "sth_tree_size": listing.sth_tree_size,
+                })
+                .to_string())
             })
         })
     }
@@ -31207,6 +31510,20 @@ fn serialize_takedown_report(
         .map_err(|e| PyRuntimeError::new_err(format!("TakedownReport encode: {e}")))
 }
 
+/// #832 / #831 — decode the optional `aad_b64` kwarg every AAD-carrying
+/// binding takes. `None` stays `None`; a malformed string is a `ValueError`
+/// before any backend work.
+fn decode_aad_b64(aad_b64: Option<&str>) -> PyResult<Option<Vec<u8>>> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    aad_b64
+        .map(|a| {
+            B64.decode(a)
+                .map_err(|e| PyValueError::new_err(format!("aad_b64 decode: {e}")))
+        })
+        .transpose()
+}
+
 fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "blob storage error");
@@ -31448,6 +31765,7 @@ fn parse_put_blob_chunks_payload(
         mrefs.push(crate::federation::ChunkRef { sha, size: c.size });
     }
     let manifest = crate::federation::ChunkManifest {
+        chunk_tier: None,
         v: wire.manifest.v,
         total_size: wire.manifest.total_size,
         chunks: mrefs,
@@ -31526,11 +31844,15 @@ fn encode_blob_body_json(body: &crate::federation::BlobBody) -> PyResult<String>
                 .iter()
                 .map(|c| serde_json::json!({ "sha": hex::encode(c.sha), "size": c.size }))
                 .collect();
+            // #832 — a v2 (sealed) manifest also carries `chunk_tier`; the
+            // storage layer only ever parses a PLAINTEXT manifest here, so
+            // this is `null` in practice and present for wire honesty.
             serde_json::json!({
                 "chunk_dag": {
                     "v": manifest.v,
                     "total_size": manifest.total_size,
                     "chunks": chunks,
+                    "chunk_tier": manifest.chunk_tier.map(|t| t.as_str()),
                 }
             })
         }

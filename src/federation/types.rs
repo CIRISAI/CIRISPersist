@@ -2246,7 +2246,8 @@ pub mod cohort_scope {
     /// to [`suppresses_holds_bytes`]**: self/family are encrypted AND
     /// suppressed; community/affiliations are encrypted but still emit
     /// `holds_bytes` (with cleartext provenance); Commons is plaintext.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum CryptoTier {
         /// `self` / `family` — per-write fresh DEK wrapped to every active
         /// occurrence/member; structurally invisible (no `holds_bytes`).
